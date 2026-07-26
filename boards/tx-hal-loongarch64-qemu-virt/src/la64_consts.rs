@@ -56,7 +56,7 @@ pub(crate) const QEMU_LA64_FW_CFG_BASE: usize = 0x1e02_0000;
 pub(crate) const QEMU_LA64_FDT_BASE: usize = 0x0010_0000;
 /// Maximum number of harts covered by the statically allocated boot stacks,
 /// trap contexts, per-hart TLS state, and IRQ-depth counters.
-pub(crate) const LA64_MAX_BOOT_CPUS: usize = 8;
+pub(crate) const LA64_MAX_BOOT_CPUS: usize = 12;
 /// Missing firmware topology must fail safe to one CPU. QEMU publishes the
 /// actual `-smp` topology through its FDT, so normal virtual-machine boots do
 /// not use this fallback.

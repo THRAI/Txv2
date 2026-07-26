@@ -160,6 +160,29 @@ fn read_pselect_timeout_ns(
     Ok(Some(ns))
 }
 
+async fn read_pselect_timeout_ns_wait(
+    aspace: &Cap<AddressSpace>,
+    timeout_ptr: u64,
+) -> Result<Option<u64>, i32> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; core::mem::size_of::<PselectTimespecLayout>()];
+    super::user_copy::bootstrap_copy_from_user_wait(aspace, &mut bytes, timeout_ptr)
+        .await
+        .map_err(errno_to_i32)?;
+    let tv_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let tv_nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 {
+        return Err(EINVAL_VALUE);
+    }
+    let ns = (tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|sec_ns| sec_ns.checked_add(tv_nsec as u64))
+        .ok_or(EINVAL_VALUE)?;
+    Ok(Some(ns))
+}
+
 fn fdset_words(nfds: u64) -> usize {
     nfds.div_ceil(FD_SET_WORD_BITS) as usize
 }
@@ -310,6 +333,24 @@ fn read_ppoll_sigmask(
     }
 }
 
+async fn read_ppoll_sigmask_wait(
+    ctx: &SyscallCtx<'_>,
+    mask_ptr: u64,
+    mask_size: u64,
+) -> Result<Option<u64>, SyscallResult> {
+    if mask_ptr == 0 {
+        return Ok(None);
+    }
+    if mask_size < SIGSETSIZE_BYTES {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    let mut bytes = [0u8; core::mem::size_of::<u64>()];
+    match super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, mask_ptr).await {
+        Ok(()) => Ok(Some(u64::from_le_bytes(bytes))),
+        Err(errno) => Err(SyscallResult::error_from(errno)),
+    }
+}
+
 fn set_thread_signal_mask(ctx: &SyscallCtx<'_>, mask_bits: u64) -> Result<u64, SyscallResult> {
     use tx_subsystems::{
         signal::SignalMask,
@@ -448,6 +489,11 @@ async fn wait_on_any_token(
                     signalled = true;
                 }
             }
+            if mailbox.take_overflow() {
+                // The concrete event was dropped. Re-scan fd readiness and
+                // pending signals in the syscall's outer loop.
+                return core::task::Poll::Ready(false);
+            }
             if signalled {
                 return core::task::Poll::Ready(true);
             }
@@ -485,6 +531,9 @@ async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
                 ) {
                     signalled = true;
                 }
+            }
+            if mailbox.take_overflow() {
+                return core::task::Poll::Ready(PselectWaitWake::FdReady);
             }
             if signalled {
                 return core::task::Poll::Ready(PselectWaitWake::Signalled);
@@ -872,7 +921,7 @@ pub(super) fn sys_writev_pagebacked_candidate<'a>(args: [u64; 6], ctx: &SyscallC
 }
 
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
-pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -943,11 +992,11 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
     let timeout_ptr = args[2];
     let sigmask_ptr = args[3];
     let sigmask_size = args[4];
-    let timeout_ns = match read_pselect_timeout_ns(&ctx.aspace, timeout_ptr) {
+    let timeout_ns = match read_pselect_timeout_ns_wait(&ctx.aspace, timeout_ptr).await {
         Ok(value) => value,
         Err(errno) => return SyscallResult::Error(errno),
     };
-    let temporary_sigmask = match read_ppoll_sigmask(ctx, sigmask_ptr, sigmask_size) {
+    let temporary_sigmask = match read_ppoll_sigmask_wait(ctx, sigmask_ptr, sigmask_size).await {
         Ok(value) => value,
         Err(result) => return result,
     };
@@ -1012,9 +1061,11 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
     const POLLHUP: i16 = 0x0010;
     const POLLNVAL: i16 = 0x0020;
 
-    let timeout = match pselect_timeout_policy(ctx, timeout_ptr) {
-        Ok(wait) => wait,
-        Err(errno) => return SyscallResult::Error(errno),
+    let timeout = match (timeout_ptr, timeout_ns) {
+        (0, _) => PselectTimeout::Infinite,
+        (_, Some(0)) => PselectTimeout::Poll,
+        (_, Some(duration_ns)) => PselectTimeout::FiniteWait(duration_ns),
+        (_, None) => PselectTimeout::Infinite,
     };
     let timeout_deadline_ns = match timeout {
         PselectTimeout::FiniteWait(duration_ns) => {
@@ -1038,7 +1089,13 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
-            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+            if let Err(errno) = super::user_copy::bootstrap_copy_from_user_wait(
+                &ctx.aspace,
+                &mut ent_bytes,
+                ent_ptr,
+            )
+            .await
+            {
                 return restore_ppoll_sigmask(
                     ctx,
                     saved_mask,
@@ -1251,7 +1308,10 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                 ready += 1;
             }
             ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
+            if let Err(errno) =
+                super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, ent_ptr, &ent_bytes)
+                    .await
+            {
                 return restore_ppoll_sigmask(
                     ctx,
                     saved_mask,
@@ -1728,25 +1788,19 @@ async fn sys_write_pagebacked<'a>(
     // If any page is unmapped or has a prot mismatch, fail before
     // transferring any bytes.
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
-        use crate::adapter::step_engine::StepOutcome as V3;
         use tx_subsystems::vm::UserAccessKind;
-        let _guard = crate::adapter::step_engine::guard();
         emit_debug_counter(b"debug.write.pagebacked.phase", 1);
         match ctx
             .aspace
-            .reserve_user_range_for_access(range, UserAccessKind::Read)
+            .reserve_user_range_for_access_wait(range, UserAccessKind::Read)
+            .await
         {
-            V3::Done(()) => {
+            Ok(()) => {
                 emit_debug_counter(b"debug.write.pagebacked.phase", 2);
             }
-            V3::Err(e) => {
+            Err(errno) => {
                 emit_debug_counter(b"debug.write.pagebacked.err", 1);
-                let errno: tx_subsystems::execution::Errno = e.into();
                 return SyscallResult::error_from(errno);
-            }
-            V3::Yield { .. } | V3::Continue { .. } => {
-                emit_debug_counter(b"debug.write.pagebacked.err", 2);
-                return SyscallResult::error_from(tx_subsystems::execution::Errno::EIO);
             }
         }
     } else {
@@ -1895,8 +1949,12 @@ async fn sys_pipe_read_buffered<'a>(
     {
         Ok(total) => {
             if total > 0 {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
+                if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                    &ctx.aspace,
+                    buf_ptr as u64,
+                    &staging[..total],
+                )
+                .await
                 {
                     return SyscallResult::error_from(errno);
                 }
@@ -1955,7 +2013,13 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             let copy_len = core::cmp::min(len, SOCKET_IO_MAX_INLINE);
             let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; copy_len];
-            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+            if let Err(errno) = super::user_copy::bootstrap_copy_from_user_wait(
+                &ctx.aspace,
+                &mut bytes,
+                buf_ptr as u64,
+            )
+            .await
+            {
                 return SyscallResult::error_from(errno);
             }
             return match super::socket::dispatch_netlink_send(ctx, &socket, &bytes) {
@@ -1978,7 +2042,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             return SyscallResult::Return(0);
         }
         let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, buf_ptr as u64)
+                .await
+        {
             return SyscallResult::error_from(errno);
         }
         return sys_pipe_write_buffered(&tx, &bytes, file.flags().nonblocking, false, ctx).await;
@@ -2021,7 +2088,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             return SyscallResult::Return(0);
         }
         let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, buf_ptr as u64)
+                .await
+        {
             return SyscallResult::error_from(errno);
         }
         return sys_pipe_write_buffered(
@@ -2053,7 +2123,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // `step_write`.
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
     if len > 0 {
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, buf_ptr as u64)
+                .await
+        {
             return SyscallResult::error_from(errno);
         }
     }
@@ -2145,20 +2218,15 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
     // the pmap so the step loop below finds every page in the cache.
     // Access is Write — we're writing data *into* the user buffer.
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
-        use crate::adapter::step_engine::StepOutcome as V3;
         use tx_subsystems::vm::UserAccessKind;
-        let _guard = crate::adapter::step_engine::guard();
         match ctx
             .aspace
-            .reserve_user_range_for_access(range, UserAccessKind::Write)
+            .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
+            .await
         {
-            V3::Done(()) => {}
-            V3::Err(e) => {
-                let errno: tx_subsystems::execution::Errno = e.into();
+            Ok(()) => {}
+            Err(errno) => {
                 return SyscallResult::error_from(errno);
-            }
-            V3::Yield { .. } | V3::Continue { .. } => {
-                return SyscallResult::error_from(tx_subsystems::execution::Errno::EIO);
             }
         }
     }
@@ -2206,7 +2274,7 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
 /// Mirrors `sys_write`'s structure. For PageBacked files, delegates to
 /// `sys_read_pagebacked` (direct user-buffer path, PAGE_BACKED_v1 §5.1);
 /// for struct-backed files, uses kernel-buffer staging + copy_to_user.
-pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_read<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -2449,9 +2517,16 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     match driven {
         Ok(total) => {
             if total > 0 {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
+                if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                    &ctx.aspace,
+                    buf_ptr as u64,
+                    &staging[..total],
+                )
+                .await
                 {
+                    if errno == tx_subsystems::execution::Errno::EIO {
+                        report_async_read_eio::<P>("copy-to-user", fd, buf_ptr, len);
+                    }
                     return SyscallResult::error_from(errno);
                 }
             }
@@ -2459,9 +2534,18 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EIO {
+                report_async_read_eio::<P>("file-op-drive", fd, buf_ptr, len);
+            }
             SyscallResult::error_from(errno)
         }
     }
+}
+
+fn report_async_read_eio<P: tx_hal::ConsoleIf>(stage: &str, fd: i32, buf_ptr: usize, len: usize) {
+    tx_hal::console_write_str::<P>(&alloc::format!(
+        "txkernel:read-eio:stage={stage}:fd={fd}:buf={buf_ptr:#x}:len={len}\n"
+    ));
 }
 
 /// `pread64(fd, buf, count, offset)`.
@@ -2470,7 +2554,7 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
 /// snapshots the shared `OpenFile` offset, delegates to the existing
 /// `read(2)` path, then restores the original offset so callers do
 /// not observe a positioned read as a seek.
-pub(super) async fn sys_pread64<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_pread64<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -2557,7 +2641,7 @@ fn read_iovec_entry(ctx: &SyscallCtx<'_>, iov_ptr: u64, idx: u64) -> Result<(u64
     Ok((base, len))
 }
 
-pub(super) async fn sys_preadv<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_preadv<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -2696,7 +2780,7 @@ fn preadv2_offset(args: [u64; 6]) -> Result<Option<u64>, i32> {
     Ok(Some(args[3]))
 }
 
-pub(super) async fn sys_preadv2<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_preadv2<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {

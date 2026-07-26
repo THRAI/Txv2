@@ -1775,6 +1775,11 @@ impl core::future::Future for SubstrateReadyWait {
                 return core::task::Poll::Ready(());
             }
         }
+        if this.mailbox.take_overflow() {
+            // Readiness is level-checked by the caller after this future
+            // resolves; overflow is therefore a safe conservative wake.
+            return core::task::Poll::Ready(());
+        }
         core::task::Poll::Pending
     }
 }

@@ -326,9 +326,7 @@ fn exec_group_collapse_keeps_initiator_and_clears_episode() {
     let sibling = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
         .expect("step_clone_thread");
 
-    let collapsed = parent
-        .collapse_threads_for_exec(&leader)
-        .expect("live process");
+    let collapsed = block_on(parent.collapse_threads_for_exec(&leader)).expect("live process");
 
     assert_eq!(collapsed, 1);
     assert_eq!(parent.live_thread_count(), 1);
@@ -344,4 +342,38 @@ fn exec_group_collapse_keeps_initiator_and_clears_episode() {
         sibling.is_zombie(),
         "exec collapse zombifies sibling identities before AS replacement"
     );
+}
+
+#[test]
+fn clone_thread_commit_is_rejected_after_group_exit_install() {
+    let _g = setup();
+    let process = bootstrap();
+    let leader = first_thread(&process);
+    let sibling =
+        crate::process::execution::spawn_sibling_thread_for_test(&process).expect("sibling");
+
+    let participants =
+        crate::process::execution::initiate_group_exit(&process, ExitStatus::Exited(31));
+    assert_eq!(participants.len(), 2);
+
+    let result = step_clone_thread(
+        &process,
+        &synthetic_parent_ctx(),
+        SignalMask::EMPTY,
+        0,
+        0,
+        0,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(crate::process::adapter::step_engine::ZoneError::InvalidState)
+        ),
+        "CLONE_THREAD must not publish after GroupExit fixed its participant set"
+    );
+    assert_eq!(process.live_thread_count(), 2);
+
+    crate::thread_runtime::step_thread_exit_with_status(leader, ExitStatus::Exited(31));
+    crate::thread_runtime::step_thread_exit_with_status(sibling, ExitStatus::Exited(31));
+    assert!(process.is_zombie());
 }

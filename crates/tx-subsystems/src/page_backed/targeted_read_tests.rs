@@ -5,6 +5,22 @@ use crate::execution::Errno;
 use crate::page_backed::adapter::step_engine::{self as step_engine, StepOutcome as V3StepOutcome};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |_| RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE),
+    |_| {},
+    |_| {},
+    |_| {},
+);
+
+fn noop_waker() -> Waker {
+    // SAFETY: every vtable operation is a no-op and the data pointer is never
+    // dereferenced.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) }
+}
 
 fn setup_host_substrate() {
     tx_test_support::init_host();
@@ -152,5 +168,27 @@ fn read_exact_at_zero_length_is_done_noop() {
     assert_eq!(
         read_exact_at(&pc, 0, &mut out, &guard),
         V3StepOutcome::Done(())
+    );
+}
+
+#[test]
+fn page_ready_remains_visible_to_late_async_waiter() {
+    let wait = crate::page_backed::notification::new_page_ready_wait();
+    let source = crate::page_backed::notification::page_ready_source_id(&wait);
+    let notifier = wait.notifier();
+
+    // Complete publication before the waiter even exists.  An edge-only
+    // channel loses this event and leaves a late exec loader asleep forever;
+    // the readiness queue must preserve it.
+    crate::page_backed::notification::notify_page_ready(&notifier);
+
+    let token = crate::execution::WaitToken::new(source, 0x1);
+    let mut future = crate::wait_source::wait_on_token(token)
+        .expect("page-ready source must be registered for async resolution");
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(
+        Pin::new(&mut future).poll(&mut cx),
+        Poll::Ready(tx_reactor::wait::WaitOutcome::Ready)
     );
 }

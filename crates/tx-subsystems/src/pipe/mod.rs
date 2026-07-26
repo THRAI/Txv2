@@ -741,7 +741,21 @@ impl PipePayload {
         }
     }
 
-    /// Snapshot of the reader count. Test-only use today.
+    /// Snapshot the fd-accounting counters for diagnostics.
+    ///
+    /// These counters are intentionally exposed as one pair instead of
+    /// separate mutation-capable accessors.  Kernel diagnostics compare them
+    /// with the live process fd tables to detect a missed fork/dup/close
+    /// accounting transition; pipe semantics must continue to use
+    /// `readable_level` / `writable_level`.
+    pub fn endpoint_count_snapshot(&self) -> (u32, u32) {
+        (
+            self.reader_count.load(Ordering::Acquire),
+            self.writer_count.load(Ordering::Acquire),
+        )
+    }
+
+    /// Snapshot of the reader count. Test-only convenience.
     #[cfg(test)]
     fn reader_count_snapshot(&self) -> u32 {
         self.reader_count.load(Ordering::Acquire)

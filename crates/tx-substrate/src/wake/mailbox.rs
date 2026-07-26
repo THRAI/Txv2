@@ -419,10 +419,15 @@ impl TaskMailbox {
                     }
                 }
                 if coalesced {
-                    return false;
+                    false
+                } else if q.len() >= MAILBOX_QUEUE_BOUND {
+                    self.overflow.store(true, Ordering::Release);
+                    false
+                } else {
+                    q.push_back(event);
+                    true
                 }
-            }
-            if q.len() >= MAILBOX_QUEUE_BOUND {
+            } else if q.len() >= MAILBOX_QUEUE_BOUND {
                 self.overflow.store(true, Ordering::Release);
                 false
             } else {
@@ -814,6 +819,45 @@ mod tests {
         assert!(
             flag.load(Ordering::Acquire),
             "registered waker should fire on post"
+        );
+    }
+
+    #[test]
+    fn coalesced_source_fired_still_wakes_registered_waker() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::AtomicBool;
+
+        let mb = TaskMailbox::new();
+        let evt = MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: WaitSourceId::new(1),
+            interests: InterestMask::new(0b1),
+        };
+        assert!(mb.post(evt));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        mb.register_waker(make_test_waker(Arc::clone(&flag)));
+
+        assert!(
+            !mb.post(MailboxEvent::SourceFired {
+                generation: WaitGeneration::new(1),
+                source: WaitSourceId::new(1),
+                interests: InterestMask::new(0b10),
+            }),
+            "coalescing does not enqueue a second event"
+        );
+        assert!(
+            flag.load(Ordering::Acquire),
+            "coalescing an existing event must still wake its consumer"
+        );
+        assert_eq!(mb.len(), 1);
+        assert_eq!(
+            mb.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: WaitGeneration::new(1),
+                source: WaitSourceId::new(1),
+                interests: InterestMask::new(0b11),
+            })
         );
     }
 

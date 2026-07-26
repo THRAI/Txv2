@@ -948,7 +948,16 @@ where
         }
         TrapClass::InterprocessorInterrupt => {
             let _irq_context = crate::enter_irq_context();
-            K::on_ipi(<Platform as tx_hal::SmpIf>::current_cpu_id())
+            // Clear the hardware SSIP latch before consulting the software
+            // pending bitmap. This makes stale/spurious software interrupts
+            // one-shot instead of trapping forever when no IPI kind is
+            // recorded for the current hart. A concurrently sent IPI will
+            // set the latch again after publishing its pending bit.
+            crate::clear_supervisor_software_interrupt();
+            K::on_ipi(
+                <Platform as tx_hal::SmpIf>::current_cpu_id(),
+                frame.view_mut(),
+            )
         }
         TrapClass::IllegalInstruction => {
             if from_user && try_enable_lazy_user_fp(frame) {

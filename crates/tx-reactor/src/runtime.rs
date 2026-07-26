@@ -20,9 +20,9 @@ use crate::{
     hart_loop::HartLoopStep,
     preempt::PreemptMarkers,
     scheduler::{
-        HartId, HartSchedulerLocal, InitialSchedMeta, LocalAffinityMove, LocalEnqueueRequest,
-        Phase1Scheduler, QueuedTaskReport, RunnablePlacement, SchedulerAffinityError,
-        SchedulerStats, SliceConfig, StopReason, TaskHandle, TaskRunOwner, WakeHint,
+        HartId, HartSchedulerLocal, InitialSchedMeta, LocalEnqueueRequest, Phase1Scheduler,
+        QueuedTaskReport, RunnablePlacement, SchedulerAffinityError, SchedulerStats, SliceConfig,
+        StopReason, TaskHandle, TaskRunOwner, WakeHint,
     },
     spin_lock::SpinLock,
     task::{
@@ -261,6 +261,7 @@ fn emit_poll_duration_debug(task: TaskId, consumed_ns: u64) {
 
 pub struct ReactorShared {
     tasks: SpinLock<TaskTable>,
+    queued_wakes: Arc<AtomicUsize>,
     scheduler: Phase1Scheduler,
     observability: SpinLock<ReactorObservability>,
     timers: SpinLock<TimerQueue>,
@@ -319,10 +320,6 @@ impl ReactorLocals {
         } else {
             Some(unsafe { &*ptr })
         }
-    }
-
-    fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire)
     }
 
     fn total_queue_depth(&self, hart: HartId) -> usize {
@@ -503,7 +500,6 @@ impl SharedReactor {
             let mut view = reactor.hart_runtime_view(hart);
             timer_wakes = view.advance_time_to(now_ns);
             wake_report = view.drain_wakes_for_hart(hart, signal);
-            view.rebalance_local_at(hart, now_ns);
         }
 
         // Phase 2: poll loop — take a task future, then poll outside reactor locks.
@@ -511,7 +507,7 @@ impl SharedReactor {
             let poll_packet = {
                 let mut view = reactor.hart_runtime_view(hart);
                 view.drain_wakes_for_hart(hart, signal);
-                let Some((handle, slice)) = view.pick_next_or_steal_local(hart) else {
+                let Some((handle, slice)) = view.pick_next_local(hart) else {
                     break;
                 };
                 let packet = match view
@@ -740,12 +736,7 @@ impl HartRuntimeView<'_> {
                 mailbox_scheduler_hint_code(hint),
             );
             let hint = mailbox_scheduler_hint_to_reactor(hint);
-            if let Some((placement, request)) =
-                self.shared
-                    .scheduler
-                    .task_runnable_from_for_locals(key.id(), hint, current_hart)
-            {
-                self.apply_local_enqueue(request);
+            if let Some(placement) = self.commit_woken_task(key.id(), hint, current_hart) {
                 if placement.target_hart != current_hart {
                     report.record(self.apply_runnable_placement(placement, signal));
                 } else {
@@ -758,6 +749,38 @@ impl HartRuntimeView<'_> {
             }
         }
         report
+    }
+
+    /// Commit a wake into its destination run queue.
+    ///
+    /// Routing is optimistic; the scheduler rechecks ownership and affinity
+    /// while the destination queue lock is held.  A concurrent affinity move
+    /// returns the new hart and retries without ever publishing a false
+    /// `Queued` owner.
+    fn commit_woken_task(
+        &mut self,
+        task: TaskId,
+        hint: WakeHint,
+        current_hart: HartId,
+    ) -> Option<RunnablePlacement> {
+        let mut target = self
+            .shared
+            .scheduler
+            .runnable_target_hart(task, hint, current_hart)?;
+        loop {
+            self.locals.ensure_hart(target);
+            let local = self.locals.get(target)?;
+            match self.shared.scheduler.commit_runnable_on_local(
+                task,
+                hint,
+                current_hart,
+                target,
+                local.scheduler(),
+            ) {
+                Ok(placement) => return placement,
+                Err(retry_target) => target = retry_target,
+            }
+        }
     }
 
     pub fn consume_dispatch_markers(&self, hart: HartId) -> PreemptMarkers {
@@ -806,7 +829,7 @@ impl HartRuntimeView<'_> {
         loop {
             let Some((key, mut future, wake_state, slice)) = ({
                 self.drain_wakes_for_hart(hart, signal);
-                let Some((handle, slice)) = self.pick_next_or_steal_local(hart) else {
+                let Some((handle, slice)) = self.pick_next_local(hart) else {
                     break;
                 };
                 match self
@@ -961,18 +984,6 @@ impl HartRuntimeView<'_> {
             .record_run_stats(hart, stats);
     }
 
-    fn apply_local_enqueue(&mut self, request: LocalEnqueueRequest) {
-        self.locals.ensure_hart(request.hart);
-        if let Some(local) = self.locals.get(request.hart) {
-            Phase1Scheduler::push_to_local_queue(
-                local.scheduler(),
-                request.task,
-                request.queue,
-                request.front,
-            );
-        }
-    }
-
     fn task_stopped_local(
         &mut self,
         task: TaskId,
@@ -980,99 +991,35 @@ impl HartRuntimeView<'_> {
         consumed_ns: u64,
         hart: HartId,
     ) {
-        if let Some(request) =
+        let Some(mut target) = self.shared.scheduler.stopped_target_hart(task, hart) else {
+            return;
+        };
+        loop {
+            self.locals.ensure_hart(target);
+            let Some(local) = self.locals.get(target) else {
+                return;
+            };
+            match self.shared.scheduler.commit_stopped_on_local(
+                task,
+                reason,
+                consumed_ns,
+                hart,
+                target,
+                local.scheduler(),
+            ) {
+                Ok(_) => return,
+                Err(retry_target) => target = retry_target,
+            }
+        }
+    }
+
+    fn pick_next_local(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
+        self.locals.ensure_hart(hart);
+        self.locals.get(hart).and_then(|local| {
             self.shared
                 .scheduler
-                .task_stopped_for_locals(task, reason, consumed_ns, hart)
-        {
-            self.apply_local_enqueue(request);
-        }
-    }
-
-    fn pick_next_or_steal_local(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
-        self.locals.ensure_hart(hart);
-        if let Some(local) = self.locals.get(hart) {
-            if let Some(next) = self
-                .shared
-                .scheduler
                 .pick_next_from_local(hart, local.scheduler())
-            {
-                return Some(next);
-            }
-        }
-
-        let victim = self.busiest_local_steal_victim(hart)?;
-        let handle = self.try_steal_between_locals(hart, victim)?;
-        self.locals
-            .get(hart)
-            .and_then(|local| {
-                self.shared
-                    .scheduler
-                    .pick_next_from_local(hart, local.scheduler())
-            })
-            .or(Some((
-                handle,
-                SliceConfig::Preemptive {
-                    slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS,
-                },
-            )))
-    }
-
-    fn busiest_local_steal_victim(&self, thief: HartId) -> Option<HartId> {
-        let mut best = None;
-        let mut best_depth = 0;
-        for victim_index in 0..self.locals.len() {
-            let victim = HartId(victim_index);
-            if victim == thief {
-                continue;
-            }
-            let depth = self
-                .locals
-                .get(victim)
-                .map(|local| {
-                    let depths = local.scheduler().queue_depths();
-                    depths.boosted + depths.new + depths.preempted
-                })
-                .unwrap_or(0);
-            if depth > best_depth {
-                best = Some(victim);
-                best_depth = depth;
-            }
-        }
-        best
-    }
-
-    fn try_steal_between_locals(&mut self, thief: HartId, victim: HartId) -> Option<TaskHandle> {
-        let thief_local = self.locals.get(thief)?.scheduler();
-        let victim_local = self.locals.get(victim)?.scheduler();
-        self.shared
-            .scheduler
-            .try_steal_from_locals(thief, thief_local, victim, victim_local)
-    }
-
-    fn rebalance_local_at(&mut self, hart: HartId, now_ns: u64) -> Option<TaskHandle> {
-        self.locals.ensure_hart(hart);
-        let local = self.locals.get(hart)?.scheduler();
-        let victim = self.shared.scheduler.rebalance_victim_from_locals(
-            hart,
-            local,
-            now_ns,
-            self.locals.len(),
-            |victim| {
-                self.locals
-                    .get(victim)
-                    .map(|local| {
-                        let depths = local.scheduler().queue_depths();
-                        depths.boosted + depths.new + depths.preempted
-                    })
-                    .unwrap_or(0)
-            },
-        )?;
-        let stolen = self.try_steal_between_locals(hart, victim);
-        if stolen.is_some() {
-            self.shared.scheduler.record_rebalance_move();
-        }
-        stolen
+        })
     }
 
     pub fn take_userspace_preempt_marker(&self, hart: HartId) -> bool {
@@ -1093,12 +1040,7 @@ impl HartRuntimeView<'_> {
     {
         let mut report = WakeDispatchReport::empty();
         if self.shared.tasks.lock().mark_runnable(key).is_ok() {
-            if let Some((placement, request)) =
-                self.shared
-                    .scheduler
-                    .task_runnable_from_for_locals(key.id(), hint, current_hart)
-            {
-                self.apply_local_enqueue(request);
+            if let Some(placement) = self.commit_woken_task(key.id(), hint, current_hart) {
                 let action = self.apply_runnable_placement(placement, signal);
                 self.mark_userspace_preempt_for_wake(placement, current_hart, hint);
                 report.record(action);
@@ -1169,9 +1111,12 @@ impl Reactor {
     const WAKE_INBOX_DRAIN_LIMIT: usize = 64;
 
     pub fn new() -> Self {
+        let tasks = TaskTable::new();
+        let queued_wakes = tasks.queued_wake_counter();
         Self {
             shared: ReactorShared {
-                tasks: SpinLock::new(TaskTable::new()),
+                tasks: SpinLock::new(tasks),
+                queued_wakes,
                 scheduler: Phase1Scheduler::new(),
                 observability: SpinLock::new(ReactorObservability::default()),
                 timers: SpinLock::new(TimerQueue::new()),
@@ -1395,13 +1340,32 @@ impl Reactor {
         }
 
         let mut report = WakeDispatchReport::empty();
-        if let Some((placement, movement)) =
-            self.shared
-                .scheduler
-                .set_affinity_for_locals(task.id(), affinity, current_hart)?
-        {
-            self.apply_local_affinity_move(movement);
-            report.record(self.apply_runnable_placement(placement, signal));
+        loop {
+            let Some((placement, movement)) =
+                self.shared
+                    .scheduler
+                    .set_affinity_for_locals(task.id(), affinity, current_hart)?
+            else {
+                break;
+            };
+            self.locals.ensure_hart(movement.from_hart);
+            self.locals.ensure_hart(movement.to_hart);
+            let from_local = self
+                .locals
+                .get(movement.from_hart)
+                .expect("source hart local");
+            let to_local = self
+                .locals
+                .get(movement.to_hart)
+                .expect("destination hart local");
+            if self.shared.scheduler.commit_affinity_move_on_locals(
+                movement,
+                from_local.scheduler(),
+                to_local.scheduler(),
+            )? {
+                report.record(self.apply_runnable_placement(placement, signal));
+                break;
+            }
         }
         Ok(report)
     }
@@ -1647,7 +1611,18 @@ impl Reactor {
     }
 
     pub fn should_leave_polling_idle(&self, hart: HartId) -> bool {
-        self.dispatch_markers(hart).need_resched() || !self.is_idle()
+        if self.dispatch_markers(hart).need_resched()
+            || self.shared.queued_wakes.load(Ordering::Acquire) != 0
+        {
+            return true;
+        }
+
+        self.locals.get(hart).is_some_and(|local| {
+            self.shared
+                .scheduler
+                .total_queue_depth_from_local(local.scheduler())
+                != 0
+        })
     }
 
     pub fn scheduler_stats(&self) -> SchedulerStats {
@@ -1695,26 +1670,6 @@ impl Reactor {
                 request.task,
                 request.queue,
                 request.front,
-            );
-        }
-    }
-
-    fn apply_local_affinity_move(&self, movement: LocalAffinityMove) {
-        self.locals.ensure_hart(movement.from_hart);
-        self.locals.ensure_hart(movement.to_hart);
-        if let Some(from_local) = self.locals.get(movement.from_hart) {
-            Phase1Scheduler::remove_from_local_queue(
-                movement.task,
-                from_local.scheduler(),
-                movement.queue,
-            );
-        }
-        if let Some(to_local) = self.locals.get(movement.to_hart) {
-            Phase1Scheduler::push_to_local_queue(
-                to_local.scheduler(),
-                movement.task,
-                movement.queue,
-                false,
             );
         }
     }

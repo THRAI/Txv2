@@ -41,7 +41,8 @@ pub(crate) mod topology;
 
 pub(crate) use address_space::{
     commit_mapping, create_pmap_root, destroy_pmap_root, protect_mapping, reserve_mapping,
-    rollback_mapping, shootdown_mapping, shootdown_mappings, unmap_mapping, ASID_CAPACITY,
+    rollback_mapping, shootdown_mapping, shootdown_mappings, synchronize_new_mappings,
+    unmap_mapping, ASID_CAPACITY,
 };
 #[cfg(target_arch = "riscv64")]
 pub(crate) use kernel_space::cover_boot_firmware_dtb_from_bag;

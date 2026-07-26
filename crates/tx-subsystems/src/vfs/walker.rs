@@ -258,6 +258,11 @@ pub fn step_open<'g>(
     let rnode = dentry.rnode().clone();
     match OpenFile::new_cap_with_dentry(rnode, flags, dentry) {
         Ok(open) => V3::done(open),
+        // Preserve resource exhaustion as ENOMEM.  Collapsing every
+        // zone failure to EIO made concurrent exec failures look like
+        // storage corruption even when only the OpenFile zone could
+        // not grow.
+        Err(tx_substrate::zone::ZoneError::AllocationFailed) => V3::err(step_engine::Errno::ENOMEM),
         Err(_) => V3::err(step_engine::Errno::EIO),
     }
 }

@@ -1241,7 +1241,11 @@ pub(super) fn sys_dup3<'a>(
 /// Userspace writeback: the `pipefd_uaddr` flows through
 /// `bootstrap_write_user::<[u32; 2]>` (canonical `aspace.write_user`
 /// lane with kernel-pointer fallback for test scaffolding).
-pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_pipe2<'a>(
+    pipefd_uaddr: u64,
+    flags: u32,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     // Validate flags. Recognised: O_CLOEXEC | O_NONBLOCK | O_DIRECT.
     let recognised = O_CLOEXEC | O_NONBLOCK | O_DIRECT;
     if flags & !recognised != 0 {
@@ -1296,7 +1300,10 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     let mut pipefd_bytes = [0u8; 8];
     pipefd_bytes[0..4].copy_from_slice(&reader_fd.to_le_bytes());
     pipefd_bytes[4..8].copy_from_slice(&writer_fd.to_le_bytes());
-    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, pipefd_uaddr, &pipefd_bytes) {
+    if let Err(errno) =
+        super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, pipefd_uaddr, &pipefd_bytes)
+            .await
+    {
         let _ = ctx.process.set_fd(reader_fd, None);
         let _ = ctx.process.set_fd(writer_fd, None);
         return SyscallResult::error_from(errno);

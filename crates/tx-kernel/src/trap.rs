@@ -104,17 +104,33 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         }
     }
 
-    fn on_ipi(_cpu: CpuId) -> TrapAction {
+    fn on_ipi(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+        let reschedule = P::pending_ipi(IpiKind::Reschedule);
         if P::pending_ipi(IpiKind::Membarrier) {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             P::ack_ipi(IpiKind::Membarrier);
         }
-        if P::pending_ipi(IpiKind::Reschedule) {
+        if reschedule {
             P::ack_ipi(IpiKind::Reschedule);
         }
         if P::pending_ipi(IpiKind::TlbShootdown) {
             P::ack_ipi(IpiKind::TlbShootdown);
         }
+
+        // A remote runnable task has already been published before the
+        // reschedule IPI. If the interrupt landed in userspace, complete the
+        // same context handoff used by timer preemption; returning a bare
+        // Reschedule without it would strand UserspaceRunWait, while returning
+        // Resume would postpone the queued task until an unrelated timer or
+        // syscall.
+        if reschedule && view.view().previous_mode == tx_hal::TrapPreviousMode::User {
+            let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
+            if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
+                crate::init::mark_boot_reactor_userspace_preempt(cpu);
+            }
+            return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
+        }
+
         TrapAction::Resume
     }
 

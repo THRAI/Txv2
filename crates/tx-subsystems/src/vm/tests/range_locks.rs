@@ -61,7 +61,8 @@ fn vm_range_lock_conflict_matrix_matches_modes() {
     drop(writer);
 
     let materializer_a = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
-    let materializer_b = acquired(lock.acquire_step_rich(overlap, LockMode::Materializer));
+    would_block(lock.acquire_step_rich(overlap, LockMode::Materializer));
+    let materializer_b = acquired(lock.acquire_step_rich(disjoint, LockMode::Materializer));
     would_block(lock.acquire_step_rich(overlap, LockMode::ExclusiveWriter));
     drop(materializer_b);
     drop(materializer_a);
@@ -169,9 +170,7 @@ fn vm_range_lock_tree_keeps_disjoint_reservations_independent() {
 
     would_block(lock.acquire_step_rich(a, LockMode::Materializer));
     would_block(lock.acquire_step_rich(b, LockMode::Materializer));
-    let second_materializer_c = acquired(lock.acquire_step_rich(c, LockMode::Materializer));
-
-    drop(second_materializer_c);
+    would_block(lock.acquire_step_rich(c, LockMode::Materializer));
     drop(materializer_c);
     drop(writer_b);
     drop(writer_a);

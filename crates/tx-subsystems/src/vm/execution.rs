@@ -70,15 +70,17 @@ impl AddressSpace {
 
         require_fault_publication(self, &outcome, &materialization)?;
 
-        self.pmap
-            .publish_page_with_replacement(
-                outcome.page_range.start().containing_page(),
-                materialization.page.ppn,
-                materialization.publish_prot,
-                materialization.page.map_pin,
-                materialization.replace_existing,
-            )
-            .map_err(VmFaultError::Pmap)
+        match self.pmap.publish_page_with_replacement(
+            outcome.page_range.start().containing_page(),
+            materialization.page.ppn,
+            materialization.publish_prot,
+            materialization.page.map_pin,
+            materialization.replace_existing,
+        ) {
+            Ok(published) => Ok(published),
+            Err(crate::vm::VmPmapError::ConcurrentPublication) => Err(VmFaultError::StaleRecipe),
+            Err(error) => Err(VmFaultError::Pmap(error)),
+        }
     }
 
     /// Duplicate `parent`'s recipes into a fresh child `AddressSpace` and
@@ -105,17 +107,53 @@ impl AddressSpace {
     /// potential v2 optimization.
     ///
     /// Returns `VmMapError::WouldBlock` if a concurrent operation already
-    /// holds an overlapping reservation. Callers may retry; no async
-    /// retry is built in at the VM layer because the Process subsystem
-    /// orchestrates fork above this function.
+    /// holds an overlapping reservation. Synchronous one-shot callers may
+    /// surface that result; syscall paths must use [`Self::fork_aspace_wait`]
+    /// so an internal coordination conflict is never exposed as userspace
+    /// resource exhaustion.
     pub fn fork_aspace<P: PmapIf>(parent: &AddressSpace) -> Result<AddressSpace, VmMapError> {
-        let V3StepOutcome::Done(_full_guard) = parent
+        let V3StepOutcome::Done(full_guard) = parent
             .range_lock
             .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
         else {
             return Err(VmMapError::WouldBlock);
         };
+        Self::fork_aspace_reserved::<P>(parent, full_guard)
+    }
 
+    /// Wait-capable fork preparation for concurrent syscall paths.
+    ///
+    /// No reservation survives an await: on conflict the RangeLock provides
+    /// a wait token, this function awaits a release notification, then
+    /// retries acquisition and all authoritative observation from scratch.
+    /// Once acquired, the complete CoW clone is synchronous under the
+    /// full-address-space reservation.
+    pub async fn fork_aspace_wait<P: PmapIf>(
+        parent: &AddressSpace,
+    ) -> Result<AddressSpace, VmMapError> {
+        loop {
+            match parent
+                .range_lock
+                .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
+            {
+                V3StepOutcome::Done(full_guard) => {
+                    return Self::fork_aspace_reserved::<P>(parent, full_guard);
+                }
+                V3StepOutcome::Yield { shape, .. } => {
+                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                        return Err(VmMapError::WouldBlock);
+                    };
+                    await_range_lock(token).await;
+                }
+                _ => unreachable_acquire_step(),
+            }
+        }
+    }
+
+    fn fork_aspace_reserved<P: PmapIf>(
+        parent: &AddressSpace,
+        _full_guard: RangeGuard<'_>,
+    ) -> Result<AddressSpace, VmMapError> {
         let guard = step_engine::guard();
         let parent_recipes = parent.recipes_snapshot();
         let child_recipes = parent.recipes.clone_shared(&guard);
@@ -201,17 +239,14 @@ impl AddressSpace {
     ///
     /// VM_v1_2 §5.1 + §3.6 cross-async-wait discipline. Each iteration:
     ///
-    /// 1. Acquires a Materializer reservation, observes the recipe, and
-    ///    drops the reservation. On WouldBlock the future awaits on the
-    ///    `RangeLock`'s wait channel and retries.
-    /// 2. Materializes the page through `materialize_pagebacked`. PC-side
-    ///    Blocked outcomes (File-variant `step_fsync` / FsPageBacking)
-    ///    are not yet exposed through this script — they remain a
-    ///    follow-up that requires per-`PageContainer` wait channels.
-    /// 3. Re-acquires the Materializer reservation and publishes the
-    ///    materialization through the pmap. WouldBlock here drops the
-    ///    materialization (releasing the MapPin) and retries from
-    ///    step 1, re-observing the recipe afresh.
+    /// 1. Acquires a Materializer reservation and observes the recipe. UFFD
+    ///    delegation may drop it and await an agent reply.
+    /// 2. Acquires one page-level Materializer for the final attempt and keeps
+    ///    it continuously across materialization, private-page mutation,
+    ///    publication revalidation, and PTE installation.
+    /// 3. If page-cache or coordination work blocks, drops every reservation
+    ///    before awaiting and retries from recipe observation. No RangeGuard
+    ///    crosses an async suspension.
     pub async fn fault_script(&self, fault: VmFault) -> Result<PmapPublishOutcome, VmFaultError> {
         // The OnAgent dispatcher slot is empty for the simple
         // entrypoint — callers that want userfaultfd-aware fault
@@ -334,11 +369,10 @@ impl AddressSpace {
                     continue;
                 }
                 FaultScriptPublish::Retry => {
-                    // The recipe or private-page state changed after the
-                    // resolve phase dropped its Materializer reservation.
-                    // This is an expected optimistic-concurrency conflict:
-                    // discard the temporary materialization and resolve the
-                    // fault against the current recipe.
+                    // The recipe changed between the initial observation and
+                    // acquisition of the final page-level transaction, or a
+                    // lower-level optimistic private-page CAS requested a
+                    // restart. Discard temporary state and re-observe.
                     emit_vm_trace(b"debug.vm.fault.script.retry", 1);
                     continue;
                 }
@@ -406,6 +440,21 @@ impl AddressSpace {
             }
             _ => unreachable_acquire_step(),
         };
+        self.try_fault_script_publish_locked(outcome, materialization)
+    }
+
+    /// Final synchronous half of a page-fault transaction.
+    ///
+    /// The caller must hold the target page's Materializer reservation from
+    /// before materialization until this function returns. That reservation is
+    /// the AddressSpace-level linearization owner; the inner pmap lock then
+    /// keeps software residency bookkeeping and the hardware PTE update
+    /// atomic with respect to other pmap operations.
+    fn try_fault_script_publish_locked(
+        &self,
+        outcome: &VmFaultOutcome,
+        materialization: VmFaultMaterialization,
+    ) -> Result<FaultScriptPublish, VmFaultError> {
         emit_vm_trace(b"debug.vm.fault.publish.phase", 2);
         emit_vm_trace(
             b"debug.vm.fault.publish.pmap_mapped_pages",
@@ -428,16 +477,16 @@ impl AddressSpace {
             return Err(error);
         }
         emit_vm_trace(b"debug.vm.fault.publish.phase", 3);
-        let published = self
-            .pmap
-            .publish_page_with_replacement(
-                outcome.page_range.start().containing_page(),
-                materialization.page.ppn,
-                materialization.publish_prot,
-                materialization.page.map_pin,
-                materialization.replace_existing,
-            )
-            .map_err(VmFaultError::Pmap)?;
+        let published = match self.pmap.publish_page_with_replacement(
+            outcome.page_range.start().containing_page(),
+            materialization.page.ppn,
+            materialization.publish_prot,
+            materialization.page.map_pin,
+            materialization.replace_existing,
+        ) {
+            Ok(published) => published,
+            Err(error) => return Err(VmFaultError::Pmap(error)),
+        };
         emit_vm_trace(b"debug.vm.fault.publish.phase", 4);
         Ok(FaultScriptPublish::Done(published))
     }
@@ -448,6 +497,40 @@ impl AddressSpace {
         ufd_reply: Option<DelegateReply>,
     ) -> Result<FaultScriptPublish, VmFaultError> {
         emit_vm_trace(b"debug.vm.fault.materialize.phase", 0);
+        // Re-acquire one exclusive page-level Materializer after any UFFD
+        // await and keep it continuously through materialization, private-page
+        // mutation, publication validation, and PTE install. If page-cache
+        // materialization blocks, returning from this function drops the
+        // reservation before the async caller awaits and retries.
+        let _page_guard = match self
+            .range_lock
+            .acquire_step(outcome.page_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield { shape, .. } => {
+                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                    emit_vm_trace(b"debug.vm.fault.materialize.wait", 2);
+                    return Ok(FaultScriptPublish::Wait(token));
+                }
+                unreachable_acquire_step()
+            }
+            _ => unreachable_acquire_step(),
+        };
+        let page = outcome.page_range.start().containing_page();
+        if let Some(existing) = self.pmap.lookup(page) {
+            if existing.prot.permits(outcome.access) {
+                // Both harts may have trapped before either installed a PTE.
+                // After waiting for the page transaction, a sufficient
+                // resident mapping means the winner already resolved this
+                // fault. Converge on it instead of publishing a second page.
+                self.pmap.refresh_page_translation(page)?;
+                emit_vm_trace(b"debug.vm.fault.materialize.coalesced", 1);
+                return Ok(FaultScriptPublish::Done(PmapPublishOutcome {
+                    page,
+                    replaced: false,
+                }));
+            }
+        }
         let materialization = match ufd_reply {
             Some(DelegateReply::Ufd(UfdReply::Copy {
                 src_kernel_addr,
@@ -497,7 +580,7 @@ impl AddressSpace {
             }
         };
         emit_vm_trace(b"debug.vm.fault.materialize.phase", 3);
-        self.try_fault_script_publish(outcome, materialization)
+        self.try_fault_script_publish_locked(outcome, materialization)
     }
 
     fn prefault_private_anon_write_batch(&self, first: &VmFaultOutcome) {
@@ -614,71 +697,82 @@ impl AddressSpace {
     pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
         let total_start = vm_map_path_clock_now();
         emit_vm_trace(b"debug.vm.mmap.enter", 0);
-        let (range, placement) = match request.target {
-            VmMapTarget::Anywhere { window, page_count } => {
-                emit_vm_trace(b"debug.vm.mmap.target", 0);
-                emit_vm_trace(b"debug.vm.mmap.pages", page_count as i64);
-                let search_start = vm_map_path_clock_now();
-                let range = self
-                    .find_free_range_for_anywhere(window, page_count)
-                    .ok_or(VmMapError::NoFreeRange)?;
-                emit_vm_map_path_duration(
-                    b"debug.vm.map_path.mmap.anywhere_search_ns",
-                    search_start,
-                );
-                (range, MapPlacement::RequireFree)
-            }
-            VmMapTarget::Fixed { range, placement } => {
-                emit_vm_trace(b"debug.vm.mmap.target", 1);
-                emit_vm_trace(b"debug.vm.mmap.pages", range.page_count() as i64);
-                (range, placement)
-            }
-        };
-        emit_vm_trace(
-            b"debug.vm.mmap.range_start",
-            range.start().as_usize() as i64,
-        );
-        emit_vm_trace(b"debug.vm.mmap.placement", placement as i64);
-        let entry = VmEntry::new(range, request.prot, request.flags, request.backing);
-
-        let reserve_start = vm_map_path_clock_now();
-        match self.reserve_map(entry, placement) {
-            MapReserveResult::Reserved(reservation) => {
-                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.reserve_map_ns", reserve_start);
-                emit_vm_trace(b"debug.vm.mmap.reserved", 1);
-                let commit_start = vm_map_path_clock_now();
-                let commit = reservation.commit()?;
-                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_ns", commit_start);
-                emit_vm_trace(
-                    b"debug.vm.mmap.committed_pages",
-                    commit.changed_pages as i64,
-                );
-                if matches!(request.target, VmMapTarget::Anywhere { .. }) {
-                    self.next_mmap_search_start
-                        .store(range.end().as_usize(), Ordering::Relaxed);
+        loop {
+            let (range, placement, anywhere) = match request.target {
+                VmMapTarget::Anywhere { window, page_count } => {
+                    emit_vm_trace(b"debug.vm.mmap.target", 0);
+                    emit_vm_trace(b"debug.vm.mmap.pages", page_count as i64);
+                    let search_start = vm_map_path_clock_now();
+                    let range = self
+                        .find_free_range_for_anywhere(window, page_count)
+                        .ok_or(VmMapError::NoFreeRange)?;
+                    emit_vm_map_path_duration(
+                        b"debug.vm.map_path.mmap.anywhere_search_ns",
+                        search_start,
+                    );
+                    (range, MapPlacement::RequireFree, true)
                 }
-                emit_vm_map_path_count(
-                    b"debug.vm.map_path.mmap.changed_pages",
-                    commit.changed_pages as u64,
-                );
-                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
-                Ok(VmMapOutcome { range, commit })
-            }
-            MapReserveResult::Blocked(_) => {
-                emit_vm_map_path_duration(
-                    b"debug.vm.map_path.mmap.reserve_blocked_ns",
-                    reserve_start,
-                );
-                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
-                Err(VmMapError::WouldBlock)
-            }
-            MapReserveResult::Err(error) => {
-                emit_vm_map_path_duration(
-                    b"debug.vm.map_path.mmap.reserve_error_ns",
-                    reserve_start,
-                );
-                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
-                Err(error)
+                VmMapTarget::Fixed { range, placement } => {
+                    emit_vm_trace(b"debug.vm.mmap.target", 1);
+                    emit_vm_trace(b"debug.vm.mmap.pages", range.page_count() as i64);
+                    (range, placement, false)
+                }
+            };
+            emit_vm_trace(
+                b"debug.vm.mmap.range_start",
+                range.start().as_usize() as i64,
+            );
+            emit_vm_trace(b"debug.vm.mmap.placement", placement as i64);
+            let entry = VmEntry::new(range, request.prot, request.flags, request.backing.clone());
+
+            let reserve_start = vm_map_path_clock_now();
+            match self.reserve_map(entry, placement) {
+                MapReserveResult::Reserved(reservation) => {
+                    emit_vm_map_path_duration(
+                        b"debug.vm.map_path.mmap.reserve_map_ns",
+                        reserve_start,
+                    );
+                    emit_vm_trace(b"debug.vm.mmap.reserved", 1);
+                    let commit_start = vm_map_path_clock_now();
+                    let commit = reservation.commit()?;
+                    emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_ns", commit_start);
+                    emit_vm_trace(
+                        b"debug.vm.mmap.committed_pages",
+                        commit.changed_pages as i64,
+                    );
+                    if anywhere {
+                        self.next_mmap_search_start
+                            .store(range.end().as_usize(), Ordering::Release);
+                    }
+                    emit_vm_map_path_count(
+                        b"debug.vm.map_path.mmap.changed_pages",
+                        commit.changed_pages as u64,
+                    );
+                    emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
+                    return Ok(VmMapOutcome { range, commit });
+                }
+                MapReserveResult::Blocked(_) => {
+                    emit_vm_map_path_duration(
+                        b"debug.vm.map_path.mmap.reserve_blocked_ns",
+                        reserve_start,
+                    );
+                    emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
+                    return Err(VmMapError::WouldBlock);
+                }
+                // Another thread may commit into the selected gap between
+                // the lock-free recipe snapshot and our range reservation.
+                // For mmap(NULL, ...), Linux requires the kernel to choose a
+                // different gap; EEXIST is reserved for
+                // MAP_FIXED_NOREPLACE. Re-observe the recipe tree and retry.
+                MapReserveResult::Err(VmMapError::AlreadyMapped) if anywhere => continue,
+                MapReserveResult::Err(error) => {
+                    emit_vm_map_path_duration(
+                        b"debug.vm.map_path.mmap.reserve_error_ns",
+                        reserve_start,
+                    );
+                    emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
+                    return Err(error);
+                }
             }
         }
     }
@@ -689,7 +783,7 @@ impl AddressSpace {
         page_count: usize,
     ) -> Option<UserRange> {
         let len = page_count.checked_mul(USER_PAGE_SIZE)?;
-        let hint = self.next_mmap_search_start.load(Ordering::Relaxed);
+        let hint = self.next_mmap_search_start.load(Ordering::Acquire);
         if hint > window.start().as_usize()
             && hint < window.end().as_usize()
             && hint.is_multiple_of(USER_PAGE_SIZE)

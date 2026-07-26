@@ -580,6 +580,20 @@ fn write_page_to_hole_and_tail_reads_back() {
 }
 
 #[test]
+fn content_commit_updates_size_mtime_and_ctime_together() {
+    let image = mock_image();
+    let mut pager = Ext4Pager::open(image).unwrap();
+    pager
+        .set_inode_size_and_times(InodeNo::new(12), 6 * BLOCK_SIZE as u64, 1_800_000_123)
+        .unwrap();
+
+    let inode = read_inode_from_image(pager.image(), 4, 12);
+    assert_eq!(inode.size, 6 * BLOCK_SIZE as u64);
+    assert_eq!(inode.mtime, 1_800_000_123);
+    assert_eq!(inode.ctime, 1_800_000_123);
+}
+
+#[test]
 fn sequential_writeback_allocates_one_contiguous_extent() {
     let mut image = mock_image();
     mark_inode_bitmap_used(&mut image, 13);

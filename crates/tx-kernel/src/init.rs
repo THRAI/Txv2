@@ -41,7 +41,8 @@ static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::
 /// the concurrent poll path on all harts.
 pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static CONSOLE_WRITE_LOCK: SpinMutex<()> = spin_mutex((), b"debug.lock.kernel.console_write");
+pub(crate) static CONSOLE_WRITE_LOCK: SpinMutex<()> =
+    spin_mutex((), b"debug.lock.kernel.console_write");
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
@@ -196,12 +197,6 @@ pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
     let _ = BOOT_REACTOR.with(|reactor| {
         reactor.mark_userspace_preempt(boot_runtime::HartId(cpu_id.0));
     });
-}
-
-pub(crate) fn boot_reactor_hart_is_polling_idle(hart: boot_runtime::HartId) -> bool {
-    BOOT_REACTOR
-        .with(|reactor| reactor.is_polling_idle(hart))
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -640,6 +635,10 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn init_vdso_after_rootfs_mount() {
+        // VFS and concrete filesystem backends are deliberately not generic
+        // over the platform. Install the platform monotonic clock once so
+        // inode timestamps use the exact CLOCK_REALTIME timebase.
+        tx_subsystems::wall_clock::install_monotonic_source(<P as tx_hal::TimeIf>::read_ns);
         // Initialise the vDSO image and high-res clock parameters.
         // Must run after the substrate page allocator is ready.
         if let Err(e) = crate::vdso::init::<P>() {
@@ -2148,6 +2147,12 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::init_observe_on_ap(cpu_id);
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
+        // `online` is a readiness publication, not merely proof that the AP
+        // reached Rust.  The BSP may target every online hart immediately
+        // (the boot IPI smoke does exactly that), so install the local wake
+        // sources before making this hart visible in `online_cpus()`.
+        P::enable_ipi_wakeups();
+        P::enable_timer_wakeups();
         P::mark_cpu_online(cpu_id);
         Self::secondary_reactor_loop()
     }
@@ -2167,8 +2172,6 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn secondary_reactor_loop() -> ! {
-        P::enable_ipi_wakeups();
-        P::enable_timer_wakeups();
         loop {
             // Re-read after every trap/longjmp round-trip; the boot argument is
             // not the authoritative hart identity once the reactor is running.
@@ -2190,7 +2193,14 @@ impl<P: TxPlatform> CoreInit<P> {
             if Self::poll_boot_reactor_idle_window(hart) {
                 continue;
             }
-            P::wait_for_interrupt_once();
+            let wait_state = P::prepare_interrupt_wait();
+            if AP_REACTOR_STOP_REQUESTED.load(core::sync::atomic::Ordering::Acquire)
+                || Self::boot_reactor_has_runnable_work(hart)
+            {
+                P::cancel_interrupt_wait(wait_state);
+                continue;
+            }
+            P::wait_for_interrupt_prepared(wait_state);
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
             }
@@ -2307,10 +2317,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let mut observed = false;
         let _ = BOOT_REACTOR.with(|reactor| reactor.begin_polling_idle(hart));
         for _ in 0..POLLING_IDLE_SPINS {
-            if BOOT_REACTOR
-                .with(|reactor| reactor.should_leave_polling_idle(hart))
-                .unwrap_or(false)
-            {
+            if Self::boot_reactor_has_runnable_work(hart) {
                 observed = true;
                 break;
             }
@@ -2318,6 +2325,12 @@ impl<P: TxPlatform> CoreInit<P> {
         }
         let _ = BOOT_REACTOR.with(|reactor| reactor.end_polling_idle(hart));
         observed
+    }
+
+    fn boot_reactor_has_runnable_work(hart: boot_runtime::HartId) -> bool {
+        BOOT_REACTOR
+            .with(|reactor| reactor.should_leave_polling_idle(hart))
+            .unwrap_or(false)
     }
 
     fn clear_ap_reactor_task_done(cpus: CpuMask) {
@@ -2370,7 +2383,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let fallback = Self::cpu_bit(cpu_id);
         let online = P::online_cpus().bits();
         let affinity = if online == 0 { fallback } else { online };
-        // Distribute newly submitted children across the least-loaded online
+        // Distribute newly submitted children round-robin across online
         // hart, then keep each child pinned there. This activates parallel
         // Cargo/rustc processes without enabling post-trap userspace migration
         // or userspace work stealing yet.

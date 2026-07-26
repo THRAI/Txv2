@@ -41,6 +41,10 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 
 use tx_subsystems::vfs::FsOps;
 
+fn current_ext4_time_sec() -> u32 {
+    tx_subsystems::wall_clock::current_realtime_sec().min(u32::MAX as u64) as u32
+}
+
 /// Initial sparse-cache window for ext4 regular-file PageContainers.
 ///
 /// This is not a file-size limit: file-backed PageContainers are sparse and
@@ -190,8 +194,9 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
+        let now_sec = current_ext4_time_sec();
         match self.with_pager(|pager| {
-            pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, 0)
+            pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
         }) {
             Ok(new_ino) => {
                 self.invalidate_lookup_cache_for(parent_ino);
@@ -334,8 +339,9 @@ where
             Ok(None) => {}
             Err(e) => return StepOutcome::err(e.into()),
         }
+        let now_sec = current_ext4_time_sec();
         match self.with_pager(|pager| {
-            pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
+            pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
         }) {
             Ok(new_ino) => {
                 self.invalidate_lookup_cache_for(parent_ino);

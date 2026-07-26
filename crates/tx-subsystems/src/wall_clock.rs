@@ -5,7 +5,7 @@
 //! offset and bump a generation counter that timer consumers can
 //! observe.
 
-use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
 use tx_hal::TimeIf;
 
@@ -124,6 +124,40 @@ impl WallClock {
 }
 
 static WALL_CLOCK: WallClock = WallClock::new(DEFAULT_REALTIME_EPOCH_BASE_NS as i64);
+type MonotonicNowFn = fn() -> u64;
+
+/// Platform-independent clock bridge for subsystems whose public types are
+/// intentionally not generic over `TimeIf` (VFS/filesystem backends in
+/// particular). The kernel installs the concrete source once during boot.
+static MONOTONIC_NOW_FN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn install_monotonic_source(source: MonotonicNowFn) {
+    MONOTONIC_NOW_FN.store(source as *mut (), Ordering::Release);
+}
+
+pub fn registered_monotonic_now_ns() -> u64 {
+    let raw = MONOTONIC_NOW_FN.load(Ordering::Acquire);
+    if raw.is_null() {
+        0
+    } else {
+        // SAFETY: `install_monotonic_source` is the only writer and stores a
+        // `MonotonicNowFn` using the inverse pointer cast.
+        let source = unsafe { core::mem::transmute::<*mut (), MonotonicNowFn>(raw) };
+        source()
+    }
+}
+
+/// Realtime clock for non-`TimeIf`-generic kernel subsystems.
+pub fn current_realtime_ns() -> u64 {
+    add_signed_ns(
+        registered_monotonic_now_ns(),
+        WALL_CLOCK.realtime_offset_ns(),
+    )
+}
+
+pub fn current_realtime_sec() -> u64 {
+    current_realtime_ns() / 1_000_000_000
+}
 
 pub fn monotonic_now_ns<P: TimeIf>() -> u64 {
     WALL_CLOCK.monotonic_now_ns::<P>()
@@ -164,6 +198,7 @@ pub fn publish_vvar<P: TimeIf>() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     WALL_CLOCK.reset_for_test();
+    MONOTONIC_NOW_FN.store(core::ptr::null_mut(), Ordering::Release);
 }
 
 fn add_signed_ns(base: u64, delta: i64) -> u64 {
@@ -231,5 +266,20 @@ mod tests {
         assert_eq!(clock.generation(), before_gen + 1);
         assert!(clock.realtime_now_ns::<TestTime>() >= 1_800_000_000_000_000_000);
         assert!(clock.monotonic_now_ns::<TestTime>() < 6_000_000_000);
+    }
+
+    #[test]
+    fn registered_source_uses_the_same_realtime_offset() {
+        fn test_now() -> u64 {
+            7_000_000_000
+        }
+
+        reset_for_test();
+        install_monotonic_source(test_now);
+        assert_eq!(
+            current_realtime_ns(),
+            DEFAULT_REALTIME_EPOCH_BASE_NS + 7_000_000_000
+        );
+        reset_for_test();
     }
 }

@@ -1,3 +1,49 @@
+- 2026-07-26 (RV64 SMP 空闲核丢唤醒闭环). BuildStorm 计时构建已经完成
+  `arceos-helloworld` 和 objcopy，但外层 `timeout` 永久停在 wait4。现场确认退出子进程
+  已是 zombie、parent key 正确，而所有 AP 均睡在 `wfi`；这排除了“子进程没有退出”，并
+  将根因收敛到 check-empty 与 WFI 之间的中断竞态。原实现即使总发 reschedule IPI，IPI
+  仍可在 WFI 执行前进入内核、清除 SSIP 后返回原 PC，随后 AP 执行 WFI 并永久睡眠。现为
+  `SmpIf` 增加线性的 prepare/cancel/commit interrupt-wait 协议；RV64 prepare 在最终
+  runnable-work 检查前清除全局 `sstatus.SIE` 但保留 `sie` 本地源，竞态到达的 SSIP 会
+  保持 pending 并使 WFI 立即返回，commit 后再恢复原 SIE。AP reactor 与 BSP userspace
+  reactor 均使用该协议，最终检查覆盖本核 runnable 队列、need-resched、全局 queued wake，
+  AP 额外覆盖 stop 请求。验证：相关三 crate host check 通过；RV64 release 交叉编译通过；
+  release 反汇编确认 `csrrci sstatus,2 -> authoritative work check -> wfi -> csrsi
+  sstatus,2` 顺序；8-hart smoke 通过 AP online、IPI、dispatch、AP loop 和 AP runqueue
+  标记；`target/oscomp/submit/kernel-rv` 已刷新且与 release ELF SHA-256 一致。Next：使用
+  当前有缓存的官方 RV 镜像复跑 4-GiB/8-hart BuildStorm，确认最后三行后能继续打印
+  `BUILDSTORM_COMPILE`、测试组 END 和 PID 1 退出。Blocker：完整 BuildStorm 仍需一次约
+  20 分钟的客户机实测，未在本轮短验证中冒充完成。
+- 2026-07-25 (BuildStorm 文件时间与 SMP fork 根因修复). ext4 不再把新建文件/目录
+  的 atime/mtime/ctime 写成 1970：启动时向 wall_clock 注册平台单调时钟，文件系统从与
+  `clock_gettime(CLOCK_REALTIME)` 相同的 offset 读取时间；page-cache 写回和 truncate 在
+  同一次 inode 更新中提交 size、mtime、ctime，避免 Cargo 因本地产物旧于源码而反复重编
+  `axbuild/tg-xtask`。进程 fork 改为“可等待 VM 准备 + 一次性进程发布”：RangeLock
+  冲突在内核中等待释放并从头重试，不再直接映射为用户态 EAGAIN；fd/pipe 引用、pid 和
+  topology 发布均位于等待之后，exec 并发替换 aspace 时丢弃未发布 clone 并重做准备。
+  普通 process clone 已退出同步 one-shot 快路，CLONE_THREAD 仍保留紧凑快路。验证：
+  wall-clock、ext4 元数据原子更新、fork 冲突等待三个针对性测试通过；RV64 与 LA64
+  `cargo xtask build` 均通过。统一 `cargo -q xtask unit` 仍被分支已有的 tx-shims
+  测试桩缺失（ITIMER_REAL/NETLINK_XFRM/CLONE_NEWNS 等）和现有 SMP 线程 future
+  2112-byte 超预算测试阻断；tx-ext4 本身 11/11 通过。Next：生成新的 submit 内核后用
+  干净或可回滚镜像跑八核 BuildStorm，确认计时阶段不再重编上述 host 工具，并且
+  `core`/rustc spawn 不再出现 `Resource temporarily unavailable`。
+- 2026-07-25 (SMP 最小正确调度路径). 用户任务采用提交时按 affinity mask
+  round-robin 分配、运行后固定 CPU 的模型；生产 hart loop 暂停 work stealing 与周期
+  rebalance，避免反复扫描并弹出实际不可迁移的 pinned 用户任务。idle 判断不再扫描全局
+  TaskTable：只观察本核队列、本核 need-resched 和原子待处理 wake 数，其他 CPU 有任务时
+  本核可以正常休眠。RawWaker 用原子 wake bit 合并重复唤醒；Parked -> Runnable 的
+  scheduler metadata 转换和 queued affinity 转换都在单次 metadata 临界区完成，防止两个
+  CPU 同时把一个 future 发布到不同队列。此前已撤销 reschedule IPI 在缺少
+  `TrapFrameMut` 时直接返回 `TrapAction::Reschedule` 的错误行为；IPI 仍确认低层 pending
+  位并唤醒目标 hart，但返回 `Resume`，避免用户上下文未保存、userspace wait 未完成便跳回
+  Reactor。用户任务的 spread-on-submit 不再在全局 scheduler metadata 锁内扫描全部任务；
+  改为一个 relaxed 原子游标按 affinity mask 做 round-robin，metadata 锁只承担 O(1) 任务
+  登记。验证：`cargo test -p tx-reactor -- --test-threads=1` 全部通过，
+  `cargo check -p tx-kernel --lib` 和 `git diff --check` 通过。Next：重新构建 RV64 后进行
+  4-GiB BuildStorm 八核复跑，先确认八核均能运行且不再出现旧的空闲核抢锁/任务双重发布。
+  Blocker：本轮按要求未启动耗时 QEMU 测试；动态负载均衡需在 movable 任务队列与原子迁移
+  协议完成后再启用。
 - 2026-07-24 (LA64 BuildStorm vmalloc 激活链补齐). LA64 的 PGDH 实际已在
   `TrapIf::enter_userspace_with_context` 中激活，但运行时绕过了原先唯一调用
   `enable_vmalloc_after_kernel_pmap_activation` 的 `VmPmap::activate` 包装层，导致诊断长期为
@@ -17949,6 +17995,33 @@
   errno and instrument the statfs plus final file-write/close paths before
   changing ext4 allocation again. Serial log:
   `target/buildstorm-rv-statfs.log`.
+- 2026-07-25 RV64 SMP ASID/pmap correctness fix: process-root activation now
+  publishes incoming residency before `satp` replacement and retains outgoing
+  residency until the hardware switch completes. Root destruction waits for
+  residency quiescence and performs an all-online-hart ASID flush before
+  releasing page-table pages or recycling the ASID, so non-resident harts
+  cannot retain translations into a reused address space. Fault publication
+  now also revalidates the page-level `PrivatePageSet` winner; a stale read
+  materialization racing a private writer retries instead of surfacing
+  `MappingMismatch` as SIGSEGV. Verification: all 87 RV64 QEMU HAL host tests,
+  the four focused VM publication tests, RV64 no-std cross-check for
+  `tx-hal-riscv64-qemu-virt` and `tx-subsystems`, formatting check, and
+  `git diff --check` passed. Next step: rebuild the RV submission kernel and
+  rerun the 8-hart BuildStorm workload; that long QEMU run was intentionally
+  not started during the focused fix.
+- 2026-07-26 finals test refresh and LA64 12-hart capacity: updated the
+  embedded finals launcher for the official fixed CAgent script by removing
+  the obsolete server-watchdog rewrite; the launcher now runs the official
+  CAgent unchanged and then BuildStorm. Raised the LA64 QEMU platform's boot,
+  trap, TLS, pmap and IPI capacity from 8 to 12 harts, changed both assembly
+  CPU-id bounds to 12, expanded the linker-owned boot-stack arena to 6 MiB
+  (12 × 512 KiB), and aligned reactor per-hart task context slots with its
+  existing 64-hart runtime capacity. Verification: shell syntax and
+  `git diff --check` passed; all 43 LA64 platform host tests and 40 reactor
+  smoke tests passed; the LA64 release kernel cross-built successfully, and
+  `readelf` confirmed a 6 MiB `.bss.stack`. Next step/blocker: obtain the
+  refreshed official images containing `ss`, then run RV with 16 GiB/8 harts
+  and LA with 36 GiB/12 harts on a host with sufficient RAM.
 - Real K210 boot, linker, and hardware path are not implemented yet.
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.

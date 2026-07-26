@@ -326,6 +326,12 @@ impl PmapIf for Platform {
         }
         la64_remote_tlb_shootdown(la64_asid_residency_mask(asid));
     }
+
+    fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            la64_invtlb_asid(asid, invalidation.virt());
+        }
+    }
 }
 impl TrapIf for Platform {
     fn install_minimal_trap_vector() {

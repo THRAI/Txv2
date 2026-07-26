@@ -87,6 +87,10 @@ fn drain_stale_signal_events(mailbox: &crate::adapter::reactor_entry::TaskMailbo
             keep.push(event);
         }
     }
+    // Any dropped event has already published its authoritative signal/source
+    // state. Clear the hint latch so a later unrelated wait does not spin; the
+    // syscall paths re-observe the authoritative state before parking.
+    let _ = mailbox.take_overflow();
     for event in keep {
         let _ = mailbox.post(event);
     }
@@ -431,6 +435,11 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
         Ok(mask) => mask,
         Err(result) => return result,
     };
+    let Some(thread_payload) = ctx.thread.payload_cap() else {
+        let _ = set_thread_signal_mask(ctx, old_mask);
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    thread_payload.store_sigsuspend_restore_mask(Some(old_mask));
 
     // Return EINTR for an interrupting signal WITHOUT restoring the pre-suspend
     // mask first. POSIX sigsuspend runs the signal's handler *while the suspend
@@ -443,10 +452,10 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
     // undeliverable: the signal stayed pending, every re-`sigsuspend` saw it
     // again, and the caller span forever (the flaky fs_bind* hang, root-caused
     // by gdb to a busy rt_sigsuspend loop). The pre-suspend mask is re-applied
-    // by the delivered handler's `sigreturn` frame / the caller's own SETMASK
-    // after its wait loop.
-    let restore_and_eintr =
-        |_ctx: &SyscallCtx<'_>, _old_mask: SignalMask| SyscallResult::Error(EINTR_VALUE);
+    // by the delivered handler's `sigreturn` frame. The thread payload carries
+    // `old_mask` separately so the handler itself still runs under the
+    // temporary suspend mask.
+    let return_eintr = || SyscallResult::Error(EINTR_VALUE);
 
     const CHUNK_NS: u64 = 5_000_000;
     loop {
@@ -463,8 +472,8 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
         // fs_bind* hang. This is the rt_sigsuspend counterpart of the
         // ppoll/pselect/recv/send/wait4 fix that already switched to
         // `thread_pending_signal_interrupts` (it broke netperf identically).
-        if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
-            return restore_and_eintr(ctx, old_mask);
+        if tx_subsystems::signal::thread_pending_signal_ends_sigsuspend(&ctx.thread) {
+            return return_eintr();
         }
 
         use crate::adapter::step_engine::DriveMode;
@@ -492,9 +501,12 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
             Err(v3errno) => {
                 let errno: Errno = v3errno.into();
                 if errno == Errno::EINTR {
-                    return restore_and_eintr(ctx, old_mask);
+                    if tx_subsystems::signal::thread_pending_signal_ends_sigsuspend(&ctx.thread) {
+                        return return_eintr();
+                    }
                 }
                 let _ = set_thread_signal_mask(ctx, old_mask);
+                thread_payload.store_sigsuspend_restore_mask(None);
                 return SyscallResult::error_from(errno);
             }
         }
@@ -583,6 +595,22 @@ fn take_matching_pending_signal(ctx: &SyscallCtx<'_>, wait_bits: u64) -> Option<
     Some(sig)
 }
 
+fn has_matching_pending_signal(ctx: &SyscallCtx<'_>, wait_bits: u64) -> bool {
+    let thread_match = ctx
+        .thread
+        .payload_cap()
+        .map(|payload| payload.pending().snapshot() & wait_bits)
+        .unwrap_or(0);
+    if thread_match != 0 {
+        return true;
+    }
+
+    ctx.process
+        .upgrade_operational()
+        .map(|payload| payload.group_pending().snapshot() & wait_bits != 0)
+        .unwrap_or(false)
+}
+
 fn write_sigtimedwait_siginfo(ctx: &SyscallCtx<'_>, info_ptr: u64, sig: Signum) -> Result<(), i32> {
     if info_ptr == 0 {
         return Ok(());
@@ -602,9 +630,23 @@ async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
     const SIGTIMEDWAIT_POLL_NS: u64 = 1_000_000;
 
     if wait_bits & Signum::SIGCHLD.bit() != 0 && deadline_ns.is_none() {
-        if let Some(token) = ctx.process.exit_source_wait_token() {
-            if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
-                future.await;
+        if let Some(source) = ctx.process.exit_wait_source() {
+            // The legacy exit Channel is edge-triggered: a child can exit
+            // after the pending-signal check above but before the Channel
+            // future installs its subscription, permanently losing the only
+            // wake.  Install against the process's v3 WaitSource and recheck
+            // the authoritative pending queues under the same publication
+            // lock used by child-exit notification.
+            let parked = super::await_wait_source_if(
+                ctx,
+                source.id(),
+                crate::adapter::step_engine::InterestMask::new(
+                    tx_subsystems::process::EXIT_SOURCE_CHILD_ZOMBIFIED,
+                ),
+                || !has_matching_pending_signal(ctx, wait_bits),
+            )
+            .await;
+            if parked || has_matching_pending_signal(ctx, wait_bits) {
                 return;
             }
         }

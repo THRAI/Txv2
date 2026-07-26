@@ -168,11 +168,22 @@ pub(crate) fn post_signal_mailbox(payload: &ThreadPayload, signum: Signum, routi
     });
 }
 
-/// Mark a thread zombie: set its exit status, drop its payload. Does
-/// not touch the parent process's thread list — callers that need
-/// parent-side bookkeeping (e.g. `step_thread_exit`) do that
-/// themselves; callers that already hold the parent payload (e.g.
-/// `process::step_exit_group`) skip it.
+/// Wake a userspace reactor task after process termination is published.
+///
+/// The outer `PerHartSlotted` task wrapper owns the authoritative termination
+/// checkpoint, so the mailbox only has to force one more poll; it does not need
+/// to understand or resolve whichever nested wait the thread currently holds.
+pub(crate) fn post_termination_wake(payload: &ThreadPayload) {
+    // This route is independent from TaskMailbox's replaceable wait waker.
+    // A nested futex/I/O future is allowed to clear the mailbox slot, but it
+    // must never make an exec/group-exit sibling uninterruptible.
+    payload.wake_lifecycle_task();
+    post_signal_mailbox(payload, Signum::SIGKILL, SignalRouting::ProcessDirected);
+}
+
+/// Mark a thread zombie: set its exit status and drop its payload.
+/// Parent-side roster/count bookkeeping remains the caller's
+/// responsibility.
 ///
 /// **D9-A.** Before dropping the payload, post a `SignalDelivered`
 /// wake-hint with signum `SIGKILL` and routing `ProcessDirected` to
@@ -181,19 +192,22 @@ pub(crate) fn post_signal_mailbox(payload: &ThreadPayload, signum: Signum, routi
 /// sitting idle until some unrelated channel fires. Silently no-op
 /// when no mailbox is bound (D9-A's early-bring-up invariant). The
 /// summary side of "termination" itself is *not* mutated here —
-/// `step_exit_group_with_signal` is the canonical site for the
-/// termination bit; D9-A only adds the wake-hint side.
-pub(crate) fn set_thread_zombie(thread: &Cap<ThreadIdentity>, status: i32) {
+/// GroupExit publication owns that transition; D9-A only adds the
+/// wake-hint side.
+pub(crate) fn set_thread_zombie(thread: &Cap<ThreadIdentity>, status: i32) -> bool {
     // Post the wake-hint *before* dropping the payload so the
     // `mailbox` slot is still readable. If the payload is already
     // gone (idempotent double-zombify), `payload.lock()` returns
     // `None` and we skip the post — the future has already had its
     // last chance to observe state.
-    if let Some(payload) = thread.payload.lock().as_ref() {
-        post_signal_mailbox(payload, Signum::SIGKILL, SignalRouting::ProcessDirected);
-    }
+    let mut payload_slot = thread.payload.lock();
+    let Some(payload) = payload_slot.as_ref() else {
+        return false;
+    };
+    post_termination_wake(payload);
     *thread.exit_status.lock() = Some(status);
-    *thread.payload.lock() = None;
+    *payload_slot = None;
+    true
 }
 
 /// Test-only: mark a thread as a zombie **without** removing it
@@ -208,32 +222,38 @@ pub(crate) fn set_thread_zombie(thread: &Cap<ThreadIdentity>, status: i32) {
 /// never reaches release builds.
 #[cfg(any(test, feature = "test-support"))]
 pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
-    set_thread_zombie(thread, status);
+    let _ = set_thread_zombie(thread, status);
 }
 
 /// Single-thread exit. Marks the thread zombie, removes it from the
 /// owning process's thread list, and zombifies the process if this was
 /// the last thread.
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
-    let mut group_exit_completed = false;
+    step_thread_exit_inner(
+        thread,
+        status,
+        crate::process::structure::ExitStatus::Exited(status),
+    );
+}
+
+/// Status-aware thread exit used by GroupExit. Each thread executes this on
+/// its own reactor future; the thread whose roster decrement reaches zero is
+/// the only path allowed to tear down process-owned resources.
+pub fn step_thread_exit_with_status(
+    thread: Cap<ThreadIdentity>,
+    status: crate::process::structure::ExitStatus,
+) {
+    step_thread_exit_inner(thread, status.wait_status_word(), status);
+}
+
+fn step_thread_exit_inner(
+    thread: Cap<ThreadIdentity>,
+    thread_status: i32,
+    process_status: crate::process::structure::ExitStatus,
+) {
     let trace = thread_exit_debug_sample();
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.enter", thread.tid.0 as i64);
-    }
-    // Snapshot clear_child_tid and robust-list BEFORE
-    // set_thread_zombie drops the thread payload.
-    let ctid = thread
-        .payload
-        .lock()
-        .as_ref()
-        .and_then(|p| *p.clear_child_tid.lock());
-    let robust = thread.payload.lock().as_ref().and_then(|p| {
-        let head = *p.robust_list_head.lock();
-        let len = *p.robust_list_len.lock();
-        head.map(|h| (h, len))
-    });
-    if trace {
-        emit_thread_exit_debug(b"debug.thread_exit.snapshot.after", thread.tid.0 as i64);
     }
 
     // observe
@@ -241,11 +261,6 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     // reserve
     // commit
     // publish
-    set_thread_zombie(&thread, status);
-    if trace {
-        emit_thread_exit_debug(b"debug.thread_exit.zombie.after", thread.tid.0 as i64);
-    }
-
     let guard = crate::thread_runtime::adapter::step_engine::guard();
     let Some(parent) = thread.owner_proc.upgrade(&guard) else {
         return;
@@ -255,96 +270,81 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         emit_thread_exit_debug(b"debug.thread_exit.parent.after", thread.tid.0 as i64);
     }
 
-    let payload_guard = parent.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Some(payload) = parent.payload.lock().as_ref().cloned() else {
         return;
     };
 
-    let _removed = crate::process::execution::measure_process_lock_service(
-        b"debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
-        || payload.threads.detach(&thread),
-    );
+    // Linux requires clear_child_tid and robust-futex repair while the old
+    // address space is still live. This also guarantees that the last thread
+    // cannot drop the process payload before another exiting thread finishes
+    // its userspace-visible cleanup.
+    let aspace = payload.aspace_cap();
+    notify_thread_exit_userspace_in_aspace(&thread, &aspace);
     if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.snapshot.after", thread.tid.0 as i64);
+    }
+
+    // GroupExit installation/snapshot, CLONE_THREAD publication, and this
+    // live->zombie roster commit share one serialization boundary:
+    //
+    // - if we commit first, a later GroupExit snapshot cannot count us;
+    // - if GroupExit installs first, we observe it and arrive after commit;
+    // - clone cannot publish a participant after either episode starts.
+    //
+    // Only this short state commit is protected. Userspace cleanup above and
+    // process teardown below stay outside the lock, avoiding slow work and
+    // scheduler/syscall hot paths under a process-wide lock.
+    let (group_exit, prev) = {
+        let group_exit_slot = payload.group_exit.lock();
+        let group_exit = group_exit_slot.as_ref().cloned();
+
+        // Exactly one caller wins the live -> zombie transition. Duplicate
+        // wake, signal, or syscall paths cannot detach/decrement twice.
+        if !set_thread_zombie(&thread, thread_status) {
+            return;
+        }
+        let _removed = crate::process::execution::measure_process_lock_service(
+            b"debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
+            || payload.threads.detach(&thread),
+        );
+        let prev = crate::process::execution::measure_process_lock_service(
+            b"debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
+            || {
+                payload
+                    .thread_count
+                    .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
+            },
+        );
+        (group_exit, prev)
+    };
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.zombie.after", thread.tid.0 as i64);
         emit_thread_exit_debug(b"debug.thread_exit.retain.after", thread.tid.0 as i64);
     }
-    let prev = crate::process::execution::measure_process_lock_service(
-        b"debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
-        || {
-            payload
-                .thread_count
-                .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
-        },
-    );
     let new_count = prev.saturating_sub(1);
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.count.after", thread.tid.0 as i64);
     }
 
-    // GroupExit coordination (PROCESS_v1 §5): if the owning process
-    // has an active group-exit episode (exit_group or multi-threaded
-    // execve), decrement the remaining_threads counter. The
-    // initiating thread is not counted here.
-    crate::process::execution::measure_process_lock_service(
-        b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
-        || {
-            if let Some(ref ge) = *payload.group_exit.lock() {
-                let prev_remaining = ge
-                    .remaining_threads
-                    .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-                if prev_remaining == 1 {
-                    group_exit_completed = true;
-                }
-            }
-        },
-    );
-
     let was_last = new_count == 0;
-    drop(payload_guard);
-
-    if was_last {
-        // Thread side carries `i32` per `THREAD_RUNTIME_v1` §7.2;
-        // the cascade promotes that to `ExitStatus::Exited` because
-        // signal-driven termination doesn't reach this path (it goes
-        // through `step_exit_group_with_signal` which records
-        // `ExitStatus::Signaled` directly before zombifying threads).
-        crate::process::execution::step_process_exit(
-            &parent,
-            crate::process::structure::ExitStatus::Exited(status),
+    if let Some(group_exit) = group_exit.as_ref() {
+        crate::process::execution::measure_process_lock_service(
+            b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
+            || group_exit.participant_exited(thread.tid.0),
         );
     }
 
-    if group_exit_completed {
-        if let Some(payload) = parent.payload.lock().as_ref() {
-            *payload.group_exit.lock() = None;
-        }
-    }
-
-    // clear_child_tid futex protocol (CLONE_CHILD_CLEARTID).
-    // Linux semantics: atomically write 0 to *ctid, then
-    // FUTEX_WAKE on the same address. We do both best-effort —
-    // if the userspace page is unmapped, skip the write but
-    // still fire the wake (hash-bucket wake is unconditional).
-    if let Some(ctid_ptr) = ctid {
-        let guard = crate::thread_runtime::adapter::step_engine::guard();
-        // Zero the word at *ctid_ptr in userspace.
-        if let Some(proc) = thread.owner_proc.upgrade(&guard) {
-            if let Some(payload) = proc.payload.lock().as_ref() {
-                let aspace = payload.aspace_cap();
-                clear_and_wake_child_tid(&aspace, ctid_ptr, &guard);
-            }
-        }
-        drop(guard);
+    if was_last {
+        let process_status = group_exit
+            .as_ref()
+            .map(|state| state.status())
+            .unwrap_or(process_status);
+        crate::process::execution::step_process_exit(&parent, process_status);
     }
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.ctid.after", thread.tid.0 as i64);
     }
 
-    // robust-list walk: mark each robust futex as FUTEX_OWNER_DIED
-    // and issue FUTEX_WAKE. Best-effort — if the userspace pages
-    // are unmapped or the list is malformed, skip the entry.
-    if let Some((head, _len)) = robust {
-        walk_robust_list(&thread, head, 16);
-    }
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.robust.after", thread.tid.0 as i64);
     }
@@ -367,11 +367,45 @@ fn clear_and_wake_child_tid(
     tid_ptr: u64,
     guard: &step_engine::Guard<'_>,
 ) {
-    let _ = aspace.copy_to_user(UserPtr::<u8>::new(tid_ptr as usize), &[0u8; 4], guard);
     let trace = clear_child_tid_debug_sample();
     if trace {
         emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.uaddr", tid_ptr as i64);
     }
+
+    // `copy_to_user` is a step operation: a concurrent materializer can own
+    // the TCB page's RangeLock and make the write return `Yield`.  Thread exit
+    // is synchronous, however, and must not publish the futex wake until the
+    // kernel has actually stored zero.  Ignoring `Yield` creates a permanent
+    // lost wake: pthread_join observes the unchanged TID, waits again, and the
+    // already-dead thread can never wake it a second time.
+    //
+    // A clear-child-tid word belongs to the exiting thread's resident
+    // private-anonymous TCB mapping.  Therefore a yielded attempt is transient
+    // SMP page-transaction contention, not page-backed I/O: the owning remote
+    // hart can finish while this hart retries.  On a single hart such
+    // contention cannot be introduced between userspace exit and this
+    // synchronous cleanup.
+    loop {
+        match aspace.copy_to_user(
+            UserPtr::<u8>::new(tid_ptr as usize),
+            &[0u8; core::mem::size_of::<u32>()],
+            guard,
+        ) {
+            step_engine::StepOutcome::Done(written) if written == core::mem::size_of::<u32>() => {
+                break;
+            }
+            step_engine::StepOutcome::Yield { .. } | step_engine::StepOutcome::Continue { .. } => {
+                core::hint::spin_loop();
+            }
+            step_engine::StepOutcome::Done(_) | step_engine::StepOutcome::Err(_) => {
+                if trace {
+                    emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.err", -1);
+                }
+                return;
+            }
+        }
+    }
+
     match step_futex_lifecycle_wake_in(aspace, tid_ptr, 1, guard) {
         step_engine::StepOutcome::Done(woken) => {
             if trace {
@@ -392,82 +426,6 @@ fn clear_and_wake_child_tid(
             }
         }
     }
-}
-
-/// Best-effort robust-list walk on thread exit.
-///
-/// Linux's `robust_list_head` layout:
-///   head+0:  `list` (pointer to first robust_list entry)
-///   head+8:  `futex_offset` (long)
-///   head+16: `list_op_pending` (pointer to in-progress entry)
-///
-/// Each `robust_list` entry:
-///   entry+0:      `next` pointer
-///   entry+offset: futex word guarded by the mutex
-///
-/// Walk the list plus `list_op_pending`. Malformed lists are bounded
-/// so a corrupt userspace pointer cannot trap the kernel in a loop.
-fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
-    let guard = step_engine::guard();
-    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
-        return;
-    };
-    let aspace = {
-        let proc_guard = proc.payload.lock();
-        let Some(payload) = proc_guard.as_ref() else {
-            return;
-        };
-        payload.aspace_cap()
-    };
-
-    let Some((first, futex_offset, pending)) =
-        crate::process::execution::measure_process_lock_service(
-            b"debug.lock_service.process.payload.robust.head_reads.duration_ns",
-            || {
-                let first = read_user_u64(&aspace, head, &guard)?;
-                let futex_offset = read_user_i64(&aspace, head + 8, &guard)?;
-                let pending = read_user_u64(&aspace, head + 16, &guard)?;
-                Some((first, futex_offset, pending))
-            },
-        )
-    else {
-        return;
-    };
-
-    let mut entry = first;
-    let mut entry_count = 0usize;
-    crate::process::execution::measure_process_lock_service(
-        b"debug.lock_service.process.payload.robust.entries.duration_ns",
-        || {
-            for _ in 0..2048 {
-                if entry == 0 || entry == head {
-                    break;
-                }
-                mark_robust_entry_owner_died(&aspace, entry, futex_offset, &guard);
-                entry_count += 1;
-                let Some(next) = read_user_u64(&aspace, entry, &guard) else {
-                    break;
-                };
-                if next == entry {
-                    break;
-                }
-                entry = next;
-            }
-        },
-    );
-    crate::process::execution::emit_process_lock_service_trace(
-        b"debug.lock_service.process.payload.robust.entry_count",
-        entry_count.min(i64::MAX as usize) as i64,
-    );
-
-    if pending != 0 {
-        crate::process::execution::measure_process_lock_service(
-            b"debug.lock_service.process.payload.robust.pending.duration_ns",
-            || mark_robust_entry_owner_died(&aspace, pending, futex_offset, &guard),
-        );
-    }
-
-    drop(guard);
 }
 
 fn walk_robust_list_in_aspace(

@@ -2,7 +2,7 @@
 
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{RawWaker, RawWakerVTable, Waker},
 };
 
@@ -16,20 +16,34 @@ use crate::{spin_lock::SpinLock, task::TaskId};
 pub(crate) struct TaskWakeState {
     task: TaskId,
     wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
+    queued_wakes: Arc<AtomicUsize>,
     wake_requested: AtomicBool,
 }
 
 impl TaskWakeState {
-    pub(crate) fn new(task: TaskId, wake_queue: Arc<SpinLock<VecDeque<TaskId>>>) -> Self {
+    pub(crate) fn new(
+        task: TaskId,
+        wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
+        queued_wakes: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             task,
             wake_queue,
+            queued_wakes,
             wake_requested: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn wake(&self) {
-        self.wake_requested.store(true, Ordering::Release);
+        // The wake bit owns the queue entry. Multiple wake calls before the
+        // pending wake is consumed therefore collapse into one entry.
+        if self.wake_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        // Publish pending work before appending the id. An idle hart may retry
+        // once in this short window, but cannot sleep through the publication.
+        self.queued_wakes.fetch_add(1, Ordering::Release);
         self.wake_queue.lock().push_back(self.task);
     }
 

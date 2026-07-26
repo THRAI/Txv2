@@ -482,7 +482,7 @@ impl<'a, I: SubjectIdentity> InterruptView<'a, I> {
         };
         if I::thread_termination_in_force(thread) {
             SignalWake::Kill
-        } else if I::thread_deliverable_signal_pending(thread) {
+        } else if I::thread_signal_interrupts_wait(thread) {
             SignalWake::Interrupt
         } else {
             SignalWake::Retry
@@ -866,6 +866,14 @@ where
                     self.mailbox.clear_waker();
                     return Poll::Ready(MailboxWake::Matched);
                 }
+            }
+            // Overflow means at least one wake hint was dropped.  The step
+            // predicate is the source of truth, so resolve this suspension and
+            // let drive() re-run the operation instead of spinning forever on
+            // a permanently latched overflow bit.
+            if self.mailbox.take_overflow() {
+                self.mailbox.clear_waker();
+                return Poll::Ready(MailboxWake::Matched);
             }
             Poll::Pending
         }

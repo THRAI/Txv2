@@ -13,6 +13,7 @@ use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
     SourceLabel,
 };
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use crate::page_backed::{Frame as PageFrame, FsPageBacking};
@@ -20,7 +21,8 @@ use crate::process::adapter::step_engine::{
     guard as ebr_guard, sign, Cap, ScriptCtx, StepOp, StepOutcome,
 };
 use crate::process::execution::{
-    init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError, DupOp,
+    init_process, initiate_group_exit, reset_init_process_for_test, spawn_sibling_thread_for_test,
+    step_exit_group_with_signal, BootstrapError, DupOp,
 };
 use crate::process::nsproxy::{PosixMqName, SysvKey};
 use crate::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
@@ -28,14 +30,14 @@ use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
 };
 use crate::process::{
-    bootstrap_init_process, step_chdir, step_exit_group, step_fork, step_fork_with_options,
-    step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError,
-    ForkOptions, SetpgidError, WaitError, WaitTarget,
+    bootstrap_init_process, fork_with_options_wait, step_chdir, step_exit_group, step_fork,
+    step_fork_with_options, step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang,
+    ChdirOutcome, ForkError, ForkOptions, SetpgidError, WaitError, WaitTarget,
 };
 use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
-use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
+use crate::thread_runtime::{step_thread_exit, step_thread_exit_with_status};
 use crate::vfs::{
     Credential, DEntry, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
     RNode, RNodeBacking,
@@ -584,6 +586,42 @@ fn fork_clones_address_space_into_distinct_cap() {
 }
 
 #[test]
+fn wait_capable_fork_does_not_publish_before_vm_conflict_clears() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_aspace = parent.aspace_cap().expect("parent aspace");
+    let holder = match parent_aspace.range_lock().acquire_step_rich(
+        crate::vm::UserRange::new_aligned(crate::vm::UserVirtAddr(0x40000), 0x1000).expect("range"),
+        crate::vm::LockMode::ExclusiveWriter,
+    ) {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline reservation should succeed"),
+    };
+
+    let mut future = Box::pin(fork_with_options_wait::<TestPmap>(
+        &parent,
+        ForkOptions::default(),
+    ));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(
+        parent.children.snapshot().is_empty(),
+        "contended VM preparation must not publish a child"
+    );
+
+    drop(holder);
+    let child = match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(child)) => child,
+        Poll::Ready(Err(error)) => panic!("post-release fork errored: {error:?}"),
+        Poll::Pending => panic!("fork should complete after VM reservation release"),
+    };
+    let children = parent.children.snapshot();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0], child);
+}
+
+#[test]
 fn fork_registers_child_in_parent_pgrp_member_list() {
     let _g = setup();
     let parent = bootstrap();
@@ -667,6 +705,50 @@ fn exit_group_zombifies_process_at_once_and_records_status() {
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(42)));
     assert_eq!(proc_cap.live_thread_count(), 0);
+}
+
+#[test]
+fn smp_group_exit_keeps_process_resources_until_last_thread_exits() {
+    let _g = setup();
+    let process = bootstrap();
+    let leader = first_thread(&process);
+    let sibling = spawn_sibling_thread_for_test(&process).expect("spawn sibling");
+    assert_eq!(process.live_thread_count(), 2);
+
+    let participants = initiate_group_exit(&process, ExitStatus::Exited(23));
+    assert_eq!(participants.len(), 2);
+    assert!(!process.is_zombie());
+    assert_eq!(process.live_thread_count(), 2);
+    assert!(
+        leader
+            .payload_cap()
+            .expect("leader live")
+            .interrupt_summary()
+            .termination
+    );
+    assert!(
+        sibling
+            .payload_cap()
+            .expect("sibling live")
+            .interrupt_summary()
+            .termination
+    );
+
+    step_thread_exit_with_status(leader.clone(), ExitStatus::Exited(23));
+    assert!(!process.is_zombie());
+    assert_eq!(process.live_thread_count(), 1);
+    assert!(process.aspace_cap().is_some());
+    step_thread_exit_with_status(leader, ExitStatus::Exited(23));
+    assert_eq!(
+        process.live_thread_count(),
+        1,
+        "duplicate exit paths must not decrement thread_count twice"
+    );
+
+    step_thread_exit_with_status(sibling, ExitStatus::Exited(23));
+    assert!(process.is_zombie());
+    assert_eq!(process.exit_status(), Some(ExitStatus::Exited(23)));
+    assert_eq!(process.live_thread_count(), 0);
 }
 
 #[test]

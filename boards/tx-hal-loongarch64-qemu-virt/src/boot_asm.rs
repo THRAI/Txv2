@@ -69,8 +69,8 @@ tx_la64_high_start:
     bnez    $s0, .Ltx_la64_secondary_wait
     la.local $sp, __tx_boot_stack_top
     // Keep the static stack geometry in sync with LA64_MAX_BOOT_CPUS and
-    // LA64_BOOT_STACK_STRIDE (8 harts × 512 KiB).
-    li.d    $t2, 8
+    // LA64_BOOT_STACK_STRIDE (12 harts × 512 KiB).
+    li.d    $t2, 12
     bgeu    $s0, $t2, .Ltx_la64_bsp_stack_ready
     slli.d  $t1, $s0, 19
     sub.d   $sp, $sp, $t1
@@ -136,7 +136,7 @@ tx_la64_secondary_high_start:
     // CSR.CPUID is both the QEMU arch id and Txv2 logical CpuId on this
     // board. Reject a malformed id before indexing the static stack arena.
     csrrd   $a0, 0x20
-    li.d    $t2, 8
+    li.d    $t2, 12
     bgeu    $a0, $t2, .Ltx_la64_secondary_bad_id
 
     la.local $sp, __tx_boot_stack_top

@@ -104,7 +104,7 @@ impl<P: TxPlatform> CoreInit<P> {
             .retain(|(_, existing)| *existing != task);
     }
 
-    fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
+    pub(super) fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
         THREAD_REACTOR_TASKS
             .lock()
             .iter()

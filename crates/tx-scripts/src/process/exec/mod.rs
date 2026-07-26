@@ -10,4 +10,4 @@ pub mod loader;
 pub mod script;
 pub mod stack;
 
-pub use script::{exec_script, ExecError};
+pub use script::{exec_script, ExecError, ExecIoStage, EXEC_LAST_OPEN_ERRNO};

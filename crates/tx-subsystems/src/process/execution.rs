@@ -23,7 +23,6 @@ use crate::process::topology::{
 use crate::signal::{
     sync_thread_group_pending_summary, PendingSignalQueue, SigActionTable, SignalMask,
 };
-use crate::thread_runtime::execution::{notify_thread_exit_userspace_in_aspace, set_thread_zombie};
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
@@ -91,8 +90,7 @@ pub(crate) fn emit_process_lock_service_trace(name: &'static [u8], value: i64) {
 
 use crate::process::numbers::{
     allocate_pid, register_pgrp, register_pid as ns_register_pid, register_session, register_tid,
-    resolve_pid_number_as, unregister_pid_number, unregister_tid_number, with_namespace, PidName,
-    PidNameKind,
+    resolve_pid_number_as, unregister_pid_number, with_namespace, PidName, PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -447,6 +445,51 @@ pub fn step_fork_with_options<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
     options: ForkOptions,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
+    step_fork_with_prepared_aspace::<P>(parent, options, None)
+}
+
+/// Wait-capable process-fork path used by Linux clone/fork syscalls.
+///
+/// The only yielding work is preparation of a detached child address space.
+/// Process/fd snapshots and all child publication happen afterwards in the
+/// ordinary one-shot commit, so retrying a contended VM reservation cannot
+/// duplicate pipe endpoint accounting, pid allocation, or topology links.
+pub async fn fork_with_options_wait<P: PmapIf>(
+    parent: &Cap<ProcessIdentity>,
+    options: ForkOptions,
+) -> Result<Cap<ProcessIdentity>, ForkError> {
+    if options.clone_vm {
+        return step_fork_with_prepared_aspace::<P>(parent, options, None);
+    }
+
+    loop {
+        let parent_aspace = {
+            let payload_guard = parent.payload.lock();
+            let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+            payload.aspace_cap()
+        };
+        let child_aspace = AddressSpace::fork_aspace_wait::<P>(&parent_aspace).await?;
+        let child_aspace = step_engine::sign(child_aspace)?;
+
+        match step_fork_with_prepared_aspace::<P>(
+            parent,
+            options,
+            Some((parent_aspace, child_aspace)),
+        ) {
+            // Exec replaced the parent's AddressSpace after preparation.
+            // The detached clone was never published; drop it and retry from
+            // the new authoritative parent state.
+            Err(ForkError::Busy) => continue,
+            other => return other,
+        }
+    }
+}
+
+fn step_fork_with_prepared_aspace<P: PmapIf>(
+    parent: &Cap<ProcessIdentity>,
+    options: ForkOptions,
+    prepared_aspace: Option<(Cap<AddressSpace>, Cap<AddressSpace>)>,
+) -> Result<Cap<ProcessIdentity>, ForkError> {
     // observe
     // upgrade
     // reserve
@@ -479,9 +522,16 @@ pub fn step_fork_with_options<P: PmapIf>(
     ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+        let parent_aspace = payload.aspace_cap();
+        if prepared_aspace
+            .as_ref()
+            .is_some_and(|(expected_parent, _)| expected_parent != &parent_aspace)
+        {
+            return Err(ForkError::Busy);
+        }
         let (parent_fds, parent_fd_cloexec) = payload.clone_fd_state_for_fork();
         (
-            payload.aspace_cap(),
+            parent_aspace,
             payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd(),
@@ -513,6 +563,8 @@ pub fn step_fork_with_options<P: PmapIf>(
     // Address space: fork (CoW clone) or share (CLONE_VM).
     let child_aspace_cap = if options.clone_vm {
         parent_aspace.clone()
+    } else if let Some((_expected_parent, child_aspace)) = prepared_aspace {
+        child_aspace
     } else {
         let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
         step_engine::sign(child_aspace)?
@@ -824,6 +876,14 @@ pub fn step_clone_thread(
     let Some(proc_payload) = payload_guard.as_ref() else {
         return Err(ZoneError::InvalidState);
     };
+    // Serialize the final CLONE_THREAD publication with GroupExit's episode
+    // install + roster snapshot. This is the commit-time check: an earlier
+    // observe-only check would still allow a thread to appear after the
+    // collapse participant set had been fixed.
+    let group_exit = proc_payload.group_exit.lock();
+    if group_exit.is_some() {
+        return Err(ZoneError::InvalidState);
+    }
     proc_payload.threads.attach(child.clone());
     sync_thread_group_pending_summary(proc_payload, &child);
     proc_payload.thread_count.fetch_add(1, Ordering::AcqRel);
@@ -834,6 +894,7 @@ pub fn step_clone_thread(
         register_tid_start,
     );
     emit_clone_thread_marker(b"debug.clone_thread.register_tid.after", tid.0 as i64);
+    drop(group_exit);
     drop(payload_guard);
     drop(lifecycle);
     emit_clone_path_duration(
@@ -893,101 +954,93 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
     }
 }
 
-/// Exit the entire thread group: zombify every thread, drop the
-/// process payload, set the process exit status. Identity persists.
+/// Publish a process-wide termination episode.
 ///
-/// Threads zombify with the `wait_status_word` projection of `status`
-/// — POSIX `<sys/wait.h>` encoding (`(code & 0xff) << 8` for explicit
-/// exits, `sig & 0x7f` for signal exits) — preserving the
-/// "thread-side exit_status is an int" shape that `THREAD_RUNTIME_v1`
-/// §7.2 carries. (Migrated to POSIX from the day-1 shell-convention
-/// `128 + sig` encoding by Wave 1 of the fork/clone/wait4 slice;
-/// Open Q #3 DECIDED 2026-05-06.)
+/// This function deliberately does not zombify sibling threads or tear down
+/// process resources. Every live thread observes `summary.termination` in its
+/// own reactor future and runs `step_thread_exit_with_status`; the last thread
+/// alone runs `step_process_exit`. This is the SMP-safe GroupExit boundary:
+/// no hart can invalidate another hart's address space or ThreadPayload while
+/// that hart is still executing.
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
-    if !process.begin_exit() {
-        // Preserve the existing signal-vs-explicit-exit overwrite semantics
-        // for an already completed zombie, but never run teardown twice.
-        if *process.lifecycle.lock() == ProcessLifecycle::Zombie {
-            *process.exit_status.lock() = Some(status);
-        }
-        return;
-    }
+    let threads = initiate_group_exit(process, status);
 
-    let payload = process.payload.lock().as_ref().cloned();
-    // observe
-    if let Some(payload) = payload.as_ref() {
-        payload.notify_vfork_done();
+    // Unit/integration scaffolding has no reactor futures to consume the
+    // termination summary. Preserve deterministic test teardown, but keep the
+    // shipping kernel on the asynchronous per-thread path above.
+    #[cfg(any(test, feature = "test-support"))]
+    for thread in threads {
+        crate::thread_runtime::execution::step_thread_exit_with_status(thread, status);
     }
-    // upgrade
-    // reserve
-    // commit
-    // publish
-    session_leader_hangup_cascade(process);
-    sever_children(process);
-    crate::ipc::sysv_sem::execution::step_sem_undo(process);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = threads;
+}
 
-    if let Some(payload) = payload.as_ref() {
-        let aspace = payload.aspace_cap();
-        let drained: Vec<Cap<ThreadIdentity>> = measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
-            || payload.threads.drain(),
-        );
-        payload.thread_count.store(0, Ordering::Release);
-        measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
-            || {
-                for thread in &drained {
-                    notify_thread_exit_userspace_in_aspace(thread, &aspace);
-                    set_thread_zombie(thread, status.wait_status_word());
-                    if thread.tid.0 != process.pid.0 {
-                        unregister_tid_number(thread.tid.0 as u64);
-                    }
+pub(crate) fn initiate_group_exit(
+    process: &Cap<ProcessIdentity>,
+    status: ExitStatus,
+) -> Vec<Cap<ThreadIdentity>> {
+    let Some(payload) = process.payload.lock().as_ref().cloned() else {
+        // Preserve the existing idempotent zombie-status behavior used by
+        // wait/signal observers, without attempting teardown twice.
+        *process.exit_status.lock() = Some(status);
+        return Vec::new();
+    };
+
+    let threads = {
+        // CLONE_THREAD holds this same lock through its final roster attach.
+        // Therefore the snapshot and episode installation cannot miss a
+        // concurrently-created thread.
+        let mut slot = payload.group_exit.lock();
+        let threads = payload.threads.snapshot();
+        match slot.as_ref() {
+            Some(existing) => {
+                // A fatal exit racing with multi-threaded exec converts that
+                // episode into process death. Its completion remains usable
+                // so the exec waiter wakes and aborts before AS replacement.
+                if existing.is_exec() {
+                    existing.convert_to_exit(status);
                 }
-            },
-        );
-        // Do not synchronously wait for remote reactor polls here. A sibling
-        // may still have its poll-scoped identity installed on another hart,
-        // and that slot can only be cleared after this exit path yields back
-        // to the reactor. Spinning here therefore deadlocks the very progress
-        // needed to acknowledge the exit. The remote future owns a
-        // PayloadCap, so its in-flight state remains alive; after the payload
-        // is withdrawn it observes termination on its next poll/trap and
-        // finishes asynchronously.
+            }
+            None => {
+                *slot = Some(Arc::new(
+                    crate::process::structure::GroupExitState::for_exit(status),
+                ));
+            }
+        }
+        threads
+    };
 
-        let _shm_detach = measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
-            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
-        );
-        let closed_fds = measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
-            || payload.drain_fds(),
-        );
-        close_socket_files_for_process_exit(&closed_fds);
-        flush_page_backed_files_for_process_exit(&closed_fds);
-        measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
-            || {
-                drop(closed_fds);
-                drop(drained);
-            },
-        );
+    // Wake after dropping both coordination and roster locks. A mailbox post
+    // may make a remote task runnable immediately.
+    for thread in &threads {
+        if let Some(thread_payload) = thread.payload_cap() {
+            thread_payload.update_summary(|summary| summary.termination = true);
+            crate::thread_runtime::execution::post_termination_wake(&thread_payload);
+        }
     }
-    let mut payload_guard = process.payload.lock();
-    measure_process_lock_service(
-        b"debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
-        || *payload_guard = None,
-    );
-    drop(payload_guard);
-    *process.exit_status.lock() = Some(status);
-    process.finish_exit();
 
-    if try_auto_reap_adopted_by_init(process) {
+    threads
+}
+
+/// Return the authoritative GroupExit status currently attached to `process`.
+pub fn group_exit_status(process: &Cap<ProcessIdentity>) -> Option<ExitStatus> {
+    let payload = process.payload.lock().as_ref().cloned()?;
+    let state = payload.group_exit.lock().as_ref().cloned()?;
+    Some(state.status())
+}
+
+/// Called by the current thread's reactor future after it observes the
+/// termination summary or a no-return group-exit syscall.
+pub fn step_current_thread_group_exit(thread: &Cap<ThreadIdentity>) {
+    if thread.payload_cap().is_none() {
         return;
     }
-
-    // §7.3.3 phase 5: notify the parent. Posted after zombification so
-    // the parent observes a complete zombie when it acts on SIGCHLD.
-    post_sigchld_to_parent(process);
+    let Some(process) = thread.upgrade_owner_proc() else {
+        return;
+    };
+    let status = group_exit_status(&process).unwrap_or(ExitStatus::Exited(0));
+    crate::thread_runtime::execution::step_thread_exit_with_status(thread.clone(), status);
 }
 
 /// Last-thread cascade: called by `thread_runtime::step_thread_exit`
@@ -1302,9 +1355,11 @@ fn try_auto_reap_adopted_by_init(process: &Cap<ProcessIdentity>) -> bool {
     true
 }
 
-/// Exit the entire thread group due to a fatal signal. Records
-/// `ExitStatus::Signaled(sig)` and runs the same payload teardown as
-/// `step_exit_group`.
+/// Publish fatal-signal termination to the entire thread group.
+///
+/// Records `ExitStatus::Signaled(sig)` and wakes every live thread. Each
+/// thread performs its own exit commit; only the last one tears down the
+/// process payload.
 ///
 /// Materialises `route_sigkill`'s `invoke_group_exit_with_signal`
 /// per `SIGNAL_v1` §12.3. Any caller of `route_gewalt(SIGKILL)`,
@@ -1394,6 +1449,32 @@ pub fn step_waitpid_nohang(
     maintenance_after_process_reap();
 
     Ok((pid, status))
+}
+
+/// Recheck the blocking predicate used while atomically committing a wait4
+/// exit-source subscription.
+///
+/// Returns `true` only when at least one child matches `target` and none of
+/// those children is currently reapable. A zombie or the disappearance of all
+/// matching children means the caller must not park; it should rerun
+/// `step_waitpid_nohang` and either reap or return `ECHILD`.
+pub fn waitpid_would_block(parent: &Cap<ProcessIdentity>, target: WaitTarget) -> bool {
+    let target = match target {
+        WaitTarget::CallerPgrp => WaitTarget::Pgrp(parent.pgrp_cap().pgid),
+        other => other,
+    };
+    let snapshot: Vec<Cap<ProcessIdentity>> = parent.children.snapshot();
+    let mut any_match = false;
+    for child in &snapshot {
+        if !target.matches(child) {
+            continue;
+        }
+        any_match = true;
+        if child.is_zombie() {
+            return false;
+        }
+    }
+    any_match
 }
 
 /// Outcome of `step_chdir`. `Replaced` is the normal path, carrying
@@ -1751,6 +1832,7 @@ pub fn spawn_sibling_thread_for_test(
     if let Some(payload) = target.payload.lock().as_ref() {
         payload.threads.attach(sibling.clone());
         sync_thread_group_pending_summary(payload, &sibling);
+        payload.thread_count.fetch_add(1, Ordering::AcqRel);
     }
     Ok(sibling)
 }

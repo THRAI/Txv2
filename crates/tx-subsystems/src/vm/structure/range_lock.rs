@@ -318,9 +318,12 @@ impl RangeLockState {
     }
 
     fn materializer_blocked(&self, range: UserRange) -> bool {
-        self.active.any_overlap_where(range, |reservation| {
-            reservation.mode == LockMode::ExclusiveWriter
-        }) || self.pending_writers.any_overlap_where(range, |_| true)
+        // A page's resolve/materialize/private-page/PTE publication sequence
+        // has one linearization owner. Different pages remain independent,
+        // but overlapping Materializers must not both prepare and publish
+        // from different snapshots of the same page.
+        self.active.any_overlap_where(range, |_| true)
+            || self.pending_writers.any_overlap_where(range, |_| true)
     }
 
     fn writer_blocked(&self, range: UserRange, own_pending_id: Option<u64>) -> bool {
@@ -348,8 +351,7 @@ impl RangeLockState {
     ) -> bool {
         match current.1 {
             LockMode::Materializer => {
-                self.materializer_blocked(current.0)
-                    || (other.1 == LockMode::ExclusiveWriter && current.0.overlaps(other.0))
+                self.materializer_blocked(current.0) || current.0.overlaps(other.0)
             }
             LockMode::ExclusiveWriter => {
                 self.writer_blocked(current.0, None) || current.0.overlaps(other.0)

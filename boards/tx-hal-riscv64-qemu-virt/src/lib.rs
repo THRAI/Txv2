@@ -113,7 +113,20 @@ static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
 const IPI_KIND_COUNT: usize = 4;
 static IPI_PENDING: [AtomicU8; MAX_BOOT_CPUS] = [const { AtomicU8::new(0) }; MAX_BOOT_CPUS];
 static IPI_ACKED_CPUS: [AtomicU64; IPI_KIND_COUNT] = [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
+/// Harts whose hardware currently has this ASID installed in `satp`.
+///
+/// This is a root-lifetime reference: it is cleared as soon as a hart has
+/// switched away and is used to decide when page-table pages may be freed.
 static ASID_RESIDENCY: [AtomicU64; pmap::ASID_CAPACITY] =
+    [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
+/// Harts which may retain TLB entries tagged with this ASID.
+///
+/// Unlike `ASID_RESIDENCY`, a context switch must not clear this mask. RISC-V
+/// permits tagged entries to survive a `satp` switch, so a hart that ran an
+/// address space earlier still needs every later unmap/protection shootdown.
+/// The mask is reset only after a full all-hart ASID invalidation immediately
+/// before ASID reuse.
+static ASID_TLB_HARTS: [AtomicU64; pmap::ASID_CAPACITY] =
     [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
 static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_IRQ_TABLE: AtomicPtr<IrqDispatchTable> = AtomicPtr::new(core::ptr::null_mut());
@@ -587,6 +600,10 @@ impl PmapIf for Platform {
         pmap::shootdown_mappings(asid, invalidations);
     }
 
+    fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        pmap::synchronize_new_mappings(asid, invalidations);
+    }
+
     /// 写 satp 指向 `root.phys()`(带 Sv39 模式位 + 该 root 的 ASID),再发一条本地 sfence.vma。
     ///
     /// 线程运行时在 `TrapIf::enter_userspace_with_context` 之前紧接着调它,好让用户态取指
@@ -594,7 +611,11 @@ impl PmapIf for Platform {
     /// 用户态每条取指都会永久缺页。
     fn activate_user_pmap(root: &PmapRoot) {
         let asid_usable = hw_asid_tagging_usable();
-        mark_asid_resident_on_current_cpu(root.asid());
+        // Keep the outgoing root resident until hardware has stopped using
+        // it.  During the switch both ASIDs are conservatively resident on
+        // this hart; an unnecessary shootdown is safe, an early root free is
+        // not.
+        let switch = begin_asid_switch_on_current_cpu(root.asid());
         #[cfg(target_arch = "riscv64")]
         unsafe {
             const SATP_MODE_SV39: usize = 0x8 << 60;
@@ -614,12 +635,14 @@ impl PmapIf for Platform {
             let current: usize;
             core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
             if current == satp {
+                finish_asid_switch_on_current_cpu(switch);
                 return;
             }
-            // 换了 root:写 satp。ASID 硬件(QEMU:16 位)上按特权规范无需 fence:
+            // 换了 root:写 satp。ASID 硬件(QEMU:16 位)上无需在地址空间
+            // 切换点额外 fence:
             //  - TLB 项带 ASID 标签,切 ASID 不用 fence。
-            //  - 无效(V=0)PTE 从不缓存,所以 invalid→valid 的映射提交下次硬件游走就能看到,
-            //    无需 fence(fill_mapping 只在覆盖已有的有效 PTE 时才 fence)。
+            //  - PTE 的 invalid→valid 发布由 VmPmap 提交后的 ASID 范围
+            //    shootdown 完成可见性，不依赖这里补刷。
             //  - ASID 复用在 root 销毁时 fence(invalidate_root_translations 切到引导根并在那 sfence.vma)。
             // 以前这里无条件 sfence.vma 会在每次进用户态时全刷 TLB——QEMU TCG 下相当于每次
             // syscall 返回都 full tlb_flush(约 ms 级),是 LTP shell 测试耗时的主项(net_stress 预算之战)。
@@ -634,6 +657,7 @@ impl PmapIf for Platform {
                 core::arch::asm!("sfence.vma", options(nostack));
             }
         }
+        finish_asid_switch_on_current_cpu(switch);
         #[cfg(not(target_arch = "riscv64"))]
         let _ = (root, asid_usable);
     }
@@ -908,6 +932,63 @@ impl SmpIf for Platform {
         core::hint::spin_loop();
     }
 
+    fn prepare_interrupt_wait() -> tx_hal::InterruptWaitState {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let previous_sstatus: usize;
+            unsafe {
+                // Keep sie.SSIE/STIE/SEIE enabled, but defer trap delivery by
+                // clearing the global SIE bit before the caller's final work
+                // check. The RISC-V privileged specification requires WFI to
+                // resume for a locally-enabled pending interrupt regardless
+                // of the global interrupt-enable bit. An IPI that races the
+                // check therefore remains pending instead of being handled
+                // and cleared immediately before WFI.
+                core::arch::asm!(
+                    "csrrci {previous}, sstatus, 2",
+                    previous = out(reg) previous_sstatus,
+                    options(nostack)
+                );
+            }
+            return tx_hal::InterruptWaitState::from_raw(previous_sstatus);
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        tx_hal::InterruptWaitState::from_raw(0)
+    }
+
+    fn cancel_interrupt_wait(state: tx_hal::InterruptWaitState) {
+        #[cfg(target_arch = "riscv64")]
+        if state.raw() & 0x2 != 0 {
+            unsafe {
+                core::arch::asm!("csrsi sstatus, 2", options(nostack));
+            }
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = state;
+    }
+
+    fn wait_for_interrupt_prepared(state: tx_hal::InterruptWaitState) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            // Interrupt delivery is still globally masked here, so a wake
+            // arriving after the final queue check remains pending until WFI
+            // observes it. Restore the caller's SIE state only after WFI has
+            // returned.
+            core::arch::asm!("wfi", options(nostack));
+            if state.raw() & 0x2 != 0 {
+                core::arch::asm!("csrsi sstatus, 2", options(nostack));
+            }
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = state;
+            core::hint::spin_loop();
+        }
+    }
+
     fn pending_ipi(kind: IpiKind) -> bool {
         let cpu = current_cpu_id();
         cpu.0 < IPI_PENDING.len()
@@ -955,15 +1036,16 @@ impl SmpIf for Platform {
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-        let mut bits = mask.bits();
+        let targets = remote_ipi_targets_from(mask, current_cpu_id());
+        let mut bits = targets.bits();
         while bits != 0 {
             let cpu = bits.trailing_zeros() as usize;
-            if cpu < IPI_PENDING.len() && CpuId(cpu) != current_cpu_id() {
+            if cpu < IPI_PENDING.len() {
                 IPI_PENDING[cpu].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
             }
             bits &= bits - 1;
         }
-        send_sbi_ipi(mask);
+        send_sbi_ipi(targets);
     }
 
     fn ack_ipi(kind: IpiKind) {
@@ -984,6 +1066,30 @@ impl SmpIf for Platform {
 
     fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
         CpuMask::from_bits(IPI_ACKED_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire))
+    }
+
+    fn wait_for_ipi_ack_cpus(mask: CpuMask, kind: IpiKind) -> usize {
+        let target = mask.bits();
+        if target == 0 {
+            return 0;
+        }
+
+        // QEMU TCG does not give every vCPU an equal host timeslice. A fixed
+        // spin count can expire before the last otherwise-healthy AP runs,
+        // which made the 8-hart boot smoke intermittently report 6/7 acks.
+        // Use the same architectural timebase discipline as secondary boot.
+        let start_ns = time::read_ns(<Platform as TimeIf>::frequency_hz());
+        let deadline_ns = start_ns.saturating_add(RV64_IPI_ACK_TIMEOUT_NS);
+        loop {
+            let acked = Self::ipi_ack_cpus(kind).bits() & target;
+            if acked == target {
+                return mask.count();
+            }
+            if time::read_ns(<Platform as TimeIf>::frequency_hz()) >= deadline_ns {
+                return acked.count_ones() as usize;
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -1746,6 +1852,7 @@ fn mark_ipi_ack_for(kind: IpiKind, cpu_id: CpuId) {
 const SBI_SUCCESS: isize = 0;
 const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
 const RV64_SECONDARY_BOOT_TIMEOUT_NS: u64 = 2_000_000_000;
+const RV64_IPI_ACK_TIMEOUT_NS: u64 = 2_000_000_000;
 
 fn start_secondary_hart(cpu: CpuId, entry: SecondaryEntry) -> isize {
     #[cfg(target_arch = "riscv64")]
@@ -1821,25 +1928,23 @@ pub(crate) fn remote_sfence_vma_asid_batch(asid: Asid, invalidations: &[PmapInva
     #[cfg(target_arch = "riscv64")]
     {
         let asid_usable = hw_asid_tagging_usable();
+        if !asid_usable {
+            // Zero-ASID hardware cannot isolate address spaces, and the U74
+            // CIP-1200 workaround requires an unqualified full fence on every
+            // target hart. A range-limited SBI request would merely move the
+            // local stale-translation bug to a remote hart.
+            let error = sbi_remote_sfence_vma(targets.bits(), 0, 0, 0);
+            assert_eq!(error, 0, "SBI remote full sfence.vma failed");
+            return;
+        }
         for invalidation in invalidations {
-            let error = if asid_usable {
-                sbi_remote_sfence_vma_asid(
-                    targets.bits(),
-                    0,
-                    invalidation.virt().0,
-                    invalidation.size(),
-                    asid.0 as usize,
-                )
-            } else {
-                // Zero-ASID hardware: remote harts can't match the
-                // truncated tag either; use the unqualified form.
-                sbi_remote_sfence_vma(
-                    targets.bits(),
-                    0,
-                    invalidation.virt().0,
-                    invalidation.size(),
-                )
-            };
+            let error = sbi_remote_sfence_vma_asid(
+                targets.bits(),
+                0,
+                invalidation.virt().0,
+                invalidation.size(),
+                asid.0 as usize,
+            );
             assert_eq!(error, 0, "SBI remote sfence.vma failed");
         }
     }
@@ -1861,22 +1966,73 @@ fn remote_sfence_targets_for_asid(asid: Asid) -> CpuMask {
 }
 
 fn remote_sfence_targets_for_asid_from(asid: Asid, online: CpuMask, current: CpuId) -> CpuMask {
-    let resident = asid_residency_mask(asid);
-    CpuMask::from_bits(resident.bits() & online.bits() & !CpuMask::single(current).bits())
+    let cached = asid_tlb_hart_mask(asid);
+    CpuMask::from_bits(cached.bits() & online.bits() & !CpuMask::single(current).bits())
 }
 
-fn mark_asid_resident_on_current_cpu(asid: Asid) {
+#[derive(Clone, Copy, Debug)]
+struct AsidSwitch {
+    cpu: CpuId,
+    previous: usize,
+    next: usize,
+    tracked: bool,
+}
+
+/// Publish the incoming ASID without removing the outgoing one.
+///
+/// The returned token records the old software state.  The caller must install
+/// the new hardware root before passing it to
+/// [`finish_asid_switch_on_current_cpu`].
+fn begin_asid_switch_on_current_cpu(asid: Asid) -> AsidSwitch {
     let cpu = current_cpu_id();
     if (asid.0 as usize) >= ASID_RESIDENCY.len() || cpu.0 >= u64::BITS as usize {
-        return;
+        return AsidSwitch {
+            cpu,
+            previous: 0,
+            next: asid.0 as usize,
+            tracked: false,
+        };
     }
+    let next = asid.0 as usize;
     let previous = RV64_PERCPU_AREAS[cpu.0]
         .active_user_asid
-        .swap(asid.0 as usize, Ordering::AcqRel);
-    if previous != 0 && previous != asid.0 as usize && previous < ASID_RESIDENCY.len() {
-        ASID_RESIDENCY[previous].fetch_and(!(1u64 << cpu.0), Ordering::AcqRel);
+        .load(Ordering::Acquire);
+    ASID_RESIDENCY[next].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
+    // Publish possible TLB ownership before installing `satp`. A concurrent
+    // unmap can now conservatively include this hart even while the hardware
+    // switch is in progress.
+    ASID_TLB_HARTS[next].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
+    AsidSwitch {
+        cpu,
+        previous,
+        next,
+        tracked: true,
     }
-    ASID_RESIDENCY[asid.0 as usize].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
+}
+
+/// Publish completion after `satp` no longer names the outgoing root.
+fn finish_asid_switch_on_current_cpu(switch: AsidSwitch) {
+    if !switch.tracked {
+        return;
+    }
+    RV64_PERCPU_AREAS[switch.cpu.0]
+        .active_user_asid
+        .store(switch.next, Ordering::Release);
+    if switch.previous != 0
+        && switch.previous != switch.next
+        && switch.previous < ASID_RESIDENCY.len()
+    {
+        ASID_RESIDENCY[switch.previous].fetch_and(!(1u64 << switch.cpu.0), Ordering::AcqRel);
+    }
+}
+
+/// Complete a software-only transition for host tests and boot helpers.
+///
+/// Real pmap activation uses begin/switch/finish explicitly.
+#[cfg(test)]
+fn mark_asid_resident_on_current_cpu(asid: Asid) {
+    let switch = begin_asid_switch_on_current_cpu(asid);
+    finish_asid_switch_on_current_cpu(switch);
 }
 
 /// Leave the current user root in the only safe order:
@@ -1904,12 +2060,16 @@ pub(crate) fn deactivate_current_user_pmap() {
         const SATP_MODE_SV39: usize = 0x8 << 60;
         let bootstrap_root = BootStaticBag::<IdentityDropped>::global_ref().bootstrap_root_phys();
         let bootstrap_satp = SATP_MODE_SV39 | (bootstrap_root.0 >> 12);
-        core::arch::asm!(
-            "csrw satp, {satp}",
-            "sfence.vma",
-            satp = in(reg) bootstrap_satp,
-            options(nostack)
-        );
+        core::arch::asm!("csrw satp, {satp}", satp = in(reg) bootstrap_satp, options(nostack));
+        // With usable ASID tags, changing from the process ASID to bootstrap
+        // ASID 0 does not require discarding either address space's cached
+        // translations. ASID_TLB_HARTS retains the old ownership bit so a
+        // later unmap/root teardown still targets this hart. Zero-ASID U74
+        // hardware has no isolation and must retain the conservative full
+        // fence on every root switch.
+        if !hw_asid_tagging_usable() {
+            core::arch::asm!("sfence.vma", options(nostack));
+        }
     }
 
     RV64_PERCPU_AREAS[cpu.0]
@@ -1925,9 +2085,64 @@ fn asid_residency_mask(asid: Asid) -> CpuMask {
     CpuMask::from_bits(ASID_RESIDENCY[asid.0 as usize].load(Ordering::Acquire))
 }
 
+fn asid_tlb_hart_mask(asid: Asid) -> CpuMask {
+    if (asid.0 as usize) >= ASID_TLB_HARTS.len() {
+        return CpuMask::EMPTY;
+    }
+    CpuMask::from_bits(ASID_TLB_HARTS[asid.0 as usize].load(Ordering::Acquire))
+}
+
+#[cfg(test)]
 pub(crate) fn clear_asid_residency(asid: Asid) {
     if (asid.0 as usize) < ASID_RESIDENCY.len() {
         ASID_RESIDENCY[asid.0 as usize].store(0, Ordering::Release);
+        ASID_TLB_HARTS[asid.0 as usize].store(0, Ordering::Release);
+    }
+}
+
+/// Invalidate one ASID on every online hart before its numeric value is
+/// returned to the allocator.
+///
+/// Current residency is intentionally not used as a filter: a hart that
+/// switched away can retain tagged TLB entries until an explicit fence.
+pub(crate) fn invalidate_asid_on_all_harts(asid: Asid) {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let asid_usable = hw_asid_tagging_usable();
+        unsafe {
+            if asid_usable {
+                core::arch::asm!(
+                    "sfence.vma x0, {asid}",
+                    asid = in(reg) asid.0 as usize,
+                    options(nostack)
+                );
+            } else {
+                core::arch::asm!("sfence.vma", options(nostack));
+            }
+        }
+
+        let targets = remote_sfence_targets();
+        if !targets.is_empty() {
+            let error = if asid_usable {
+                // OpenSBI defines start=0,size=0 as a full ASID-scoped
+                // invalidation on every target hart.
+                sbi_remote_sfence_vma_asid(targets.bits(), 0, 0, 0, asid.0 as usize)
+            } else {
+                sbi_remote_sfence_vma(targets.bits(), 0, 0, 0)
+            };
+            assert_eq!(error, 0, "SBI global ASID invalidation failed");
+        }
+
+        // This function is called only after residency reached zero. Once the
+        // local and remote full-ASID fences complete, no hart can retain a
+        // translation under this numeric tag, so reuse starts with an empty
+        // history mask.
+        ASID_TLB_HARTS[asid.0 as usize].store(0, Ordering::Release);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    if (asid.0 as usize) < ASID_TLB_HARTS.len() {
+        ASID_TLB_HARTS[asid.0 as usize].store(0, Ordering::Release);
     }
 }
 
@@ -1970,6 +2185,10 @@ fn send_sbi_ipi(mask: CpuMask) {
 
     #[cfg(not(target_arch = "riscv64"))]
     let _ = mask;
+}
+
+fn remote_ipi_targets_from(mask: CpuMask, current: CpuId) -> CpuMask {
+    mask.without(current)
 }
 
 fn rv64_fence_all() {

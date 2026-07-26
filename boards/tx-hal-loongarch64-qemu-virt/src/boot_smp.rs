@@ -138,7 +138,7 @@ pub(crate) fn wait_for_online_secondaries(target: CpuMask) -> usize {
 
     // AP initialization includes per-hart substrate/reactor setup. A fixed
     // iteration count is not a real timeout and expires far too early under
-    // multi-threaded TCG. Use the architectural stable counter so an 8-hart
+    // multi-threaded TCG. Use the architectural stable counter so a 12-hart
     // QEMU boot gets a deterministic five-second window even on a busy judge.
     let frequency = la64_timebase_frequency_hz();
     let start = la64_read_stable_counter();

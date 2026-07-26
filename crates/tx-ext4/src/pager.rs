@@ -105,7 +105,6 @@ where
     fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
         match self.with_pager(|pager| pager.filesystem_stats()) {
             Ok(stats) => {
-                crate::report_filesystem_stats(stats);
                 StepOutcome::done(FilesystemStats {
                     block_size: stats.block_size,
                     total_blocks: stats.total_blocks,
@@ -184,7 +183,8 @@ where
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match self.with_pager(|pager| pager.set_inode_size(inode, new_size)) {
+        let now_sec = tx_subsystems::wall_clock::current_realtime_sec().min(u32::MAX as u64) as u32;
+        match self.with_pager(|pager| pager.set_inode_size_and_times(inode, new_size, now_sec)) {
             Ok(()) => {
                 self.invalidate_inode_meta(inode);
                 StepOutcome::done(())

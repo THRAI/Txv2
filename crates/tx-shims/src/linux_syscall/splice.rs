@@ -279,7 +279,7 @@ pub(super) fn sys_tee<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     splice_outcome_to_result(outcome)
 }
 
-pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -355,7 +355,7 @@ pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf>(
     }
 }
 
-async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
+async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     fd_in: i32,
     fd_out: i32,
     off_out_ptr: u64,
@@ -563,7 +563,7 @@ fn try_splice_pipe_lease_to_file<'a>(
     }
 }
 
-async fn splice_file_to_pipe<'a, P: tx_hal::TimeIf>(
+async fn splice_file_to_pipe<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     fd_in: i32,
     off_in_ptr: u64,
     fd_out: i32,
@@ -709,7 +709,7 @@ fn try_splice_file_lease_to_pipe<'a>(
     }
 }
 
-async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
+async fn read_file_to_kernel<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     fd: i32,
     buf: &mut [u8],
     ctx: &SyscallCtx<'a>,

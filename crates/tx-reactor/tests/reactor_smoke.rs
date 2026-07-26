@@ -1017,6 +1017,17 @@ fn pending_task_wake_breaks_polling_idle_before_marker_drain() {
 }
 
 #[test]
+fn runnable_work_on_another_hart_does_not_keep_this_hart_spinning() {
+    let reactor = Reactor::new();
+    reactor.submit_task_with_meta(async {}, InitialSchedMeta::kernel().with_affinity(0b0100));
+
+    reactor.begin_polling_idle(HartId(0));
+    assert!(!reactor.should_leave_polling_idle(HartId(0)));
+    assert!(reactor.should_leave_polling_idle(HartId(2)));
+    reactor.end_polling_idle(HartId(0));
+}
+
+#[test]
 fn userspace_preempt_marker_does_not_alias_normal_reschedule() {
     let reactor = Reactor::new();
 
@@ -1287,15 +1298,15 @@ fn per_hart_runtime_context_is_visible_only_on_polling_hart() {
     let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         HartContextProbe {
-            hart: 2,
+            hart: 11,
             other_hart: 0,
             seen: Arc::clone(&seen),
         },
-        InitialSchedMeta::kernel().with_affinity(0b0100),
+        InitialSchedMeta::kernel().with_affinity(1 << 11),
     );
 
     assert_eq!(
-        reactor.run_until_idle_on_hart(HartId(2)),
+        reactor.run_until_idle_on_hart(HartId(11)),
         RunStats {
             polled: 1,
             completed: 1,
@@ -1306,9 +1317,9 @@ fn per_hart_runtime_context_is_visible_only_on_polling_hart() {
         seen.load(Ordering::SeqCst),
         SAW_MAILBOX | SAW_TIMER_WHEEL | SAW_DELEGATE_REGISTRY | SAW_OTHER_HART_CLEAR
     );
-    assert!(tx_reactor::current_task_mailbox(2).is_none());
-    assert!(tx_reactor::current_timer_wheel(2).is_none());
-    assert!(tx_reactor::current_delegate_registry(2).is_none());
+    assert!(tx_reactor::current_task_mailbox(11).is_none());
+    assert!(tx_reactor::current_timer_wheel(11).is_none());
+    assert!(tx_reactor::current_delegate_registry(11).is_none());
     assert!(tx_reactor::current_task_mailbox(usize::MAX).is_none());
 }
 

@@ -48,7 +48,9 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::adapter::bus_wire::{agent_event_matches, MailboxEvent, TaskMailbox};
-use crate::adapter::step_engine::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
+use crate::adapter::step_engine::{
+    AbortReason, DelegateRegistry, DelegateReply, DelegateState, DelegateTokenId,
+};
 
 /// Outcome of [`await_agent_reply`]. Mirrors the `Replied` /
 /// non-`Replied` terminal split in the registry state machine: on
@@ -165,6 +167,31 @@ impl<'a> Future for AwaitAgentReply<'a> {
         // No match this round — restore spurious events and park.
         for evt in spurious.into_iter() {
             let _ = self.mailbox.post(evt);
+        }
+        if self.mailbox.take_overflow() {
+            // The terminal mailbox event may have been the dropped one.  The
+            // registry state is authoritative, so recover the result directly
+            // instead of leaving the task in a permanent overflow/re-poll
+            // loop.
+            match self.registry.state(self.token_id) {
+                Some(DelegateState::Replied) => {
+                    return Poll::Ready(
+                        self.registry
+                            .take_reply(self.token_id)
+                            .ok_or(AbortReason::AgentDied),
+                    );
+                }
+                Some(DelegateState::Canceled) => {
+                    return Poll::Ready(Err(AbortReason::Canceled));
+                }
+                Some(DelegateState::AgentDied) => {
+                    return Poll::Ready(Err(AbortReason::AgentDied));
+                }
+                Some(DelegateState::TimedOut) => {
+                    return Poll::Ready(Err(AbortReason::TimedOut));
+                }
+                Some(DelegateState::Pending | DelegateState::ReplyInstalling) | None => {}
+            }
         }
         Poll::Pending
     }

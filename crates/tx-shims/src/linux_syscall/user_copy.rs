@@ -341,6 +341,54 @@ pub(super) fn bootstrap_copy_from_user(
     }
 }
 
+/// Wait-capable runtime counterpart of [`bootstrap_copy_from_user`].
+///
+/// A concurrent first-touch of the same user page is normal on SMP. Runtime
+/// syscalls must wait for that VM transaction instead of exposing the
+/// synchronous bootstrap helper's `EIO` collapse to userspace.
+pub(super) async fn bootstrap_copy_from_user_wait(
+    aspace: &AddressSpace,
+    dst: &mut [u8],
+    uaddr: u64,
+) -> Result<(), Errno> {
+    use StepOutcome as V3;
+    if dst.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "none"))]
+    {
+        return bootstrap_copy_from_user(aspace, dst, uaddr);
+    }
+
+    #[cfg(target_os = "none")]
+    {
+        let Some(range) = covering_user_range(uaddr, dst.len()) else {
+            return Err(Errno::EFAULT);
+        };
+        aspace
+            .reserve_user_range_for_access_wait(range, UserAccessKind::Read)
+            .await?;
+
+        loop {
+            let outcome = {
+                let guard = user_access_guard();
+                aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard)
+            };
+            match outcome {
+                V3::Done(_) | V3::Continue { .. } => return Ok(()),
+                V3::Err(error) => return Err(error.into()),
+                V3::Yield { .. } => {
+                    tx_reactor::yield_now().await;
+                    aspace
+                        .reserve_user_range_for_access_wait(range, UserAccessKind::Read)
+                        .await?;
+                }
+            }
+        }
+    }
+}
+
 /// Copy `src.len()` bytes from the kernel-side buffer `src` to
 /// user-space `uaddr`. Bridges through `aspace.copy_to_user`, falling
 /// back to a kernel-pointer memcpy on `EFAULT`.
@@ -421,6 +469,54 @@ pub(super) fn bootstrap_copy_to_user(
             }
             V3::Err(e) => Err(Errno::from(e)),
             V3::Yield { .. } => Err(Errno::EIO),
+        }
+    }
+}
+
+/// Wait-capable runtime counterpart of [`bootstrap_copy_to_user`].
+///
+/// The destination is prefaulted before copying. Retrying after a racing VM
+/// mutation is safe because the immutable kernel buffer overwrites an
+/// already-copied prefix with the same bytes.
+pub(super) async fn bootstrap_copy_to_user_wait(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    src: &[u8],
+) -> Result<(), Errno> {
+    use StepOutcome as V3;
+    if src.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "none"))]
+    {
+        return bootstrap_copy_to_user(aspace, uaddr, src);
+    }
+
+    #[cfg(target_os = "none")]
+    {
+        let Some(range) = covering_user_range(uaddr, src.len()) else {
+            return Err(Errno::EFAULT);
+        };
+        aspace
+            .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
+            .await?;
+
+        loop {
+            let outcome = {
+                let guard = user_access_guard();
+                aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard)
+            };
+            match outcome {
+                V3::Done(_) | V3::Continue { .. } => return Ok(()),
+                V3::Err(error) => return Err(error.into()),
+                V3::Yield { .. } => {
+                    tx_reactor::yield_now().await;
+                    aspace
+                        .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
+                        .await?;
+                }
+            }
         }
     }
 }

@@ -1034,7 +1034,12 @@ impl<P: TxPlatform> CoreInit<P> {
                 if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
                     continue;
                 }
-                P::wait_for_interrupt_once();
+                let wait_state = P::prepare_interrupt_wait();
+                if Self::boot_reactor_has_runnable_work(boot_runtime::HartId(loop_cpu.0)) {
+                    P::cancel_interrupt_wait(wait_state);
+                    continue;
+                }
+                P::wait_for_interrupt_prepared(wait_state);
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }

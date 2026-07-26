@@ -1,7 +1,12 @@
 //! Reactor task identity and task-table entries.
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
-use core::{future::Future, pin::Pin, task::Waker};
+use core::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Waker,
+};
 
 use tx_substrate::wake::mailbox::{MailboxSchedulerHint, TaskMailbox};
 
@@ -129,13 +134,14 @@ impl Task {
         handle: TaskKey,
         future: F,
         wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
+        queued_wakes: Arc<AtomicUsize>,
     ) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let future: TaskFuture = Box::pin(future);
         emit_task_submit_debug(b"debug.task.submit.future_box.after", handle.id);
-        let wake_state = Arc::new(TaskWakeState::new(handle.id, wake_queue));
+        let wake_state = Arc::new(TaskWakeState::new(handle.id, wake_queue, queued_wakes));
         emit_task_submit_debug(b"debug.task.submit.wake_state.after", handle.id);
         let mailbox = Arc::new(TaskMailbox::new().with_task_id(handle.id.0 as u32));
         emit_task_submit_debug(b"debug.task.submit.mailbox.after", handle.id);
@@ -169,6 +175,7 @@ pub struct TaskTable {
     completed: Vec<TaskId>,
     cancelled: Vec<TaskId>,
     wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
+    queued_wakes: Arc<AtomicUsize>,
 }
 
 struct TaskSlot {
@@ -184,7 +191,12 @@ impl TaskTable {
             completed: Vec::new(),
             cancelled: Vec::new(),
             wake_queue: Arc::new(SpinLock::new(VecDeque::new())),
+            queued_wakes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn queued_wake_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.queued_wakes)
     }
 
     pub fn submit<F>(&mut self, future: F) -> TaskKey
@@ -200,7 +212,12 @@ impl TaskTable {
             core::mem::size_of::<F>() as i64,
         );
         let handle = TaskKey::new(id, generation);
-        let task = Task::new_for_handle(handle, future, Arc::clone(&self.wake_queue));
+        let task = Task::new_for_handle(
+            handle,
+            future,
+            Arc::clone(&self.wake_queue),
+            Arc::clone(&self.queued_wakes),
+        );
         emit_task_submit_debug(b"debug.task.submit.construct.after", id);
         self.slots[id.index()].task = Some(task);
         emit_task_submit_debug(b"debug.task.submit.store.after", id);
@@ -390,6 +407,8 @@ impl TaskTable {
             let Some(id) = id else {
                 break;
             };
+            let previous = self.queued_wakes.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0, "wake queue counter underflow");
             woken.push(id);
         }
         woken
@@ -597,14 +616,32 @@ mod tests {
         ));
         assert_eq!(tasks.status(handle), Some(TaskStatus::Runnable));
     }
+
+    #[test]
+    fn repeated_wakes_share_one_queue_entry() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let waker = tasks.waker(handle).expect("task waker");
+
+        waker.wake_by_ref();
+        waker.wake_by_ref();
+        waker.wake_by_ref();
+
+        assert_eq!(tasks.queued_wakes.load(Ordering::Acquire), 1);
+        assert_eq!(tasks.drain_wake_ids(), [handle.id()]);
+        assert_eq!(tasks.queued_wakes.load(Ordering::Acquire), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-hart current-task mailbox slot (drive-taskmb trampoline injection)
 // ---------------------------------------------------------------------------
 
-/// Max harts for per-hart runtime context slots in the Phase 1 SMP shell.
-const MAX_HARTS: usize = 8;
+/// Capacity of the per-hart runtime context slots.
+///
+/// Keep this aligned with `MAX_REACTOR_HARTS` and the 64-bit CPU masks used
+/// by the runtime rather than with any one board's current QEMU topology.
+const MAX_HARTS: usize = 64;
 
 /// Per-hart slots for the currently-polling task's mailbox.
 /// Indexed by `HartId.0`.  Each hart writes only its own slot before

@@ -12,11 +12,14 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use tx_reactor::completion::CountdownCompletion;
+use tx_reactor::wait::WaitProtocol;
 
 use crate::process::adapter::step_engine::{
-    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy, ProcessSpinMutex, RawPort,
-    RawQueue, Weak, Zone, ZoneAllocated,
+    self, process_spin_mutex, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy,
+    ProcessSpinMutex, RawPort, RawQueue, Weak, Zone, ZoneAllocated,
 };
 use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
@@ -238,6 +241,10 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
         crate::signal::select_next_signal(thread).is_some()
     }
 
+    fn thread_signal_interrupts_wait(thread: &Cap<Self::ThreadIdentity>) -> bool {
+        crate::signal::thread_pending_signal_interrupts(thread)
+    }
+
     fn thread_termination_in_force(thread: &Cap<Self::ThreadIdentity>) -> bool {
         thread
             .payload_cap()
@@ -412,12 +419,19 @@ impl ProcessIdentity {
     /// Collapse all sibling threads for exec, leaving `initiator`
     /// as the sole live thread. Returns the number of siblings
     /// removed, or `None` for zombies.
-    pub fn collapse_threads_for_exec(&self, initiator: &Cap<ThreadIdentity>) -> Option<usize> {
+    pub async fn collapse_threads_for_exec(
+        &self,
+        initiator: &Cap<ThreadIdentity>,
+    ) -> Option<usize> {
         let exec = self.begin_exec_transaction()?;
-        self.collapse_threads_for_exec_in(initiator, &exec)
+        let collapsed = self.collapse_threads_for_exec_in(initiator, &exec).await;
+        if collapsed.is_some() {
+            self.clear_exec_group_exit_in(&exec);
+        }
+        collapsed
     }
 
-    pub fn collapse_threads_for_exec_in(
+    pub async fn collapse_threads_for_exec_in(
         &self,
         initiator: &Cap<ThreadIdentity>,
         exec: &ProcessExecGuard<'_>,
@@ -433,7 +447,23 @@ impl ProcessIdentity {
                 None => return None,
             }
         };
-        payload.collapse_threads_for_exec(initiator)
+        payload.collapse_threads_for_exec(initiator).await
+    }
+
+    /// Clear a completed exec-only GroupExit episode after the new image has
+    /// committed. Ordinary exit-group state is never cleared here; it remains
+    /// authoritative until the last thread publishes process exit.
+    pub fn clear_exec_group_exit_in(&self, exec: &ProcessExecGuard<'_>) {
+        if !core::ptr::eq(self, exec.process) {
+            return;
+        }
+        let Some(payload) = self.payload.lock().as_ref().cloned() else {
+            return;
+        };
+        let mut slot = payload.group_exit.lock();
+        if slot.as_ref().is_some_and(|state| state.is_exec()) {
+            *slot = None;
+        }
     }
 
     /// Snapshot the current address space `Cap`, if the process is
@@ -1124,13 +1154,71 @@ pub struct TargetProcCred {
 /// (`rlimits`, `fd_table`) land in follow-up passes without changing
 /// the existing surface.
 /// Group-exit coordination state (PROCESS_v1 §5).
-#[derive(Debug)]
 pub(crate) struct GroupExitState {
-    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
-    pub status: ExitStatus,
-    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
-    pub is_exec: bool,
-    pub remaining_threads: AtomicU32,
+    status: ProcessSpinMutex<ExitStatus>,
+    /// `true` while this episode is an exec sibling-collapse. A fatal
+    /// process-wide termination can convert it to an ordinary group exit.
+    is_exec: AtomicBool,
+    /// The exec caller survives the collapse and therefore does not arrive at
+    /// the sibling countdown. `None` for an ordinary exit-group episode.
+    exec_initiator_tid: Option<u32>,
+    /// Present only for exec, where the surviving caller must asynchronously
+    /// wait for every sibling to run its own `step_thread_exit`.
+    completion: Option<CountdownCompletion>,
+}
+
+impl GroupExitState {
+    pub(crate) fn for_exit(status: ExitStatus) -> Self {
+        Self {
+            status: process_spin_mutex(status, b"debug.lock.process.group_exit.status"),
+            is_exec: AtomicBool::new(false),
+            exec_initiator_tid: None,
+            completion: None,
+        }
+    }
+
+    pub(crate) fn for_exec(initiator_tid: u32, sibling_count: NonZeroU32) -> Self {
+        Self {
+            status: process_spin_mutex(
+                ExitStatus::Exited(0),
+                b"debug.lock.process.group_exit.status",
+            ),
+            is_exec: AtomicBool::new(true),
+            exec_initiator_tid: Some(initiator_tid),
+            completion: Some(CountdownCompletion::new(sibling_count)),
+        }
+    }
+
+    pub(crate) fn status(&self) -> ExitStatus {
+        *self.status.lock()
+    }
+
+    pub(crate) fn is_exec(&self) -> bool {
+        self.is_exec.load(Ordering::Acquire)
+    }
+
+    /// Convert an in-flight exec collapse into process termination. The
+    /// sibling countdown remains alive so an already-waiting exec future is
+    /// woken and can abort before replacing the address space.
+    pub(crate) fn convert_to_exit(&self, status: ExitStatus) {
+        *self.status.lock() = status;
+        self.is_exec.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn participant_exited(&self, tid: u32) {
+        let Some(completion) = self.completion.as_ref() else {
+            return;
+        };
+        if self.exec_initiator_tid != Some(tid) {
+            completion.arrive();
+        }
+    }
+
+    pub(crate) async fn wait_for_exec_siblings(&self) {
+        if let Some(completion) = self.completion.as_ref() {
+            let _ = completion.wait(WaitProtocol::Uninterruptible).await;
+        }
+    }
 }
 
 /// Per-process resource frame — the set of resources governed by
@@ -1413,7 +1501,7 @@ pub struct ProcessPayload {
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
     pub _comm: ProcessSpinMutex<[u8; 16]>,
     pub(crate) thread_count: AtomicU32,
-    pub(crate) group_exit: ProcessSpinMutex<Option<GroupExitState>>,
+    pub(crate) group_exit: ProcessSpinMutex<Option<Arc<GroupExitState>>>,
     pub vfork_done: AtomicBool,
     /// Waker for a vfork-parent that is parked in `sys_clone` waiting
     /// for this process to exec or exit.  Set by the parent before
@@ -1750,65 +1838,59 @@ impl ProcessPayload {
         self._exe_file.lock().clone()
     }
 
-    /// EXEC Phase 5 — install the group-exit state that collapses every
-    /// sibling thread of the calling process. Returns `true` if more
-    /// than one thread was live and the group_exit slot was populated;
-    /// `false` if the process was single-threaded and no collapse is
-    /// needed. `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`.
-    pub fn install_exec_group_exit(&self) -> bool {
-        let n = self
-            .thread_count
-            .load(core::sync::atomic::Ordering::Acquire);
-        if n > 1 {
-            *self.group_exit.lock() = Some(GroupExitState {
-                status: ExitStatus::Exited(0),
-                is_exec: true,
-                remaining_threads: AtomicU32::new(n - 1),
-            });
-            true
-        } else {
-            false
-        }
-    }
-
     /// Collapse the thread group for exec. Marks all non-initiator
-    /// threads zombie, clears the roster down to the initiator, and
-    /// arms the exec GroupExit episode for the remaining exit path.
+    /// threads for termination and asynchronously waits until every sibling
+    /// has executed its own thread-exit path.
     ///
     /// Returns the number of threads removed from the live roster.
     /// No-op for zombies; returns `0` if the process is already
     /// single-threaded.
-    pub fn collapse_threads_for_exec(&self, initiator: &Cap<ThreadIdentity>) -> Option<usize> {
-        let siblings: Vec<Cap<ThreadIdentity>> = self
-            .threads
-            .snapshot()
-            .into_iter()
-            .filter(|thread| thread.key() != initiator.key())
-            .collect();
+    pub async fn collapse_threads_for_exec(
+        &self,
+        initiator: &Cap<ThreadIdentity>,
+    ) -> Option<usize> {
+        let (state, siblings) = {
+            // This lock is also taken by CLONE_THREAD's commit path. Holding it
+            // across the roster snapshot makes "install collapse vs attach a
+            // new thread" a single serialized decision.
+            let mut slot = self.group_exit.lock();
+            if slot.is_some() {
+                return None;
+            }
+            let siblings: Vec<Cap<ThreadIdentity>> = self
+                .threads
+                .snapshot()
+                .into_iter()
+                .filter(|thread| thread.key() != initiator.key() && thread.payload_cap().is_some())
+                .collect();
+            let Some(count) = NonZeroU32::new(siblings.len() as u32) else {
+                return Some(0);
+            };
+            let state = Arc::new(GroupExitState::for_exec(initiator.tid.0, count));
+            *slot = Some(Arc::clone(&state));
+            (state, siblings)
+        };
 
-        if siblings.is_empty() {
-            return Some(0);
-        }
-
-        {
-            let mut group_exit = self.group_exit.lock();
-            *group_exit = Some(GroupExitState {
-                status: ExitStatus::Exited(0),
-                is_exec: true,
-                remaining_threads: AtomicU32::new(siblings.len() as u32),
-            });
-        }
-
+        // Publish after releasing group_exit/threads locks. Mailbox wakeups can
+        // immediately poll the target on another hart and must never run into
+        // the initiator holding the coordination locks.
         for sibling in &siblings {
-            crate::thread_runtime::step_thread_exit(sibling.clone(), 0);
+            if let Some(payload) = sibling.payload_cap() {
+                payload.update_summary(|summary| summary.termination = true);
+                crate::thread_runtime::execution::post_termination_wake(&payload);
+            }
         }
-        // Remote thread futures retain their PayloadCaps until their reactor
-        // polls finish. Never spin-wait for their per-hart poll slots while
-        // holding the exec transition: returning to the reactor is what lets
-        // those slots clear.
 
-        *self.group_exit.lock() = None;
-        Some(self.threads.count())
+        #[cfg(any(test, feature = "test-support"))]
+        for sibling in &siblings {
+            crate::thread_runtime::execution::step_thread_exit_with_status(
+                sibling.clone(),
+                ExitStatus::Exited(0),
+            );
+        }
+
+        state.wait_for_exec_siblings().await;
+        state.is_exec().then_some(siblings.len())
     }
 
     /// Process short name comm (for `/proc/<pid>/stat`).

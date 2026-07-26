@@ -65,6 +65,7 @@ struct VmPmapOps {
     unmap_mapping: UnmapMappingFn,
     protect_mapping: ProtectMappingFn,
     shootdown_mappings: fn(Asid, &[tx_hal::PmapInvalidation]),
+    synchronize_new_mappings: fn(Asid, &[tx_hal::PmapInvalidation]),
 }
 
 impl VmPmapOps {
@@ -77,6 +78,7 @@ impl VmPmapOps {
             unmap_mapping: P::unmap_mapping,
             protect_mapping: P::protect_mapping,
             shootdown_mappings: P::shootdown_mappings,
+            synchronize_new_mappings: P::synchronize_new_mappings,
         }
     }
 }
@@ -126,6 +128,12 @@ pub enum VmPmapError {
     Zone(ZoneError),
     MissingReservation,
     AlreadyMappedDrift,
+    /// A different mapping reached this page outside the required
+    /// AddressSpace page-level Materializer transaction.
+    ///
+    /// The existing mapping is preserved for diagnostics. Canonical fault,
+    /// prefault, and eager user-access paths should make this unreachable.
+    ConcurrentPublication,
     MappingMismatch,
 }
 
@@ -272,7 +280,13 @@ impl VmPmap {
                 // to the full unmap+commit+fence rewrite below.
             }
             if !replace_existing {
-                return Err(VmPmapError::MappingMismatch);
+                // Canonical publishers hold an exclusive page-level
+                // Materializer across validation and this pmap critical
+                // section. A different resident mapping therefore identifies
+                // an entrypoint that bypassed that transaction. Preserve the
+                // existing mapping and surface a distinct diagnostic;
+                // MappingMismatch remains reserved for shadow/PTE drift.
+                return Err(VmPmapError::ConcurrentPublication);
             }
             let existing = state.mappings.remove(&page).expect("existing mapping");
             let result = match self.unmap_tracked_page(page, existing.ppn) {
@@ -311,6 +325,20 @@ impl VmPmap {
             .mappings
             .insert(page, PmapMapping::new(ppn, prot, map_pin));
         state.commits += 1;
+        // Publishing an invalid -> valid leaf is not complete until the
+        // publishing hart crosses the architecture's translation barrier.
+        // Another hart that raced the commit may already be waiting on this
+        // exact page transaction; it performs the same local synchronization
+        // when it observes and converges on the winner.
+        //
+        // Do not hold the software-residency lock while the architecture
+        // synchronization executes. Canonical callers still own the page
+        // Materializer.
+        drop(state);
+        (self.ops.synchronize_new_mappings)(
+            self.asid(),
+            &[PmapInvalidation::new(virt, USER_PAGE_SIZE)],
+        );
         Ok(PmapPublishOutcome { page, replaced })
     }
 
@@ -325,6 +353,7 @@ impl VmPmap {
         emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 0);
         let root = self.root();
         let mut state = self.state.lock();
+        let mut invalidations = Vec::new();
         emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 1);
         state.mappings.reserve_additional(pages.len());
         let mut published = 0usize;
@@ -366,6 +395,7 @@ impl VmPmap {
                 None
             };
             state.mappings.insert(page.page, mapping);
+            invalidations.push(PmapInvalidation::new(virt, USER_PAGE_SIZE));
             if let Some(insert_start_ns) = insert_start_ns {
                 record_pmap_batch_insert_debug(
                     tx_observe::clock_now_ns().saturating_sub(insert_start_ns),
@@ -379,7 +409,28 @@ impl VmPmap {
 
         emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.published", published as i64);
         emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 7);
+        drop(state);
+        if !invalidations.is_empty() {
+            (self.ops.synchronize_new_mappings)(self.asid(), &invalidations);
+        }
         published
+    }
+
+    /// Re-establish architecture visibility for an already-published page.
+    ///
+    /// Used when a faulting hart waited behind another publisher. The winner's
+    /// PTE is authoritative; the waiter only needs to discard the
+    /// failed/stale translation associated with the access that trapped.
+    pub(in crate::vm) fn refresh_page_translation(
+        &self,
+        page: UserPage,
+    ) -> Result<(), VmPmapError> {
+        let virt = virt_for_page(page)?;
+        (self.ops.synchronize_new_mappings)(
+            self.asid(),
+            &[PmapInvalidation::new(virt, USER_PAGE_SIZE)],
+        );
+        Ok(())
     }
 
     /// Tears down every published pmap entry in `range`, releasing the
@@ -403,10 +454,12 @@ impl VmPmap {
             None
         };
         let drain_start = pmap_map_path_clock_now();
-        let drained = {
-            let mut state = self.state.lock();
-            state.mappings.drain_range(start, end)
-        };
+        // `state` is the per-AddressSpace pmap transaction lock, not merely a
+        // container lock. Keep it across the HAL leaf updates so shadow
+        // residency and hardware PTEs cannot be observed or modified as two
+        // independent states by another hart.
+        let mut state = self.state.lock();
+        let drained = state.mappings.drain_range(start, end);
         emit_pmap_map_path_duration(b"debug.vm.map_path.pmap.teardown_drain_ns", drain_start);
         emit_pmap_map_path_count(
             b"debug.vm.map_path.pmap.teardown_removed_pages",
@@ -442,13 +495,11 @@ impl VmPmap {
                         b"debug.vm.map_path.pmap.teardown_hal_unmap_ns",
                         unmap_start,
                     );
-                    let mut state = self.state.lock();
                     state.mappings.insert(page, mapping);
                     for (remaining_page, remaining_mapping) in mappings {
                         state.mappings.insert(remaining_page, remaining_mapping);
                     }
-                    drop(state);
-                    self.issue_unmap_batch(&mut invalidations, &mut pins);
+                    self.issue_unmap_batch_locked(&mut state, &mut invalidations, &mut pins);
                     return Err(error);
                 }
             };
@@ -464,7 +515,7 @@ impl VmPmap {
         }
         emit_pmap_map_path_duration(b"debug.vm.map_path.pmap.teardown_loop_ns", loop_start);
         let shootdown_start = pmap_map_path_clock_now();
-        self.issue_unmap_batch(&mut invalidations, &mut pins);
+        self.issue_unmap_batch_locked(&mut state, &mut invalidations, &mut pins);
         emit_pmap_map_path_duration(
             b"debug.vm.map_path.pmap.teardown_shootdown_ns",
             shootdown_start,
@@ -483,19 +534,14 @@ impl VmPmap {
     pub fn protect_range(&self, range: UserRange, prot: Prot) -> Result<usize, VmPmapError> {
         let permissions = permissions_for_prot(prot);
         let mut protected = 0;
-        let pages = {
-            let state = self.state.lock();
-            mapped_pages_in_range(&state, range)
-        };
+        // Serialize the complete shadow-state/PTE/shootdown transaction with
+        // publish, teardown, and gift removal. Different page materialization
+        // remains concurrent outside this short pmap commit section.
+        let mut state = self.state.lock();
+        let pages = mapped_pages_in_range(&state, range);
 
         for page in pages {
-            let Some(current) = self
-                .state
-                .lock()
-                .mappings
-                .get(&page)
-                .map(PmapMapping::snapshot)
-            else {
+            let Some(current) = state.mappings.get(&page).map(PmapMapping::snapshot) else {
                 continue;
             };
             if current.prot == prot {
@@ -514,11 +560,11 @@ impl VmPmap {
                 Err(error) => return Err(VmPmapError::Pmap(error)),
             };
 
-            if let Some(mapping) = self.state.lock().mappings.get_mut(&page) {
+            if let Some(mapping) = state.mappings.get_mut(&page) {
                 mapping.prot = prot;
             }
             (self.ops.shootdown_mappings)(self.asid(), &[invalidation]);
-            self.state.lock().shootdowns += 1;
+            state.shootdowns += 1;
             protected += 1;
         }
 
@@ -536,23 +582,24 @@ impl VmPmap {
         page: UserPage,
         expected_ppn: Ppn,
     ) -> Result<bool, VmPmapError> {
-        let Some(mapping) = self.state.lock().mappings.remove(&page) else {
+        let mut state = self.state.lock();
+        let Some(mapping) = state.mappings.remove(&page) else {
             return Ok(false);
         };
         if mapping.ppn != expected_ppn {
-            self.state.lock().mappings.insert(page, mapping);
+            state.mappings.insert(page, mapping);
             return Err(VmPmapError::MappingMismatch);
         }
 
         let result = match self.unmap_tracked_page(page, expected_ppn) {
             Ok(result) => result,
             Err(error) => {
-                self.state.lock().mappings.insert(page, mapping);
+                state.mappings.insert(page, mapping);
                 return Err(error);
             }
         };
         self.issue_single_unmap_result(result, mapping.into_pin());
-        self.state.lock().shootdowns += 1;
+        state.shootdowns += 1;
         Ok(true)
     }
 
@@ -589,8 +636,9 @@ impl VmPmap {
         }
     }
 
-    fn issue_unmap_batch(
+    fn issue_unmap_batch_locked(
         &self,
+        state: &mut VmPmapState,
         invalidations: &mut Vec<PmapInvalidation>,
         pins: &mut Vec<MaterializedPagePin>,
     ) {
@@ -602,7 +650,7 @@ impl VmPmap {
             invalidations.len() as i64,
         );
         (self.ops.shootdown_mappings)(self.asid(), invalidations);
-        self.state.lock().shootdowns += 1;
+        state.shootdowns += 1;
         invalidations.clear();
         pins.clear();
     }

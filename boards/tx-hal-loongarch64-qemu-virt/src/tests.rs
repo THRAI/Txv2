@@ -56,7 +56,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         panic!("unexpected external irq")
     }
 
-    fn on_ipi(_cpu: CpuId) -> TrapAction {
+    fn on_ipi(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected ipi")
     }
 
@@ -90,7 +90,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         panic!("unexpected external irq")
     }
 
-    fn on_ipi(_cpu: CpuId) -> TrapAction {
+    fn on_ipi(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected ipi")
     }
 
@@ -1244,8 +1244,8 @@ fn la64_timer_deadline_rounds_up_to_tcfg_granule() {
 }
 
 #[test]
-fn la64_smp_static_capacity_covers_final_eight_hart_lane() {
-    assert_eq!(LA64_MAX_BOOT_CPUS, 8);
+fn la64_smp_static_capacity_covers_final_twelve_hart_lane() {
+    assert_eq!(LA64_MAX_BOOT_CPUS, 12);
     assert_eq!(LA64_IRQ_CONTEXT_DEPTHS.len(), LA64_MAX_BOOT_CPUS);
     assert_eq!(LA64_KERNEL_RESUME_CTX.len(), LA64_MAX_BOOT_CPUS);
     assert_eq!(LA64_TRAP_STACKS.len(), LA64_MAX_BOOT_CPUS);

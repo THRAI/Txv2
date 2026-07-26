@@ -78,7 +78,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use alloc::{boxed::Box, format, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{Cap, PayloadCap};
@@ -89,10 +89,8 @@ use boot_runtime::userspace::{
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_shims::linux_syscall::numbers::{
-    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_CLOSE, NR_FALLOCATE, NR_FDATASYNC,
-    NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX, NR_LSEEK, NR_MMAP, NR_MPROTECT, NR_MSYNC,
-    NR_MUNMAP, NR_PWRITE64, NR_PWRITEV, NR_PWRITEV2, NR_READ, NR_READV, NR_RENAMEAT2,
-    NR_RT_SIGPROCMASK, NR_STATFS, NR_SYNC_FILE_RANGE, NR_UNLINKAT, NR_WRITE, NR_WRITEV,
+    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_FUTEX, NR_MMAP, NR_MPROTECT,
+    NR_MUNMAP, NR_READ, NR_READV, NR_RT_SIGPROCMASK, NR_WRITE, NR_WRITEV,
 };
 use tx_shims::linux_syscall::SyscallResult;
 use tx_subsystems::signal::deliver_synchronous_fault;
@@ -127,100 +125,6 @@ fn drain_post_trap_epoch_maintenance() {
     // normal-stack queue. Drain it in the same round so old persistent roots do
     // not retain millions of shared treap nodes until the reactor becomes idle.
     let _ = tx_subsystems::vm::drain_deferred_recipe_reclaims(POST_TRAP_EBR_BUDGET);
-}
-
-fn is_link_diagnostic_process(process: &Cap<tx_subsystems::process::ProcessIdentity>) -> bool {
-    let comm = process.comm();
-    let len = comm
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(comm.len());
-    let comm = &comm[..len];
-    [
-        b"ld".as_slice(),
-        b"collect2".as_slice(),
-        b"cc".as_slice(),
-        b"rustc".as_slice(),
-        b"tg-xtask".as_slice(),
-    ]
-    .iter()
-    .any(|name| comm == *name)
-}
-
-fn is_link_file_syscall(nr: u64) -> bool {
-    matches!(
-        nr,
-        NR_STATFS
-            | NR_FSTATFS
-            | NR_WRITE
-            | NR_WRITEV
-            | NR_PWRITE64
-            | NR_PWRITEV
-            | NR_PWRITEV2
-            | NR_FTRUNCATE
-            | NR_FALLOCATE
-            | NR_FSYNC
-            | NR_FDATASYNC
-            | NR_SYNC_FILE_RANGE
-            | NR_CLOSE
-            | NR_LSEEK
-            | NR_MSYNC
-            | NR_RENAMEAT2
-            | NR_UNLINKAT
-    )
-}
-
-/// Emit only failures that can explain a final linker error. Successful writes
-/// stay silent: rustc/ld issue enough of them to make serial tracing alter the
-/// workload. ENOSYS is always interesting for linker-related processes because
-/// libc/BFD may translate an unavailable file operation into a later generic
-/// failure.
-fn report_link_syscall_failure<P: TxPlatform>(
-    process: &Cap<tx_subsystems::process::ProcessIdentity>,
-    req: &SyscallRequest,
-    result: &SyscallResult,
-) {
-    let SyscallResult::Error(errno) = *result else {
-        return;
-    };
-    if !is_link_diagnostic_process(process) || (!is_link_file_syscall(req.nr) && errno != 38) {
-        return;
-    }
-
-    let comm_raw = process.comm();
-    let comm_len = comm_raw
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(comm_raw.len());
-    let comm = core::str::from_utf8(&comm_raw[..comm_len]).unwrap_or("?");
-    let fd = req.args[0] as u32;
-    let file_details = process.fd(fd).and_then(|file| {
-        let tx_subsystems::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() else {
-            return None;
-        };
-        let size = match rnode.backing() {
-            tx_subsystems::vfs::RNodeBacking::PageBacked { pc } => pc.size_bytes(),
-            _ => rnode.meta().size,
-        };
-        Some(format!(
-            ":inode={}:offset={}:size={}",
-            rnode.fs_object_id().as_u64(),
-            file.offset(),
-            size,
-        ))
-    });
-    let line = format!(
-        "txkernel:linkdiag:syscall-error:pid={}:comm={}:nr={}:errno={}:a0={:#x}:a1={:#x}:a2={:#x}{}\n",
-        process.pid.0,
-        comm,
-        req.nr,
-        errno,
-        req.args[0],
-        req.args[1],
-        req.args[2],
-        file_details.as_deref().unwrap_or(""),
-    );
-    tx_hal::console_write_str::<P>(&line);
 }
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
@@ -329,8 +233,8 @@ impl<P: TxPlatform, F: Future> PerHartSlotted<P, F> {
     }
 }
 
-impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
-    type Output = F::Output;
+impl<P: TxPlatform, F: Future<Output = ()>> Future for PerHartSlotted<P, F> {
+    type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: structural pinning — we never move `inner` out of
@@ -340,14 +244,53 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
 
         let _prev_thread = set_current_thread_identity(hart, this.thread.clone());
         let _prev = set_current_thread_payload(hart, this.payload.clone());
-        if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
-            this.payload.bind_mailbox(Arc::downgrade(&mailbox));
+        this.payload.bind_lifecycle_waker(cx.waker().clone());
+        let task_mailbox = crate::adapter::boot_runtime::current_task_mailbox(hart);
+        if let Some(mailbox) = task_mailbox.as_ref() {
+            this.payload.bind_mailbox(Arc::downgrade(mailbox));
+            // `ThreadPayload::mailbox` is the lifecycle wake route used by
+            // exec/group-exit and fatal signals.  It must retain a task waker
+            // even when the inner future is parked on a userspace-run wait
+            // rather than one of drive.rs' mailbox-backed waits.
+            //
+            // Local wait futures are allowed to replace/clear the mailbox
+            // waker while they are polled, so install it both before and
+            // after the inner poll.  The post-poll pending check closes the
+            // register-vs-post race: an event published before registration
+            // is observed in the queue; an event published afterwards sees
+            // the registered waker.
+            mailbox.register_waker(cx.waker().clone());
+        }
+
+        // Process termination is a task-level AST, not a property of the
+        // particular wait currently held inside `run_thread`. Checking it in
+        // the outer wrapper lets exec/group-exit cancel a thread parked in
+        // *any* nested await (userspace-run, futex, I/O, timer, ...). The old
+        // inner-loop-only checkpoint was unreachable until that await happened
+        // to resolve, which left exec waiting forever for random siblings.
+        if this.payload.interrupt_summary().termination {
+            tx_subsystems::process::execution::step_current_thread_group_exit(&this.thread);
+            let _ = clear_current_userspace_payload(hart);
+            let _ = clear_current_thread_payload(hart);
+            let _ = clear_current_thread_identity(hart);
+            return Poll::Ready(());
         }
 
         // SAFETY: `this.inner` is structurally pinned via the
         // `get_unchecked_mut` above; we never move out of it.
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         let out = inner.poll(cx);
+
+        if out.is_pending() {
+            if let Some(mailbox) = task_mailbox.as_ref() {
+                mailbox.register_waker(cx.waker().clone());
+                if !mailbox.is_empty() || mailbox.overflow() {
+                    cx.waker().wake_by_ref();
+                }
+            }
+        } else {
+            let _ = clear_current_userspace_payload(hart);
+        }
 
         let _ = clear_current_thread_payload(hart);
         let _ = clear_current_thread_identity(hart);
@@ -527,9 +470,12 @@ pub async fn run_thread<P: TxPlatform>(
 
                     // Read current mask to pass to the handler, and
                     // compute the handler-entry mask per sigaction(2).
-                    let old_mask = payload.signal_mask();
-                    payload.store_saved_signal_mask(Some(old_mask));
-                    let mut new_mask = old_mask.union(action.sa_mask);
+                    let handler_base_mask = payload.signal_mask();
+                    let return_mask = payload
+                        .take_sigsuspend_restore_mask()
+                        .unwrap_or(handler_base_mask);
+                    payload.store_saved_signal_mask(Some(return_mask));
+                    let mut new_mask = handler_base_mask.union(action.sa_mask);
                     if !action
                         .flags
                         .contains(tx_subsystems::signal::SaFlags::NODEFER)
@@ -560,7 +506,7 @@ pub async fn run_thread<P: TxPlatform>(
                         sig_no: sig.raw() as u32,
                         siginfo,
                         old_mask: tx_hal::UserSignalMaskAbi {
-                            bits: old_mask.raw_bits(),
+                            bits: return_mask.raw_bits(),
                         },
                         flags: tx_hal::UserSaFlagsAbi {
                             bits: action.flags.bits(),
@@ -584,6 +530,9 @@ pub async fn run_thread<P: TxPlatform>(
                             ) {
                                 tx_subsystems::process::execution::step_exit_group_with_signal(
                                     &process, sig,
+                                );
+                                tx_subsystems::process::execution::step_current_thread_group_exit(
+                                    &thread,
                                 );
                                 return;
                             }
@@ -618,6 +567,9 @@ pub async fn run_thread<P: TxPlatform>(
                                 tx_subsystems::process::execution::step_exit_group_with_signal(
                                     &process, sig,
                                 );
+                                tx_subsystems::process::execution::step_current_thread_group_exit(
+                                    &thread,
+                                );
                                 return;
                             }
                             make_signal_frame_executable(
@@ -648,12 +600,18 @@ pub async fn run_thread<P: TxPlatform>(
                             tx_subsystems::process::execution::step_exit_group_with_signal(
                                 &process, sig,
                             );
+                            tx_subsystems::process::execution::step_current_thread_group_exit(
+                                &thread,
+                            );
                             return;
                         }
                     }
                 }
             }
-            AstOutcome::InitiateTermination => return,
+            AstOutcome::InitiateTermination | AstOutcome::DefaultTerminate { .. } => {
+                tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
+                return;
+            }
             _ => {}
         }
 
@@ -916,7 +874,6 @@ pub async fn run_thread<P: TxPlatform>(
                             Box::pin(tx_shims::linux_syscall::dispatch::<P>(req, &ctx)).await
                         };
                         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.after");
-                        report_link_syscall_failure::<P>(&process, &req, &result);
                         result
                     }
                 };
@@ -936,7 +893,11 @@ pub async fn run_thread<P: TxPlatform>(
                     }
                     tx_shims::linux_syscall::SyscallResult::NoReturn => {
                         // Thread/process exited inside dispatch; do not
-                        // re-enter userspace.
+                        // re-enter userspace. `exit(2)` has already run
+                        // step_thread_exit; `exit_group(2)` has only published
+                        // GroupExit, so the current thread must join the same
+                        // per-thread exit path as its siblings.
+                        tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
                         return;
                     }
                     tx_shims::linux_syscall::SyscallResult::ExecCommitted => {
@@ -985,6 +946,9 @@ pub async fn run_thread<P: TxPlatform>(
                                 &process,
                                 Signum::SIGSEGV,
                             );
+                            tx_subsystems::process::execution::step_current_thread_group_exit(
+                                &thread,
+                            );
                             return;
                         };
                         let Some(aspace) = process.aspace_cap() else {
@@ -996,6 +960,9 @@ pub async fn run_thread<P: TxPlatform>(
                             tx_subsystems::process::execution::step_exit_group_with_signal(
                                 &process,
                                 Signum::SIGSEGV,
+                            );
+                            tx_subsystems::process::execution::step_current_thread_group_exit(
+                                &thread,
                             );
                             return;
                         }
@@ -1072,6 +1039,7 @@ pub async fn run_thread<P: TxPlatform>(
                         log_user_segv::<P>(&payload, info.addr.raw(), info.access, "pf", e);
                         log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize);
                         deliver_synchronous_fault(&thread, Signum::SIGSEGV);
+                        tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
                         return;
                     }
                 }
@@ -1087,6 +1055,7 @@ pub async fn run_thread<P: TxPlatform>(
                     tx_subsystems::vm::VmFaultError::NoRecipe,
                 );
                 deliver_synchronous_fault(&thread, Signum::SIGSEGV);
+                tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
                 return;
             }
         }
@@ -1396,6 +1365,7 @@ fn vm_fault_error_label(error: tx_subsystems::vm::VmFaultError) -> &'static str 
             tx_subsystems::vm::VmPmapError::Zone(_) => "pmap-zone",
             tx_subsystems::vm::VmPmapError::MissingReservation => "pmap-missing-reservation",
             tx_subsystems::vm::VmPmapError::AlreadyMappedDrift => "pmap-already-mapped-drift",
+            tx_subsystems::vm::VmPmapError::ConcurrentPublication => "pmap-concurrent-publication",
             tx_subsystems::vm::VmPmapError::MappingMismatch => "pmap-mapping-mismatch",
         },
     }

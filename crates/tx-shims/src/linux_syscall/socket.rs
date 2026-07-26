@@ -182,7 +182,7 @@ fn socket_requires_net_raw(kind: SocketKind, valid: ValidSocketType) -> bool {
             ))
 }
 
-pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let domain = args[0] as i32;
     let type_ = args[1] as i32;
     let protocol = args[2] as i32;
@@ -252,7 +252,10 @@ pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         ctx.process.set_fd(first_fd, None);
         return SyscallResult::Error(EMFILE_VALUE);
     };
-    match bootstrap_write_user::<[i32; 2]>(&ctx.aspace, sv, [first_fd as i32, second_fd as i32]) {
+    let mut fd_bytes = [0u8; core::mem::size_of::<[i32; 2]>()];
+    fd_bytes[..4].copy_from_slice(&(first_fd as i32).to_le_bytes());
+    fd_bytes[4..].copy_from_slice(&(second_fd as i32).to_le_bytes());
+    match super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sv, &fd_bytes).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => {
             ctx.process.set_fd(first_fd, None);
@@ -997,6 +1000,152 @@ pub(super) fn sys_recvfrom<'a, P: TimeIf + 'a>(
     recvfrom_impl::<P>(args, ctx)
 }
 
+async fn recvfrom_read_socklen_wait(
+    ctx: &SyscallCtx<'_>,
+    sockaddr_len_ptr: u64,
+) -> Result<u32, Errno> {
+    let mut bytes = [0u8; core::mem::size_of::<u32>()];
+    super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, sockaddr_len_ptr)
+        .await?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+async fn recvfrom_write_socklen_wait(
+    ctx: &SyscallCtx<'_>,
+    sockaddr_len_ptr: u64,
+    len: u32,
+) -> Result<(), Errno> {
+    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_len_ptr, &len.to_le_bytes())
+        .await
+}
+
+async fn validate_recvfrom_addrlen_wait(
+    ctx: &SyscallCtx<'_>,
+    sockaddr_len_ptr: u64,
+) -> Result<(), Errno> {
+    if sockaddr_len_ptr == 0 {
+        return Ok(());
+    }
+    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
+    if invalid_socklen(len) {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+async fn write_recvfrom_sockaddr_nl_wait(
+    ctx: &SyscallCtx<'_>,
+    sockaddr_ptr: u64,
+    sockaddr_len_ptr: u64,
+) -> Result<(), Errno> {
+    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
+        return Ok(());
+    }
+    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
+    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, SOCKADDR_NL_BYTES).await?;
+    if invalid_socklen(len) || len < SOCKADDR_NL_BYTES {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = [0u8; SOCKADDR_NL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes).await
+}
+
+async fn write_recvfrom_sockaddr_ll_wait(
+    ctx: &SyscallCtx<'_>,
+    sockaddr_ptr: u64,
+    sockaddr_len_ptr: u64,
+    sockaddr: SockAddrLl,
+) -> Result<(), Errno> {
+    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
+        return Ok(());
+    }
+    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
+    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, SOCKADDR_LL_BYTES).await?;
+    if invalid_socklen(len) || len < SOCKADDR_LL_BYTES {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = [0u8; SOCKADDR_LL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
+    bytes[2..4].copy_from_slice(&sockaddr.protocol.to_be_bytes());
+    bytes[4..8].copy_from_slice(&sockaddr.ifindex.to_le_bytes());
+    bytes[8..10].copy_from_slice(&sockaddr.hatype.to_le_bytes());
+    bytes[10] = sockaddr.pkttype;
+    bytes[11] = sockaddr.halen;
+    bytes[12..20].copy_from_slice(&sockaddr.addr);
+    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes).await
+}
+
+async fn write_recvfrom_sockaddr_un_wait(
+    ctx: &SyscallCtx<'_>,
+    sockaddr_ptr: u64,
+    sockaddr_len_ptr: u64,
+    path: Option<UnixSocketPath>,
+) -> Result<(), Errno> {
+    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
+        return Ok(());
+    }
+    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let sockaddr_len = sockaddr_un_len(path);
+    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
+    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, sockaddr_len as u32).await?;
+    if invalid_socklen(len) || len < sockaddr_len as u32 {
+        return Err(Errno::EINVAL);
+    }
+    let bytes = sockaddr_un_bytes(path);
+    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes[..sockaddr_len])
+        .await
+}
+
+async fn write_recvfrom_sockaddr_endpoint_wait(
+    ctx: &SyscallCtx<'_>,
+    sockaddr_ptr: u64,
+    sockaddr_len_ptr: u64,
+    endpoint: IpEndpoint,
+) -> Result<(), Errno> {
+    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
+        return Ok(());
+    }
+    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let out_len = if endpoint.family == AddressFamily::Inet6 {
+        SOCKADDR_IN6_BYTES
+    } else {
+        SOCKADDR_IN_BYTES
+    };
+    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
+    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, out_len).await?;
+    if invalid_socklen(len) {
+        return Err(Errno::EINVAL);
+    }
+    let copy_len = core::cmp::min(len, out_len) as usize;
+    if endpoint.family == AddressFamily::Inet6 {
+        let mut bytes = [0u8; SOCKADDR_IN6_BYTES as usize];
+        bytes[0..2].copy_from_slice(&AF_INET6.to_le_bytes());
+        bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
+        bytes[8..24].copy_from_slice(&endpoint.addr6.octets());
+        super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
+            .await
+    } else {
+        let mut bytes = [0u8; SOCKADDR_IN_BYTES as usize];
+        bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+        bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
+        bytes[4..8].copy_from_slice(&endpoint.addr.octets());
+        super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
+            .await
+    }
+}
+
 async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let (file, socket) = match resolve_socket_fd(ctx, args[0] as i32) {
         Ok(pair) => pair,
@@ -1016,7 +1165,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         if let Some(errno) = recv_special_flags_errno(flags) {
             return SyscallResult::Error(errno);
         }
-        if let Err(errno) = validate_recvfrom_addrlen(ctx, args[5]) {
+        if let Err(errno) = validate_recvfrom_addrlen_wait(ctx, args[5]).await {
             return SyscallResult::Error(errno_to_i32(errno));
         }
     }
@@ -1032,13 +1181,17 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             };
             let copied = core::cmp::min(len.min(NETLINK_RECVMSG_MAX), response.len());
             if copied > 0 {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, args[1], &response.as_slice()[..copied])
+                if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                    &ctx.aspace,
+                    args[1],
+                    &response.as_slice()[..copied],
+                )
+                .await
                 {
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
             }
-            if let Err(errno) = write_sockaddr_nl(ctx, args[4], args[5]) {
+            if let Err(errno) = write_recvfrom_sockaddr_nl_wait(ctx, args[4], args[5]).await {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
@@ -1061,11 +1214,17 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         };
         let copied = core::cmp::min(recv, staging.len());
         if copied > 0 {
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..copied]) {
+            if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                &ctx.aspace,
+                args[1],
+                &staging[..copied],
+            )
+            .await
+            {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }
-        if let Err(errno) = write_sockaddr_nl(ctx, args[4], args[5]) {
+        if let Err(errno) = write_recvfrom_sockaddr_nl_wait(ctx, args[4], args[5]).await {
             return SyscallResult::Error(errno_to_i32(errno));
         }
         return SyscallResult::Return(recv as i64);
@@ -1135,8 +1294,13 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         // message, so a bad buffer (e.g. -1) returns EFAULT without dropping the
         // queued message (a later recv must still see it).
         if staging_len > 0 && !flags.contains(SendRecvFlags::MSG_PEEK) {
-            if let Err(errno) =
-                validate_user_range(ctx, args[1], staging_len, UserAccessKind::Write)
+            let Some(range) = covering_user_range(args[1], staging_len) else {
+                return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
+            };
+            if let Err(errno) = ctx
+                .aspace
+                .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
+                .await
             {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
@@ -1149,22 +1313,32 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         match outcome {
             StepOutcome::Done(recv) => {
                 if recv.bytes > 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..recv.bytes])
+                    if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                        &ctx.aspace,
+                        args[1],
+                        &staging[..recv.bytes],
+                    )
+                    .await
                     {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
                 if let Some(source) = recv.source {
-                    if let Err(errno) = write_sockaddr_endpoint(ctx, args[4], args[5], source) {
+                    if let Err(errno) =
+                        write_recvfrom_sockaddr_endpoint_wait(ctx, args[4], args[5], source).await
+                    {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 } else if let Some(source) = recv.unix_source {
-                    if let Err(errno) = write_sockaddr_un(ctx, args[4], args[5], Some(source)) {
+                    if let Err(errno) =
+                        write_recvfrom_sockaddr_un_wait(ctx, args[4], args[5], Some(source)).await
+                    {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 } else if let Some(source) = recv.packet_source {
-                    if let Err(errno) = write_sockaddr_ll(ctx, args[4], args[5], source) {
+                    if let Err(errno) =
+                        write_recvfrom_sockaddr_ll_wait(ctx, args[4], args[5], source).await
+                    {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }

@@ -825,7 +825,23 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// EOF. The VFS PageContainer path provides one coherent cache per inode
     /// and withdraws cached suffix pages after this operation succeeds.
     pub fn set_inode_size(&mut self, inode: InodeNo, new_size: u64) -> Result<()> {
+        let current = self.read_inode(inode)?;
+        self.set_inode_size_and_times(inode, new_size, current.mtime)
+    }
+
+    /// Persist a content-size change and its modification timestamps in the
+    /// same inode-table update. Explicit truncate and page-cache writeback use
+    /// this entry point so observers never see new bytes with an epoch-zero
+    /// or otherwise stale `mtime`.
+    pub fn set_inode_size_and_times(
+        &mut self,
+        inode: InodeNo,
+        new_size: u64,
+        now_sec: u32,
+    ) -> Result<()> {
         let mut disk_inode = self.read_inode(inode)?;
+        disk_inode.mtime = now_sec;
+        disk_inode.ctime = now_sec;
         if new_size < disk_inode.size && disk_inode.flags & Inode::EXTENTS_FL != 0 {
             let keep_blocks = div_ceil_u64(new_size, BLOCK_SIZE as u64);
             let header = ExtentHeader::parse(disk_inode.extent_root_bytes())?;

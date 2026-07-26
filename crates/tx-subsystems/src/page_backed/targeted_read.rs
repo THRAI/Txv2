@@ -121,3 +121,52 @@ pub fn read_exact_at(
 
     V3::done(())
 }
+
+/// Wait-capable targeted read used by asynchronous kernel loaders.
+///
+/// A `PageContainer` serialises first materialisation of a file page.  Under
+/// SMP, another hart reading the same executable or interpreter can therefore
+/// legitimately return `Yield(OnWaitSource)` while the owner fetches that
+/// page.  This is an internal scheduling condition, not an `EIO`/`EBUSY`
+/// condition visible to `execve(2)`.
+///
+/// Each attempt owns a fresh epoch guard and drops it before awaiting.  After
+/// notification the complete bounded read is retried; this is safe because the
+/// destination is a private kernel buffer and previously copied bytes are
+/// simply overwritten with the same file contents.
+pub async fn read_exact_at_wait(pc: &PageContainer, off: u64, out: &mut [u8]) -> Result<(), Errno> {
+    use crate::execution::WaitToken;
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
+    loop {
+        let outcome = {
+            let guard = crate::page_backed::adapter::step_engine::guard();
+            read_exact_at(pc, off, out, &guard)
+        };
+
+        match outcome {
+            V3::Done(()) => return Ok(()),
+            V3::Err(error) => return Err(error.into()),
+            V3::Continue { .. } => {
+                // `read_exact_at` currently collapses a materializer
+                // Continue into EAGAIN, so this is only future-proofing for a
+                // backend that adopts resumable local progress.
+                continue;
+            }
+            V3::Yield { shape, .. } => {
+                let Some((source, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    return Err(Errno::EIO);
+                };
+                let token = WaitToken::new(source, interests);
+                if let Some(wait) = crate::wait_source::wait_on_token(token) {
+                    let _ = wait.await;
+                }
+                // If the source disappeared before registration, its owner
+                // has already completed or aborted publication.  Retry and
+                // observe the resulting page-cache state.
+            }
+        }
+    }
+}

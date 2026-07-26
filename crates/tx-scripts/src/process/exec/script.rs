@@ -47,7 +47,7 @@ use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::MountFlags;
-use tx_subsystems::page_backed::{read_exact_at, PageContainer};
+use tx_subsystems::page_backed::{read_exact_at_wait, PageContainer};
 use tx_subsystems::process::adapter::wait_routing::Mask;
 use tx_subsystems::process::{
     step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
@@ -182,6 +182,20 @@ pub static EXEC_LAST_OPEN_ERRNO: core::sync::atomic::AtomicI32 =
 /// Linux-flavoured exec errors. Mapped to `-errno` by the syscall arm
 /// (Phase 6 of the ELF-loader plan, out of scope here).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExecIoStage {
+    MainOpen,
+    MainHeader,
+    InterpreterPath,
+    InterpreterOpen,
+    InterpreterHeader,
+    BuildAddressSpace,
+    MainPartialPage,
+    InterpreterPartialPage,
+    InitialStack,
+}
+
+/// Linux-flavoured exec errors. Mapped to `-errno` by the syscall arm.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExecError {
     /// `ENAMETOOLONG`. Path component or full path too long.
     PathTooLong,
@@ -209,9 +223,21 @@ pub enum ExecError {
     Busy,
     /// `EIO`. Page-cache / direct-map I/O failure.
     IoError,
+    /// `EIO` with the reversible exec phase that produced it.  Keeping
+    /// the stage in the returned value is concurrency-safe: unlike a
+    /// global "last phase" variable, simultaneous Cargo execs cannot
+    /// overwrite one another's diagnosis.
+    IoAt(ExecIoStage),
 }
 
 impl ExecError {
+    fn with_io_stage(self, stage: ExecIoStage) -> Self {
+        match self {
+            Self::IoError => Self::IoAt(stage),
+            other => other,
+        }
+    }
+
     fn from_walker_errno(err: Errno) -> Self {
         match err {
             Errno::ENOENT => Self::PathNotFound,
@@ -298,7 +324,7 @@ impl ExecError {
             // EBUSY
             ExecError::Busy => -16,
             // EIO
-            ExecError::IoError => -5,
+            ExecError::IoError | ExecError::IoAt(_) => -5,
         }
     }
 }
@@ -347,7 +373,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
 ) -> Result<(), ExecError> {
     // Shebang recursion guard (Linux limit: 4).
     if depth > SHEBANG_MAX_DEPTH {
-        return Err(ExecError::IoError); // maps to ELOOP
+        return Err(ExecError::SymlinkLoop);
     }
 
     // ---- ASLR helpers (inline closures) ----------------------------
@@ -415,7 +441,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
             V3::Err(err) => {
                 EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
-                Err(ExecError::from_walker_errno(Errno::from(err)))
+                Err(ExecError::from_walker_errno(Errno::from(err))
+                    .with_io_stage(ExecIoStage::MainOpen))
             }
         };
         drop(guard);
@@ -468,18 +495,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         return Err(ExecError::NotExecutable);
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
-    {
-        use StepOutcome as V3;
-        let guard = step_engine::guard();
-        let outcome = read_exact_at(&file_pc, 0, &mut header_bytes, &guard);
-        let result = match outcome {
-            V3::Done(()) => Ok(()),
-            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
-        };
-        drop(guard);
-        result?;
-    }
+    read_exact_at_wait(&file_pc, 0, &mut header_bytes)
+        .await
+        .map_err(|err| ExecError::from_read_errno(err).with_io_stage(ExecIoStage::MainHeader))?;
 
     // ===== Phase 2.5 — shebang (#!) + no-shebang script dispatch =====
     //
@@ -617,19 +635,14 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             let want = core::cmp::min(interp_len as usize, USER_PAGE_SIZE as usize);
             if want > 0 {
                 let mut path_buf: Vec<u8> = alloc::vec![0u8; want];
-                use StepOutcome as V3;
-                let guard = step_engine::guard();
-                let outcome = read_exact_at(&file_pc, interp_off, &mut path_buf, &guard);
-                drop(guard);
-                match outcome {
-                    V3::Done(()) => {
-                        let path = path_buf.split(|&b| b == 0).next().unwrap_or(&[]).to_vec();
-                        if !path.is_empty() {
-                            parsed.interpreter_path = Some(path);
-                        }
-                    }
-                    V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                    V3::Err(err) => return Err(ExecError::from_read_errno(err.into())),
+                read_exact_at_wait(&file_pc, interp_off, &mut path_buf)
+                    .await
+                    .map_err(|err| {
+                        ExecError::from_read_errno(err).with_io_stage(ExecIoStage::InterpreterPath)
+                    })?;
+                let path = path_buf.split(|&b| b == 0).next().unwrap_or(&[]).to_vec();
+                if !path.is_empty() {
+                    parsed.interpreter_path = Some(path);
                 }
             }
         }
@@ -753,7 +766,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             }
             match outcome {
                 V3::Done(file) => file,
-                V3::Err(_) => return Err(ExecError::IoError),
+                V3::Err(err) => {
+                    EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
+                    return Err(ExecError::from_walker_errno(Errno::from(err))
+                        .with_io_stage(ExecIoStage::InterpreterOpen));
+                }
                 _ => return Err(ExecError::Busy),
             }
         };
@@ -764,12 +781,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         };
         // Read interpreter ELF header + program headers.
         let mut interp_hdr = [0u8; 4096];
-        let guard = step_engine::guard();
-        let outcome = read_exact_at(&interp_pc, 0, &mut interp_hdr, &guard);
-        match outcome {
-            StepOutcome::Done(()) => {}
-            _ => return Err(ExecError::IoError),
-        }
+        read_exact_at_wait(&interp_pc, 0, &mut interp_hdr)
+            .await
+            .map_err(|err| {
+                ExecError::from_read_errno(err).with_io_stage(ExecIoStage::InterpreterHeader)
+            })?;
         let interp_parsed = parse_image_plan(&interp_hdr).map_err(ExecError::from_parse_error)?;
         let mut interp_segs: Vec<ParsedLoadSegment> = Vec::new();
         let interp_lowest_vaddr = interp_parsed
@@ -876,8 +892,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // its own per-call guards internally. Per
     // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` callers must NOT
     // hold a guard at the call site.
-    let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan)
-        .map_err(ExecError::from_build_aspace_error)?;
+    let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan).map_err(|err| {
+        ExecError::from_build_aspace_error(err).with_io_stage(ExecIoStage::BuildAddressSpace)
+    })?;
 
     // ===== Phase 4a.2 — register interpreter LOAD segments =========
     //
@@ -1028,19 +1045,16 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             .checked_add(partial_start - segment.vaddr)
             .ok_or(ExecError::NotExecutable)?;
         let mut buf = alloc::vec![0u8; partial_in_page as usize];
-        {
-            use StepOutcome as V3;
-            let guard = step_engine::guard();
-            match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
-                V3::Done(()) => {}
-                V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                V3::Err(_) => return Err(ExecError::NotExecutable),
-            }
-        }
+        read_exact_at_wait(&segment.backing, file_off, &mut buf)
+            .await
+            .map_err(|err| {
+                ExecError::from_read_errno(err).with_io_stage(ExecIoStage::MainPartialPage)
+            })?;
         match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
             StepOutcome::Done(()) => {}
             StepOutcome::Err(err) => {
-                return Err(ExecError::from_populate_errno(err.into()));
+                return Err(ExecError::from_populate_errno(err.into())
+                    .with_io_stage(ExecIoStage::MainPartialPage));
             }
             _ => return Err(ExecError::Busy),
         }
@@ -1065,19 +1079,17 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 .checked_add(partial_start - segment.vaddr)
                 .ok_or(ExecError::NotExecutable)?;
             let mut buf = alloc::vec![0u8; partial_in_page as usize];
-            {
-                use StepOutcome as V3;
-                let guard = step_engine::guard();
-                match read_exact_at(interp_pc, file_off, &mut buf, &guard) {
-                    V3::Done(()) => {}
-                    V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                    V3::Err(_) => return Err(ExecError::NotExecutable),
-                }
-            }
+            read_exact_at_wait(interp_pc, file_off, &mut buf)
+                .await
+                .map_err(|err| {
+                    ExecError::from_read_errno(err)
+                        .with_io_stage(ExecIoStage::InterpreterPartialPage)
+                })?;
             match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
                 StepOutcome::Done(()) => {}
                 StepOutcome::Err(err) => {
-                    return Err(ExecError::from_populate_errno(err.into()));
+                    return Err(ExecError::from_populate_errno(err.into())
+                        .with_io_stage(ExecIoStage::InterpreterPartialPage));
                 }
                 _ => return Err(ExecError::Busy),
             }
@@ -1159,7 +1171,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     {
         StepOutcome::Done(()) => {}
         StepOutcome::Err(err) => {
-            return Err(ExecError::from_populate_errno(err.into()));
+            return Err(
+                ExecError::from_populate_errno(err.into()).with_io_stage(ExecIoStage::InitialStack)
+            );
         }
         _ => return Err(ExecError::Busy),
     }
@@ -1173,6 +1187,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let exec_guard = process.begin_exec_transaction().ok_or(ExecError::Busy)?;
     let _collapsed = process
         .collapse_threads_for_exec_in(thread, &exec_guard)
+        .await
         .ok_or(ExecError::Busy)?;
 
     // ===== Phase 6 — address-space visibility boundary ===============
@@ -1269,6 +1284,10 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // vfork completion: if the parent is waiting on CLONE_VFORK,
     // unblock it now that exec has completed.
     process.fire_exit_source(Mask::from_bits(1));
+    // The sibling-collapse episode is one-shot per exec. Clear it only after
+    // every post-swap commit is complete; lifecycle remains Execing until the
+    // guard drops immediately after this function returns.
+    process.clear_exec_group_exit_in(&exec_guard);
 
     // ===== Phase 8 — userspace re-entry ==============================
     //

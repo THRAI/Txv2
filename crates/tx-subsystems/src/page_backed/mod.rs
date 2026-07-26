@@ -36,7 +36,7 @@ pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::{FilesystemStats, FsPageBacking};
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
 pub use reflink::{cow_replace_into_private, install_shared_page};
-pub use targeted_read::read_exact_at;
+pub use targeted_read::{read_exact_at, read_exact_at_wait};
 pub use user_buffer::{
     step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
     ReadToUserOp, WriteFromUserOp,
@@ -1008,6 +1008,13 @@ impl PageContainer {
             }
 
             let fetch_id = state.allocate_file_fetch_id();
+            if let Some(wait) = state.file_page_waits.get(&page) {
+                // A retained level-triggered source may still carry the
+                // completion bit from an earlier fetch of this page.  A new
+                // owner establishes a new generation of work; clear readiness
+                // before publishing the in-flight record under the same lock.
+                notification::reset_page_ready(wait);
+            }
             state
                 .in_flight_file_pages
                 .insert(page, FilePageFetch::new(fetch_id));

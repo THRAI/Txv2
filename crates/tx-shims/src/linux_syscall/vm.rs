@@ -1202,6 +1202,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
     let bitset = args[5] as u32;
 
     let op = op_full & FUTEX_CMD_MASK;
+    let private = (op_full & FUTEX_PRIVATE_FLAG) != 0;
 
     match op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
@@ -1322,6 +1323,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 woken: false,
                 waiting: false,
                 registered_source_id: None,
+                private,
             };
             match drive(
                 op,
@@ -1369,6 +1371,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 val,
                 wake_mask,
                 MailboxSchedulerHint::WakeHandoff,
+                private,
             );
             if trace_wake {
                 emit_futex_result(b"debug.futex.wake.result", &result);
@@ -1393,12 +1396,13 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             }
             let mut script_ctx = build_subject_script_ctx(ctx);
             let guard = step_engine::guard();
-            let outcome = tx_subsystems::futex::step_futex_requeue_in(
+            let outcome = tx_subsystems::futex::step_futex_requeue_scoped_in(
                 &ctx.aspace,
                 uaddr,
                 uaddr2,
                 val,
                 val2,
+                private,
                 &guard,
             );
             drop(guard);
@@ -1415,11 +1419,11 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             if uaddr2 == 0 {
                 return SyscallResult::Error(EINVAL_VALUE);
             }
-            let first = match futex_wake_count(ctx, uaddr, val) {
+            let first = match futex_wake_count(ctx, uaddr, val, private) {
                 Ok(woken) => woken,
                 Err(result) => return result,
             };
-            let second = match futex_wake_count(ctx, uaddr2, val2) {
+            let second = match futex_wake_count(ctx, uaddr2, val2, private) {
                 Ok(woken) => woken,
                 Err(result) => return result,
             };
@@ -1427,7 +1431,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
         }
         FUTEX_LOCK_PI => futex_pi_lock(ctx, uaddr, false),
         FUTEX_TRYLOCK_PI => futex_pi_lock(ctx, uaddr, true),
-        FUTEX_UNLOCK_PI => futex_pi_unlock(ctx, uaddr),
+        FUTEX_UNLOCK_PI => futex_pi_unlock(ctx, uaddr, private),
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /
         // UNLOCK_PI / TRYLOCK_PI / WAIT_BITSET / WAKE_BITSET — out
         // of scope for v1. musl's libc init only emits FUTEX_WAIT
@@ -1450,6 +1454,7 @@ pub(super) fn sys_futex_oneshot_with_wake_hint(
     let val = args[2] as u32;
     let bitset = args[5] as u32;
     let op = op_full & FUTEX_CMD_MASK;
+    let private = (op_full & FUTEX_PRIVATE_FLAG) != 0;
 
     match op {
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
@@ -1465,7 +1470,7 @@ pub(super) fn sys_futex_oneshot_with_wake_hint(
             if trace_wake {
                 emit_futex_wake_entry(uaddr, val, op, wake_mask);
             }
-            let result = futex_wake_oneshot(ctx, uaddr, val, wake_mask, wake_hint);
+            let result = futex_wake_oneshot(ctx, uaddr, val, wake_mask, wake_hint, private);
             if trace_wake {
                 emit_futex_result(b"debug.futex.wake.result", &result);
             }
@@ -1481,15 +1486,27 @@ fn futex_wake_oneshot(
     n: u32,
     wake_mask: u64,
     wake_hint: MailboxSchedulerHint,
+    private: bool,
 ) -> SyscallResult {
-    match futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, wake_hint) {
+    match futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, wake_hint, private) {
         Ok(woken) => SyscallResult::Return(woken as i64),
         Err(result) => result,
     }
 }
 
-fn futex_wake_count(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> Result<u32, SyscallResult> {
-    futex_wake_count_masked(ctx, uaddr, n, tx_subsystems::futex::FUTEX_WAKE_MASK)
+fn futex_wake_count(
+    ctx: &SyscallCtx<'_>,
+    uaddr: u64,
+    n: u32,
+    private: bool,
+) -> Result<u32, SyscallResult> {
+    futex_wake_count_masked(
+        ctx,
+        uaddr,
+        n,
+        tx_subsystems::futex::FUTEX_WAKE_MASK,
+        private,
+    )
 }
 
 fn futex_wake_count_masked(
@@ -1497,8 +1514,16 @@ fn futex_wake_count_masked(
     uaddr: u64,
     n: u32,
     wake_mask: u64,
+    private: bool,
 ) -> Result<u32, SyscallResult> {
-    futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, MailboxSchedulerHint::WakeHandoff)
+    futex_wake_count_masked_with_hint(
+        ctx,
+        uaddr,
+        n,
+        wake_mask,
+        MailboxSchedulerHint::WakeHandoff,
+        private,
+    )
 }
 
 fn futex_wake_count_masked_with_hint(
@@ -1507,14 +1532,16 @@ fn futex_wake_count_masked_with_hint(
     n: u32,
     wake_mask: u64,
     wake_hint: MailboxSchedulerHint,
+    private: bool,
 ) -> Result<u32, SyscallResult> {
     let guard = step_engine::guard();
-    let outcome = tx_subsystems::futex::step_futex_wake_masked_with_hint_in(
+    let outcome = tx_subsystems::futex::step_futex_wake_masked_with_hint_scoped_in(
         &ctx.aspace,
         uaddr,
         n,
         wake_mask,
         wake_hint,
+        private,
         &guard,
     );
     drop(guard);
@@ -1549,10 +1576,16 @@ fn futex_pi_lock(ctx: &SyscallCtx<'_>, uaddr: u64, try_only: bool) -> SyscallRes
     }
 }
 
-fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64) -> SyscallResult {
+fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64, private: bool) -> SyscallResult {
     let owner = futex_owner_tid(ctx);
     let guard = step_engine::guard();
-    let outcome = tx_subsystems::futex::step_futex_unlock_pi_in(&ctx.aspace, uaddr, owner, &guard);
+    let outcome = tx_subsystems::futex::step_futex_unlock_pi_scoped_in(
+        &ctx.aspace,
+        uaddr,
+        owner,
+        private,
+        &guard,
+    );
     drop(guard);
     match outcome {
         StepOutcome::Done(_) => SyscallResult::Return(0),

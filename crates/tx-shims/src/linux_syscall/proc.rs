@@ -514,7 +514,7 @@ pub(super) fn sys_setns(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
 // PR-9 phase 3b: StepOp-driven via ExecOp (10-phase state
 // machine).  Async operations yield; the drive loop parks on I/O.
 // Remaining synchronous phases return Continue.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -594,7 +594,17 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
             ctx.process.notify_vfork_done();
             SyscallResult::ExecCommitted
         }
-        Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
+        Err(e) => {
+            if matches!(e, ExecError::IoError | ExecError::IoAt(_)) {
+                let path = core::str::from_utf8(&path_buf).unwrap_or("<non-utf8>");
+                tx_hal::console_write_str::<P>(&alloc::format!(
+                    "txkernel:execdiag:path={path}:error={e:?}:open_errno={}\n",
+                    tx_scripts::process::exec::EXEC_LAST_OPEN_ERRNO
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                ));
+            }
+            SyscallResult::Error(execve_errno_magnitude(e))
+        }
     }
 }
 
@@ -675,10 +685,10 @@ fn is_identity_noop_helper(path: &[u8]) -> bool {
 ///    fresh trap frame's `a0`); the child re-enters userspace with
 ///    `a0 == 0` from the seed.
 ///
-/// Synchronous (no `.await`): `step_fork` is itself synchronous in
-/// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
-/// v1's single-thread-per-process model). The function is non-`async`
-/// to keep the seam minimal.
+/// This synchronous entry is reserved for `CLONE_THREAD`, whose
+/// address space is shared and therefore needs no COW snapshot.
+/// Process creation is routed through [`sys_clone`] so an address-space
+/// reservation conflict can park and retry without exposing `EAGAIN`.
 pub(super) fn sys_clone_oneshot<P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
@@ -699,8 +709,11 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
     // thread clones we accept any signal (including zero — musl
     // sets the lower byte to zero when CLONE_THREAD is set).
     let clone_thread = (flags & CLONE_THREAD) != 0;
-    if !clone_thread && flags & SIGCHLD == 0 {
-        return Some(SyscallResult::Error(EINVAL_VALUE));
+    // Process fork may have to wait for the parent's VM RangeLock. Route every
+    // non-thread clone through the async syscall body below; only CLONE_THREAD
+    // remains a genuinely one-shot fast path.
+    if !clone_thread {
+        return None;
     }
     let clone_vm = (flags & CLONE_VM) != 0;
     let clone_sighand = (flags & CLONE_SIGHAND) != 0;
@@ -1049,30 +1062,34 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 
     let tls = if clone_settls { tls_arg } else { 0 };
 
-    // ── Non-CLONE_THREAD (fork) path with CLONE_VFORK ─────────────
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let fork_result = {
-        let mut op = tx_subsystems::process::execution::ForkOp::<P> {
-            parent: &ctx.process,
+    // ── Non-CLONE_THREAD process fork ─────────────────────────────
+    //
+    // VM preparation is wait-capable and side-effect free until it owns the
+    // full parent address-space reservation. Process publication remains a
+    // bounded one-shot commit after that preparation completes.
+    let fork_result = tx_subsystems::process::fork_with_options_wait::<P>(
+        &ctx.process,
+        tx_subsystems::process::ForkOptions {
             clone_vm,
             clone_sighand,
             clone_newipc,
             clone_newnet,
             clone_newns,
-            _pmap: core::marker::PhantomData,
-        };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(r) => r,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
-        }
-    };
+        },
+    )
+    .await;
     let child = match fork_result {
         Ok(c) => c,
         Err(tx_subsystems::process::ForkError::ParentZombie) => {
             return SyscallResult::Error(ESRCH_VALUE);
         }
-        Err(tx_subsystems::process::ForkError::Vm(_)) => {
+        Err(tx_subsystems::process::ForkError::Vm(tx_subsystems::vm::VmMapError::WouldBlock)) => {
+            // The wait-capable path consumes ordinary lock contention. Seeing
+            // WouldBlock here means the coordination contract was violated.
             return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Vm(_)) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
         }
         Err(tx_subsystems::process::ForkError::Zone(_)) => {
             return SyscallResult::Error(ENOMEM_VALUE);
@@ -1302,7 +1319,20 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
                     return SyscallResult::Error(EINTR_VALUE);
                 }
-                await_wait_source(ctx, source, interests).await;
+                // Commit the subscription and recheck the child state under
+                // the exit source's notification lock. This closes the SMP
+                // window between the no-zombie observation in op.step() and
+                // publishing the parent as an exit-source subscriber.
+                let parked = super::await_wait_source_if(ctx, source, interests, || {
+                    tx_subsystems::process::execution::waitpid_would_block(
+                        &ctx.process,
+                        target,
+                    )
+                })
+                .await;
+                if !parked {
+                    continue;
+                }
             }
             WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
             _ => {}

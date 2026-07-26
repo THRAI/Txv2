@@ -570,7 +570,7 @@ impl Future for WaitFuture {
         }
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if this.mailbox.poll().is_some() {
+            if this.mailbox.poll().is_some() || this.mailbox.take_overflow() {
                 true
             } else {
                 subscription.update(
@@ -620,7 +620,7 @@ where
         }
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if this.mailbox.poll().is_some() {
+            if this.mailbox.poll().is_some() || this.mailbox.take_overflow() {
                 true
             } else {
                 subscription.update(
@@ -670,7 +670,7 @@ where
         }
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if this.mailbox.poll().is_some() {
+            if this.mailbox.poll().is_some() || this.mailbox.take_overflow() {
                 true
             } else {
                 subscription.update(

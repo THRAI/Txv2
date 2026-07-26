@@ -568,6 +568,14 @@ tx-ext4 implements two traits (`FsPageBacking`, `FsOps`), consumes one trait (`B
 2. **Read path.** `read(2)` on any regular file in the filesystem returns correct data. Works through VFS walker → RNode PageBacked(File) PC → `FsPageBacking::fetch_page` → extent walk → block device read → frame installed. Yields on disk I/O.
 3. **Directory traversal.** `readdir(2)`, `getdents(2)` work over both linear and htree directories. `lookup` walks through htree.
 4. **Write path.** `write(2)`, `truncate(2)`, `ftruncate(2)` correctly mutate file data. Sizes grow through the extent allocator. `flush_page` produces correct on-disk content.
+
+   File timestamps use the kernel's single `CLOCK_REALTIME` timebase. The
+   platform monotonic source is installed once at boot and combined with the
+   wall-clock offset; filesystem code must not invent an independent epoch or
+   pass zero as "now". Creation initializes atime/mtime/ctime from that clock.
+   Page-cache writeback and explicit truncate commit size, mtime, and ctime in
+   the same inode-table update, so build tools cannot observe new content with
+   an epoch-zero or stale modification time.
 5. **Namespace mutations.** `creat`, `open(O_CREAT)`, `unlink`, `rmdir`, `mkdir`, `rename`, `link`, `symlink` all work and leave the filesystem consistent. Unlinked-but-open holds correctly via `destroy_inode` triggered by payload-liveness loss.
 6. **fsync.** `fsync(2)` flushes data pages and commits any pending journal transaction containing the file's metadata.
 7. **Journal correctness.** Crash (simulated via hard-killing the emulator) at arbitrary points during active mutations, remount, run `e2fsck -n`: filesystem reported as clean, no corruption.

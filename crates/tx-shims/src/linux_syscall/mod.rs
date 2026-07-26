@@ -46,7 +46,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
+use tx_hal::{AuxvIf, CacheIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
 use tx_observe::encode::{
     arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
     syscall_exit_tag,
@@ -493,7 +493,10 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
+pub async fn dispatch<
+    'a,
+    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf + tx_hal::ConsoleIf,
+>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -557,11 +560,11 @@ pub fn dispatch_pthread_hot_oneshot(
     Some(result)
 }
 
-/// One-shot syscall lane for non-vfork `clone`.
+/// One-shot syscall lane for `CLONE_THREAD`.
 ///
-/// This keeps pthread `CLONE_THREAD` and regular non-vfork fork out of the
-/// broad async dispatcher carried by `run_thread`. `CLONE_VFORK` is excluded
-/// because it intentionally parks the parent until child exec/exit.
+/// Process fork can contend on the parent VM and therefore belongs to the
+/// boxed async dispatcher. Keeping only pthread creation here prevents the
+/// large wait-capable fork state machine from inflating every thread task.
 pub fn dispatch_clone_oneshot<P: PmapIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
@@ -572,7 +575,7 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
         return None;
     }
     let flags = req.args[0];
-    if (flags & CLONE_VFORK) != 0 && (flags & CLONE_THREAD) == 0 {
+    if (flags & CLONE_THREAD) == 0 {
         return None;
     }
     // Net/mount-namespace clones take the async fork path (namespace creation +
@@ -586,7 +589,7 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     let prev = tx_observe::set_current_parent_span(l0_span);
     let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
     let result = sys_clone_oneshot::<P>(req.args, &ctx)
-        .expect("dispatch_clone_oneshot prefilters vfork-only async clone");
+        .expect("dispatch_clone_oneshot prefilters process-fork async clone");
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
@@ -893,7 +896,10 @@ fn syscall_publishes_net_clock(nr: u64) -> bool {
         || nr == NR_PSELECT6_TIME64
 }
 
-async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
+async fn dispatch_inner<
+    'a,
+    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf + tx_hal::ConsoleIf,
+>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -1003,7 +1009,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_SPLICE => sys_splice::<P>(req.args, ctx).await,
         nr if nr == NR_TEE => sys_tee(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
-        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx).await,
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
@@ -1137,7 +1143,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
             ctx,
         ),
         // fd-ops Wave 3 — anonymous pipe.
-        nr if nr == NR_PIPE2 => sys_pipe2(req.args[0], req.args[1] as u32, ctx),
+        nr if nr == NR_PIPE2 => sys_pipe2(req.args[0], req.args[1] as u32, ctx).await,
         // fd-ops Wave 4 — `lseek(2)`. Non-async; pure offset compute
         // through `OpenFile::step_lseek`. ESPIPE for non-seekable
         // backings (TTY / chardev / pipe), EISDIR for directories,
@@ -1429,7 +1435,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
 /// `flags` and `cpu_id` are currently ignored (must be 0).
-fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
+fn sys_membarrier<P: SmpIf + CacheIf + TimeIf>(args: &[u64; 6]) -> SyscallResult {
     let cmd = args[0];
     let flags = args[1] as u32;
 
@@ -1444,7 +1450,16 @@ fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
         | MEMBARRIER_CMD_GLOBAL_EXPEDITED
         | MEMBARRIER_CMD_PRIVATE_EXPEDITED
         | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
-            let targets = P::online_cpus();
+            // The issuing hart participates locally; only remote harts need
+            // an IPI and acknowledgement. Sending an SBI software interrupt
+            // to the current hart while omitting its software pending bit
+            // leaves SSIP permanently asserted and livelocks the trap entry.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            if cmd == MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE {
+                P::fence_i_all();
+            }
+
+            let targets = P::online_cpus().without(P::current_cpu_id());
             if targets.is_empty() {
                 return SyscallResult::Return(0);
             }
@@ -1454,7 +1469,19 @@ fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
             // executed the barrier and acked. The IPI handler on the
             // target hart runs `fence(SeqCst)` + ack before
             // returning to its interrupt context.
-            P::wait_for_ipi_ack_cpus(targets, IpiKind::Membarrier);
+            const MEMBARRIER_ACK_TIMEOUT_NS: u64 = 2_000_000_000;
+            let deadline = P::read_ns().saturating_add(MEMBARRIER_ACK_TIMEOUT_NS);
+            loop {
+                let acked = P::ipi_ack_cpus(IpiKind::Membarrier);
+                if (acked.bits() & targets.bits()) == targets.bits() {
+                    break;
+                }
+                if P::read_ns() >= deadline {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                core::hint::spin_loop();
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             SyscallResult::Return(0)
         }
 

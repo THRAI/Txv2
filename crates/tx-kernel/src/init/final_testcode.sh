@@ -35,38 +35,12 @@ run_cagent() {
     cd "$TEST_BASE" || return 1
     echo "TX_FINAL_INIT cagent=start base=$TEST_BASE script=$TEST_SCRIPT"
 
-    # The published CAgent script starts simple_llm_server before its ten
-    # background cases and then uses a bare `wait`.  Because the server is
-    # persistent, that wait cannot finish by itself.  All cases have a maximum
-    # timeout of 35 seconds.  Patch a temporary copy immediately after it has
-    # captured the exact server PID; using killall here is not reliable because
-    # execve does not yet refresh Txv2's /proc comm field.
-    cagent_patched=/tmp/tx-cagent_testcode.sh
-    if [ -x ./busybox ]; then
-        ./busybox sed '/^SERVER_PID=\$!$/a\
-( sleep 45; kill -9 "$SERVER_PID" 2>/dev/null ) \& # TX_CAGENT_SERVER_WATCHDOG' \
-            "$TEST_SCRIPT" > "$cagent_patched"
-        patch_rc=$?
-        ./busybox grep -q TX_CAGENT_SERVER_WATCHDOG "$cagent_patched"
-        marker_rc=$?
-    else
-        sed '/^SERVER_PID=\$!$/a\
-( sleep 45; kill -9 "$SERVER_PID" 2>/dev/null ) \& # TX_CAGENT_SERVER_WATCHDOG' \
-            "$TEST_SCRIPT" > "$cagent_patched"
-        patch_rc=$?
-        grep -q TX_CAGENT_SERVER_WATCHDOG "$cagent_patched"
-        marker_rc=$?
-    fi
-    if [ "$patch_rc" -ne 0 ] || [ "$marker_rc" -ne 0 ]; then
-        echo "TX_FINAL_INIT cagent=patch-failed sed_rc=$patch_rc marker_rc=$marker_rc"
-        rm -f "$cagent_patched"
-        return 126
-    fi
-
-    echo "TX_FINAL_INIT cagent=server-watchdog mode=pid timeout=45s"
-    /bin/bash "$cagent_patched"
+    # The current official script records the ten test-job PIDs, waits only
+    # for those jobs, and then terminates simple_llm_server itself. Execute it
+    # unchanged: the old watchdog workaround could outlive CAgent and kill a
+    # PID reused by the following BuildStorm run.
+    /bin/bash "$TEST_SCRIPT"
     cagent_rc=$?
-    rm -f "$cagent_patched"
     echo "TX_FINAL_INIT cagent=done rc=$cagent_rc"
     return "$cagent_rc"
 }
@@ -85,13 +59,18 @@ run_buildstorm() {
     return "$buildstorm_rc"
 }
 
-echo "TX_FINAL_INIT start mode=buildstorm-only"
+echo "TX_FINAL_INIT start mode=final-all"
+
+run_cagent
+cagent_rc=$?
+sync
+
 run_buildstorm
 buildstorm_rc=$?
 sync
-echo "TX_FINAL_INIT done mode=buildstorm-only buildstorm_rc=$buildstorm_rc"
+echo "TX_FINAL_INIT done mode=final-all cagent_rc=$cagent_rc buildstorm_rc=$buildstorm_rc"
 
-if [ "$buildstorm_rc" -ne 0 ]; then
+if [ "$cagent_rc" -ne 0 ] || [ "$buildstorm_rc" -ne 0 ]; then
     exit 1
 fi
 exit 0

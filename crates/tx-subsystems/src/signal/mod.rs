@@ -695,6 +695,43 @@ pub fn thread_pending_signal_interrupts(
     }
 }
 
+/// True iff a pending deliverable signal must end `rt_sigsuspend`.
+///
+/// Unlike ordinary restartable slow syscalls, `sigsuspend(2)` always returns
+/// `EINTR` after a caught handler, even when that handler was installed with
+/// `SA_RESTART`. Ignored signals still do not end the suspension.
+pub fn thread_pending_signal_ends_sigsuspend(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+) -> bool {
+    let Ok(thread_payload) = thread.upgrade_operational() else {
+        return false;
+    };
+    let guard = step_engine::guard();
+    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
+        return false;
+    };
+    drop(guard);
+    let Ok(payload) = proc.upgrade_operational() else {
+        return false;
+    };
+
+    // Inspect every deliverable bit. An ignored lower-numbered signal must not
+    // hide a caught higher-numbered signal and leave sigsuspend asleep.
+    let mask = thread_payload.signal_mask();
+    let mut pending = thread_payload.pending().deliverable_bits(mask)
+        | payload.group_pending().deliverable_bits(mask);
+    while let Some(sig) = lowest_signum_bit(pending) {
+        pending &= !sig.bit();
+        match payload.sig_actions().get(sig) {
+            SigDisposition::Ignore => {}
+            SigDisposition::Default
+                if matches!(default_action(sig), DefaultAction::Ignore) => {}
+            SigDisposition::Default | SigDisposition::Handler(_) => return true,
+        }
+    }
+    false
+}
+
 fn refresh_deliverable_signal_summary_fast(
     thread: &Cap<crate::thread_runtime::ThreadIdentity>,
 ) -> bool {

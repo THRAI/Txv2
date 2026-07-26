@@ -113,8 +113,13 @@ pub(super) fn destroy_pmap_root_from_bag<State>(bag: &BootStaticBag<State>, root
     // translations before returning any child PT-node to the frame allocator;
     // otherwise a hardware page walk can continue through a page-table page
     // that has already been reused for unrelated kernel data.
-    let invalidated = invalidate_destroyed_root(bag, root_phys);
+    leave_destroyed_root_on_current_hart(bag, root_phys);
     crate::wait_for_asid_quiescence(root.asid());
+    // Residency reaching zero proves that no hart can still page-walk this
+    // root.  It does not prove that tagged TLB entries disappeared from harts
+    // which used the ASID earlier.  Flush every online hart before either the
+    // page-table pages or the numeric ASID can be reused.
+    let invalidated = invalidate_asid_before_reuse(root.asid());
 
     let table = unsafe { page_table_mut_from_phys(root_phys) };
     for slot in &mut table.0[..256] {
@@ -302,17 +307,10 @@ pub(super) fn commit_mapping_from_root(
             l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;
         }
     }
-    // 带 ASID 标记的硬件（QEMU）：此处不需要 fence。提交都是 invalid->valid
-    //（reserve 已拒绝 AlreadyMapped），而 invalid PTE 从不会被缓存，因此下一次
-    // 硬件页表遍历自然会取到新项；unmap/protect 在失效时仍会 fence。
-    //
-    // 零 ASID 硬件（VF2 U74）：再次进入“同一”地址空间会走 `activate_user_pmap`
-    // 的快路径（不写 satp、不 fence），因此 fence 必须在这里做。按 SiFive 勘误
-    // CIP-1200，带地址限定的形式在该硅片上不可靠——改用整表 sfence.vma
-    //（与 Linux 的绕过手法一致）。
-    if !crate::hw_asid_tagging_usable() {
-        sfence_vma_all();
-    }
+    // 这里只负责写入叶子。上层 VmPmap 在登记软件映射后统一调用
+    // synchronize_new_mappings，使 invalid→valid 提交对当前 hart 可见。
+    // 零 ASID/U74 的整表 fence 也由该入口处理；竞争失败的远端 hart 在
+    // 缺页合并路径中自行执行本地同步。
 }
 
 // 解除用户映射：只清空对应叶子项并返回失效凭证供 shootdown。
@@ -459,6 +457,27 @@ pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation])
     crate::remote_sfence_vma_asid_batch(asid, &coalesced); // 通知其他 hart 做远程失效
 }
 
+/// Complete invalid→valid publication on the current hart.
+///
+/// Remote harts need no eager IPI for a previously-invalid leaf: any hart
+/// that raced the commit and retained a failed walk traps, then executes this
+/// same local synchronization before retrying. Replacements/unmaps continue
+/// to use `shootdown_mappings` above.
+pub(crate) fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+    if invalidations.is_empty() {
+        return;
+    }
+    let coalesced = coalesce_invalidation_ranges(invalidations);
+    if crate::hw_asid_tagging_usable() {
+        for invalidation in &coalesced {
+            sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
+        }
+    } else {
+        // U74/CIP-1200 requires the conservative unqualified local fence.
+        sfence_vma_all();
+    }
+}
+
 // 分配一个空闲 ASID：在无锁位图上扫描，ASID 0 保留。
 fn alloc_asid() -> Result<Asid, PmapError> {
     for word_index in 0..ASID_BITMAP_WORDS {
@@ -514,12 +533,10 @@ fn free_asid(asid: Asid) {
 /// PTE 继续游走。因此必须先切换到永久存在的 bootstrap 内核根，
 /// 再刷新 TLB，然后才能释放进程根页表。
 ///
-/// 当前保证本 hart（BuildStorm `-smp 1` 路径）；多核下还需要在释放前
-/// 确保其他 hart 也已经离开该根页表。
-fn invalidate_destroyed_root<State>(
-    bag: &BootStaticBag<State>,
-    root_phys: PhysAddr,
-) -> RootInvalidated {
+/// This helper is the current-hart half of teardown.  The caller separately
+/// waits for all residency bits to clear and performs the all-hart ASID flush
+/// before freeing the tree or recycling the ASID.
+fn leave_destroyed_root_on_current_hart<State>(bag: &BootStaticBag<State>, root_phys: PhysAddr) {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         const SATP_PPN_MASK: usize = (1usize << 44) - 1;
@@ -538,16 +555,20 @@ fn invalidate_destroyed_root<State>(
                 satp = in(reg) bootstrap_satp,
                 options(nostack)
             );
-            return RootInvalidated;
+            return;
         }
     }
     #[cfg(not(target_arch = "riscv64"))]
     let _ = (bag, root_phys);
     sfence_vma_all();
+}
+
+fn invalidate_asid_before_reuse(asid: Asid) -> RootInvalidated {
+    crate::invalidate_asid_on_all_harts(asid);
     RootInvalidated
 }
 
-// 在完成 TLB 失效后回收 ASID：先清除该 ASID 的驻留记录再释放位图。
+// 只有全核 ASID 失效见证存在时，才允许把数值放回分配位图。
 fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
     free_asid(asid);
 }

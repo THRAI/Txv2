@@ -1054,6 +1054,21 @@ Superpage/multi-frame accounting remains before userspace work; the current
 remote shootdown implementation is RV64 QEMU SBI RFENCE rather than a full
 kernel-managed IPI/ack protocol.
 
+RV64 process-root activation and ASID reuse obey two distinct SMP masks.
+The **residency mask** names harts whose `satp` currently carries the ASID and
+therefore acts as a page-table-root lifetime reference. The **TLB-history
+mask** names every hart that may still cache a translation for the ASID; it is
+not cleared on a context switch. During a `satp` switch, the incoming ASID is
+added to both masks before the CSR write, while the outgoing ASID remains
+resident until after the CSR write completes. Normal unmap/protect shootdowns
+target the TLB-history mask rather than only current residents, matching the
+`mm_cpumask` discipline used by mature kernels: a hart that switched away can
+still carry tagged translations and must be invalidated before a mapped frame
+is released. Root destruction first prevents re-entry and waits for the
+residency mask to become empty, then invalidates the ASID on **all online
+harts**. Only after that global invalidation completes is the TLB-history mask
+cleared and may page-table pages and the numeric ASID be reused.
+
 The full planned trait surface is:
 
 ```rust
@@ -2344,8 +2359,20 @@ pub trait SmpIf {
     fn enable_ipi_wakeups();
 
     /// Wait once for an interrupt or platform wake event. The caller owns the
-    /// surrounding condition check and lost-wake discipline.
+    /// surrounding condition check. Callers that can race remote publication
+    /// use the prepared three-step protocol below instead.
     fn wait_for_interrupt_once();
+
+    /// Enter the platform half of a race-free idle transition. The kernel
+    /// performs its final runnable-work check only after this returns.
+    fn prepare_interrupt_wait() -> InterruptWaitState;
+
+    /// Abort a prepared transition because the final check found work.
+    fn cancel_interrupt_wait(state: InterruptWaitState);
+
+    /// Commit a prepared transition, wait once, and restore the saved local
+    /// interrupt state.
+    fn wait_for_interrupt_prepared(state: InterruptWaitState);
 
     /// Report whether an IPI of this kind is pending on the current hart.
     /// Used by kernel-owned AP loops that poll/ack low-level IPI state instead
@@ -2399,6 +2426,10 @@ pub enum IpiKind {
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
 
+/// Opaque platform state carried across prepare/check/commit.
+#[derive(Eq, PartialEq, Debug)]
+pub struct InterruptWaitState(/* platform-private */);
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct CpuMask(pub u64);  // v1: 64 CPU max
 ```
@@ -2414,8 +2445,12 @@ pub struct CpuMask(pub u64);  // v1: 64 CPU max
   generic kernel publishes AP online only after AP-local substrate init.
 - IPI send/receive primitives, pending-state observation, wake-from-wait
   enablement, and low-level acknowledgement observation.
-- A single low-power wait primitive that a kernel-owned AP loop can compose
-  with its own condition checks.
+- A low-power wait primitive plus a prepare/check/commit protocol that a
+  kernel-owned AP loop can compose with its own authoritative work check
+  without an interrupt-before-wait lost-wake window. On RV64,
+  `prepare_interrupt_wait` clears global `sstatus.SIE` while leaving local
+  `sie` sources enabled; a racing SSIP therefore stays pending and makes the
+  following `wfi` resume before SIE is restored.
 - CPU parking primitive.
 - Platform remote-TLB primitive when firmware provides one. RV64 QEMU uses SBI
   RFENCE behind `PmapIf::shootdown_*`; this is not exposed as a scheduler
@@ -2448,6 +2483,9 @@ In v1 single-CPU builds:
 - `boot_secondary_cpus()` is a no-op and returns `0`.
 - `enable_ipi_wakeups()` is a no-op.
 - `wait_for_interrupt_once()` may be a spin-loop fallback.
+- `prepare_interrupt_wait()` returns an empty token;
+  `cancel_interrupt_wait()` is a no-op; and
+  `wait_for_interrupt_prepared()` may use the same spin-loop fallback.
 - `pending_ipi(_)` returns `false`.
 - `send_ipi(target, _)` asserts if `target != current_cpu_id()`.
 - `broadcast_ipi(mask, _)` asserts if `mask` has more than the current CPU bit set.

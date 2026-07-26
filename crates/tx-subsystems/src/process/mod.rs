@@ -24,12 +24,12 @@ pub use exec_prep::{
     step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
 };
 pub use execution::{
-    all_pids, bootstrap_init_process, init_process, process_by_pid, process_group_by_pgid,
-    seed_child_leader_context, step_chdir, step_exit_group, step_fork, step_fork_with_options,
-    step_getcwd, step_set_mount_namespace, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOp,
-    ChdirOutcome, CloneThreadOp, CloseOp, Dup3Op, DupOp, ExitGroupOp, FcntlDupFdOp, FcntlFdOp,
-    ForkError, ForkOptions, GetcwdOp, SetpgidError, SetpgidOp, SetsidError, SetsidOp, WaitError,
-    WaitTarget,
+    all_pids, bootstrap_init_process, fork_with_options_wait, init_process, process_by_pid,
+    process_group_by_pgid, seed_child_leader_context, step_chdir, step_exit_group, step_fork,
+    step_fork_with_options, step_getcwd, step_set_mount_namespace, step_setpgid, step_setsid,
+    step_waitpid_nohang, ChdirOp, ChdirOutcome, CloneThreadOp, CloseOp, Dup3Op, DupOp, ExitGroupOp,
+    FcntlDupFdOp, FcntlFdOp, ForkError, ForkOptions, GetcwdOp, SetpgidError, SetpgidOp,
+    SetsidError, SetsidOp, WaitError, WaitTarget,
 };
 pub use structure::{
     ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,

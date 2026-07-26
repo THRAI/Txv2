@@ -508,7 +508,7 @@ where
         }
         TrapClass::InterprocessorInterrupt => {
             let _irq_context = enter_la64_irq_context();
-            K::on_ipi(<Platform as SmpIf>::current_cpu_id())
+            K::on_ipi(<Platform as SmpIf>::current_cpu_id(), frame.view_mut())
         }
         TrapClass::IllegalInstruction
         | TrapClass::Breakpoint

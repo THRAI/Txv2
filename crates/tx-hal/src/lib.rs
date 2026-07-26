@@ -55,6 +55,10 @@ impl CpuMask {
         cpu.0 < u64::BITS as usize && (self.0 & (1u64 << cpu.0)) != 0
     }
 
+    pub const fn without(self, cpu: CpuId) -> Self {
+        Self(self.0 & !Self::single(cpu).0)
+    }
+
     pub fn count(self) -> usize {
         self.0.count_ones() as usize
     }
@@ -763,6 +767,19 @@ pub trait PmapIf {
         }
     }
 
+    /// Complete publication of newly-valid user leaves on the current hart.
+    ///
+    /// A new mapping does not replace a valid translation, so remote harts do
+    /// not need an eager shootdown: a hart that retained a failed walk will
+    /// trap and synchronize before retrying. The publishing/faulting hart must
+    /// nevertheless cross the architecture's local translation barrier.
+    ///
+    /// Platforms may override this with a local-only batch operation. The
+    /// conservative default uses the ordinary shootdown surface.
+    fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        Self::shootdown_mappings(asid, invalidations);
+    }
+
     /// 把 `root` 激活为当前 hart 的用户页表。
     ///
     /// RV64 上就是 `csrw satp, ((root.phys >> 12) | Sv39 模式位) + sfence.vma`。
@@ -1133,6 +1150,32 @@ pub trait DmaIf: PlatformConfig {
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
 
+/// Opaque platform state captured while entering an interrupt-wait window.
+///
+/// The kernel must pass the value returned by
+/// [`SmpIf::prepare_interrupt_wait`] exactly once to either
+/// [`SmpIf::cancel_interrupt_wait`] or
+/// [`SmpIf::wait_for_interrupt_prepared`].  Its raw contents are private to
+/// the selected platform.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "a prepared interrupt wait must be cancelled or committed"]
+pub struct InterruptWaitState(usize);
+
+impl InterruptWaitState {
+    /// Construct platform-private wait state.
+    ///
+    /// Board crates use this to preserve the architecture interrupt-enable
+    /// state that must be restored when the wait window closes.
+    pub const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    /// Return the platform-private raw state.
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpiKind {
     Reschedule,
@@ -1189,6 +1232,28 @@ pub trait SmpIf {
 
     fn wait_for_interrupt_once() {
         core::hint::spin_loop();
+    }
+
+    /// Start the race-free half of an idle transition.
+    ///
+    /// The caller performs its final runnable-work check after this method
+    /// returns. Platforms whose interrupt architecture permits it should
+    /// defer interrupt delivery until the matching cancel/commit operation,
+    /// while keeping wake sources pending. This closes the classic
+    /// check-empty -> interrupt-arrives -> handler-clears -> WFI lost-wake
+    /// window.
+    fn prepare_interrupt_wait() -> InterruptWaitState {
+        InterruptWaitState::from_raw(0)
+    }
+
+    /// Abort a prepared idle transition because the final work check found
+    /// runnable work.
+    fn cancel_interrupt_wait(_state: InterruptWaitState) {}
+
+    /// Commit a prepared idle transition, wait once, and restore the
+    /// interrupt state captured by [`Self::prepare_interrupt_wait`].
+    fn wait_for_interrupt_prepared(_state: InterruptWaitState) {
+        Self::wait_for_interrupt_once();
     }
 
     fn pending_ipi(_kind: IpiKind) -> bool {

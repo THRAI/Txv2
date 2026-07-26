@@ -309,7 +309,10 @@ pub trait KernelTrapSink<P: TxPlatform> {
     /// future, whose wait would otherwise never resolve.
     fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
-    fn on_ipi(cpu: CpuId) -> TrapAction;
+    /// Interprocessor interrupt. `view` is required for the same reason as
+    /// timer/external IRQs: a reschedule IPI that interrupted userspace must
+    /// save and hand off that user context before returning `Reschedule`.
+    fn on_ipi(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
     fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction;
 }

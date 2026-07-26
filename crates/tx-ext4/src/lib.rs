@@ -46,25 +46,6 @@ pub(crate) fn report_writeback_error(
     sink(line.as_str());
 }
 
-pub(crate) fn report_filesystem_stats(stats: tx_ext4_format::pager::FilesystemStatsLite) {
-    let sink = *DIAGNOSTIC_SINK.lock();
-    let Some(sink) = sink else {
-        return;
-    };
-    let mut line = DiagnosticLine::new();
-    let _ = write!(
-        line,
-        "txkernel:linkdiag:ext4-statfs:block_size={}:blocks={}:free={}:avail={}:inodes={}:ifree={}\n",
-        stats.block_size,
-        stats.total_blocks,
-        stats.free_blocks,
-        stats.available_blocks,
-        stats.total_inodes,
-        stats.free_inodes,
-    );
-    sink(line.as_str());
-}
-
 pub(crate) fn report_writeback_stats(
     inode: u32,
     logical_block: u64,
@@ -82,7 +63,7 @@ pub(crate) fn report_writeback_stats(
     let mut line = DiagnosticLine::new();
     let _ = write!(
         line,
-        "txkernel:linkdiag:ext4-writeback-capacity:inode={inode}:logical={logical_block}:blocks={}:free={}:avail={}:ifree={}\n",
+        "txkernel:ext4:writeback:capacity:inode={inode}:logical={logical_block}:blocks={}:free={}:avail={}:ifree={}\n",
         stats.total_blocks,
         stats.free_blocks,
         stats.available_blocks,

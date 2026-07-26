@@ -5,9 +5,10 @@ use tx_hal::{
 };
 
 use crate::{
-    asid_residency_mask, clear_asid_residency, deactivate_current_user_pmap, dispatch_trap_frame,
-    enter_irq_context, for_each_console_byte_for_sbi, limit_cpus,
-    mark_asid_resident_on_current_cpu, mark_ipi_ack, percpu_tls_for_cpu,
+    asid_residency_mask, asid_tlb_hart_mask, begin_asid_switch_on_current_cpu,
+    clear_asid_residency, deactivate_current_user_pmap, dispatch_trap_frame, enter_irq_context,
+    finish_asid_switch_on_current_cpu, for_each_console_byte_for_sbi, limit_cpus,
+    mark_asid_resident_on_current_cpu, mark_ipi_ack, percpu_tls_for_cpu, remote_ipi_targets_from,
     remote_sfence_targets_for_asid_from, remote_sfence_targets_from, trap::classify_rv64_trap,
     Platform, Rv64TrapFrame, MAX_BOOT_CPUS, RV64_PERCPU_AREAS,
 };
@@ -52,7 +53,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         TrapAction::Resume
     }
 
-    fn on_ipi(_cpu: CpuId) -> TrapAction {
+    fn on_ipi(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         assert!(<Platform as IrqIf>::in_irq_context());
         TrapAction::Resume
     }
@@ -637,7 +638,16 @@ fn remote_sfence_targets_exclude_current_hart() {
 }
 
 #[test]
-fn remote_sfence_targets_are_limited_to_asid_residency() {
+fn remote_ipi_targets_exclude_current_hart() {
+    assert_eq!(
+        remote_ipi_targets_from(CpuMask::from_bits(0b1111), CpuId(2)).bits(),
+        0b1011
+    );
+    assert!(remote_ipi_targets_from(CpuMask::single(CpuId(0)), CpuId(0)).is_empty());
+}
+
+#[test]
+fn remote_sfence_targets_include_harts_with_stale_asid_tlb_history() {
     let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let asid = tx_hal::Asid(9);
     clear_asid_residency(asid);
@@ -652,7 +662,61 @@ fn remote_sfence_targets_are_limited_to_asid_residency() {
     assert_eq!(targets.bits(), 0b1000);
     assert_eq!(asid_residency_mask(asid).bits(), 0b1010);
     deactivate_current_user_pmap();
+    assert_eq!(
+        asid_tlb_hart_mask(asid).bits(),
+        0b1010,
+        "switching away must retain the ASID TLB-history bit"
+    );
+    assert_eq!(
+        remote_sfence_targets_for_asid_from(asid, CpuMask::from_bits(0b1111), CpuId(0)).bits(),
+        0b1010,
+        "later invalidation must still reach every hart that ran the ASID"
+    );
     clear_asid_residency(asid);
+}
+
+#[test]
+fn asid_switch_retains_old_residency_until_hardware_transition_finishes() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let old = tx_hal::Asid(10);
+    let new = tx_hal::Asid(11);
+    let cpu = CpuId(2);
+    clear_asid_residency(old);
+    clear_asid_residency(new);
+
+    <Platform as PercpuIf>::install_early_percpu(cpu);
+    mark_asid_resident_on_current_cpu(old);
+    let switch = begin_asid_switch_on_current_cpu(new);
+
+    assert_eq!(asid_residency_mask(old).bits(), CpuMask::single(cpu).bits());
+    assert_eq!(asid_residency_mask(new).bits(), CpuMask::single(cpu).bits());
+    assert_eq!(
+        RV64_PERCPU_AREAS[cpu.0]
+            .active_user_asid
+            .load(core::sync::atomic::Ordering::Acquire),
+        old.0 as usize,
+        "software active root must remain old until satp changes"
+    );
+
+    finish_asid_switch_on_current_cpu(switch);
+
+    assert!(asid_residency_mask(old).is_empty());
+    assert_eq!(asid_residency_mask(new).bits(), CpuMask::single(cpu).bits());
+    assert_eq!(
+        asid_tlb_hart_mask(old).bits(),
+        CpuMask::single(cpu).bits(),
+        "old tagged translations may survive the context switch"
+    );
+    assert_eq!(
+        RV64_PERCPU_AREAS[cpu.0]
+            .active_user_asid
+            .load(core::sync::atomic::Ordering::Acquire),
+        new.0 as usize
+    );
+
+    deactivate_current_user_pmap();
+    clear_asid_residency(old);
+    clear_asid_residency(new);
 }
 
 #[test]

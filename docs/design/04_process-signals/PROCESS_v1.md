@@ -825,6 +825,15 @@ The new process is observable as soon as the namespace index commit completes. E
 
 **Atomicity note:** commit phase publishes to multiple independent structures (`PidNamespace.numbers`, `parent.children`, `pgrp.members`). These are independently atomic but not cross-structure atomic. This is class-3 compositional (per BINDING_v1 §5.4 / CONCEPTS §8): a brief window exists where the child is visible in some indexes but not others. POSIX does not specify atomicity across such indexes; the behavior is acceptable. Each namespace entry must nevertheless target a fully initialized identity.
 
+**SMP preparation/commit split.** For a non-`CLONE_VM` child, the syscall
+first prepares a detached address-space clone through VM's wait-capable
+full-range reservation. This phase may yield, but it must not snapshot fd
+state, increment pipe endpoint accounting, allocate a pid, or attach topology.
+After VM preparation finishes, `step_clone_process` performs the one-step
+process publication above. The commit revalidates that the parent's
+authoritative address-space cap is still the one that was prepared; if exec
+replaced it, the detached clone is dropped and preparation restarts.
+
 #### 7.1.3 step_clone_thread (CLONE_THREAD path)
 
 <!-- txdoc:PROCESS-STEP-CLONE-THREAD-CLONE-THREAD-PATH-1 -->

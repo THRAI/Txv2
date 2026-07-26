@@ -165,6 +165,7 @@ impl tx_hal::ConsoleIf for ShimsTestPmap {
 }
 
 impl SmpIf for ShimsTestPmap {}
+impl tx_hal::CacheIf for ShimsTestPmap {}
 
 impl tx_hal::TrapIf for ShimsTestPmap {}
 impl tx_hal::SignalFrameIf for ShimsTestPmap {}
