@@ -1,3 +1,24 @@
+- 2026-07-26 (**HTTPS 吞吐塌方定性完成:真根因是 syscall 路径固定开销,不是网络** — 只入 harness,未修性能).
+  接着上一条(SWS 修好但 HTTPS 522KB 仍 284 s)继续追,**三个假设连环证伪**:① **TCP RX 丢唤醒** ❌ 真实互联网
+  纯 HTTP 522KB **1 s** 跑完、sha256 全对;② **AF_UNIX socketpair 特殊** ❌ socketpair 与 pipe 在每个 chunk
+  尺寸几乎相同(64B 24.1 vs 27.3 KB/s、4096B 1118 vs 1242 KB/s)——**先前用 `cat|cat` 管道做的排除本身无效**
+  (管道与 socketpair 是两条代码路径),这轮才是真对比;③ **跨进程唤醒延迟** ❌ **单进程内** socketpair 自收自发
+  (无 fork、无调度)已 3.1 ms/轮,跨进程只多 1.1 ms,且 `in_write`/`in_read` 显示两侧几乎全程待在 syscall 内部
+  而非等对方。**真根因=每次 syscall 的固定开销**(`.v6work/ipcbench.c`,`riscv64-linux-musl-gcc -static` 交叉
+  编译后塞进镜像 `/musl/ipcbench`):`getpid()` **235 µs**、`clock_gettime` 316、`write /dev/null` 64B 716、
+  `read /dev/zero` 64B **781** / **4096B 803**(**载荷大小几乎不影响**⇒全是固定每调用开销)、socketpair 与 pipe
+  的 write+read ~1500(≈750/call,**与 `/dev/zero`/`/dev/null` 同价**⇒socket/IPC 无任何特殊)。**PC 采样归因**
+  (`.v6work/pcsample.sh`:QEMU monitor `info registers` + addr2line 聚类,286 样本/200 s,**无单一热点、最高仅
+  3.5%** ⇒ 开销弥散非热循环):内核态 **92%**/用户态 8%;内核内部 **`tx_substrate` 32%** + **`core` 29%**
+  (`SlotKey::{slab_id,slot_id,zone_id}`、`ZoneId::eq`、`align_up`、`atomic_load`,**`drop_in_place<[u8]>` 是
+  第二热符号**)+ 未解析 17% + **真正的 net/fs 逻辑 `tx_subsystems` 仅 6%** + `sbi_set_timer` 4% + `tx_shims` 2%
+  ⇒ **时间花在 zone/capability/slab 记账与字节缓冲 alloc/free 上,不是在做实际工作**。HTTPS 中招只因它每字节
+  syscall 数最多(ssl_client 逐条 TLS 记录经 socketpair 转交);纯 HTTP 单进程大块读,syscall 数少两个数量级。
+  **⚠️ 精确账未平**:284 s ÷ 750 µs = 24.5 万次 op(每 2 字节一次),算术对不上 ⇒ 真实路径单次 op 远贵于微基准
+  (要走 TCP 状态机 + delegate poll);但 PC 采样证明这 200 s guest 是**真在烧 CPU**(92% 内核)而非空等,
+  方向确定。**本次只入两个可复用 harness,未做任何性能修改。** **Next**(未做,均需改内核共享路径,规模超本轮):
+  给 syscall 加按号计数器(`SYSHIST` 只是 40 条崩溃后验环、不能计数)以拿到真实 op 数;或优化 substrate 的
+  每调用记账(能力查找缓存、避免每次 fd 操作 alloc/free 字节缓冲)。**Blocker**:无。
 - 2026-07-26 (**接收端 SWS 避免(RFC 1122 §4.2.3.3)** — 正确性修复,**不解决 HTTPS 慢**). 起因:真实场景验
   `wget` 时发现 **HTTPS 下载吞吐塌方**(本机同一文件 522KB:纯 HTTP **1 s** / HTTPS **184 s**,差 180 倍;
   打真实互联网时对端等不及发 RST,表现为"卡死")。**过程中定位到并修掉一个真缺陷**:

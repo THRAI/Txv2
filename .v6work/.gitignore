@@ -9,3 +9,6 @@ unit-v53.failures
 unit-v52fix.failures
 suites/
 unit-v52fix2.failures
+ipcbench
+*.tpl
+unit-sws.failures
