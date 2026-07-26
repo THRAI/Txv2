@@ -1,3 +1,28 @@
+- 2026-07-26 (**接收端 SWS 避免(RFC 1122 §4.2.3.3)** — 正确性修复,**不解决 HTTPS 慢**). 起因:真实场景验
+  `wget` 时发现 **HTTPS 下载吞吐塌方**(本机同一文件 522KB:纯 HTTP **1 s** / HTTPS **184 s**,差 180 倍;
+  打真实互联网时对端等不及发 RST,表现为"卡死")。**过程中定位到并修掉一个真缺陷**:
+  `external/smoltcp-asterinas/src/socket/tcp.rs` 的 `scaled_window()` **原样上报 rx 缓冲剩余空间、没有任何
+  下限**——wire 实证最小报到 **4 字节**、`win==0` 一次都没出现过,对端老实遵守于是发出 `length 45/90/180/428`
+  的小段,每段一次完整往返(效率剩 3%),ACK 回得慢再触发对端指数退避。修法=剩余空间 < `min(MSS, 容量/2)`
+  时报 0,靠 `window_to_update()`(`new_win>0 && new_win/2>=last_win`,从 `last_win==0` 成立)一次性重开。
+  **两个必须一起改的点**:① `last_scaled_window()` 的 `last_ack + last_win - next_ack` 用的
+  `SeqNumber::sub` **underflow 会 panic**——改前 `last_win` 恒等于真实剩余空间,故 `last_ack+last_win` 正好
+  等于 `process()` 裁剪用的 `remote_seq_no+capacity` 上界,永不越界;报 0 后该恒等式破裂(在途数据仍会被收下),
+  必须改成饱和到 0。② 阈值加 `capacity >= 4*MSS` 门槛:第一版无门槛打挂 3 个上游测试(用 6 字节 / 2×MSS 的
+  退化缓冲),而 SWS 是"拿缓冲利用率换报文大小"的交易,缓冲装不下几个 MSS 时该交易反向(会压成停等);真实
+  缓冲 64KiB:1460 = 45:1,门槛不会排除要治的场景。**验证**:vendored smoltcp 测试套 **591/591**
+  (590 原有 + 新增 `test_receiver_sws_avoidance_suppresses_tiny_window_then_reopens`,**控制实验**:撤掉修复
+  该测试立刻 FAIL);rv64/la64 编译零新增 warning;`tx-subsystems --lib` 集合差 **IDENTICAL(326==326)**;
+  `verify-git-net.sh` **8/8**;netperf/iperf 四 lane **22/22**;纯 HTTP 522KB 仍 1 s、HTTPS 6KB 仍 3 s
+  (无回归);**线上生效确认**:`win 0` 出现 25 次、非零最小 1880(>MSS),修复前最小 4。
+  **⚠️ 但修复目标未达成**:HTTPS 522KB 仍 284 s。**小窗口是症状不是病根**——pcap 显示我方报 0 后
+  **280 秒既不回零窗口探测也不发窗口更新**(对端探测退避 5→8→16→32→60→60→60 s),然后突然开窗 34KB、传输
+  立刻恢复 ⇒ **应用侧(wget/ssl_client)停摆 280 秒**。同一次运行的纯 HTTP 是 406 包/0.4 s,HTTPS 是
+  446 包/283.5 s。**为跑通上游测试套另改了 vendored 的 Cargo.toml(+6:`[workspace]`/rstest dev-dep/放宽
+  missing_docs)与 assembler.rs(+4:唯一用 rand 的 fuzz 测试 cfg(any()) 掉,其 zerocopy 在本 nightly 编不过)**
+  ——这套测试有价值,正是它抓出第一版阈值过激。**Next**:追 AF_UNIX socketpair 唤醒(**先前用 `cat|cat` 管道
+  512KB/1s 做的排除无效——管道与 socketpair 是两条代码路径**);宿主有 `riscv64-linux-musl-gcc`,可交叉编译
+  探针程序对比 pipe/socketpair/各 chunk 尺寸。**Blocker**:无。
 - 2026-07-25 (**net 抽样对账 + V5-2 回归修复:v6 地址槽位 newest-wins**). ① **netperf/iperf 全绿**:rv64 四条
   lane(netperf-musl 5.0/5、netperf-glibc 5.0/5、iperf-musl 6.0/6、iperf-glibc 6.0/6 = **22/22**,已是天花板
   故未跑基线对照)。**两个 harness 坑**(已入 memory):**`tx.oscomp=<suite>` 不是选择器**——只有

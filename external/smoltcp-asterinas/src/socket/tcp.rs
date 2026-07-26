@@ -678,7 +678,39 @@ impl<'a> Socket<'a> {
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        let window = self.rx_buffer.window();
+        // RFC 1122 §4.2.3.3 receiver-side silly-window-syndrome avoidance.
+        //
+        // Reporting the remaining space verbatim looks harmless but collapses
+        // throughput once the application drains slower than the peer sends:
+        // the free space shrinks to a few hundred — measured as low as FOUR —
+        // bytes, the peer dutifully obeys and emits 45..428 byte segments, and
+        // every one of those costs a full round trip. The resulting ACK delay
+        // then trips the peer's retransmit backoff (12 s gaps), so a 522 KiB
+        // HTTPS download spent 281.7 s of its 284 s wall time simply waiting.
+        // Plain HTTP of the same file took 1 s, because a single-process reader
+        // keeps the buffer empty and the window never collapses.
+        //
+        // The fix is to say "stop" instead of "send me four bytes": advertise
+        // zero until at least a full segment (or half the buffer, whichever is
+        // smaller) is free, then reopen in one step. `window_to_update` already
+        // emits the reopening ACK — its `new_win > 0 && new_win / 2 >= last_win`
+        // test is satisfied from `last_win == 0` — so this cannot deadlock.
+        // Only worth doing when the buffer can actually hold several segments.
+        // The rule trades buffer utilisation for segment size; on a buffer
+        // barely larger than one segment that trade inverts — refusing to
+        // advertise sub-MSS windows would force the connection into stop-and-
+        // wait. Real sockets here run a 64 KiB receive buffer against a ~1460
+        // byte MSS (45:1), so the guard never excludes the case that matters;
+        // it only leaves degenerate buffers on the previous behaviour.
+        let capacity = self.rx_buffer.capacity();
+        if capacity >= 4 * self.remote_mss {
+            let threshold = self.remote_mss.min(capacity / 2);
+            if window < threshold {
+                return 0;
+            }
+        }
+        u16::try_from(window >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -695,7 +727,25 @@ impl<'a> Socket<'a> {
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let last_win_end = last_ack + last_win;
+        // Saturate instead of subtracting straight through: `SeqNumber::sub`
+        // PANICS on underflow, and `next_ack` can now legitimately pass
+        // `last_ack + last_win`.
+        //
+        // Before receiver-side SWS avoidance the two were identical by
+        // construction — the advertised window WAS the free space, so
+        // `last_ack + last_win` equalled the `remote_seq_no + capacity` bound
+        // that `process()` clips incoming segments to, and nothing could ever
+        // land beyond it. Now the advertised window is deliberately smaller
+        // than the space we still accept, so data already in flight when we
+        // announced zero is taken in and pushes `next_ack` past that point.
+        // Zero is the right answer there: the window we last advertised has
+        // been fully consumed.
+        let last_win_adjusted = if next_ack > last_win_end {
+            0
+        } else {
+            last_win_end - next_ack
+        };
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -6665,6 +6715,69 @@ mod test {
             window_len: 6,
             ..RECV_TEMPL
         }));
+    }
+
+    // Receiver-side silly-window-syndrome avoidance (RFC 1122 §4.2.3.3).
+    //
+    // Regression target: a real 522 KiB HTTPS download collapsed to ~3 KB/s
+    // because the remaining buffer space was advertised verbatim — down to
+    // FOUR bytes — so the peer emitted 45-byte segments and then backed off.
+    // With a buffer that holds several segments we must say zero instead, and
+    // reopen in one step once a full segment is free again.
+    #[test]
+    fn test_receiver_sws_avoidance_suppresses_tiny_window_then_reopens() {
+        // 8 * MSS receive buffer: comfortably past the `capacity >= 4 * mss`
+        // guard, so the rule is active (unlike the degenerate-buffer tests).
+        let mut s = socket_established_with_buffer_sizes(DEFAULT_MSS, DEFAULT_MSS * 8);
+        let capacity = DEFAULT_MSS * 8;
+
+        // Fill the buffer to within a few bytes of full.
+        let payload = vec![0u8; capacity - 4];
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &payload[..],
+                ..SEND_TEMPL
+            }
+        );
+        // Four bytes of space left. Verbatim reporting would advertise `4`;
+        // SWS avoidance must advertise zero.
+        assert_eq!(s.rx_buffer.window(), 4);
+        assert_eq!(s.scaled_window(), 0, "a 4-byte window must be reported as 0");
+
+        // Draining less than one segment must NOT reopen the window.
+        s.recv(|b| {
+            let n = b.len().min(100);
+            (n, ())
+        })
+        .unwrap();
+        assert!(
+            s.rx_buffer.window() > 0 && s.scaled_window() == 0,
+            "sub-MSS space must stay suppressed (window={})",
+            s.rx_buffer.window()
+        );
+        assert!(
+            !s.window_to_update(),
+            "no window update while still below the threshold"
+        );
+
+        // Draining a full segment reopens it, in one step, at full size.
+        s.recv(|b| {
+            let n = b.len().min(DEFAULT_MSS);
+            (n, ())
+        })
+        .unwrap();
+        assert!(
+            s.scaled_window() >= DEFAULT_MSS as u16,
+            "reopened window must be at least one segment, got {}",
+            s.scaled_window()
+        );
+        assert!(
+            s.window_to_update(),
+            "the reopening window update must be emitted, else the peer stalls forever"
+        );
     }
 
     #[test]
