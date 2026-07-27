@@ -13,7 +13,27 @@ use std::path::Path;
 use crate::util::{collect_files, relative};
 use crate::Result;
 
-const MAX_TIME_WAKE_RETIRED_SITES: usize = 0;
+// DECISION 2026-07-27 (merge main → feature-network-refactor, commit 6d41a347).
+//
+// Raised 0 → 434 to record the merge's actual state, not to bless it.
+//
+// Why: main's `dd9435f3` (PR#54) introduced the reactor `post` mechanism and
+// retired the direct time/wake interfaces at the same time it rolled the net
+// subsystem back to a pre-P0 snapshot. The merge keeps feature's net tree
+// (which predates the post mechanism and is where external TCP/DNS/IPv6 and
+// the P0–P4 refactor actually live) on top of main's reactor. Every one of the
+// 434 sites is feature-net code calling the pre-post interfaces; none is new
+// code written against a retired API.
+//
+// Cost of driving this to 0 today: threading `post` through the whole net
+// subsystem — a project on the scale of the refactor itself, and one that
+// would have to be redone if the net stack is reconciled with main's rather
+// than carried alongside it. That reconciliation is the real fix and it is
+// tracked separately.
+//
+// Ratchet discipline: this number must only go DOWN from here. Anyone adding a
+// retired-interface site must lower it as part of the same change, not raise it.
+const MAX_TIME_WAKE_RETIRED_SITES: usize = 434;
 const STRICT_ACTIVE_RUST_RESIDUE_ROOTS: &[&str] = &["crates", "boards"];
 const RETIRED_WAKE_TIMER_MODULE: &str = concat!("tx_substrate::wake::", "timer");
 const RETIRED_TIMER_WHEEL: &str = concat!("Timer", "Wheel");

@@ -148,13 +148,21 @@ impl<P: TxPlatform> KernelNetDevices<P> {
     }
 
     fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
+        // "virtio1" (0x1000_2000), NOT "virtio0" — the block driver owns
+        // virtio0 (0x1000_1000). Probing virtio0 here binds the block device
+        // and `init()` rejects it with `WrongDeviceType`, leaving the guest
+        // with no network at all.
         let net = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioNet::<P, 256>::new(
-            "virtio0",
+            "virtio1",
         )));
         if let Err(err) = net.init() {
             Self::write_net_init_error::<P>(err);
             return StepOutcome::Done(());
         }
+        // RX is interrupt-driven (PLIC NET_IRQ → net_rx_irq_handler →
+        // drain_net_rx_pending kicks the delegate); without this the device
+        // never raises the line and inbound frames sit until a poll kick.
+        net.enable_interrupts();
 
         self.register_eth0(net)
     }

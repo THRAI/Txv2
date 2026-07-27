@@ -254,6 +254,56 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
 
+        // tx.runsh=<path>: bring-up lane for the on-site-finals git task. Run an
+        // arbitrary shell script from the mounted Alpine ext4 (/musl) under the
+        // Alpine userland env, so real dynamic musl binaries (git and its
+        // helpers) resolve their interpreter, shared libraries (/musl/usr/lib),
+        // and git-core helpers. Flag-gated; default boot path unchanged.
+        // (Ported from net-git ca0ae657 + e7992ef8 — git Task2.)
+        if let Some(script) = cmdline_value::<P>("tx.runsh") {
+            if super::MUSL_MOUNT.lock().is_some() {
+                // The Alpine ext4 is mounted at /musl, but its binaries and
+                // their absolute symlinks (/bin/sh -> /bin/busybox, default lib
+                // search /lib:/usr/lib, git's hardcoded /bin/sh for spawning
+                // index-pack/upload-pack) assume a real root layout. Bind-mount
+                // the image's /usr,/lib,/bin,/sbin subtrees over the empty rootfs
+                // skeleton so the image behaves as the root fs. Gated to this lane.
+                Self::overlay_image_dirs_for_runsh();
+                let envp: &[&[u8]] = &[
+                    b"PATH=/musl/usr/bin:/musl/bin:/musl/usr/sbin:/musl/sbin:/usr/bin:/bin",
+                    b"LD_LIBRARY_PATH=/musl/usr/lib:/musl/lib",
+                    b"GIT_EXEC_PATH=/musl/usr/libexec/git-core",
+                    // Skip git-init's optional sample-hook template copy: now that
+                    // /usr is overlaid git *finds* /usr/share/git-core/templates
+                    // and tries to copy them into every new repo's .git/hooks,
+                    // which currently fails fatally. An empty template dir makes
+                    // git warn-and-continue (clone still produces a full repo).
+                    b"GIT_TEMPLATE_DIR=",
+                    b"HOME=/musl/root",
+                    b"TERM=linux",
+                ];
+                let argv: &[&[u8]] = &[b"sh", script.as_bytes()];
+                let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                    &init,
+                    &thread,
+                    b"/musl/bin/busybox",
+                    argv,
+                    envp,
+                    &cred,
+                ));
+                Self::write_board_sentinel_prefix();
+                match outcome {
+                    Ok(()) => tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:ok\n"),
+                    Err(ref e) => {
+                        tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:fail:");
+                        tx_hal::console_write_str::<P>(exec_error_tag(e));
+                        tx_hal::console_write_str::<P>("\n");
+                    }
+                }
+                return;
+            }
+        }
+
         let sdcard_test_init = match boot_plan.first_userspace {
             FirstUserspace::OscompSdcard { test_init } => Some(test_init),
             FirstUserspace::CmdlineInit => None,
