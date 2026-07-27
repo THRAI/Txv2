@@ -250,7 +250,7 @@ impl AddressSpace {
             StepOutcome::Done(guard) => guard,
             StepOutcome::Yield { .. } => {
                 return crate::vm::notification::range_lock_blocked(
-                    self.range_lock().wait_source_id(),
+                    self.range_lock().release_endpoint(),
                 );
             }
             _ => unreachable!("RangeLock acquire_step only returns Done or Yield"),
@@ -442,7 +442,7 @@ const fn vm_fault_error_to_errno(error: VmFaultError) -> Errno {
         | VmFaultError::BackingOffsetOverflow
         | VmFaultError::PageBeyondSize
         | VmFaultError::StaleRecipe => Errno::EINVAL,
-        VmFaultError::PageCache(_) => Errno::EIO,
+        VmFaultError::PageCache(_) | VmFaultError::SpecialUnavailable => Errno::EIO,
         VmFaultError::Pmap(VmPmapError::Zone(_)) => Errno::ENOMEM,
         VmFaultError::Pmap(
             VmPmapError::Pmap(_)

@@ -64,3 +64,24 @@ Start with:
   blocker. Validate changed JSON records with `cargo xtask progress validate`.
 - After doc edits, check active Markdown links and stale vocabulary before declaring alignment.
 - **Do not** add yourself as coauthor when creating commits.
+
+<!-- CODEGRAPH_START -->
+## CodeGraph
+
+In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
+
+If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
+<!-- CODEGRAPH_END -->
+
+## Discover and output discipline
+
+- confirm discovery files first: use `rg -l <keyword>' <paths>` to search for files, then `rg -n` on selected candidate files.
+- rangy, long queries goes in `/tmp` first, cope large files with `wc -l` and `sed` for selective read.
+- do not read large files in one shot: after determining the lines, use `sed` to read the code snippets.
+- On exploring files: use `head` and `tail` plus pipe with `rg` to check sample shard, then decide whether to read more.
+- User allows subagent/delegation in this repo, do not ask for confirmation before parallel agent worl.
+- Explorer should return conclusion and evidence table ONLY (claim | file:line | confidence), DO NOT return original output, long diff or irrevelent logs.
+- Main thread should use long timeout `wait_agent` for results. Do not read repo and files in main thread while waiting for agents. Syncthesize the results after explorers returned. Spot checwith key suspects.

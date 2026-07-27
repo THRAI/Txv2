@@ -81,7 +81,8 @@ fn pipe_user_gift_read_copies_bytes_and_releases_gift() {
     );
     let mut out = alloc::vec![0u8; crate::vm::USER_PAGE_SIZE];
     assert_eq!(
-        step_read(&payload, &mut out, &guard, false),
+        step_read_with_post(&payload, &mut out, &guard, false, |mailbox, event| mailbox
+            .post(event)),
         V3Out::Done(crate::vm::USER_PAGE_SIZE)
     );
     assert_eq!(&out[96..104], &pattern);
@@ -119,7 +120,11 @@ fn pipe_user_gift_tee_copies_to_anonymous_destination() {
     }
 
     let mut out = [0u8; 36];
-    assert_eq!(step_read(&dst, &mut out, &guard, false), V3Out::Done(36));
+    assert_eq!(
+        step_read_with_post(&dst, &mut out, &guard, false, |mailbox, event| mailbox
+            .post(event)),
+        V3Out::Done(36)
+    );
     assert_eq!(&out[32..36], &pattern);
 
     match step_pop_user_page_gift(&src, &guard, false) {

@@ -9,19 +9,26 @@ use crate::adapter::step_engine::{
     self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, Errno as V3Errno,
     NoProgress, SpinMutex, StepOutcome,
 };
+use crate::linux_syscall::errno_to_i32;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    SourceLabel,
 };
 use tx_subsystems::page_backed::{
     AnonSwapPolicy, Frame, MaterializeAccess, PageContainer, PageContainerKind, PageIndex,
 };
-use tx_subsystems::process::step_chdir;
+use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking, S_IFDIR, S_IFREG,
 };
 use tx_subsystems::vm::USER_PAGE_SIZE;
+
+#[test]
+fn execve_elibbad_errno_translation_is_80() {
+    assert_eq!(errno_to_i32(Errno::ELIBBAD), 80);
+}
 
 // Minimal in-test FsOps fixture mirroring tx-scripts'
 // `ExecTestFs`. We re-implement here rather than depending on
@@ -225,7 +232,7 @@ fn ensure_zero_frame_claimed() {
     }
 }
 
-fn build_fs_root() -> (Cap<DEntry>, Arc<ExecveTestFs>) {
+fn build_fs_root() -> (Cap<DEntry>, Arc<ExecveTestFs>, Cap<MountIdentity>) {
     let root_id = FsObjectId::new(2);
     let fs = ExecveTestFs::new(root_id);
 
@@ -251,25 +258,25 @@ fn build_fs_root() -> (Cap<DEntry>, Arc<ExecveTestFs>) {
         sign_for(res, raw)
     };
 
-    let _mount = MountIdentity::new_cap(
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    let mount = MountIdentity::new_cap_with_root_dentry(
         MountId::new(1),
         None,
-        root_rnode.clone(),
+        root_dentry.clone(),
         None,
         payload,
         MountFlags::empty(),
     )
     .expect("mount identity");
 
-    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
-    (root_dentry, fs)
+    (root_dentry, fs, mount)
 }
 
 fn bootstrap_with_file(
     name: &[u8],
     bytes: &[u8],
 ) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>, Arc<ExecveTestFs>) {
-    let (root_dentry, fs) = build_fs_root();
+    let (root_dentry, fs, mount) = build_fs_root();
     let _ = fs.add_regular_with_bytes(FsObjectId::new(2), name, bytes);
 
     let aspace = fresh_aspace();
@@ -282,6 +289,8 @@ fn bootstrap_with_file(
             panic!("init bootstrap somehow zombified")
         }
     }
+    let namespace = MountNamespace::new_cap(mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
 
     (process, thread, fs)
 }
@@ -311,16 +320,214 @@ fn dispatch_execve_path_not_found_returns_neg_enoent() {
     assert_eq!(result, SyscallResult::Error(2));
 }
 
-/// `execve` of a non-ELF file returns `-ENOEXEC` (positive 8) via
-/// Non-ELF / non-shebang file → kernel-side fallback to `/bin/sh`.
-/// Pre-2026-05-18 returned `-ENOEXEC (8)`; the new behaviour matches
-/// every userspace shell's ENOEXEC fallback. The test fixture has no
-/// `/bin/sh`, so the second exec attempt fails the walker with
-/// `-ENOENT (2)`. The shape of the failure proves the fallback fires
-/// (the libctest 0/220 unblock relies on this — see STATUS.md
-/// 2026-05-18).
 #[test]
-fn dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh() {
+fn dispatch_execve_empty_path_returns_enoent_before_walking() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process, thread);
+    let path: &[u8] = b"\0";
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(2));
+}
+
+#[test]
+fn dispatch_execve_path_allocation_failure_returns_enomem_before_argv_read() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let aspace_before = process.aspace_cap().expect("live aspace").key();
+    let ctx = make_ctx(process.clone(), thread);
+    let path: &[u8] = b"/init\0";
+
+    let _allocation_failure =
+        crate::linux_syscall::user_copy::fail_user_copy_allocation_after_for_test(0);
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 1, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(12));
+    assert_eq!(
+        process
+            .aspace_cap()
+            .expect("live aspace after failure")
+            .key(),
+        aspace_before
+    );
+    assert!(!process.is_zombie());
+}
+
+#[test]
+fn dispatch_execve_argv_string_allocation_failure_returns_enomem() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process, thread);
+    let path: &[u8] = b"/init\0";
+    let arg0: &[u8] = b"init\0";
+    let argv = [arg0.as_ptr() as u64, 0];
+
+    let _allocation_failure =
+        crate::linux_syscall::user_copy::fail_user_copy_allocation_after_for_test(1);
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_EXECVE,
+            [path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(12));
+}
+
+#[test]
+fn dispatch_execve_argv_vector_allocation_failure_returns_enomem() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process, thread);
+    let path: &[u8] = b"/init\0";
+    let arg0: &[u8] = b"init\0";
+    let argv = [arg0.as_ptr() as u64, 0];
+
+    let _allocation_failure =
+        crate::linux_syscall::user_copy::fail_user_copy_allocation_after_for_test(2);
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_EXECVE,
+            [path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(12));
+}
+
+#[test]
+fn dispatch_execve_reference_vector_allocation_failure_returns_enomem() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process, thread);
+    let path: &[u8] = b"/init\0";
+    let arg: &[u8] = b"init\0";
+    let env: &[u8] = b"KEY=value\0";
+    let argv = [arg.as_ptr() as u64, 0];
+    let envp = [env.as_ptr() as u64, 0];
+
+    let _allocation_failure =
+        crate::linux_syscall::user_copy::fail_user_copy_allocation_after_for_test(5);
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_EXECVE,
+            [
+                path.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp.as_ptr() as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(12));
+}
+
+#[test]
+fn execve_allocation_fault_guard_resets_after_unwind() {
+    let _setup = execve_setup();
+
+    let unwind = std::panic::catch_unwind(|| {
+        let _allocation_failure =
+            crate::linux_syscall::user_copy::fail_user_copy_allocation_after_for_test(0);
+        panic!("exercise allocation fault guard drop");
+    });
+    assert!(unwind.is_err());
+
+    let mut items = Vec::<u8>::new();
+    assert!(crate::linux_syscall::user_copy::try_reserve_user_copy_items(&mut items, 1).is_ok());
+}
+
+#[test]
+fn dispatch_execve_invalid_argv_array_returns_efault() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process, thread);
+    let path: &[u8] = b"/init\0";
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 1, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(14));
+}
+
+#[test]
+fn dispatch_execve_invalid_argv_element_returns_efault() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process, thread);
+    let path: &[u8] = b"/init\0";
+    let argv = [1u64, 0];
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_EXECVE,
+            [path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(14));
+}
+
+#[test]
+fn dispatch_execve_invalid_envp_array_returns_efault() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process, thread);
+    let path: &[u8] = b"/init\0";
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 0, 1, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(14));
+}
+
+#[test]
+fn execve_vector_reader_rejects_impossible_slot_count_without_iterating() {
+    let _setup = execve_setup();
+    let aspace = fresh_aspace();
+    let empty = [0u64];
+    let mut budget = 4096;
+
+    assert!(matches!(
+        crate::linux_syscall::user_copy::read_user_cstr_vec(
+            &aspace,
+            empty.as_ptr() as u64,
+            usize::MAX,
+            &mut budget,
+        ),
+        Err(crate::linux_syscall::user_copy::ReadVecError::TooBig)
+    ));
+}
+
+#[test]
+fn dispatch_execve_non_elf_non_shebang_returns_enoexec() {
     let _setup = execve_setup();
 
     let bytes = vec![0u8; 4096]; // 4 KiB of zeroes — fails ELF magic.
@@ -332,16 +539,13 @@ fn dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(
         result,
-        SyscallResult::Error(2),
-        "kernel-side ENOEXEC fallback should re-exec via /bin/sh; \
-         the fixture has no /bin/sh so the second walker returns \
-         -ENOENT (2) — not -ENOEXEC (8), which would mean the \
-         fallback never fired."
+        SyscallResult::Error(8),
+        "plain non-ELF input is ENOEXEC; userspace owns shell fallback"
     );
 }
 
 #[test]
-fn dispatch_execve_short_non_elf_non_shebang_falls_back_to_bin_sh() {
+fn dispatch_execve_short_non_elf_non_shebang_returns_enoexec() {
     let _setup = execve_setup();
 
     let bytes = b"/code/lmbench_src/bin/build/lmbench_all hello \"$@\"\n".to_vec();
@@ -354,9 +558,8 @@ fn dispatch_execve_short_non_elf_non_shebang_falls_back_to_bin_sh() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(
         result,
-        SyscallResult::Error(2),
-        "short wrapper scripts must reach the /bin/sh fallback before \
-         the ELF64 minimum-header rejection"
+        SyscallResult::Error(8),
+        "short non-shebang input is ENOEXEC before ELF64 parsing"
     );
 }
 
@@ -411,6 +614,45 @@ fn dispatch_execve_argv_overflow_returns_neg_e2big() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(7));
     drop(big_arg);
+}
+
+#[test]
+fn dispatch_execve_identity_noop_returns_eagain_when_exec_owns_lifecycle() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&process, &thread)
+        .expect("reserve exec lifecycle");
+    let ctx = make_ctx(process.clone(), thread.clone());
+    let path: &[u8] = b"/bin/useradd\0";
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(11));
+    assert!(!process.is_zombie(), "Retry must leave process live");
+    assert!(!thread.is_zombie(), "Retry must leave thread live");
+    drop(exec_prep);
+}
+
+#[test]
+fn dispatch_execve_identity_noop_completed_returns_no_return() {
+    let _setup = execve_setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let ctx = make_ctx(process.clone(), thread.clone());
+    let path: &[u8] = b"/bin/useradd\0";
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::NoReturn);
+    assert!(process.is_zombie());
+    assert!(thread.is_zombie());
 }
 
 /// Successful execve of a minimal ELF returns

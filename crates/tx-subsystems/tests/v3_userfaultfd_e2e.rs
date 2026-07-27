@@ -11,14 +11,14 @@
 //!   2. Spawn a handler "thread" (a separate future) that blocks on
 //!      `ufd.read()` waiting for a fault message.
 //!   3. The faulting "thread" touches a page in the registered region
-//!      → drives `AddressSpace::fault_script_for_process` with the
+//!      → drives `AddressSpace::fault_script_for_process_with_post` with the
 //!      production `ProcessUfdDispatch` → `dispatch_ufd_fault`
 //!      installs an OnAgent request, pushes the fault message onto
 //!      the per-ufd queue, parks the faulting future on
 //!      `await_agent_reply`.
 //!   4. Handler thread wakes: drains the pending queue, decodes the
 //!      `fault_addr`, drives `UFFDIO_COPY` against the ufd's
-//!      `DelegateRegistry` (the same `mark_replied` path the
+//!      `DelegateRegistry` (the same `delegate reply transition` path the
 //!      production shim ioctl arms use).
 //!   5. Faulting thread resumes: the `await_agent_reply` helper sees
 //!      the `AgentReplied` event, the fault future completes the
@@ -55,6 +55,10 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
+use tx_substrate::step::{InterestMask, WaitSourceId};
+use tx_substrate::wake::{
+    MailboxEvent, MailboxSchedulerHint, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 use tx_subsystems::vm::adapter::step_engine::{
     page_allocator, Cap, DelegateReply, DelegateState, DelegateTokenId, TaskMailbox,
     TransitionOutcome, UfdReply,
@@ -75,6 +79,7 @@ use tx_subsystems::zones;
 // -------- Test serialization + stub PMAP ---------------------------
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static UFD_REF_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct StubPmap;
 
@@ -176,6 +181,66 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Option<F::Output> {
 /// (e.g., 1000); fail the test if it doesn't complete within bounds."
 const MAX_DRIVER_TICKS: usize = 1000;
 
+fn counting_ufd_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    assert_eq!(hint, MailboxSchedulerHint::Normal);
+    UFD_REF_POST_COUNT.fetch_add(1, Ordering::AcqRel);
+    mailbox.post_with_scheduler_hint(event, hint)
+}
+
+fn direct_ufd_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    mailbox.post_with_scheduler_hint(event, hint)
+}
+
+fn direct_delegate_mailbox_post(mailbox: std::sync::Weak<TaskMailbox>, event: MailboxEvent) {
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
+
+fn register_waiter<'a>(
+    source: &'a Arc<WaitSource>,
+    mailbox: &Arc<TaskMailbox>,
+    interests: u64,
+) -> (WaitRegistrationGuard<'a>, WaitGeneration) {
+    let generation = mailbox.next_generation();
+    let prep = source.prepare(
+        Arc::downgrade(mailbox),
+        generation,
+        InterestMask::new(interests),
+    );
+    let guard = prep.install_if(|| true).expect("registration installed");
+    (guard, generation)
+}
+
+fn assert_source_fired(
+    mailbox: &TaskMailbox,
+    source: WaitSourceId,
+    generation: WaitGeneration,
+    expected_overlap: u64,
+) {
+    let event = mailbox.poll().expect("mailbox should receive SourceFired");
+    match event {
+        MailboxEvent::SourceFired {
+            generation: actual_generation,
+            source: actual_source,
+            interests,
+        } => {
+            assert_eq!(actual_generation, generation);
+            assert_eq!(actual_source, source);
+            assert_ne!(interests.raw() & expected_overlap, 0);
+        }
+        other => panic!("expected SourceFired, got {other:?}"),
+    }
+}
+
 // -------- Canary harness -------------------------------------------
 
 /// Build a fresh init process with a ufd installed at fd 3 and the
@@ -241,13 +306,13 @@ fn setup_proc_with_registered_ufd(
 /// 2. **Spawn handler.** The handler is modelled as a checkpoint in the
 ///    driver loop — when the fault future has parked on the mailbox,
 ///    we (the test) drain the per-ufd `pending_faults` queue, decode
-///    the fault address, and drive `mark_replied` against the per-ufd
+///    the fault address, and drive `delegate reply transition` against the per-ufd
 ///    `DelegateRegistry`. This is exactly what the production handler
 ///    thread's `UFFDIO_COPY` arm does (see the
 ///    `v3_userfaultfd_ioctl_reply` tests' `dispatch_ioctl(UFFDIO_COPY)`
-///    path, which drives `mark_replied` against the same registry).
-/// 3. **Fault.** We drive `aspace.fault_script_for_process(fault,
-///    &proc, mailbox.weak())` — the **production** entrypoint that
+///    path, which drives `delegate reply transition` against the same registry).
+/// 3. **Fault.** We drive `aspace.fault_script_for_process_with_post(fault,
+///    &proc, mailbox.weak(), direct_post)` — the **production** entrypoint that
 ///    builds a `ProcessUfdDispatch` and walks the fd table to resolve
 ///    the ufd. This exercises the same code path `thread_future`
 ///    will call once the phase-6 production loop wires it.
@@ -255,7 +320,7 @@ fn setup_proc_with_registered_ufd(
 ///    `Pending` poll of the fault future, the test inspects the ufd's
 ///    `pending_faults` queue (the production handler's `read(uffd_fd,
 ///    ...)` arm drains this queue via `step_ufd_read`), pulls the
-///    front message, and drives `mark_replied(token_id,
+///    front message, and drives the delegate reply transition for `token_id`
 ///    DelegateReply::Ufd(UfdReply::Copy { ... }))` — exactly what
 ///    `step_uffdio_copy` does at the shim layer.
 /// 5. **Resume.** The next driver tick re-polls the fault future,
@@ -287,11 +352,11 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
     // ----- Step 2 (preamble): handler "thread" closure ----------------
     //
     // The "handler thread" in the canary is the test-driven
-    // mark_replied step. We don't spawn a real Rust thread — the
+    // delegate reply transition step. We don't spawn a real Rust thread — the
     // production handler is a userspace agent that runs on its own
     // reactor task and drains `read(uffd_fd, ...)`. Here we just
     // drive the substrate-side equivalent (`pop_fault_msg` +
-    // `mark_replied`) from the driver loop between fault-future polls.
+    // `delegate reply transition`) from the driver loop between fault-future polls.
     // This is the same shape `v3_userfaultfd_ioctl_reply.rs` uses to
     // exercise the reply ioctls.
     let handler_src_pattern: u8 = 0xAB;
@@ -317,7 +382,12 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
     let proc_ref = proc_cap.clone();
     let fault_fut = async move {
         aspace_ref
-            .fault_script_for_process(fault, &proc_ref, mailbox_weak)
+            .fault_script_for_process_with_post(
+                fault,
+                &proc_ref,
+                mailbox_weak,
+                direct_ufd_ref_post_with_hint,
+            )
             .await
     };
     let mut fault_fut = Box::pin(fault_fut);
@@ -337,7 +407,7 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
             }
             None => {
                 // Faulting future is parked. If the handler hasn't
-                // yet fired, drain the pending queue + mark_replied.
+                // yet fired, drain the pending queue + delegate reply transition.
                 if !handler_fired {
                     // ----- Step 4: handler thread wakes -------------------
                     if let Some(msg) = ufd_cap.pop_fault_msg() {
@@ -357,19 +427,20 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
                         );
 
                         // Drive UFFDIO_COPY semantically — the same
-                        // `mark_replied` path `step_uffdio_copy` drives.
-                        let reply_outcome = registry.mark_replied(
+                        // `delegate reply transition` path `step_uffdio_copy` drives.
+                        let reply_outcome = registry.mark_replied_with_post(
                             msg.token_id,
                             DelegateReply::Ufd(UfdReply::Copy {
                                 src_kernel_addr,
                                 dst_uaddr: msg.fault_addr,
                                 len: USER_PAGE_SIZE as u64,
                             }),
+                            direct_delegate_mailbox_post,
                         );
                         assert_eq!(
                             reply_outcome,
                             TransitionOutcome::Applied,
-                            "mark_replied transitions Pending → Replied",
+                            "delegate reply transition transitions Pending → Replied",
                         );
                         handler_fired = true;
                     }
@@ -385,7 +456,7 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
     let result = fault_result.expect("fault future must resolve within MAX_DRIVER_TICKS");
     assert!(
         result.is_ok(),
-        "fault_script_for_process must succeed end-to-end, got {result:?}",
+        "fault_script_for_process_with_post must succeed end-to-end, got {result:?}",
     );
 
     // Token must be in Replied state (the registry's
@@ -393,7 +464,7 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
     assert_eq!(
         registry.state(expected_token_id),
         Some(DelegateState::Replied),
-        "DelegateRegistry pins the token as Replied after mark_replied",
+        "DelegateRegistry pins the token as Replied after delegate reply transition",
     );
 
     // The reply payload was consumed exactly once on the resume path
@@ -462,7 +533,8 @@ fn process_ufd_dispatch_resolves_via_process_fd_table() {
     let (proc_cap, _fd, ufd_cap, mailbox) = setup_proc_with_registered_ufd(vma_base);
     let mailbox_weak = Arc::downgrade(&mailbox);
 
-    let dispatch = ProcessUfdDispatch::new(&proc_cap, mailbox_weak);
+    let dispatch =
+        ProcessUfdDispatch::new_with_post(&proc_cap, mailbox_weak, direct_ufd_ref_post_with_hint);
 
     // Hit: the ufd is installed at fd 3 with matching ufd_id.
     let target = dispatch.resolve(ufd_cap.ufd_id());
@@ -472,7 +544,56 @@ fn process_ufd_dispatch_resolves_via_process_fd_table() {
     );
 
     // Miss: a bogus ufd_id falls through to None.
-    let dispatch2 = ProcessUfdDispatch::new(&proc_cap, Arc::downgrade(&mailbox));
+    let dispatch2 = ProcessUfdDispatch::new_with_post(
+        &proc_cap,
+        Arc::downgrade(&mailbox),
+        direct_ufd_ref_post_with_hint,
+    );
     let miss = dispatch2.resolve(0xDEAD_BEEF);
     assert!(miss.is_none(), "dispatcher returns None for unknown ufd_id");
+}
+
+#[test]
+fn process_fault_push_uses_injected_mailbox_ref_post_for_ufd_readable_wake() {
+    let _g = setup();
+    UFD_REF_POST_COUNT.store(0, Ordering::Release);
+
+    let vma_base = 0x6000_0000u64;
+    let (proc_cap, _fd, ufd_cap, fault_mailbox) = setup_proc_with_registered_ufd(vma_base);
+    let handler_mailbox = Arc::new(TaskMailbox::new());
+    let (_registration, generation) = register_waiter(ufd_cap.wait_source(), &handler_mailbox, 1);
+
+    let aspace = proc_cap.aspace_cap().expect("aspace");
+    let fault = VmFault::new(UserVirtAddr::new(vma_base as usize), AccessMode::Read);
+    let fault_mailbox_weak = Arc::downgrade(&fault_mailbox);
+    let aspace_ref = aspace.clone();
+    let proc_ref = proc_cap.clone();
+    let fault_fut = async move {
+        aspace_ref
+            .fault_script_for_process_with_post(
+                fault,
+                &proc_ref,
+                fault_mailbox_weak,
+                counting_ufd_ref_post_with_hint,
+            )
+            .await
+    };
+    let mut fault_fut = Box::pin(fault_fut);
+
+    assert!(
+        poll_once(fault_fut.as_mut()).is_none(),
+        "fault future should park after enqueueing the userfaultfd message",
+    );
+    assert_eq!(
+        UFD_REF_POST_COUNT.load(Ordering::Acquire),
+        1,
+        "userfaultfd pending-fault publication should use injected mailbox-ref post"
+    );
+    assert_eq!(ufd_cap.pending_fault_count(), 1);
+    assert_source_fired(
+        &handler_mailbox,
+        WaitSourceId::new(ufd_cap.wait_source_id()),
+        generation,
+        1,
+    );
 }

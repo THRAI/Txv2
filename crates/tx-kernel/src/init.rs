@@ -1,22 +1,40 @@
 use core::{
+    future::Future,
     marker::PhantomData,
+    pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
 };
+
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
     self as step_engine, init, init_on_ap, spin_mutex, ByteProgress, Cap, SpinMutex, StepOutcome,
 };
+use crate::init::boot_plan::{BootPlan, RootfsSetup};
 use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
+use tx_services::time::{
+    platform::HalDeadlineTimer, platform::HalRtcDevice, timekeeper_clock, ClockRead,
+    CurrentHartDeadlineTimer, DeadlineNs, DeadlineRegistrar, TimerRole, TimerTarget,
+};
+use tx_services::time::{RtcDeviceOps as TimeRtcDeviceOps, TimeError};
+use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
     self, MountFlags, MountIdentity, MountNamespace, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
+use tx_subsystems::tty::execution::{
+    register_console_alias, register_hardware_with_winsize, step_ioctl_tiocsctty_for_process,
+};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
+use tx_subsystems::vm::{
+    AddressSpace, MapPlacement, MapReserveResult, Prot, UfdRegistration, UserRange, UserVirtAddr,
+    VmBacking, VmEntry, VmEntryFlags, USER_PAGE_SIZE,
+};
 
 // Boot-smoke busy-wait budget for AP reactor task completion. 100k was
 // fine on bare metal and Apple-silicon TCG, but GitHub Actions runs
@@ -36,6 +54,34 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 const POLLING_IDLE_SPINS: usize = 256;
 
+fn platform_rtc_read_time_ns<P>() -> Result<u64, TimeError>
+where
+    HalRtcDevice<P>: TimeRtcDeviceOps,
+{
+    HalRtcDevice::<P>::new().read_time_ns()
+}
+
+fn platform_rtc_set_time_ns<P>(ns: u64) -> Result<(), TimeError>
+where
+    HalRtcDevice<P>: TimeRtcDeviceOps,
+{
+    HalRtcDevice::<P>::new().set_time_ns(ns)
+}
+
+fn platform_rtc_set_alarm_ns<P>(ns: u64) -> Result<(), TimeError>
+where
+    HalRtcDevice<P>: TimeRtcDeviceOps,
+{
+    HalRtcDevice::<P>::new().set_alarm_ns(ns)
+}
+
+fn platform_rtc_clear_alarm<P>() -> Result<(), TimeError>
+where
+    HalRtcDevice<P>: TimeRtcDeviceOps,
+{
+    HalRtcDevice::<P>::new().clear_alarm()
+}
+
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
 /// Switched to true when the userspace reactor phase begins, enabling
 /// the concurrent poll path on all harts.
@@ -45,6 +91,230 @@ static CONSOLE_WRITE_LOCK: SpinMutex<()> = spin_mutex((), b"debug.lock.kernel.co
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
+static OWNER_WAKE_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
+static OWNER_WAKE_SMP_DELEGATE_TOKEN: SpinMutex<Option<boot_runtime::DelegateTokenId>> =
+    spin_mutex(None, b"debug.lock.kernel.owner_wake_token");
+static OWNER_WAKE_SMP_DELEGATE_REGISTRY: SpinMutex<Option<Arc<boot_runtime::DelegateRegistry>>> =
+    spin_mutex(None, b"debug.lock.kernel.owner_wake_registry");
+static RCU_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
+
+struct FileIoRuntimeTaskSpawner<P: TxPlatform>(PhantomData<fn() -> P>);
+
+impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
+    for FileIoRuntimeTaskSpawner<P>
+{
+    fn spawn_file_io_service(
+        &self,
+        runtime: tx_subsystems::device::PageContainerFileIoServiceRuntime,
+    ) {
+        let submitted = CoreInit::<P>::submit_file_io_runtime_task_with(
+            runtime,
+            |runtime, config, meta| {
+                BOOT_REACTOR
+                    .with(|reactor| {
+                        reactor.submit_task_with_meta(
+                            async move {
+                                let _report = tx_subsystems::device::page_container_file_io_service_task_loop_owned(
+                                    runtime, config,
+                                )
+                                .await;
+                            },
+                            meta,
+                        )
+                    })
+                    .is_some()
+            },
+        );
+        assert!(
+            submitted,
+            "file I/O runtime spawner requires an initialized reactor"
+        );
+    }
+}
+
+const OWNER_WAKE_STAGE_INITIALIZED: u64 = 1;
+const OWNER_WAKE_STAGE_SOURCE: u64 = 2;
+const OWNER_WAKE_STAGE_TIMER: u64 = 3;
+const OWNER_WAKE_STAGE_DELEGATE: u64 = 4;
+const RCU_SMP_STAGE_READER_ACTIVE: u64 = 1;
+const RCU_SMP_STAGE_RELEASE_READER: u64 = 2;
+const RCU_SMP_STAGE_READER_DONE: u64 = 3;
+
+struct RcuSmpGuardedReader<P: TxPlatform> {
+    target_cpu: CpuId,
+    aspace: &'static AddressSpace,
+    address: UserVirtAddr,
+    expected_tag: UfdRegistration,
+    _platform: PhantomData<fn() -> P>,
+}
+
+impl<P: TxPlatform> Future for RcuSmpGuardedReader<P> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let guard = step_engine::guard();
+        assert_eq!(guard.cpu_id(), self.target_cpu, "RCU smoke reader CPU");
+        assert!(
+            self.aspace
+                .lookup(self.address)
+                .expect("RCU smoke initial recipe")
+                .ufd_registration
+                .is_none(),
+            "RCU smoke initial root must be untagged"
+        );
+
+        RCU_SMP_STAGE.store(RCU_SMP_STAGE_READER_ACTIVE, Ordering::Release);
+        while RCU_SMP_STAGE.load(Ordering::Acquire) < RCU_SMP_STAGE_RELEASE_READER {
+            core::hint::spin_loop();
+        }
+
+        assert_eq!(
+            self.aspace
+                .lookup(self.address)
+                .expect("RCU smoke replacement recipe")
+                .ufd_registration,
+            Some(self.expected_tag),
+            "RCU smoke reader must observe the replacement root"
+        );
+        drop(guard);
+        RCU_SMP_STAGE.store(RCU_SMP_STAGE_READER_DONE, Ordering::Release);
+        Poll::Ready(())
+    }
+}
+
+struct OwnerWakeSmpPark {
+    hart: usize,
+    source: Arc<boot_runtime::WaitSource>,
+    interests: boot_runtime::InterestMask,
+    deadline_ns: u64,
+    initialized: bool,
+    stage: u8,
+    subscriber: Option<boot_runtime::SubscriberId>,
+    timer: Option<boot_runtime::TimerGuard>,
+    delegate_token: Option<boot_runtime::DelegateTokenId>,
+    delegate_registry: Option<Arc<boot_runtime::DelegateRegistry>>,
+}
+
+impl Future for OwnerWakeSmpPark {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mailbox =
+            boot_runtime::current_task_mailbox(self.hart).expect("owner-wake task mailbox");
+
+        if !self.initialized {
+            let generation = mailbox.next_generation();
+            self.subscriber = Some(self.source.register(
+                Arc::downgrade(&mailbox),
+                generation,
+                self.interests,
+            ));
+
+            let registrar = boot_runtime::current_deadline_registrar(self.hart)
+                .expect("owner-wake deadline registrar");
+            self.timer = Some(
+                registrar
+                    .register_deadline(
+                        DeadlineNs::new(self.deadline_ns),
+                        TimerRole::DeadlineAbort,
+                        TimerTarget::TaskMailbox(Arc::downgrade(&mailbox)),
+                    )
+                    .expect("owner-wake deadline registration"),
+            );
+
+            let registry = boot_runtime::current_delegate_registry(self.hart)
+                .expect("owner-wake delegate registry");
+            let guard = registry.install_request(
+                boot_runtime::DelegateRequest::Placeholder,
+                0,
+                boot_runtime::AgentCancelPolicy::BestEffort,
+                boot_runtime::TokenDropPolicy::Abandon,
+                Arc::downgrade(&mailbox),
+            );
+            let token = guard.forget();
+            self.delegate_token = Some(token);
+            self.delegate_registry = Some(Arc::clone(&registry));
+            *OWNER_WAKE_SMP_DELEGATE_TOKEN.lock() = Some(token);
+            *OWNER_WAKE_SMP_DELEGATE_REGISTRY.lock() = Some(registry);
+            self.initialized = true;
+            OWNER_WAKE_SMP_STAGE.store(OWNER_WAKE_STAGE_INITIALIZED, Ordering::Release);
+            return Poll::Pending;
+        }
+
+        match self.stage {
+            0 => {
+                let source_id = self.source.id();
+                let interests = self.interests;
+                if mailbox
+                    .poll_select(|event| match event {
+                        boot_runtime::MailboxEvent::SourceFired {
+                            source,
+                            interests: event_interests,
+                            ..
+                        } if *source == source_id
+                            && event_interests.raw() & interests.raw() == interests.raw() =>
+                        {
+                            boot_runtime::MailboxPollAction::Take
+                        }
+                        _ => boot_runtime::MailboxPollAction::Keep,
+                    })
+                    .is_some()
+                {
+                    if let Some(subscriber) = self.subscriber.take() {
+                        self.source.unregister(subscriber);
+                    }
+                    self.stage = 1;
+                    OWNER_WAKE_SMP_STAGE.store(OWNER_WAKE_STAGE_SOURCE, Ordering::Release);
+                    return Poll::Pending;
+                }
+            }
+            1 => {
+                if mailbox
+                    .poll_select(|event| match event {
+                        boot_runtime::MailboxEvent::TimerFired { .. } => {
+                            boot_runtime::MailboxPollAction::Take
+                        }
+                        _ => boot_runtime::MailboxPollAction::Keep,
+                    })
+                    .is_some()
+                {
+                    self.timer = None;
+                    self.stage = 2;
+                    OWNER_WAKE_SMP_STAGE.store(OWNER_WAKE_STAGE_TIMER, Ordering::Release);
+                    return Poll::Pending;
+                }
+            }
+            2 => {
+                let expected = self.delegate_token;
+                if let Some(boot_runtime::MailboxEvent::AgentReplied { token_id }) = mailbox
+                    .poll_select(|event| match event {
+                        boot_runtime::MailboxEvent::AgentReplied { token_id }
+                            if Some(*token_id) == expected =>
+                        {
+                            boot_runtime::MailboxPollAction::Take
+                        }
+                        _ => boot_runtime::MailboxPollAction::Keep,
+                    })
+                {
+                    let registry = self
+                        .delegate_registry
+                        .as_ref()
+                        .expect("owner-wake delegate registry");
+                    assert!(
+                        registry.take_reply(token_id).is_some(),
+                        "owner-wake delegate reply payload"
+                    );
+                    self.stage = 3;
+                    OWNER_WAKE_SMP_STAGE.store(OWNER_WAKE_STAGE_DELEGATE, Ordering::Release);
+                    return Poll::Ready(());
+                }
+            }
+            _ => {}
+        }
+
+        Poll::Pending
+    }
+}
 
 /// Global root-mount slot retained for the kernel lifetime after
 /// `mount_rootfs_tmpfs` bootstraps the process subsystem.
@@ -98,6 +368,20 @@ static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
 static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.console_tty");
 
+#[cfg(any(test, tx_demo_boot))]
+const TX_KERNEL_DEMO_BANNER: &str = r#"
+TxKernel demo boot
+ ________          __    __                                          __
+/        |        /  |  /  |                                        /  |
+$$$$$$$$/__    __ $$ | /$$/   ______    ______   _______    ______  $$ |
+   $$ | /  \  /  |$$ |/$$/   /      \  /      \ /       \  /      \ $$ |
+   $$ | $$  \/$$/ $$  $$<   /$$$$$$  |/$$$$$$  |$$$$$$$  |/$$$$$$  |$$ |
+   $$ |  $$  $$<  $$$$$  \  $$    $$ |$$ |  $$/ $$ |  $$ |$$    $$ |$$ |
+   $$ |  /$$$$  \ $$ |$$  \ $$$$$$$$/ $$ |      $$ |  $$ |$$$$$$$$/ $$ |
+   $$ | /$$/ $$  |$$ | $$  |$$       |$$ |      $$ |  $$ |$$       |$$ |
+   $$/  $$/   $$/ $$/   $$/  $$$$$$$/ $$/       $$/   $$/  $$$$$$$/ $$/
+"#;
+
 /// Snapshot the boot-time root mount cap. Returns `None` until
 /// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
 /// pre-mount). Pairs with `ROOT_MOUNT`'s strong-retainer slot so
@@ -109,6 +393,20 @@ pub fn root_mount() -> Option<Cap<MountIdentity>> {
 
 fn init_mount_namespace() -> Option<Cap<MountNamespace>> {
     tx_subsystems::process::init_process()?.mount_namespace_cap()
+}
+
+fn publish_boot_mountpoint_dentry(
+    parent: &Cap<DEntry>,
+    name: &[u8],
+    rnode: Cap<RNode>,
+) -> Cap<DEntry> {
+    let mut raw = DEntry::new(
+        InlineName::new(name).expect("boot mountpoint name must be valid"),
+        rnode,
+    );
+    raw.set_parent_hint(parent);
+    let dentry = step_engine::sign(raw).expect("boot mountpoint dentry reservation");
+    parent.cache_child(dentry)
 }
 
 /// Snapshot the boot-time devfs mount cap. Returns `None` until
@@ -129,10 +427,98 @@ pub fn console_tty() -> Option<Cap<TtyIdentity>> {
     CONSOLE_TTY.lock().clone()
 }
 
+pub(crate) fn ingest_console_tty_bytes<P: TxPlatform>(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let Some(tty) = console_tty() else {
+        return 0;
+    };
+    let guard = step_engine::guard();
+    let outcome = match tx_subsystems::tty::execution::step_ingest_with_post(
+        &tty,
+        bytes,
+        &guard,
+        post_mailbox_ref_event_with_hint_from_current_hart::<P>,
+    ) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => return 0,
+    };
+    drop(guard);
+    if let Some(init) = tx_subsystems::process::execution::init_process() {
+        let _ = tx_subsystems::tty::execution::deliver_signal_dispatch_for_process(
+            &init,
+            outcome.signal_dispatch,
+        );
+    }
+    outcome.consumed
+}
+
 pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
     let _ = BOOT_REACTOR.with(|reactor| {
         reactor.mark_userspace_preempt(boot_runtime::HartId(cpu_id.0));
     });
+}
+
+pub(crate) fn post_mailbox_event_from_current_hart<P: TxPlatform>(
+    mailbox: alloc::sync::Weak<boot_runtime::TaskMailbox>,
+    event: boot_runtime::MailboxEvent,
+) {
+    let current_hart = boot_runtime::HartId(<P as tx_hal::SmpIf>::current_cpu_id().0);
+    let mut signal = SmpRescheduleSignal::<P>::new();
+    let mut pending = Some((mailbox, event));
+    let routed = BOOT_REACTOR
+        .with(|reactor| {
+            let Some((mailbox, event)) = pending.take() else {
+                return false;
+            };
+            let _ = reactor.post_mailbox_event_from_hart(mailbox, event, current_hart, &mut signal);
+            true
+        })
+        .unwrap_or(false);
+
+    if routed {
+        return;
+    }
+    if let Some((mailbox, event)) = pending {
+        let Some(mailbox) = mailbox.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    }
+}
+
+pub(crate) fn post_mailbox_ref_event_with_hint_from_current_hart<P: TxPlatform>(
+    mailbox: &boot_runtime::TaskMailbox,
+    event: boot_runtime::MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    let current_hart = boot_runtime::HartId(<P as tx_hal::SmpIf>::current_cpu_id().0);
+    let mut signal = SmpRescheduleSignal::<P>::new();
+    let mut pending = Some(event);
+    let routed = BOOT_REACTOR
+        .with(|reactor| {
+            let Some(event) = pending.take() else {
+                return None;
+            };
+            let (posted, _) = reactor.post_mailbox_ref_event_with_hint_from_hart(
+                mailbox,
+                event,
+                hint,
+                current_hart,
+                &mut signal,
+            );
+            Some(posted)
+        })
+        .flatten();
+
+    if let Some(posted) = routed {
+        return posted;
+    }
+    if let Some(event) = pending {
+        return mailbox.post_with_scheduler_hint(event, hint);
+    }
+    false
 }
 
 pub(crate) fn boot_reactor_hart_is_polling_idle(hart: boot_runtime::HartId) -> bool {
@@ -207,22 +593,31 @@ pub struct CoreInit<P: TxPlatform> {
     _platform: PhantomData<P>,
 }
 
+mod boot_args;
+mod boot_plan;
 mod exec;
 mod helpers;
 mod net;
 mod reactor_submit;
 
 impl<P: TxPlatform> CoreInit<P> {
+    fn monotonic_now_ns() -> u64 {
+        timekeeper_clock::<P>().monotonic_now_ns()
+    }
+
+    fn deadline_timer() -> HalDeadlineTimer<P> {
+        HalDeadlineTimer::<P>::new()
+    }
+
     pub fn boot(handoff: BootHandoff) -> ! {
         Self::init_early(handoff);
         Self::init_substrate_if_ready(handoff);
-        // ELF-loader Phase 7: register the embedded `/init` fixture
-        // into the rootfs tmpfs and drive `exec_script` synchronously
-        // so the init leader's `saved_user_context` is seeded with
-        // the new image's entry-point + initial stack pointer. The
-        // BSP reactor loop below then picks up the seeded context
-        // on its first poll and re-enters userspace through the
-        // production trap return path.
+        // Unpack boot media and drive `exec_script` synchronously so
+        // the init leader's `saved_user_context` is seeded with the
+        // selected userspace image's entry-point + initial stack
+        // pointer. The BSP reactor loop below then picks up the
+        // seeded context on its first poll and re-enters userspace
+        // through the production trap return path.
         //
         // Order (per Phase 7 plan): runs after
         // `bind_init_cwd_and_root` (init has cwd + fds 0/1/2) and
@@ -239,8 +634,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // the ELF-loader plan, the leader's `saved_user_context` was
         // seeded by `run_bootstrap_exec_for_init` above; the first
         // iteration of `run_thread` re-enters userspace at the
-        // fixture's `_start` and the eventual `exit_group(0)` syscall
-        // zombifies init.
+        // selected init image and the eventual `exit_group(0)`
+        // syscall zombifies init.
         if P::SUBSTRATE_BOOT_READY {
             Self::run_userspace_reactor_loop();
         }
@@ -263,15 +658,19 @@ impl<P: TxPlatform> CoreInit<P> {
             // Uncomment to re-arm them (events on the WATCH_LO..WATCH_HI user
             // VA range print to the console as `txkernel:vmwatch:*`):
             // tx_subsystems::vm::probe::install_probe_sink(vm_probe_sink::<P>);
+            Self::write_demo_boot_banner();
             init::<P>();
             crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
+            tx_subsystems::time_hooks::ensure_hooks_installed();
             Self::install_kernel_trap_vector();
             Self::init_boot_reactor();
             Self::boot_secondary_cpus();
             Self::run_smp_shootdown_smoke();
             Self::run_smp_ipi_smoke();
             Self::run_reactor_dispatcher_smoke();
+            Self::run_reactor_owner_wake_smp_smoke();
+            Self::run_rcu_smp_smoke();
             Self::run_zone_smoke();
             Self::run_bsp_reactor_runtime_smoke();
             Self::run_bsp_reactor_timer_idle_smoke();
@@ -311,6 +710,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // #4 in the pre-ELF plan).
             Self::register_console_hardware();
             Self::install_irq_handlers();
+            Self::init_rtc_device();
             Self::init_block_devices();
             Self::init_net_devices();
             Self::mount_rootfs_from_boot_media();
@@ -320,12 +720,29 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_procfs_at_proc();
             Self::mount_sysfs_at_sys();
             Self::mount_bdevfs_at_dev_block();
-            Self::mount_sdcard_at_musl();
-            Self::populate_rootfs_shebang_shims();
-            Self::populate_rootfs_tmp_dirs();
-            Self::populate_rootfs_identity_files();
-            Self::populate_rootfs_kernel_config();
-            Self::populate_rootfs_network_databases();
+            let boot_plan = BootPlan::read::<P>();
+            if boot_plan.args.mount_sdcard {
+                Self::mount_sdcard_at_musl();
+            }
+            match boot_plan.rootfs_setup {
+                RootfsSetup::LinuxLike => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":rootfs-shims:skip:");
+                    tx_hal::console_write_str::<P>(boot_plan.args.mode.name());
+                    tx_hal::console_write_str::<P>("\n");
+                }
+                RootfsSetup::TestInit => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":rootfs-shims:skip:test-init\n");
+                }
+                RootfsSetup::LegacyKernelShims => {
+                    Self::populate_rootfs_shebang_shims();
+                    Self::populate_rootfs_tmp_dirs();
+                    Self::populate_rootfs_identity_files();
+                    Self::populate_rootfs_kernel_config();
+                    Self::populate_rootfs_network_databases();
+                }
+            }
             Self::init_csprng();
             Self::bind_init_cwd_and_root();
             // Boot net bring-up: publish the boot net device (virtio-net0) into
@@ -333,6 +750,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // submit the net delegate/deadline runtime tasks. PR#50 dropped this
             // call; without it only `lo` exists in the namespace (in6_02 etc.).
             Self::submit_net_runtime_tasks();
+            let _ = Self::install_file_io_runtime_task_spawner();
 
             // Deferred H4 spine slots:
             // - post-substrate init hooks
@@ -346,6 +764,72 @@ impl<P: TxPlatform> CoreInit<P> {
             // have concrete no_std initialization contracts.
         }
     }
+
+    fn file_io_service_task_config() -> tx_subsystems::device::PageContainerFileIoServiceTaskConfig
+    {
+        tx_subsystems::device::PageContainerFileIoServiceTaskConfig::run_forever(
+            tx_subsystems::io_manager::runtime::ServiceBudget::new(64),
+            tx_subsystems::io_manager::runtime::ServiceBudget::new(64),
+        )
+    }
+
+    fn install_file_io_runtime_task_spawner() -> usize {
+        tx_subsystems::device::install_file_io_service_runtime_spawner(Arc::new(
+            FileIoRuntimeTaskSpawner::<P>(PhantomData),
+        ))
+        .expect("file I/O runtime spawner installs once after boot reactor initialization")
+    }
+
+    fn submit_file_io_runtime_task_with<F>(
+        runtime: tx_subsystems::device::PageContainerFileIoServiceRuntime,
+        mut submit: F,
+    ) -> bool
+    where
+        F: FnMut(
+            tx_subsystems::device::PageContainerFileIoServiceRuntime,
+            tx_subsystems::device::PageContainerFileIoServiceTaskConfig,
+            tx_reactor::InitialSchedMeta,
+        ) -> bool,
+    {
+        let config = Self::file_io_service_task_config();
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let meta = tx_reactor::InitialSchedMeta::kernel()
+            .with_affinity(tx_hal::CpuMask::single(current_cpu).bits());
+        submit(runtime, config, meta)
+    }
+
+    #[cfg(test)]
+    fn submit_file_io_runtime_tasks_with<F>(mut submit: F) -> usize
+    where
+        F: FnMut(
+            tx_subsystems::device::PageContainerFileIoServiceRuntime,
+            tx_subsystems::device::PageContainerFileIoServiceTaskConfig,
+            tx_reactor::InitialSchedMeta,
+        ) -> bool,
+    {
+        let mut submitted = 0;
+        for runtime in tx_subsystems::device::page_container_file_io_service_runtimes_snapshot() {
+            if Self::submit_file_io_runtime_task_with(runtime, &mut submit) {
+                submitted += 1;
+            }
+        }
+        submitted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_file_io_runtime_tasks_for_test() -> usize {
+        Self::submit_file_io_runtime_tasks_with(|_runtime, _config, _meta| true)
+    }
+
+    #[cfg(tx_demo_boot)]
+    fn write_demo_boot_banner() {
+        tx_hal::console_write_str::<P>(TX_KERNEL_DEMO_BANNER);
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":demo:boot-banner:ok\n");
+    }
+
+    #[cfg(not(tx_demo_boot))]
+    fn write_demo_boot_banner() {}
 
     fn init_process_subsystem() {
         // Allocates an `AddressSpace` for init using the boot platform's
@@ -378,9 +862,9 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>("\n");
     }
 
-    /// Register the boot console as a hardware TTY and stash its cap
-    /// in `CONSOLE_TTY` so subsequent steps can publish it under the
-    /// `/dev/console` devfs alias. Per `txdoc:TTY-THE-HARDWARE-
+    /// Register the boot UART as hardware TTY `ttyS0` and stash its cap
+    /// in `CONSOLE_TTY` so subsequent steps can publish the same identity
+    /// under the `/dev/console` devfs alias. Per `txdoc:TTY-THE-HARDWARE-
     /// CONSOLE-PATH-1` (`docs/design/06_devices/TTY.md` §7).
     ///
     /// **Order invariant:** must precede `mount_devfs_at_dev`.
@@ -419,7 +903,11 @@ impl<P: TxPlatform> CoreInit<P> {
         }));
 
         let guard = step_engine::guard();
-        let tty = match register_hardware("console", 0, binding, &guard) {
+        let winsize = BootPlan::read::<P>()
+            .args
+            .tty_winsize
+            .unwrap_or(tx_subsystems::tty::structure::payload::DEFAULT_HARDWARE_WINSIZE);
+        let tty = match register_hardware_with_winsize("ttyS0", 0, binding, winsize, &guard) {
             StepOutcome::Done(tty) => tty,
             other => panic!("register_console_hardware: register_hardware failed: {other:?}"),
         };
@@ -523,6 +1011,17 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":devices:net:ok\n");
     }
 
+    /// Install the statically selected platform's persistent-clock capability
+    /// behind the typed devfs RTC character-device ops.
+    pub(crate) fn init_rtc_device() {
+        tx_fs::devfs::install_rtc_backend(
+            platform_rtc_read_time_ns::<P>,
+            platform_rtc_set_time_ns::<P>,
+            platform_rtc_set_alarm_ns::<P>,
+            platform_rtc_clear_alarm::<P>,
+        );
+    }
+
     /// Mount tmpfs as the boot rootfs.
     ///
     /// Keep LA64 aligned with RV64: `/` is a writable tmpfs used for
@@ -544,18 +1043,12 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
         // Route CLOCK_REALTIME to code below the platform generic
-        // (page-backed writeback stamps file mtimes on flush).
-        tx_subsystems::wall_clock::install_monotonic_ns_source(P::read_ns);
-        // Seed CLOCK_REALTIME from the platform hardware RTC (if any) so wall
-        // time — `date`, `git` commit timestamps, file mtimes — reflects real
-        // time instead of the fixed epoch base. Runs after vDSO init so the
-        // offset update is republished into the vvar page. Platforms without a
-        // readable RTC return `None` and keep the default base (no change).
-        if let Some(rtc_ns) = P::read_rtc_epoch_ns() {
-            let _ = tx_subsystems::wall_clock::set_realtime_ns::<P>(rtc_ns);
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":rtc:synced\n");
-        }
+        // (page-backed writeback stamps file mtimes on flush). The hook now
+        // lives in `tx-time` alongside main's other non-generic time hooks;
+        // main's own RTC seeding runs from `vdso::init` via
+        // `RealtimeControl::seed_realtime_from_persistent`, so the feature
+        // branch's `P::read_rtc_epoch_ns()` block is dropped as redundant.
+        tx_services::time::install_monotonic_ns_source(P::read_ns);
     }
 
     /// Mount tmpfs as the rootfs.
@@ -613,13 +1106,13 @@ impl<P: TxPlatform> CoreInit<P> {
                 .expect("mount_rootfs_tmpfs: root rnode reservation");
             step_engine::sign_for(res, raw)
         };
-        let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
+        let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode)
             .expect("mount_rootfs_tmpfs: root dentry reservation");
 
-        let mount = MountIdentity::new_cap(
+        let mount = MountIdentity::new_cap_with_root_dentry(
             mount::allocate_mount_id(),
             None,
-            root_rnode,
+            root_dentry,
             None,
             payload,
             MountFlags::empty(),
@@ -684,11 +1177,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // Build the `/dev` mountpoint DEntry on the rootfs.
         let dev_rnode_in_root = RNode::new_cap(dev_object_id, dev_meta, RNodeBacking::Directory)
             .expect("mount_devfs_at_dev: /dev rnode-on-rootfs reservation");
-        let dev_dentry_on_root = DEntry::new_cap(
-            InlineName::new(b"dev").expect("mount_devfs_at_dev: /dev inline name"),
-            dev_rnode_in_root,
-        )
-        .expect("mount_devfs_at_dev: /dev dentry-on-rootfs reservation");
+        let dev_dentry_on_root =
+            publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"dev", dev_rnode_in_root);
 
         // Build the devfs payload before its root RNode so the rnode
         // can carry a `containing_mount` weak — same reason as the
@@ -736,7 +1226,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let dev_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
-            Some(dev_dentry_on_root),
+            Some(dev_dentry_on_root.clone()),
             devfs_root_rnode,
             Some(root_mount),
             devfs_payload,
@@ -754,7 +1244,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // half-built one).
         mount::register_mount(&rootfs_payload, dev_object_id, dev_mount.clone());
         if let Some(mnt_ns) = init_mount_namespace() {
-            mnt_ns.register_mount(&rootfs_payload, dev_object_id, dev_mount.clone());
+            mnt_ns.register_mount(&dev_dentry_on_root, dev_mount.clone());
         }
 
         *DEV_MOUNT.lock() = Some(dev_mount);
@@ -771,10 +1261,10 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// **Order invariant:** runs after `mount_rootfs_from_boot_media`.
     pub(crate) fn mount_procfs_at_proc() {
-        // /proc/uptime needs a monotonic clock, but procfs is not generic
-        // over the platform — inject the concrete `TimeIf::read_ns` once
-        // (same fn-pointer pattern as `tx_observe`'s TS_FN).
-        tx_fs::procfs::procfs_register_uptime_clock(<P as tx_hal::TimeIf>::read_ns);
+        // /proc/uptime needs a monotonic clock, but procfs is not generic over
+        // the platform. Inject the boot-time Time facade read once.
+        tx_fs::procfs::procfs_register_uptime_clock(Self::monotonic_now_ns);
+        tx_fs::procfs::procfs_register_boot_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline);
 
         let root_mount = ROOT_MOUNT
             .lock()
@@ -822,11 +1312,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let proc_rnode_in_root = RNode::new_cap(proc_object_id, proc_meta, RNodeBacking::Directory)
             .expect("mount_procfs_at_proc: /proc rnode-on-rootfs reservation");
-        let proc_dentry_on_root = DEntry::new_cap(
-            InlineName::new(b"proc").expect("mount_procfs_at_proc: /proc inline name"),
-            proc_rnode_in_root,
-        )
-        .expect("mount_procfs_at_proc: /proc dentry-on-rootfs reservation");
+        let proc_dentry_on_root =
+            publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"proc", proc_rnode_in_root);
 
         let procfs_fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
         let procfs_fs_page_backing = alloc::sync::Arc::new(tx_fs::procfs::Procfs)
@@ -860,7 +1347,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let proc_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
-            Some(proc_dentry_on_root),
+            Some(proc_dentry_on_root.clone()),
             procfs_root_rnode,
             Some(root_mount),
             procfs_payload,
@@ -870,7 +1357,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         mount::register_mount(&rootfs_payload, proc_object_id, proc_mount.clone());
         if let Some(mnt_ns) = init_mount_namespace() {
-            mnt_ns.register_mount(&rootfs_payload, proc_object_id, proc_mount.clone());
+            mnt_ns.register_mount(&proc_dentry_on_root, proc_mount.clone());
         }
 
         *PROC_MOUNT.lock() = Some(proc_mount);
@@ -928,11 +1415,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let sys_rnode_in_root = RNode::new_cap(sys_object_id, sys_meta, RNodeBacking::Directory)
             .expect("mount_sysfs_at_sys: /sys rnode-on-rootfs reservation");
-        let sys_dentry_on_root = DEntry::new_cap(
-            InlineName::new(b"sys").expect("mount_sysfs_at_sys: /sys inline name"),
-            sys_rnode_in_root,
-        )
-        .expect("mount_sysfs_at_sys: /sys dentry-on-rootfs reservation");
+        let sys_dentry_on_root =
+            publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"sys", sys_rnode_in_root);
 
         let sysfs_payload = MountPayload::new_cap(
             tx_fs::sysfs::Sysfs::fs_ops_arc(),
@@ -962,7 +1446,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let sys_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
-            Some(sys_dentry_on_root),
+            Some(sys_dentry_on_root.clone()),
             sysfs_root_rnode,
             Some(root_mount),
             sysfs_payload,
@@ -972,7 +1456,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         mount::register_mount(&rootfs_payload, sys_object_id, sys_mount.clone());
         if let Some(mnt_ns) = init_mount_namespace() {
-            mnt_ns.register_mount(&rootfs_payload, sys_object_id, sys_mount.clone());
+            mnt_ns.register_mount(&sys_dentry_on_root, sys_mount.clone());
         }
 
         *SYS_MOUNT.lock() = Some(sys_mount);
@@ -1007,11 +1491,8 @@ impl<P: TxPlatform> CoreInit<P> {
             RNodeBacking::Directory,
         )
         .expect("mount_tmpfs_at_dev_shm: /dev/shm rnode-on-devfs reservation");
-        let shm_dentry_on_devfs = DEntry::new_cap(
-            InlineName::new(b"shm").expect("mount_tmpfs_at_dev_shm: /shm inline name"),
-            shm_rnode_in_devfs,
-        )
-        .expect("mount_tmpfs_at_dev_shm: /dev/shm dentry-on-devfs reservation");
+        let shm_dentry_on_devfs =
+            publish_boot_mountpoint_dentry(dev_mount.root_dentry(), b"shm", shm_rnode_in_devfs);
 
         let (_tmpfs, mount_output) = tx_fs::tmpfs::Tmpfs::new_root();
         let tmpfs_payload = MountPayload::new_cap(
@@ -1044,7 +1525,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let shm_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
-            Some(shm_dentry_on_devfs),
+            Some(shm_dentry_on_devfs.clone()),
             tmpfs_root_rnode,
             Some(dev_mount),
             tmpfs_payload,
@@ -1058,11 +1539,7 @@ impl<P: TxPlatform> CoreInit<P> {
             shm_mount.clone(),
         );
         if let Some(mnt_ns) = init_mount_namespace() {
-            mnt_ns.register_mount(
-                &devfs_payload,
-                tx_fs::devfs::DEVFS_SHM_DIR_OBJECT_ID,
-                shm_mount.clone(),
-            );
+            mnt_ns.register_mount(&shm_dentry_on_devfs, shm_mount.clone());
         }
 
         *DEV_SHM_MOUNT.lock() = Some(shm_mount);
@@ -1121,11 +1598,11 @@ impl<P: TxPlatform> CoreInit<P> {
             RNodeBacking::Directory,
         )
         .expect("mount_bdevfs_at_dev_block: /dev/block rnode-on-devfs reservation");
-        let dev_block_dentry_on_devfs = DEntry::new_cap(
-            InlineName::new(b"block").expect("mount_bdevfs_at_dev_block: /block inline name"),
+        let dev_block_dentry_on_devfs = publish_boot_mountpoint_dentry(
+            dev_mount.root_dentry(),
+            b"block",
             dev_block_rnode_in_devfs,
-        )
-        .expect("mount_bdevfs_at_dev_block: /dev/block dentry-on-devfs reservation");
+        );
 
         // Build the bdev-fs MountPayload.
         let bdevfs_payload_inner = Arc::new(tx_fs::bdevfs::BdevFsMountPayload::new());
@@ -1168,7 +1645,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let bdev_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
-            Some(dev_block_dentry_on_devfs),
+            Some(dev_block_dentry_on_devfs.clone()),
             bdevfs_root_rnode,
             Some(dev_mount),
             bdevfs_payload,
@@ -1182,11 +1659,7 @@ impl<P: TxPlatform> CoreInit<P> {
             bdev_mount.clone(),
         );
         if let Some(mnt_ns) = init_mount_namespace() {
-            mnt_ns.register_mount(
-                &devfs_payload,
-                tx_fs::devfs::DEVFS_BLOCK_DIR_OBJECT_ID,
-                bdev_mount,
-            );
+            mnt_ns.register_mount(&dev_block_dentry_on_devfs, bdev_mount);
         }
 
         // rootfs ownership of the chain holds: devfs is mounted on
@@ -1195,113 +1668,6 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:bdevfs:ok\n");
-    }
-
-    /// Bind-mount the mounted Alpine ext4 image's top-level subtrees
-    /// (`/musl/usr` -> `/usr`, `/musl/lib` -> `/lib`, `/musl/bin` -> `/bin`,
-    /// `/musl/sbin` -> `/sbin`) over the empty rootfs skeleton directories.
-    ///
-    /// For the `tx.runsh` (on-site-finals git) lane only — call it from the
-    /// bootstrap path when `tx.runsh` is set.
-    ///
-    /// The image is mounted at `/musl`, but its binaries and its own *absolute*
-    /// symlinks assume a real root layout: `/usr/bin/git`, `/bin/sh ->
-    /// /bin/busybox`, the musl loader's default library search (`/lib:/usr/lib`),
-    /// and git's compiled-in `/bin/sh` for spawning helpers (index-pack,
-    /// upload-pack). Those all land on the read-only kernel rootfs, not `/musl`,
-    /// so git clone reaches the network but dies at helper spawn. The
-    /// `populate_rootfs_*` shims already create `/usr`, `/lib`, `/bin`, ... as
-    /// empty tmpfs dirs, so a plain top-level symlink can't take their place
-    /// (EEXIST). Instead, mount the matching ext4 subtree over each empty
-    /// skeleton dir, so the mounted image behaves as the root fs for the
-    /// helper-spawn paths git relies on. Gated to this lane, so the OSComp
-    /// tmpfs layout is untouched. Best-effort: a missing image dir or a backend
-    /// that would block is skipped rather than aborting boot. (Ported from
-    /// net-git e7992ef8 — git Task2.)
-    pub(super) fn overlay_image_dirs_for_runsh() {
-        use step_engine::StepOutcome as V3;
-        let Some(musl_mount) = MUSL_MOUNT.lock().clone() else {
-            return;
-        };
-        let Some(root_mount) = ROOT_MOUNT.lock().clone() else {
-            return;
-        };
-        let Ok(ext4_payload) = musl_mount.payload_cap() else {
-            return;
-        };
-        let ext4_payload = ext4_payload.into_cap();
-        let ext4_fs_ops = ext4_payload.fs_ops.clone();
-        let ext4_root_id = musl_mount.root().fs_object_id();
-        let Ok(rootfs_payload) = root_mount.payload_cap() else {
-            return;
-        };
-        let rootfs_payload = rootfs_payload.into_cap();
-        let rootfs_fs_ops = rootfs_payload.fs_ops.clone();
-
-        for name in [
-            b"usr".as_slice(),
-            b"lib".as_slice(),
-            b"bin".as_slice(),
-            b"sbin".as_slice(),
-        ] {
-            let guard = step_engine::guard();
-            // Source: the ext4 subtree (e.g. /musl/usr).
-            let V3::Done(ext4_sub_id) = ext4_fs_ops.lookup(ext4_root_id, name, &guard) else {
-                drop(guard);
-                continue;
-            };
-            let V3::Done(ext4_sub_meta) = ext4_fs_ops.load_inode_meta(ext4_sub_id, &guard) else {
-                drop(guard);
-                continue;
-            };
-            // Mountpoint: the empty tmpfs skeleton dir (e.g. /usr).
-            let V3::Done(skel_id) =
-                rootfs_fs_ops.lookup(tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID, name, &guard)
-            else {
-                drop(guard);
-                continue;
-            };
-            let V3::Done(skel_meta) = rootfs_fs_ops.load_inode_meta(skel_id, &guard) else {
-                drop(guard);
-                continue;
-            };
-            drop(guard);
-
-            // ext4 subtree root RNode (with the ext4 containing-mount hint so
-            // the walker resolves the right FsOps after crossing the mount).
-            let ext4_sub_rnode = {
-                let raw = RNode::new(ext4_sub_id, ext4_sub_meta, RNodeBacking::Directory)
-                    .with_containing_mount(&ext4_payload);
-                let Ok(res) = step_engine::reserve_for::<RNode>() else {
-                    continue;
-                };
-                step_engine::sign_for(res, raw)
-            };
-            // Mountpoint DEntry on the rootfs.
-            let Ok(skel_rnode) = RNode::new_cap(skel_id, skel_meta, RNodeBacking::Directory) else {
-                continue;
-            };
-            let Ok(inline) = InlineName::new(name) else {
-                continue;
-            };
-            let Ok(mountpoint_dentry) = DEntry::new_cap(inline, skel_rnode) else {
-                continue;
-            };
-            let Ok(overlay_mount) = MountIdentity::new_cap(
-                mount::allocate_mount_id(),
-                Some(mountpoint_dentry),
-                ext4_sub_rnode,
-                Some(root_mount.clone()),
-                ext4_payload.clone(),
-                MountFlags::empty(),
-            ) else {
-                continue;
-            };
-            mount::register_mount(&rootfs_payload, skel_id, overlay_mount.clone());
-            if let Some(mnt_ns) = init_mount_namespace() {
-                mnt_ns.register_mount(&rootfs_payload, skel_id, overlay_mount);
-            }
-        }
     }
 
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
@@ -1315,31 +1681,48 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
-        use tx_subsystems::device::block_device_by_name;
+        use tx_fs::tx_ext4::{
+            mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
+            Ext4FileIoRuntimeBinder, JournalPagePool,
+        };
+        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+        use tx_subsystems::io_manager::block::DeviceKey;
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
         };
 
+        let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
-        // Mount read-write so test binaries that create or write to
-        // files under `/musl/musl/basic/` (test_mmap, test_munmap,
-        // test_mkdir, test_openat with O_CREAT, …) don't fall to
-        // -EROFS at every mutation. The ext4 backend's RW path is
-        // wired (`create_inode`/`mkdir`/`unlink` go through the
-        // pager's direct-write path per the 2026-05-13 trail); the
-        // only RW gap is `flush_page` (returns -ENOSYS), which
-        // affects long-running persistence but not the per-syscall
-        // contract these basic tests check.
-        let mount_output = match mount_ext4_read_write(image) {
-            Ok(out) => out,
+        let Some(geometry) = image.block_geometry(device) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
+            return;
+        };
+        // The pool holds the active ordered transaction's descriptor, commit,
+        // metadata journal copies, and later home-block checkpoint copies.
+        // Ext4Pager currently supports at most four inline extent mutations,
+        // so 32 pages leaves headroom without allowing unbounded staging.
+        let pool = match JournalPagePool::new(32) {
+            Ok(pool) => pool,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
                 return;
             }
         };
+        let mount_output =
+            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
+                Ok(out) => out,
+                Err(_) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
+                    return;
+                }
+            };
+        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+        )));
 
         let root_mount = ROOT_MOUNT
             .lock()
@@ -1370,14 +1753,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // Build the `/musl` mountpoint DEntry on the rootfs.
         let musl_rnode_in_root = RNode::new_cap(musl_object_id, musl_meta, RNodeBacking::Directory)
             .expect("mount_sdcard_at_musl: /musl rnode-on-rootfs reservation");
-        let musl_dentry_on_root = DEntry::new_cap(
-            InlineName::new(b"musl").expect("mount_sdcard_at_musl: /musl inline name"),
-            musl_rnode_in_root,
-        )
-        .expect("mount_sdcard_at_musl: /musl dentry-on-rootfs reservation");
+        let musl_dentry_on_root =
+            publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"musl", musl_rnode_in_root);
 
         // Build the ext4 mount payload.
-        let ext4_payload = MountPayload::new_cap(
+        let ext4_payload = MountPayload::new_cap_with_backend_planner(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
@@ -1385,6 +1765,7 @@ impl<P: TxPlatform> CoreInit<P> {
             MountOptions::default(),
             "ext4",
             SourceLabel::Static("vda"),
+            mount_output.backend_planner(),
         )
         .expect("mount_sdcard_at_musl: ext4 payload reservation");
 
@@ -1416,7 +1797,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let musl_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
-            Some(musl_dentry_on_root),
+            Some(musl_dentry_on_root.clone()),
             ext4_root_rnode,
             Some(root_mount),
             ext4_payload,
@@ -1428,7 +1809,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // tmpfs into ext4 at `/musl`.
         mount::register_mount(&rootfs_payload, musl_object_id, musl_mount.clone());
         if let Some(mnt_ns) = init_mount_namespace() {
-            mnt_ns.register_mount(&rootfs_payload, musl_object_id, musl_mount.clone());
+            mnt_ns.register_mount(&musl_dentry_on_root, musl_mount.clone());
         }
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
@@ -1545,14 +1926,10 @@ impl<P: TxPlatform> CoreInit<P> {
 
     /// Re-publish `console` under devfs's alias table.
     ///
-    /// `register_hardware("console", ...)` already published the
-    /// alias once (see `register_console_hardware` and
-    /// `tty::structure::registry::register_devfs_alias`). Calling
-    /// `register_console_alias` here lets the trio plan's spec read
-    /// — devfs's `lookup` is what resolves `/dev/console`, and the
-    /// alias must be visible **after** `mount_devfs_at_dev` so any
-    /// follow-up code that re-binds the registry sees the same
-    /// snapshot devfs's lookup walks.
+    /// `register_hardware("ttyS0", ...)` publishes the hardware entry.
+    /// Calling `register_console_alias` here publishes `/dev/console`
+    /// as a second devfs name for the same `TtyIdentity`, after devfs
+    /// itself is mounted.
     ///
     /// **Order invariant:** runs after `mount_devfs_at_dev` and
     /// before `bind_init_cwd_and_root` (which preopens
@@ -1589,17 +1966,11 @@ impl<P: TxPlatform> CoreInit<P> {
         let init = tx_subsystems::process::execution::init_process()
             .expect("bind_init_cwd_and_root: INIT_PROCESS must be populated");
 
-        // Re-derive the root dentry from `ROOT_MOUNT.root` so the
-        // chdir target shares the same RNode the mount table
-        // exposes. We could have stashed the dentry from
-        // `mount_rootfs_tmpfs` directly, but going through the
-        // mount keeps the boot wiring spec-shaped: cwd is always
-        // a DEntry over a mount's root rnode.
+        // Reuse the mount-owned namespace root identity. Cwd, absolute path
+        // resolution, and namespace cloning must all retain this exact DEntry.
         let root_mount =
             root_mount().expect("bind_init_cwd_and_root: ROOT_MOUNT must be populated");
-        let root_rnode = root_mount.root().clone();
-        let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode)
-            .expect("bind_init_cwd_and_root: cwd dentry reservation");
+        let root_dentry = root_mount.root_dentry().clone();
         // Pin the root dentry identity for the kernel lifetime. The
         // walker writes `parent_hint = Weak<DEntry>` to whatever root
         // dentry the syscall driver hands it; without a long-lived
@@ -1608,7 +1979,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // identity, breaking every subsequent `getcwd` (and every
         // walk whose target's parent_hint chain terminates at `/`).
         *ROOT_DENTRY.lock() = Some(root_dentry.clone());
-        let _outcome = tx_subsystems::process::execution::step_chdir(&init, root_dentry);
+        let _outcome = tx_subsystems::process::execution::step_chdir_with_mount(
+            &init,
+            root_dentry,
+            root_mount,
+        );
 
         // Preopen fds 0/1/2. Each call materialises a fresh
         // `OpenFile` over the same console TTY; the kernel's fd
@@ -1618,64 +1993,26 @@ impl<P: TxPlatform> CoreInit<P> {
             let console = tx_fs::devfs::open_console_for_init();
             let _prev = init.set_fd(fd, Some(console));
         }
+        if let Some(tty) = console_tty() {
+            let guard = step_engine::guard();
+            let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
+        }
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":init:cwd-fds:ok\n");
     }
 
-    /// ELF-loader Phase 7: register the embedded `/init` fixture into
-    /// the rootfs tmpfs and synchronously drive `exec_script` against
-    /// init. On `Err` panics with `:bootstrap-exec:fail` (Open Q #3
-    /// DECIDED 2026-05-06).
+    /// Unpack boot media, then synchronously drive `exec_script`
+    /// against the init path selected from firmware cmdline/profile.
+    /// On `Err` panics with `:bootstrap-exec:fail`.
     ///
-    /// Two sub-steps:
-    /// 1. `register_init_fixture_into_tmpfs` — call
-    ///    `FsOps::create_inode` on the rootfs to allocate `/init`,
-    ///    materialise its RNode (through tmpfs's Phase-7
-    ///    `materialise_rnode` override) so we can reach the inode's
-    ///    `Cap<PageContainer>`, copy the fixture bytes into the
-    ///    container's anon pages via the kernel direct map, and
-    ///    update the inode's visible size via `step_truncate`.
-    /// 2. `drive_bootstrap_exec` — `block_on(exec_script::<P>(...))`
-    ///    against init; on `Ok(())` the eight-phase EXEC_v1 protocol
-    ///    has seeded `process.aspace` with the new aspace and
-    ///    `thread.payload().saved_user_context` with the fixture's
-    ///    entry-point + initial stack pointer.
+    /// Userspace files are supplied by initramfs or block media. The
+    /// production path no longer registers a kernel-embedded `/init`
+    /// or baked BusyBox before exec.
     pub(crate) fn run_bootstrap_exec_for_init() {
-        // Try to install the embedded fork/wait `/init` fixture
-        // unconditionally. `register_init_fixture_into_tmpfs` is
-        // idempotent: `FsOps::create_inode(/init)` returns `EEXIST`
-        // when initramfs already supplied a `/init`, in which case
-        // the helper logs `:init:fixture:skip:ro` and returns
-        // without overwriting. On a clean tmpfs (no initramfs, CI
-        // smoke tests, host unit tests) it installs the bake-in
-        // fixture so `exec_script("/init", …)` can proceed.
-        //
-        // Removed: an `if !has_initramfs` short-circuit that hard-
-        // coded `has_initramfs = true`. The `boot_info().initrd`
-        // probe is unreliable at this point in boot (initrd may
-        // not be published yet), and `register_initramfs_if_present`
-        // already overlays its own /init on top of the fixture
-        // when present — so the EEXIST-tolerant idempotent call is
-        // both correct and simpler.
-        Self::register_init_fixture_into_tmpfs();
-        // Shell-prompt roadmap Slice 10 (2026-05-08): when the build
-        // script bakes a busybox binary via `TX_BUSYBOX`, also
-        // register it at `/bin/sh` so the bootstrap fixture's
-        // hand-written ELF can `execve("/bin/sh", ...)` into a real
-        // shell. `cfg(busybox_baked)` is set by `build.rs`; without
-        // it the fall-through is the legacy `/init` fixture path
-        // exclusively.
-        #[cfg(busybox_baked)]
-        Self::register_busybox_into_tmpfs();
         // Initramfs slice (2026-05-08): when the firmware (or QEMU
-        // `-initrd`) supplied a cpio archive, walk it and overlay
-        // its contents on top of the bake-in fixture. Entries that
-        // collide with bake-ins (e.g. `/init`) are left alone — the
-        // unpacker treats `EEXIST` from `create_inode` / `mkdir` /
-        // `symlink` as a non-fatal skip, so the bake-in always
-        // wins. Entries unique to the cpio (e.g. `/bin/busybox`,
-        // `/bin/sh` symlink) get added.
+        // `-initrd`) supplied a cpio archive, walk it into the
+        // writable rootfs before resolving the selected init path.
         Self::register_initramfs_if_present();
         Self::drive_bootstrap_exec();
     }
@@ -1835,6 +2172,295 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
+    fn run_reactor_owner_wake_smp_smoke() {
+        // AP reactor loops continuously drain due shared deadlines against the
+        // real monotonic clock. Keep this smoke-only deadline safely in the
+        // future: the BSP advances it explicitly below, so no wall-clock wait
+        // is introduced, while an AP cannot consume it between the source and
+        // timer stages.
+        const OWNER_WAKE_TIMER_DELTA_NS: u64 = 60 * 1_000_000_000;
+
+        let Some(target_cpu) = Self::first_remote_online_cpu() else {
+            return;
+        };
+
+        OWNER_WAKE_SMP_STAGE.store(0, Ordering::Release);
+        *OWNER_WAKE_SMP_DELEGATE_TOKEN.lock() = None;
+        *OWNER_WAKE_SMP_DELEGATE_REGISTRY.lock() = None;
+
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let targets = CpuMask::single(target_cpu);
+        let source = Arc::new(boot_runtime::WaitSource::new(
+            boot_runtime::WaitSourceId::new(0x0A11_CE01),
+        ));
+        let interests = boot_runtime::InterestMask::new(0b10);
+        let deadline_ns = Self::monotonic_now_ns().saturating_add(OWNER_WAKE_TIMER_DELTA_NS);
+
+        P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let submit_report = BOOT_REACTOR
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    OwnerWakeSmpPark {
+                        hart: target_cpu.0,
+                        source: Arc::clone(&source),
+                        interests,
+                        deadline_ns,
+                        initialized: false,
+                        stage: 0,
+                        subscriber: None,
+                        timer: None,
+                        delegate_token: None,
+                        delegate_registry: None,
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
+            .expect("boot reactor must be initialized before owner-wake SMP smoke");
+        assert_eq!(
+            submit_report.remote_ipis, 1,
+            "owner-wake SMP submit remote IPI"
+        );
+        Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_INITIALIZED);
+
+        P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let (source_wakes, source_report) = BOOT_REACTOR
+            .with(|reactor| {
+                let mut report = boot_runtime::WakeDispatchReport::empty();
+                let wakes = source.notify_with_owner_post(
+                    interests,
+                    MailboxSchedulerHint::Normal,
+                    |mailbox, event, hint| {
+                        let (posted, next) = reactor.post_mailbox_ref_event_with_hint_from_hart(
+                            mailbox,
+                            event,
+                            hint,
+                            current_hart,
+                            &mut signal,
+                        );
+                        report.merge(next);
+                        posted
+                    },
+                );
+                (wakes, report)
+            })
+            .expect("boot reactor must be initialized for owner-wake source post");
+        assert_eq!(source_wakes, 1, "owner-wake source wake count");
+        assert_eq!(source_report.remote_ipis, 1, "owner-wake source remote IPI");
+        Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_SOURCE);
+
+        P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let (timer_fired, timer_report) = BOOT_REACTOR
+            .with(|reactor| {
+                reactor.advance_time_to_from_hart_with_reschedule(
+                    deadline_ns,
+                    current_hart,
+                    &mut signal,
+                )
+            })
+            .expect("boot reactor must be initialized for owner-wake timer post");
+        assert_eq!(timer_fired, 1, "owner-wake timer fire count");
+        assert_eq!(timer_report.remote_ipis, 1, "owner-wake timer remote IPI");
+        Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_TIMER);
+
+        let token = (*OWNER_WAKE_SMP_DELEGATE_TOKEN.lock()).expect("owner-wake delegate token");
+        let registry = OWNER_WAKE_SMP_DELEGATE_REGISTRY
+            .lock()
+            .clone()
+            .expect("owner-wake delegate registry");
+
+        P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let (outcome, delegate_report) = BOOT_REACTOR
+            .with(|reactor| {
+                reactor.mark_delegate_replied_from_hart_with_reschedule(
+                    &registry,
+                    token,
+                    boot_runtime::DelegateReply::placeholder(),
+                    current_hart,
+                    &mut signal,
+                )
+            })
+            .expect("boot reactor must be initialized for owner-wake delegate post");
+        assert_eq!(
+            outcome,
+            boot_runtime::TransitionOutcome::Applied,
+            "owner-wake delegate transition"
+        );
+        assert_eq!(
+            delegate_report.remote_ipis, 1,
+            "owner-wake delegate remote IPI"
+        );
+        Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_DELEGATE);
+
+        *OWNER_WAKE_SMP_DELEGATE_TOKEN.lock() = None;
+        *OWNER_WAKE_SMP_DELEGATE_REGISTRY.lock() = None;
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":reactor:owner-wake:smp:ok\n");
+    }
+
+    fn wait_for_owner_wake_stage(expected: u64) {
+        for _ in 0..AP_REACTOR_WAIT_SPINS {
+            if OWNER_WAKE_SMP_STAGE.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+
+        panic!("owner-wake SMP smoke stage {expected} not observed");
+    }
+
+    fn run_rcu_smp_smoke() {
+        const RCU_SMOKE_ADDR: usize = 0x20_0000;
+        const RCU_DRAIN_BUDGET: usize = 1;
+        const RCU_DRAIN_ROUNDS: usize = 16;
+
+        let Some(target_cpu) = Self::first_remote_online_cpu() else {
+            return;
+        };
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let targets = CpuMask::single(target_cpu);
+        let range = UserRange::new_aligned(UserVirtAddr(RCU_SMOKE_ADDR), USER_PAGE_SIZE)
+            .expect("RCU smoke range");
+        let address = range.start();
+        let tag = UfdRegistration {
+            ufd_id: 0x5243_5501,
+            mode: 1,
+        };
+        let aspace = Box::leak(Box::new(
+            AddressSpace::new_for_platform::<P>().expect("RCU smoke address space"),
+        ));
+        let reservation = match aspace.reserve_map(
+            VmEntry::new(range, Prot::READ, VmEntryFlags::PRIVATE, VmBacking::None),
+            MapPlacement::RequireFree,
+        ) {
+            MapReserveResult::Reserved(reservation) => reservation,
+            MapReserveResult::Blocked(_) => panic!("RCU smoke initial map blocked"),
+            MapReserveResult::Err(error) => panic!("RCU smoke initial map failed: {error:?}"),
+        };
+        reservation.commit().expect("RCU smoke initial map commit");
+        Self::drain_rcu_smoke_until_quiet(RCU_DRAIN_ROUNDS, RCU_DRAIN_BUDGET);
+
+        let bsp_summary = step_engine::cpu_summary(current_cpu).expect("RCU smoke BSP epoch state");
+        let ap_summary = step_engine::cpu_summary(target_cpu).expect("RCU smoke AP epoch state");
+        assert!(bsp_summary.initialized, "RCU smoke BSP epoch initialized");
+        assert!(ap_summary.initialized, "RCU smoke AP epoch initialized");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":rcu:smp:cpus:ok\n");
+
+        RCU_SMP_STAGE.store(0, Ordering::Release);
+        P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let submit_report = BOOT_REACTOR
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    RcuSmpGuardedReader::<P> {
+                        target_cpu,
+                        aspace,
+                        address,
+                        expected_tag: tag,
+                        _platform: PhantomData,
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
+            .expect("boot reactor must be initialized before RCU SMP smoke");
+        assert_eq!(submit_report.remote_ipis, 1, "RCU smoke remote submit IPI");
+        Self::wait_for_rcu_smp_stage(RCU_SMP_STAGE_READER_ACTIVE);
+
+        let active_ap = step_engine::cpu_summary(target_cpu).expect("RCU smoke active AP state");
+        assert_ne!(active_ap.local_epoch, 0, "RCU smoke AP guard published");
+        aspace
+            .tag_ufd_registration(range, tag)
+            .expect("RCU smoke recipe replacement");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":rcu:smp:guarded-overlap:ok\n");
+
+        let early = step_engine::drain_with_budget(RCU_DRAIN_BUDGET);
+        assert_eq!(early.bag_reclaimed, 0, "RCU smoke early bag reclaim");
+        assert_eq!(
+            early.publication_dropped, 0,
+            "RCU smoke early publication drop"
+        );
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":rcu:smp:no-early-reclaim:ok\n");
+
+        P::clear_ipi_ack_cpus(IpiKind::Maintenance, targets);
+        P::send_ipi(target_cpu, IpiKind::Maintenance);
+        let acked = P::wait_for_ipi_ack_cpus(targets, IpiKind::Maintenance);
+        assert_eq!(
+            acked,
+            targets.count(),
+            "RCU smoke maintenance acknowledgements"
+        );
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":rcu:smp:maintenance-ack:ok\n");
+
+        RCU_SMP_STAGE.store(RCU_SMP_STAGE_RELEASE_READER, Ordering::Release);
+        Self::wait_for_rcu_smp_stage(RCU_SMP_STAGE_READER_DONE);
+
+        let mut reclaimed = 0usize;
+        let mut dropped = 0usize;
+        let mut quiet = false;
+        for _ in 0..RCU_DRAIN_ROUNDS {
+            let stats = step_engine::drain_with_budget(RCU_DRAIN_BUDGET);
+            assert!(
+                stats.bag_reclaimed <= RCU_DRAIN_BUDGET,
+                "RCU smoke bag drain exceeded budget"
+            );
+            assert!(
+                stats.publication_dropped <= RCU_DRAIN_BUDGET,
+                "RCU smoke publication drain exceeded budget"
+            );
+            reclaimed += stats.bag_reclaimed;
+            dropped += stats.publication_dropped;
+            if stats.bag_remaining == 0 && stats.publication_remaining == 0 {
+                quiet = true;
+                break;
+            }
+        }
+        assert!(quiet, "RCU smoke bounded drain did not quiesce");
+        assert!(reclaimed >= 1, "RCU smoke retired root was not reclaimed");
+        assert!(dropped >= 1, "RCU smoke retired root was not dropped");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":rcu:smp:bounded-drain:ok\n");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":rcu:smp:ok\n");
+    }
+
+    fn drain_rcu_smoke_until_quiet(rounds: usize, budget: usize) {
+        for _ in 0..rounds {
+            let stats = step_engine::drain_with_budget(budget);
+            if stats.bag_remaining == 0 && stats.publication_remaining == 0 {
+                return;
+            }
+        }
+        panic!("RCU smoke preflight drain did not quiesce");
+    }
+
+    fn wait_for_rcu_smp_stage(expected: u64) {
+        for _ in 0..AP_REACTOR_WAIT_SPINS {
+            if RCU_SMP_STAGE.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        panic!("RCU SMP smoke stage {expected} not observed");
+    }
+
     fn first_remote_online_cpu() -> Option<CpuId> {
         let online = P::online_cpus();
         let current = <P as tx_hal::SmpIf>::current_cpu_id();
@@ -1868,20 +2494,18 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn emit_ap_observe_marker(cpu_id: CpuId) {
         if let Some(observer) = tx_observe::current() {
-            observer.counter(
-                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.observe.ap.init")),
-                cpu_id.0 as i64,
-            );
+            observer.debug_counter(b"debug.observe.ap.init", cpu_id.0 as i64);
         }
     }
 
     fn secondary_reactor_loop() -> ! {
         P::enable_ipi_wakeups();
-        P::enable_timer_wakeups();
+        Self::deadline_timer().enable_timer_wakeups();
         loop {
             // Re-read after every trap/longjmp round-trip; the boot argument is
             // not the authoritative hart identity once the reactor is running.
             let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
+            let _ = step_engine::service_local_drain_request(64);
             if Self::run_secondary_reactor_once(cpu_id) {
                 continue;
             }
@@ -1899,9 +2523,9 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
         let step = if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
-            Self::step_boot_reactor_once_concurrent(cpu_id)
+            Self::boot_reactor_once_concurrent(cpu_id)
         } else {
-            Self::step_boot_reactor_once(cpu_id)
+            Self::boot_reactor_once(cpu_id)
         };
 
         // Reclaim terminal child tasks before publishing queued children so
@@ -1920,40 +2544,44 @@ impl<P: TxPlatform> CoreInit<P> {
             || step.is_some_and(|step| !step.should_idle())
     }
 
-    fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
+    fn boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
         let hart = boot_runtime::HartId(cpu_id.0);
-        let now_ns = P::read_ns();
+        let now_ns = Self::monotonic_now_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
         // Force a guard acquire+drop to clear stale epoch state.
         drop(step_engine::guard());
         let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
             boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
         })?;
-        Self::program_hart_loop_deadline(step.deadline_action);
+        Self::program_boot_reactor_deadline(hart);
         Some(step)
     }
 
     /// Concurrent variant: releases the reactor lock during each task's
     /// `future.poll()`, allowing other harts to make progress in parallel
     /// (Phase 1a poll lease).
-    fn step_boot_reactor_once_concurrent(
+    fn boot_reactor_once_concurrent(
         cpu_id: CpuId,
     ) -> Option<boot_runtime::hart_loop::HartLoopStep> {
         let hart = boot_runtime::HartId(cpu_id.0);
-        let now_ns = P::read_ns();
+        let now_ns = Self::monotonic_now_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
         struct KernelSliceClock<P>(core::marker::PhantomData<P>);
         impl<P: TxPlatform> boot_runtime::SliceClock for KernelSliceClock<P> {
             fn now_ns(&mut self) -> u64 {
-                P::read_ns()
+                CoreInit::<P>::monotonic_now_ns()
+            }
+        }
+
+        impl<P: TxPlatform> CurrentHartDeadlineTimer for KernelSliceClock<P> {
+            fn set_current_hart_deadline_ns(&mut self, deadline_ns: u64) {
+                let mut timer = CoreInit::<P>::deadline_timer();
+                timer.set_current_hart_deadline_ns(deadline_ns);
             }
 
-            fn set_deadline_ns(&mut self, deadline_ns: u64) {
-                P::set_deadline_ns(deadline_ns);
-            }
-
-            fn cancel_deadline(&mut self) {
-                P::cancel_deadline();
+            fn cancel_current_hart_deadline(&mut self) {
+                let mut timer = CoreInit::<P>::deadline_timer();
+                timer.cancel_current_hart_deadline();
             }
         }
 
@@ -1964,17 +2592,15 @@ impl<P: TxPlatform> CoreInit<P> {
             &mut signal,
             &mut slice_clock,
         )?;
-        Self::program_hart_loop_deadline(step.deadline_action);
+        Self::program_boot_reactor_deadline(hart);
         Some(step)
     }
 
-    fn program_hart_loop_deadline(action: boot_runtime::hart_loop::HartLoopDeadlineAction) {
-        match action {
-            boot_runtime::hart_loop::HartLoopDeadlineAction::Arm { deadline_ns } => {
-                P::set_deadline_ns(deadline_ns)
-            }
-            boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel => P::cancel_deadline(),
-        }
+    fn program_boot_reactor_deadline(hart: boot_runtime::HartId) {
+        let mut deadline_timer = Self::deadline_timer();
+        let _ = BOOT_REACTOR.with(|reactor| {
+            reactor.program_current_hart_deadline(&mut deadline_timer);
+        });
     }
 
     pub(super) fn poll_boot_reactor_idle_window(hart: boot_runtime::HartId) -> bool {
@@ -2054,13 +2680,7 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn userspace_thread_sched_meta() -> boot_runtime::InitialSchedMeta {
-        let cpu0 = CpuId(0);
-        let cpu = if <P as tx_hal::SmpIf>::online_cpus().contains(cpu0) {
-            cpu0
-        } else {
-            <P as tx_hal::SmpIf>::current_cpu_id()
-        };
-        Self::userspace_thread_sched_meta_for(cpu)
+        Self::userspace_thread_sched_meta_for(<P as tx_hal::SmpIf>::current_cpu_id())
     }
 
     fn run_zone_smoke() {
@@ -2082,8 +2702,7 @@ impl<P: TxPlatform> CoreInit<P> {
             })
             .expect("boot reactor must be initialized before BSP runtime smoke");
 
-        let step =
-            Self::step_boot_reactor_once(current_cpu).expect("boot reactor runtime step failed");
+        let step = Self::boot_reactor_once(current_cpu).expect("boot reactor runtime step failed");
         assert_eq!(step.stats.polled, 1, "BSP runtime smoke task poll count");
         assert_eq!(
             step.stats.completed, 1,
@@ -2114,7 +2733,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 let mask = Mask::from_bits(0x1);
                 reactor.submit_task_with_meta(
                     async move {
-                        let deadline_ns = P::read_ns().saturating_add(TIMER_SMOKE_DELTA_NS);
+                        let deadline_ns =
+                            Self::monotonic_now_ns().saturating_add(TIMER_SMOKE_DELTA_NS);
                         BSP_REACTOR_TIMER_DEADLINE_NS.store(deadline_ns, Ordering::Release);
                         let outcome = channel
                             .wait_event(
@@ -2132,7 +2752,7 @@ impl<P: TxPlatform> CoreInit<P> {
             })
             .expect("boot reactor must be initialized before BSP timer smoke");
 
-        let armed = Self::step_boot_reactor_once(current_cpu).expect("BSP timer arm step");
+        let armed = Self::boot_reactor_once(current_cpu).expect("BSP timer arm step");
         let deadline_ns = BSP_REACTOR_TIMER_DEADLINE_NS.load(Ordering::Acquire);
         assert_ne!(deadline_ns, 0, "BSP timer smoke task first poll");
         assert_eq!(
@@ -2141,11 +2761,11 @@ impl<P: TxPlatform> CoreInit<P> {
             "BSP timer smoke deadline"
         );
 
-        P::enable_timer_wakeups();
+        Self::deadline_timer().enable_timer_wakeups();
 
         let mut deadline_reached = false;
         for _ in 0..BSP_REACTOR_TIMER_WAIT_SPINS {
-            if P::read_ns() >= deadline_ns {
+            if Self::monotonic_now_ns() >= deadline_ns {
                 deadline_reached = true;
                 break;
             }
@@ -2160,8 +2780,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let mut observed_timer_wake = false;
         for _ in 0..1024 {
-            let step = Self::step_boot_reactor_once(current_cpu)
-                .expect("boot reactor timer idle step failed");
+            let step =
+                Self::boot_reactor_once(current_cpu).expect("boot reactor timer idle step failed");
             observed_timer_wake |= step.observed_timer_wakes();
             if Self::bsp_timer_smoke_done(cpu_bit) {
                 assert!(observed_timer_wake, "BSP timer smoke wake");
@@ -2215,23 +2835,8 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 }
 
+#[cfg(test)]
 mod init_fixture;
-
-/// Shell-prompt roadmap Slice 10 (2026-05-08): when the build script
-/// at `crates/tx-kernel/build.rs` sees `TX_BUSYBOX` pointing at a
-/// real static-musl-built busybox binary, it copies the bytes to
-/// `$OUT_DIR/busybox.bin` and emits `cargo:rustc-cfg=busybox_baked`.
-/// This module is then compiled in and exposes
-/// `BUSYBOX_BYTES: &'static [u8]` for
-/// `register_busybox_into_tmpfs()` to consume.
-///
-/// Without `TX_BUSYBOX`, the module is not compiled in and the
-/// kernel boots through the existing `/init` fixture path
-/// exclusively (host tests + CI without a riscv64 cross-toolchain).
-#[cfg(busybox_baked)]
-mod busybox_fixture {
-    pub static BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
-}
 
 /// DAC + setuid slice (Wave 5, Part 8): sibling fixture for the
 /// end-to-end setuid smoke. See `init_setuid_fixture.rs`'s module

@@ -9,8 +9,8 @@
 //!
 //! These tests run the syscall against a thread whose `pending()`
 //! queue is pre-loaded by direct method call — i.e. the unit-test
-//! equivalent of `post_sigchld_to_parent` → `step_kill_process` →
-//! `post_signal`'s final write. If `sys_rt_sigtimedwait` observes
+//! equivalent of `post_sigchld_to_parent` → process-directed kill →
+//! catchable-signal posting's final write. If `sys_rt_sigtimedwait` observes
 //! and clears that bit correctly here, the kernel-side wait path
 //! is correct, and any libctest hang must lie in the child-exit /
 //! signal-post path instead of the wait path.
@@ -91,7 +91,7 @@ fn sigtimedwait_returns_pending_signum_and_clears_bit() {
     let ctx = make_ctx(proc_cap, thread.clone());
 
     // Pre-load SIGCHLD on the thread's pending queue — same
-    // place `post_signal` writes to.
+    // place catchable-signal posting writes to.
     let payload = thread.payload_cap().expect("thread payload alive");
     payload.pending().post(Signum::SIGCHLD);
     assert!(payload.pending().is_pending(Signum::SIGCHLD));
@@ -232,20 +232,20 @@ fn sigtimedwait_sigchld_finite_timeout_expires_without_child_exit() {
 }
 
 /// End-to-end libctest shape: fork a child, zombify it via
-/// `step_exit_group` (which routes through
-/// `post_sigchld_to_parent` → `step_kill_process(parent,
-/// SIGCHLD)` → `post_signal` → `payload.pending().post(SIGCHLD)`
+/// explicit no-context group exit (which routes through
+/// `post_sigchld_to_parent` → process-directed parent `SIGCHLD` →
+/// catchable-signal post → `payload.pending().post(SIGCHLD)`
 /// on the parent thread), then dispatch `sigtimedwait`. The
 /// signum must be observed and cleared.
 ///
 /// This is the unit-test equivalent of the libctest `runtest.c`
 /// pattern — minus the actual fork+execve (the test calls
-/// `step_exit_group` synchronously to fast-forward the child to
+/// group exit synchronously to fast-forward the child to
 /// the post-exit state).
 #[test]
 fn sigtimedwait_observes_sigchld_posted_by_child_exit() {
     use tx_hal::UserTrapContext;
-    use tx_subsystems::process::{step_exit_group, ExitStatus};
+    use tx_subsystems::process::{step_exit_group_with_posts, ExitStatus};
     use tx_subsystems::reactor_submit::{self, SubmitChildThreadStatus};
 
     fn noop(_p: Cap<ProcessIdentity>, _t: Cap<ThreadIdentity>) -> SubmitChildThreadStatus {
@@ -282,10 +282,20 @@ fn sigtimedwait_observes_sigchld_posted_by_child_exit() {
     assert!(!child.is_zombie());
 
     // Zombify the child. This drives the real kernel-side post
-    // path: `step_exit_group` → `post_sigchld_to_parent` →
-    // `step_kill_process(parent, SIGCHLD)` → `post_signal` on
+    // path: group exit -> `post_sigchld_to_parent` ->
+    // process-directed parent `SIGCHLD` → catchable-signal post on
     // the parent's chosen thread.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    step_exit_group_with_posts(
+        &child,
+        ExitStatus::Exited(0),
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
     assert!(child.is_zombie());
 
     // The parent's thread payload's pending queue should now

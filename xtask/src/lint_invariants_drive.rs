@@ -200,10 +200,9 @@ pub(crate) fn lint_invariants_no_adhoc_drive(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "files with ad-hoc outcome dispatch: {:>4}  (ceiling {})  {}",
-        file_count, MAX_ADHOC_OUTCOME_FILES, status
+        "files with ad-hoc outcome dispatch: {file_count:>4}  (ceiling {MAX_ADHOC_OUTCOME_FILES})  {status}"
     );
-    println!("total ad-hoc outcome sites:         {:>4}", site_count);
+    println!("total ad-hoc outcome sites:         {site_count:>4}");
 
     if !adhoc_files.is_empty() {
         println!();

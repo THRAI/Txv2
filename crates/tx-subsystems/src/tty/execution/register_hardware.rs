@@ -6,7 +6,7 @@ use crate::device::CharDeviceBinding;
 use crate::execution::{Errno, Guard};
 use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
 use crate::tty::structure::registry;
-use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
+use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload, Winsize};
 
 /// Create a hardware-backed TTY identity/payload and publish it to the tty
 /// registry. devfs aliases can then materialize RNodes pointing at it.
@@ -14,6 +14,23 @@ pub fn register_hardware(
     name: &str,
     index: u32,
     binding: &'static CharDeviceBinding,
+    _guard: &Guard<'_>,
+) -> StepOutcome<Cap<TtyIdentity>, NoProgress> {
+    register_hardware_with_winsize(
+        name,
+        index,
+        binding,
+        crate::tty::structure::payload::DEFAULT_HARDWARE_WINSIZE,
+        _guard,
+    )
+}
+
+/// Create a hardware-backed TTY with a caller-supplied initial winsize.
+pub fn register_hardware_with_winsize(
+    name: &str,
+    index: u32,
+    binding: &'static CharDeviceBinding,
+    winsize: Winsize,
     _guard: &Guard<'_>,
 ) -> StepOutcome<Cap<TtyIdentity>, NoProgress> {
     use crate::tty::adapter::step_engine::StepOutcome as V3Out;
@@ -32,7 +49,7 @@ pub fn register_hardware(
     );
     let payload = PayloadCap::from_cap(step_engine::sign_for(
         payload_res,
-        TtyPayload::new_hardware(binding),
+        TtyPayload::new_hardware_with_winsize(binding, winsize),
     ));
     tty.install_payload(payload);
 

@@ -1,4 +1,5 @@
 use tx_substrate::bus::RawPort;
+use tx_substrate::step::WaitSourceId;
 use tx_substrate::zone::PayloadCap;
 
 use crate::net::adapter::wait_routing;
@@ -103,10 +104,19 @@ impl SocketWaitCarriers {
         let accept = crate::allocate_notification_source_id();
         let urgent = crate::allocate_notification_source_id();
 
-        wait_source::register_wait_queue_with_id(recv, readiness.recv_wq.clone());
-        wait_source::register_wait_queue_with_id(send, readiness.send_wq.clone());
-        wait_source::register_wait_queue_with_id(accept, readiness.accept_wq.clone());
-        wait_source::register_wait_port_with_id(urgent, urgent_port.clone());
+        // `register_wait_queue`/`register_wait_port` honour an id the carrier
+        // already carries and only allocate when it is still 0, so stamping the
+        // notification id first pins the registration to that id. The two id
+        // spaces do not overlap: notification ids start at 1 << 32, the
+        // registry's own allocator starts at 1.
+        readiness.recv_wq.set_source_id(WaitSourceId::new(recv));
+        readiness.send_wq.set_source_id(WaitSourceId::new(send));
+        readiness.accept_wq.set_source_id(WaitSourceId::new(accept));
+        urgent_port.set_source_id(WaitSourceId::new(urgent));
+        wait_source::register_wait_queue(readiness.recv_wq.clone());
+        wait_source::register_wait_queue(readiness.send_wq.clone());
+        wait_source::register_wait_queue(readiness.accept_wq.clone());
+        wait_source::register_wait_port(urgent_port.clone());
 
         readiness.install_substrate_mirrors(
             wait_routing::new_wait_source(recv),

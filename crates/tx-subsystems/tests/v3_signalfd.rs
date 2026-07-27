@@ -1,9 +1,9 @@
 //! D9-D: signalfd subsystem integration tests.
 //!
 //! Pins the per-process subscription registry and the
-//! signal → signalfd routing path (`step_kill_process` →
-//! `signalfd::notify_process_signal` → matching subscriptions push
-//! onto their pending queues + fire their wait sources).
+//! signal → signalfd routing path (process-directed kill helper →
+//! `signalfd::notify_process_signal_with_post` → matching subscriptions
+//! push onto their pending queues + fire their wait sources).
 //!
 //! Invariants pinned (bundled into a single integration `#[test]`
 //! per the mailbox / userfaultfd-scaffold precedent — `reset_*_for_test`
@@ -14,12 +14,12 @@
 //!    returns a `Cap<SignalFd>` with a fresh `sfd_id` and the
 //!    requested mask installed; the cap is registered with the
 //!    per-process subscription list.
-//! 2. **kill-routes-to-signalfd**. `step_kill_process(proc, SIGUSR1)`
+//! 2. **kill-routes-to-signalfd**. Process-directed `SIGUSR1`
 //!    with a signalfd registered for `SIGUSR1` pushes a signum onto
 //!    the signalfd's pending queue and fires the wait source. The
 //!    signalfd's `read(2)`-shape returns one `signalfd_siginfo`
 //!    record with `ssi_signo == SIGUSR1`.
-//! 3. **kill-filters-by-mask**. `step_kill_process(proc, SIGUSR2)`
+//! 3. **kill-filters-by-mask**. Process-directed `SIGUSR2`
 //!    against a signalfd subscribed only to SIGUSR1 is dropped on
 //!    the floor (the signalfd's pending queue stays empty).
 //! 4. **eagain-on-empty-and-nonblock**. `signalfd_read` with an
@@ -31,10 +31,10 @@
 //!    wait source id — the dispatcher would park on it until a
 //!    signal arrives.
 //! 6. **drop-unregisters**. Dropping a `Cap<SignalFd>` releases the
-//!    subscription entry so subsequent `step_kill_process` calls
+//!    subscription entry so subsequent process-directed kill calls
 //!    no longer route to the dropped cap. (Verified by counting
-//!    `notify_process_signal`'s returned `delivered` count before
-//!    and after drop.)
+//!    `notify_process_signal_with_post`'s returned `delivered` count
+//!    before and after drop.)
 
 extern crate alloc;
 
@@ -47,9 +47,10 @@ use tx_hal::{
 use tx_subsystems::signalfd::adapter::step_engine::{Cap, StepOutcome, V3Errno, YieldShape};
 
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
-use tx_subsystems::signal::{step_kill_process, KillOutcome, Signum};
+use tx_subsystems::signal::{step_kill_process_with_post, KillOutcome, Signum};
 use tx_subsystems::signalfd::{
-    notify_process_signal, signalfd_create, signalfd_read, SignalFd, SIGNALFD_SIGINFO_SIZE,
+    notify_process_signal_with_post, signalfd_create, signalfd_read, SignalFd,
+    SIGNALFD_SIGINFO_SIZE,
 };
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
@@ -123,6 +124,19 @@ fn fresh_aspace() -> Cap<AddressSpace> {
     AddressSpace::new_cap_for_platform::<StubPmap>().expect("fresh aspace")
 }
 
+fn kill_process_direct_for_test(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
+    step_kill_process_with_post(target, sig, None, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    })
+}
+
+fn notify_signalfd_process_signal_direct_for_test(proc_key: u32, signum: Signum) -> usize {
+    notify_process_signal_with_post(proc_key, signum, |mailbox, event| mailbox.post(event))
+}
+
 fn read_one_signo(sfd: &SignalFd) -> u32 {
     let mut buf = [0u8; SIGNALFD_SIGINFO_SIZE];
     match signalfd_read(sfd, &mut buf, /* nonblocking = */ true) {
@@ -159,10 +173,10 @@ fn signalfd_d9d_pins_create_route_and_drain() {
 
     // ---- (2) kill-routes-to-signalfd --------------------------------
     // SIGUSR1 covers sfd_a (mask = SIGUSR1) but not sfd_b (mask =
-    // SIGUSR2). `step_kill_process` posts to the thread-eligibility
+    // SIGUSR2). The process-directed kill helper posts to the thread-eligibility
     // first, then fans out to every matching signalfd subscription.
     assert_eq!(
-        step_kill_process(&proc_cap, sigusr1, None),
+        kill_process_direct_for_test(&proc_cap, sigusr1),
         KillOutcome::Delivered,
     );
     assert_eq!(
@@ -187,7 +201,7 @@ fn signalfd_d9d_pins_create_route_and_drain() {
 
     // Now deliver SIGUSR2 — sfd_b receives it, sfd_a does not.
     assert_eq!(
-        step_kill_process(&proc_cap, sigusr2, None),
+        kill_process_direct_for_test(&proc_cap, sigusr2),
         KillOutcome::Delivered,
     );
     assert_eq!(sfd_b.pending_count(), 1, "sfd_b's mask covers SIGUSR2");
@@ -226,8 +240,8 @@ fn signalfd_d9d_pins_create_route_and_drain() {
     // Two signalfds registered against `proc_key` cover SIGUSR1 +
     // SIGUSR2 respectively. SIGUSR1 should route to *exactly one*
     // (sfd_a). Now drop sfd_a; the next SIGUSR1 should route to zero.
-    let delivered_before = notify_process_signal(proc_key, sigusr1);
-    // Drop one queued entry (we just pushed via notify_process_signal).
+    let delivered_before = notify_signalfd_process_signal_direct_for_test(proc_key, sigusr1);
+    // Drop one queued entry (we just pushed via notify_process_signal_with_post).
     let _ = sfd_a.pop_pending();
     assert_eq!(
         delivered_before, 1,
@@ -237,7 +251,7 @@ fn signalfd_d9d_pins_create_route_and_drain() {
     drop(sfd_a);
     tx_test_support::drain_to_quiescence();
 
-    let delivered_after = notify_process_signal(proc_key, sigusr1);
+    let delivered_after = notify_signalfd_process_signal_direct_for_test(proc_key, sigusr1);
     assert_eq!(
         delivered_after, 0,
         "after dropping sfd_a, SIGUSR1 routes to zero subscriptions",
@@ -245,7 +259,7 @@ fn signalfd_d9d_pins_create_route_and_drain() {
 
     // sfd_b is still alive and covers SIGUSR2; verify it still
     // receives.
-    let delivered_b = notify_process_signal(proc_key, sigusr2);
+    let delivered_b = notify_signalfd_process_signal_direct_for_test(proc_key, sigusr2);
     assert_eq!(delivered_b, 1);
     let _ = sfd_b.pop_pending();
     drop(sfd_b);

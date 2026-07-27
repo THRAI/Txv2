@@ -9,11 +9,14 @@ use core::mem::{offset_of, size_of};
 
 use crate::adapter::step_engine::{Cap, SpinMutex};
 use tx_subsystems::process::ProcessIdentity;
-
-use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext};
-use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 
+use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext};
+use tx_services::time::{
+    timekeeper_clock, ClockRead, DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle,
+    RealtimeControl, RealtimeSetPolicy, TimekeeperClock, TimekeeperIf, TimerGuard, TimerRole,
+    TimerTarget,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -199,13 +202,11 @@ fn timeval_to_ns(tv: TimevalLayout) -> Option<u64> {
 
 const CLOCK_GETRES_NS: i64 = 2_000_000;
 
-// Keep CLOCK_REALTIME ahead of the OSComp ext4 image mtimes; libc
-// `stat.c` rejects file timestamps that appear to be in the future
-// relative to `time(0)`.
-const REALTIME_EPOCH_BASE_NS: u64 = 1_779_494_400_000_000_000;
-
-pub(super) fn realtime_ns<P: TimeIf>() -> u64 {
-    tx_subsystems::wall_clock::realtime_now_ns::<P>()
+pub(super) fn realtime_ns<P>() -> u64
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    timekeeper_clock::<P>().realtime_now_ns()
 }
 
 /// Read a Linux-shaped `(tv_sec, tv_nsec)` pair from user memory and
@@ -265,12 +266,12 @@ fn write_remaining_timespec(
 ///
 /// Day-1 surface: every recognised clock id (REALTIME / MONOTONIC /
 /// PROCESS_CPUTIME / THREAD_CPUTIME plus the *_RAW / *_COARSE /
-/// BOOTTIME aliases) routes to `<P as TimeIf>::read_ns()`. Unknown
+/// BOOTTIME aliases) routes through the timekeeper monotonic clock. Unknown
 /// clock ids return `-EINVAL`. Null `tp` returns `-EFAULT`.
-pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) fn sys_clock_gettime<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let clk_id = args[0] as u32;
     let ts_uaddr = args[1];
     if ts_uaddr == 0 {
@@ -286,7 +287,7 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
         | CLOCK_MONOTONIC_RAW
         | CLOCK_MONOTONIC_COARSE
         | CLOCK_BOOTTIME
-        | CLOCK_BOOTTIME_ALARM => <P as TimeIf>::read_ns(),
+        | CLOCK_BOOTTIME_ALARM => timekeeper_clock::<P>().monotonic_now_ns(),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     let ts = ns_to_timespec(ns);
@@ -338,10 +339,10 @@ pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 ///
 /// The `tz` argument (args[1]) is deprecated on Linux and ignored.
 /// Null `tv` returns `-EFAULT`.
-pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) fn sys_gettimeofday<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let tv_uaddr = args[0];
     // args[1] = tz (ignored — deprecated on Linux).
     if tv_uaddr == 0 {
@@ -358,10 +359,29 @@ fn can_set_realtime(ctx: &SyscallCtx<'_>) -> bool {
     ctx.cred().euid.is_root()
 }
 
-pub(super) fn sys_clock_settime<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+fn set_realtime_from_syscall<P>(ns: u64, ctx: &SyscallCtx<'_>) -> SyscallResult
+where
+    TimekeeperClock<P>: RealtimeControl,
+{
+    let timer_registrar = ctx
+        .timer_registrar
+        .as_ref()
+        .map(|registrar| registrar as &dyn DeadlineRegistrar);
+    match timekeeper_clock::<P>().set_realtime_ns_with_timerfd_post(
+        ns,
+        RealtimeSetPolicy::BestEffort,
+        timer_registrar,
+        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+    ) {
+        Ok(_) => SyscallResult::Return(0),
+        Err(_) => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+pub(super) fn sys_clock_settime<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: RealtimeControl,
+{
     let clk_id = args[0] as u32;
     let ts_uaddr = args[1];
     if clk_id != CLOCK_REALTIME {
@@ -376,16 +396,13 @@ pub(super) fn sys_clock_settime<'a, P: TimeIf>(
     let Some(ns) = read_timespec_at(&ctx.aspace, ts_uaddr) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
-    match tx_subsystems::wall_clock::set_realtime_ns::<P>(ns) {
-        Ok(_) => SyscallResult::Return(0),
-        Err(_) => SyscallResult::Error(EINVAL_VALUE),
-    }
+    set_realtime_from_syscall::<P>(ns, ctx)
 }
 
-pub(super) fn sys_settimeofday<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) fn sys_settimeofday<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: RealtimeControl,
+{
     let tv_uaddr = args[0];
     if tv_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
@@ -400,10 +417,7 @@ pub(super) fn sys_settimeofday<'a, P: TimeIf>(
     let Some(ns) = timeval_to_ns(tv) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
-    match tx_subsystems::wall_clock::set_realtime_ns::<P>(ns) {
-        Ok(_) => SyscallResult::Return(0),
-        Err(_) => SyscallResult::Error(EINVAL_VALUE),
-    }
+    set_realtime_from_syscall::<P>(ns, ctx)
 }
 
 pub const ITIMER_REAL: u32 = 0;
@@ -413,10 +427,11 @@ const SIGALRM: u8 = 14;
 const SIGVTALRM: u8 = 26;
 const SIGPROF: u8 = 27;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Default)]
 struct IntervalTimer {
     deadline_ns: u64,
     interval_ns: u64,
+    timer_guard: Option<TimerGuard>,
 }
 
 static INTERVAL_TIMERS: SpinMutex<Option<BTreeMap<(u32, u32), IntervalTimer>>> =
@@ -442,16 +457,54 @@ fn signal_for_itimer(which: u32) -> Option<tx_subsystems::signal::Signum> {
     tx_subsystems::signal::Signum::new(signo)
 }
 
-fn itimer_to_layout(timer: Option<IntervalTimer>, now_ns: u64) -> ItimervalLayout {
-    let timer = timer.unwrap_or_default();
+fn itimer_to_layout(timer: Option<&IntervalTimer>, now_ns: u64) -> ItimervalLayout {
+    let deadline_ns = timer.map_or(0, |timer| timer.deadline_ns);
+    let interval_ns = timer.map_or(0, |timer| timer.interval_ns);
     ItimervalLayout {
-        it_interval: ns_to_timeval(timer.interval_ns),
-        it_value: ns_to_timeval(if timer.deadline_ns == 0 {
+        it_interval: ns_to_timeval(interval_ns),
+        it_value: ns_to_timeval(if deadline_ns == 0 {
             0
         } else {
-            timer.deadline_ns.saturating_sub(now_ns)
+            deadline_ns.saturating_sub(now_ns)
         }),
     }
+}
+
+fn register_syscall_timer_deadline(
+    ctx: &SyscallCtx<'_>,
+    deadline_ns: u64,
+    role: TimerRole,
+) -> Option<TimerGuard> {
+    let registrar = ctx.timer_registrar.as_ref()?;
+    let mailbox = ctx.mailbox.as_ref()?;
+    registrar
+        .register_deadline(
+            DeadlineNs::new(deadline_ns),
+            role,
+            TimerTarget::SignalTarget {
+                mailbox: alloc::sync::Arc::downgrade(mailbox),
+            },
+        )
+        .ok()
+}
+
+fn register_task_timer_deadline(
+    registrar: Option<&dyn DeadlineRegistrar>,
+    mailbox: Option<&alloc::sync::Weak<tx_substrate::wake::TaskMailbox>>,
+    deadline_ns: u64,
+    role: TimerRole,
+) -> Option<TimerGuard> {
+    let registrar = registrar?;
+    let mailbox = mailbox?;
+    registrar
+        .register_deadline(
+            DeadlineNs::new(deadline_ns),
+            role,
+            TimerTarget::SignalTarget {
+                mailbox: mailbox.clone(),
+            },
+        )
+        .ok()
 }
 
 fn parse_itimerval(value: ItimervalLayout) -> Option<(u64, u64)> {
@@ -473,7 +526,10 @@ fn signal_unblocked_on_any_thread(
     })
 }
 
-pub(super) fn sys_getitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_getitimer<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let which = args[0] as u32;
     let curr_value_ptr = args[1];
     if !valid_itimer(which) {
@@ -483,16 +539,20 @@ pub(super) fn sys_getitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    let now_ns = P::read_ns();
-    let timer = with_interval_timers(|timers| timers.get(&(ctx.process.pid.0, which)).copied());
-    let value = itimer_to_layout(timer, now_ns);
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+    let value = with_interval_timers(|timers| {
+        itimer_to_layout(timers.get(&(ctx.process.pid.0, which)), now_ns)
+    });
     match bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, curr_value_ptr, value) {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::error_from(errno),
     }
 }
 
-pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_setitimer<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let which = args[0] as u32;
     let new_value_ptr = args[1];
     let old_value_ptr = args[2];
@@ -511,11 +571,10 @@ pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    let now_ns = P::read_ns();
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
     let key = (ctx.process.pid.0, which);
-    let old_timer = with_interval_timers(|timers| timers.get(&key).copied());
+    let old_value = with_interval_timers(|timers| itimer_to_layout(timers.get(&key), now_ns));
     if old_value_ptr != 0 {
-        let old_value = itimer_to_layout(old_timer, now_ns);
         if let Err(errno) =
             bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, old_value_ptr, old_value)
         {
@@ -523,13 +582,17 @@ pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
         }
     }
 
+    let deadline_ns = if value_ns == 0 {
+        0
+    } else {
+        now_ns.saturating_add(value_ns)
+    };
+    let timer_guard = (deadline_ns != 0)
+        .then(|| register_syscall_timer_deadline(ctx, deadline_ns, TimerRole::ItimerReal));
     let timer = IntervalTimer {
-        deadline_ns: if value_ns == 0 {
-            0
-        } else {
-            now_ns.saturating_add(value_ns)
-        },
+        deadline_ns,
         interval_ns,
+        timer_guard: timer_guard.flatten(),
     };
     with_interval_timers(|timers| {
         if timer.deadline_ns == 0 && timer.interval_ns == 0 {
@@ -538,15 +601,21 @@ pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
             timers.insert(key, timer);
         }
     });
-    if timer.deadline_ns != 0 {
-        P::set_deadline_ns(timer.deadline_ns);
-    }
     SyscallResult::Return(0)
 }
 
-pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64> {
+pub fn poll_due_itimers_with_post<P, F>(
+    process: &Cap<ProcessIdentity>,
+    timer_registrar: Option<&dyn DeadlineRegistrar>,
+    timer_mailbox: Option<alloc::sync::Weak<tx_substrate::wake::TaskMailbox>>,
+    mut post: F,
+) -> Option<u64>
+where
+    TimekeeperClock<P>: ClockRead,
+    F: FnMut(alloc::sync::Weak<tx_substrate::wake::TaskMailbox>, tx_substrate::wake::MailboxEvent),
+{
     let pid = process.pid.0;
-    let now_ns = P::read_ns();
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
     let mut to_deliver = [None; 3];
     let mut deliver_len = 0usize;
 
@@ -568,9 +637,17 @@ pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64
                 }
 
                 if timer.interval_ns == 0 {
+                    timer.timer_guard = None;
                     timer.deadline_ns = 0;
                 } else {
+                    timer.timer_guard = None;
                     timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
+                    timer.timer_guard = register_task_timer_deadline(
+                        timer_registrar,
+                        timer_mailbox.as_ref(),
+                        timer.deadline_ns,
+                        TimerRole::ItimerReal,
+                    );
                 }
             }
 
@@ -585,9 +662,10 @@ pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64
     });
 
     for signal in to_deliver.into_iter().flatten().take(deliver_len) {
-        let _ = tx_subsystems::signal::deliver_posix_signal(
+        let _ = tx_subsystems::signal::deliver_posix_signal_with_post(
             tx_subsystems::signal::SignalTarget::Process(process.clone()),
             signal,
+            &mut post,
         );
     }
 
@@ -600,9 +678,12 @@ pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64
 /// `tms_utime = ticks` and zeros the other three fields when `buf` is
 /// non-null. Null `buf` is permitted per Linux semantics — only the
 /// return value matters in that case (LTP `times02` covers this).
-pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_times<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let buf_uaddr = args[0];
-    let ns = <P as TimeIf>::read_ns();
+    let ns = timekeeper_clock::<P>().monotonic_now_ns();
     let ticks = (ns / TIMES_NS_PER_TICK) as i64;
     if buf_uaddr != 0 {
         let tms = TmsLayout {
@@ -618,19 +699,22 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(ticks)
 }
 
-pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
+pub(super) async fn sleep_until_deadline<'a, P>(
     deadline_ns: u64,
     original_ns: u64,
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
 
-    if <P as TimeIf>::read_ns() < deadline_ns {
-        let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
+    if timekeeper_clock::<P>().monotonic_now_ns() < deadline_ns {
+        let remaining_ns = deadline_ns.saturating_sub(timekeeper_clock::<P>().monotonic_now_ns());
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let timer_registrar_handle = script_ctx.timer_registrar().cloned();
         let delegate_registry_arc = script_ctx.delegate_registry().cloned();
         let op = NanosleepOp {
             nanos: original_ns.min(remaining_ns),
@@ -643,7 +727,7 @@ pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
             DriveMode::Waiting,
             mailbox_arc.as_ref(),
             delegate_registry_arc.as_deref(),
-            timer_wheel_arc.as_ref(),
+            timer_registrar_handle.as_ref(),
         )
         .await
         {
@@ -672,31 +756,40 @@ pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
     ITIMER_REAL_DELIVERED_INTERRUPTS.lock().remove(&pid)
 }
 
-fn take_due_itimer_real<P: TimeIf>(pid: u32) -> bool {
+fn take_due_itimer_real<P>(pid: u32) -> bool
+where
+    TimekeeperClock<P>: ClockRead,
+{
     with_interval_timers(|timers| {
         let key = (pid, ITIMER_REAL);
         let Some(timer) = timers.get_mut(&key) else {
             return false;
         };
-        let now_ns = P::read_ns();
+        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
         if timer.deadline_ns == 0 || timer.deadline_ns > now_ns {
             return false;
         }
         if timer.interval_ns == 0 {
             timers.remove(&key);
         } else {
+            timer.timer_guard = None;
             timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
         }
         true
     })
 }
 
-pub fn maybe_deliver_itimer_signal<P: TimeIf + tx_hal::PlatformConfig>(
+pub fn maybe_deliver_itimer_signal_with_post<P: tx_hal::PlatformConfig, F>(
     mut ctx: UserTrapContext,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
     aspace: &AddressSpace,
-) -> UserTrapContext {
+    post: F,
+) -> UserTrapContext
+where
+    TimekeeperClock<P>: ClockRead,
+    F: FnMut(alloc::sync::Weak<tx_substrate::wake::TaskMailbox>, tx_substrate::wake::MailboxEvent),
+{
     // This compatibility path predates the generic SignalFrameIf delivery
     // path and emits an RV64-specific frame/trampoline using x2 as sp.
     // LoongArch uses r2 as TLS and r3 as sp, so running this path there
@@ -722,7 +815,7 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf + tx_hal::PlatformConfig>(
         return ctx;
     };
     let Some(SigDisposition::Handler(handler)) = process.sig_disposition(sig) else {
-        let _ = step_kill_process(process, sig, None);
+        let _ = tx_subsystems::signal::step_kill_process_with_post(process, sig, None, post);
         return ctx;
     };
 
@@ -816,16 +909,16 @@ pub(super) fn reset_itimer_registry_for_test() {
 /// Validates `*req` (returns `-EINVAL` on negative fields or
 /// `tv_nsec >= 1_000_000_000`); zero-duration requests short-circuit
 /// immediately to `Return(0)`. Non-zero durations park the task on the
-/// reactor's timer queue until the absolute deadline passes, then
+/// shared timer registry until the absolute deadline passes, then
 /// return `0`. Null `req` returns `-EFAULT`.
 ///
 /// `rem` (args[1]) is ignored — no EINTR path wired yet.
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
-pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) async fn sys_nanosleep<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let req_uaddr = args[0];
     let rem_uaddr = args[1];
     let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr) {
@@ -835,10 +928,13 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
     if req_ns == 0 {
         return SyscallResult::Return(0);
     }
-    let deadline_ns = <P as TimeIf>::read_ns().saturating_add(req_ns);
+    let deadline_ns = timekeeper_clock::<P>()
+        .monotonic_now_ns()
+        .saturating_add(req_ns);
     match sleep_until_deadline::<P>(deadline_ns, req_ns, ctx).await {
         SyscallResult::Error(errno) if errno == EINTR_VALUE => {
-            let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
+            let remaining_ns =
+                deadline_ns.saturating_sub(timekeeper_clock::<P>().monotonic_now_ns());
             match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns) {
                 SyscallResult::Return(_) => SyscallResult::Error(EINTR_VALUE),
                 other => other,
@@ -855,10 +951,13 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
 /// is an absolute deadline; past deadlines return `0` immediately.
 /// Recognised clock ids match `clock_gettime`. Unknown clock ids or
 /// flag bits return `-EINVAL`. Null `req` returns `-EFAULT`.
-pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
+pub(super) async fn sys_clock_nanosleep<'a, P>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let clk_id = args[0] as u32;
     let flags = args[1] as u32;
     let req_uaddr = args[2];
@@ -886,7 +985,7 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
         Ok(ns) => ns,
         Err(result) => return result,
     };
-    let platform_now = <P as TimeIf>::read_ns();
+    let platform_now = timekeeper_clock::<P>().monotonic_now_ns();
     let clock_now = match clk_id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM | CLOCK_TAI => {
             realtime_ns::<P>()
@@ -911,7 +1010,8 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     let deadline_ns = platform_now.saturating_add(sleep_ns);
     match sleep_until_deadline::<P>(deadline_ns, sleep_ns, ctx).await {
         SyscallResult::Error(errno) if errno == EINTR_VALUE => {
-            let remaining_ns = deadline_ns.saturating_sub(<P as TimeIf>::read_ns());
+            let remaining_ns =
+                deadline_ns.saturating_sub(timekeeper_clock::<P>().monotonic_now_ns());
             match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns) {
                 SyscallResult::Return(_) => SyscallResult::Error(EINTR_VALUE),
                 other => other,
@@ -920,7 +1020,6 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
         other => other,
     }
 }
-
 
 /// Fire `pid`'s ITIMER_REAL at expiry: re-arm the deadline and deliver SIGALRM
 /// to the process when it has a handler installed.
@@ -933,12 +1032,36 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
 ///     the past and make a blocked recv spin returning EINTR); a one-shot timer
 ///     is disarmed. Without this the passed deadline made every recv wake
 ///     immediately — the busy loop seen on `ping01`.
-///  2. **SIGALRM.** Delivered only when a handler is installed (see
-///     [`tx_subsystems::signal::deliver_signal_if_handler`]). busybox `ping`
-///     sends each subsequent probe from its SIGALRM handler, so without delivery
-///     it only ever sent one packet; handler-less alarm users keep EINTR-only
-///     semantics and are not terminated.
-pub(super) fn fire_itimer_real<P: TimeIf>(pid: u32) {
+///  2. **SIGALRM.** Delivered only when a handler is installed through the
+///     injected-post signal helper. busybox `ping` sends each subsequent probe
+///     from its SIGALRM handler, so without delivery it only ever sent one
+///     packet; handler-less alarm users keep EINTR-only semantics and are not
+///     terminated.
+pub(super) fn fire_itimer_real_with_post<P>(ctx: &SyscallCtx<'_>)
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    fire_itimer_real_inner::<P, _, _>(
+        ctx.process.pid.0,
+        |process, sig| {
+            tx_subsystems::signal::deliver_signal_if_handler_with_post(
+                process,
+                sig,
+                |mailbox, event| {
+                    ctx.post_mailbox_event(mailbox, event);
+                },
+            )
+        },
+        |deadline_ns| register_syscall_timer_deadline(ctx, deadline_ns, TimerRole::ItimerReal),
+    );
+}
+
+fn fire_itimer_real_inner<P, F, R>(pid: u32, deliver: F, mut register_rearm: R)
+where
+    TimekeeperClock<P>: ClockRead,
+    F: FnOnce(&Cap<ProcessIdentity>, tx_subsystems::signal::Signum) -> bool,
+    R: FnMut(u64) -> Option<TimerGuard>,
+{
     let Some(process) = tx_subsystems::process::execution::process_by_pid(
         tx_subsystems::process::structure::Pid(pid),
     ) else {
@@ -949,16 +1072,19 @@ pub(super) fn fire_itimer_real<P: TimeIf>(pid: u32) {
     };
     // No handler → preserve the existing EINTR-only contract: do not deliver and
     // do not re-arm (the caller still returns EINTR for this expiry).
-    if !tx_subsystems::signal::deliver_signal_if_handler(&process, sigalrm) {
+    if !deliver(&process, sigalrm) {
         return;
     }
-    let now_ns = P::read_ns();
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
     let key = (pid, ITIMER_REAL);
-    let interval_ns = with_interval_timers(|timers| timers.get(&key).map(|timer| timer.interval_ns));
+    let interval_ns =
+        with_interval_timers(|timers| timers.get(&key).map(|timer| timer.interval_ns));
     match interval_ns {
         Some(interval) if interval > 0 => with_interval_timers(|timers| {
             if let Some(timer) = timers.get_mut(&key) {
+                timer.timer_guard = None;
                 timer.deadline_ns = now_ns.saturating_add(interval);
+                timer.timer_guard = register_rearm(timer.deadline_ns);
             }
         }),
         Some(_) => with_interval_timers(|timers| {
@@ -984,15 +1110,18 @@ const SIGALRM_SIGNUM: u8 = 14;
 /// Linux delivers a fired ITIMER_REAL on the next return-to-userspace from ANY
 /// syscall. The dispatcher calls this on every syscall boundary to reproduce
 /// that: when the calling process's ITIMER_REAL deadline has passed, post
-/// SIGALRM (handler-gated, same contract as [`fire_itimer_real`]) so the AST
-/// checkpoint delivers the handler on this syscall's return. The common case —
-/// no armed ITIMER_REAL — is a single `BTreeMap` lookup that returns `None`.
-pub(super) fn poll_itimer_real_on_syscall_boundary<P: TimeIf>(ctx: &SyscallCtx<'_>) {
+/// SIGALRM through the injected-post helper so the AST checkpoint delivers the
+/// handler on this syscall's return. The common case — no armed ITIMER_REAL —
+/// is a single `BTreeMap` lookup that returns `None`.
+pub(super) fn poll_itimer_real_on_syscall_boundary<P>(ctx: &SyscallCtx<'_>)
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let pid = ctx.process.pid.0;
     let Some(deadline_ns) = itimer_real_deadline_ns(pid) else {
         return;
     };
-    if P::read_ns() >= deadline_ns {
-        fire_itimer_real::<P>(pid);
+    if timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns {
+        fire_itimer_real_with_post::<P>(ctx);
     }
 }

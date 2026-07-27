@@ -95,7 +95,7 @@ expect "N72X_BRIDGE_ADDR" within 15000
 expect "/ # " within 10000
 
 sleep 500
-send "if $IP link add veth0 type veth peer name eth0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
+send "if $IP link add veth0 type veth peer name vethpeer0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
 expect "N72X_VETH_CREATED" within 15000
 expect "/ # " within 10000
 

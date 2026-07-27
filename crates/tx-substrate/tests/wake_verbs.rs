@@ -2,7 +2,7 @@
 //!
 //! `new_source` and `notify` are the promoted canonical shims that
 //! replace the per-subsystem `wait_routing::new_wait_source` and
-//! `wait_routing::notify_v3_source` wrappers.
+//! `wait_routing::*_with_post` wrappers.
 
 use alloc::sync::Arc;
 use tx_substrate::step::InterestMask;

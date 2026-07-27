@@ -12,7 +12,7 @@ use alloc::boxed::Box;
 use crate::execution::Guard;
 use crate::mount::MountPayload;
 use crate::page_backed::{AnonSwapPolicy, Frame, PageContainer, PageContainerKind};
-use crate::vfs::adapter::step_engine::{guard, Cap, Errno, NoProgress, StepOutcome};
+use crate::vfs::adapter::step_engine::{Cap, Errno, NoProgress, StepOutcome, guard};
 use crate::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking,
 };
@@ -289,8 +289,8 @@ impl crate::page_backed::FsPageBacking for TestFs {
 
 #[test]
 fn testfs_v3_lookup_round_trips_after_add_dir() {
-    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
     use crate::vfs::FsOps;
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -313,8 +313,8 @@ fn testfs_v3_lookup_round_trips_after_add_dir() {
 
 #[test]
 fn testfs_v3_read_link_returns_target_bytes() {
-    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
     use crate::vfs::FsOps;
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()

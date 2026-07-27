@@ -2,9 +2,7 @@ use super::*;
 use crate::cred::{CapabilitySet, Cred, Gid, Uid};
 use crate::execution::Errno;
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL};
-use crate::process::adapter::step_engine::{
-    InterestMask, NoProgress, StepOutcome, WaitSourceId, YieldShape,
-};
+use crate::process::adapter::step_engine::{NoProgress, StepOutcome, WaitSourceId, YieldShape};
 use crate::process::adapter::wait_routing::{MailboxEvent, TaskMailbox};
 use crate::process::bootstrap_init_process;
 use crate::process::execution::reset_init_process_for_test;
@@ -12,6 +10,20 @@ use crate::test_support::EPOCH_TEST_LOCK;
 use crate::vm::AddressSpace;
 use crate::zones;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use tx_substrate::step::InterestMask;
+
+static SYSV_SEM_REF_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn counting_sem_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    SYSV_SEM_REF_POST_COUNT.fetch_add(1, Ordering::SeqCst);
+    mailbox.post(event)
+}
+
+fn direct_sem_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    mailbox.post(event)
+}
+
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tx_test_support::init_host();
@@ -33,6 +45,200 @@ fn cred(uid: u32, gid: u32) -> crate::process::adapter::step_engine::Cap<Cred> {
         permitted_caps: CapabilitySet::EMPTY,
     })
     .expect("cred cap")
+}
+
+#[test]
+fn sem_payload_endpoint_matches_changed_source_id() {
+    let _g = setup();
+
+    let owner = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let process = bootstrap_init_process(AddressSpace::new_cap().expect("aspace cap"))
+        .expect("bootstrap init");
+    let semid =
+        execution::step_semget(IPC_EXCL, 1, IPC_CREAT | 0o600, &owner, &ns).expect("semget");
+    let array = structure::lookup_sem(semid).expect("array registered");
+    let payload = array
+        .payload
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("live sem payload");
+
+    assert_eq!(
+        tx_substrate::wake::WaitEndpoint::source_id(payload.changed_endpoint()).raw(),
+        payload.changed_source_id
+    );
+
+    execution::step_semctl_in_ns_with_post(
+        semid,
+        0,
+        execution::IPC_RMID,
+        execution::SemCtlArg::None,
+        &owner,
+        &ns,
+        Some(&process),
+        direct_sem_ref_post,
+    )
+    .expect("cleanup");
+}
+
+#[test]
+fn semop_with_post_uses_injected_mailbox_ref_post_for_changed_wake() {
+    let _g = setup();
+
+    let owner = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let process = bootstrap_init_process(AddressSpace::new_cap().expect("aspace cap"))
+        .expect("bootstrap init");
+    let semid =
+        execution::step_semget(IPC_EXCL, 1, IPC_CREAT | 0o600, &owner, &ns).expect("semget");
+
+    let wait_sop = structure::SemBuf {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
+    let wait_source_id = match execution::step_semop_v3_with_post(
+        semid,
+        &[wait_sop],
+        &owner,
+        &process,
+        direct_sem_ref_post,
+    ) {
+        StepOutcome::Yield {
+            progress,
+            shape: YieldShape::OnWaitSource { source, interests },
+        } => {
+            assert_eq!(progress, NoProgress);
+            assert_eq!(interests.raw(), 1);
+            source.raw()
+        }
+        other => panic!("expected blocking semop to yield, got {other:?}"),
+    };
+
+    let source = tx_substrate::wake::lookup_source(WaitSourceId::new(wait_source_id))
+        .expect("sem wait source should be registered");
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let subscriber = source.register(Arc::downgrade(&mailbox), generation, InterestMask::new(1));
+    SYSV_SEM_REF_POST_COUNT.store(0, Ordering::SeqCst);
+
+    let post_sop = structure::SemBuf {
+        sem_num: 0,
+        sem_op: 1,
+        sem_flg: 0,
+    };
+    match execution::step_semop_v3_with_post(
+        semid,
+        &[post_sop],
+        &owner,
+        &process,
+        counting_sem_ref_post,
+    ) {
+        StepOutcome::Done(1) => {}
+        other => panic!("expected posting semop to complete, got {other:?}"),
+    }
+
+    assert_eq!(
+        SYSV_SEM_REF_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "semop value change must use injected mailbox-ref post"
+    );
+    assert!(
+        matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: fired,
+                ..
+            }) if fired == generation
+        ),
+        "semop value change must wake sem waiters"
+    );
+    source.unregister(subscriber);
+
+    execution::step_semctl_in_ns_with_post(
+        semid,
+        0,
+        execution::IPC_RMID,
+        execution::SemCtlArg::None,
+        &owner,
+        &ns,
+        Some(&process),
+        direct_sem_ref_post,
+    )
+    .expect("cleanup");
+}
+
+#[test]
+fn semctl_with_post_uses_injected_mailbox_ref_post_for_rmid_wake() {
+    let _g = setup();
+
+    let owner = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let process = bootstrap_init_process(AddressSpace::new_cap().expect("aspace cap"))
+        .expect("bootstrap init");
+    let semid =
+        execution::step_semget(IPC_EXCL, 1, IPC_CREAT | 0o600, &owner, &ns).expect("semget");
+
+    let sop = structure::SemBuf {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
+    let wait_source_id = match execution::step_semop_v3_with_post(
+        semid,
+        &[sop],
+        &owner,
+        &process,
+        direct_sem_ref_post,
+    ) {
+        StepOutcome::Yield {
+            progress,
+            shape: YieldShape::OnWaitSource { source, interests },
+        } => {
+            assert_eq!(progress, NoProgress);
+            assert_eq!(interests.raw(), 1);
+            source.raw()
+        }
+        other => panic!("expected blocking semop to yield, got {other:?}"),
+    };
+
+    let source = tx_substrate::wake::lookup_source(WaitSourceId::new(wait_source_id))
+        .expect("sem wait source should be registered");
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let subscriber = source.register(Arc::downgrade(&mailbox), generation, InterestMask::new(1));
+    SYSV_SEM_REF_POST_COUNT.store(0, Ordering::SeqCst);
+
+    execution::step_semctl_in_ns_with_post(
+        semid,
+        0,
+        execution::IPC_RMID,
+        execution::SemCtlArg::None,
+        &owner,
+        &ns,
+        Some(&process),
+        counting_sem_ref_post,
+    )
+    .expect("IPC_RMID");
+
+    assert_eq!(
+        SYSV_SEM_REF_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "IPC_RMID must use injected mailbox-ref post"
+    );
+    assert!(
+        matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: fired,
+                ..
+            }) if fired == generation
+        ),
+        "IPC_RMID must wake sem waiters"
+    );
+    source.unregister(subscriber);
 }
 
 #[test]
@@ -63,7 +269,7 @@ fn sem_namespace_entry_is_identity_cap_authority() {
         "IpcNamespace.sysv_sem must be the authority for the sem identity cap"
     );
 
-    execution::step_semctl_in_ns(
+    execution::step_semctl_in_ns_with_post(
         semid,
         0,
         execution::IPC_RMID,
@@ -71,6 +277,7 @@ fn sem_namespace_entry_is_identity_cap_authority() {
         &owner,
         &ns,
         None,
+        direct_sem_ref_post,
     )
     .expect("cleanup");
 }
@@ -86,24 +293,26 @@ fn semctl_getpid_tracks_setall_and_semop_last_modifier() {
     let semid =
         execution::step_semget(IPC_EXCL, 2, IPC_CREAT | 0o600, &owner, &ns).expect("semget");
 
-    execution::step_semctl(
+    execution::step_semctl_with_post(
         semid,
         0,
         execution::SETALL,
         execution::SemCtlArg::All(alloc::vec![2, 3]),
         &owner,
         Some(&process),
+        direct_sem_ref_post,
     )
     .expect("SETALL");
 
     for semnum in [0, 1] {
-        match execution::step_semctl(
+        match execution::step_semctl_with_post(
             semid,
             semnum,
             execution::GETPID,
             execution::SemCtlArg::None,
             &owner,
             None,
+            direct_sem_ref_post,
         )
         .expect("GETPID after SETALL")
         {
@@ -112,7 +321,7 @@ fn semctl_getpid_tracks_setall_and_semop_last_modifier() {
         }
     }
 
-    execution::step_semop(
+    execution::step_semop_with_post(
         semid,
         &[structure::SemBuf {
             sem_num: 1,
@@ -121,16 +330,18 @@ fn semctl_getpid_tracks_setall_and_semop_last_modifier() {
         }],
         &owner,
         &process,
+        direct_sem_ref_post,
     )
     .expect("semop");
 
-    match execution::step_semctl(
+    match execution::step_semctl_with_post(
         semid,
         1,
         execution::GETPID,
         execution::SemCtlArg::None,
         &owner,
         None,
+        direct_sem_ref_post,
     )
     .expect("GETPID after semop")
     {
@@ -138,7 +349,7 @@ fn semctl_getpid_tracks_setall_and_semop_last_modifier() {
         other => panic!("expected Val, got {other:?}"),
     }
 
-    execution::step_semctl_in_ns(
+    execution::step_semctl_in_ns_with_post(
         semid,
         0,
         execution::IPC_RMID,
@@ -146,6 +357,7 @@ fn semctl_getpid_tracks_setall_and_semop_last_modifier() {
         &owner,
         &ns,
         Some(&process),
+        direct_sem_ref_post,
     )
     .expect("cleanup");
 }
@@ -166,7 +378,13 @@ fn semop_blocking_wait_yields_and_rmid_wakes_waiter() {
         sem_op: -1,
         sem_flg: 0,
     };
-    let wait_source_id = match execution::step_semop_v3(semid, &[sop], &owner, &process) {
+    let wait_source_id = match execution::step_semop_v3_with_post(
+        semid,
+        &[sop],
+        &owner,
+        &process,
+        direct_sem_ref_post,
+    ) {
         StepOutcome::Yield {
             progress,
             shape: YieldShape::OnWaitSource { source, interests },
@@ -185,7 +403,7 @@ fn semop_blocking_wait_yields_and_rmid_wakes_waiter() {
     let subscriber = source.register(Arc::downgrade(&mailbox), generation, InterestMask::new(1));
     assert!(mailbox.poll().is_none(), "wait should park before IPC_RMID");
 
-    execution::step_semctl_in_ns(
+    execution::step_semctl_in_ns_with_post(
         semid,
         0,
         execution::IPC_RMID,
@@ -193,6 +411,7 @@ fn semop_blocking_wait_yields_and_rmid_wakes_waiter() {
         &owner,
         &ns,
         Some(&process),
+        direct_sem_ref_post,
     )
     .expect("IPC_RMID");
 
@@ -208,7 +427,7 @@ fn semop_blocking_wait_yields_and_rmid_wakes_waiter() {
     );
     source.unregister(subscriber);
     assert_eq!(
-        execution::step_semop(semid, &[sop], &owner, &process),
+        execution::step_semop_with_post(semid, &[sop], &owner, &process, direct_sem_ref_post),
         Err(Errno::EIDRM),
         "retry after namespace withdrawal must report the removed id"
     );

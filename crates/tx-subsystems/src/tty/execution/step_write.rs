@@ -9,7 +9,7 @@ use crate::tty::adapter::step_engine::{
     ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::tty::checks::{background_write_signal, require_fg_pgrp, require_live_tty};
-use crate::tty::execution::{step_ingest, TTY_WRITABLE};
+use crate::tty::execution::{step_ingest_with_post, TTY_WRITABLE};
 use crate::tty::ldisc::process_output;
 use crate::tty::structure::{termios::TOSTOP, TtyIdentity, TtyTransport};
 
@@ -141,23 +141,27 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
             },
             TtyTransport::Pty { .. } => V3Out::Err(Errno::EIO.into()),
         },
-        Kick::Pty(peer) => match step_ingest(&peer, &chunk, guard) {
-            V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
-            V3Out::Err(e) => V3Out::Err(e),
-            V3Out::Yield { shape, .. } => {
-                if let Some((carrier, interests)) =
-                    crate::tty::notification::wait_source_parts(&shape)
-                {
-                    crate::tty::notification::yield_on_wait_source(
-                        ByteProgress::new(chunk.len()),
-                        carrier,
-                        interests,
-                    )
-                } else {
-                    V3Out::Err(step_engine::Errno::EIO)
+        Kick::Pty(peer) => {
+            match step_ingest_with_post(&peer, &chunk, guard, |mailbox, event, hint| {
+                mailbox.post_with_scheduler_hint(event, hint)
+            }) {
+                V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
+                V3Out::Err(e) => V3Out::Err(e),
+                V3Out::Yield { shape, .. } => {
+                    if let Some((carrier, interests)) =
+                        crate::tty::notification::wait_source_parts(&shape)
+                    {
+                        crate::tty::notification::yield_on_wait_source(
+                            ByteProgress::new(chunk.len()),
+                            carrier,
+                            interests,
+                        )
+                    } else {
+                        V3Out::Err(step_engine::Errno::EIO)
+                    }
                 }
             }
-        },
+        }
     }
 }
 

@@ -1,8 +1,10 @@
+use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
 use tx_ext4_format::ondisk::{
-    crc32c, crc32c_append, metadata_csum32, BitmapMut, BitmapView, CommitHeader, DirEntryIter,
-    DxCountLimit, DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError, Extent, ExtentHeader,
-    ExtentIdx, ExtentNode, GroupDesc, Inode, JournalBlockTag, JournalHeader, Superblock,
-    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
+    block_bitmap_csum32, crc32c, crc32c_append, group_desc_csum16, inode_csum32, metadata_csum32,
+    superblock_csum32, BitmapMut, BitmapView, CommitHeader, DirEntryIter, DxCountLimit, DxEntry,
+    DxEntryIter, DxRootInfo, Ext4FormatError, Extent, ExtentHeader, ExtentIdx, ExtentNode,
+    GroupDesc, Inode, JournalBlockTag, JournalHeader, Superblock, JBD2_BLOCK_COMMIT,
+    JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead, WritebackReceipt,
@@ -323,6 +325,351 @@ fn pager_rejects_non_4k_images_and_hole_writeback() {
 }
 
 #[test]
+fn pager_plans_mapped_write_without_mutating_home_block() {
+    let image = mock_image();
+    let original = *image.block(21);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let page = filled_page(0xEE);
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 1, &page, FsyncStamp::new(9))
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::FlushPage);
+    assert_eq!(plan.object, 12);
+    assert_eq!(plan.fsync_stamp, FsyncStamp::new(9));
+    assert_eq!(plan.metadata.len(), 1);
+    assert_eq!(
+        plan.metadata[0].role,
+        tx_ext4_format::mutation::MetaRole::InodeTable
+    );
+    assert_eq!(plan.metadata[0].home, 4);
+    assert_eq!(plan.allocations, Vec::new());
+    assert_eq!(plan.data.len(), 1);
+    assert_eq!(plan.data[0].logical_page, 1);
+    assert_eq!(plan.data[0].physical_block, 21);
+    assert_eq!(plan.data[0].bytes, page);
+    assert_eq!(pager.image().block(21), &original);
+}
+
+#[test]
+fn pager_plans_hole_write_with_bitmap_and_inode_after_images() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 48);
+    let bitmap_before = *image.block(2);
+    let group_desc_before = *image.block(1);
+    let superblock_before = *image.block(0);
+    let inode_table_before = *image.block(4);
+    let data_before = *image.block(48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let page = filled_page(0xE4);
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 4, &page, FsyncStamp::new(11))
+        .unwrap();
+
+    assert_eq!(plan.data.len(), 1);
+    assert_eq!(plan.data[0].logical_page, 4);
+    assert_eq!(plan.data[0].physical_block, 48);
+    assert_eq!(plan.data[0].bytes, page);
+    assert_eq!(plan.allocations.len(), 1);
+    assert_eq!(plan.allocations[0].physical_block, 48);
+
+    let bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    assert_eq!(bitmap.home, 2);
+    assert!(BitmapView::new(&bitmap.after).is_set(48));
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert_eq!(inode_table.home, 4);
+    let inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.size, 5 * BLOCK_SIZE as u64);
+    assert_eq!(inode.blocks_512, 32);
+    assert_eq!(
+        inode.map_extent_block(4).unwrap(),
+        tx_ext4_format::ondisk::BlockMapping::Data(48)
+    );
+
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    assert_eq!(group_desc.home, 1);
+    assert_eq!(
+        GroupDesc::parse(&group_desc.after[..32])
+            .unwrap()
+            .free_blocks_count,
+        GroupDesc::parse(&group_desc_before[..32])
+            .unwrap()
+            .free_blocks_count
+            - 1
+    );
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    assert_eq!(superblock.home, 0);
+    assert_eq!(
+        Superblock::parse(&superblock.after[1024..2048])
+            .unwrap()
+            .free_blocks_count,
+        Superblock::parse(&superblock_before[1024..2048])
+            .unwrap()
+            .free_blocks_count
+            - 1
+    );
+
+    assert_eq!(pager.image().block(2), &bitmap_before);
+    assert_eq!(pager.image().block(1), &group_desc_before);
+    assert_eq!(pager.image().block(0), &superblock_before);
+    assert_eq!(pager.image().block(4), &inode_table_before);
+    assert_eq!(pager.image().block(48), &data_before);
+}
+
+#[test]
+fn pager_plans_inline_extent_tail_truncate_with_revokes() {
+    let mut image = mock_image();
+    // The fixture maps logical blocks 0, 1, and 3 to physical blocks 20,
+    // 21, and 30. Mark them allocated so the after-image must clear the
+    // blocks released by truncating to one page.
+    mark_block_bitmap_used(&mut image, 31);
+    let bitmap_before = *image.block(2);
+    let group_desc_before = *image.block(1);
+    let superblock_before = *image.block(0);
+    let inode_table_before = *image.block(4);
+    let data_21_before = *image.block(21);
+    let data_30_before = *image.block(30);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_truncate_tail(InodeNo::new(12), BLOCK_SIZE as u64, FsyncStamp::new(13))
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Truncate);
+    assert_eq!(plan.object, 12);
+    assert_eq!(plan.fsync_stamp, FsyncStamp::new(13));
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert_eq!(
+        plan.revokes
+            .iter()
+            .map(|claim| claim.physical_block)
+            .collect::<Vec<_>>(),
+        vec![21, 30]
+    );
+
+    let bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    assert_eq!(bitmap.home, 2);
+    assert!(BitmapView::new(&bitmap.after).is_set(20));
+    assert!(!BitmapView::new(&bitmap.after).is_set(21));
+    assert!(!BitmapView::new(&bitmap.after).is_set(30));
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.size, BLOCK_SIZE as u64);
+    assert_eq!(inode.blocks_512, 8);
+    assert_eq!(
+        Extent::parse_all(inode.extent_root_bytes()).unwrap(),
+        vec![Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 20,
+        }]
+    );
+
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    assert_eq!(
+        GroupDesc::parse(&group_desc.after[..32])
+            .unwrap()
+            .free_blocks_count,
+        GroupDesc::parse(&group_desc_before[..32])
+            .unwrap()
+            .free_blocks_count
+            + 2
+    );
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    assert_eq!(
+        Superblock::parse(&superblock.after[1024..2048])
+            .unwrap()
+            .free_blocks_count,
+        Superblock::parse(&superblock_before[1024..2048])
+            .unwrap()
+            .free_blocks_count
+            + 2
+    );
+
+    assert_eq!(pager.image().block(2), &bitmap_before);
+    assert_eq!(pager.image().block(1), &group_desc_before);
+    assert_eq!(pager.image().block(0), &superblock_before);
+    assert_eq!(pager.image().block(4), &inode_table_before);
+    assert_eq!(pager.image().block(21), &data_21_before);
+    assert_eq!(pager.image().block(30), &data_30_before);
+}
+
+#[test]
+fn pager_plans_tail_hole_truncate_as_inode_only_metadata() {
+    let mut image = mock_image();
+    let mut inode = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    inode.size = 5 * BLOCK_SIZE as u64;
+    write_inode(&mut image, 12, &inode);
+    let inode_table_before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_truncate_tail(InodeNo::new(12), 4 * BLOCK_SIZE as u64, FsyncStamp::new(14))
+        .unwrap();
+
+    assert!(plan.revokes.is_empty());
+    assert_eq!(plan.metadata.len(), 1);
+    assert_eq!(
+        plan.metadata[0].role,
+        tx_ext4_format::mutation::MetaRole::InodeTable
+    );
+    let inode = Inode::parse(&plan.metadata[0].after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.size, 4 * BLOCK_SIZE as u64);
+    assert_eq!(pager.image().block(4), &inode_table_before);
+}
+
+#[test]
+fn pager_rejects_partial_or_indexed_extent_tail_truncate_plans() {
+    let image = mock_image();
+    let inode_table_before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    assert_eq!(
+        pager
+            .plan_truncate_tail(InodeNo::new(12), BLOCK_SIZE as u64 + 1, FsyncStamp::new(15),)
+            .unwrap_err(),
+        Ext4FormatError::Unsupported
+    );
+    assert_eq!(pager.image().block(4), &inode_table_before);
+
+    let mut image = mock_image();
+    let mut inode = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    inode
+        .set_extent_index_root(
+            &[
+                ExtentIdx {
+                    logical_block: 0,
+                    child: 76,
+                },
+                ExtentIdx {
+                    logical_block: 2,
+                    child: 77,
+                },
+            ],
+            1,
+        )
+        .unwrap();
+    write_inode(&mut image, 12, &inode);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    assert_eq!(
+        pager
+            .plan_truncate_tail(InodeNo::new(12), BLOCK_SIZE as u64, FsyncStamp::new(16))
+            .unwrap_err(),
+        Ext4FormatError::Unsupported
+    );
+}
+
+#[test]
+fn pager_plans_metadata_checksum_after_images_for_hole_write() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 4, &filled_page(0xD4), FsyncStamp::new(12))
+        .unwrap();
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    let mut desc_bytes = group_desc.after[..32].to_vec();
+    let stored_desc_checksum = u16::from_le_bytes(desc_bytes[30..32].try_into().unwrap());
+    desc_bytes[30..32].fill(0);
+    let seed = crc32c_append(0xFFFF_FFFF, &superblock.uuid);
+    assert_eq!(
+        stored_desc_checksum,
+        group_desc_csum16(seed, 0, &desc_bytes)
+    );
+
+    let bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    let stored_bitmap_checksum = u16::from_le_bytes(group_desc.after[24..26].try_into().unwrap());
+    assert_eq!(
+        stored_bitmap_checksum,
+        block_bitmap_csum32(seed, &bitmap.after, 64).unwrap() as u16
+    );
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let inode_bytes = &inode_table.after[2816..3072];
+    let stored_inode_checksum = u32::from(u16::from_le_bytes(
+        inode_bytes[124..126].try_into().unwrap(),
+    )) | (u32::from(u16::from_le_bytes(
+        inode_bytes[130..132].try_into().unwrap(),
+    )) << 16);
+    assert_eq!(
+        stored_inode_checksum,
+        inode_csum32(
+            seed,
+            12,
+            u32::from_le_bytes(inode_bytes[100..104].try_into().unwrap()),
+            inode_bytes
+        )
+        .unwrap()
+    );
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let bytes = &superblock.after[1024..2048];
+    assert_eq!(
+        u32::from_le_bytes(bytes[1020..1024].try_into().unwrap()),
+        superblock_csum32(bytes).unwrap()
+    );
+}
+
+#[test]
 fn pager_writeback_and_journal_replay_on_mock_image() {
     let image = mock_image();
     let mut pager = Ext4Pager::open(image).unwrap();
@@ -443,6 +790,101 @@ fn pager_resolves_indexed_extents_and_inodes_across_groups() {
         PageRead::Data { block: 80 }
     );
     assert_eq!(page, filled_page(0x80));
+}
+
+#[test]
+fn pager_plans_indexed_extent_tail_truncate_releasing_child_and_data() {
+    let mut image = mock_image();
+    let mut sb = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    sb.inodes_count = 128;
+    sb.blocks_count = 128;
+    sb.blocks_per_group = 64;
+    sb.inodes_per_group = 64;
+    sb.desc_size = 64;
+    sb.feature_incompat |= Superblock::FEATURE_INCOMPAT_64BIT;
+    sb.encode(&mut image.block_mut(0)[1024..2048]).unwrap();
+    GroupDesc {
+        block_bitmap: 66,
+        inode_bitmap: 67,
+        inode_table: 70,
+        free_blocks_count: 10,
+        free_inodes_count: 63,
+        ..GroupDesc::default()
+    }
+    .encode(&mut image.block_mut(1)[64..128])
+    .unwrap();
+
+    let mut leaf = [0u8; BLOCK_SIZE];
+    ExtentNode::encode_leaf(
+        &[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 80,
+        }],
+        &mut leaf,
+    )
+    .unwrap();
+    *image.block_mut(76) = leaf;
+    *image.block_mut(80) = filled_page(0x80);
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o600;
+    inode.size = BLOCK_SIZE as u64;
+    inode.blocks_512 = 16;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_index_root(
+            &[ExtentIdx {
+                logical_block: 0,
+                child: 76,
+            }],
+            1,
+        )
+        .unwrap();
+    write_inode_at_table(&mut image, 70, 1, &inode);
+    BitmapMut::new(image.block_mut(66)).set(12).unwrap();
+    BitmapMut::new(image.block_mut(66)).set(16).unwrap();
+
+    let bitmap_before = *image.block(66);
+    let inode_table_before = *image.block(70);
+    let child_before = *image.block(76);
+    let data_before = *image.block(80);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_truncate_tail(InodeNo::new(65), 0, FsyncStamp::new(17))
+        .unwrap();
+
+    assert_eq!(
+        plan.revokes
+            .iter()
+            .map(|claim| claim.physical_block)
+            .collect::<Vec<_>>(),
+        vec![80, 76]
+    );
+    let bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    assert!(!BitmapView::new(&bitmap.after).is_set(12));
+    assert!(!BitmapView::new(&bitmap.after).is_set(16));
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let inode = Inode::parse(&inode_table.after[..256]).unwrap();
+    assert_eq!(inode.size, 0);
+    assert_eq!(inode.blocks_512, 0);
+    assert_eq!(
+        Extent::parse_all(inode.extent_root_bytes()).unwrap(),
+        Vec::new()
+    );
+    assert_eq!(pager.image().block(66), &bitmap_before);
+    assert_eq!(pager.image().block(70), &inode_table_before);
+    assert_eq!(pager.image().block(76), &child_before);
+    assert_eq!(pager.image().block(80), &data_before);
 }
 
 #[test]
@@ -621,6 +1063,7 @@ fn mock_image() -> MemImage {
     let sb = Superblock {
         inodes_count: 64,
         blocks_count: 64,
+        free_blocks_count: 32,
         log_block_size: 2,
         blocks_per_group: 64,
         inodes_per_group: 64,
@@ -741,6 +1184,59 @@ fn mock_image() -> MemImage {
     image
 }
 
+#[test]
+fn pager_derives_journal_ring_from_journal_inode_mapping() {
+    let mut image = mock_image();
+    let mut journal_inode = Inode::default();
+    journal_inode.mode = 0x8000 | 0o600;
+    journal_inode.size = 8 * BLOCK_SIZE as u64;
+    journal_inode.blocks_512 = 64;
+    journal_inode.links_count = 1;
+    journal_inode.flags = Inode::EXTENTS_FL;
+    journal_inode
+        .set_extent_root(&[
+            Extent {
+                logical_block: 0,
+                len: 3,
+                physical_start: 40,
+            },
+            Extent {
+                logical_block: 3,
+                len: 5,
+                physical_start: 50,
+            },
+        ])
+        .unwrap();
+    write_inode(&mut image, 8, &journal_inode);
+    let journal = image.block_mut(40);
+    journal[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    journal[4..8].copy_from_slice(&4u32.to_be_bytes());
+    journal[8..12].copy_from_slice(&23u32.to_be_bytes());
+    journal[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
+    journal[16..20].copy_from_slice(&8u32.to_be_bytes());
+    journal[20..24].copy_from_slice(&1u32.to_be_bytes());
+    journal[24..28].copy_from_slice(&24u32.to_be_bytes());
+    journal[28..32].copy_from_slice(&3u32.to_be_bytes());
+    journal[48..64].copy_from_slice(&[0x6b; 16]);
+    let expected_journal_superblock_page = *image.block(40);
+
+    let mut pager = Ext4Pager::open(image).expect("open journal image");
+    let geometry = pager.journal_geometry().expect("derive journal geometry");
+
+    assert_eq!(geometry.superblock.max_len, 8);
+    assert_eq!(geometry.superblock.first, 1);
+    assert_eq!(geometry.superblock.sequence, 24);
+    assert_eq!(geometry.superblock.start, 3);
+    assert_eq!(
+        geometry.blocks.as_slice(),
+        &[40, 41, 42, 50, 51, 52, 53, 54]
+    );
+    assert_eq!(
+        geometry.superblock_page.as_ref(),
+        Some(&expected_journal_superblock_page)
+    );
+}
+
 fn assert_dir_entry(entry: &DirEntryLite, name: &[u8], inode: InodeNo, file_type: u8) {
     assert_eq!(entry.name(), name);
     assert_eq!(entry.inode, inode);
@@ -784,4 +1280,77 @@ fn write_inode_at_table(image: &mut MemImage, inode_table_block: u64, ino: u32, 
 
 fn filled_page(byte: u8) -> [u8; BLOCK_SIZE] {
     [byte; BLOCK_SIZE]
+}
+
+/// Raw `ee_len` semantics pinned to the on-disk numbers (Linux
+/// `ext4_ext_is_unwritten` / `ext4_ext_get_actual_len`): raw 0x8000 is the
+/// LEGAL MAXIMUM initialized extent (32768 blocks), not an unwritten flag;
+/// only raw values above 0x8000 are unwritten, of `raw - 0x8000` blocks.
+/// Regression: the onsite alpine image's libLLVM.so.19.1 starts with a
+/// maximal 32768-block extent that decoded as "unwritten, length 0", so its
+/// first 128 MiB read back as a hole (all zeroes) and the dynamic loader
+/// rejected the library with "Exec format error".
+#[test]
+fn extent_len_0x8000_is_initialized_maximum_not_unwritten() {
+    let max_initialized = Extent {
+        logical_block: 0,
+        len: 0x8000,
+        physical_start: 124_928,
+    };
+    assert!(max_initialized.is_initialized());
+    assert_eq!(max_initialized.actual_len(), 32768);
+    assert_eq!(max_initialized.physical_for(0), Some(124_928));
+    assert_eq!(max_initialized.physical_for(32767), Some(124_928 + 32767));
+    assert_eq!(max_initialized.physical_for(32768), None);
+
+    let unwritten_one = Extent {
+        logical_block: 0,
+        len: 0x8001,
+        physical_start: 50,
+    };
+    assert!(!unwritten_one.is_initialized());
+    assert_eq!(unwritten_one.actual_len(), 1);
+    // Unwritten extents occupy logical range but read back as zeroes.
+    assert!(unwritten_one.contains(0));
+    assert_eq!(unwritten_one.physical_for(0), None);
+}
+
+/// Inode-level lookup across a maximal extent, mirroring the exact layout
+/// debugfs reported for the corrupted file: (0-32767)->124928 followed by
+/// (32768-38911)->157696.
+#[test]
+fn inode_maps_blocks_through_a_maximal_extent() {
+    let mut inode = Inode::default();
+    inode.mode = 0x8000 | 0o644;
+    inode.size = 162_201_592;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_root(&[
+            Extent {
+                logical_block: 0,
+                len: 0x8000,
+                physical_start: 124_928,
+            },
+            Extent {
+                logical_block: 32768,
+                len: 6144,
+                physical_start: 157_696,
+            },
+        ])
+        .unwrap();
+
+    use tx_ext4_format::ondisk::BlockMapping;
+    assert_eq!(
+        inode.map_extent_block(0).unwrap(),
+        BlockMapping::Data(124_928)
+    );
+    assert_eq!(
+        inode.map_extent_block(32767).unwrap(),
+        BlockMapping::Data(157_695)
+    );
+    assert_eq!(
+        inode.map_extent_block(32768).unwrap(),
+        BlockMapping::Data(157_696)
+    );
 }

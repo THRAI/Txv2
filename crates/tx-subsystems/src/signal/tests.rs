@@ -6,11 +6,12 @@
 
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
-use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
+use crate::process::{bootstrap_init_process, step_exit_group_with_posts, step_fork, ExitStatus};
 use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
-    step_kill_pgrp, step_kill_process, step_sigaction, KillOutcome, PendingSignalQueue,
-    SigActionEntry, SigDisposition, SigDispositionChange, SignalMask, Signum,
+    step_kill_pgrp_with_post, step_kill_process_with_post, step_sigaction, KillOutcome,
+    PendingSignalQueue, SigActionEntry, SigDisposition, SigDispositionChange, SigInfo, SignalMask,
+    Signum,
 };
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
@@ -35,6 +36,45 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 
 fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
+}
+
+fn kill_process_direct_for_test(
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+    info: Option<SigInfo>,
+) -> KillOutcome {
+    step_kill_process_with_post(target, sig, info, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    })
+}
+
+fn kill_pgrp_direct_for_test(
+    pgrp: &Cap<crate::process::structure::ProcessGroup>,
+    sig: Signum,
+) -> usize {
+    step_kill_pgrp_with_post(pgrp, sig, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    })
+}
+
+fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    step_exit_group_with_posts(
+        process,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
 }
 
 #[test]
@@ -120,7 +160,7 @@ fn kill_process_routes_signal_to_first_live_thread() {
     let proc_cap = bootstrap();
     let leader = first_thread(&proc_cap);
 
-    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM, None);
+    let outcome = kill_process_direct_for_test(&proc_cap, Signum::SIGTERM, None);
     assert_eq!(outcome, KillOutcome::Delivered);
 
     let pending = leader
@@ -135,9 +175,9 @@ fn kill_process_routes_signal_to_first_live_thread() {
 fn kill_zombie_process_returns_no_live_thread() {
     let _g = setup();
     let proc_cap = bootstrap();
-    step_exit_group(&proc_cap, ExitStatus::Exited(0));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
 
-    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM, None);
+    let outcome = kill_process_direct_for_test(&proc_cap, Signum::SIGTERM, None);
     assert_eq!(outcome, KillOutcome::NoLiveThread);
 }
 
@@ -149,7 +189,7 @@ fn kill_pgrp_fans_out_to_every_live_member() {
     let child_b = step_fork::<TestPmap>(&parent, false, false).expect("fork b");
     let pgrp = parent.pgrp_cap();
 
-    let delivered = step_kill_pgrp(&pgrp, Signum::SIGINT);
+    let delivered = kill_pgrp_direct_for_test(&pgrp, Signum::SIGINT);
     assert_eq!(delivered, 3); // parent + 2 children
 
     for proc_cap in [&parent, &child_a, &child_b] {
@@ -168,10 +208,10 @@ fn kill_pgrp_skips_zombie_members_in_count() {
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     let pgrp = parent.pgrp_cap();
-    let delivered = step_kill_pgrp(&pgrp, Signum::SIGTERM);
+    let delivered = kill_pgrp_direct_for_test(&pgrp, Signum::SIGTERM);
     assert_eq!(delivered, 1); // only parent received
 }
 
@@ -234,7 +274,7 @@ fn sigaction_refuses_to_change_uncatchable_disposition() {
 fn sigaction_on_zombie_process_is_zombie_ignored() {
     let _g = setup();
     let proc_cap = bootstrap();
-    step_exit_group(&proc_cap, ExitStatus::Exited(0));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
 
     let outcome = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Ignore);
     assert_eq!(outcome, SigDispositionChange::ZombieIgnored);
@@ -297,8 +337,8 @@ fn deliverable_bits_filter_blocked_pending_correctly() {
     block.block(Signum::SIGTERM);
     let _ = step_sigprocmask(&leader, SigmaskHow::Block, block);
 
-    step_kill_process(&proc_cap, Signum::SIGTERM, None);
-    step_kill_process(&proc_cap, Signum::SIGINT, None);
+    kill_process_direct_for_test(&proc_cap, Signum::SIGTERM, None);
+    kill_process_direct_for_test(&proc_cap, Signum::SIGINT, None);
 
     let payload_guard = leader.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");

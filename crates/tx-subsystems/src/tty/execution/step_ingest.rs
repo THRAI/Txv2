@@ -11,6 +11,7 @@ use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
+use crate::tty::adapter::wait_routing::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use crate::tty::checks::require_live_tty;
 use crate::tty::execution::{
     deferred_signal_for_tty, SignalDispatch, TTY_DEFERRED_SIGNAL, TTY_READABLE, TTY_WRITABLE,
@@ -37,12 +38,17 @@ pub struct IngestOutcome {
     pub flow_control: Option<FlowCtl>,
 }
 
-/// Ingest transport bytes into a TTY's line discipline.
-pub fn step_ingest(
+/// Ingest transport bytes and route TTY-readable wait-source publication
+/// through a caller-provided mailbox post path.
+pub fn step_ingest_with_post<F>(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
     guard: &Guard<'_>,
-) -> StepOutcome<IngestOutcome, NoProgress> {
+    mut post: F,
+) -> StepOutcome<IngestOutcome, NoProgress>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -59,7 +65,7 @@ pub fn step_ingest(
     let linearized = payload.apply_ingest_linearizer();
     if linearized.readable_fired {
         tty.input_readable.fire(TTY_READABLE);
-        crate::tty::notification::notify_readable(tty.wait_channel(), tty.wait_source());
+        crate::tty::notification::notify_readable_with_post(tty.read_endpoint(), &mut post);
         outcome.readable_fired = true;
     }
     if linearized.writable_fired {
@@ -74,7 +80,7 @@ pub fn step_ingest(
                     let input_len_before = input_queue.len();
                     let output_len_before = output_queue.len();
                     let effect = {
-                        // SAFETY: Phase C keeps `step_ingest` as the only
+                        // SAFETY: Phase C keeps the ingest step as the only
                         // mutable accessor to ldisc_state. Later external
                         // mutators route through the documented linearizer.
                         let state = unsafe { &mut *payload.ldisc_state.get() };
@@ -93,9 +99,9 @@ pub fn step_ingest(
                                 payload.eof_pending.store(true, Ordering::Release);
                             }
                             tty.input_readable.fire(TTY_READABLE);
-                            crate::tty::notification::notify_readable(
-                                tty.wait_channel(),
-                                tty.wait_source(),
+                            crate::tty::notification::notify_readable_with_post(
+                                tty.read_endpoint(),
+                                &mut post,
                             );
                             outcome.readable_fired = true;
                         }
@@ -126,7 +132,7 @@ pub fn step_ingest(
 // StepOp wraps (PR-2 cleanup)
 // ---------------------------------------------------------------------------
 
-/// `StepOp` wrap of [`step_ingest`].
+/// `StepOp` wrap of [`step_ingest_with_post`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IngestOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
@@ -138,7 +144,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IngestOp<'a> {
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let __guard = step_engine::guard();
-        step_ingest(self.tty, self.bytes, &__guard)
+        step_ingest_with_post(self.tty, self.bytes, &__guard, |mailbox, event, hint| {
+            mailbox.post_with_scheduler_hint(event, hint)
+        })
     }
 }
 

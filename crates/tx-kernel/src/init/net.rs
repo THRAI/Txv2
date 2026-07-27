@@ -9,6 +9,7 @@ use core::marker::PhantomData;
 
 use smoltcp::time::Instant;
 use tx_hal::TxPlatform;
+use tx_services::time::{timekeeper_clock, ClockRead};
 use tx_substrate::SpinMutex;
 use tx_subsystems::net::delegate::{
     net_delegate_kick_poll, net_delegate_kick_tick,
@@ -306,7 +307,9 @@ impl<P: TxPlatform> BootNetDelegateDriver<P> {
 
 impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
     fn now(&self) -> Instant {
-        let micros = P::read_ns() / 1_000;
+        // Absorbed from main: the platform monotonic counter is read through
+        // the `tx-time` timekeeper now, not `P::read_ns()` directly.
+        let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
         Instant::from_micros(micros.min(i64::MAX as u64) as i64)
     }
 
@@ -397,7 +400,7 @@ impl<P: TxPlatform> CoreInit<P> {
                             // initial syscall-driven burst (git clone froze
                             // at ~20 KiB). Clamp the deadline so the
                             // delegate always re-polls the device soon.
-                            let micros = P::read_ns() / 1_000;
+                            let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
                             let now =
                                 Instant::from_micros(micros.min(i64::MAX as u64) as i64);
                             let floor = now + smoltcp::time::Duration::from_millis(10);
@@ -432,7 +435,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return Some(runtime);
         }
 
-        let now_ns = P::read_ns();
+        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
         let smoltcp_now = instant_from_ns(now_ns);
         let runtime = BOOT_REACTOR.with(|reactor| {
             let runtime: &'static BootNetRuntime = Box::leak(Box::new(BootNetRuntime::new(

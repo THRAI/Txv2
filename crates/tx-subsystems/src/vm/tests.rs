@@ -2,7 +2,7 @@ use super::*;
 use crate::page_backed::PageContainer;
 use crate::test_support::EPOCH_TEST_LOCK;
 use alloc::collections::BTreeMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, Barrier, LazyLock, Mutex};
 use std::thread_local;
 use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
@@ -592,61 +592,116 @@ fn vm_address_space_map_reservation_publishes_recipe_on_commit() {
 }
 
 #[test]
-fn vm_recipe_reclaim_defers_old_root_destruction_until_vm_drain() {
+fn vm_recipe_publish_allocation_failure_preserves_authoritative_root() {
     setup_host_substrate();
-    crate::vm::reset_debug_phase_totals();
-    while crate::vm::structure::drain_deferred_recipe_reclaims(usize::MAX) != 0 {}
-
     let aspace = AddressSpace::new();
-    map_reserved(aspace.reserve_map(
+    let original = VmEntry::new(
+        range(0x4000, 2),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("initial map");
+    let before_stats = aspace.stats();
+
+    tx_substrate::testing::fail_next_publication_allocations(1);
+    let result = aspace.try_mprotect(original.range, Prot::READ);
+
+    assert_eq!(result, Err(VmMapError::NoFreeRange));
+    assert_eq!(aspace.lookup(UserVirtAddr(0x4000)), Some(original));
+    assert_eq!(aspace.stats(), before_stats);
+}
+
+#[test]
+fn vm_recipe_guarded_reader_survives_replacement_publication() {
+    setup_host_substrate();
+    let aspace = Arc::new(AddressSpace::new());
+    let original = VmEntry::new(
+        range(0x8000, 1),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+        .commit()
+        .expect("initial map");
+
+    let guard = crate::vm::adapter::step_engine::guard();
+    let old = aspace
+        .recipes
+        .lookup_ref_for_test(UserVirtAddr(0x8000), &guard)
+        .expect("guarded old recipe");
+    let reader_ready = Arc::new(Barrier::new(2));
+    let writer_done = Arc::new(Barrier::new(2));
+    let writer_aspace = Arc::clone(&aspace);
+    let writer_ready = Arc::clone(&reader_ready);
+    let writer_finished = Arc::clone(&writer_done);
+    let writer = std::thread::spawn(move || {
+        writer_ready.wait();
+        writer_aspace
+            .try_mprotect(range(0x8000, 1), Prot::READ)
+            .expect("replacement publish");
+        writer_finished.wait();
+    });
+
+    reader_ready.wait();
+    writer_done.wait();
+
+    assert_eq!(old.prot, Prot::READ_WRITE);
+    assert_eq!(
+        aspace
+            .lookup(UserVirtAddr(0x8000))
+            .expect("new recipe")
+            .prot,
+        Prot::READ
+    );
+    drop(guard);
+    writer.join().expect("recipe writer thread");
+}
+
+#[test]
+fn vm_recipe_ordered_coverage_walk_rejects_first_gap_without_partial_tagging() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    for entry in [
         VmEntry::new(
-            range(0x4000, 2),
+            range(0x10_0000, 2),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
             VmBacking::PrivateAnon,
         ),
-        MapPlacement::RequireFree,
-    ))
-    .commit()
-    .expect("initial map");
-    let before = crate::vm::structure::recipe_debug_totals();
-
-    for _ in 0..8 {
-        let _ = tx_test_support::drain_once_unbounded();
-        if crate::vm::structure::deferred_recipe_reclaim_len_for_test() != 0 {
-            break;
-        }
+        VmEntry::new(
+            range(0x10_4000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+    ] {
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("sparse recipe map");
     }
+    let tag = UfdRegistration {
+        ufd_id: 7,
+        mode: 1,
+    };
 
     assert_eq!(
-        crate::vm::structure::deferred_recipe_reclaim_len_for_test(),
-        1,
-        "EBR callback should enqueue the old recipe root instead of dropping it inline"
+        aspace.tag_ufd_registration(range(0x10_0000, 5), tag),
+        Err(VmMapError::MissingMapping)
     );
-    let after_ebr = crate::vm::structure::recipe_debug_totals();
-    assert_eq!(
-        after_ebr.deferred_reclaim_enqueued,
-        before.deferred_reclaim_enqueued + 1
-    );
-    assert_eq!(
-        after_ebr.deferred_reclaim_drained,
-        before.deferred_reclaim_drained
-    );
-    assert_eq!(
-        after_ebr.deferred_reclaim_inline_fallback,
-        before.deferred_reclaim_inline_fallback
-    );
-
-    assert_eq!(crate::vm::drain_deferred_recipe_reclaims(1), 1);
-    assert_eq!(
-        crate::vm::structure::deferred_recipe_reclaim_len_for_test(),
-        0
-    );
-    let after_drain = crate::vm::structure::recipe_debug_totals();
-    assert_eq!(
-        after_drain.deferred_reclaim_drained,
-        after_ebr.deferred_reclaim_drained + 1
-    );
+    assert!(aspace
+        .lookup(UserVirtAddr(0x10_0000))
+        .expect("left recipe")
+        .ufd_registration
+        .is_none());
+    assert!(aspace
+        .lookup(UserVirtAddr(0x10_4000))
+        .expect("right recipe")
+        .ufd_registration
+        .is_none());
 }
 
 #[test]
@@ -1602,6 +1657,46 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
 }
 
 #[test]
+fn vm_checks_require_fault_publication_accepts_special_mapping() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x3000, 1),
+        Prot::READ_EXECUTE,
+        VmEntryFlags::SHARED,
+        VmBacking::Special(VmSpecialBacking::VdsoText),
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("map special recipe");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x3008), AccessMode::Execute))
+        .expect("special fault resolves");
+    let ppn =
+        crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
+    let map_pin = crate::vm::adapter::step_engine::page_allocator::acquire_map_pin(ppn)
+        .expect("zero frame map pin");
+    let materialized = VmFaultMaterialization {
+        backing: VmFaultMaterializationBacking::Special(VmSpecialBacking::VdsoText),
+        page_index: crate::page_backed::PageIndex::new(0),
+        page: crate::page_backed::MaterializedPage {
+            ppn,
+            map_pin: crate::page_backed::MaterializedPagePin::Allocated(map_pin),
+            newly_installed: false,
+            dirty: false,
+        },
+        publish_prot: Prot::READ_EXECUTE,
+        replace_existing: false,
+        pmap_materialization_deferred: false,
+    };
+
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Ok(())
+    );
+}
+
+#[test]
 fn vm_checks_require_fault_publication_does_not_clone_recipe_entry() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -2324,4 +2419,102 @@ fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon(
         other => panic!("copy_from_user expected Done, got {other:?}"),
     }
     assert_eq!(readback, payload, "readback must match prior write");
+}
+
+#[test]
+fn vdso_unavailable_leaves_detached_aspace_unmodified() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let layout = crate::vm::VdsoLayout::for_user_top(UserVirtAddr(FULL_USER_V1_TOP))
+        .expect("full user range has a vDSO layout");
+
+    assert_eq!(
+        crate::vm::map_vdso_into_aspace(&aspace, layout).expect("unavailable vDSO is optional"),
+        None,
+    );
+    assert!(aspace.recipes_snapshot().is_empty());
+    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+}
+
+#[test]
+fn vdso_layout_uses_the_platform_user_top_as_its_ceiling() {
+    let user_top = 64 * 1024 * 1024;
+    let layout = crate::vm::VdsoLayout::for_user_top(UserVirtAddr(user_top))
+        .expect("low user top still leaves one vDSO reservation window");
+
+    assert_eq!(layout.window().start().as_usize(), 48 * 1024 * 1024);
+    assert_eq!(layout.window().end().as_usize(), user_top);
+}
+
+#[test]
+fn vdso_pte_failure_rolls_back_recipes_and_resident_mappings() {
+    setup_host_substrate();
+    reset_counting_pmap();
+    let aspace = AddressSpace::new_for_platform::<CountingPmap>().expect("counting pmap");
+    let ppn =
+        crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
+    let layout = crate::vm::VdsoLayout::for_user_top(UserVirtAddr(FULL_USER_V1_TOP))
+        .expect("full user range has a vDSO layout");
+    fail_counting_reserve(PmapError::AlreadyMapped);
+
+    assert!(matches!(
+        super::vdso::map_frames_for_test(&aspace, &[ppn], ppn, layout),
+        Err(VmMapError::Pmap(_))
+    ));
+    assert!(aspace.recipes_snapshot().is_empty());
+    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+}
+
+#[test]
+fn vdso_fork_keeps_special_mapping_shared_without_cow_demotion() {
+    setup_host_substrate();
+    reset_counting_pmap();
+    let parent = AddressSpace::new_for_platform::<CountingPmap>().expect("counting pmap");
+    let ppn =
+        crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
+    let layout = crate::vm::VdsoLayout::for_user_top(UserVirtAddr(FULL_USER_V1_TOP))
+        .expect("full user range has a vDSO layout");
+    let mapping = super::vdso::map_frames_for_test(&parent, &[ppn], ppn, layout).expect("map vDSO");
+    let runtime_vvar = mapping
+        .vdso_base
+        .as_usize()
+        .checked_add_signed(tx_vdso::VVAR_DELTA)
+        .expect("vDSO-relative VVAR address");
+
+    assert_eq!(runtime_vvar, mapping.vvar_base.as_usize());
+
+    let child = AddressSpace::fork_aspace::<CountingPmap>(&parent).expect("fork");
+
+    assert_eq!(
+        parent
+            .pmap()
+            .lookup(mapping.vdso_base.containing_page())
+            .expect("parent vDSO PTE")
+            .prot,
+        Prot::READ_EXECUTE,
+        "shared special text must not be demoted for CoW"
+    );
+    assert_eq!(
+        parent
+            .pmap()
+            .lookup(mapping.vvar_base.containing_page())
+            .expect("parent VVAR PTE")
+            .prot,
+        Prot::READ,
+        "VVAR must be user-readable but neither writable nor executable"
+    );
+    assert_eq!(
+        child
+            .lookup(mapping.vdso_base)
+            .expect("child vDSO recipe")
+            .special_backing(),
+        Some(VmSpecialBacking::VdsoText)
+    );
+    assert_eq!(
+        child
+            .lookup(mapping.vvar_base)
+            .expect("child VVAR recipe")
+            .special_backing(),
+        Some(VmSpecialBacking::Vvar)
+    );
 }

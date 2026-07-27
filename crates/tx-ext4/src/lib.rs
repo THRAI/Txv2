@@ -9,9 +9,11 @@ pub mod adapter;
 
 #[cfg(feature = "host-async")]
 pub mod host_async;
+pub mod journal;
 pub mod mount;
 pub mod namespace;
 pub mod pager;
+pub mod planner;
 mod read_backend;
 mod sync;
 

@@ -689,7 +689,8 @@ impl SocketPayload {
                 }
             }
             SocketImpl::Icmp(raw_icmp) => {
-                let drain = raw_icmp.recv_bytes(out, peek)?;
+                let drain =
+                    raw_icmp.recv_bytes_with_ipv4_header(out, peek, self.is_raw_icmp_socket())?;
                 let source = match drain.source {
                     RawIpAddress::V4(addr) => IpEndpoint::new(addr, 0),
                     RawIpAddress::V6(addr) => IpEndpoint::new_v6(addr, 0),
@@ -1146,7 +1147,7 @@ impl SocketPayload {
                 raw_udp.recv_len(len, peek)
             }
             SocketImpl::Icmp(raw_icmp) => {
-                raw_icmp.recv_len(len, peek)
+                raw_icmp.recv_len_with_ipv4_header(len, peek, self.is_raw_icmp_socket())
             }
             SocketImpl::Unix(raw_unix) => {
                 raw_unix.recv_len(len, peek, unix_stream)

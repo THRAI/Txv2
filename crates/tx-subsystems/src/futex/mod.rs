@@ -4,10 +4,10 @@
 //! Roadmap: Slice 3 of the shell-prompt roadmap (2026-05-07).
 //!
 //! **Bucket model.** A fixed array of 256 `FutexBucket`s indexed by
-//! `hash(uaddr) & 0xff`. Each bucket holds a [`Channel`] registered
+//! `hash(uaddr) & 0xff`. Each bucket holds a [`WaitSource`] registered
 //! with the global [`crate::wait_source`]. `FUTEX_WAIT` parks on the
-//! bucket's channel (after verifying `*uaddr == val`); `FUTEX_WAKE`
-//! fires the bucket's channel, waking all waiters in that bucket.
+//! bucket's wait source (after verifying `*uaddr == val`); `FUTEX_WAKE`
+//! fires the bucket's source, waking matching waiters in that bucket.
 //! Collisions are absorbed by the per-waiter re-check on wakeup —
 //! the syscall arm re-loads `*uaddr` and either returns success or
 //! re-parks. Linux uses a similar global hash-bucket scheme.
@@ -34,26 +34,9 @@
 //! `TODO(phase-userva)` — replace with `UserAccessIf::read_user::<u32>`
 //! once Slice 9 lands.
 //!
-//! **PR-3D-2 coexistence** (D2/D4 ADRs). Each bucket now carries
-//! **two** parallel wake-publication points, mirroring the pipe
-//! template from PR-3D-1:
-//!
-//! 1. The legacy `Channel` (`channel`) — backed by `RawPort`+`Waker`.
-//!    Consumed by the existing `wait_source` resolver and any caller
-//!    that `lookup_wait_channel`s the bucket's `source_id` and awaits
-//!    via `WaitFuture`. **Stays in place** until PR-3D-5 retires the
-//!    legacy resolver path.
-//! 2. The new `Arc<WaitSource>` (`wait_source`) — backed by
-//!    `TaskMailbox`. Consumed by v3 callers that own a `TaskMailbox`
-//!    and register via `WaitSource::prepare(...).install_if(...)`.
-//!    Tested in `crates/tx-subsystems/tests/v3_futex_waitsource.rs`.
-//!
-//! Both paths fire on every `step_futex_wake`. The `WaitSourceId`
-//! stamped into `step_futex_wait`'s `YieldShape::OnWaitSource` is the
-//! same `u64` the legacy `wait_source` resolver returned, so the two
-//! paths share an id namespace and a v3 caller's
-//! `WaitSourceId.raw()` round-trips cleanly to the right bucket's
-//! `WaitSource`.
+//! Each bucket owns one `Arc<WaitSource>` backed by `TaskMailbox`.
+//! `step_futex_wait` stamps that source id into `YieldShape::OnWaitSource`;
+//! `step_futex_wake` notifies the same source.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -68,40 +51,27 @@ use adapter::step_engine::{
     self, Errno, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
     SubjectIdentity, ZoneError,
 };
-use adapter::wait_routing::{self, Channel, WaitSource};
+use adapter::wait_routing::{self, WaitSource};
 
 use crate::execution::Guard;
 use crate::vm::AddressSpace;
 use tx_hal::UserPtr;
-use tx_substrate::wake::MailboxSchedulerHint;
+use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 
 /// Number of futex hash buckets. Fixed; no dynamic allocation.
 /// Collisions are absorbed by the per-waiter re-check on wakeup.
 pub const FUTEX_BUCKET_COUNT: usize = 256;
 
-/// Wake-mask bit fired into a bucket's channel by `FUTEX_WAKE`.
+/// Wake-mask bit fired into a bucket's wait source by `FUTEX_WAKE`.
 /// Waiters subscribe to this same bit so any wake fires every
 /// waiter in the bucket.
 pub const FUTEX_WAKE_MASK: u64 = u32::MAX as u64;
 const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
-/// Per-bucket state. Holds the wait channel + the carrier id
-/// registered with [`crate::wait_source`].
-///
-/// **PR-3D-2 (D2/D4 coexistence)** adds an `Arc<WaitSource>` next to
-/// the legacy `Channel`. Both fire on `step_futex_wake`; v3 callers
-/// register a `TaskMailbox` against `wait_source` via
-/// `WaitSource::prepare(..).install_if(..)` while legacy callers stay
-/// on the `Channel`+`wait_source` resolver path. `wait_source.id()`
-/// matches `source_id` (same `u64` in both worlds) so the round-trip
-/// from `YieldShape::OnWaitSource { source: WaitSourceId(source_id), .. }`
-/// lands on the right bucket.
+/// Per-bucket wait source state.
 struct FutexBucket {
-    channel: Channel,
     source_id: u64,
-    /// PR-3D-2 new path. Fired alongside `channel` on every
-    /// `step_futex_wake` call routed to this bucket.
     wait_source: Arc<WaitSource>,
 }
 
@@ -153,10 +123,7 @@ fn emit_futex_debug_value(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -311,7 +278,6 @@ struct FutexEntry {
 }
 
 struct FutexWaiter {
-    channel: Channel,
     source_id: u64,
     wait_source: Arc<WaitSource>,
     tid: Option<u32>,
@@ -379,17 +345,18 @@ pub fn thread_has_waiter(tid: u32) -> bool {
 fn new_waiter(tid: Option<u32>, interest_mask: u64) -> FutexWaiter {
     let wait_point = notification::new_wait_point();
     register_waiting_tid(tid);
+    let source_id = tx_substrate::wake::WaitEndpoint::source_id(wait_point.endpoint()).raw();
+    let (_, wait_source) = wait_point.into_parts();
     FutexWaiter {
-        channel: wait_point.channel,
-        source_id: wait_point.source_id,
-        wait_source: wait_point.wait_source,
+        source_id,
+        wait_source,
         tid,
         interest_mask,
     }
 }
 
 fn release_waiter_source(source_id: u64) {
-    crate::wait_source::release_wait_channel(source_id);
+    crate::wait_source::release_wait_source(source_id);
     wait_routing::unregister_source(source_id);
 }
 
@@ -547,10 +514,11 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
     let mut buckets = Vec::with_capacity(FUTEX_BUCKET_COUNT);
     for _ in 0..FUTEX_BUCKET_COUNT {
         let wait_point = notification::new_wait_point();
+        let source_id = tx_substrate::wake::WaitEndpoint::source_id(wait_point.endpoint()).raw();
+        let (_, wait_source) = wait_point.into_parts();
         buckets.push(FutexBucket {
-            channel: wait_point.channel,
-            source_id: wait_point.source_id,
-            wait_source: wait_point.wait_source,
+            source_id,
+            wait_source,
         });
     }
     *guard = Some(buckets.into_boxed_slice());
@@ -763,6 +731,29 @@ pub fn step_futex_wake_masked_with_hint_in(
     hint: MailboxSchedulerHint,
     _guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    step_futex_wake_masked_with_hint_and_post_in(
+        aspace,
+        uaddr,
+        n,
+        wake_mask,
+        hint,
+        _guard,
+        |mailbox, event, hint| mailbox.post_with_scheduler_hint(event, hint),
+    )
+}
+
+pub fn step_futex_wake_masked_with_hint_and_post_in<F>(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    n: u32,
+    wake_mask: u64,
+    hint: MailboxSchedulerHint,
+    _guard: &Guard<'_>,
+    mut post: F,
+) -> StepOutcome<u32, NoProgress>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -838,12 +829,12 @@ pub fn step_futex_wake_masked_with_hint_in(
     for waiter in &waiters {
         let mask = waiter.interest_mask & wake_mask;
         fired_mask |= mask;
-        posted = posted.saturating_add(notification::notify_exact_limit_with_hint(
-            &waiter.channel,
+        posted = posted.saturating_add(notification::notify_exact_limit_with_post(
             &waiter.wait_source,
             mask,
             1,
             hint,
+            |mailbox, event, hint| post(mailbox, event, hint),
         ));
         subscribers_after = subscribers_after.saturating_add(waiter.wait_source.subscriber_count());
     }
@@ -1003,18 +994,14 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
     // source's subscriber-list lock) runs **outside** the BUCKETS
     // lock — keeps the lock-ordering simple if a future subscriber
     // callback ever needs to call back into futex.
-    let (channel, wait_source) = {
+    let wait_source = {
         let guard = BUCKETS.lock();
         let buckets = guard
             .as_ref()
             .expect("futex buckets uninitialised — register_zones not called");
-        (
-            buckets[idx].channel.clone(),
-            buckets[idx].wait_source.clone(),
-        )
+        buckets[idx].wait_source.clone()
     };
     let posted = notification::notify_bucket_with_hint(
-        &channel,
         &wait_source,
         FUTEX_WAKE_MASK,
         MailboxSchedulerHint::WakeHandoff,
@@ -1127,6 +1114,15 @@ pub fn bucket_wait_source(uaddr: u64) -> Option<Arc<WaitSource>> {
     Some(buckets[idx].wait_source.clone())
 }
 
+/// Endpoint for the bucket that `uaddr` hashes to.
+///
+/// This is the endpoint-shaped spelling of [`bucket_wait_source`]. Callers that
+/// wait or subscribe should prefer the endpoint name; the source-id spelling is
+/// retained for older yield-shape and compatibility tests.
+pub fn bucket_endpoint(uaddr: u64) -> Option<Arc<WaitSource>> {
+    bucket_wait_source(uaddr)
+}
+
 /// PR-3D-2: look up the bucket's `Arc<WaitSource>` by the
 /// `source_id` published into the legacy `wait_source` resolver
 /// (i.e. the `u64` carried inside a `WaitSourceId`). Linear scan over
@@ -1143,6 +1139,11 @@ pub fn bucket_wait_source_for_source_id(source_id: u64) -> Option<Arc<WaitSource
         .iter()
         .find(|b| b.source_id == source_id)
         .map(|b| b.wait_source.clone())
+}
+
+/// Endpoint lookup by bucket source id.
+pub fn bucket_endpoint_for_source_id(source_id: u64) -> Option<Arc<WaitSource>> {
+    bucket_wait_source_for_source_id(source_id)
 }
 
 // -- PR-2 StepOp wraps -------------------------------------------------
@@ -1192,11 +1193,7 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
             &guard,
             self.tid,
         );
-        if let StepOutcome::Yield {
-            shape: adapter::step_engine::YieldShape::OnWaitSource { source, .. },
-            ..
-        } = &outcome
-        {
+        if let Some(source) = notification::yielded_wait_source(&outcome) {
             self.waiting = true;
             self.registered_source_id = Some(source.raw());
         }
@@ -1221,6 +1218,12 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
             ) => {
                 self.unregister();
                 Err(Errno::ETIMEDOUT)
+            }
+            adapter::step_engine::ResumeOutcome::Aborted(
+                adapter::step_engine::AbortReason::Interrupted,
+            ) => {
+                self.unregister();
+                Err(Errno::EINTR)
             }
             _ => Err(Errno::EINVAL),
         }
@@ -1355,6 +1358,21 @@ mod tests {
     }
 
     #[test]
+    fn futex_bucket_endpoint_matches_wait_source_id() {
+        let _setup = setup();
+        let uaddr = 0x7000_1000;
+        let endpoint = bucket_endpoint(uaddr).expect("bucket endpoint");
+
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(&endpoint).raw(),
+            endpoint.id().raw()
+        );
+
+        let by_id = bucket_endpoint_for_source_id(endpoint.id().raw()).expect("bucket by id");
+        assert_eq!(by_id.id(), endpoint.id());
+    }
+
+    #[test]
     fn futex_step_wake_returns_n_for_valid_uaddr() {
         let _setup = setup();
         let word: u32 = 0;
@@ -1412,7 +1430,7 @@ mod tests {
             } => {
                 assert_eq!(interests.raw(), FUTEX_WAKE_MASK);
                 assert!(
-                    wait_source::lookup_wait_channel(carrier.raw()).is_some(),
+                    wait_source::lookup_wait_source(carrier.raw()).is_some(),
                     "futex bucket carrier must be registered with wait_source",
                 );
             }
@@ -1943,11 +1961,10 @@ mod tests {
         drop(guard);
         assert_eq!(wake_outcome, StepOutcome::Done(1));
         // Both ops index to the same bucket → same carrier id.
-        // The channel underlying that carrier id is the one fire()
-        // was just called on.
+        // The wait source underlying that carrier id is the one notified above.
         assert!(
-            wait_source::lookup_wait_channel(waiter_carrier).is_some(),
-            "fired channel still resolvable",
+            wait_source::lookup_wait_source(waiter_carrier).is_some(),
+            "notified wait source still resolvable",
         );
     }
 
@@ -1959,8 +1976,8 @@ mod tests {
     // fn would have returned.
     mod step_op_wraps {
         use super::super::adapter::step_engine::{
-            guard, Errno as V3Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
-            YieldShape,
+            guard, AbortReason, Errno as V3Errno, NoProgress, ProcessIdentity, ResumeOutcome,
+            ScriptCtx, StepOp, StepOutcome, YieldShape,
         };
         use super::super::{step_futex_wake, FutexWaitOp, FutexWakeOp, FUTEX_WAKE_MASK};
         use super::{setup, setup_aspace_with_word};
@@ -2013,6 +2030,29 @@ mod tests {
             let free = step_futex_wake(0, 1, &guard);
             drop(guard);
             assert_eq!(outcome, free);
+        }
+
+        #[test]
+        fn futex_wait_op_interrupted_resume_maps_to_eintr() {
+            let _setup = setup();
+            let (aspace, uaddr) = setup_aspace_with_word(0xc000_0000, 1);
+            let mut op = FutexWaitOp {
+                uaddr,
+                aspace: &aspace,
+                val: 1,
+                interest_mask: FUTEX_WAKE_MASK,
+                tid: None,
+                woken: false,
+                waiting: false,
+                registered_source_id: None,
+            };
+
+            let err = <FutexWaitOp<'_> as StepOp<ProcessIdentity>>::apply_resume(
+                &mut op,
+                ResumeOutcome::Aborted(AbortReason::Interrupted),
+            )
+            .expect_err("signal-interrupted futex wait must return EINTR");
+            assert_eq!(err, V3Errno::EINTR);
         }
     }
 }

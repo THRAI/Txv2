@@ -6,6 +6,7 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, Guard, StepOutcome};
 use tx_fs;
+use tx_services::time::{ClockRead, TimekeeperClock};
 // The alias-name `cred_checks` is required by
 // `xtask lint invariants cred-check` — see CRED_CHECK_SIGNALS in
 // xtask/src/lint_invariants_cred_check.rs. Other aliases would
@@ -60,19 +61,8 @@ fn mount_identity_for_dentry(
     None
 }
 
-fn resolve_cwd_for_path(
-    dirfd: i32,
-    _path: &[u8],
-    ctx: &SyscallCtx<'_>,
-) -> Result<Cap<DEntry>, i32> {
-    if dirfd == AT_FDCWD {
-        return ctx.process.cwd().ok_or(ENOENT_VALUE);
-    }
-    if dirfd < 0 {
-        return Err(EBADF_VALUE);
-    }
-    let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
-    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
+fn resolve_cwd_for_path(dirfd: i32, path: &[u8], ctx: &SyscallCtx<'_>) -> Result<Cap<DEntry>, i32> {
+    dirfd_anchor_errno(dirfd, path, ctx)
 }
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
@@ -89,18 +79,31 @@ fn resolve_cwd_for_path(
 ///   with `EINVAL` anyway because `InlineName::new(b"")` rejects
 ///   the empty basename)
 pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
-    match path.iter().rposition(|b| *b == b'/') {
-        None => (&[], path),
-        Some(idx) => {
-            // The slash itself stays with the parent so an absolute
-            // path like `/x/y/z` keeps its leading `/` on `parent`
-            // (the walker treats a path starting with `/` as
-            // "restart from mount root").
-            let parent = &path[..=idx];
-            let basename = &path[idx + 1..];
-            (parent, basename)
+    let split = split_parent_name(path);
+    (split.parent_path, split.basename)
+}
+
+fn proc_self_fd_number(path: &[u8]) -> Option<u32> {
+    let rest = path.strip_prefix(b"/proc/self/fd/")?;
+    if rest.is_empty() || rest.contains(&b'/') {
+        return None;
+    }
+    core::str::from_utf8(rest).ok()?.parse::<u32>().ok()
+}
+
+fn proc_self_fd_link_bytes(ctx: &SyscallCtx<'_>, fd_num: u32) -> Result<Vec<u8>, SyscallResult> {
+    let Some(open_file) = ctx.process.fd(fd_num) else {
+        return Err(SyscallResult::Error(ENOENT_VALUE));
+    };
+    if let OpenFileBacking::Rnode { rnode } = open_file.backing() {
+        if let RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } = rnode.backing()
+        {
+            return Ok(tx_subsystems::tty::project::dev_path_for_tty(tty));
         }
     }
+    Ok(alloc::format!("anon_inode:[{}]", fd_num).into_bytes())
 }
 
 /// Helper for the `O_CREAT`-on-missing path inside `sys_openat`.
@@ -117,13 +120,13 @@ pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
 /// `!Send + !Sync`, so cross-`.await` holds break the dispatch
 /// future's `Send` bound). Returns the positive-magnitude `-errno`
 /// on failure.
-pub(crate) fn create_then_walk<P: PmapIf>(
+pub(crate) async fn drive_create_then_walk(
     cwd: &Cap<DEntry>,
     path: &[u8],
     mode: u16,
     cred: &Credential,
+    ctx: &SyscallCtx<'_>,
 ) -> Result<Cap<DEntry>, i32> {
-    let _ = core::marker::PhantomData::<P>;
     let (parent_path, basename) = split_path(path);
     if basename.is_empty() {
         // A path like `/` or `foo/` has an empty basename — can't
@@ -132,66 +135,31 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         return Err(EISDIR_VALUE);
     }
 
-    // Walk to the parent. Empty `parent_path` means "use the cwd as
-    // the parent" (the basename was a single component with no
-    // slash). step_walk handles a leading `/` as "restart from mount
-    // root" and `b""` as "stay at rooted_at".
-    let parent_dentry: Cap<DEntry> = if parent_path.is_empty() {
-        cwd.clone()
-    } else {
-        let guard = step_engine::guard();
-        use StepOutcome as V3;
-        let outcome = step_walk(cwd.clone(), parent_path, cred, &guard);
-        drop(guard);
-        match outcome {
-            V3::Done(d) => d,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return Err(EIO_VALUE);
-            }
-            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
-        }
-    };
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
 
-    // Resolve the FsOps in scope at `parent_dentry`. Mirrors the
-    // existing `fs_ops_for_dentry` shape used by the file-mode arms.
-    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
-        Some(ops) => ops,
-        None => return Err(EROFS_VALUE),
-    };
-
-    // Mint the new inode under the parent. The mode arrives from
-    // userspace as the bottom 12 bits (`rwxrwxrwx | S_ISUID/S_ISGID/
-    // S_ISVTX`); umask plumbing is deferred to a future slice
-    // (TODO(phase-umask)).
-    let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
-    let new_mode = mode & 0o7777;
-    {
-        use StepOutcome as V3;
-        let guard = step_engine::guard();
-        let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
-        match outcome {
-            V3::Done(_) => {
-                parent_dentry.remove_cached_child_by_name(basename);
-            }
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return Err(EIO_VALUE);
-            }
-            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
-        }
-    }
-
-    // Re-walk the full path. Lookup now resolves the freshly-created
-    // inode; the resulting dentry carries the proper parent-hint
-    // chain back to the mount root.
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
-    let outcome = step_walk(cwd.clone(), path, cred, &guard);
-    drop(guard);
-    match outcome {
-        V3::Done(d) => Ok(d),
-        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
-    }
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let op = tx_subsystems::vfs::CreateThenWalkOp::new(
+        cwd.clone(),
+        parent_path.to_vec(),
+        path.to_vec(),
+        basename.to_vec(),
+        mode & 0o7777,
+        cred.clone(),
+    );
+    drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    .map_err(|errno| errno_to_i32(Errno::from(errno)))
 }
 
 /// Resolve the in-scope `Arc<dyn FsPageBacking>` for the given dentry.
@@ -201,16 +169,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
 pub(super) fn fs_page_backing_for_dentry(
     dentry: &Cap<DEntry>,
 ) -> Option<Arc<dyn tx_subsystems::page_backed::FsPageBacking>> {
-    let guard = step_engine::guard();
-    let mut cursor: Cap<DEntry> = dentry.clone();
-    loop {
-        if let Some(weak) = cursor.rnode().containing_mount_weak() {
-            if let Some(payload) = weak.upgrade(&guard) {
-                return Some(payload.fs_page_backing.clone());
-            }
-        }
-        cursor = cursor.parent_hint()?;
-    }
+    MountedDentry::find_ascending(dentry).map(|mounted| mounted.fs_page_backing())
 }
 
 /// `mkdirat(dirfd, pathname, mode)`. Linux RV64 generic ABI
@@ -228,6 +187,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
@@ -249,7 +209,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let parent_dentry = if parent_path.is_empty() {
         rooted_at
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from_process(rooted_at, parent_path, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -258,7 +218,6 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         return SyscallResult::Error(EROFS_VALUE);
     }
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -276,17 +235,23 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     // (umask is the bottom 9 bits — `rwxrwxrwx`).
     let umask = ctx.process.umask();
     let effective_mode = mode & !umask & 0o7777;
-    let outcome = {
-        let guard = step_engine::guard();
-        fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
+    let result = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::MkdirOp {
+            fs_ops: &fs_ops,
+            parent: parent_id,
+            name: basename,
+            mode: effective_mode,
+            cred: &cred,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    match outcome {
-        V3::Done(_) => {
+    match result {
+        Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -307,6 +272,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
@@ -324,7 +290,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let parent_dentry = if parent_path.is_empty() {
         rooted_at
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from_process(rooted_at, parent_path, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -333,30 +299,38 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         return SyscallResult::Error(EROFS_VALUE);
     }
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let target_id = {
-        let guard = step_engine::guard();
-        match fs_ops.lookup(parent_id, basename, &guard) {
-            V3::Done(id) => id,
-            V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
-            V3::Err(errno)
-                if errno == Errno::ENOENT && try_unlink_unix_socket_path(ctx, &path, &guard) =>
-            {
-                return SyscallResult::Return(0);
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::LookupInParentOp {
+            fs_ops: &fs_ops,
+            parent: parent_id,
+            name: basename,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(id) => id,
+            Err(v3errno) if v3errno == Errno::ENOENT => {
+                let guard = step_engine::guard();
+                if try_unlink_unix_socket_path(ctx, &path, &guard) {
+                    return SyscallResult::Return(0);
+                }
+                return SyscallResult::error_from(Errno::from(v3errno));
             }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     let child_meta = {
-        let guard = step_engine::guard();
-        match fs_ops.load_inode_meta(target_id, &guard) {
-            V3::Done(meta) => meta,
-            V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::LoadInodeMetaOp {
+            fs_ops: &fs_ops,
+            target: target_id,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(meta) => meta,
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     let target_kind = child_meta.kind();
@@ -375,16 +349,19 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if let Err(e) = cred_checks::authorize_unlink(ctx.cred_snapshot(), &parent_meta, &child_meta) {
         return SyscallResult::error_from(e);
     }
-    let outcome = {
-        let guard = step_engine::guard();
-        if want_rmdir {
-            fs_ops.rmdir(parent_id, basename, target_id, &guard)
-        } else {
-            fs_ops.unlink(parent_id, basename, target_id, &guard)
-        }
+    let result = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::UnlinkFromParentOp {
+            fs_ops: &fs_ops,
+            parent: parent_id,
+            name: basename,
+            target: target_id,
+            remove_dir: want_rmdir,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    match outcome {
-        V3::Done(()) => {
+    match result {
+        Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
             if want_rmdir || child_meta.nlinks <= 1 {
                 let guard = step_engine::guard();
@@ -392,8 +369,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
             }
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -427,6 +403,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if target.is_empty() {
@@ -435,6 +412,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let linkpath = match read_user_cstr(&ctx.aspace, linkpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if linkpath.is_empty() {
@@ -461,7 +439,6 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         return SyscallResult::Error(EROFS_VALUE);
     }
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -473,17 +450,23 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta) {
         return SyscallResult::error_from(e);
     }
-    let outcome = {
-        let guard = step_engine::guard();
-        fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
+    let result = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::SymlinkOp {
+            fs_ops: &fs_ops,
+            parent: parent_id,
+            name: basename,
+            target: &target,
+            cred: &cred,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    match outcome {
-        V3::Done(_) => {
+    match result {
+        Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -510,6 +493,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if oldpath.is_empty() {
@@ -518,6 +502,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if newpath.is_empty() {
@@ -564,7 +549,6 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         return SyscallResult::Error(EPERM_VALUE);
     }
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -583,17 +567,22 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta) {
         return SyscallResult::error_from(e);
     }
-    let outcome = {
-        let guard = step_engine::guard();
-        fs_ops.link(new_parent_id, new_basename, source_id, &guard)
+    let result = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::LinkInParentOp {
+            fs_ops: &fs_ops,
+            parent: new_parent_id,
+            name: new_basename,
+            target: source_id,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    match outcome {
-        V3::Done(()) => {
+    match result {
+        Ok(()) => {
             new_parent_dentry.remove_cached_child_by_name(new_basename);
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -611,6 +600,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
     if path.is_empty() {
@@ -630,15 +620,36 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let outcome = {
-        let guard = step_engine::guard();
-        tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
-    };
-    use StepOutcome as V3;
-    match outcome {
-        V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
-        V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno.into()),
+    if let Err(errno) = cred_checks::authorize_open(
+        ctx.cred_snapshot(),
+        &dentry.rnode().meta(),
+        OpenFileFlags {
+            write: true,
+            ..OpenFileFlags::default()
+        },
+    ) {
+        return SyscallResult::error_from(errno);
+    }
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::page_backed::TruncateOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let op = TruncateOp { pc: &pc, new_size };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -669,7 +680,7 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     // Op acquires its own epoch guard inside `step()`; the syscall
     // handler holds no guard across `drive(...).await` (EBR-7).
     let op = FdTruncateOp {
@@ -682,7 +693,7 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         None,
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -734,15 +745,29 @@ pub(super) async fn sys_fallocate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         return SyscallResult::Return(0);
     }
 
-    let outcome = {
-        let guard = step_engine::guard();
-        tx_subsystems::page_backed::step_fallocate(&pc, end, &guard)
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::page_backed::FallocateOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let op = FallocateOp {
+        pc: &pc,
+        new_size: end,
     };
-    use StepOutcome as V3;
-    match outcome {
-        V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
-        V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::error_from(Errno::from(v3_errno)),
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -775,8 +800,24 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
+    if let Some(fd_num) = proc_self_fd_number(&path) {
+        let link_bytes = match proc_self_fd_link_bytes(ctx, fd_num) {
+            Ok(bytes) => bytes,
+            Err(result) => return result,
+        };
+        let to_copy = core::cmp::min(link_bytes.len(), buf_len);
+        if to_copy > 0 {
+            if let Err(errno) =
+                bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy])
+            {
+                return SyscallResult::error_from(errno);
+            }
+        }
+        return SyscallResult::Return(to_copy as i64);
+    }
     if path.is_empty() {
         if dirfd == AT_FDCWD {
             return SyscallResult::Error(ENOENT_VALUE);
@@ -796,15 +837,15 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             Some(ops) => ops,
             None => return SyscallResult::Error(ENOSYS_VALUE),
         };
-        use StepOutcome as V3;
         let link_bytes = {
-            let guard = step_engine::guard();
-            match fs_ops.read_link(rnode.fs_object_id(), &guard) {
-                V3::Done(b) => b,
-                V3::Continue { .. } | V3::Yield { .. } => {
-                    return SyscallResult::Error(EIO_VALUE);
-                }
-                V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = tx_subsystems::vfs::ReadLinkByIdOp {
+                fs_ops: &fs_ops,
+                target: rnode.fs_object_id(),
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(bytes) => bytes,
+                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
             }
         };
         let to_copy = core::cmp::min(link_bytes.len(), buf_len);
@@ -835,7 +876,6 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
@@ -844,36 +884,40 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // — bypasses the walker's symlink-chase loop so the symlink's
     // own inode (not its target's) is what we read.
     let target_id = {
-        let guard = step_engine::guard();
-        match fs_ops.lookup(parent_id, basename, &guard) {
-            V3::Done(id) => id,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::LookupInParentOp {
+            fs_ops: &fs_ops,
+            parent: parent_id,
+            name: basename,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(id) => id,
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     let target_meta = {
-        let guard = step_engine::guard();
-        match fs_ops.load_inode_meta(target_id, &guard) {
-            V3::Done(m) => m,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::LoadInodeMetaOp {
+            fs_ops: &fs_ops,
+            target: target_id,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(meta) => meta,
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     if target_meta.kind() != InodeKind::Symlink {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let link_bytes = {
-        let guard = step_engine::guard();
-        match fs_ops.read_link(target_id, &guard) {
-            V3::Done(b) => b,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = tx_subsystems::vfs::ReadLinkByIdOp {
+            fs_ops: &fs_ops,
+            target: target_id,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(bytes) => bytes,
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
@@ -958,6 +1002,7 @@ pub(super) async fn sys_fsopen<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     let fsname = match read_user_cstr(&ctx.aspace, fsname_uaddr, 64) {
         Ok(name) => name,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     let Some(fstype) = supported_mount_api_fstype(&fsname) else {
@@ -997,6 +1042,7 @@ pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(path) => path,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() && flags & FSPICK_EMPTY_PATH == 0 {
@@ -1059,6 +1105,7 @@ pub(super) async fn sys_open_tree<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(path) => path,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
@@ -1114,6 +1161,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
 
@@ -1160,14 +1208,25 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
             Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
+        let namespace = match ctx.process.mount_namespace_cap() {
+            Some(namespace) => namespace,
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        };
         let guard = step_engine::guard();
-        match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
+        match mount::bind_mount_in_namespace(
+            source_dentry,
+            target_dentry,
+            &parent_payload,
+            &namespace,
+            &guard,
+        ) {
             Ok(_) => return SyscallResult::Return(0),
             Err(e) => return SyscallResult::error_from(e),
         }
@@ -1180,14 +1239,25 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
             Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         };
+        let namespace = match ctx.process.mount_namespace_cap() {
+            Some(namespace) => namespace,
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        };
         let guard = step_engine::guard();
-        match mount::move_mount(&source_dentry, target_dentry, &parent_payload, &guard) {
+        match mount::move_mount_in_namespace(
+            &source_dentry,
+            target_dentry,
+            &parent_payload,
+            &namespace,
+            &guard,
+        ) {
             Ok(()) => return SyscallResult::Return(0),
             Err(e) => return SyscallResult::error_from(e),
         }
@@ -1211,6 +1281,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let fstype = match read_user_cstr(&ctx.aspace, fstype_uaddr, 64) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
     let fstype_str = match core::str::from_utf8(&fstype) {
@@ -1231,6 +1302,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
             Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
         };
         Some(source)
@@ -1407,18 +1479,13 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
     };
 
+    mount::register_mount(
+        &parent_payload,
+        target_dentry.rnode().fs_object_id(),
+        mount_cap.clone(),
+    );
     if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
-        mnt_ns.register_mount(
-            &parent_payload,
-            target_dentry.rnode().fs_object_id(),
-            mount_cap,
-        );
-    } else {
-        mount::register_mount(
-            &parent_payload,
-            target_dentry.rnode().fs_object_id(),
-            mount_cap,
-        );
+        mnt_ns.register_mount(&target_dentry, mount_cap);
     }
 
     SyscallResult::Return(0)
@@ -1442,6 +1509,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
 
@@ -1458,43 +1526,27 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    // umount operates on the *mountpoint*, not the mounted content.
-    // `walk_from_process` crosses the final mount, so a mounted path
-    // resolves to the mounted FS's root dentry — whose `InlineName` is the
-    // empty ROOT name and whose `parent_hint` is the mountpoint dentry.
-    // Keying umount by that crossed root's own (payload, inode) uses the
-    // mounted FS's root inode — wrong, and ambiguous when several mounts
-    // share one bind source: `umount share2`, after crossing into parent2,
-    // matched parent2's *self-bind* and removed it, leaving share2 mounted.
-    // The leftover then wedged the fs_bind cleanup loop (which re-`umount`s
-    // whatever /proc/mounts still lists) into an infinite user-space spin —
-    // the flaky fs_bind* hang found via gdb. Recover the mountpoint dentry so
-    // umount keys by (mountpoint_parent_payload, mountpoint_inode), matching
-    // `register_mount`, and pops the correct top-of-stack mount.
-    let umount_target = if target_dentry.name().as_bytes().is_empty() {
-        target_dentry
-            .parent_hint()
-            .unwrap_or_else(|| target_dentry.clone())
-    } else {
-        target_dentry.clone()
-    };
-    let parent_payload = match mount_payload_for_dentry(&umount_target) {
-        Some(p) => p,
-        None => return SyscallResult::Error(ENODEV_VALUE),
-    };
-
-    // Try the process's mount namespace, then fall back to the global mount
-    // table. Bind/move mounts register globally (`crate::mount::register_mount`)
-    // and the per-process namespace table is unpopulated for them, so without
-    // this fallback `umount` of a bind mount returned EINVAL even though the
-    // mount existed and was crossable — the umount-side mirror of the walker
-    // crossing fix in `vfs::resolution::step`.
     let result = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
-        mnt_ns
-            .umount(&umount_target, &parent_payload)
-            .or_else(|_| mount::umount(&umount_target, &parent_payload))
+        // The namespace row is authoritative and returns the identity it
+        // actually removed. Only that exact identity may be withdrawn from
+        // the legacy global index; a cloned identity has no global row, which
+        // is intentionally a successful no-op.
+        mnt_ns.umount(&target_dentry).map(|removed_mount| {
+            let _ = mount::umount_identity_exact(&removed_mount);
+        })
     } else {
-        mount::umount(&umount_target, &parent_payload)
+        // Namespace-less compatibility retains the legacy dentry lookup.
+        let umount_target = if target_dentry.name().as_bytes().is_empty() {
+            target_dentry
+                .parent_hint()
+                .unwrap_or_else(|| target_dentry.clone())
+        } else {
+            target_dentry.clone()
+        };
+        match mount_payload_for_dentry(&umount_target) {
+            Some(parent_payload) => mount::umount(&umount_target, &parent_payload),
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        }
     };
 
     match result {
@@ -1522,6 +1574,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
@@ -1588,10 +1641,10 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 /// 64-bit `time_t`/`long` (`external/musl/include/alltypes.h.in`).
 /// This arm supports libc paths used by `utimensat(3)` and
 /// `futimens(3)`, including `pathname == NULL` and `AT_EMPTY_PATH`.
-pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) fn sys_utimensat<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let times_uaddr = args[2];
@@ -1644,6 +1697,7 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
         let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
             Ok(path) => path,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
             Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         if path.is_empty() {
@@ -1752,6 +1806,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if oldpath.is_empty() {
@@ -1760,6 +1815,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if newpath.is_empty() {

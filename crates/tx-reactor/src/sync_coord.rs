@@ -7,6 +7,7 @@ use core::{
     task::{Context, Poll},
 };
 
+use crate::adapter::bus_wire::{MailboxEvent, TaskMailbox};
 use crate::spin_lock::SpinLock;
 use crate::wait::{Channel, Mask, WaitFuture, WaitOutcome};
 
@@ -113,12 +114,10 @@ impl SyncRendezvous {
             .map(|entry| entry.acked)
     }
 
-    /// Acknowledge one target in the closed rendezvous set.
-    ///
-    /// The completion wait channel fires only on the first transition from
-    /// incomplete to complete. Duplicate and unknown acknowledgments report
-    /// the current state without creating extra wake events.
-    pub fn ack(&self, target: SyncTargetToken) -> AckResult {
+    pub fn ack_with_post<F>(&self, target: SyncTargetToken, post: F) -> (AckResult, usize)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         let mut fire_completion = false;
         let result = {
             let mut state = self.state.lock();
@@ -127,11 +126,14 @@ impl SyncRendezvous {
                 .iter()
                 .position(|entry| entry.target == target)
             else {
-                return AckResult {
-                    outcome: AckOutcome::UnknownTarget,
-                    completed: state.remaining == 0,
-                    remaining: state.remaining,
-                };
+                return (
+                    AckResult {
+                        outcome: AckOutcome::UnknownTarget,
+                        completed: state.remaining == 0,
+                        remaining: state.remaining,
+                    },
+                    0,
+                );
             };
 
             if state.targets[index].acked {
@@ -152,11 +154,13 @@ impl SyncRendezvous {
             }
         };
 
-        if fire_completion {
-            self.completion.fire(COMPLETE_MASK);
-        }
+        let woken = if fire_completion {
+            self.completion.fire_with_post(COMPLETE_MASK, post)
+        } else {
+            0
+        };
 
-        result
+        (result, woken)
     }
 
     pub fn wait(&self) -> SyncRendezvousWait {

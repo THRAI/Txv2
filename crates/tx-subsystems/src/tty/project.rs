@@ -13,7 +13,7 @@ use crate::execution::{Errno, Guard};
 use crate::mount::MountPayload;
 use crate::tty::execution;
 use crate::tty::structure::registry;
-use crate::tty::structure::TtyIdentity;
+use crate::tty::structure::{TtyIdentity, TtyKind};
 use crate::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
     RNode, RNodeBacking, StructPayload,
@@ -102,6 +102,38 @@ pub fn resolve_devfs_alias(name: &[u8]) -> Option<Cap<TtyIdentity>> {
     registry::devfs_alias(name)
 }
 
+/// Linux-visible `(major, minor)` for a TTY identity.
+///
+/// This is projection data for devfs/procfs/stat surfaces; I/O still dispatches
+/// through the `StructPayload::Tty` identity, not through a static char binding.
+pub fn devt_major_minor_for_tty(tty: &Cap<TtyIdentity>) -> (u32, u32) {
+    match tty.kind {
+        TtyKind::SerialHardware => (4, 64 + tty.index),
+        TtyKind::PtyMaster => (5, 2),
+        TtyKind::PtySlave => (136, tty.index),
+    }
+}
+
+/// Best-effort absolute devfs path for a TTY identity.
+///
+/// Used by `/proc/<pid>/fd/N` symlink rendering so libc/BusyBox ttyname probes
+/// can associate a TTY fd with a visible device node.
+pub fn dev_path_for_tty(tty: &Cap<TtyIdentity>) -> Vec<u8> {
+    match tty.kind {
+        TtyKind::PtyMaster => Vec::from(&b"/dev/ptmx"[..]),
+        TtyKind::PtySlave => {
+            let mut path = Vec::from(&b"/dev/"[..]);
+            path.extend_from_slice(tty.name.as_bytes());
+            path
+        }
+        TtyKind::SerialHardware => {
+            let mut path = Vec::from(&b"/dev/"[..]);
+            path.extend_from_slice(tty.name.as_bytes());
+            path
+        }
+    }
+}
+
 /// Materialize a devfs RNode for `ttyS<N>` or `console`.
 pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> V3Out<Cap<RNode>, NoProgress> {
     let tty = match devfs_tty_by_name(name, guard) {
@@ -153,6 +185,28 @@ pub fn devpts_rnode_by_index(index: u32, guard: &Guard<'_>) -> V3Out<Cap<RNode>,
 /// Build an OpenFile over a fresh StructBacked TTY RNode.
 pub fn open_file_for_tty(
     tty: Cap<TtyIdentity>,
+    guard: &Guard<'_>,
+) -> V3Out<Cap<OpenFile>, NoProgress> {
+    open_file_for_tty_with_flags(
+        tty,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+        guard,
+    )
+}
+
+/// Build an OpenFile over a fresh StructBacked TTY RNode with caller-supplied
+/// open flags. Used by caller-relative devices such as `/dev/tty`, where the
+/// syscall layer has already decoded Linux open flags.
+pub fn open_file_for_tty_with_flags(
+    tty: Cap<TtyIdentity>,
+    flags: OpenFileFlags,
     _guard: &Guard<'_>,
 ) -> V3Out<Cap<OpenFile>, NoProgress> {
     let object_id = FsObjectId::new(DEVFS_TTY_OBJECT_BASE + tty.raw() as u64);
@@ -162,17 +216,7 @@ pub fn open_file_for_tty(
         _ => return V3Out::err(Errno::EIO.into()),
     };
 
-    match OpenFile::new_cap(
-        rnode,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            append: false,
-            cloexec: false,
-            nonblocking: false,
-            packet: false,
-        },
-    ) {
+    match OpenFile::new_cap(rnode, flags) {
         Ok(file) => V3Out::done(file),
         Err(_) => V3Out::err(Errno::EIO.into()),
     }
@@ -510,7 +554,7 @@ impl FsOps for DevptsInstance {
         }
     }
 
-    // `read_link`, `step_chmod`, `step_chown`: devpts does not
+    // `read_link`, `chmod_inode`, `chown_inode`: devpts does not
     // override these. The v3 trait defaults return `ENOSYS`.
 }
 

@@ -442,7 +442,7 @@ where
         }
         TrapClass::ExternalInterrupt => {
             let _irq_context = enter_la64_irq_context();
-            K::on_external_irq(<Platform as SmpIf>::current_cpu_id(), frame.view_mut())
+            K::on_external_irq(<Platform as SmpIf>::current_cpu_id())
         }
         TrapClass::InterprocessorInterrupt => {
             let _irq_context = enter_la64_irq_context();

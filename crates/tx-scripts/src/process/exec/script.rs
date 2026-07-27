@@ -2,9 +2,9 @@
 //!
 //! Realises the eight-phase EXEC_v1 protocol against the seams shipped
 //! by Wave 1 (`vm::scripts`, `page_backed::read_exact_at`) and Wave 2
-//! (`step_close_cloexec_fds`, `step_reset_signal_dispositions_for_exec`,
-//! `step_install_brk_for_exec`). The script integrates the loader's
-//! ELF parser (`super::loader::parse_image_plan`) and stack-image
+//! (`PreparedCloexecClose`, `ResetSignalDispositionsForExecOp`,
+//! `InstallBrkForExecOp`). The script integrates the loader's
+//! staged ELF reader (`super::image_reader::read_elf_image`) and stack-image
 //! builder (`super::stack::build_initial_user_stack`) with the VFS
 //! walker (`vfs::walker::step_open`) so a `path` resolves all the way
 //! to a fully populated detached `AddressSpace` ready for the
@@ -33,69 +33,367 @@
 //! locally — its `Drop` reclaims memory under EBR with no observable
 //! side-effects on the caller's process.
 //!
-//! Phase 6 is the irreversible visibility boundary: a single
-//! `process.replace_aspace(new_aspace)` followed by a single
-//! `thread.payload().store_saved_user_context(...)`. Both atomic, both
-//! infallible. After this point the function performs only Phase-7
+//! Phase 6 performs one final checked authoritative-binding swap. Failure is
+//! returned before the new address space is stored; a successful swap is the
+//! irreversible visibility boundary. After that point the function performs only Phase-7
 //! commits (Wave 2 helpers, all infallible by EXEC-PONR) and returns
-//! `Ok(())`. There is no `?`, no `.await`, and no fallible call
-//! between the Phase-6 swap and the function's return.
+//! `Ok(())`. There is no recoverable error path after the successful Phase-6
+//! swap; an internal lifecycle-invariant violation is fatal.
 
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
-use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
+use tx_hal::{Arch, EntropyIf, PmapIf, UserTrapContext};
+use tx_subsystems::cred::{
+    commit_prepared_exec_cred, prepare_exec_cred_in, Capability, ExecSetidPolicy, Gid, Uid,
+};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::mount::MountFlags;
+use tx_subsystems::mount::{MountFlags, MountNamespace};
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
-use tx_subsystems::process::adapter::wait_routing::Mask;
 use tx_subsystems::process::{
-    step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
-    ProcessIdentity,
+    InstallBrkForExecOp, ProcessExecPrep, ProcessIdentity, ResetSignalDispositionsForExecOp,
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vfs::walker::step_open;
+use tx_subsystems::vfs::walker::step_open_in_mount_namespace_with_origin_mount;
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
-    LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_TOP_DEFAULT,
+    LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_INITIAL_RESERVATION,
 };
-use tx_subsystems::vm::{MapPlacement, MapReserveResult, Prot, VmBacking, VmEntry, VmEntryFlags};
+use tx_subsystems::vm::{map_vdso_into_aspace, VdsoLayout, VdsoMapping, VmMapError};
 
+use super::image_reader::{read_elf_image, ImageReadError, ImageRole};
 use super::loader::{
-    parse_image_plan, ExecImagePlan, InterpreterPlan, LoadSegment as ParsedLoadSegment, ParseError,
-    SegmentFlags as ParsedSegmentFlags, ELF64_PHENT, ET_DYN_LOAD_BIAS,
+    ElfLayoutError, ExecImagePlan, ImageRange, LoadSegment as ParsedLoadSegment,
+    SegmentFlags as ParsedSegmentFlags, ELF64_PHENT,
 };
-use super::stack::{build_initial_user_stack, AuxvFacts};
-use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use super::stack::{build_initial_user_stack, AuxvFacts, StackBuildError};
+use crate::adapter::step_engine::{
+    self as step_engine, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome,
+};
 use crate::adapter::vfs_exec::{
-    Credential, DEntry, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking,
+    Credential, DEntry, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNodeBacking,
 };
 
 /// User page size — RV64 today; mirrors `vm::USER_PAGE_SIZE` so the
 /// brk-base round-up doesn't require pulling in another import.
 const USER_PAGE_SIZE: u64 = 4096;
 
-const INTERP_BASE: u64 = 0x3E_0000_0000;
+const MIN_LOAD_BIAS: u64 = 0x1_0000;
+const ASLR_LAYOUT_ATTEMPTS: usize = 16;
+const ASLR_WINDOW: u64 = 16 * 1024 * 1024;
 
-// ASLR functions moved inline to exec_script_inner
-
-fn namespace_root_for_dentry(mut cursor: Cap<DEntry>) -> Cap<DEntry> {
-    while let Some(parent) = cursor.parent_hint() {
-        cursor = parent;
-    }
-    cursor
+#[derive(Debug)]
+struct CombinedImageLayout {
+    main: ExecImagePlan,
+    interpreter: Option<ExecImagePlan>,
+    stack_top: u64,
+    vdso_window: ImageRange,
+    vdso_layout: VdsoLayout,
 }
 
-fn exec_root_for_path(cwd: &Cap<DEntry>, path: &[u8]) -> Cap<DEntry> {
-    if path.starts_with(b"/") {
-        namespace_root_for_dentry(cwd.clone())
-    } else {
-        cwd.clone()
+#[derive(Clone, Copy)]
+enum ExecutableCandidateRole {
+    Main,
+    Interpreter,
+}
+
+impl ExecutableCandidateRole {
+    const fn invalid_image(self) -> ExecError {
+        match self {
+            Self::Main => ExecError::NotExecutable,
+            Self::Interpreter => ExecError::InterpreterMalformed,
+        }
     }
+}
+
+struct ExecutableCandidate {
+    file: Cap<OpenFile>,
+    pc: Cap<PageContainer>,
+    meta: InodeMeta,
+    mount: Cap<tx_subsystems::mount::MountIdentity>,
+}
+
+fn random_u64() -> u64 {
+    let mut bytes = [0u8; 8];
+    tx_services::random::fill_bytes(&mut bytes);
+    u64::from_le_bytes(bytes)
+}
+
+fn try_zeroed_exec_bytes(len: usize) -> Result<Vec<u8>, ExecError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| ExecError::OutOfMemory)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+fn try_copy_exec_bytes(bytes: &[u8]) -> Result<Vec<u8>, ExecError> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| ExecError::OutOfMemory)?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
+fn try_reserve_exec_items<T>(items: &mut Vec<T>, additional: usize) -> Result<(), ExecError> {
+    items
+        .try_reserve_exact(additional)
+        .map_err(|_| ExecError::OutOfMemory)
+}
+
+fn try_exec_argv_refs(argv: &[Vec<u8>]) -> Result<Vec<&[u8]>, ExecError> {
+    let mut refs = Vec::new();
+    try_reserve_exec_items(&mut refs, argv.len())?;
+    for item in argv {
+        refs.push(item.as_slice());
+    }
+    Ok(refs)
+}
+
+fn try_copy_exec_argv(argv: &[&[u8]]) -> Result<Vec<Vec<u8>>, ExecError> {
+    let mut owned = Vec::new();
+    try_reserve_exec_items(&mut owned, argv.len())?;
+    for item in argv {
+        if item.contains(&b'\0') {
+            return Err(ExecError::InvalidArgument);
+        }
+        owned.push(try_copy_exec_bytes(item)?);
+    }
+    Ok(owned)
+}
+
+fn align_up(value: u64, align: u64) -> Result<u64, ElfLayoutError> {
+    if align == 0 || !align.is_power_of_two() {
+        return Err(ElfLayoutError::InvalidAlignment);
+    }
+    value
+        .checked_add(align - 1)
+        .map(|rounded| rounded & !(align - 1))
+        .ok_or(ElfLayoutError::AddressOverflow)
+}
+
+const fn align_down(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
+}
+
+fn plan_alignment(plan: &ExecImagePlan) -> Result<u64, ElfLayoutError> {
+    let mut align = USER_PAGE_SIZE;
+    for segment in &plan.load_segments {
+        let segment_align = segment.align.max(USER_PAGE_SIZE);
+        if !segment_align.is_power_of_two() {
+            return Err(ElfLayoutError::InvalidAlignment);
+        }
+        align = align.max(segment_align);
+    }
+    Ok(align)
+}
+
+fn plan_relative_end(plan: &ExecImagePlan) -> Result<u64, ElfLayoutError> {
+    plan.load_segments.iter().try_fold(0, |highest, segment| {
+        let end = segment
+            .vaddr
+            .checked_add(segment.memsz)
+            .ok_or(ElfLayoutError::AddressOverflow)?;
+        let relative = end
+            .checked_sub(plan.load_bias)
+            .ok_or(ElfLayoutError::AddressOverflow)?;
+        Ok(highest.max(relative))
+    })
+}
+
+fn candidate_bias(
+    plan: &ExecImagePlan,
+    entropy: u64,
+    upper_bound: u64,
+) -> Result<u64, ElfLayoutError> {
+    let align = plan_alignment(plan)?;
+    let first = align_up(MIN_LOAD_BIAS, align)?;
+    let last = upper_bound
+        .checked_sub(plan_relative_end(plan)?)
+        .map(|value| align_down(value, align))
+        .filter(|value| *value >= first)
+        .ok_or(ElfLayoutError::UserRange)?;
+    let slots = (last - first) / align + 1;
+    let slot = entropy % slots;
+    first
+        .checked_add(
+            slot.checked_mul(align)
+                .ok_or(ElfLayoutError::AddressOverflow)?,
+        )
+        .ok_or(ElfLayoutError::AddressOverflow)
+}
+
+fn plan_ranges(plan: &ExecImagePlan) -> Result<Vec<ImageRange>, ElfLayoutError> {
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(plan.load_segments.len())
+        .map_err(|_| ElfLayoutError::OutOfMemory)?;
+    for segment in &plan.load_segments {
+        let start = align_down(segment.vaddr, USER_PAGE_SIZE);
+        let end = segment
+            .vaddr
+            .checked_add(segment.memsz)
+            .and_then(|end| align_up(end, USER_PAGE_SIZE).ok())
+            .ok_or(ElfLayoutError::AddressOverflow)?;
+        ranges.push(ImageRange {
+            vaddr: start,
+            size: end - start,
+        });
+    }
+    Ok(ranges)
+}
+
+fn try_clone_exec_plan(plan: &ExecImagePlan) -> Result<ExecImagePlan, ElfLayoutError> {
+    let mut load_segments = Vec::new();
+    load_segments
+        .try_reserve_exact(plan.load_segments.len())
+        .map_err(|_| ElfLayoutError::OutOfMemory)?;
+    for segment in &plan.load_segments {
+        load_segments.push(segment.clone());
+    }
+    let interpreter_path = plan
+        .interpreter_path
+        .as_deref()
+        .map(try_copy_exec_bytes)
+        .transpose()
+        .map_err(|_| ElfLayoutError::OutOfMemory)?;
+
+    Ok(ExecImagePlan {
+        entry: plan.entry,
+        at_phdr: plan.at_phdr,
+        at_phent: plan.at_phent,
+        at_phnum: plan.at_phnum,
+        load_segments,
+        bss_extension: plan.bss_extension,
+        load_bias: plan.load_bias,
+        tls: plan.tls,
+        dynamic: plan.dynamic,
+        relro: plan.relro,
+        stack: plan.stack,
+        interpreter_path,
+    })
+}
+
+fn ranges_overlap(left: ImageRange, right: ImageRange) -> Result<bool, ElfLayoutError> {
+    let left_end = left
+        .vaddr
+        .checked_add(left.size)
+        .ok_or(ElfLayoutError::AddressOverflow)?;
+    let right_end = right
+        .vaddr
+        .checked_add(right.size)
+        .ok_or(ElfLayoutError::AddressOverflow)?;
+    Ok(left.vaddr < right_end && right.vaddr < left_end)
+}
+
+fn ranges_are_valid(ranges: &[ImageRange], user_top: u64) -> Result<bool, ElfLayoutError> {
+    for (index, left) in ranges.iter().copied().enumerate() {
+        let end = left
+            .vaddr
+            .checked_add(left.size)
+            .ok_or(ElfLayoutError::AddressOverflow)?;
+        if end > user_top {
+            return Ok(false);
+        }
+        for right in ranges[index + 1..].iter().copied() {
+            if ranges_overlap(left, right)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn select_combined_layout(
+    main: ExecImagePlan,
+    interpreter: Option<ExecImagePlan>,
+    user_top: u64,
+    mut entropy: impl FnMut() -> u64,
+) -> Result<CombinedImageLayout, ElfLayoutError> {
+    let vm_user_top = usize::try_from(user_top).map_err(|_| ElfLayoutError::UserRange)?;
+    let vdso_layout = VdsoLayout::for_user_top(tx_subsystems::vm::UserVirtAddr::new(vm_user_top))
+        .map_err(|_| ElfLayoutError::UserRange)?;
+    let reservation = vdso_layout.window();
+    let vdso_window = ImageRange {
+        vaddr: reservation.start().as_usize() as u64,
+        size: reservation.len() as u64,
+    };
+    if user_top <= vdso_window.size + USER_STACK_INITIAL_RESERVATION + MIN_LOAD_BIAS {
+        return Err(ElfLayoutError::UserRange);
+    }
+    let stack_ceiling = vdso_window.vaddr;
+    let stack_slide_slots = ASLR_WINDOW / USER_PAGE_SIZE;
+
+    for _ in 0..ASLR_LAYOUT_ATTEMPTS {
+        let candidate = (|| {
+            let slide = (entropy() % stack_slide_slots) * USER_PAGE_SIZE;
+            let stack_top = stack_ceiling
+                .checked_sub(slide)
+                .ok_or(ElfLayoutError::AddressOverflow)?;
+            let stack_start = stack_top
+                .checked_sub(USER_STACK_INITIAL_RESERVATION)
+                .ok_or(ElfLayoutError::UserRange)?;
+
+            let main_candidate = if main.load_bias == 0 {
+                try_clone_exec_plan(&main)?.checked_rebase(0, user_top)?
+            } else {
+                let bias = candidate_bias(&main, entropy(), stack_start)?;
+                try_clone_exec_plan(&main)?.checked_rebase(bias, user_top)?
+            };
+            let interpreter_candidate = if let Some(plan) = interpreter.as_ref() {
+                if plan.load_bias == 0 {
+                    Some(try_clone_exec_plan(plan)?.checked_rebase(0, user_top)?)
+                } else {
+                    let bias = candidate_bias(plan, entropy(), stack_start)?;
+                    Some(try_clone_exec_plan(plan)?.checked_rebase(bias, user_top)?)
+                }
+            } else {
+                None
+            };
+
+            let mut ranges = plan_ranges(&main_candidate)?;
+            let extra = interpreter_candidate
+                .as_ref()
+                .map_or(2, |plan| plan.load_segments.len() + 2);
+            ranges
+                .try_reserve_exact(extra)
+                .map_err(|_| ElfLayoutError::OutOfMemory)?;
+            if let Some(plan) = interpreter_candidate.as_ref() {
+                ranges.extend(plan_ranges(plan)?);
+            }
+            ranges.push(ImageRange {
+                vaddr: stack_start,
+                size: USER_STACK_INITIAL_RESERVATION,
+            });
+            ranges.push(vdso_window);
+            if !ranges_are_valid(&ranges, user_top)? {
+                return Err(ElfLayoutError::Overlap);
+            }
+            Ok(CombinedImageLayout {
+                main: main_candidate,
+                interpreter: interpreter_candidate,
+                stack_top,
+                vdso_window,
+                vdso_layout,
+            })
+        })();
+
+        match candidate {
+            Ok(layout) => return Ok(layout),
+            Err(
+                ElfLayoutError::AddressOverflow
+                | ElfLayoutError::UserRange
+                | ElfLayoutError::Overlap,
+            ) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ElfLayoutError::Exhausted)
 }
 
 /// Emit a OBS-V1 §15.7 ProcessLabel Instant mapping `pid` to the PCB
-/// `comm` just committed by `step_store_exec_identity`-equivalent
+/// `comm` just committed by the exec identity store
 /// logic above. The daemon caches `pid → comm` and uses it as the
 /// per-process Perfetto track's `ProcessDescriptor.process_name`, so
 /// the timeline shows real program names (`busybox`, `basic_exec`)
@@ -108,28 +406,7 @@ fn emit_process_label_for(pid_low: u32, comm: &[u8; 16]) {
     let Some(em) = tx_observe::current() else {
         return;
     };
-    let mut truncated = [0u8; 12];
-    let n = core::cmp::min(comm.len(), truncated.len());
-    truncated[..n].copy_from_slice(&comm[..n]);
-    if !truncated.contains(&0) {
-        truncated[truncated.len() - 1] = 0;
-    }
-    let payload = tx_observe::PayloadProcessLabel {
-        process_id_low: pid_low,
-        comm: truncated,
-    };
-    let (enc, len) = tx_observe::encode::encode_process_label(&payload);
-    em.instant(
-        tx_observe::TxTraceLevel::Sched,
-        // Same `0x9000_0000 | pid` namespace as
-        // `tx-kernel::init::emit_process_label` so the daemon's
-        // dedupe sees both submit-time and post-exec re-emits as the
-        // same logical event.
-        tx_observe::EventNameId::from_raw(0x9000_0000 | pid_low),
-        tx_observe::current_parent_span(),
-        tx_observe::encode::process_label_tag(),
-        &enc[..len as usize],
-    );
+    em.process_label(tx_observe::current_parent_span(), pid_low, comm);
 }
 
 /// Companion to [`emit_process_label_for`] — emits the OBS-V1 §15.8
@@ -143,30 +420,17 @@ fn emit_process_group_for(pid_low: u32, pgid_low: u32, sid_low: u32) {
     let Some(em) = tx_observe::current() else {
         return;
     };
-    let payload = tx_observe::PayloadProcessGroup {
-        process_id_low: pid_low,
+    em.process_group(
+        tx_observe::current_parent_span(),
+        pid_low,
         pgid_low,
         sid_low,
-        _pad: 0,
-    };
-    let (enc, len) = tx_observe::encode::encode_process_group(&payload);
-    em.instant(
-        tx_observe::TxTraceLevel::Sched,
-        // Same `0xA000_0000 | pid` namespace as
-        // `tx-kernel::init::emit_process_group`.
-        tx_observe::EventNameId::from_raw(0xA000_0000 | pid_low),
-        tx_observe::current_parent_span(),
-        tx_observe::encode::process_group_tag(),
-        &enc[..len as usize],
     );
 }
 
-/// Initial-read window over the ELF image used to cover the header and
-/// program-header table. Sized at one page (4 KiB) which is well over
-/// `Elf64_Ehdr` (64 bytes) + `MAX_PHDRS=64 * Elf64_Phdr=56` ≈ 3.6 KiB.
-/// If a future image carries more program headers, the parser's
-/// `MAX_PHDRS` cap rejects it before this read undershoots.
-const INITIAL_PARSE_READ: usize = 4096;
+/// Linux `linux_binprm::buf` size used for shebang dispatch.
+/// ELF metadata is read independently by `image_reader` at declared offsets.
+const BINPRM_BUF_SIZE: usize = 256;
 
 /// Cumulative count of times the shebang (`#!`) handler fired.
 pub static EXEC_SHEBANG_FIRED: core::sync::atomic::AtomicUsize =
@@ -197,12 +461,26 @@ pub enum ExecError {
     /// `ENOEXEC`. File is not a recognised RV64 ELF executable
     /// (header / phdr validation failed, or backend reads short).
     NotExecutable,
+    /// `ELIBBAD`. The requested userspace interpreter is malformed.
+    InterpreterMalformed,
+    /// `ELIBBAD`. An ELF interpreter requested another interpreter.
+    InterpreterNested,
+    /// Final main/interpreter/stack/vDSO layout could not be composed.
+    Layout(ElfLayoutError),
     /// `EINVAL`. Invalid argument shape (e.g. plan that would
     /// underflow the user stack arithmetic).
     InvalidArgument,
     /// `ENOMEM`. Page-allocator / zone-allocator pressure. The exec
     /// path drops every reservation it acquired before this fired.
     OutOfMemory,
+    /// `EAGAIN`. Process lifecycle or credential mutation episode is
+    /// already owned by a concurrent exit/exec operation.
+    Again,
+    /// Re-run the current pre-PoNR operation without parking.
+    Retry,
+    /// Park on the originating wait object, then restart reversible exec
+    /// preparation from Phase 1.
+    Deferred(step_engine::YieldShape),
     /// `EBUSY`. Range-lock contention or unexpected pmap publish
     /// stall on a detached aspace; effectively unreachable for the v1
     /// surface and mostly a placeholder for tests.
@@ -212,6 +490,18 @@ pub enum ExecError {
 }
 
 impl ExecError {
+    fn from_vdso_map_error(error: VmMapError) -> Self {
+        match error {
+            VmMapError::WouldBlock => Self::Retry,
+            VmMapError::NoFreeRange | VmMapError::Private(_) => Self::OutOfMemory,
+            VmMapError::Pmap(_) => Self::IoError,
+            VmMapError::AlreadyMapped
+            | VmMapError::InvalidRange
+            | VmMapError::MissingMapping
+            | VmMapError::BackingOffsetOverflow => Self::InvalidArgument,
+        }
+    }
+
     fn from_walker_errno(err: Errno) -> Self {
         match err {
             Errno::ENOENT => Self::PathNotFound,
@@ -225,6 +515,7 @@ impl ExecError {
             // variant (Linux returns -EACCES for either).
             Errno::EACCES | Errno::EPERM => Self::PermissionDenied,
             Errno::ENOMEM => Self::OutOfMemory,
+            Errno::EAGAIN => Self::Retry,
             Errno::EIO => Self::IoError,
             Errno::ENODEV | Errno::ENOSYS => Self::NotExecutable,
             _ => Self::InvalidArgument,
@@ -235,8 +526,40 @@ impl ExecError {
         match err {
             Errno::ENOEXEC => Self::NotExecutable,
             Errno::ENOMEM => Self::OutOfMemory,
+            Errno::EAGAIN => Self::Retry,
             Errno::EIO => Self::IoError,
             _ => Self::InvalidArgument,
+        }
+    }
+
+    fn from_image_read_error(err: ImageReadError) -> Self {
+        match err {
+            ImageReadError::InvalidImage(super::loader::ParseError::OutOfMemory) => {
+                Self::OutOfMemory
+            }
+            ImageReadError::InvalidImage(_) | ImageReadError::InvalidOffset => Self::NotExecutable,
+            ImageReadError::Retry => Self::Retry,
+            ImageReadError::WouldBlock(shape) => Self::Deferred(shape),
+            ImageReadError::OutOfMemory => Self::OutOfMemory,
+            ImageReadError::Io => Self::IoError,
+        }
+    }
+
+    fn from_interpreter_image_read_error(err: ImageReadError) -> Self {
+        match err {
+            ImageReadError::InvalidImage(super::loader::ParseError::HasInterp) => {
+                Self::InterpreterNested
+            }
+            ImageReadError::InvalidImage(super::loader::ParseError::OutOfMemory) => {
+                Self::OutOfMemory
+            }
+            ImageReadError::InvalidImage(_) | ImageReadError::InvalidOffset => {
+                Self::InterpreterMalformed
+            }
+            ImageReadError::Retry => Self::Retry,
+            ImageReadError::WouldBlock(shape) => Self::Deferred(shape),
+            ImageReadError::OutOfMemory => Self::OutOfMemory,
+            ImageReadError::Io => Self::IoError,
         }
     }
 
@@ -250,19 +573,11 @@ impl ExecError {
         }
     }
 
-    fn from_parse_error(err: ParseError) -> Self {
-        // Every parser failure mode maps to ENOEXEC — userspace cannot
-        // tell `Magic` from `Phdr` from `LoadSegment`. The parser keeps
-        // them distinguished for kernel-side tracing only.
-        let _ = err;
-        Self::NotExecutable
-    }
-
     fn from_build_aspace_error(err: vm_scripts::ScriptError) -> Self {
         match err {
             vm_scripts::ScriptError::InvalidImage => Self::NotExecutable,
             vm_scripts::ScriptError::OutOfMemory => Self::OutOfMemory,
-            vm_scripts::ScriptError::WouldBlock => Self::Busy,
+            vm_scripts::ScriptError::WouldBlock => Self::Retry,
             vm_scripts::ScriptError::Efault => Self::InvalidArgument,
             vm_scripts::ScriptError::Io => Self::IoError,
             vm_scripts::ScriptError::Map(_) | vm_scripts::ScriptError::Pmap(_) => Self::OutOfMemory,
@@ -291,15 +606,155 @@ impl ExecError {
             ExecError::SymlinkLoop => -40,
             // ENOEXEC
             ExecError::NotExecutable => -8,
+            // ELIBBAD
+            ExecError::InterpreterMalformed | ExecError::InterpreterNested => -80,
+            // Layout OOM is ENOMEM; malformed/exhausted layouts are ENOEXEC.
+            ExecError::Layout(ElfLayoutError::OutOfMemory) => -12,
+            ExecError::Layout(_) => -8,
             // EINVAL
             ExecError::InvalidArgument => -22,
             // ENOMEM
             ExecError::OutOfMemory => -12,
+            ExecError::Again => -11,
+            ExecError::Retry | ExecError::Deferred(_) => -11,
             // EBUSY
             ExecError::Busy => -16,
             // EIO
             ExecError::IoError => -5,
         }
+    }
+
+    /// Map exec-script errors onto the v3 `StepOutcome::Err` errno
+    /// surface used by [`ExecScriptOp`].
+    pub fn to_step_errno(self) -> step_engine::Errno {
+        match self {
+            ExecError::PathTooLong => step_engine::Errno::ENAMETOOLONG,
+            ExecError::PathNotFound => step_engine::Errno::ENOENT,
+            ExecError::NotADirectory => step_engine::Errno::ENOTDIR,
+            ExecError::PermissionDenied => step_engine::Errno::EACCES,
+            ExecError::SymlinkLoop => step_engine::Errno::ELOOP,
+            ExecError::NotExecutable => step_engine::Errno::ENOEXEC,
+            ExecError::InterpreterMalformed | ExecError::InterpreterNested => {
+                step_engine::Errno::ELIBBAD
+            }
+            ExecError::Layout(ElfLayoutError::OutOfMemory) => step_engine::Errno::ENOMEM,
+            ExecError::Layout(_) => step_engine::Errno::ENOEXEC,
+            ExecError::InvalidArgument => step_engine::Errno::EINVAL,
+            ExecError::OutOfMemory => step_engine::Errno::ENOMEM,
+            ExecError::Again => step_engine::Errno::EAGAIN,
+            ExecError::Retry | ExecError::Deferred(_) => step_engine::Errno::EAGAIN,
+            ExecError::Busy => step_engine::Errno::EBUSY,
+            ExecError::IoError => step_engine::Errno::EIO,
+        }
+    }
+}
+
+fn vdso_auxv(mapping: Option<VdsoMapping>) -> Option<u64> {
+    mapping.map(|mapping| mapping.vdso_base.as_usize() as u64)
+}
+
+fn validate_vdso_mapping(
+    mapping: Option<VdsoMapping>,
+    layout: VdsoLayout,
+) -> Result<(), ElfLayoutError> {
+    let Some(mapping) = mapping else {
+        return Ok(());
+    };
+    let reserved = layout.window();
+    let reserved_start = reserved.start().as_usize() as u64;
+    let reserved_end = reserved.end().as_usize() as u64;
+    let ranges = [
+        ImageRange {
+            vaddr: mapping.vdso_base.as_usize() as u64,
+            size: mapping.vdso_size as u64,
+        },
+        ImageRange {
+            vaddr: mapping.vvar_base.as_usize() as u64,
+            size: USER_PAGE_SIZE,
+        },
+    ];
+    for range in ranges {
+        let end = range
+            .vaddr
+            .checked_add(range.size)
+            .ok_or(ElfLayoutError::AddressOverflow)?;
+        if range.vaddr < reserved_start || end > reserved_end {
+            return Err(ElfLayoutError::UserRange);
+        }
+    }
+    if ranges_overlap(ranges[0], ranges[1])? {
+        return Err(ElfLayoutError::Overlap);
+    }
+    Ok(())
+}
+
+/// StepOp entry for execve.
+///
+/// This is the reachable syscall-facing exec step surface. It preserves the
+/// canonical `exec_script_inner` implementation and its EXEC-PONR ordering.
+/// Pre-PoNR waits retain their wait shape; the central waiting driver parks and
+/// then re-enters reversible preparation from Phase 1.
+pub struct ExecScriptOp<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> {
+    process: &'a Cap<ProcessIdentity>,
+    thread: &'a Cap<ThreadIdentity>,
+    path: &'a [u8],
+    argv: &'a [&'a [u8]],
+    envp: &'a [&'a [u8]],
+    cred: &'a Credential,
+    _platform: core::marker::PhantomData<fn() -> P>,
+}
+
+impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> ExecScriptOp<'a, P> {
+    pub const fn new(
+        process: &'a Cap<ProcessIdentity>,
+        thread: &'a Cap<ThreadIdentity>,
+        path: &'a [u8],
+        argv: &'a [&'a [u8]],
+        envp: &'a [&'a [u8]],
+        cred: &'a Credential,
+    ) -> Self {
+        Self {
+            process,
+            thread,
+            path,
+            argv,
+            envp,
+            cred,
+            _platform: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> StepOp<ProcessIdentity> for ExecScriptOp<'a, P> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<ProcessIdentity>) -> StepOutcome<(), NoProgress> {
+        let future = exec_script::<P>(
+            self.process,
+            self.thread,
+            self.path,
+            self.argv,
+            self.envp,
+            self.cred,
+        );
+        exec_result_to_step_outcome(poll_ready_synchronously(future))
+    }
+}
+
+pub(crate) fn exec_result_to_step_outcome(
+    result: Option<Result<(), ExecError>>,
+) -> StepOutcome<(), NoProgress> {
+    match result {
+        Some(Ok(())) => StepOutcome::done(()),
+        Some(Err(ExecError::Deferred(shape))) => StepOutcome::Yield {
+            progress: NoProgress,
+            shape,
+        },
+        Some(Err(ExecError::Retry)) | None => StepOutcome::Continue {
+            progress: NoProgress,
+        },
+        Some(Err(error)) => StepOutcome::err(error.to_step_errno()),
     }
 }
 
@@ -333,7 +788,79 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
-    exec_script_inner::<P>(0, process, thread, path, argv, envp, cred).await
+    let mount_namespace = process
+        .mount_namespace_cap()
+        .ok_or(ExecError::PathNotFound)?;
+    let original_path = try_copy_exec_bytes(path)?;
+    let mut current_path = try_copy_exec_bytes(path)?;
+    let mut current_argv = try_copy_exec_argv(argv)?;
+    let envp = try_copy_exec_argv(envp)?;
+    let envp_refs = try_exec_argv_refs(&envp)?;
+
+    for depth in 0..=SHEBANG_MAX_DEPTH {
+        let argv_refs = try_exec_argv_refs(&current_argv)?;
+        let (rooted_at, origin_mount) = if current_path.starts_with(b"/") {
+            (
+                mount_namespace.root_dentry(),
+                mount_namespace.root().clone(),
+            )
+        } else {
+            let cwd = process.cwd_binding().ok_or(ExecError::PathNotFound)?;
+            (cwd.dentry, cwd.mount)
+        };
+        let candidate = open_executable_candidate(
+            rooted_at,
+            &origin_mount,
+            &current_path,
+            cred,
+            &mount_namespace,
+            ExecutableCandidateRole::Main,
+        )?;
+        let read_len = usize::try_from(candidate.pc.size_bytes().min(BINPRM_BUF_SIZE as u64))
+            .map_err(|_| ExecError::NotExecutable)?;
+        if read_len == 0 {
+            return Err(ExecError::NotExecutable);
+        }
+        let mut header = try_zeroed_exec_bytes(read_len)?;
+        let guard = step_engine::guard();
+        let read = read_exact_at(&candidate.pc, 0, &mut header, &guard);
+        drop(guard);
+        match read {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Continue { .. } => return Err(ExecError::Retry),
+            StepOutcome::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
+            StepOutcome::Err(err) => return Err(ExecError::from_read_errno(err.into())),
+        }
+
+        if header.starts_with(b"#!") {
+            if let Some((interp, opt_arg)) = shebang_parse(&header) {
+                if depth == SHEBANG_MAX_DEPTH {
+                    return Err(ExecError::SymlinkLoop);
+                }
+                EXEC_SHEBANG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let (next_path, next_argv) =
+                    shebang_exec_argv(interp, opt_arg, &current_path, &argv_refs)?;
+                current_path = next_path;
+                current_argv = next_argv;
+                continue;
+            }
+        } else if !header.starts_with(b"\x7fELF") {
+            return Err(ExecError::NotExecutable);
+        }
+
+        return exec_script_inner::<P>(
+            depth,
+            process,
+            thread,
+            &current_path,
+            &original_path,
+            &argv_refs,
+            &envp_refs,
+            cred,
+        )
+        .await;
+    }
+    Err(ExecError::SymlinkLoop)
 }
 
 async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
@@ -341,35 +868,18 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
     path: &[u8],
+    execfn: &[u8],
     argv: &[&[u8]],
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
     // Shebang recursion guard (Linux limit: 4).
     if depth > SHEBANG_MAX_DEPTH {
-        return Err(ExecError::IoError); // maps to ELOOP
+        return Err(ExecError::SymlinkLoop);
     }
-
-    // ---- ASLR helpers (inline closures) ----------------------------
-    let randomize_et_dyn_base = || -> u64 {
-        let mut buf = [0u8; 8];
-        tx_services::random::fill_bytes(&mut buf);
-        let r = u64::from_le_bytes(buf);
-        let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
-        ET_DYN_LOAD_BIAS + offset
-    };
-    let randomize_interp_base = || -> u64 {
-        let mut buf = [0u8; 8];
-        tx_services::random::fill_bytes(&mut buf);
-        let r = u64::from_le_bytes(buf);
-        let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
-        INTERP_BASE + offset
-    };
-    let randomize_stack_top = || -> u64 {
-        let mut buf = [0u8; 8];
-        tx_services::random::fill_bytes(&mut buf);
-        (USER_STACK_TOP_DEFAULT + (u64::from_le_bytes(buf) & 0x7F_FFFF)) & !(USER_PAGE_SIZE - 1)
-    };
+    let mount_namespace = process
+        .mount_namespace_cap()
+        .ok_or(ExecError::PathNotFound)?;
 
     // ===== Phase 1 — resolve path + open file =========================
     //
@@ -391,50 +901,25 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // page-cache backends grow real waits, this site shifts to the
     // canonical `take a fresh guard inside an await_*` shape per
     // `vm::execution::fault_script`.
-    let openfile = {
-        use StepOutcome as V3;
-        let guard = step_engine::guard();
-        let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let outcome = step_open(
-            rooted_at,
-            path,
-            OpenFileFlags {
-                read: true,
-                write: false,
-                append: false,
-                cloexec: false,
-                nonblocking: false,
-                packet: false,
-            },
-            0,
-            cred,
-            &guard,
-        );
-        let result = match outcome {
-            V3::Done(file) => Ok(file),
-            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => {
-                EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
-                Err(ExecError::from_walker_errno(Errno::from(err)))
-            }
-        };
-        drop(guard);
-        result?
+    let (rooted_at, origin_mount) = if path.starts_with(b"/") {
+        (
+            mount_namespace.root_dentry(),
+            mount_namespace.root().clone(),
+        )
+    } else {
+        let cwd = process.cwd_binding().ok_or(ExecError::PathNotFound)?;
+        (cwd.dentry, cwd.mount)
     };
-
-    // Snapshot the file's `Cap<PageContainer>` once. The exec image's
-    // PageContainer lives behind the resolved RNode's
-    // `RNodeBacking::PageBacked { pc }` (tmpfs's regular files use
-    // `PageContainerKind::Anon { Reclaimable }` per pre-ELF Phase 3b;
-    // ext4 will plug in a `PageContainerKind::File { mount, fs_object_id }`
-    // shape via a future `materialise_rnode` hook). Other backings —
-    // directories, symlinks (chased by the walker, never terminal
-    // here), TTY struct-payloads, projection rows — are not
-    // executable.
-    let file_pc = match openfile.rnode().backing() {
-        RNodeBacking::PageBacked { pc } => pc.clone(),
-        _ => return Err(ExecError::NotExecutable),
-    };
+    let main_candidate = open_executable_candidate(
+        rooted_at,
+        &origin_mount,
+        path,
+        cred,
+        &mount_namespace,
+        ExecutableCandidateRole::Main,
+    )?;
+    let openfile = main_candidate.file;
+    let file_pc = main_candidate.pc;
     let file_size = file_pc.size_bytes();
 
     // ----- Phase 1 (cont) — execute-bit authorisation ----------------
@@ -447,334 +932,95 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // callers, otherwise the standard owner/group/other triplet on the
     // X bits. Closes LTP `execve02` (non-root cannot execute a 0o600
     // root-owned binary) and the EACCES sub-cases of `execve03`.
-    let exec_meta = openfile.rnode().meta();
-    check_exec_perm(&exec_meta, cred)?;
+    let exec_meta = main_candidate.meta;
+    let main_mount = main_candidate.mount;
 
-    // Refuse to exec a directory (EACCES).
-    if exec_meta.kind() == InodeKind::Directory {
-        return Err(ExecError::PermissionDenied);
-    }
-
-    // ===== Phase 2 — read header + program headers ===================
+    // ===== Phase 2 — bounded script/ELF-kind probe ===================
     //
-    // `txdoc:EXEC-8-3-PARSE-AND-VALIDATE`. One bounded targeted read
-    // over the file's PageContainer. `read_exact_at` enforces the
-    // short-read contract (EOF before fill → `Errno::ENOEXEC`). The
-    // window covers ELF64 header (64 B) + the parser's MAX_PHDRS=64
-    // worth of program headers (≈ 3.6 KiB), comfortably within one
-    // 4 KiB page.
-    let read_len = core::cmp::min(file_size as usize, INITIAL_PARSE_READ);
+    // This prefix is consumed only by Phase 2.5's script rules. ELF header,
+    // phdr and PT_INTERP reads are performed in declared-offset stages below.
+    let read_len = usize::try_from(file_size.min(BINPRM_BUF_SIZE as u64))
+        .map_err(|_| ExecError::NotExecutable)?;
     if read_len == 0 {
         return Err(ExecError::NotExecutable);
     }
-    let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
+    let mut header_bytes = try_zeroed_exec_bytes(read_len)?;
     {
         use StepOutcome as V3;
         let guard = step_engine::guard();
         let outcome = read_exact_at(&file_pc, 0, &mut header_bytes, &guard);
         let result = match outcome {
             V3::Done(()) => Ok(()),
-            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
+            V3::Continue { .. } => Err(ExecError::Retry),
+            V3::Yield { shape, .. } => Err(ExecError::Deferred(shape)),
             V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
         };
         drop(guard);
         result?;
     }
 
-    // ===== Phase 2.5 — shebang (#!) + no-shebang script dispatch =====
-    //
-    // If the file starts with "#!" treat it as a script: parse the
-    // interpreter path (and optional single argument) from the first
-    // line, then re-invoke exec_script with the interpreter as the new
-    // target.  Mirrors Linux binfmt_script.  One level of recursion is
-    // sufficient (the interpreter itself must be a real ELF binary).
-    //
-    // If the file does NOT start with "#!" AND does NOT start with the
-    // ELF magic `0x7f 'E' 'L' 'F'`, treat it as a `/bin/sh` script.
-    // Linux's kernel doesn't do this — it returns -ENOEXEC and lets the
-    // shell decide whether to interpret the file as a script. busybox
-    // ash's ENOEXEC fallback only fires for files whose first character
-    // looks "script-like"; oscomp's `run-static.sh` / `run-dynamic.sh`
-    // begin with `./runtest.exe …` (no shebang) and ash gives up,
-    // leaving libctest's 220 tests at 0/220 even though the scripts
-    // are perfectly valid shell. Kernel-side fallback to `/bin/sh`
-    // matches what every userspace shell *would* do if it dared, and
-    // unblocks libctest end-to-end. (cf. STATUS.md 2026-05-18 — top
-    // of the high-stakes table.)
-    let is_shebang = header_bytes.starts_with(b"#!");
+    // ===== Phase 2.5 — executable-kind confirmation =================
+    // Valid shebang redirects are resolved by the bounded outer loop. A
+    // plain non-ELF file returns ENOEXEC; userspace shells own fallback.
     let is_elf = header_bytes.len() >= 4 && &header_bytes[..4] == b"\x7fELF";
-    if is_shebang {
-        if let Some((interp, opt_arg)) = shebang_parse(&header_bytes) {
-            EXEC_SHEBANG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let (interp_path, new_argv) = shebang_exec_argv(interp, opt_arg, path, argv);
-            let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
-            return alloc::boxed::Box::pin(exec_script_inner::<P>(
-                depth + 1,
-                process,
-                thread,
-                &interp_path,
-                &new_argv_refs,
-                envp,
-                cred,
-            ))
-            .await;
-        }
-    } else if !is_elf {
-        // No `#!` and no ELF magic — synthesize `/bin/sh <path> [argv…]`.
-        // Depth guard: don't recurse forever if `/bin/sh` itself is
-        // somehow a non-ELF / non-shebang file (the recursion limit
-        // upstream caps this; we lean on `depth + 1 < MAX_DEPTH`).
-        const DEFAULT_SHELL: &[u8] = b"/bin/sh";
-        let mut new_argv: Vec<Vec<u8>> = Vec::new();
-        new_argv.push(DEFAULT_SHELL.to_vec());
-        new_argv.push(path.to_vec());
-        for &a in argv.iter().skip(1) {
-            new_argv.push(a.to_vec());
-        }
-        let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
-        return alloc::boxed::Box::pin(exec_script_inner::<P>(
-            depth + 1,
-            process,
-            thread,
-            DEFAULT_SHELL,
-            &new_argv_refs,
-            envp,
-            cred,
-        ))
-        .await;
+    if !is_elf {
+        return Err(ExecError::NotExecutable);
     }
     if read_len < 64 {
         return Err(ExecError::NotExecutable);
     }
 
-    // ===== Phase 3 — parse + validate (pure CPU) =====================
+    // ===== Phase 3 — staged read + parse + validate ==================
     //
-    // `txdoc:EXEC-8-3-PARSE-AND-VALIDATE`. Goblin-backed parser owns
-    // every header and program-header check (class / data / version /
-    // arch / type / no PT_INTERP / no PT_DYNAMIC / phdr-table fits /
-    // congruence / overlap / W^X).  If the file does not look like a
-    // valid ELF and has no shebang, fall back to `/bin/sh` so that
-    // scripts without a `#!` line (e.g. OSComp libctest's run-static.sh
-    // / run-dynamic.sh) still execute.
-    let mut parsed: ExecImagePlan = match parse_image_plan(&header_bytes) {
-        Ok(plan) => plan,
-        Err(_parse_err) => {
-            if !is_elf && depth < SHEBANG_MAX_DEPTH {
-                let interp_path: Vec<u8> = b"/bin/sh".to_vec();
-                let mut new_argv: Vec<Vec<u8>> = Vec::new();
-                new_argv.push(interp_path.clone());
-                new_argv.push(path.to_vec());
-                for &a in argv.iter().skip(1) {
-                    new_argv.push(a.to_vec());
-                }
-                let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
-                return alloc::boxed::Box::pin(exec_script_inner::<P>(
-                    depth + 1,
-                    process,
-                    thread,
-                    &interp_path,
-                    &new_argv_refs,
-                    envp,
-                    cred,
-                ))
-                .await;
-            }
-            return Err(ExecError::NotExecutable);
-        }
-    };
-
-    // ASLR: for ET_DYN images, shift the fixed load_bias by a
-    // random offset.  ET_EXEC binaries (load_bias == 0) are not
-    // randomised — they use absolute virtual addresses.
-    let aslr_delta: i64 = if parsed.load_bias != 0 {
-        let new_bias = randomize_et_dyn_base();
-        let delta = (new_bias as i64) - (parsed.load_bias as i64);
-        parsed.load_bias = new_bias;
-        delta
-    } else {
-        0
-    };
-    // Apply delta to entry, at_phdr, and all LOAD segment vaddrs.
-    parsed.entry = (parsed.entry as i64 + aslr_delta) as u64;
-    parsed.at_phdr = (parsed.at_phdr as i64 + aslr_delta) as u64;
-    for seg in &mut parsed.load_segments {
-        seg.vaddr = (seg.vaddr as i64 + aslr_delta) as u64;
-    }
+    // The loader reads exactly the 64-byte header, then the bounded phdr
+    // table at e_phoff, then an optional bounded PT_INTERP string. All reads
+    // use the platform's architecture and USER_TOP policy and occur pre-PoNR.
+    let parsed: ExecImagePlan =
+        read_elf_image::<P>(&file_pc, ImageRole::Main).map_err(ExecError::from_image_read_error)?;
 
     // ===== Phase 3b — load interpreter (if PT_INTERP present) =========
     //
-    // When the main binary carries PT_INTERP, open and parse the
-    // interpreter ELF.  The interpreter is loaded above the main
-    // binary at a fixed high address (INTERP_LOAD_BIAS).
-    let interp_data: Option<(
-        InterpreterPlan,
-        Cap<tx_subsystems::page_backed::PageContainer>,
-    )> = if let Some(ref interp_path) = parsed.interpreter_path {
-        let interp_file = {
-            use StepOutcome as V3;
-            let guard = step_engine::guard();
-            let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-            let interp_root = exec_root_for_path(&rooted_at, interp_path);
-            let mut outcome = step_open(
-                interp_root.clone(),
+    // When the main binary carries PT_INTERP, open and parse the interpreter
+    // ELF. `select_combined_layout` later chooses non-overlapping page-aligned
+    // main/interpreter/stack/vDSO ranges, randomizing movable placements; the
+    // interpreter is rebased with checked load-bias arithmetic.
+    let interp_unlaid: Option<(ExecImagePlan, Cap<PageContainer>)> =
+        if let Some(ref interp_path) = parsed.interpreter_path {
+            debug_assert!(interp_path.starts_with(b"/"));
+            let rooted_at = mount_namespace.root_dentry();
+            let interp_candidate = open_executable_candidate(
+                rooted_at,
+                mount_namespace.root(),
                 interp_path,
-                OpenFileFlags {
-                    read: true,
-                    write: false,
-                    append: false,
-                    cloexec: false,
-                    nonblocking: false,
-                    packet: false,
-                },
-                0,
                 cred,
-                &guard,
-            );
-            // When the sdcard is mounted at /musl (OSComp layout),
-            // PT_INTERP paths like /lib/ld-musl-riscv64.so.1 don't
-            // resolve at the tmpfs root.  Retry with a /musl prefix
-            // so the walker crosses from tmpfs into ext4.
-            if matches!(outcome, V3::Err(_)) && interp_path.starts_with(b"/") {
-                let mut musl_path = alloc::vec::Vec::with_capacity(5 + interp_path.len());
-                musl_path.extend_from_slice(b"/musl");
-                musl_path.extend_from_slice(interp_path);
-                let musl_root = exec_root_for_path(&rooted_at, &musl_path);
-                outcome = step_open(
-                    musl_root,
-                    &musl_path,
-                    OpenFileFlags {
-                        read: true,
-                        write: false,
-                        append: false,
-                        cloexec: false,
-                        nonblocking: false,
-                        packet: false,
-                    },
-                    0,
-                    cred,
-                    &guard,
-                );
-            }
-            // The glibc OSComp images ship the dynamic linker under
-            // /musl/glibc/lib/<basename> while PT_INTERP names the
-            // Linux path (/lib/ld-linux-riscv64-lp64d.so.1 on rv64,
-            // /lib64/ld-linux-loongarch-lp64d.so.1 on la64).
-            if matches!(outcome, V3::Err(_))
-                && interp_path
-                    .windows(b"ld-linux".len())
-                    .any(|window| window == b"ld-linux")
-            {
-                let basename = interp_path
-                    .rsplit(|&b| b == b'/')
-                    .next()
-                    .map(|b| b.to_vec())
-                    .unwrap_or_else(|| interp_path.to_vec());
-                let mut glibc_path = alloc::vec::Vec::with_capacity(
-                    b"/musl/glibc/lib/".len() + basename.len(),
-                );
-                glibc_path.extend_from_slice(b"/musl/glibc/lib/");
-                glibc_path.extend_from_slice(&basename);
-                let glibc_root = exec_root_for_path(&rooted_at, &glibc_path);
-                outcome = step_open(
-                    glibc_root,
-                    &glibc_path,
-                    OpenFileFlags {
-                        read: true,
-                        write: false,
-                        append: false,
-                        cloexec: false,
-                        nonblocking: false,
-                        packet: false,
-                    },
-                    0,
-                    cred,
-                    &guard,
-                );
-            }
-            // The musl OSComp images ship the dynamic linker as
-            // /musl/musl/lib/libc.so, while PT_INTERP names the Linux
-            // compatibility path (/lib*/ld-musl-*.so.1). Try the
-            // shipped location before giving up.
-            if matches!(outcome, V3::Err(_))
-                && interp_path
-                    .windows(b"ld-musl".len())
-                    .any(|window| window == b"ld-musl")
-            {
-                let libc_path = b"/musl/musl/lib/libc.so";
-                let libc_root = exec_root_for_path(&rooted_at, libc_path);
-                outcome = step_open(
-                    libc_root,
-                    libc_path,
-                    OpenFileFlags {
-                        read: true,
-                        write: false,
-                        append: false,
-                        cloexec: false,
-                        nonblocking: false,
-                        packet: false,
-                    },
-                    0,
-                    cred,
-                    &guard,
-                );
-            }
-            match outcome {
-                V3::Done(file) => file,
-                V3::Err(_) => return Err(ExecError::IoError),
-                _ => return Err(ExecError::Busy),
-            }
+                &mount_namespace,
+                ExecutableCandidateRole::Interpreter,
+            )?;
+            let interp_pc = interp_candidate.pc;
+            let interp_parsed = read_elf_image::<P>(&interp_pc, ImageRole::Interpreter)
+                .map_err(ExecError::from_interpreter_image_read_error)?;
+            Some((interp_parsed, interp_pc))
+        } else {
+            None
         };
-        // Extract PageContainer from the interpreter file's RNode.
-        let interp_pc: Cap<PageContainer> = match interp_file.rnode().backing() {
-            RNodeBacking::PageBacked { pc } => pc.clone(),
-            _ => return Err(ExecError::NotExecutable),
-        };
-        // Read interpreter ELF header + program headers.
-        let mut interp_hdr = [0u8; 4096];
-        let guard = step_engine::guard();
-        let outcome = read_exact_at(&interp_pc, 0, &mut interp_hdr, &guard);
-        match outcome {
-            StepOutcome::Done(()) => {}
-            _ => return Err(ExecError::IoError),
-        }
-        let interp_parsed = parse_image_plan(&interp_hdr).map_err(ExecError::from_parse_error)?;
-        let mut interp_segs: Vec<ParsedLoadSegment> = Vec::new();
-        let interp_lowest_vaddr = interp_parsed
-            .load_segments
-            .iter()
-            .map(|s| s.vaddr)
-            .min()
-            .unwrap_or(0);
-        // Fixed high address for the interpreter.
 
-        let interp_load_delta = randomize_interp_base() - interp_lowest_vaddr;
-        let interp_runtime_load_bias = interp_parsed
-            .load_bias
-            .checked_add(interp_load_delta)
-            .ok_or(ExecError::NotExecutable)?;
-        for seg in &interp_parsed.load_segments {
-            interp_segs.push(ParsedLoadSegment {
-                vaddr: seg.vaddr + interp_load_delta,
-                memsz: seg.memsz,
-                filesz: seg.filesz,
-                file_offset: seg.file_offset,
-                flags: seg.flags,
-                align: seg.align,
-            });
-        }
-        Some((
-            InterpreterPlan {
-                load_bias: interp_runtime_load_bias,
-                entry: interp_parsed.entry + interp_load_delta,
-                load_segments: interp_segs,
-                bss_extension: interp_parsed.bss_extension,
-                executable_stack: interp_parsed.executable_stack,
-            },
-            interp_pc,
-        ))
-    } else {
-        None
+    // Select the complete main/interpreter/stack/vDSO layout once, before any
+    // detached-AS recipes are created. Each image is rebased atomically and
+    // with its own maximum LOAD alignment.
+    let (interp_plan, interp_pc) = match interp_unlaid {
+        Some((plan, pc)) => (Some(plan), Some(pc)),
+        None => (None, None),
     };
+    let layout = select_combined_layout(parsed, interp_plan, P::USER_TOP.0 as u64, random_u64)
+        .map_err(ExecError::Layout)?;
+    let CombinedImageLayout {
+        main: parsed,
+        interpreter,
+        stack_top,
+        vdso_layout,
+        ..
+    } = layout;
+    let interp_data = interpreter.zip(interp_pc);
 
     // Compose the brk base from the image plan: the page-rounded end
     // of the highest LOAD segment's memory footprint. Linux's
@@ -788,15 +1034,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`.
     // Per Open Q #2 (DECIDED 2026-05-06): the cred recompute lands
     // BETWEEN parse (Phase 3) and `build_aspace` (Phase 4). Cred
-    // mutation is reversible (the helper returns `previous_cred` so a
-    // caller could roll back via `step_setresuid` / `step_setresgid`
-    // if a later pre-PoNR phase fails). Production exec_script does
-    // not roll back — Linux's exec failure modes between Phase 3.5 and
-    // Phase 6's `replace_aspace` PoNR leave the new cred installed
-    // (see the slice plan's risk #5: `replace_aspace` is documented
-    // infallible, so the only failure modes here are `OutOfMemory` /
-    // `Busy` from Phase 4-5, which are equivalent to fork-then-fail
-    // and not user-observable per LTP).
+    // mutation stays reversible: the helper signs a fresh `Cap<Cred>`
+    // but does not publish it. Any later pre-PoNR error drops that cap;
+    // Phase 7 consumes it in one infallible slot swap.
     //
     // The recompute MUST run before Phase 5's auxv build so the
     // `AT_SECURE` slot reflects the post-recompute effective-id delta.
@@ -804,26 +1044,32 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // nosuid mount check: if the file resides on a mount with the
     // `NOSUID` flag, skip S_ISUID/S_ISGID processing and keep the
     // caller's credentials.  `AT_SECURE` is not set.
-    let mount_nosuid = openfile
-        .rnode()
-        .containing_mount_weak()
-        .and_then(|w| {
-            let guard = step_engine::guard();
-            w.upgrade(&guard)
-        })
-        .is_some_and(|mp| mp.options.flags.contains(MountFlags::NOSUID));
+    let mount_nosuid = main_mount.flags().contains(MountFlags::NOSUID);
 
-    let at_secure = if mount_nosuid {
-        false
+    let setid_policy = if mount_nosuid {
+        ExecSetidPolicy::Suppress
     } else {
-        let exec_outcome = step_apply_suid_for_exec(
-            process,
-            Uid(exec_meta.uid),
-            Gid(exec_meta.gid),
-            exec_meta.mode,
-        );
-        exec_outcome.is_some_and(|o| o.at_secure)
+        ExecSetidPolicy::Apply
     };
+    let process_prep = ProcessExecPrep::begin(process, thread).map_err(|error| match error {
+        tx_subsystems::process::ExecPrepError::Again => ExecError::Again,
+        tx_subsystems::process::ExecPrepError::OutOfMemory => ExecError::OutOfMemory,
+        tx_subsystems::process::ExecPrepError::Zombie
+        | tx_subsystems::process::ExecPrepError::StaleBinding => ExecError::Again,
+    })?;
+    let mut prepared_exec_cred = prepare_exec_cred_in(
+        process_prep,
+        Uid(exec_meta.uid),
+        Gid(exec_meta.gid),
+        exec_meta.mode,
+        setid_policy,
+    )
+    .map_err(|error| match error {
+        Errno::ENOMEM => ExecError::OutOfMemory,
+        Errno::EAGAIN => ExecError::Again,
+        _ => ExecError::InvalidArgument,
+    })?;
+    let at_secure = prepared_exec_cred.at_secure();
 
     // ===== Phase 4 — build detached AddressSpace =====================
     //
@@ -836,9 +1082,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // of the same file).
     let interp_exec_stack = interp_data
         .as_ref()
-        .is_some_and(|(i, _)| i.executable_stack);
-    let stack_top = randomize_stack_top();
-    let image_plan = build_vm_image_plan(&parsed, interp_exec_stack, stack_top, &file_pc);
+        .is_some_and(|(i, _)| i.stack.executable_requested);
+    let image_plan = build_vm_image_plan(&parsed, interp_exec_stack, stack_top, &file_pc)?;
     // V1 (`build_aspace_from_image`) takes no `&Guard` — it acquires
     // its own per-call guards internally. Per
     // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` callers must NOT
@@ -848,92 +1093,12 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
 
     // ===== Phase 4a.2 — register interpreter LOAD segments =========
     //
-    // The interpreter's PageContainer-backed LOAD segments are
-    // registered as additional VmEntry recipes in the detached
-    // aspace, alongside the main binary's entries.  Overlap with the
-    // main binary's segments was validated in Phase 4a.1.
+    // The interpreter uses the same VM registration primitive as the main
+    // image, after the combined layout pass has proven all final ranges.
     if let Some((ref interp, ref interp_pc)) = interp_data {
-        for seg in &interp.load_segments {
-            let prot = if seg.flags.writable {
-                if seg.flags.executable {
-                    Prot::new(true, true, true)
-                } else {
-                    Prot::READ_WRITE
-                }
-            } else if seg.flags.executable {
-                Prot::READ_EXECUTE
-            } else {
-                Prot::READ
-            };
-
-            let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
-            let page_delta = seg.vaddr % page_size;
-            let map_start = seg.vaddr - page_delta;
-            let file_page_offset = seg
-                .file_offset
-                .checked_sub(page_delta)
-                .ok_or(ExecError::NotExecutable)?;
-            let file_end = seg
-                .vaddr
-                .checked_add(seg.filesz)
-                .ok_or(ExecError::NotExecutable)?;
-            let mem_end = seg
-                .vaddr
-                .checked_add(seg.memsz)
-                .ok_or(ExecError::NotExecutable)?;
-            let file_end_rounded = page_round_up(file_end).ok_or(ExecError::NotExecutable)?;
-            let mem_end_rounded = page_round_up(mem_end).ok_or(ExecError::NotExecutable)?;
-            let file_part_end = if mem_end > file_end {
-                (file_end & !(page_size - 1)).max(map_start)
-            } else {
-                file_end_rounded.min(mem_end_rounded)
-            };
-
-            if file_part_end > map_start {
-                let seg_range = match vm_scripts::align_range(map_start, file_part_end - map_start)
-                {
-                    Some(r) => r,
-                    None => return Err(ExecError::NotExecutable),
-                };
-                let entry = VmEntry::new(
-                    seg_range,
-                    prot,
-                    VmEntryFlags::PRIVATE,
-                    VmBacking::Page {
-                        pc: interp_pc.clone().into(),
-                        offset: file_page_offset,
-                    },
-                );
-                match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
-                    MapReserveResult::Reserved(r) => {
-                        r.commit().map_err(|_| ExecError::OutOfMemory)?;
-                    }
-                    MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
-                    MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
-                }
-            }
-
-            if mem_end_rounded > file_part_end {
-                let seg_range =
-                    match vm_scripts::align_range(file_part_end, mem_end_rounded - file_part_end) {
-                        Some(r) => r,
-                        None => return Err(ExecError::NotExecutable),
-                    };
-                let entry = VmEntry::new(
-                    seg_range,
-                    prot,
-                    VmEntryFlags::PRIVATE,
-                    VmBacking::PrivateAnon,
-                );
-                match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
-                    MapReserveResult::Reserved(r) => {
-                        r.commit().map_err(|_| ExecError::OutOfMemory)?;
-                    }
-                    MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
-                    MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
-                }
-            }
-        }
+        let interpreter_vm_plan = build_vm_image_plan(interp, false, stack_top, interp_pc)?;
+        vm_scripts::register_image_load_segments(&new_aspace, &interpreter_vm_plan)
+            .map_err(ExecError::from_build_aspace_error)?;
     }
 
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
@@ -994,14 +1159,15 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             .file_offset
             .checked_add(partial_start - segment.vaddr)
             .ok_or(ExecError::NotExecutable)?;
-        let mut buf = alloc::vec![0u8; partial_in_page as usize];
+        let mut buf = try_zeroed_exec_bytes(partial_in_page as usize)?;
         {
             use StepOutcome as V3;
             let guard = step_engine::guard();
             match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
                 V3::Done(()) => {}
-                V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                V3::Err(_) => return Err(ExecError::NotExecutable),
+                V3::Continue { .. } => return Err(ExecError::Retry),
+                V3::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
+                V3::Err(err) => return Err(ExecError::from_read_errno(err.into())),
             }
         }
         match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
@@ -1009,7 +1175,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             StepOutcome::Err(err) => {
                 return Err(ExecError::from_populate_errno(err.into()));
             }
-            _ => return Err(ExecError::Busy),
+            StepOutcome::Continue { .. } => return Err(ExecError::Retry),
+            StepOutcome::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
         }
     }
     if let Some((ref interp, ref interp_pc)) = interp_data {
@@ -1031,14 +1198,15 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 .file_offset
                 .checked_add(partial_start - segment.vaddr)
                 .ok_or(ExecError::NotExecutable)?;
-            let mut buf = alloc::vec![0u8; partial_in_page as usize];
+            let mut buf = try_zeroed_exec_bytes(partial_in_page as usize)?;
             {
                 use StepOutcome as V3;
                 let guard = step_engine::guard();
                 match read_exact_at(interp_pc, file_off, &mut buf, &guard) {
                     V3::Done(()) => {}
-                    V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                    V3::Err(_) => return Err(ExecError::NotExecutable),
+                    V3::Continue { .. } => return Err(ExecError::Retry),
+                    V3::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
+                    V3::Err(err) => return Err(ExecError::from_read_errno(err.into())),
                 }
             }
             match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
@@ -1046,10 +1214,20 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 StepOutcome::Err(err) => {
                     return Err(ExecError::from_populate_errno(err.into()));
                 }
-                _ => return Err(ExecError::Busy),
+                StepOutcome::Continue { .. } => return Err(ExecError::Retry),
+                StepOutcome::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
             }
         }
     }
+
+    // ===== Phase 4b — map optional vDSO/VVAR before exec PoNR =========
+    //
+    // The mapping commits its recipes and PTEs as one reversible detached-AS
+    // operation. A target without an image returns None; a mapping failure
+    // exits before auxv construction and before address-space publication.
+    let vdso_mapping =
+        map_vdso_into_aspace(&new_aspace, vdso_layout).map_err(ExecError::from_vdso_map_error)?;
+    validate_vdso_mapping(vdso_mapping, vdso_layout).map_err(ExecError::Layout)?;
 
     // ===== Phase 5 — compose + populate user stack ===================
     //
@@ -1062,9 +1240,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // auxv stack image. `process.cred()` returns `None` only for a
     // zombie target; the exec front-end keeps us alive through this
     // point, so the `Cred::root()` fallback is purely defensive.
-    let cred = process
-        .cred()
-        .unwrap_or_else(tx_subsystems::cred::Cred::root);
+    let aux_cred = *prepared_exec_cred.credential();
 
     // CSPRNG chore (chore/csprng-at-random): pull 16 bytes from
     // the platform's `EntropyIf` impl (RV64: rdtime + xorshift
@@ -1091,10 +1267,10 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         // its own load bias in AT_BASE to relocate and hand off.
         at_base: interp_aux.map(|(base, _)| base).unwrap_or(0),
         at_entry: parsed.entry,
-        at_uid: cred.uid.raw() as u64,
-        at_euid: cred.euid.raw() as u64,
-        at_gid: cred.gid.raw() as u64,
-        at_egid: cred.egid.raw() as u64,
+        at_uid: aux_cred.uid.raw() as u64,
+        at_euid: aux_cred.euid.raw() as u64,
+        at_gid: aux_cred.gid.raw() as u64,
+        at_egid: aux_cred.egid.raw() as u64,
         // Wave 4 Part 5: post-Phase-3.5 effective-id delta. `1` when
         // the binary's S_ISUID bit changed the effective uid, or its
         // S_ISGID-with-group-X bit changed the effective gid. Per Q5
@@ -1105,15 +1281,30 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         at_random_bytes,
         at_hwcap: arch.hwcap,
         at_hwcap2: arch.hwcap2,
-        at_platform: None,
-        platform_string: arch.platform.as_bytes(),
+        platform_string: match P::ARCH {
+            Arch::Riscv64 => b"riscv64",
+            Arch::LoongArch64 => b"loongarch64",
+        },
         at_clktck: super::stack::CLKTCK_VALUE,
-        at_execfn: None,
-        execfn_string: b"",
+        execfn_string: execfn,
         at_flags: 0,
-        at_sysinfo_ehdr: None,
+        at_sysinfo_ehdr: vdso_auxv(vdso_mapping),
+        user_top: P::USER_TOP.0 as u64,
     };
-    let stack_image = build_initial_user_stack(stack_top, argv, envp, &auxv_facts);
+    let stack_image = build_initial_user_stack(stack_top, argv, envp, &auxv_facts).map_err(
+        |error| match error {
+            StackBuildError::OutOfMemory => ExecError::OutOfMemory,
+            StackBuildError::InvalidLayout => ExecError::NotExecutable,
+            StackBuildError::InvalidString => ExecError::InvalidArgument,
+        },
+    )?;
+    let argv0 = argv.first().copied().unwrap_or(b"");
+    let cmdline_bytes = try_copy_exec_bytes(argv0)?;
+    let committed_exe_file = openfile.opendir_dentry();
+    let process_group_label = {
+        let pgrp = process.pgrp_cap();
+        (pgrp.pgid.0, pgrp.session_cap().sid.0)
+    };
 
     // V2 (`populate_detached_user_range`) also acquires its own
     // guards internally; same discipline as V1.
@@ -1128,8 +1319,23 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         StepOutcome::Err(err) => {
             return Err(ExecError::from_populate_errno(err.into()));
         }
-        _ => return Err(ExecError::Busy),
+        StepOutcome::Continue { .. } => return Err(ExecError::Retry),
+        StepOutcome::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
     }
+
+    // All CLOEXEC scanning, vector growth, and capability retention must happen
+    // before sibling collapse and before PoNR. The final commit revalidates this
+    // exact snapshot under the fd-table locks immediately before the AS swap.
+    let close_plan = prepared_exec_cred
+        .process_prep_mut()
+        .prepare_cloexec_close()
+        .map_err(|error| match error {
+            tx_subsystems::process::ExecPrepError::OutOfMemory => ExecError::OutOfMemory,
+            tx_subsystems::process::ExecPrepError::Again
+            | tx_subsystems::process::ExecPrepError::Zombie
+            | tx_subsystems::process::ExecPrepError::StaleBinding => ExecError::Again,
+        })?;
+    let thread_payload = thread.payload_cap().ok_or(ExecError::Again)?;
 
     // ----- Phase 5 (cont) — collapse old-AS work -------------------
     //
@@ -1137,16 +1343,32 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // the old thread group must be reduced to the calling thread after
     // all reversible preparation has succeeded and before the address
     // space replacement becomes visible.
-    let _collapsed = process.collapse_threads_for_exec(thread);
+    prepared_exec_cred
+        .process_prep_mut()
+        .collapse_threads(thread)
+        .map_err(|error| match error {
+            tx_subsystems::process::ExecPrepError::Zombie => ExecError::Again,
+            tx_subsystems::process::ExecPrepError::Again
+            | tx_subsystems::process::ExecPrepError::StaleBinding => ExecError::Again,
+            tx_subsystems::process::ExecPrepError::OutOfMemory => ExecError::OutOfMemory,
+        })?;
+    prepared_exec_cred
+        .process_prep_mut()
+        .validate_commit_ready()
+        .map_err(|_| ExecError::Again)?;
 
     // ===== Phase 6 — address-space visibility boundary ===============
     //
     // `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
     //
-    // EXEC-PONR begins here. Two atomic stores, both infallible:
+    // The checked address-space swap below may still return before mutation if
+    // the authoritative process binding is stale. A successful swap begins
+    // EXEC-PONR. No recoverable error path follows; an internal lifecycle-
+    // invariant violation after the swap is fatal.
     //
-    //   1. `process.replace_aspace(new_aspace)` — exchanges the
-    //      `AtomicSlot<Cap<AddressSpace>>` and returns the previous
+    //   1. `process.replace_aspace_and_close_cloexec(...)` validates the
+    //      preallocated close plan, exchanges the `AtomicSlot<Cap<AddressSpace>>`,
+    //      removes only the prevalidated fds, and returns the previous
     //      `Cap` for EBR-deferred drop. The new aspace is observable
     //      to every concurrent fault / VM lookup the moment this
     //      store completes; the previous aspace's `Drop` runs after
@@ -1161,13 +1383,13 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     //      `txdoc:THREAD-5-1-STATE-PLACEMENT`) and resumes via
     //      `enter_userspace_with_context`.
     //
-    // Past this point the function performs only Phase-7 commits
-    // (Wave 2 helpers, all infallible). No `?`, no `.await`, no
-    // fallible call — the EXEC-PONR invariant is encoded in the
-    // function's structure: every `?`-bearing or async call lives
-    // in phases 1-5; phases 6-7 are a straight-line block of
-    // synchronous, infallible operations.
-    let _previous_aspace = process.replace_aspace(new_aspace);
+    // Past a successful swap the function performs only Phase-7 commits. The
+    // `?` below is therefore still on the reversible side of the boundary;
+    // after it there is no recoverable error path.
+    let _previous_aspace = prepared_exec_cred
+        .process_prep_mut()
+        .replace_aspace_and_close_cloexec(new_aspace, close_plan)
+        .map_err(|_| ExecError::Again)?;
     // `_previous_aspace` drops at end of scope; EBR defers reclamation
     // so any concurrent reader on another hart can finish its
     // observation of the old aspace before its memory is reused.
@@ -1175,21 +1397,18 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let entry_pc = interp_aux.map(|(_, entry)| entry).unwrap_or(parsed.entry) as usize;
     let initial_sp = stack_image.initial_sp as usize;
     let user_ctx = make_initial_user_trap_context(P::ARCH, entry_pc, initial_sp);
-    if let Some(payload) = thread.payload_cap() {
-        payload.store_saved_user_context(Some(user_ctx));
-    }
+    thread_payload.store_saved_user_context(Some(user_ctx));
 
     // ===== Phase 7 — install per-frame replacements ==================
     //
     // `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT` (handled by Phase 6
-    // above), `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC`,
+    // above), `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC` (prepared before
+    // PoNR and committed atomically with the Phase-6 AS swap),
     // `txdoc:EXEC-12-3-RESET-SIGNAL-DISPOSITIONS`,
-    // `txdoc:EXEC-12-4-INSTALL-BRK`. All Wave 2 helpers; all infallible
-    // synchronous. Order is documented but immaterial — each commit
-    // touches a disjoint slot.
-    step_close_cloexec_fds(process);
-    step_reset_signal_dispositions_for_exec(process);
-    step_install_brk_for_exec(process, new_brk_base);
+    // `txdoc:EXEC-12-4-INSTALL-BRK`. The remaining post-swap operations are
+    // infallible synchronous commits. Order is documented but immaterial —
+    // each commit touches a disjoint slot.
+    drive_exec_post_commit_ops(process, new_brk_base);
     // Store executable reference, cmdline, AND comm for procfs and
     // observation (§EXEC_v1 §3.7). The PCB short name (`comm`) is the
     // basename of argv[0] truncated to 15 bytes + NUL — Linux
@@ -1200,10 +1419,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // shows e.g. `busybox` / `basic_exec` instead of `pid-<N>`).
     let mut committed_comm: Option<[u8; 16]> = None;
     if let Some(payload) = process.payload_slot().lock().as_ref() {
-        if let Some(dentry) = openfile.opendir_dentry() {
-            *payload._exe_file.lock() = Some(dentry.clone());
-        }
-        let argv0 = argv.first().copied().unwrap_or(b"");
+        *payload._exe_file.lock() = committed_exe_file;
         // basename(argv[0]) — strip everything up to the last `/`.
         let comm_src = match argv0.iter().rposition(|&b| b == b'/') {
             Some(i) => &argv0[i + 1..],
@@ -1213,7 +1429,6 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         let n = core::cmp::min(comm_src.len(), 15);
         comm_buf[..n].copy_from_slice(&comm_src[..n]);
         *payload._comm.lock() = comm_buf;
-        let cmdline_bytes = argv0.to_vec();
         *payload._cmdline.lock() = Some(cmdline_bytes);
         committed_comm = Some(comm_buf);
     }
@@ -1226,13 +1441,13 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // lock acquisition flat and short.
     if let Some(comm_buf) = committed_comm {
         emit_process_label_for(process.pid.0, &comm_buf);
-        let pgrp = process.pgrp_cap();
-        let sid = pgrp.session_cap().sid.0;
-        emit_process_group_for(process.pid.0, pgrp.pgid.0, sid);
+        emit_process_group_for(process.pid.0, process_group_label.0, process_group_label.1);
     }
+    let _cred_outcome = commit_prepared_exec_cred(prepared_exec_cred)
+        .expect("checked address-space swap preserves the authoritative exec binding");
     // vfork completion: if the parent is waiting on CLONE_VFORK,
     // unblock it now that exec has completed.
-    process.fire_exit_source(Mask::from_bits(1));
+    process.fire_exit_source_with_post(1, |mailbox, event| mailbox.post(event));
 
     // ===== Phase 8 — userspace re-entry ==============================
     //
@@ -1244,6 +1459,21 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // `Ok(())` as "exec committed; do NOT write a syscall return for
     // this thread."
     Ok(())
+}
+
+fn drive_exec_post_commit_ops(process: &Cap<ProcessIdentity>, new_brk_base: u64) {
+    let mut script_ctx = step_engine::ScriptCtx::<ProcessIdentity>::new();
+
+    let mut signal_op = ResetSignalDispositionsForExecOp { process };
+    step_engine::drive_oneshot(&mut signal_op, &mut script_ctx)
+        .expect("exec post-commit ResetSignalDispositionsForExecOp is infallible");
+
+    let mut brk_op = InstallBrkForExecOp {
+        process,
+        new_brk_base,
+    };
+    step_engine::drive_oneshot(&mut brk_op, &mut script_ctx)
+        .expect("exec post-commit InstallBrkForExecOp is infallible");
 }
 
 /// Compose a fresh `UserTrapContext` for the new image's first
@@ -1283,39 +1513,41 @@ const fn translate_flags(parsed: ParsedSegmentFlags) -> VmSegmentFlags {
     }
 }
 
-/// Bridge `parse_image_plan`'s view (no PageContainer) to the
+/// Bridge the ELF image plan's view to the
 /// vm-scripts view (LOAD segments carry the file's `Cap<PageContainer>`).
 fn build_vm_image_plan(
     parsed: &ExecImagePlan,
     interp_exec_stack: bool,
     stack_top: u64,
     file_pc: &Cap<PageContainer>,
-) -> VmImagePlan {
-    let load_segments: alloc::vec::Vec<VmLoadSegment> = parsed
-        .load_segments
-        .iter()
-        .map(|seg: &ParsedLoadSegment| VmLoadSegment {
+) -> Result<VmImagePlan, ExecError> {
+    let mut load_segments = Vec::new();
+    load_segments
+        .try_reserve_exact(parsed.load_segments.len())
+        .map_err(|_| ExecError::OutOfMemory)?;
+    for seg in &parsed.load_segments {
+        load_segments.push(VmLoadSegment {
             vaddr: seg.vaddr,
             memsz: seg.memsz,
             filesz: seg.filesz,
             file_offset: seg.file_offset,
             flags: translate_flags(seg.flags),
             backing: file_pc.clone(),
-        })
-        .collect();
+        });
+    }
 
     let bss_extension = parsed.bss_extension.map(|tail| VmBssTail {
         vaddr: tail.vaddr,
         size: tail.size,
     });
 
-    VmImagePlan {
+    Ok(VmImagePlan {
         entry: parsed.entry,
         stack_top,
         load_segments,
         bss_extension,
-        executable_stack: parsed.executable_stack || interp_exec_stack,
-    }
+        executable_stack: parsed.stack.executable_requested || interp_exec_stack,
+    })
 }
 
 /// Compute the page-rounded brk base from the parsed LOAD segments.
@@ -1343,6 +1575,15 @@ fn compute_brk_base(load_segments: &[ParsedLoadSegment]) -> Result<u64, ExecErro
     page_round_up(highest).ok_or(ExecError::NotExecutable)
 }
 
+/// Return the exact interpreter path declared by `PT_INTERP`.
+///
+/// Image compatibility belongs in rootfs symlinks or an explicit filesystem
+/// adapter, not in ELF semantics.
+#[cfg(test)]
+fn interpreter_lookup_paths(interp_path: &[u8]) -> Vec<Vec<u8>> {
+    alloc::vec![interp_path.to_vec()]
+}
+
 /// Round `value` up to the next multiple of `USER_PAGE_SIZE`. Returns
 /// `None` on overflow.
 const fn page_round_up(value: u64) -> Option<u64> {
@@ -1350,6 +1591,27 @@ const fn page_round_up(value: u64) -> Option<u64> {
     match value.checked_add(mask) {
         Some(rounded) => Some(rounded & !mask),
         None => None,
+    }
+}
+
+fn poll_ready_synchronously<F: core::future::Future>(future: F) -> Option<F::Output> {
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: the vtable above never dereferences the data pointer.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut pinned = pin!(future);
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => Some(value),
+        Poll::Pending => None,
     }
 }
 
@@ -1416,7 +1678,11 @@ fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F::Output {
 fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError> {
     let mode = meta.mode as u32;
     if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
-        return Ok(());
+        return if mode & 0o111 != 0 {
+            Ok(())
+        } else {
+            Err(ExecError::PermissionDenied)
+        };
     }
     let bits = if cred.uid == meta.uid {
         (mode >> 6) & 0o7
@@ -1429,6 +1695,71 @@ fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError>
         return Err(ExecError::PermissionDenied);
     }
     Ok(())
+}
+
+fn open_executable_candidate(
+    rooted_at: Cap<DEntry>,
+    origin_mount: &Cap<tx_subsystems::mount::MountIdentity>,
+    path: &[u8],
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    role: ExecutableCandidateRole,
+) -> Result<ExecutableCandidate, ExecError> {
+    use StepOutcome as V3;
+
+    let guard = step_engine::guard();
+    let outcome = step_open_in_mount_namespace_with_origin_mount(
+        rooted_at,
+        origin_mount,
+        path,
+        OpenFileFlags {
+            read: false,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+        0,
+        cred,
+        mount_namespace,
+        &guard,
+    );
+    let opened = match outcome {
+        V3::Done(opened) => opened,
+        V3::Continue { .. } => return Err(ExecError::Retry),
+        V3::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
+        V3::Err(err) => {
+            EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
+            return Err(ExecError::from_walker_errno(Errno::from(err)));
+        }
+    };
+    drop(guard);
+
+    if opened.mount.flags().contains(MountFlags::NOEXEC) {
+        return Err(ExecError::PermissionDenied);
+    }
+    let file = opened.open_file;
+
+    let meta = file.rnode().meta();
+    check_exec_perm(&meta, cred)?;
+    if meta.kind() == InodeKind::Directory {
+        return Err(ExecError::PermissionDenied);
+    }
+    if meta.kind() != InodeKind::Regular {
+        return Err(role.invalid_image());
+    }
+    let pc = match file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        _ => return Err(role.invalid_image()),
+    };
+
+    Ok(ExecutableCandidate {
+        file,
+        pc,
+        meta,
+        mount: opened.mount,
+    })
 }
 
 // Note: the original plan sketched `Result<core::convert::Infallible,
@@ -1445,37 +1776,43 @@ fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError>
 /// Returns `(interpreter_path, optional_arg)` slices into `header`, or
 /// `None` if the line is malformed (empty interpreter path).
 ///
-/// Format: `#! <whitespace>? <interp> <whitespace> <opt_arg>? <newline>`
-/// Only the first argument after the interpreter is captured (Linux
-/// binfmt_script passes at most one optional argument).
+/// Format: `#! <whitespace>? <interp> <whitespace> <opt_arg>? <newline>`.
+/// Linux passes the entire trimmed text after the interpreter as one optional
+/// argument. If the 256-byte probe ends before a terminator, only a possibly
+/// truncated interpreter token makes the line invalid; optional text may be
+/// truncated at the probe boundary.
 fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
     debug_assert!(header.starts_with(b"#!"));
-    let line_end = header[2..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map(|i| i + 2)
-        .unwrap_or(header.len());
-    let line = shebang_trim_start(&header[2..line_end]);
+    let window = &header[..header.len().min(BINPRM_BUF_SIZE)];
+    let after_marker = window.get(2..)?;
+    let terminator = after_marker.iter().position(|&b| b == b'\n' || b == b'\0');
+
+    if terminator.is_none() && window.len() == BINPRM_BUF_SIZE {
+        let interpreter = shebang_trim_start(after_marker);
+        if !interpreter.iter().any(|&b| b == b' ' || b == b'\t') {
+            return None;
+        }
+    }
+
+    let line_end = terminator.unwrap_or_else(|| {
+        if window.len() == BINPRM_BUF_SIZE {
+            // Linux reserves buf[BINPRM_BUF_SIZE - 1] as the forced NUL
+            // terminator when no newline was found in the probe.
+            after_marker.len() - 1
+        } else {
+            after_marker.len()
+        }
+    });
+    let line = shebang_trim_start(shebang_trim_end(&after_marker[..line_end]));
     if line.is_empty() {
         return None;
     }
     let (interp, rest) = shebang_split_word(line);
-    let interp = shebang_trim_end(interp);
     if interp.is_empty() {
         return None;
     }
-    let rest = shebang_trim_start(rest);
-    let opt_arg = if rest.is_empty() {
-        None
-    } else {
-        let (arg, _) = shebang_split_word(rest);
-        let arg = shebang_trim_end(arg);
-        if arg.is_empty() {
-            None
-        } else {
-            Some(arg)
-        }
-    };
+    let rest = shebang_trim_end(shebang_trim_start(rest));
+    let opt_arg = if rest.is_empty() { None } else { Some(rest) };
     Some((interp, opt_arg))
 }
 
@@ -1493,11 +1830,15 @@ fn shebang_exec_argv(
     opt_arg: Option<&[u8]>,
     script_path: &[u8],
     original_argv: &[&[u8]],
-) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let mut interp_path = interp.to_vec();
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), ExecError> {
+    let normalized_interp = if interp == b"/bin/busybox" {
+        b"/bin/sh".as_slice()
+    } else {
+        interp
+    };
+    let interp_path = try_copy_exec_bytes(normalized_interp)?;
     let mut opt_arg = opt_arg;
     if interp == b"/bin/busybox" {
-        interp_path = b"/bin/sh".to_vec();
         if matches!(opt_arg, Some(b"sh" | b"ash")) {
             opt_arg = None;
         }
@@ -1505,16 +1846,21 @@ fn shebang_exec_argv(
 
     // Linux binfmt_script shape: [interp, opt_arg?, script_path,
     // original argv[1..]...].
+    let item_count = 2usize
+        .checked_add(usize::from(opt_arg.is_some()))
+        .and_then(|count| count.checked_add(original_argv.len().saturating_sub(1)))
+        .ok_or(ExecError::OutOfMemory)?;
     let mut new_argv: Vec<Vec<u8>> = Vec::new();
-    new_argv.push(interp_path.clone());
+    try_reserve_exec_items(&mut new_argv, item_count)?;
+    new_argv.push(try_copy_exec_bytes(&interp_path)?);
     if let Some(arg) = opt_arg {
-        new_argv.push(arg.to_vec());
+        new_argv.push(try_copy_exec_bytes(arg)?);
     }
-    new_argv.push(script_path.to_vec());
+    new_argv.push(try_copy_exec_bytes(script_path)?);
     for &a in original_argv.iter().skip(1) {
-        new_argv.push(a.to_vec());
+        new_argv.push(try_copy_exec_bytes(a)?);
     }
-    (interp_path, new_argv)
+    Ok((interp_path, new_argv))
 }
 
 fn shebang_trim_start(s: &[u8]) -> &[u8] {
@@ -1528,7 +1874,7 @@ fn shebang_trim_start(s: &[u8]) -> &[u8] {
 fn shebang_trim_end(s: &[u8]) -> &[u8] {
     let i = s
         .iter()
-        .rposition(|&b| b != b' ' && b != b'\t' && b != b'\r')
+        .rposition(|&b| b != b' ' && b != b'\t')
         .map(|i| i + 1)
         .unwrap_or(0);
     &s[..i]

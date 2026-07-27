@@ -468,7 +468,7 @@ async fn fault_script(
         };
 
         // Phase: observe recipes under epoch guard (within reservation).
-        let epoch_guard = epoch::pin();
+        let epoch_guard = epoch::guard();
         let recipe_ref = match ctx.aspace.recipes.range_containing(va, &epoch_guard) {
             Some(r) => r,
             None => return Err(SigInfo::sigsegv(va)),

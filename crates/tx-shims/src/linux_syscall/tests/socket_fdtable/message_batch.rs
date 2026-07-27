@@ -209,7 +209,7 @@ fn dispatch_recvmsg_empty_socket_is_interrupted_by_due_itimer() {
         SyscallResult::Return(0)
     );
     for _ in 0..1_100 {
-        let _ = <ShimsTestPmap as tx_hal::TimeIf>::read_ns();
+        let _ = <ShimsTestPmap as tx_hal::MonotonicCounterIf>::read_ns();
     }
 
     let mut out = [0u8; 8];
@@ -941,10 +941,21 @@ fn dispatch_ping_socket_sendto_recvfrom_loopback_echo_reply() {
         events: TEST_POLLIN,
         revents: -1,
     };
+    let zero_timeout = TestTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     assert_eq!(
         socket_req(
             NR_PPOLL,
-            [(&mut pollfd as *mut TestPollfd) as u64, 1, 0, 0, 0, 0,],
+            [
+                (&mut pollfd as *mut TestPollfd) as u64,
+                1,
+                (&zero_timeout as *const TestTimespec) as u64,
+                0,
+                0,
+                0,
+            ],
             &ctx,
         ),
         SyscallResult::Return(0)
@@ -1040,7 +1051,14 @@ fn dispatch_ping_socket_sendto_recvfrom_loopback_echo_reply() {
     assert_eq!(
         socket_req(
             NR_PPOLL,
-            [(&mut pollfd as *mut TestPollfd) as u64, 1, 0, 0, 0, 0,],
+            [
+                (&mut pollfd as *mut TestPollfd) as u64,
+                1,
+                (&zero_timeout as *const TestTimespec) as u64,
+                0,
+                0,
+                0,
+            ],
             &ctx,
         ),
         SyscallResult::Return(0)

@@ -22,7 +22,7 @@ use page_allocator::ZeroPolicy;
 fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     let owned = match reserve_frame_with_reclaim(ZeroPolicy::Zeroed) {
         Ok(reservation) => reservation.commit(),
-        Err(_) => return StepOutcome::err(Errno::EBUSY.into()),
+        Err(_) => return StepOutcome::err(Errno::EBUSY),
     };
     let ppn = owned.ppn();
 
@@ -34,7 +34,7 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     {
         let dst = match page_allocator::frame_kernel_addr(ppn) {
             Ok(ptr) => ptr,
-            Err(_) => return StepOutcome::err(Errno::EIO.into()),
+            Err(_) => return StepOutcome::err(Errno::EIO),
         };
         // SAFETY: `dst` is the kernel direct-map VA of a freshly
         // allocated frame we own through `owned`. `page` is a
@@ -107,11 +107,11 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            return StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
@@ -119,7 +119,7 @@ where
         if let Err(err) =
             self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
         {
-            return StepOutcome::err(err.into());
+            return StepOutcome::err(err);
         }
 
         materialize_frame(&page)
@@ -132,21 +132,24 @@ where
         frame: &Frame,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        if !self.legacy_writeback_enabled() {
+            return StepOutcome::err(Errno::ENOSYS.into());
+        }
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            return StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
         if let Err(err) = read_frame_bytes(frame, &mut page) {
-            return StepOutcome::err(err.into());
+            return StepOutcome::err(err);
         }
         match self.with_pager(|pager| pager.write_page(inode, file_page_index, &page)) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -158,11 +161,11 @@ where
     ) -> StepOutcome<(), NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         match self.with_pager(|pager| pager.set_inode_size(inode, new_size)) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -171,6 +174,9 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        if !self.legacy_writeback_enabled() {
+            return StepOutcome::err(Errno::ENOSYS.into());
+        }
         StepOutcome::done(())
     }
 

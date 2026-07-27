@@ -17,8 +17,8 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::page_allocator;
     pub use tx_substrate::step::{
-        AcceptOutcome, AgentCancelPolicy, ByteProgress, Deadline, DelegateEndpoint,
-        DelegateRequest, DelegateToken, DriveMode, Errno, InterestMask, NoProgress,
+        drive_oneshot, AcceptOutcome, AgentCancelPolicy, ByteProgress, Deadline, DelegateEndpoint,
+        DelegateRequest, DelegateToken, DriveMode, Errno, InterestMask, NoProgress, OneShotStepOp,
         ProcessIdentity, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
         SubjectAuthority, SubjectContext, SubjectIdentity, TimerId, Translation, WaitSourceId,
         YieldShape,
@@ -38,12 +38,25 @@ pub mod step_engine {
     reason = "expose substrate wake primitives (TaskMailbox, ActiveWait, MailboxEvent) for drive() reactor integration"
 )]
 pub mod wake {
-    pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+    pub use tx_substrate::wake::deadline::TimerToken;
+    pub use tx_substrate::wake::mailbox::MailboxPollAction;
     pub use tx_substrate::wake::wait_source::{
-        lookup_source, register_source, unregister_source, WaitSource,
+        lookup_source, register_source, unregister_source, SubscriberId, WaitSource,
     };
     pub use tx_substrate::wake::{
         agent_event_matches, ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration,
+    };
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "registered_wait",
+    apis = ["bus", "wake"],
+    reason = "expose registered RawQueue and RawPort mailbox waits to the central drive loop"
+)]
+pub mod registered_wait {
+    pub use tx_subsystems::wait_source::{
+        install_registered_mailbox_wait, RegisteredMailboxSubscription, RegisteredMailboxWait,
     };
 }
 

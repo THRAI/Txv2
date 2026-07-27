@@ -629,7 +629,9 @@ fn net_delegate_queue_registers_rawqueue_and_wakes_on_poll() {
     assert!(crate::wait_source::lookup_wait_queue(token.source_id()).is_some());
     assert_eq!(token.interest(), bits.bits());
 
-    let mut future = crate::wait_source::wait_on_token(token).expect("delegate wait future");
+    let mut future =
+        crate::wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
+            .expect("delegate wait future");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -723,7 +725,7 @@ fn socket_readiness_carriers_visible_to_substrate_registry() {
     )
     .expect("tcp socket");
 
-    use crate::adapter::step_engine::wake;
+    use tx_substrate::wake;
 
     for (name, id) in [
         ("recv", socket.wait_carriers.recv),

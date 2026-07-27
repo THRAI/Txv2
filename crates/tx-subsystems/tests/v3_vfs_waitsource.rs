@@ -1,10 +1,7 @@
-//! PR-3D-5 (D2/D4): per-RNode `read_wait_source` /
-//! `write_wait_source` integration tests — the **last** mechanical bus
-//! consumer landing.
+//! PR-3D-5: per-RNode `read_endpoint` / `write_endpoint` integration tests.
 //!
-//! Pin the new task-mailbox-based wake path that runs in parallel with
-//! the legacy `Channel`+`Waker` path on per-inode read/write
-//! readiness. Unlike pipe (one payload — two sources) / futex (one
+//! Pin the task-mailbox-based wake path for per-inode read/write readiness.
+//! Unlike pipe (one payload — two sources) / futex (one
 //! registry — 256 buckets) / exit_source (one process — one source) /
 //! tty (one identity — one source), VFS is the **per-inode unbounded
 //! count** consumer: an RNode mints two sources (read + write) the
@@ -12,7 +9,7 @@
 //! on retirement.
 //!
 //! VFS wake-key model: one `Arc<WaitSource>` per direction
-//! (`read_wait_source` / `write_wait_source`) per `RNode`. The bits
+//! (`read_endpoint` / `write_endpoint`) per `RNode`. The bits
 //! `VFS_READABLE` (0x1) and `VFS_WRITABLE` (0x2) live in their own
 //! per-direction source so a subscriber interested only in readability
 //! sees no spurious writable-side posts and vice versa. This is
@@ -32,31 +29,30 @@
 //!    `WaitSource::id()` of the RNode's `read_wait_source` /
 //!    `write_wait_source` each matches the `u64` returned by
 //!    `RNode::read_wait_source_id()` / `write_wait_source_id()` (the
-//!    `u64` the legacy `wait_source` resolver published). PR-3D-5's
+//!    `u64` the compatibility `wait_source` resolver published). PR-3D-5's
 //!    "same id namespace" pin, applied per-direction. Read and write
 //!    ids are distinct so v3 callers can park on the right direction
 //!    without collision.
-//! 2. **blocked-reader-woken-on-fire_read_wait**. A subscriber
+//! 2. **blocked-reader-woken-on-read-wait publication**. A subscriber
 //!    registers a `TaskMailbox` against the RNode's
 //!    `read_wait_source` while no fire has happened; a subsequent
-//!    `fire_read_wait(VFS_READABLE)` posts exactly one
+//!    `fire_read_wait_with_post(VFS_READABLE, post)` posts exactly one
 //!    `MailboxEvent::SourceFired` with the registration's generation
 //!    and the `VFS_READABLE` interest.
-//! 3. **blocked-writer-woken-on-fire_write_wait**. Symmetric: writer
+//! 3. **blocked-writer-woken-on-write-wait publication**. Symmetric: writer
 //!    registers against `write_wait_source` and observes its post.
-//! 4. **D2-coexistence: legacy `Channel` fires alongside `WaitSource`**.
-//!    A `Channel.wait` future parked on the legacy `read_wait_channel`
-//!    keeps firing on `fire_read_wait` alongside the new path. If D2
-//!    coexistence regresses, one of the two consumers parks forever.
-//! 5. **direction-isolation**. `fire_read_wait` must NOT post to a
+//! 4. **endpoint-wait-resolves-on-publication**. A future created through
+//!    `wait_on_endpoint(rnode.read_endpoint(), VFS_READABLE)` parks before
+//!    publication and resolves after the read wait source fires.
+//! 5. **direction-isolation**. Read-wait publication must NOT post to a
 //!    subscriber registered against the writer source, and vice versa.
 //!    This is the "two independent sources, one per direction" pin —
 //!    without it a poll/select on POLLOUT would spuriously fire on
 //!    every byte-arrival.
 //! 6. **drop-cleanup-retires-registry-slots**. When the last
-//!    `Cap<RNode>` drops and EBR retires the slot, the legacy
+//!    `Cap<RNode>` drops and EBR retires the slot, the compatibility
 //!    `wait_source` registry stops resolving the per-inode ids
-//!    (`lookup_wait_channel` returns `None`). Subscribers cloning the
+//!    (`lookup_wait_source` returns `None`). Subscribers cloning the
 //!    `Arc<WaitSource>` before retirement still hold the strong ref
 //!    and observe no spurious posts, matching the exit_source /
 //!    pipe / tty templates.
@@ -66,26 +62,32 @@
 //! 8. **large-N-inode-create-destroy-no-arc-leak**. The crux of the
 //!    per-inode unbounded-count flag: minting and immediately dropping
 //!    N inodes back-to-back must release N pairs of registry slots,
-//!    so a later `lookup_wait_channel` on any of those ids returns
+//!    so a later `lookup_wait_source` on any of those ids returns
 //!    `None`. Without `Drop for RNode` releasing the slots, the
 //!    `BTreeMap` would grow without bound.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 
 use tx_subsystems::vfs::adapter::step_engine::{Cap, InterestMask, WaitSourceId};
 use tx_subsystems::vfs::adapter::wait_routing::{
-    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource,
 };
 
+use tx_substrate::wake::{WaitGeneration, WaitRegistrationGuard};
 use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking, VFS_READABLE, VFS_WRITABLE,
 };
-use tx_subsystems::wait_source as legacy_wait_source;
+use tx_subsystems::wait_source;
 use tx_subsystems::zones;
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static VFS_REF_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -143,15 +145,79 @@ fn assert_source_fired_for(
     }
 }
 
+fn counting_vfs_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    VFS_REF_POST_COUNT.fetch_add(1, Ordering::SeqCst);
+    mailbox.post_with_scheduler_hint(event, hint)
+}
+
+fn direct_vfs_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    mailbox.post_with_scheduler_hint(event, hint)
+}
+
+#[test]
+fn vfs_rnode_fire_wait_uses_injected_mailbox_ref_post() {
+    let _setup = setup();
+    VFS_REF_POST_COUNT.store(0, Ordering::SeqCst);
+
+    let rnode = make_rnode(9101);
+    let read_id = rnode.read_wait_source_id();
+    let write_id = rnode.write_wait_source_id();
+    let read_source: Arc<WaitSource> = rnode.read_wait_source().clone();
+    let write_source: Arc<WaitSource> = rnode.write_wait_source().clone();
+    let reader_mb = Arc::new(TaskMailbox::new());
+    let writer_mb = Arc::new(TaskMailbox::new());
+    let (_reader_guard, reader_gen) = register(&read_source, &reader_mb, VFS_READABLE);
+    let (_writer_guard, writer_gen) = register(&write_source, &writer_mb, VFS_WRITABLE);
+
+    let _ = rnode.fire_read_wait_with_post(VFS_READABLE, counting_vfs_ref_post_with_hint);
+    let _ = rnode.fire_write_wait_with_post(VFS_WRITABLE, counting_vfs_ref_post_with_hint);
+
+    assert_eq!(
+        VFS_REF_POST_COUNT.load(Ordering::SeqCst),
+        2,
+        "RNode read/write waits should route through injected mailbox-ref post"
+    );
+    assert_source_fired_for(
+        &reader_mb,
+        WaitSourceId::new(read_id),
+        reader_gen,
+        VFS_READABLE,
+    );
+    assert_source_fired_for(
+        &writer_mb,
+        WaitSourceId::new(write_id),
+        writer_gen,
+        VFS_WRITABLE,
+    );
+    assert!(reader_mb.is_empty(), "only one read event should be posted");
+    assert!(
+        writer_mb.is_empty(),
+        "only one write event should be posted"
+    );
+
+    drop(_reader_guard);
+    drop(_writer_guard);
+    drop(rnode);
+    tx_test_support::drain_to_quiescence();
+}
+
 #[test]
 fn vfs_rnode_wait_sources_are_allocated_lazily() {
     let _setup = setup();
-    let baseline = legacy_wait_source::registered_wait_source_count();
+    let baseline = wait_source::registered_wait_source_count();
     {
         let rnode = make_rnode(9001);
         tx_test_support::drain_to_quiescence();
         assert_eq!(
-            legacy_wait_source::registered_wait_source_count(),
+            wait_source::registered_wait_source_count(),
             baseline,
             "plain RNode construction must not allocate global wait-source rows",
         );
@@ -160,22 +226,22 @@ fn vfs_rnode_wait_sources_are_allocated_lazily() {
         let write_id = rnode.write_wait_source_id();
         assert_ne!(read_id, write_id);
         assert!(
-            legacy_wait_source::lookup_wait_channel(read_id).is_some(),
+            wait_source::lookup_wait_source(read_id).is_some(),
             "first readiness accessor registers the read carrier",
         );
         assert!(
-            legacy_wait_source::lookup_wait_channel(write_id).is_some(),
+            wait_source::lookup_wait_source(write_id).is_some(),
             "first readiness accessor registers the write carrier",
         );
         assert_eq!(
-            legacy_wait_source::registered_wait_source_count(),
+            wait_source::registered_wait_source_count(),
             baseline + 2,
             "one RNode readiness endpoint owns exactly two registry rows",
         );
     }
     tx_test_support::drain_to_quiescence();
     assert_eq!(
-        legacy_wait_source::registered_wait_source_count(),
+        wait_source::registered_wait_source_count(),
         baseline,
         "dropping a lazily-initialized RNode releases its readiness rows",
     );
@@ -200,58 +266,47 @@ fn vfs_wait_source_invariants_round_trip() {
         read_id, write_id,
         "read and write directions must mint distinct registry slots",
     );
-    let read_source: Arc<WaitSource> = rnode.read_wait_source().clone();
-    let write_source: Arc<WaitSource> = rnode.write_wait_source().clone();
+    let read_endpoint = rnode.read_endpoint();
+    let write_endpoint = rnode.write_endpoint();
+    let read_source: Arc<WaitSource> = read_endpoint.clone();
+    let write_source: Arc<WaitSource> = write_endpoint.clone();
     assert_eq!(
         read_source.id(),
         WaitSourceId::new(read_id),
         "read_wait_source.id() must match read_wait_source_id (same u64 namespace)",
     );
     assert_eq!(
+        tx_substrate::wake::WaitEndpoint::source_id(&read_endpoint),
+        WaitSourceId::new(read_id),
+        "read_endpoint source id must match read_wait_source_id",
+    );
+    assert_eq!(
         write_source.id(),
         WaitSourceId::new(write_id),
         "write_wait_source.id() must match write_wait_source_id (same u64 namespace)",
     );
+    assert_eq!(
+        tx_substrate::wake::WaitEndpoint::source_id(&write_endpoint),
+        WaitSourceId::new(write_id),
+        "write_endpoint source id must match write_wait_source_id",
+    );
 
-    // ---- (2) blocked-reader-woken-on-fire_read_wait ---------------
+    // ---- (2) blocked-reader-woken-on-read-wait publication --------
     let reader_mb = Arc::new(TaskMailbox::new());
     let (_reader_guard, reader_gen) = register(&read_source, &reader_mb, VFS_READABLE);
     assert!(reader_mb.is_empty(), "no events before any fire");
 
-    // ---- (4) D2-coexistence: drive a legacy `Channel.wait` future
-    // through Pending -> Ready across the same fire call.
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn no_op(_: *const ()) {}
-    fn waker_clone(_: *const ()) -> RawWaker {
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
-    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
-    // SAFETY: vtable functions are no-ops.
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-
-    let legacy_read_channel = legacy_wait_source::lookup_wait_channel(read_id)
-        .expect("legacy resolver still has the read carrier");
-    let mut legacy_read_wait = legacy_read_channel.wait(Mask::from_bits(VFS_READABLE));
-    let pre_legacy_read = Pin::new(&mut legacy_read_wait).poll(&mut cx);
+    // ---- (4) endpoint wait resolves on read-wait publication -------
+    let waker = core::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut endpoint_read_wait = wait_source::wait_on_endpoint(&read_endpoint, VFS_READABLE);
+    let pre_endpoint_read = Pin::new(&mut endpoint_read_wait).poll(&mut cx);
     assert!(
-        matches!(pre_legacy_read, Poll::Pending),
-        "no fires yet -> legacy read Pending"
+        matches!(pre_endpoint_read, Poll::Pending),
+        "no fires yet -> endpoint read wait Pending"
     );
 
-    let released = rnode.fire_read_wait(VFS_READABLE);
-    // Legacy Channel side returned non-zero because the legacy wait
-    // future above was parked. Production callers don't branch on
-    // this, but the test pins that the dual-fire happens on the
-    // observable Channel side.
-    assert!(
-        released >= 1,
-        "fire_read_wait must release the parked legacy Channel awaiter; got {released}",
-    );
+    rnode.fire_read_wait_with_post(VFS_READABLE, direct_vfs_ref_post_with_hint);
 
     // New path posted exactly one event with matching gen/source.
     assert_source_fired_for(
@@ -265,19 +320,21 @@ fn vfs_wait_source_invariants_round_trip() {
         "new path posts exactly one event per fire",
     );
 
-    // D2 coexistence: legacy `Channel.wait` future also resolves.
-    let post_legacy_read = Pin::new(&mut legacy_read_wait).poll(&mut cx);
+    let post_endpoint_read = Pin::new(&mut endpoint_read_wait).poll(&mut cx);
     assert!(
-        matches!(post_legacy_read, Poll::Ready(_)),
-        "legacy Channel.fire on fire_read_wait must release the parked awaiter",
+        matches!(post_endpoint_read, Poll::Ready(_)),
+        "read-wait publication must release the parked endpoint awaiter",
     );
 
-    // ---- (3) blocked-writer-woken-on-fire_write_wait --------------
+    // ---- (3) blocked-writer-woken-on-write-wait publication -------
     let writer_mb = Arc::new(TaskMailbox::new());
     let (_writer_guard, writer_gen) = register(&write_source, &writer_mb, VFS_WRITABLE);
-    assert!(writer_mb.is_empty(), "no events before fire_write_wait");
+    assert!(
+        writer_mb.is_empty(),
+        "no events before write-wait publication"
+    );
 
-    let _ = rnode.fire_write_wait(VFS_WRITABLE);
+    let _ = rnode.fire_write_wait_with_post(VFS_WRITABLE, direct_vfs_ref_post_with_hint);
     assert_source_fired_for(
         &writer_mb,
         WaitSourceId::new(write_id),
@@ -289,7 +346,7 @@ fn vfs_wait_source_invariants_round_trip() {
     // ---- (5) direction-isolation ----------------------------------
     // Fire the read side again — the writer mailbox must NOT receive
     // any event, even though both sources live on the same RNode.
-    let _ = rnode.fire_read_wait(VFS_READABLE);
+    let _ = rnode.fire_read_wait_with_post(VFS_READABLE, direct_vfs_ref_post_with_hint);
     // The reader mailbox sees the second event; the writer mailbox
     // sees nothing new.
     assert_source_fired_for(
@@ -300,11 +357,11 @@ fn vfs_wait_source_invariants_round_trip() {
     );
     assert!(
         writer_mb.is_empty(),
-        "fire_read_wait must NOT post to write_wait_source subscribers",
+        "read-wait publication must NOT post to write_wait_source subscribers",
     );
 
     // And vice versa: fire write_wait_source — reader mailbox empty.
-    let _ = rnode.fire_write_wait(VFS_WRITABLE);
+    let _ = rnode.fire_write_wait_with_post(VFS_WRITABLE, direct_vfs_ref_post_with_hint);
     assert_source_fired_for(
         &writer_mb,
         WaitSourceId::new(write_id),
@@ -313,17 +370,17 @@ fn vfs_wait_source_invariants_round_trip() {
     );
     assert!(
         reader_mb.is_empty(),
-        "fire_write_wait must NOT post to read_wait_source subscribers",
+        "write-wait publication must NOT post to read_wait_source subscribers",
     );
 
     // ---- (6) drop-cleanup-retires-registry-slots ------------------
-    // Pre-drop: legacy resolver returns Some for both ids.
+    // Pre-drop: compatibility resolver returns Some for both ids.
     assert!(
-        legacy_wait_source::lookup_wait_channel(read_id).is_some(),
+        wait_source::lookup_wait_source(read_id).is_some(),
         "live RNode keeps read slot registered"
     );
     assert!(
-        legacy_wait_source::lookup_wait_channel(write_id).is_some(),
+        wait_source::lookup_wait_source(write_id).is_some(),
         "live RNode keeps write slot registered"
     );
 
@@ -335,11 +392,11 @@ fn vfs_wait_source_invariants_round_trip() {
     tx_test_support::drain_to_quiescence();
 
     assert!(
-        legacy_wait_source::lookup_wait_channel(read_id).is_none(),
+        wait_source::lookup_wait_source(read_id).is_none(),
         "Drop for RNode must release the read carrier id",
     );
     assert!(
-        legacy_wait_source::lookup_wait_channel(write_id).is_none(),
+        wait_source::lookup_wait_source(write_id).is_none(),
         "Drop for RNode must release the write carrier id",
     );
 
@@ -372,11 +429,11 @@ fn vfs_wait_source_invariants_round_trip() {
         // Every minted id is currently resolvable.
         for (r, w) in &minted_ids {
             assert!(
-                legacy_wait_source::lookup_wait_channel(*r).is_some(),
+                wait_source::lookup_wait_source(*r).is_some(),
                 "live RNode read slot must resolve mid-stress"
             );
             assert!(
-                legacy_wait_source::lookup_wait_channel(*w).is_some(),
+                wait_source::lookup_wait_source(*w).is_some(),
                 "live RNode write slot must resolve mid-stress"
             );
         }
@@ -386,15 +443,15 @@ fn vfs_wait_source_invariants_round_trip() {
     tx_test_support::drain_to_quiescence();
 
     // Post-drop: every minted id is unresolvable. This is the no-leak
-    // proof — without `Drop for RNode` releasing the slots, the legacy
-    // registry would still hold all 2*N Channel clones.
+    // proof — without `Drop for RNode` releasing the slots, the registry
+    // would still hold all 2*N source clones.
     for (r, w) in &minted_ids {
         assert!(
-            legacy_wait_source::lookup_wait_channel(*r).is_none(),
+            wait_source::lookup_wait_source(*r).is_none(),
             "read slot {r} must be released after EBR retire",
         );
         assert!(
-            legacy_wait_source::lookup_wait_channel(*w).is_none(),
+            wait_source::lookup_wait_source(*w).is_none(),
             "write slot {w} must be released after EBR retire",
         );
     }

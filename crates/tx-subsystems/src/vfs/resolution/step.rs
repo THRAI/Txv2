@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::Guard;
-use crate::mount::{MountNamespace, MountPayload};
+use crate::mount::{MountIdentity, MountNamespace, MountPayload};
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_ISVTX,
@@ -24,8 +24,8 @@ use crate::vfs::walker::{self, SYMLOOP_MAX};
 use crate::vfs::FsOps;
 
 use super::state::{
-    FinalSymlinkPolicy, IORequest, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode,
-    WalkState, WalkingState,
+    try_clone_io_request, try_copy_path, try_join_path, FinalSymlinkPolicy, IORequest, KernelStep,
+    PathResolution, ResumeToken, WalkCause, WalkMode, WalkState, WalkingState,
 };
 use super::terminal;
 
@@ -62,13 +62,15 @@ pub fn kernel_step(
         remaining,
         mut hop_count,
         mount_root,
+        mut current_mount,
+        mount_root_mount,
         must_be_directory,
     } = walking;
 
     // --- extract next component / end of input ---
     let (component, remaining) = match take_next_component(remaining) {
-        Some(next) => next,
-        None => {
+        Ok(Some(next)) => next,
+        Ok(None) => {
             if must_be_directory && current.rnode().meta().kind() != InodeKind::Directory {
                 return KernelStep::Error(WalkCause::NotADirectory);
             }
@@ -80,12 +82,14 @@ pub fn kernel_step(
                 rnode,
                 fs_object_id,
                 meta,
+                mount: current_mount,
             };
             if terminal::accepts(&WalkState::Terminal(resolved.clone()), rules.mode) {
                 return KernelStep::Continue(WalkState::Terminal(resolved));
             }
             return KernelStep::Error(WalkCause::ComponentNotFound);
         }
+        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
     };
 
     // --- `.` and `..` ---
@@ -95,14 +99,24 @@ pub fn kernel_step(
             remaining,
             hop_count,
             mount_root,
+            current_mount,
+            mount_root_mount,
             must_be_directory,
         }));
     }
     if component == b".." {
-        if let Some(parent_cap) = current.parent_hint() {
-            let is_mount_root = walker::is_same_dentry(&current, &mount_root);
-            if !is_mount_root {
-                current = parent_cap;
+        if !walker::is_same_dentry(&current, &mount_root) {
+            let mount_parent = match mount_namespace {
+                Some(namespace) => namespace.dotdot_parent_for_mount_root(&current),
+                None => crate::mount::dotdot_parent_for_mount_root(&current),
+            };
+            if let Some(parent) = mount_parent {
+                current = parent;
+                current_mount = current_mount
+                    .as_ref()
+                    .and_then(|mount| mount.parent().cloned());
+            } else if let Some(parent) = current.parent_hint() {
+                current = parent;
             }
         }
         return KernelStep::Continue(WalkState::Walking(WalkingState {
@@ -110,6 +124,8 @@ pub fn kernel_step(
             remaining,
             hop_count,
             mount_root,
+            current_mount,
+            mount_root_mount,
             must_be_directory,
         }));
     }
@@ -158,10 +174,17 @@ pub fn kernel_step(
         let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
             StepOutcome::Done(id) => id,
             StepOutcome::Yield { .. } => {
-                let retry_remaining = remaining_with_component(&component, &remaining);
+                let retry_remaining = match remaining_with_component(&component, &remaining) {
+                    Ok(remaining) => remaining,
+                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                };
                 let request = IORequest::DirLookup {
                     fs_object_id: parent_fs_object_id,
-                    name: component.clone().into_boxed_slice(),
+                    name: component,
+                };
+                let resume_request = match try_clone_io_request(&request) {
+                    Ok(request) => request,
+                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
                 };
                 let token = ResumeToken {
                     walking: WalkingState {
@@ -169,9 +192,11 @@ pub fn kernel_step(
                         remaining: retry_remaining,
                         hop_count,
                         mount_root,
+                        current_mount,
+                        mount_root_mount,
                         must_be_directory,
                     },
-                    request: request.clone(),
+                    request: resume_request,
                     mount_namespace: None,
                     hop_count,
                 };
@@ -183,13 +208,18 @@ pub fn kernel_step(
                 )));
             }
             StepOutcome::Continue { .. } => {
-                let retry_remaining = remaining_with_component(&component, &remaining);
+                let retry_remaining = match remaining_with_component(&component, &remaining) {
+                    Ok(remaining) => remaining,
+                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                };
                 // Re-enter lookup (v3 continue without yield).
                 return KernelStep::Continue(WalkState::Walking(WalkingState {
                     current,
                     remaining: retry_remaining,
                     hop_count,
                     mount_root,
+                    current_mount,
+                    mount_root_mount,
                     must_be_directory,
                 }));
             }
@@ -198,18 +228,28 @@ pub fn kernel_step(
         if let Some(cached) =
             cached_child.filter(|c| c.rnode().fs_object_id() == child_fs_object_id)
         {
+            // FS agrees with the cached instance: keep the existing DEntry so
+            // its RNode/PageContainer identity survives the walk.
             let rnode = cached.rnode().clone();
             let meta = rnode.meta();
             (cached, rnode, child_fs_object_id, meta)
         } else {
             // Stale or absent cached instance: drop it and materialise fresh.
             current.remove_cached_child(child_inline);
+
             let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
                 StepOutcome::Done(m) => m,
                 StepOutcome::Yield { .. } => {
-                    let retry_remaining = remaining_with_component(&component, &remaining);
+                    let retry_remaining = match remaining_with_component(&component, &remaining) {
+                        Ok(remaining) => remaining,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                    };
                     let request = IORequest::LoadInodeMeta {
                         fs_object_id: child_fs_object_id,
+                    };
+                    let resume_request = match try_clone_io_request(&request) {
+                        Ok(request) => request,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
                     };
                     let token = ResumeToken {
                         walking: WalkingState {
@@ -217,9 +257,11 @@ pub fn kernel_step(
                             remaining: retry_remaining,
                             hop_count,
                             mount_root,
+                            current_mount,
+                            mount_root_mount,
                             must_be_directory,
                         },
-                        request: request.clone(),
+                        request: resume_request,
                         mount_namespace: None,
                         hop_count,
                     };
@@ -231,12 +273,17 @@ pub fn kernel_step(
                     ));
                 }
                 StepOutcome::Continue { .. } => {
-                    let retry_remaining = remaining_with_component(&component, &remaining);
+                    let retry_remaining = match remaining_with_component(&component, &remaining) {
+                        Ok(remaining) => remaining,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                    };
                     return KernelStep::Continue(WalkState::Walking(WalkingState {
                         current,
                         remaining: retry_remaining,
                         hop_count,
                         mount_root,
+                        current_mount,
+                        mount_root_mount,
                         must_be_directory,
                     }));
                 }
@@ -249,9 +296,14 @@ pub fn kernel_step(
                 mount_payload.as_ref(),
                 &WalkingState {
                     current: current.clone(),
-                    remaining: remaining_with_component(&component, &remaining),
+                    remaining: match remaining_with_component(&component, &remaining) {
+                        Ok(remaining) => remaining,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                    },
                     hop_count,
                     mount_root: mount_root.clone(),
+                    current_mount: current_mount.clone(),
+                    mount_root_mount: mount_root_mount.clone(),
                     must_be_directory,
                 },
                 guard,
@@ -276,7 +328,10 @@ pub fn kernel_step(
                     ));
                 }
             };
-            current.cache_child(child_dentry.clone());
+            let child_dentry = current.cache_child(child_dentry);
+            let child_rnode_cap = child_dentry.rnode().clone();
+            let child_fs_object_id = child_rnode_cap.fs_object_id();
+            let child_meta = child_rnode_cap.meta();
             (
                 child_dentry,
                 child_rnode_cap,
@@ -307,6 +362,7 @@ pub fn kernel_step(
                 rnode,
                 fs_object_id,
                 meta,
+                mount: current_mount,
             };
             return KernelStep::Continue(WalkState::Terminal(resolved));
         }
@@ -321,62 +377,48 @@ pub fn kernel_step(
         if hop_count > SYMLOOP_MAX {
             return KernelStep::Error(WalkCause::SymlinkLimit);
         }
-        let target_bytes = target.clone();
+        let target_bytes = target.as_ref();
         if target_bytes.first() == Some(&b'/') {
             // Absolute symlink: restart from mount_root.
-            let mut new_remaining = Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
-            new_remaining.extend_from_slice(&target_bytes[1..]);
-            if !remaining.is_empty() {
-                new_remaining.push(b'/');
-                new_remaining.extend_from_slice(&remaining);
-            }
+            let new_remaining = match try_join_path(&target_bytes[1..], &remaining) {
+                Ok(remaining) => remaining,
+                Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+            };
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current: mount_root.clone(),
                 remaining: new_remaining,
                 hop_count,
                 mount_root,
+                current_mount: mount_root_mount.clone(),
+                mount_root_mount,
                 must_be_directory,
             }));
         } else {
             // Relative symlink: prepend target to remaining.
-            let mut new_remaining = Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
-            new_remaining.extend_from_slice(&target_bytes);
-            if !remaining.is_empty() {
-                new_remaining.push(b'/');
-                new_remaining.extend_from_slice(&remaining);
-            }
+            let new_remaining = match try_join_path(target_bytes, &remaining) {
+                Ok(remaining) => remaining,
+                Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+            };
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current,
                 remaining: new_remaining,
                 hop_count,
                 mount_root,
+                current_mount,
+                mount_root_mount,
                 must_be_directory,
             }));
         }
     }
 
     // --- mount-point crossing ---
-    let crossing_mount = child_dentry.mounted_hint().and_then(|w| w.upgrade(guard));
-    let crossing_mount = match crossing_mount {
-        Some(m) => Some(m),
-        None => mount_payload.as_ref().and_then(|payload| {
-            // Prefer the process's mount namespace, but always fall back to
-            // the global mount table. Bind/move mounts register globally
-            // (`crate::mount::register_mount`), and the per-process namespace
-            // is currently unpopulated for them — so without this fallback a
-            // namespace-carrying walk (every `walk_from_process` caller, e.g.
-            // `sys_mount`) could not cross any bind mount, while plain
-            // `walk_from` (stat/open/ls) crossed it via the global table.
-            // That split made `mount`/`umount` on an already-mounted path
-            // fail (ENOENT/EINVAL) even though `ls` of the same path worked,
-            // breaking every nested/stacked fs_bind case. Falling back keeps
-            // both walk flavours consistent. (True per-namespace isolation is
-            // a follow-up that would register mounts into the namespace.)
-            mount_namespace
-                .and_then(|ns| ns.mount_for(payload, child_fs_object_id))
-                .or_else(|| crate::mount::mount_for(payload, child_fs_object_id))
-        }),
-    };
+    let crossing_mount = crossing_mount_for(
+        &child_dentry,
+        mount_payload.as_ref(),
+        mount_namespace,
+        child_fs_object_id,
+        guard,
+    );
     if let Some(mount_cap) = crossing_mount {
         let new_current = match walker::dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {
             Ok(d) => d,
@@ -387,6 +429,8 @@ pub fn kernel_step(
             remaining,
             hop_count,
             mount_root,
+            current_mount: Some(mount_cap),
+            mount_root_mount,
             must_be_directory,
         }));
     }
@@ -397,6 +441,8 @@ pub fn kernel_step(
         remaining,
         hop_count,
         mount_root,
+        current_mount,
+        mount_root_mount,
         must_be_directory,
     }))
 }
@@ -409,6 +455,29 @@ fn protected_symlink_follow_denied(
     let sticky_world_writable =
         (parent_meta.mode & S_ISVTX) != 0 && (parent_meta.mode & 0o002) != 0;
     sticky_world_writable && cred.uid != link_meta.uid && parent_meta.uid != link_meta.uid
+}
+
+/// Resolve a mount crossing without mixing namespace-local and legacy-global
+/// publication. A namespace-aware walk consults only that namespace's table;
+/// the DEntry hint and global table remain compatibility inputs for legacy
+/// walks that do not carry a namespace.
+fn crossing_mount_for(
+    child_dentry: &Cap<DEntry>,
+    mount_payload: Option<&Cap<MountPayload>>,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    child_fs_object_id: crate::vfs::FsObjectId,
+    guard: &Guard<'_>,
+) -> Option<Cap<MountIdentity>> {
+    if let Some(namespace) = mount_namespace {
+        return namespace.mount_for(child_dentry);
+    }
+
+    child_dentry
+        .mounted_hint()
+        .and_then(|weak| weak.upgrade(guard))
+        .or_else(|| {
+            mount_payload.and_then(|payload| crate::mount::mount_for(payload, child_fs_object_id))
+        })
 }
 
 pub(super) fn kernel_step_after_lookup_io(
@@ -435,21 +504,31 @@ pub(super) fn kernel_step_after_lookup_io(
     let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
         StepOutcome::Done(meta) => meta,
         StepOutcome::Yield { .. } => {
-            let retry_remaining = remaining_with_component(&pending.component, &pending.remaining);
+            let retry_remaining =
+                match remaining_with_component(&pending.component, &pending.remaining) {
+                    Ok(remaining) => remaining,
+                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                };
             let request = IORequest::LoadInodeMeta {
                 fs_object_id: child_fs_object_id,
             };
+            let resume_request = match try_clone_io_request(&request) {
+                Ok(request) => request,
+                Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+            };
             return KernelStep::NeedIO(
-                request.clone(),
+                request,
                 ResumeToken {
                     walking: WalkingState {
                         current: pending.current,
                         remaining: retry_remaining,
                         hop_count: pending.hop_count,
                         mount_root: pending.mount_root,
+                        current_mount: pending.current_mount,
+                        mount_root_mount: pending.mount_root_mount,
                         must_be_directory: pending.must_be_directory,
                     },
-                    request,
+                    request: resume_request,
                     mount_namespace: None,
                     hop_count: pending.hop_count,
                 },
@@ -461,11 +540,18 @@ pub(super) fn kernel_step_after_lookup_io(
             )));
         }
         StepOutcome::Continue { .. } => {
+            let retry_remaining =
+                match remaining_with_component(&pending.component, &pending.remaining) {
+                    Ok(remaining) => remaining,
+                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                };
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current: pending.current,
-                remaining: remaining_with_component(&pending.component, &pending.remaining),
+                remaining: retry_remaining,
                 hop_count: pending.hop_count,
                 mount_root: pending.mount_root,
+                current_mount: pending.current_mount,
+                mount_root_mount: pending.mount_root_mount,
                 must_be_directory: pending.must_be_directory,
             }));
         }
@@ -541,8 +627,6 @@ pub(super) fn kernel_step_after_readlink_io(
         pending,
         mount_payload,
         mount_namespace,
-        child_fs_object_id,
-        child_meta,
         child_rnode_cap,
         cred,
         rules,
@@ -554,8 +638,6 @@ pub(super) fn kernel_step_after_materialise_io(
     walking: WalkingState,
     mount_payload: Option<Cap<MountPayload>>,
     mount_namespace: Option<&Cap<MountNamespace>>,
-    child_fs_object_id: crate::vfs::FsObjectId,
-    child_meta: InodeMeta,
     child_rnode_cap: Cap<RNode>,
     cred: &Credential,
     rules: TerminalRules,
@@ -569,8 +651,6 @@ pub(super) fn kernel_step_after_materialise_io(
         pending,
         mount_payload,
         mount_namespace,
-        child_fs_object_id,
-        child_meta,
         child_rnode_cap,
         cred,
         rules,
@@ -585,6 +665,8 @@ struct PendingComponent {
     remaining: Vec<u8>,
     hop_count: u32,
     mount_root: Cap<DEntry>,
+    current_mount: Option<Cap<MountIdentity>>,
+    mount_root_mount: Option<Cap<MountIdentity>>,
     must_be_directory: bool,
 }
 
@@ -598,12 +680,16 @@ fn pending_component(
         remaining,
         hop_count,
         mount_root,
+        current_mount,
+        mount_root_mount,
         must_be_directory,
     } = walking;
 
-    let (component, remaining) = take_next_component(remaining).ok_or_else(|| {
-        KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EINVAL))
-    })?;
+    let (component, remaining) = take_next_component(remaining)
+        .map_err(|errno| KernelStep::Error(WalkCause::FsOpsRejected(errno)))?
+        .ok_or_else(|| {
+            KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EINVAL))
+        })?;
 
     if current.rnode().meta().kind() != InodeKind::Directory {
         return Err(KernelStep::Error(WalkCause::NotADirectory));
@@ -628,6 +714,8 @@ fn pending_component(
         remaining,
         hop_count,
         mount_root,
+        current_mount,
+        mount_root_mount,
         must_be_directory,
     })
 }
@@ -643,6 +731,10 @@ fn continue_after_child_meta(
     rules: TerminalRules,
     guard: &Guard<'_>,
 ) -> KernelStep {
+    let retry_remaining = match remaining_with_component(&pending.component, &pending.remaining) {
+        Ok(remaining) => remaining,
+        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+    };
     let child_rnode_cap = match materialise_child(
         fs_ops,
         child_fs_object_id,
@@ -650,9 +742,11 @@ fn continue_after_child_meta(
         mount_payload.as_ref(),
         &WalkingState {
             current: pending.current.clone(),
-            remaining: remaining_with_component(&pending.component, &pending.remaining),
+            remaining: retry_remaining,
             hop_count: pending.hop_count,
             mount_root: pending.mount_root.clone(),
+            current_mount: pending.current_mount.clone(),
+            mount_root_mount: pending.mount_root_mount.clone(),
             must_be_directory: pending.must_be_directory,
         },
         guard,
@@ -668,8 +762,6 @@ fn continue_after_child_meta(
         pending,
         mount_payload,
         mount_namespace,
-        child_fs_object_id,
-        child_meta,
         child_rnode_cap,
         cred,
         rules,
@@ -681,8 +773,6 @@ fn continue_after_child_rnode(
     pending: PendingComponent,
     mount_payload: Option<Cap<MountPayload>>,
     mount_namespace: Option<&Cap<MountNamespace>>,
-    child_fs_object_id: crate::vfs::FsObjectId,
-    child_meta: InodeMeta,
     child_rnode_cap: Cap<RNode>,
     cred: &Credential,
     rules: TerminalRules,
@@ -694,6 +784,8 @@ fn continue_after_child_rnode(
         remaining,
         mut hop_count,
         mount_root,
+        current_mount,
+        mount_root_mount,
         must_be_directory,
         ..
     } = pending;
@@ -706,7 +798,10 @@ fn continue_after_child_rnode(
             return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM));
         }
     };
-    current.cache_child(child_dentry.clone());
+    let child_dentry = current.cache_child(child_dentry);
+    let child_rnode_cap = child_dentry.rnode().clone();
+    let child_fs_object_id = child_rnode_cap.fs_object_id();
+    let child_meta = child_rnode_cap.meta();
 
     if child_meta.kind() != InodeKind::Directory
         && child_meta.kind() != InodeKind::Symlink
@@ -725,6 +820,7 @@ fn continue_after_child_rnode(
                 rnode,
                 fs_object_id,
                 meta,
+                mount: current_mount,
             };
             return KernelStep::Continue(WalkState::Terminal(resolved));
         }
@@ -736,58 +832,44 @@ fn continue_after_child_rnode(
         if hop_count > SYMLOOP_MAX {
             return KernelStep::Error(WalkCause::SymlinkLimit);
         }
-        let target_bytes = target.clone();
+        let target_bytes = target.as_ref();
         if target_bytes.first() == Some(&b'/') {
-            let mut new_remaining = Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
-            new_remaining.extend_from_slice(&target_bytes[1..]);
-            if !remaining.is_empty() {
-                new_remaining.push(b'/');
-                new_remaining.extend_from_slice(&remaining);
-            }
+            let new_remaining = match try_join_path(&target_bytes[1..], &remaining) {
+                Ok(remaining) => remaining,
+                Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+            };
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current: mount_root.clone(),
                 remaining: new_remaining,
                 hop_count,
                 mount_root,
+                current_mount: mount_root_mount.clone(),
+                mount_root_mount,
                 must_be_directory,
             }));
         }
-        let mut new_remaining = Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
-        new_remaining.extend_from_slice(&target_bytes);
-        if !remaining.is_empty() {
-            new_remaining.push(b'/');
-            new_remaining.extend_from_slice(&remaining);
-        }
+        let new_remaining = match try_join_path(target_bytes, &remaining) {
+            Ok(remaining) => remaining,
+            Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+        };
         return KernelStep::Continue(WalkState::Walking(WalkingState {
             current,
             remaining: new_remaining,
             hop_count,
             mount_root,
+            current_mount,
+            mount_root_mount,
             must_be_directory,
         }));
     }
 
-    let crossing_mount = child_dentry.mounted_hint().and_then(|w| w.upgrade(guard));
-    let crossing_mount = match crossing_mount {
-        Some(mount) => Some(mount),
-        None => mount_payload.as_ref().and_then(|payload| {
-            // Prefer the process's mount namespace, but always fall back to
-            // the global mount table. Bind/move mounts register globally
-            // (`crate::mount::register_mount`), and the per-process namespace
-            // is currently unpopulated for them — so without this fallback a
-            // namespace-carrying walk (every `walk_from_process` caller, e.g.
-            // `sys_mount`) could not cross any bind mount, while plain
-            // `walk_from` (stat/open/ls) crossed it via the global table.
-            // That split made `mount`/`umount` on an already-mounted path
-            // fail (ENOENT/EINVAL) even though `ls` of the same path worked,
-            // breaking every nested/stacked fs_bind case. Falling back keeps
-            // both walk flavours consistent. (True per-namespace isolation is
-            // a follow-up that would register mounts into the namespace.)
-            mount_namespace
-                .and_then(|ns| ns.mount_for(payload, child_fs_object_id))
-                .or_else(|| crate::mount::mount_for(payload, child_fs_object_id))
-        }),
-    };
+    let crossing_mount = crossing_mount_for(
+        &child_dentry,
+        mount_payload.as_ref(),
+        mount_namespace,
+        child_fs_object_id,
+        guard,
+    );
     if let Some(mount_cap) = crossing_mount {
         let new_current = match walker::dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {
             Ok(dentry) => dentry,
@@ -798,6 +880,8 @@ fn continue_after_child_rnode(
             remaining,
             hop_count,
             mount_root,
+            current_mount: Some(mount_cap),
+            mount_root_mount,
             must_be_directory,
         }));
     }
@@ -807,23 +891,28 @@ fn continue_after_child_rnode(
         remaining,
         hop_count,
         mount_root,
+        current_mount,
+        mount_root_mount,
         must_be_directory,
     }))
 }
 
-fn remaining_with_component(component: &[u8], remaining: &[u8]) -> Vec<u8> {
+fn remaining_with_component(
+    component: &[u8],
+    remaining: &[u8],
+) -> Result<Vec<u8>, crate::execution::Errno> {
     if remaining.is_empty() {
-        return component.to_vec();
+        return try_copy_path(component);
     }
-    let mut retry = Vec::with_capacity(component.len() + 1 + remaining.len());
-    retry.extend_from_slice(component);
-    retry.push(b'/');
-    retry.extend_from_slice(remaining);
-    retry
+    try_join_path(component, remaining)
 }
 
-fn take_next_component(mut remaining: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)> {
-    let component_start = remaining.iter().position(|byte| *byte != b'/')?;
+fn take_next_component(
+    remaining: Vec<u8>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, crate::execution::Errno> {
+    let Some(component_start) = remaining.iter().position(|byte| *byte != b'/') else {
+        return Ok(None);
+    };
     let after_leading = &remaining[component_start..];
     let component_len = after_leading
         .iter()
@@ -840,20 +929,9 @@ fn take_next_component(mut remaining: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)> {
         next_end -= 1;
     }
 
-    remaining.truncate(next_end);
-    let next = if next_start < remaining.len() {
-        remaining.split_off(next_start)
-    } else {
-        Vec::new()
-    };
-    remaining.truncate(component_end);
-    let component = if component_start == 0 {
-        remaining
-    } else {
-        remaining.split_off(component_start)
-    };
-
-    Some((component, next))
+    let next = try_copy_path(&remaining[next_start..next_end])?;
+    let component = try_copy_path(&remaining[component_start..component_end])?;
+    Ok(Some((component, next)))
 }
 
 #[cfg(test)]
@@ -862,13 +940,16 @@ mod tests {
 
     #[test]
     fn take_next_component_collapses_separator_runs_without_front_removal() {
-        let (component, remaining) =
-            take_next_component(b"////alpha///beta//".to_vec()).expect("component");
+        let (component, remaining) = take_next_component(b"////alpha///beta//".to_vec())
+            .expect("allocation")
+            .expect("component");
 
         assert_eq!(component, b"alpha");
         assert_eq!(remaining, b"beta");
 
-        let (component, remaining) = take_next_component(remaining).expect("second component");
+        let (component, remaining) = take_next_component(remaining)
+            .expect("allocation")
+            .expect("second component");
         assert_eq!(component, b"beta");
         assert!(remaining.is_empty());
     }

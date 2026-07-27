@@ -248,8 +248,12 @@ fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
         step_accept(&listener, &guard),
         StepOutcome::Done(_)
     ));
-    let mut urgent_future =
-        crate::wait_source::wait_on_token(socket_urgent_wait_token(&tcp)).expect("urgent future");
+    let urgent_token = socket_urgent_wait_token(&tcp);
+    let mut urgent_future = crate::wait_source::wait_on_registered_source_id(
+        urgent_token.source_id(),
+        urgent_token.interest(),
+    )
+    .expect("urgent future");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(

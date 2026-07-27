@@ -18,8 +18,8 @@
 //!    returns the fd.
 //! 2. **Phase 2.** `sys_io_setup` also spawns a worker for the new
 //!    context: it constructs an [`AioWorkerFuture`] via
-//!    [`tx_subsystems::aio::spawn_worker_for_context`] and stashes it
-//!    in a per-context registry [`take_worker_future_for_test`]
+//!    [`tx_subsystems::aio::spawn_worker_for_context_with_completion_post`]
+//!    and stashes it in a per-context registry [`take_worker_future_for_test`]
 //!    so a test (or a future reactor-seam installer) can drive it.
 //!    Per D8 §7 the production wiring submits the future to the boot
 //!    reactor; phase 2 leaves that wiring as a deferred-pump model
@@ -71,8 +71,9 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_subsystems::aio::{
-    is_valid_iocb_opcode, spawn_worker_for_context, AioContext, AioWorkerFuture, IoEvent, Iocb,
-    IocbDispatcher, EVENTS_AVAILABLE_MASK, IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IO_EVENT_BYTES,
+    is_valid_iocb_opcode, spawn_worker_for_context_with_completion_post, AioCompletionPost,
+    AioContext, AioWorkerFuture, IoEvent, Iocb, IocbDispatcher, EVENTS_AVAILABLE_MASK,
+    IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IO_EVENT_BYTES,
 };
 use tx_subsystems::process::ProcessIdentity;
 use tx_subsystems::vfs::execution::{OpenFileLseekOp, OpenFileReadOp, OpenFileWriteOp};
@@ -86,9 +87,7 @@ use super::{
 };
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
 use crate::adapter::step_engine::StepOutcome as V3Out;
-use crate::adapter::step_engine::{
-    self as step_engine, Cap, InterestMask, SpinMutex, StepOp, WaitSourceId,
-};
+use crate::adapter::step_engine::{self as step_engine, Cap, InterestMask, SpinMutex, StepOp};
 
 // === Linux negative-errno values used by the dispatcher =============
 //
@@ -122,6 +121,24 @@ fn build_iocb_dispatcher(
     aspace: Cap<AddressSpace>,
 ) -> IocbDispatcher {
     Arc::new(move |iocb: &Iocb| -> IoEvent { dispatch_one_iocb(&process, &aspace, iocb) })
+}
+
+fn build_aio_completion_post(ctx: &SyscallCtx<'_>) -> AioCompletionPost {
+    let with_hint = ctx.mailbox_ref_post_with_hint;
+    let plain = ctx.mailbox_ref_post;
+    Arc::new(move |mailbox, event| {
+        if let Some(post) = with_hint {
+            return post(
+                mailbox,
+                event,
+                tx_substrate::wake::MailboxSchedulerHint::Normal,
+            );
+        }
+        if let Some(post) = plain {
+            return post(mailbox, event);
+        }
+        mailbox.post(event)
+    })
 }
 
 /// Per-iocb dispatch body. Called synchronously by the worker for each
@@ -264,9 +281,8 @@ fn partial_or_error(cookie: u64, total: usize, err: i64) -> IoEvent {
 }
 
 /// Run `OpenFileLseekOp` with `whence = SEEK_SET (0)` synchronously.
-/// Returns `true` on success, `false` on any non-`Done`/`Continue`
-/// outcome. The seek is synchronous in this kernel; the loop is
-/// defensive against unexpected Yield/Err shapes.
+/// The operation is one-shot, so its driver enforces that it never
+/// returns `Continue` or `Yield`.
 fn run_lseek_set(file: &Cap<OpenFile>, offset: i64) -> bool {
     let mut script_ctx = crate::KernelScriptCtx::new();
     let mut op = OpenFileLseekOp {
@@ -274,10 +290,7 @@ fn run_lseek_set(file: &Cap<OpenFile>, offset: i64) -> bool {
         offset,
         whence: 0, // SEEK_SET
     };
-    matches!(
-        op.step(&mut script_ctx),
-        V3Out::Done(_) | V3Out::Continue { .. }
-    )
+    step_engine::drive_oneshot(&mut op, &mut script_ctx).is_ok()
 }
 
 /// Run `OpenFileReadOp` synchronously, looping on `Continue { progress }`
@@ -451,11 +464,13 @@ pub(super) fn sys_io_setup(nr_events: u32, _ctx_idp: u64, ctx: &SyscallCtx<'_>) 
     // `aio_fildes` against P's fd table and copy bytes through P's
     // address space — all under the borrow's identity.
     let dispatcher = build_iocb_dispatcher(ctx.process.clone(), ctx.aspace.clone());
-    let worker = spawn_worker_for_context(
+    let completion_post = build_aio_completion_post(ctx);
+    let worker = spawn_worker_for_context_with_completion_post(
         aio_cap.clone(),
         ctx.process.clone(),
         owner_subject,
         dispatcher,
+        completion_post,
     );
     install_worker_future_for_test(context_id, worker);
 
@@ -719,10 +734,10 @@ pub(super) async fn sys_io_getevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
         if !blocking {
             break;
         }
-        // Park on the events_available carrier and re-drain.
-        super::await_wait_source(
+        // Park on the events_available endpoint and re-drain.
+        super::await_wait_endpoint(
             ctx,
-            WaitSourceId::new(aio_cap.events_available_id()),
+            aio_cap.events_available_endpoint(),
             InterestMask::new(EVENTS_AVAILABLE_MASK),
         )
         .await;

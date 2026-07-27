@@ -12,6 +12,7 @@
 
 - [`DEVICE.md`](../06_devices/DEVICE.md) §2.2 (tier 2), §4 (device classes), §5.3 (Route C), §7 (init phase 5), §10.2 (`io_complete_wire` attachment), §11 (per-target block-device inventory).
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2 (`RNodeBacking`), §3 (`PageContainer`), §4 (PC lifecycle), §5 (`FsPageBacking` trait). bdev-fs is a vanilla consumer of this trait.
+- [`IO_MANAGER_v1.md`](IO_MANAGER_v1.md) — target async page/block submission contract. bdev-fs maps page offsets to block-device LBA ranges and later produces `BioPlan`s instead of owning generic block scheduling.
 - [`TX_EXT4_PLAN.md`](TX_EXT4_PLAN_v1_2.md) §3.2 (`BlockDevice` trait). bdev-fs's `FsPageBacking` impl is what sits between tx-ext4 (or any block-device-consuming filesystem) and the driver's `BlockDeviceOps`.
 - [`object_model.md`](../00_meta-framework/object_model_v2.md) §3 (entities), §8.1.1 (bifurcation). bdev-fs's MountPayload follows the standard Mount Identity/Payload split; no new entity classes are introduced.
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5 (publication rule), PRED-7 (race degradation). Partition-table mutation is rejected until phase 5 of tx-ext4; v1 partitions are compile-time or mount-time only.

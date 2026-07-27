@@ -21,21 +21,19 @@ use tx_platform_adapter::platform_adapter;
     platform = "substrate",
     domain = "step_engine",
     apis = ["step", "zone", "epoch"],
-    reason = "expose substrate step engine outcome types (StepOutcome, ByteProgress, NoProgress, Errno), zone role types (Cap, Weak, Zone, ZoneAllocated), and EBR guard used by vfs trait surface and walker step ops"
+    reason = "expose substrate step engine outcome types (StepOutcome, ByteProgress, NoProgress, Errno), zone role types (Cap, PayloadCap, Weak, Zone, ZoneAllocated), and EBR guard used by vfs trait surface and walker step ops"
 )]
 pub mod step_engine {
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
+    pub use tx_substrate::epoch::{Guard, borrow_current_guard, guard};
     pub use tx_substrate::step::{
-        drive_oneshot, ByteProgress, Deadline, Errno, InterestMask, NoProgress, OneShotStepOp,
-        ProcessIdentity, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
-        SubjectIdentity, TimerId, WaitSourceId, YieldShape,
+        ByteProgress, Deadline, Errno, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity,
+        ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity, TimerId,
+        WaitSourceId, YieldShape, drive_oneshot,
     };
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        Cap, Dead, Entity, IdentRef, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign, sign_for,
     };
 }
 
@@ -45,17 +43,11 @@ pub mod step_engine {
     apis = ["wake", "step"],
     reason = "wrap WaitSource registration and v3 mailbox notify for vfs RNode open-file wakeup paths"
 )]
-#[platform_adapter(
-    platform = "reactor",
-    domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as vfs RNode legacy wakeup verbs (D2 coexistence)"
-)]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{
-        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+        MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitEndpoint, WaitSource,
     };
 
     /// Delegates to `tx_substrate::wake::new_source`. Also registers
@@ -71,13 +63,18 @@ pub mod wait_routing {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
-    /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
-        tx_reactor::wait::fire_legacy(channel, mask_bits)
-    }
-
-    /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+    /// Notify the v3 `WaitSource` through a caller-provided mailbox post route.
+    ///
+    /// Scheduler-context callers inject the owner-aware reactor route here;
+    /// no-context callers pass direct mailbox posting through the same helper.
+    pub fn notify_v3_source_with_post<F>(source: &Arc<WaitSource>, mask_bits: u64, mut post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        source.notify_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            MailboxSchedulerHint::Normal,
+            |mailbox, event, hint| post(mailbox, event, hint),
+        );
     }
 }

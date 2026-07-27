@@ -327,7 +327,9 @@ impl<'a> BitmapPageAllocator<'a> {
         for (start, base_limit) in [(hint_base, range_end), (range_base, hint_base)] {
             let mut base = start;
             while base < base_limit
-                && base.checked_add(count).is_some_and(|run_end| run_end <= range_end)
+                && base
+                    .checked_add(count)
+                    .is_some_and(|run_end| run_end <= range_end)
             {
                 if !self.frame_bit_is_free(Ppn(base)) {
                     let Some(next_free) = self.next_free_ppn_at_or_after(base + 1, base_limit)

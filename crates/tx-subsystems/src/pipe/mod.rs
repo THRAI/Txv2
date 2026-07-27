@@ -14,12 +14,10 @@
 //!   before returning `-EPIPE` to userspace — the pipe module itself
 //!   has no `Cap<ProcessIdentity>` and so cannot fan out the signal.
 //!
-//! The payload allocates *two* `Channel`s registered with the global
-//! `wait_source` resolver: one fired when bytes become available
-//! (wakes blocked readers) and one fired when space becomes available
-//! (wakes blocked writers). This mirrors the TTY identity's
-//! single-channel pattern in `tty::structure::TtyIdentity`, generalised
-//! to a reader-side and a writer-side carrier.
+//! The payload allocates two `WaitSource`s registered with the global
+//! `wait_source` resolver: one fired when bytes become available (or EOF
+//! becomes observable) and one fired when space becomes available (or EPIPE
+//! becomes observable).
 //!
 //! Side bookkeeping. A single `Cap<PipePayload>` backs *two* `OpenFile`
 //! shapes — the reader-end and the writer-end — distinguished by the
@@ -36,10 +34,9 @@
 //! fd is closed, without waiting for EBR to retire the shared
 //! `OpenFile` slot. `step_pipe2` seeds one reader fd and one writer fd;
 //! fd-table `dup` / `fork` increments, while `close` / `exec` /
-//! process-exit drain decrements. The last-reader-close transition
-//! fires the writer-side wait channel for SIGPIPE/EPIPE; the
-//! last-writer-close transition fires the reader-side wait channel
-//! for EOF.
+//! process-exit drain decrements. The last-reader-close transition fires the
+//! writer-side wait source for SIGPIPE/EPIPE; the last-writer-close transition
+//! fires the reader-side wait source for EOF.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -61,7 +58,7 @@ use adapter::step_engine::{
     self, ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
     SubjectIdentity, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::{Channel, WaitSource};
+use adapter::wait_routing::{MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource};
 pub use notification::{PIPE_READABLE, PIPE_WRITABLE};
 
 use crate::execution::{Errno, Guard};
@@ -101,30 +98,13 @@ pub struct PipeFlags {
 }
 
 /// Anonymous-pipe payload. Carries the descriptor ring, per-side reference
-/// counts, and the two wait sources.
+/// counts, and the two mailbox-backed wait sources.
 ///
-/// **PR-3D-1 coexistence** (D2/D4 ADRs). Each side carries **two**
-/// parallel wake-publication points:
-///
-/// 1. The legacy `Channel` (`reader_wait_channel` /
-///    `writer_wait_channel`) — backed by `RawPort`+`Waker`. Consumed
-///    by the existing `wait_source` resolver and any caller that
-///    `lookup_wait_channel`s the source id and awaits via
-///    `WaitFuture`. **Stays in place** until PR-3D-4 retires the
-///    legacy resolver path.
-/// 2. The new `Arc<WaitSource>` (`reader_wait_source` /
-///    `writer_wait_source`) — backed by `TaskMailbox`. Consumed by
-///    v3 callers that own a `TaskMailbox` and register via
-///    `WaitSource::prepare(...).install_if(...)`. Tested in
-///    `crates/tx-subsystems/tests/v3_pipe_waitsource.rs`.
-///
-/// Both paths fire on every state transition (`step_read`,
-/// `step_write`, `decr_reader`, `decr_writer`). The `WaitSourceId`
-/// stamped into `step_read` / `step_write`'s `YieldShape::OnWaitSource`
-/// is the same `u64` the legacy `wait_source` resolver returned, so
-/// the two paths share an id namespace and a v3 caller's
-/// `WaitSourceId.raw()` round-trips cleanly to the right side's
-/// `WaitSource`.
+/// Each side has one `Arc<WaitSource>` backed by `TaskMailbox`. The
+/// `WaitSourceId` stamped into `step_read` / `step_write`'s
+/// `YieldShape::OnWaitSource` is also registered with the compatibility
+/// `wait_source` resolver, so older `WaitToken` consumers resolve to this same
+/// mailbox source instead of a reactor-side wait carrier.
 ///
 /// Single zone slot per pipe; the reader and writer ends share one
 /// `Cap<PipePayload>`.
@@ -132,16 +112,12 @@ pub struct PipePayload {
     ring: SpinMutex<PipeRing>,
     reader_count: AtomicU32,
     writer_count: AtomicU32,
-    reader_wait_channel: Channel,
     reader_wait_source_id: u64,
-    writer_wait_channel: Channel,
     writer_wait_source_id: u64,
-    /// PR-3D-1 new path. Fired alongside `reader_wait_channel` on
-    /// every transition that makes the reader side wake-relevant
+    /// Fired on every transition that makes the reader side wake-relevant
     /// (bytes-available, writer-closed-EOF).
     reader_wait_source: Arc<WaitSource>,
-    /// PR-3D-1 new path. Fired alongside `writer_wait_channel` on
-    /// every transition that makes the writer side wake-relevant
+    /// Fired on every transition that makes the writer side wake-relevant
     /// (space-available, reader-closed-EPIPE).
     writer_wait_source: Arc<WaitSource>,
 }
@@ -626,51 +602,61 @@ impl PipePayload {
     /// signature aligned with future bounded carrier slabs).
     pub fn new() -> Result<Self, ZoneError> {
         let wait_points = notification::new_wait_points();
+        let reader_wait_source_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.reader_endpoint()).raw();
+        let writer_wait_source_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.writer_endpoint()).raw();
+        let (_, reader_wait_source, _, writer_wait_source) = wait_points.into_parts();
 
         Ok(Self {
             ring: SpinMutex::new(PipeRing::new()),
             reader_count: AtomicU32::new(1),
             writer_count: AtomicU32::new(1),
-            reader_wait_channel: wait_points.reader_channel,
-            reader_wait_source_id: wait_points.reader_source_id,
-            writer_wait_channel: wait_points.writer_channel,
-            writer_wait_source_id: wait_points.writer_source_id,
-            reader_wait_source: wait_points.reader_source,
-            writer_wait_source: wait_points.writer_source,
+            reader_wait_source_id,
+            writer_wait_source_id,
+            reader_wait_source,
+            writer_wait_source,
         })
     }
 
-    /// Carrier id paired with the reader-side `Channel`. `step_read`
-    /// embeds this in any `Blocked(WaitToken)` it returns; the
-    /// channel fires when bytes land in the ring (on
-    /// `step_write`-side push).
+    /// Carrier id paired with the reader-side `WaitSource`. `step_read`
+    /// embeds this in any blocked wait it returns; the source fires when bytes
+    /// land in the ring or EOF becomes observable.
     pub fn reader_source_id(&self) -> u64 {
         self.reader_wait_source_id
     }
 
-    /// Carrier id paired with the writer-side `Channel`. `step_write`
-    /// embeds this in any `Blocked(WaitToken)` it returns; the
-    /// channel fires when space frees up in the ring (on
-    /// `step_read`-side drain) and on last-reader-close to surface
-    /// SIGPIPE/EPIPE to blocked writers.
+    /// Carrier id paired with the writer-side `WaitSource`. `step_write`
+    /// embeds this in any blocked wait it returns; the source fires when space
+    /// frees up in the ring and on last-reader-close to surface SIGPIPE/EPIPE
+    /// to blocked writers.
     pub fn writer_source_id(&self) -> u64 {
         self.writer_wait_source_id
     }
 
-    /// PR-3D-1: reader-side `WaitSource` for the new mailbox-based
-    /// wake path. Returned as `&Arc<WaitSource>` so callers can clone
-    /// and hold the source across the wait window — pipe's
+    /// Reader-side mailbox wake source. Returned as `&Arc<WaitSource>` so
+    /// callers can clone and hold the source across the wait window; pipe's
     /// `Drop` releases its own clone independently of any consumer's.
     ///
     /// `WaitSource::id()` matches [`Self::reader_source_id`].
-    pub fn reader_wait_source(&self) -> &Arc<WaitSource> {
+    fn reader_wait_source(&self) -> &Arc<WaitSource> {
         &self.reader_wait_source
     }
 
-    /// PR-3D-1: writer-side `WaitSource`. See [`Self::reader_wait_source`].
+    /// Writer-side mailbox wake source. See [`Self::reader_wait_source`].
     /// `WaitSource::id()` matches [`Self::writer_source_id`].
-    pub fn writer_wait_source(&self) -> &Arc<WaitSource> {
+    fn writer_wait_source(&self) -> &Arc<WaitSource> {
         &self.writer_wait_source
+    }
+
+    /// Reader-side endpoint exposed to wait drivers.
+    pub fn reader_endpoint(&self) -> &Arc<WaitSource> {
+        self.reader_wait_source()
+    }
+
+    /// Writer-side endpoint exposed to wait drivers.
+    pub fn writer_endpoint(&self) -> &Arc<WaitSource> {
+        self.writer_wait_source()
     }
 
     pub fn pipe_size_bytes(&self) -> usize {
@@ -699,7 +685,7 @@ impl PipePayload {
         let mut ring = self.ring.lock();
         let size = ring.set_pipe_size_bytes(requested)?;
         drop(ring);
-        notification::notify_writable(&self.writer_wait_channel, &self.writer_wait_source);
+        notification::notify_writable(&self.writer_wait_source);
         Ok(size)
     }
 
@@ -713,9 +699,9 @@ impl PipePayload {
         self.writer_count.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Reader-end fd close. On the last-reader-close transition, fires
-    /// the writer-side wait channel so any blocked writer observes the
-    /// closed-reader state on its next iteration and surfaces `EPIPE`.
+    /// Reader-end fd close. On the last-reader-close transition, fires the
+    /// writer-side wait source so any blocked writer observes the closed-reader
+    /// state on its next iteration and surfaces `EPIPE`.
     ///
     /// `pub(crate)` because the only legitimate caller is
     /// process fd-table accounting.
@@ -724,20 +710,20 @@ impl PipePayload {
             return;
         };
         if prev == 1 {
-            notification::notify_writable(&self.writer_wait_channel, &self.writer_wait_source);
+            notification::notify_writable(&self.writer_wait_source);
         }
     }
 
     /// Writer-end fd close. Companion of `decr_reader`. On the
-    /// last-writer-close transition, fires the reader-side wait channel
-    /// so any blocked reader observes the closed-writer state on its
-    /// next iteration and surfaces `Done(0)` (EOF).
+    /// last-writer-close transition, fires the reader-side wait source so any
+    /// blocked reader observes the closed-writer state on its next iteration
+    /// and surfaces `Done(0)` (EOF).
     pub(crate) fn decr_writer(&self) {
         let Some(prev) = decrement_nonzero(&self.writer_count) else {
             return;
         };
         if prev == 1 {
-            notification::notify_readable(&self.reader_wait_channel, &self.reader_wait_source);
+            notification::notify_readable(&self.reader_wait_source);
         }
     }
 
@@ -881,7 +867,7 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
     Ok((reader_open, writer_open))
 }
 
-// === step_read / step_write ==============================================
+// === pipe byte read/write =================================================
 
 /// `read(pipe_fd, buf, len)`.
 ///
@@ -890,12 +876,16 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
 /// - empty ring + writers closed → `Done(0)` (EOF)
 /// - empty ring + writers alive + nonblocking → `Err(EAGAIN)`
 /// - empty ring + writers alive + blocking → `Yield` on reader carrier
-pub fn step_read(
+pub fn step_read_with_post<F>(
     payload: &Cap<PipePayload>,
     out: &mut [u8],
     _guard: &Guard<'_>,
     nonblocking: bool,
-) -> StepOutcome<usize, ByteProgress> {
+    post: F,
+) -> StepOutcome<usize, ByteProgress>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -913,7 +903,7 @@ pub fn step_read(
         drop(ring);
         // ④ commit — drain bytes into caller buffer, release lock
         // ⑤ publish — wake writers parked on space-available
-        notification::notify_writable(&payload.writer_wait_channel, &payload.writer_wait_source);
+        notification::notify_writable_with_post(&payload.writer_wait_source, post);
         return step_engine::done_bytes(copied);
     }
     drop(ring);
@@ -925,7 +915,7 @@ pub fn step_read(
         return step_engine::eagain();
     }
     // Yield: wait for readable — publish (N/A) precedes yield, ok per A-14
-    notification::wait_until_readable(payload.reader_wait_source_id)
+    notification::wait_until_readable(payload.reader_endpoint())
 }
 
 /// `write(pipe_fd, buf, len)`.
@@ -936,13 +926,17 @@ pub fn step_read(
 /// - non-full ring → `Done(copied)` (single-step per wave-6 finding)
 /// - full + nonblocking → `Err(EAGAIN)`
 /// - full + blocking → `Yield` on writer carrier
-pub fn step_write(
+pub fn step_write_with_post<F>(
     payload: &Cap<PipePayload>,
     bytes: &[u8],
     _guard: &Guard<'_>,
     nonblocking: bool,
     packet_mode: bool,
-) -> StepOutcome<usize, ByteProgress> {
+    post: F,
+) -> StepOutcome<usize, ByteProgress>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -964,7 +958,7 @@ pub fn step_write(
         if nonblocking {
             return step_engine::eagain();
         }
-        return notification::wait_until_writable(payload.writer_wait_source_id);
+        return notification::wait_until_writable(payload.writer_endpoint());
     }
     if !ring.is_full() || ring.available_write_capacity() > 0 {
         let copied = ring.fill_from_slice(bytes, packet_mode);
@@ -972,10 +966,7 @@ pub fn step_write(
         // ⑤ publish — wake readers parked on bytes-available
         if copied > 0 {
             drop(ring);
-            notification::notify_readable(
-                &payload.reader_wait_channel,
-                &payload.reader_wait_source,
-            );
+            notification::notify_readable_with_post(&payload.reader_wait_source, post);
             return step_engine::done_bytes(copied);
         }
     }
@@ -984,7 +975,7 @@ pub fn step_write(
         return step_engine::eagain();
     }
     // Yield: wait for writable — publish (N/A) precedes yield
-    notification::wait_until_writable(payload.writer_wait_source_id)
+    notification::wait_until_writable(payload.writer_endpoint())
 }
 
 /// Copy pipe bytes into `out` without consuming them.
@@ -1008,7 +999,7 @@ pub fn step_peek(
     if nonblocking {
         return step_engine::eagain();
     }
-    notification::wait_until_readable(payload.reader_wait_source_id)
+    notification::wait_until_readable(payload.reader_endpoint())
 }
 
 pub fn step_push_page_lease(
@@ -1030,14 +1021,11 @@ pub fn step_push_page_lease(
     match ring.push_page_lease(lease, offset, len, packet_mode) {
         Ok(()) => {
             drop(ring);
-            notification::notify_readable(
-                &payload.reader_wait_channel,
-                &payload.reader_wait_source,
-            );
+            notification::notify_readable(&payload.reader_wait_source);
             step_engine::done_bytes(len)
         }
         Err(_lease) if nonblocking => step_engine::eagain(),
-        Err(_lease) => notification::wait_until_writable(payload.writer_wait_source_id),
+        Err(_lease) => notification::wait_until_writable(payload.writer_endpoint()),
     }
 }
 
@@ -1049,7 +1037,7 @@ pub fn step_pop_page_lease(
     let mut ring = payload.ring.lock();
     if let Some(buf) = ring.pop_front_lease() {
         drop(ring);
-        notification::notify_writable(&payload.writer_wait_channel, &payload.writer_wait_source);
+        notification::notify_writable(&payload.writer_wait_source);
         return match buf.storage {
             PipeStorage::PageBackedLease(lease) => {
                 StepOutcome::Done(Some((lease, buf.offset, buf.len)))
@@ -1065,7 +1053,7 @@ pub fn step_pop_page_lease(
     if nonblocking {
         return StepOutcome::Err(step_engine::Errno::EAGAIN);
     }
-    notification::yield_until_readable(payload.reader_wait_source_id)
+    notification::yield_until_readable(payload.reader_endpoint())
 }
 
 /// Move bytes from one pipe ring to another without staging through
@@ -1100,8 +1088,8 @@ pub fn step_splice_to_pipe(
         (copied, src_empty, dst_accepts)
     });
     if copied > 0 {
-        notification::notify_writable(&src.writer_wait_channel, &src.writer_wait_source);
-        notification::notify_readable(&dst.reader_wait_channel, &dst.reader_wait_source);
+        notification::notify_writable(&src.writer_wait_source);
+        notification::notify_readable(&dst.reader_wait_source);
         return step_engine::done_bytes(copied);
     }
 
@@ -1112,11 +1100,11 @@ pub fn step_splice_to_pipe(
         return step_engine::eagain();
     }
     if src_empty {
-        notification::wait_until_readable(src.reader_wait_source_id)
+        notification::wait_until_readable(src.reader_endpoint())
     } else if !dst_accepts {
-        notification::wait_until_writable(dst.writer_wait_source_id)
+        notification::wait_until_writable(dst.writer_endpoint())
     } else {
-        notification::wait_until_readable(src.reader_wait_source_id)
+        notification::wait_until_readable(src.reader_endpoint())
     }
 }
 
@@ -1152,7 +1140,7 @@ pub fn step_tee_to_pipe(
         (copied, src_empty, dst_accepts)
     });
     if copied > 0 {
-        notification::notify_readable(&dst.reader_wait_channel, &dst.reader_wait_source);
+        notification::notify_readable(&dst.reader_wait_source);
         return step_engine::done_bytes(copied);
     }
 
@@ -1163,11 +1151,11 @@ pub fn step_tee_to_pipe(
         return step_engine::eagain();
     }
     if src_empty {
-        notification::wait_until_readable(src.reader_wait_source_id)
+        notification::wait_until_readable(src.reader_endpoint())
     } else if !dst_accepts {
-        notification::wait_until_writable(dst.writer_wait_source_id)
+        notification::wait_until_writable(dst.writer_endpoint())
     } else {
-        notification::wait_until_readable(src.reader_wait_source_id)
+        notification::wait_until_readable(src.reader_endpoint())
     }
 }
 
@@ -1192,11 +1180,10 @@ fn with_two_rings<R>(
 // StepOp wraps (PR-2 wave 2)
 // ---------------------------------------------------------------------------
 //
-// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
-// Each wrap stores its inputs (Cap by value, slice + guard by reference under
-// a single lifetime `'a`) and delegates from `step()` to the corresponding
-// free fn above. The free fns remain the source of truth; callers can migrate
-// to the `*Op` types incrementally.
+// `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// Each wrap stores its inputs and delegates from `step()` to the owning helper
+// above. Read/write adapters require an explicit caller-provided post path;
+// no hidden direct fallback lives in the StepOp.
 //
 // `step_pipe2` returns `Result<_, Errno>` rather than `StepOutcome`, so its
 // wrap lifts the result via `StepOutcome::Done` / `StepOutcome::Err`, mirroring
@@ -1221,41 +1208,120 @@ impl<I: SubjectIdentity> StepOp<I> for Pipe2Op {
 impl OneShotStepOp for Pipe2Op {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for Pipe2Op {}
 
-/// `StepOp` wrap of [`step_read`].
-pub struct ReadOp<'a> {
+/// `StepOp` wrap of [`step_read_with_post`] for callers that can inject an
+/// owner-aware mailbox-ref post operation.
+pub struct ReadWithPostOp<'a, F> {
     pub payload: &'a Cap<PipePayload>,
     pub out: &'a mut [u8],
     pub nonblocking: bool,
+    pub post: F,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
+pub type MailboxRefPostWithHintFn = fn(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool;
+
+/// `StepOp` wrap of [`step_read_with_post`] for syscall callers that pass the
+/// hint-aware owner post function pointer from `SyscallCtx`.
+pub struct ReadWithHintPostOp<'a> {
+    pub payload: &'a Cap<PipePayload>,
+    pub out: &'a mut [u8],
+    pub nonblocking: bool,
+    pub post: MailboxRefPostWithHintFn,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadWithHintPostOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let __guard = step_engine::guard();
-        step_read(self.payload, self.out, &__guard, self.nonblocking)
+        let post = self.post;
+        step_read_with_post(
+            self.payload,
+            self.out,
+            &__guard,
+            self.nonblocking,
+            |mailbox, event| post(mailbox, event, MailboxSchedulerHint::Normal),
+        )
     }
 }
 
-/// `StepOp` wrap of [`step_write`].
-pub struct WriteOp<'a> {
+impl<'a, I, F> StepOp<I> for ReadWithPostOp<'a, F>
+where
+    I: SubjectIdentity,
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    type Output = usize;
+    type Progress = ByteProgress;
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        // Pipe reads use the explicit caller post route, but remain in this
+        // script frame's subject context for the duration of the transition.
+        let _ = ctx.subject();
+        let __guard = step_engine::guard();
+        step_read_with_post(
+            self.payload,
+            self.out,
+            &__guard,
+            self.nonblocking,
+            &mut self.post,
+        )
+    }
+}
+
+/// `StepOp` wrap of [`step_write_with_post`] for callers that can inject an
+/// owner-aware mailbox-ref post operation.
+pub struct WriteWithPostOp<'a, F> {
     pub payload: &'a Cap<PipePayload>,
     pub bytes: &'a [u8],
     pub nonblocking: bool,
     pub packet_mode: bool,
+    pub post: F,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
+impl<'a, I, F> StepOp<I> for WriteWithPostOp<'a, F>
+where
+    I: SubjectIdentity,
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        // Pipe writes use the explicit caller post route, but remain in this
+        // script frame's subject context for the duration of the transition.
+        let _ = ctx.subject();
         let __guard = step_engine::guard();
-        step_write(
+        step_write_with_post(
             self.payload,
             self.bytes,
             &__guard,
             self.nonblocking,
             self.packet_mode,
+            &mut self.post,
+        )
+    }
+}
+
+/// `StepOp` wrap of [`step_write_with_post`] for syscall callers that pass the
+/// hint-aware owner post function pointer from `SyscallCtx`.
+pub struct WriteWithHintPostOp<'a> {
+    pub payload: &'a Cap<PipePayload>,
+    pub bytes: &'a [u8],
+    pub nonblocking: bool,
+    pub packet_mode: bool,
+    pub post: MailboxRefPostWithHintFn,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteWithHintPostOp<'a> {
+    type Output = usize;
+    type Progress = ByteProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        let post = self.post;
+        step_write_with_post(
+            self.payload,
+            self.bytes,
+            &__guard,
+            self.nonblocking,
+            self.packet_mode,
+            |mailbox, event| post(mailbox, event, MailboxSchedulerHint::Normal),
         )
     }
 }
@@ -1277,7 +1343,7 @@ mod tests {
     }
 
     /// Pull the shared `Cap<PipePayload>` back out of an OpenFile so
-    /// tests can poke at counters / call step_read/step_write directly.
+    /// tests can poke at counters / call read/write helpers directly.
     fn payload_of(openfile: &Cap<OpenFile>) -> Cap<PipePayload> {
         match openfile.rnode().backing() {
             RNodeBacking::StructBacked {
@@ -1313,6 +1379,14 @@ mod tests {
         assert_eq!(payload_a.writer_count_snapshot(), 1);
         assert_eq!(payload_a.reader_source_id(), payload_b.reader_source_id());
         assert_eq!(payload_a.writer_source_id(), payload_b.writer_source_id());
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(payload_a.reader_endpoint()).raw(),
+            payload_b.reader_source_id()
+        );
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(payload_a.writer_endpoint()).raw(),
+            payload_b.writer_source_id()
+        );
     }
 
     #[test]
@@ -1322,7 +1396,9 @@ mod tests {
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
         let guard = guard();
-        let outcome = step_read(&payload, &mut buf, &guard, false);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         match outcome {
             V3Out::Yield {
@@ -1352,7 +1428,9 @@ mod tests {
         assert_eq!(payload.writer_count_snapshot(), 0);
         let mut buf = [0u8; 4];
         let guard = guard();
-        let outcome = step_read(&payload, &mut buf, &guard, false);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         assert_eq!(outcome, V3Out::Done(0));
     }
@@ -1365,10 +1443,20 @@ mod tests {
         // payload pulled via reader; same identity as writer's payload.
         let _ = writer;
         let guard = guard();
-        let write_outcome = step_write(&payload, b"hello", &guard, false, false);
+        let write_outcome = step_write_with_post(
+            &payload,
+            b"hello",
+            &guard,
+            false,
+            false,
+            |mailbox, event| mailbox.post(event),
+        );
         assert_eq!(write_outcome, V3Out::Done(5));
         let mut buf = [0u8; 8];
-        let read_outcome = step_read(&payload, &mut buf, &guard, false);
+        let read_outcome =
+            step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         assert_eq!(read_outcome, V3Out::Done(5));
         assert_eq!(&buf[..5], b"hello");
@@ -1388,24 +1476,37 @@ mod tests {
         let guard = guard();
 
         assert_eq!(
-            step_write(&payload, b"abcdef", &guard, false, true),
+            step_write_with_post(
+                &payload,
+                b"abcdef",
+                &guard,
+                false,
+                true,
+                |mailbox, event| mailbox.post(event)
+            ),
             V3Out::Done(6)
         );
         assert_eq!(
-            step_write(&payload, b"XY", &guard, false, true),
+            step_write_with_post(&payload, b"XY", &guard, false, true, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(2)
         );
 
         let mut first = [0u8; 3];
         assert_eq!(
-            step_read(&payload, &mut first, &guard, false),
+            step_read_with_post(&payload, &mut first, &guard, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(3)
         );
         assert_eq!(&first, b"abc");
 
         let mut second = [0u8; 4];
         assert_eq!(
-            step_read(&payload, &mut second, &guard, false),
+            step_read_with_post(&payload, &mut second, &guard, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(2)
         );
         drop(guard);
@@ -1428,18 +1529,24 @@ mod tests {
         let guard = guard();
 
         assert_eq!(
-            step_write(&payload, &bytes, &guard, false, true),
+            step_write_with_post(&payload, &bytes, &guard, false, true, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(bytes.len())
         );
         let mut first = alloc::vec![0u8; PIPE_BUF + 2];
         assert_eq!(
-            step_read(&payload, &mut first, &guard, false),
+            step_read_with_post(&payload, &mut first, &guard, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(PIPE_BUF)
         );
         assert_eq!(&first[..PIPE_BUF], &bytes[..PIPE_BUF]);
         let mut second = [0u8; 4];
         assert_eq!(
-            step_read(&payload, &mut second, &guard, false),
+            step_read_with_post(&payload, &mut second, &guard, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(2)
         );
         drop(guard);
@@ -1463,15 +1570,22 @@ mod tests {
         let guard = guard();
 
         assert_eq!(
-            step_write(&payload, b"a", &guard, false, true),
+            step_write_with_post(&payload, b"a", &guard, false, true, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(1)
         );
         assert_eq!(
-            step_write(&payload, b"b", &guard, true, true),
+            step_write_with_post(&payload, b"b", &guard, true, true, |mailbox, event| mailbox
+                .post(event)),
             V3Out::Err(V3Errno::EAGAIN)
         );
         let mut out = [0u8; 8];
-        assert_eq!(step_read(&payload, &mut out, &guard, false), V3Out::Done(1));
+        assert_eq!(
+            step_read_with_post(&payload, &mut out, &guard, false, |mailbox, event| mailbox
+                .post(event)),
+            V3Out::Done(1)
+        );
         drop(guard);
         assert_eq!(out[0], b'a');
     }
@@ -1499,7 +1613,14 @@ mod tests {
         let guard = guard();
         let two_pages = alloc::vec![b'x'; 2 * crate::vm::USER_PAGE_SIZE];
         assert_eq!(
-            step_write(&payload, &two_pages, &guard, false, false),
+            step_write_with_post(
+                &payload,
+                &two_pages,
+                &guard,
+                false,
+                false,
+                |mailbox, event| mailbox.post(event)
+            ),
             V3Out::Done(two_pages.len())
         );
         drop(guard);
@@ -1522,18 +1643,28 @@ mod tests {
         let guard = guard();
         let almost_full = alloc::vec![b'a'; crate::vm::USER_PAGE_SIZE - 8];
         assert_eq!(
-            step_write(&payload, &almost_full, &guard, false, false),
+            step_write_with_post(
+                &payload,
+                &almost_full,
+                &guard,
+                false,
+                false,
+                |mailbox, event| mailbox.post(event)
+            ),
             V3Out::Done(almost_full.len())
         );
         let atomic = alloc::vec![b'b'; 16];
         assert_eq!(
-            step_write(&payload, &atomic, &guard, true, false),
+            step_write_with_post(&payload, &atomic, &guard, true, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Err(V3Errno::EAGAIN)
         );
 
         let mut out = alloc::vec![0u8; crate::vm::USER_PAGE_SIZE];
         assert_eq!(
-            step_read(&payload, &mut out, &guard, false),
+            step_read_with_post(&payload, &mut out, &guard, false, |mailbox, event| mailbox
+                .post(event)),
             V3Out::Done(almost_full.len())
         );
         drop(guard);
@@ -1548,10 +1679,16 @@ mod tests {
         // Fill the pipe exactly to its current byte capacity.
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let filled = step_write(&payload, &big, &guard, false, false);
+        let filled =
+            step_write_with_post(&payload, &big, &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         assert_eq!(filled, V3Out::Done(big.len()));
         // Next write blocks.
-        let outcome = step_write(&payload, b"y", &guard, false, false);
+        let outcome =
+            step_write_with_post(&payload, b"y", &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         match outcome {
             V3Out::Yield {
@@ -1581,11 +1718,15 @@ mod tests {
         let guard = guard();
         let dst_fill = alloc::vec![b'x'; crate::vm::USER_PAGE_SIZE];
         assert_eq!(
-            step_write(&dst, &dst_fill, &guard, false, false),
+            step_write_with_post(&dst, &dst_fill, &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(dst_fill.len())
         );
         assert_eq!(
-            step_write(&src, b"data", &guard, false, false),
+            step_write_with_post(&src, b"data", &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(4)
         );
 
@@ -1620,11 +1761,15 @@ mod tests {
         let guard = guard();
         let dst_fill = alloc::vec![b'x'; crate::vm::USER_PAGE_SIZE];
         assert_eq!(
-            step_write(&dst, &dst_fill, &guard, false, false),
+            step_write_with_post(&dst, &dst_fill, &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(dst_fill.len())
         );
         assert_eq!(
-            step_write(&src, b"data", &guard, false, false),
+            step_write_with_post(&src, b"data", &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            }),
             V3Out::Done(4)
         );
 
@@ -1654,8 +1799,13 @@ mod tests {
         let payload = payload_of(&reader);
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let _ = step_write(&payload, &big, &guard, false, false);
-        let outcome = step_write(&payload, b"y", &guard, true, false);
+        let _ = step_write_with_post(&payload, &big, &guard, false, false, |mailbox, event| {
+            mailbox.post(event)
+        });
+        let outcome =
+            step_write_with_post(&payload, b"y", &guard, true, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EAGAIN));
     }
@@ -1670,7 +1820,10 @@ mod tests {
         drop(reader);
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = guard();
-        let outcome = step_write(&payload, b"x", &guard, false, false);
+        let outcome =
+            step_write_with_post(&payload, b"x", &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EPIPE));
         drop(writer);
@@ -1713,7 +1866,9 @@ mod tests {
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
         let guard = guard();
-        let outcome = step_read(&payload, &mut buf, &guard, true);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, true, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EAGAIN));
     }
@@ -1763,7 +1918,10 @@ mod tests {
         // syscall arm in tx-shims pairs this with SIGPIPE delivery
         // before returning -EPIPE to userspace.
         let guard = guard();
-        let outcome = step_write(&payload, b"x", &guard, false, false);
+        let outcome =
+            step_write_with_post(&payload, b"x", &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EPIPE));
         drop(writer);
@@ -1781,7 +1939,9 @@ mod tests {
         // rather than parking forever.
         let mut buf = [0u8; 8];
         let guard = guard();
-        let outcome = step_read(&payload, &mut buf, &guard, false);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         assert_eq!(outcome, V3Out::Done(0));
         drop(reader);
@@ -1854,9 +2014,18 @@ mod tests {
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
         let guard = guard();
         // Seed with bytes via the (non-step_v3) write path.
-        let _ = step_write(&payload, b"hello", &guard, false, false);
+        let _ = step_write_with_post(
+            &payload,
+            b"hello",
+            &guard,
+            false,
+            false,
+            |mailbox, event| mailbox.post(event),
+        );
         let mut buf = [0u8; 8];
-        let outcome = step_read(&payload, &mut buf, &guard, false);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         match outcome {
             StepOutcome::Done(n) => {
@@ -1879,7 +2048,9 @@ mod tests {
         let payload = payload_of(&reader);
         let guard = guard();
         let mut empty: [u8; 0] = [];
-        let outcome = step_read(&payload, &mut empty, &guard, false);
+        let outcome = step_read_with_post(&payload, &mut empty, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
@@ -1899,7 +2070,9 @@ mod tests {
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
         let guard = guard();
-        let outcome = step_read(&payload, &mut buf, &guard, true);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, true, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -1919,7 +2092,9 @@ mod tests {
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
         let guard = guard();
-        let outcome = step_read(&payload, &mut buf, &guard, false);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         match outcome {
             StepOutcome::Yield {
@@ -1956,7 +2131,9 @@ mod tests {
         drop(writer);
         let mut buf = [0u8; 4];
         let guard = guard();
-        let outcome = step_read(&payload, &mut buf, &guard, false);
+        let outcome = step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
         drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
@@ -1983,7 +2160,14 @@ mod tests {
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so reader_count > 0 path is irrelevant
         let guard = guard();
-        let outcome = step_write(&payload, b"hello", &guard, false, false);
+        let outcome = step_write_with_post(
+            &payload,
+            b"hello",
+            &guard,
+            false,
+            false,
+            |mailbox, event| mailbox.post(event),
+        );
         drop(guard);
         match outcome {
             StepOutcome::Done(n) => {
@@ -2008,7 +2192,10 @@ mod tests {
         drop(reader);
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = guard();
-        let outcome = step_write(&payload, b"x", &guard, false, false);
+        let outcome =
+            step_write_with_post(&payload, b"x", &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EPIPE) => {}
@@ -2030,10 +2217,16 @@ mod tests {
         // Fill the pipe exactly to its current byte capacity.
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let filled = step_write(&payload, &big, &guard, false, false);
+        let filled =
+            step_write_with_post(&payload, &big, &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         assert_eq!(filled, V3Out::Done(big.len()));
         // Next write blocks → Yield::OnWaitSource with empty progress.
-        let outcome = step_write(&payload, b"y", &guard, false, false);
+        let outcome =
+            step_write_with_post(&payload, b"y", &guard, false, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         match outcome {
             StepOutcome::Yield {
@@ -2067,8 +2260,13 @@ mod tests {
         let payload = payload_of(&reader);
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let _ = step_write(&payload, &big, &guard, false, false);
-        let outcome = step_write(&payload, b"y", &guard, true, false);
+        let _ = step_write_with_post(&payload, &big, &guard, false, false, |mailbox, event| {
+            mailbox.post(event)
+        });
+        let outcome =
+            step_write_with_post(&payload, b"y", &guard, true, false, |mailbox, event| {
+                mailbox.post(event)
+            });
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -2159,10 +2357,11 @@ mod step_op_wraps {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let mut empty: [u8; 0] = [];
-        let mut op = ReadOp {
+        let mut op = ReadWithPostOp {
             payload: &payload,
             out: &mut empty,
             nonblocking: false,
+            post: |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -2177,10 +2376,11 @@ mod step_op_wraps {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
-        let mut op = ReadOp {
+        let mut op = ReadWithPostOp {
             payload: &payload,
             out: &mut buf,
             nonblocking: true,
+            post: |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -2195,17 +2395,25 @@ mod step_op_wraps {
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
-                        // Seed via the free fn (its own guard scope so the StepOp wrap
-                        // below acquires its own per STEP_MODEL §1).
+                        // Seed via the post-injected helper (its own guard scope so the
+                        // StepOp wrap below acquires its own per STEP_MODEL §1).
         {
             let guard = guard();
-            let _ = step_write(&payload, b"hello", &guard, false, false);
+            let _ = step_write_with_post(
+                &payload,
+                b"hello",
+                &guard,
+                false,
+                false,
+                |mailbox, event| mailbox.post(event),
+            );
         }
         let mut buf = [0u8; 8];
-        let mut op = ReadOp {
+        let mut op = ReadWithPostOp {
             payload: &payload,
             out: &mut buf,
             nonblocking: false,
+            post: |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -2223,10 +2431,11 @@ mod step_op_wraps {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
-        let mut op = ReadOp {
+        let mut op = ReadWithPostOp {
             payload: &payload,
             out: &mut buf,
             nonblocking: false,
+            post: |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -2252,11 +2461,12 @@ mod step_op_wraps {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let bytes: &[u8] = &[];
-        let mut op = WriteOp {
+        let mut op = WriteWithPostOp {
             payload: &payload,
             bytes,
             nonblocking: false,
             packet_mode: false,
+            post: |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -2273,11 +2483,12 @@ mod step_op_wraps {
         let _ = writer; // hold writer alive
         let _ = reader; // hold reader alive
         let bytes: &[u8] = b"hello";
-        let mut op = WriteOp {
+        let mut op = WriteWithPostOp {
             payload: &payload,
             bytes,
             nonblocking: false,
             packet_mode: false,
+            post: |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -2295,11 +2506,12 @@ mod step_op_wraps {
         drop(reader);
         assert_eq!(payload.reader_count_snapshot(), 0);
         let bytes: &[u8] = b"x";
-        let mut op = WriteOp {
+        let mut op = WriteWithPostOp {
             payload: &payload,
             bytes,
             nonblocking: false,
             packet_mode: false,
+            post: |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {

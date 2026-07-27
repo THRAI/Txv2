@@ -22,6 +22,7 @@ pub mod scripts;
 pub mod step_ops;
 mod structure;
 mod user_access;
+mod vdso;
 
 #[cfg(test)]
 pub(crate) use pmap::TestPmap;
@@ -54,24 +55,17 @@ pub use structure::{
     VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
     VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
     VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
-    WouldBlock, FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
+    VmSpecialBacking, WouldBlock, FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
 };
 pub use user_access::UserAccessKind;
+pub use vdso::{
+    map_vdso_into_aspace, vdso_rt_sigreturn_addr, VdsoLayout, VdsoMapping, VDSO_RESERVATION_WINDOW,
+};
 
 pub fn reset_debug_phase_totals() {
     structure::reset_private_page_debug_totals();
     structure::reset_recipe_debug_totals();
     pmap::reset_pmap_debug_totals();
-}
-
-/// Drop recipe roots that EBR has already proven unreachable.
-///
-/// Recipe EBR callbacks only enqueue old immutable roots; draining here moves
-/// the potentially expensive tree destruction into explicit VM maintenance
-/// batches. Delaying the drop is conservative for reader safety because EBR has
-/// already completed before an item enters this queue.
-pub fn drain_deferred_recipe_reclaims(limit: usize) -> usize {
-    structure::drain_deferred_recipe_reclaims(limit)
 }
 
 pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
@@ -119,29 +113,6 @@ pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
             ("chunk_alloc_count", recipe.chunk_alloc_count),
         ],
     );
-    let recipe_reclaim_avg_ns = if recipe.reclaim_count == 0 {
-        0
-    } else {
-        recipe.reclaim_total_ns / recipe.reclaim_count
-    };
-    write_debug_line::<P>(
-        ":vm:phase-total:recipe.reclaim_tree",
-        &[
-            ("count", recipe.reclaim_count),
-            ("total_ns", recipe.reclaim_total_ns),
-            ("avg_ns", recipe_reclaim_avg_ns),
-            ("max_ns", recipe.reclaim_max_ns),
-            ("node_total", recipe.reclaim_node_total),
-            ("node_max", recipe.reclaim_node_max),
-            ("deferred_enqueued", recipe.deferred_reclaim_enqueued),
-            ("deferred_drained", recipe.deferred_reclaim_drained),
-            (
-                "deferred_inline_fallback",
-                recipe.deferred_reclaim_inline_fallback,
-            ),
-        ],
-    );
-
     let pmap = pmap::pmap_debug_totals();
     let pmap_avg_ns = if pmap.batch_insert_count == 0 {
         0

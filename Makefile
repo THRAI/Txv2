@@ -17,9 +17,17 @@ OSCOMP_TARGET ?= rv64-qemu
 OSCOMP_EXTRA ?=
 HOST_CARGO_TARGET_DIR ?= target/host-cargo
 OSCOMP_KERNEL_PROFILE ?= --release
+DEMO_TARGET ?= rv64-qemu
+DEMO_PROFILE ?= alpine
+DEMO_BOOT_MODE ?= alpine
+DEMO_ALPINE_ROOTFS ?= target/rootfs/alpine-rv64-qemu
+DEMO_TCC_STAGE ?= target/rootfs/alpine-tcc-dev-ext4-stage
+DEMO_TCC_EXT4 ?= target/images/alpine-tcc-dev-root-rv64-qemu.ext4
+DEMO_CMDLINE ?= tx.mount.sdcard=0
+DEMO_RUSTFLAGS ?= --cfg tx_demo_boot
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
-	all all-rv all-both setup-cargo-config \
+	all all-rv all-both setup-cargo-config demo \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
 	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
@@ -59,6 +67,7 @@ docker-help:
 	@echo "  make oscomp-export-testcase"
 	@echo "  make docker-busybox-la64"
 	@echo "  make docker-oscomp-prepare docker-oscomp-submit docker-oscomp-run"
+	@echo "  make demo"
 
 # Default OSComp entry point for submit builds. Match the official autotest
 # expectation by preparing both RV64 and LA64 kernels from `make all`.
@@ -77,6 +86,13 @@ all-both: setup-cargo-config
 	cargo xtask build --target rv64-qemu $(OSCOMP_KERNEL_PROFILE)
 	cargo xtask build --target la64-qemu $(OSCOMP_KERNEL_PROFILE)
 	cargo xtask oscomp submit --target all --submit . $(OSCOMP_KERNEL_PROFILE)
+
+demo:
+	sh tools/demo/sqlite-tcc/install-to-rootfs.sh $(DEMO_ALPINE_ROOTFS)
+	sh tools/demo/sqlite-tcc/prepare-tcc-ext4.sh $(DEMO_TCC_STAGE) $(DEMO_TCC_EXT4)
+	TX_ALPINE_ROOTFS=$(DEMO_ALPINE_ROOTFS) cargo xtask image cpio --profile $(DEMO_PROFILE) --target $(DEMO_TARGET)
+	RUSTFLAGS="$(strip $(RUSTFLAGS) $(DEMO_RUSTFLAGS))" cargo xtask build --target $(DEMO_TARGET)
+	cargo xtask qemu --target $(DEMO_TARGET) --profile $(DEMO_PROFILE) --boot-mode $(DEMO_BOOT_MODE) --interactive --append-cmdline "$(DEMO_CMDLINE)" --extra-rv64-ext4 $(DEMO_TCC_EXT4)
 
 docker-build:
 	$(DOCKER_COMPOSE) build $(DOCKER_SERVICE)
@@ -243,9 +259,13 @@ OSCOMP_LTP_GROUP = $(if $(strip $(OSCOMP_LTP)),ltp-musl:$(subst $(COMMA),+,$(OSC
 OSCOMP_EFFECTIVE_GROUPS = $(if $(strip $(OSCOMP_LIBCTEST)),$(OSCOMP_LIBCTEST_GROUP),$(if $(strip $(OSCOMP_LTP)),$(OSCOMP_LTP_GROUP),$(OSCOMP_GROUPS)))
 OSCOMP_LTP_MAX_RUNTIME_CMDLINE = $(if $(strip $(LTP_MAX_RUNTIME)),tx.ltp.max_runtime=$(LTP_MAX_RUNTIME),)
 OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE = $(if $(strip $(LTP_MAX_RUNTIME_CASES)),tx.ltp.max_runtime_cases=$(subst $(COMMA),+,$(LTP_MAX_RUNTIME_CASES)),)
-OSCOMP_CMDLINE = $(strip $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
-OSCOMP_APPEND_RV = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
-OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
+OSCOMP_TEST_INIT ?= 1
+OSCOMP_TEST_INITRD_RV ?= target/images/test-init-initramfs-rv64-qemu.cpio
+OSCOMP_TEST_INITRD_LA ?= target/images/test-init-initramfs-la64-qemu.cpio
+OSCOMP_TEST_INIT_CMDLINE = $(if $(filter 1,$(OSCOMP_TEST_INIT)),init=/tx-test-init tx.test_init=1,)
+OSCOMP_CMDLINE = $(strip tx.boot.mode=oscomp $(OSCOMP_TEST_INIT_CMDLINE) $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
+OSCOMP_APPEND_RV = $(if $(filter 1,$(OSCOMP_TEST_INIT)),-initrd $(OSCOMP_TEST_INITRD_RV),) $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
+OSCOMP_APPEND_LA = $(if $(filter 1,$(OSCOMP_TEST_INIT)),-initrd $(OSCOMP_TEST_INITRD_LA) -fw_cfg name=opt/tx.initrd$(COMMA)file=$(OSCOMP_TEST_INITRD_LA),) $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)' -fw_cfg name=opt/tx.cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)
 OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
 OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
 OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'
@@ -295,6 +315,7 @@ oscomp-submit-la64:
 	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target la64-qemu --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-qemu-rv64:
+	$(if $(filter 1,$(OSCOMP_TEST_INIT)),cargo xtask image test-init --profile busybox --target rv64-qemu,)
 	set -o pipefail; \
 	qemu-system-riscv64 -machine virt \
 		-kernel $(OSCOMP_SUBMIT)/kernel-rv \
@@ -309,6 +330,7 @@ oscomp-qemu-rv64:
 
 oscomp-qemu-rv64-smp2:
 	mkdir -p $(dir $(OSCOMP_OUT_RV_SMP2))
+	$(if $(filter 1,$(OSCOMP_TEST_INIT)),cargo xtask image test-init --profile busybox --target rv64-qemu,)
 	set -o pipefail; \
 	qemu-system-riscv64 -machine virt \
 		-kernel $(OSCOMP_SUBMIT)/kernel-rv \
@@ -323,6 +345,7 @@ oscomp-qemu-rv64-smp2:
 
 oscomp-qemu-rv64-smp4:
 	mkdir -p $(dir $(OSCOMP_OUT_RV_SMP4))
+	$(if $(filter 1,$(OSCOMP_TEST_INIT)),cargo xtask image test-init --profile busybox --target rv64-qemu,)
 	set -o pipefail; \
 	qemu-system-riscv64 -machine virt \
 		-kernel $(OSCOMP_SUBMIT)/kernel-rv \
@@ -336,6 +359,7 @@ oscomp-qemu-rv64-smp4:
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_RV_SMP4) | $(OSCOMP_CONSOLE_FILTER)
 
 oscomp-qemu-la64:
+	$(if $(filter 1,$(OSCOMP_TEST_INIT)),cargo xtask image test-init --profile busybox --target la64-qemu,)
 	set -o pipefail; \
 	qemu-system-loongarch64 \
 		-kernel $(OSCOMP_SUBMIT)/kernel-la \
@@ -350,6 +374,7 @@ oscomp-qemu-la64:
 
 oscomp-qemu-la64-smp4:
 	mkdir -p $(dir $(OSCOMP_OUT_LA_SMP4))
+	$(if $(filter 1,$(OSCOMP_TEST_INIT)),cargo xtask image test-init --profile busybox --target la64-qemu,)
 	set -o pipefail; \
 	qemu-system-loongarch64 \
 		-kernel $(OSCOMP_SUBMIT)/kernel-la \

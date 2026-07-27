@@ -34,6 +34,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -41,18 +42,26 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    Arch, Asid, DeadlineTimerIf, EntropyIf, MonotonicCounterIf, PhysAddr, PlatformConfig,
+    PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, PtNode, UserPtr, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
-use tx_shims::adapter::step_engine::Cap;
-use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
+use tx_shims::adapter::step_engine::{self as zone, Cap};
+use tx_substrate::step::InterestMask;
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+use tx_subsystems::aio::{
+    reset_context_id_counter_for_test, AioWorkerFuture, EVENTS_AVAILABLE_MASK, IOCB_CMD_PREAD,
+};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
+use tx_subsystems::vm::{
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest, USER_PAGE_SIZE,
+};
 use tx_subsystems::zones;
 
 use tx_shims::linux_syscall::aio::{reset_worker_registry_for_test, take_worker_future_for_test};
@@ -118,20 +127,34 @@ impl tx_hal::ConsoleIf for StubPmap {
 }
 impl tx_hal::SmpIf for StubPmap {}
 
-impl TimeIf for StubPmap {
+impl MonotonicCounterIf for StubPmap {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
 
+impl DeadlineTimerIf for StubPmap {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for StubPmap {}
+
 // -------- Setup ----------------------------------------------------
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+static AIO_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_aio_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    AIO_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post(event)
+}
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -196,27 +219,65 @@ fn encode_iocb(
     buf
 }
 
-#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
-fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
-        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
-    let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
-        .iter_mut()
-        .map(|b| b.as_mut_ptr() as u64)
-        .collect();
-    let iocbpp_ptr = pointers.as_mut_ptr() as u64;
-    let _leak = alloc::boxed::Box::leak(pointers.into_boxed_slice());
-    (iocbpp_ptr, heap_iocbs)
+const USER_AIO_IOCBPP: usize = 0x5300_0000;
+const USER_AIO_EVENTS: usize = 0x5300_4000;
+
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
 }
 
-/// Heap-allocate a buffer large enough for `n` `struct io_event`
-/// records (32 bytes each) and return the raw pointer; leak it for
-/// the test's lifetime so the user-VA write stays valid across
-/// `sys_io_getevents` and the post-syscall assertion.
-fn stage_events_buffer(n: usize) -> u64 {
-    let buf: alloc::boxed::Box<[u8]> = alloc::vec![0u8; n * 32].into_boxed_slice();
-    let leak = alloc::boxed::Box::leak(buf);
-    leak.as_mut_ptr() as u64
+fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, len: usize) {
+    let len = align_up(len.max(1), USER_PAGE_SIZE);
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), len).expect("aligned user range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace
+        .try_mmap(request)
+        .expect("mmap anon for aio io_getevents test");
+}
+
+fn copy_to_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_to_user(UserPtr::<u8>::new(uaddr), bytes, &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(bytes.len()));
+}
+
+fn copy_from_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, out: &mut [u8]) {
+    let guard = zone::guard();
+    let copied = ctx
+        .aspace
+        .copy_from_user(out, UserPtr::<u8>::new(uaddr), &guard);
+    drop(guard);
+    assert_eq!(copied, zone::StepOutcome::Done(out.len()));
+}
+
+fn stage_iocb_array(ctx: &SyscallCtx<'_>, base: usize, iocbs: &[[u8; 64]]) -> u64 {
+    let pointer_bytes_len = iocbs.len() * core::mem::size_of::<u64>();
+    let iocb_base = base + USER_PAGE_SIZE;
+    map_user_bytes(ctx, base, pointer_bytes_len);
+    map_user_bytes(ctx, iocb_base, iocbs.len() * 64);
+
+    let mut pointer_bytes = alloc::vec![0u8; pointer_bytes_len];
+    for (i, iocb) in iocbs.iter().enumerate() {
+        let iocb_addr = iocb_base + i * 64;
+        pointer_bytes[i * 8..(i + 1) * 8].copy_from_slice(&(iocb_addr as u64).to_le_bytes());
+        copy_to_user_bytes(ctx, iocb_addr, iocb);
+    }
+    copy_to_user_bytes(ctx, base, &pointer_bytes);
+    base as u64
+}
+
+fn stage_events_buffer(ctx: &SyscallCtx<'_>, uaddr: usize, n: usize) -> u64 {
+    map_user_bytes(ctx, uaddr, n * 32);
+    uaddr as u64
 }
 
 fn pump_worker_until<F>(mut worker: AioWorkerFuture, mut done: F, budget: u32) -> AioWorkerFuture
@@ -244,9 +305,10 @@ where
 #[test]
 fn submit_dispatch_completion_round_trip() {
     let _g = setup();
+    AIO_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
     let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox_ref_post(counting_aio_ref_post);
 
     let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
@@ -259,13 +321,24 @@ fn submit_dispatch_completion_round_trip() {
         .aio_context()
         .expect("aio_context accessor")
         .clone();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = aio
+        .events_available_source()
+        .prepare(
+            Arc::downgrade(&mailbox),
+            generation,
+            InterestMask::new(EVENTS_AVAILABLE_MASK),
+        )
+        .install();
+    let events_source = aio.events_available_id();
 
     let worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed by io_setup");
 
     // Submit one PREAD iocb. aio_fildes=99 → dispatcher will get
     // None from ctx.process.fd(99) → returns -EBADF (-9).
     let iocb = encode_iocb(0xCAFE_BABE, IOCB_CMD_PREAD, 99, 0, 16, 0);
-    let (iocbpp, _ka) = stage_iocb_array(&[iocb]);
+    let iocbpp = stage_iocb_array(&ctx, USER_AIO_IOCBPP, &[iocb]);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_SUBMIT, [fd as u64, 1, iocbpp, 0, 0, 0]),
@@ -275,9 +348,26 @@ fn submit_dispatch_completion_round_trip() {
     // Pump worker until one completion lands.
     _ = pump_worker_until(worker, |_| aio.completion_len() >= 1, 128);
     assert_eq!(aio.completion_len(), 1);
+    assert_eq!(
+        AIO_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "AIO worker completion should use the SyscallCtx mailbox-ref post"
+    );
+    match mailbox.poll().expect("events_available source fired") {
+        MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        } => {
+            assert_eq!(seen_generation, generation);
+            assert_eq!(source.raw(), events_source);
+            assert_eq!(interests.raw(), EVENTS_AVAILABLE_MASK);
+        }
+        other => panic!("expected AIO SourceFired, got {other:?}"),
+    }
 
     // Drain via sys_io_getevents.
-    let events_ptr = stage_events_buffer(2);
+    let events_ptr = stage_events_buffer(&ctx, USER_AIO_EVENTS, 2);
     // timeout = 1 (any non-zero pointer) → non-blocking variant per
     // our canary semantic.
     let r = dispatch_call(
@@ -287,7 +377,8 @@ fn submit_dispatch_completion_round_trip() {
     assert_eq!(r, SyscallResult::Return(1));
 
     // Verify the event was serialised into user memory at events_ptr.
-    let event_bytes = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
+    let mut event_bytes = [0u8; 32];
+    copy_from_user_bytes(&ctx, events_ptr as usize, &mut event_bytes);
     let data = u64::from_le_bytes(event_bytes[0..8].try_into().unwrap());
     let obj = u64::from_le_bytes(event_bytes[8..16].try_into().unwrap());
     let res = i64::from_le_bytes(event_bytes[16..24].try_into().unwrap());
@@ -313,7 +404,7 @@ fn io_getevents_with_min_nr_zero_and_empty_queue_returns_zero() {
         other => panic!("expected Return, got {other:?}"),
     };
 
-    let events_ptr = stage_events_buffer(1);
+    let events_ptr = stage_events_buffer(&ctx, USER_AIO_EVENTS, 1);
     // timeout = 1 (non-blocking variant) so we don't park on the
     // wait carrier even with min_nr=0.
     let r = dispatch_call(
@@ -348,7 +439,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     // Submit two iocbs (both surface -EBADF since fd 99 absent).
     let a = encode_iocb(0xAAAA, IOCB_CMD_PREAD, 99, 0, 16, 0);
     let b = encode_iocb(0xBBBB, IOCB_CMD_PREAD, 99, 0, 16, 0);
-    let (iocbpp, _ka) = stage_iocb_array(&[a, b]);
+    let iocbpp = stage_iocb_array(&ctx, USER_AIO_IOCBPP, &[a, b]);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_SUBMIT, [fd as u64, 2, iocbpp, 0, 0, 0]),
@@ -360,7 +451,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     assert_eq!(aio.completion_len(), 2);
 
     // Drain via sys_io_getevents with min_nr = 2.
-    let events_ptr = stage_events_buffer(4);
+    let events_ptr = stage_events_buffer(&ctx, USER_AIO_EVENTS, 4);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_GETEVENTS, [fd as u64, 2, 4, events_ptr, 1, 0]),
@@ -368,8 +459,10 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     assert_eq!(r, SyscallResult::Return(2));
 
     // Both events should land at offsets 0 and 32.
-    let first = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
-    let second = unsafe { core::slice::from_raw_parts((events_ptr + 32) as *const u8, 32) };
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    copy_from_user_bytes(&ctx, events_ptr as usize, &mut first);
+    copy_from_user_bytes(&ctx, events_ptr as usize + 32, &mut second);
     let data0 = u64::from_le_bytes(first[0..8].try_into().unwrap());
     let data1 = u64::from_le_bytes(second[0..8].try_into().unwrap());
     assert_eq!(data0, 0xAAAA);
@@ -385,7 +478,7 @@ fn io_getevents_against_non_aio_fd_returns_einval_or_ebadf() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let events_ptr = stage_events_buffer(1);
+    let events_ptr = stage_events_buffer(&ctx, USER_AIO_EVENTS, 1);
     let r = dispatch_call(
         &ctx,
         SyscallRequest::new(NR_IO_GETEVENTS, [0, 0, 1, events_ptr, 1, 0]),

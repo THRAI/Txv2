@@ -2,16 +2,20 @@
 
 use super::*;
 
+use crate::adapter::step_engine::{reserve_for, sign_for};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
     SourceLabel,
 };
 use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
-use tx_subsystems::vfs::structure::{DEntry, InlineName, RNodeBacking, StructPayload, S_IFREG};
+use tx_subsystems::vfs::structure::{
+    DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, StructPayload, S_IFDIR, S_IFREG,
+};
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
@@ -123,9 +127,41 @@ fn build_procfs_root(dev_id: u32, mount_id: u64) -> Cap<DEntry> {
     build_procfs_root_with_mount(dev_id, mount_id).0
 }
 
-// Ids 90/90 stay clear of the 73/74 roots other tests in this file build.
 fn build_mount_api_test_root() -> (Cap<DEntry>, Cap<MountIdentity>) {
-    build_procfs_root_with_mount(90, 90)
+    let tmpfs = Arc::new(Tmpfs::new());
+    let payload = MountPayload::new_cap(
+        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        DevId::new(75),
+        MountOptions::default(),
+        "tmpfs-netns-mount",
+        SourceLabel::Static("tmpfs-netns-mount"),
+    )
+    .expect("tmpfs mount payload");
+
+    let root_rnode = {
+        let raw = RNode::new(
+            TMPFS_ROOT_OBJECT_ID,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let res = reserve_for::<RNode>().expect("root rnode reservation");
+        sign_for(res, raw)
+    };
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
+    let root_mount = MountIdentity::new_cap(
+        MountId::new(75),
+        None,
+        root_rnode,
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("root mount identity");
+
+    (root_dentry, root_mount)
 }
 
 #[test]

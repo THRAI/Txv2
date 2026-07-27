@@ -6,6 +6,7 @@
 //! validation; the day-1 queue operations are non-blocking over the
 //! SysV message queue substrate.
 
+use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -15,6 +16,7 @@ use crate::ipc::posix_mq::structure::{self, MqNotification};
 use crate::ipc::sysv_msg::structure::Msg;
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::Cap;
+use crate::process::adapter::wait_routing::{MailboxEvent, TaskMailbox, WaitSource};
 use crate::process::nsproxy::PosixMqName;
 use crate::signal::SignalTarget;
 
@@ -35,12 +37,14 @@ pub struct MqAttr {
 }
 
 /// Poll/readiness snapshot for fd-shaped POSIX mq descriptors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct MqPollInfo {
     pub readable: bool,
     pub writable: bool,
     pub read_source_id: u64,
     pub write_source_id: u64,
+    pub read_endpoint: Arc<WaitSource>,
+    pub write_endpoint: Arc<WaitSource>,
 }
 
 pub const MQ_O_CREAT: i32 = 0o100;
@@ -136,16 +140,41 @@ pub fn step_mq_open(
 }
 
 // ---------------------------------------------------------------------------
-// step_mq_send / step_mq_receive
+// mq send / receive
 // ---------------------------------------------------------------------------
 
 /// `mq_send(mqfd, msg_ptr, msg_len, msg_prio)` — send a message.
-pub fn step_mq_send(
+pub fn step_mq_send_with_post<F>(
     instance: &structure::PosixMqInstance,
     msg: &[u8],
     prio: u32,
     cred: &Cap<Cred>,
-) -> Result<(), Errno> {
+    post: F,
+) -> Result<(), Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    step_mq_send_with_posts(instance, msg, prio, cred, post, |mailbox, event| {
+        if let Some(mailbox) = mailbox.upgrade() {
+            let _ = mailbox.post(event);
+        }
+    })
+}
+
+/// `mq_send(mqfd, msg_ptr, msg_len, msg_prio)` with separate readiness and
+/// signal-post seams.
+pub fn step_mq_send_with_posts<R, S>(
+    instance: &structure::PosixMqInstance,
+    msg: &[u8],
+    prio: u32,
+    cred: &Cap<Cred>,
+    mut readiness_post: R,
+    mut signal_post: S,
+) -> Result<(), Errno>
+where
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    S: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -201,7 +230,10 @@ pub fn step_mq_send(
         payload.msg_count.fetch_add(1, Ordering::Release);
         payload.queue_seq.fetch_add(1, Ordering::Release);
         let woken_receivers =
-            crate::ipc::posix_mq::notification::notify_message_available(&payload.recv_channel);
+            crate::ipc::posix_mq::notification::notify_message_available_with_post(
+                &payload.recv_source,
+                &mut readiness_post,
+            );
 
         if was_empty && woken_receivers == 0 {
             instance.identity.notify.lock().take()
@@ -216,8 +248,11 @@ pub fn step_mq_send(
                 let guard = crate::process::adapter::step_engine::guard();
                 if let Some(owner) = owner.upgrade(&guard) {
                     drop(guard);
-                    let _ =
-                        crate::signal::deliver_posix_signal(SignalTarget::Process(owner), signum);
+                    let _ = crate::signal::deliver_posix_signal_with_post(
+                        SignalTarget::Process(owner),
+                        signum,
+                        &mut signal_post,
+                    );
                 }
             }
             MqNotification::None => {}
@@ -227,11 +262,15 @@ pub fn step_mq_send(
 }
 
 /// `mq_receive(mqfd, msg_ptr, msg_len, msg_prio)` — receive a message.
-pub fn step_mq_receive(
+pub fn step_mq_receive_with_post<F>(
     instance: &structure::PosixMqInstance,
     max_len: usize,
     cred: &Cap<Cred>,
-) -> Result<(Vec<u8>, u32), Errno> {
+    post: F,
+) -> Result<(Vec<u8>, u32), Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -272,7 +311,10 @@ pub fn step_mq_receive(
         .current_bytes
         .fetch_sub(msg_len as u64, Ordering::Release);
     payload.msg_count.fetch_sub(1, Ordering::Release);
-    crate::ipc::posix_mq::notification::notify_space_available(&payload.send_channel);
+    crate::ipc::posix_mq::notification::notify_space_available_with_post(
+        &payload.send_source,
+        post,
+    );
     Ok((msg.mtext, msg.mtype.saturating_sub(1) as u32))
 }
 
@@ -311,6 +353,8 @@ pub fn step_mq_poll_info(instance: &structure::PosixMqInstance) -> Result<MqPoll
         writable: msg_count < instance.maxmsg() && current_bytes < payload.max_bytes as u64,
         read_source_id: payload.recv_source_id,
         write_source_id: payload.send_source_id,
+        read_endpoint: Arc::clone(payload.recv_endpoint()),
+        write_endpoint: Arc::clone(payload.send_endpoint()),
     })
 }
 

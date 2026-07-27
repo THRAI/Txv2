@@ -1,27 +1,20 @@
-//! PR-3D-4 (D2/D4): per-TTY `wait_source` `WaitSource` integration tests.
+//! PR-3D-4: per-TTY `read_endpoint` integration tests.
 //!
-//! Pin the new task-mailbox-based wake path that runs in parallel
-//! with the legacy `Channel`+`Waker` path on per-TTY input-readable
-//! transitions. The legacy path is exercised by
-//! `crates/tx-subsystems/src/tty/tests/legacy_phase_a.rs` and the
-//! `step_ingest` step-op-wraps; this file pins the new path so PR-3D-5
-//! reviewers see what a migrated consumer looks like end-to-end.
+//! Pin the task-mailbox-based wake path on per-TTY input-readable
+//! transitions. This file pins the endpoint path so PR-3D-5 reviewers see
+//! what a migrated consumer looks like end-to-end.
 //!
 //! TTY wake-key model: one `WaitSource` per `TtyIdentity`, one bit
 //! (`TTY_READABLE`). Even though `TtyIdentity` has multiple readiness
 //! wires (`input_readable` / `output_writable` / `hangup_port` /
-//! `session_ctl_port`), only `input_readable` is paired with a
-//! reactor `Channel` today — the others are `RawPort`/`RawQueue`
-//! shapes not in this PR's bus-consumer scope. The single
-//! `wait_channel` is therefore the only Channel migrating; one
-//! `Arc<WaitSource>` mirrors it. This is the same "one source per
+//! `session_ctl_port`), only `input_readable` exposes an object-owned
+//! `read_endpoint()` today. The others are `RawPort`/`RawQueue`
+//! shapes outside this endpoint slice. This is the same "one source per
 //! object" shape as `exit_source` (PR-3D-3), simpler than pipe's
 //! two-port shape, and the template applies verbatim.
 //!
 //! The fire site is `step_ingest`: every byte-ingest that transitions
-//! the input queue to readable fires both the legacy
-//! `tty.wait_channel().fire(Mask)` and the new
-//! `tty.wait_source().notify(InterestMask)` in the same arm.
+//! the input queue to readable fires `tty.wait_source().notify(InterestMask)`.
 //!
 //! Invariants pinned (bundled into a single `#[test]` per the cred-
 //! zone / exit_wait_source integration-test precedent:
@@ -39,15 +32,14 @@
 //!    while the input queue is empty; a subsequent `step_ingest`
 //!    posts a `MailboxEvent::SourceFired` with the registration's
 //!    generation and the `TTY_READABLE` interest.
-//! 3. **D2-coexistence: legacy_channel_still_fires**. A `Channel.wait`
-//!    future parked on the legacy `wait_channel` keeps firing
-//!    alongside the new path. The shared `step_ingest` callsite is
-//!    the legacy + new dual-fire site; if D2 coexistence regresses,
-//!    one of the two would leave its consumer parked.
+//! 3. **endpoint-wait-resolves-on-step_ingest**. A future created through
+//!    `wait_on_endpoint(tty.read_endpoint(), TTY_READABLE)` parks while the
+//!    input queue is empty and resolves after `step_ingest` publishes
+//!    readability.
 //! 4. **hangup-does-not-double-fire-source**. `step_hangup` clears
 //!    the payload and fires `hangup_port` / `session_ctl_port` but
-//!    those are `RawPort` shapes — the `wait_source` (paired with
-//!    `wait_channel`) has no fire site on hangup itself. Pin that
+//!    those are `RawPort` shapes — the read endpoint has no fire site on
+//!    hangup itself. Pin that
 //!    a hangup transition does NOT post a new `SourceFired` event
 //!    (the source remains observable through the identity since
 //!    identity outlives hangup).
@@ -61,22 +53,25 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
+use tx_substrate::wake::{WaitGeneration, WaitRegistrationGuard};
 use tx_subsystems::tty::adapter::step_engine::{
     self as zone_mod, guard as ebr_guard, ByteProgress, Cap, InterestMask, PayloadCap, StepOutcome,
     WaitSourceId,
 };
 use tx_subsystems::tty::adapter::wait_routing::{
-    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource,
 };
 
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
-use tx_subsystems::tty::execution::{step_hangup, step_ingest, TTY_READABLE};
+use tx_subsystems::tty::execution::{step_hangup, step_ingest_with_post, TTY_READABLE};
 use tx_subsystems::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use tx_subsystems::zones;
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TTY_REF_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct NoopOps;
 
@@ -159,6 +154,56 @@ fn assert_source_fired_for(
     }
 }
 
+fn counting_tty_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    TTY_REF_POST_COUNT.fetch_add(1, Ordering::SeqCst);
+    mailbox.post_with_scheduler_hint(event, hint)
+}
+
+#[test]
+fn tty_ingest_uses_injected_mailbox_ref_post_for_readable_wake() {
+    let _setup = setup();
+    TTY_REF_POST_COUNT.store(0, Ordering::SeqCst);
+
+    let tty = alloc_hardware_tty(701, "ttyV3-with-post");
+    let tty_source_id = tty.wait_source_id();
+    let tty_source: Arc<WaitSource> = tty.wait_source().clone();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let (_reg_guard, gen) = register(&tty_source, &mailbox, TTY_READABLE);
+
+    let guard = ebr_guard();
+    let outcome = step_ingest_with_post(&tty, b"\n", &guard, counting_tty_ref_post_with_hint);
+    drop(guard);
+
+    use tx_subsystems::tty::adapter::step_engine::StepOutcome as V3;
+    match outcome {
+        V3::Done(o) => assert!(o.readable_fired, "expected readable_fired"),
+        other => panic!("expected Done(_) with readable_fired, got {other:?}"),
+    }
+
+    assert_eq!(
+        TTY_REF_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "TTY readable wake should route through injected mailbox-ref post"
+    );
+    assert_source_fired_for(
+        &mailbox,
+        WaitSourceId::new(tty_source_id),
+        gen,
+        TTY_READABLE,
+    );
+    assert!(
+        mailbox.is_empty(),
+        "only one readable event should be posted"
+    );
+
+    drop(tty);
+    tx_test_support::drain_to_quiescence();
+}
+
 /// Single integration test that bootstraps once and walks every
 /// `wait_source` invariant in order. Mirrors the exit_wait_source /
 /// cred-zone integration-test structure (the `reset_*_for_test`
@@ -173,6 +218,11 @@ fn tty_wait_source_invariants_round_trip() {
     // ---- (1) WaitSourceId round-trip pin --------------------------
     let tty_source_id = tty.wait_source_id();
     let tty_source: Arc<WaitSource> = tty.wait_source().clone();
+    assert_eq!(
+        tx_substrate::wake::WaitEndpoint::source_id(tty.read_endpoint()),
+        WaitSourceId::new(tty_source_id),
+        "read_endpoint must expose the same TTY readable WaitSource",
+    );
     assert_eq!(
         tty_source.id(),
         WaitSourceId::new(tty_source_id),
@@ -190,8 +240,7 @@ fn tty_wait_source_invariants_round_trip() {
     let (_reg_guard, gen) = register(&tty_source, &mailbox, TTY_READABLE);
     assert!(mailbox.is_empty(), "no events before any byte ingest");
 
-    // ---- (3) D2-coexistence: drive a legacy `Channel.wait` future
-    // through Pending -> Ready across the same step_ingest call.
+    // ---- (3) Endpoint wait future resolves across the same step_ingest call.
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -206,20 +255,21 @@ fn tty_wait_source_invariants_round_trip() {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
 
-    let legacy_channel = tx_subsystems::wait_source::lookup_wait_channel(tty_source_id)
-        .expect("legacy resolver still has the carrier");
-    let mut legacy_wait = legacy_channel.wait(Mask::from_bits(TTY_READABLE));
-    let pre_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
+    let mut endpoint_wait =
+        tx_subsystems::wait_source::wait_on_endpoint(tty.read_endpoint(), TTY_READABLE);
+    let pre_endpoint = Pin::new(&mut endpoint_wait).poll(&mut cx);
     assert!(
-        matches!(pre_legacy, Poll::Pending),
-        "no fires yet -> legacy Pending"
+        matches!(pre_endpoint, Poll::Pending),
+        "no fires yet -> endpoint Pending"
     );
 
     // Single byte-ingest transition. `\n` commits a cooked line under
     // default_cooked() termios, which fires `input_readable` and
-    // both the legacy `wait_channel` and the new `wait_source`.
+    // the mailbox `wait_source`.
     let guard = ebr_guard();
-    let outcome = step_ingest(&tty, b"\n", &guard);
+    let outcome = step_ingest_with_post(&tty, b"\n", &guard, |mailbox, event, hint| {
+        mailbox.post_with_scheduler_hint(event, hint)
+    });
     drop(guard);
     use tx_subsystems::tty::adapter::step_engine::StepOutcome as V3;
     match outcome {
@@ -239,11 +289,11 @@ fn tty_wait_source_invariants_round_trip() {
         "new path posts exactly one event per readable transition"
     );
 
-    // (3) D2 coexistence: legacy `Channel.wait` future also resolves.
-    let post_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
+    // (3) Endpoint wait future also resolves.
+    let post_endpoint = Pin::new(&mut endpoint_wait).poll(&mut cx);
     assert!(
-        matches!(post_legacy, Poll::Ready(_)),
-        "legacy Channel.fire on step_ingest must release the parked awaiter",
+        matches!(post_endpoint, Poll::Ready(_)),
+        "WaitEndpoint notify on step_ingest must release the parked awaiter",
     );
 
     // ---- (4) hangup does NOT double-fire the input wait_source ----

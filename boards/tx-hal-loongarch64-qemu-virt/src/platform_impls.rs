@@ -561,6 +561,7 @@ impl FpSimdIf for Platform {
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = QEMU_LA64_GSI_BASE + QEMU_LA64_PCH_PIC_IRQS;
     const UART_IRQ: u32 = QEMU_LA64_UART0_IRQ;
+    const RTC_IRQ: u32 = QEMU_LA64_RTC_IRQ;
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0
@@ -568,6 +569,10 @@ impl IrqIf for Platform {
 
     fn interrupts_enabled() -> bool {
         read_la64_csr(LA64_CSR_CRMD) & LA64_CRMD_IE != 0
+    }
+
+    fn exclude_local_execution() -> LocalExecutionGuard {
+        exclude_la64_interrupts()
     }
 
     fn claim() -> u32 {
@@ -606,75 +611,56 @@ impl IrqIf for Platform {
         handler(irq)
     }
 }
-/// Read the QEMU virt loongson ls7a-rtc (`rtc@100d0100`) as Unix-epoch
-/// nanoseconds. The "toy" (time-of-year) read registers hold the current
-/// broken-down time; TOY_READ0 packs month/day/hour/min/sec and TOY_READ1 the
-/// year. Reachable through the DMW uncached window — no page-table entry, so
-/// (unlike RV64's goldfish-rtc) no boot mapping is required.
-#[cfg(target_arch = "loongarch64")]
-fn read_ls7a_rtc_epoch_ns() -> Option<u64> {
-    const LS7A_RTC_PHYS: usize = 0x100d_0100;
-    const TOY_READ0: usize = 0x2c;
-    const TOY_READ1: usize = 0x30;
-    const RTC_CTRL: usize = 0x40;
-    // QEMU gates the toy read registers on the enable bits; firmware normally
-    // sets them, but we boot bare `-kernel`, so enable the toy oscillator +
-    // counter ourselves before reading.
-    const TOY_ENABLE: u32 = 1 << 11;
-    const OSC_ENABLE: u32 = 1 << 8;
-    // SAFETY: the DMW uncached window maps every physical address; this only
-    // touches the ls7a-rtc MMIO registers.
-    let (toy0, year_reg) = unsafe {
-        let ctrl = (la64_uncached_virt(LS7A_RTC_PHYS) + RTC_CTRL) as *mut u32;
-        ctrl.write_volatile(ctrl.read_volatile() | TOY_ENABLE | OSC_ENABLE);
-        let toy0 = ((la64_uncached_virt(LS7A_RTC_PHYS) + TOY_READ0) as *const u32).read_volatile();
-        let year_reg =
-            ((la64_uncached_virt(LS7A_RTC_PHYS) + TOY_READ1) as *const u32).read_volatile();
-        (toy0, year_reg)
-    };
-    // TOY_READ0: mon[31:26] day[25:21] hour[20:16] min[15:10] sec[9:4] 0.1s[3:0].
-    let mon = ((toy0 >> 26) & 0x3f) as i64;
-    let day = ((toy0 >> 21) & 0x1f) as i64;
-    let hour = ((toy0 >> 16) & 0x1f) as i64;
-    let min = ((toy0 >> 10) & 0x3f) as i64;
-    let sec = ((toy0 >> 4) & 0x3f) as i64;
-    // TOY_READ1 is years-since-1900 on some QEMU builds, a full year on others;
-    // disambiguate by magnitude.
-    let year = if year_reg >= 1970 {
-        year_reg as i64
-    } else {
-        year_reg as i64 + 1900
-    };
-    if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || year < 1970 {
-        return None; // toy clock not populated
+
+fn exclude_la64_interrupts() -> LocalExecutionGuard {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let mut saved = 0usize;
+        let mask = LA64_CRMD_IE;
+        unsafe {
+            core::arch::asm!(
+                "csrxchg {saved}, {mask}, 0x00",
+                saved = inout(reg) saved,
+                mask = in(reg) mask,
+                options(nostack)
+            );
+            LocalExecutionGuard::new(saved & LA64_CRMD_IE, restore_la64_interrupts)
+        }
     }
-    let secs = civil_to_epoch_secs(year, mon, day, hour, min, sec);
-    (secs > 0).then(|| secs as u64 * 1_000_000_000)
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    unsafe {
+        LocalExecutionGuard::new(0, restore_la64_interrupts)
+    }
 }
 
-#[cfg(not(target_arch = "loongarch64"))]
-fn read_ls7a_rtc_epoch_ns() -> Option<u64> {
-    None
-}
+unsafe fn restore_la64_interrupts(saved: usize) {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        let restored = saved & LA64_CRMD_IE;
+        let mask = LA64_CRMD_IE;
+        core::arch::asm!(
+            "csrxchg {restored}, {mask}, 0x00",
+            restored = inout(reg) restored => _,
+            mask = in(reg) mask,
+            options(nostack)
+        );
+    }
 
-/// Civil (proleptic Gregorian) date to Unix-epoch seconds — Howard Hinnant's
-/// `days_from_civil` algorithm plus the intra-day seconds.
-#[cfg(target_arch = "loongarch64")]
-fn civil_to_epoch_secs(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    days * 86400 + hh * 3600 + mm * 60 + ss
+    #[cfg(not(target_arch = "loongarch64"))]
+    let _ = saved;
 }
-
-impl TimeIf for Platform {
+impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
         tx_hal::time::ticks_to_ns(la64_read_stable_counter(), Self::frequency_hz())
     }
 
+    fn frequency_hz() -> u64 {
+        la64_timebase_frequency_hz()
+    }
+}
+
+impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
         let frequency_hz = Self::frequency_hz();
         if frequency_hz == 0 {
@@ -705,15 +691,86 @@ impl TimeIf for Platform {
         let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
         write_la64_csr(LA64_CSR_CRMD, crmd);
     }
+}
 
-    fn frequency_hz() -> u64 {
-        la64_timebase_frequency_hz()
-    }
-
-    fn read_rtc_epoch_ns() -> Option<u64> {
-        read_ls7a_rtc_epoch_ns()
+fn ls7a_rtc_ensure_toy_enabled() {
+    let ctrl = ls7a_rtc_read_u32(LS7A_RTC_CTRL);
+    let required = LS7A_RTC_CTRL_EO | LS7A_RTC_CTRL_TOYEN;
+    if ctrl & required != required {
+        ls7a_rtc_write_u32(LS7A_RTC_CTRL, ctrl | required);
     }
 }
+
+#[cfg(target_arch = "loongarch64")]
+fn ls7a_rtc_read_u32(offset: usize) -> u32 {
+    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *const u32).read_volatile() }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn ls7a_rtc_write_u32(offset: usize, value: u32) {
+    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *mut u32).write_volatile(value) }
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
+fn ls7a_rtc_read_u32(_offset: usize) -> u32 {
+    0
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
+fn ls7a_rtc_write_u32(_offset: usize, _value: u32) {}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+fn ls7a_rtc_read_u32(offset: usize) -> u32 {
+    LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state")
+        .read_u32(offset)
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+fn ls7a_rtc_write_u32(offset: usize, value: u32) {
+    LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state")
+        .write_u32(offset, value);
+}
+
+impl PersistentClockIf for Platform {
+    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        ls7a_rtc_ensure_toy_enabled();
+        let toy0 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD0);
+        let toy1 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD1);
+        ls7a_unix_ns_from_toy_registers(toy0, toy1)
+    }
+
+    fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError> {
+        let (toy0, toy1) = ls7a_toy_registers_from_unix_ns(ns)?;
+        ls7a_rtc_ensure_toy_enabled();
+        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE1, toy1);
+        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE0, toy0);
+        Ok(())
+    }
+
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError> {
+        let toymatch = ls7a_toymatch_from_unix_ns(ns)?;
+        ls7a_rtc_ensure_toy_enabled();
+        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, toymatch);
+        Self::set_priority(QEMU_LA64_RTC_IRQ, 1);
+        Self::unmask(QEMU_LA64_RTC_IRQ);
+        Ok(())
+    }
+
+    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, 0);
+        Self::mask(QEMU_LA64_RTC_IRQ);
+        Ok(())
+    }
+
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        Ok(())
+    }
+}
+
 impl PercpuIf for Platform {
     fn current_cpu_id() -> CpuId {
         la64_current_cpu_id()
@@ -787,39 +844,28 @@ impl SmpIf for Platform {
         la64_wait_for_interrupt_once();
     }
 
-    fn pending_ipi(_kind: IpiKind) -> bool {
-        let _ = _kind;
-        boot_smp::pending_ipi()
+    fn pending_ipi(kind: IpiKind) -> bool {
+        boot_smp::pending_ipi(kind)
     }
 
-    fn send_ipi(target: CpuId, _kind: IpiKind) {
-        let _ = _kind;
-        boot_smp::send_ipi(target);
+    fn send_ipi(target: CpuId, kind: IpiKind) {
+        boot_smp::send_ipi(target, kind);
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-        let current = la64_current_cpu_id();
-        let mut bits = mask.bits() & !CpuMask::single(current).bits();
-        while bits != 0 {
-            let cpu = bits.trailing_zeros() as usize;
-            Self::send_ipi(CpuId(cpu), kind);
-            bits &= bits - 1;
-        }
+        boot_smp::broadcast_ipi(mask, kind);
     }
 
-    fn ack_ipi(_kind: IpiKind) {
-        let _ = _kind;
-        boot_smp::ack_ipi();
+    fn ack_ipi(kind: IpiKind) {
+        boot_smp::ack_ipi(kind);
     }
 
-    fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
-        let _ = _kind;
-        boot_smp::clear_ipi_ack_cpus(mask);
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
+        boot_smp::clear_ipi_ack_cpus(kind, mask);
     }
 
-    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
-        let _ = _kind;
-        boot_smp::ipi_ack_cpus()
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
+        boot_smp::ipi_ack_cpus(kind)
     }
 }
 

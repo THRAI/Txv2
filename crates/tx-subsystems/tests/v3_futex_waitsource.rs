@@ -1,17 +1,15 @@
 //! PR-3D-2 (D2/D4): futex-bucket `WaitSource` integration tests.
 //!
-//! Pin the new task-mailbox-based wake path that runs in parallel
-//! with the legacy `RawPort`+`Waker` path on futex buckets. The
-//! legacy path is exercised by `crates/tx-subsystems/src/futex.rs::tests`;
-//! this file pins the new path so PR-3D-3..5 reviewers see what a
-//! migrated consumer looks like end-to-end.
+//! Pin the task-mailbox-based wake path on futex buckets. This file pins
+//! the endpoint/source path so PR-3D-3..5 reviewers see what a migrated
+//! consumer looks like end-to-end.
 //!
 //! Futex wake-key model: per-bucket (256 fixed buckets keyed on
 //! `hash(uaddr) & 0xff`). `(uaddr, val)` is the wait-key but the
 //! `val` check is the per-waiter predicate done before parking; the
 //! actual wake addressing is `addr` via the bucket-hash. Bucket
 //! collisions are absorbed by the per-waiter re-check on wakeup —
-//! the same model the legacy `Channel` already used. PR-3D-2 stays on
+//! the same model the bucket `WaitSource` uses. PR-3D-2 stays on
 //! the per-bucket `Arc<WaitSource>` shape; no `(addr, val)` map.
 //!
 //! Invariants pinned:
@@ -43,16 +41,17 @@
 //!    `WaitGeneration` the registration captured.
 //! 7. **exact_wait_source_id**. The `WaitSourceId` stamped into
 //!    `step_futex_wait`'s `OnWaitSource` yield is the exact
-//!    `(aspace, uaddr)` wait source, not the legacy compatibility
-//!    bucket source.
-//! 8. **D2-coexistence**. A `step_futex_wake` call fires both the
-//!    legacy `Channel` AND the new `WaitSource` on the same step.
-//!    Mirrors the pipe-side `write_fires_both_legacy_channel_and_new_wait_source`
-//!    pin from PR-3D-1.
+//!    `(aspace, uaddr)` wait source, not the compatibility bucket source.
+//! 8. **endpoint-wait-resolves-on-wake**. A future created through
+//!    `wait_on_endpoint(bucket_endpoint, FUTEX_WAKE_MASK)` parks before
+//!    wake and resolves when `step_futex_wake` fires the bucket source.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use tx_subsystems::futex::adapter::step_engine::{
     guard as ebr_guard, InterestMask, StepOutcome, WaitSourceId, YieldShape,
@@ -68,14 +67,14 @@ use tx_hal::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, UserPtr, VirtAddr,
 };
 use tx_subsystems::futex::{
-    bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, step_futex_wait,
-    step_futex_wake, step_futex_wake_in, FUTEX_WAKE_MASK,
+    bucket_endpoint, bucket_endpoint_for_source_id, bucket_index, bucket_wait_source,
+    step_futex_wait, step_futex_wake, step_futex_wake_in, FUTEX_WAKE_MASK,
 };
 use tx_subsystems::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
     USER_PAGE_SIZE,
 };
-use tx_subsystems::wait_source as legacy_wait_source;
+use tx_subsystems::wait_source;
 use tx_subsystems::zones;
 
 /// Minimal `PmapIf` stub for integration tests — the futex wait-source
@@ -413,7 +412,7 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
     }
 }
 
-// === Invariant 7: bucket_wait_source_id round-trip =====================
+// === Invariant 7: bucket endpoint id round-trip ========================
 
 #[test]
 fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
@@ -455,7 +454,7 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
         other => panic!("expected Yield::OnWaitSource, got {other:?}"),
     };
 
-    let bucket = bucket_wait_source(uaddr).expect("bucket initialised");
+    let bucket = bucket_endpoint(uaddr).expect("bucket initialised");
     assert_ne!(
         bucket.id().raw(),
         stamped_id,
@@ -463,8 +462,8 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
     );
 
     assert!(
-        bucket_wait_source_for_source_id(stamped_id).is_none(),
-        "exact futex wait-source ids must not resolve through the legacy bucket namespace",
+        bucket_endpoint_for_source_id(stamped_id).is_none(),
+        "exact futex wait-source ids must not resolve through the bucket registry namespace",
     );
 
     let guard = ebr_guard();
@@ -473,28 +472,29 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
     assert_eq!(wake, StepOutcome::Done(1));
 }
 
-// === Invariant 8: D2 coexistence — both paths fire =====================
+// === Invariant 8: endpoint wait resolves on wake =======================
 
 #[test]
-fn wake_fires_both_legacy_channel_and_new_wait_source() {
+fn wake_fires_registered_wait_source_and_endpoint_wait() {
     let _setup = setup();
     let word: u32 = 0;
     let uaddr = &word as *const u32 as u64;
-    let source = bucket_wait_source(uaddr).expect("bucket initialised");
+    let source = bucket_endpoint(uaddr).expect("bucket initialised");
     let mailbox = Arc::new(TaskMailbox::new());
 
     let (_g, gen) = register(&source, &mailbox, FUTEX_WAKE_MASK);
 
-    // Sanity: the legacy `Channel` is still resolvable via the
-    // legacy `wait_source` registry under the same id. The legacy
-    // path's wake is `Channel::fire` — we don't directly drive a
-    // `WaitFuture` here (that requires async coordination), but we
-    // pin that the legacy id namespace is intact AND the new path
-    // is additive (mailbox receives an event in addition to whatever
-    // the legacy `Channel.fire` does).
     assert!(
-        legacy_wait_source::lookup_wait_channel(source.id().raw()).is_some(),
-        "legacy Channel must remain resolvable under the same source_id",
+        wait_source::lookup_wait_source(source.id().raw()).is_some(),
+        "bucket source must remain resolvable under the same source_id",
+    );
+
+    let waker = core::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut endpoint_wait = wait_source::wait_on_endpoint(&source, FUTEX_WAKE_MASK);
+    assert!(
+        matches!(Pin::new(&mut endpoint_wait).poll(&mut cx), Poll::Pending),
+        "no wake yet -> endpoint wait Pending",
     );
 
     let guard = ebr_guard();
@@ -505,6 +505,10 @@ fn wake_fires_both_legacy_channel_and_new_wait_source() {
         "legacy bucket wake should complete synchronously, got {outcome:?}",
     );
 
+    assert!(
+        matches!(Pin::new(&mut endpoint_wait).poll(&mut cx), Poll::Ready(_)),
+        "futex wake must release the parked endpoint awaiter",
+    );
     assert_eq!(mailbox.len(), 1, "new path must have posted one event");
     assert_source_fired(&mailbox, source.id(), gen, FUTEX_WAKE_MASK);
 }

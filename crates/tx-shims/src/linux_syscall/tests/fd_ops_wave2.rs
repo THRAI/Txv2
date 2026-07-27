@@ -2,27 +2,36 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::adapter::step_engine::{
-    self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap,
-    StepOutcome,
+    self as step_engine, Cap, StepOutcome, guard as ebr_guard, page_allocator, reserve_for,
+    sign_for,
 };
 use alloc::sync::Arc;
 use alloc::vec;
-use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use tx_subsystems::cred::{step_setresuid, CapabilitySet, Uid};
+use tx_fs::tmpfs::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
+use tx_subsystems::cred::{CapabilitySet, Uid, step_setresuid};
 use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
+use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
+use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    SourceLabel, mount_for,
 };
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::process::step_chdir;
+use tx_subsystems::process::{
+    step_chdir, step_chdir_with_mount, step_fork, step_set_mount_namespace,
+};
+use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
+use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
+    StructPayload,
 };
-use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT,
-    O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
+    AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_CLOSE, NR_DUP, NR_DUP3, NR_FACCESSAT, NR_MOUNT,
+    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_STATX, NR_UMOUNT2, NR_UNLINKAT, O_CLOEXEC, O_CREAT,
+    O_DIRECT, O_DIRECTORY, O_EXCL, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC,
+    R_OK, W_OK,
 };
 
 /// errno magnitudes: positive Linux RV64 generic ABI values.
@@ -35,6 +44,43 @@ const E_ACCES: i32 = 13;
 const E_NAMETOOLONG: i32 = 36;
 const E_MFILE: i32 = 24;
 const E_ISDIR: i32 = 21;
+const E_NXIO: i32 = 6;
+const E_LOOP: i32 = 40;
+
+const STAT_BYTES: usize = 128;
+const STAT_MODE_OFF: usize = 16;
+const STAT_RDEV_OFF: usize = 32;
+const STATX_BYTES: usize = 256;
+const STATX_MODE_OFF: usize = 28;
+const STATX_RDEV_MAJOR_OFF: usize = 128;
+const STATX_RDEV_MINOR_OFF: usize = 132;
+
+struct NoopTtyOps;
+
+impl CharDeviceOps for NoopTtyOps {
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, step_engine::ByteProgress> {
+        StepOutcome::Done(0)
+    }
+
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, step_engine::ByteProgress> {
+        StepOutcome::Done(bytes.len())
+    }
+}
+
+static NOOP_TTY_OPS: NoopTtyOps = NoopTtyOps;
+static NOOP_TTY_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(4, 64),
+    name: "fdops-tty",
+    ops: &NOOP_TTY_OPS,
+};
 
 fn ensure_zero_frame_claimed() {
     match page_allocator::claim_zero_frame() {
@@ -52,7 +98,7 @@ fn fd_ops_setup() -> TestSetup {
 /// Build a fresh tmpfs-backed mount + a root `Cap<DEntry>`.
 /// Mirrors the wave4_setup helper's shape but lives in this module
 /// so the fd-ops tests don't depend on wave4's path.
-fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
+fn build_tmpfs_root_with_mount() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<MountIdentity>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
         tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
@@ -76,7 +122,7 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
         sign_for(res, raw)
     };
 
-    let _mount = MountIdentity::new_cap(
+    let mount = MountIdentity::new_cap(
         MountId::new(21),
         None,
         root_rnode.clone(),
@@ -87,7 +133,108 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     .expect("mount identity");
 
     let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    (root_dentry, tmpfs, mount)
+}
+
+fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
+    let (root_dentry, tmpfs, _mount) = build_tmpfs_root_with_mount();
     (root_dentry, tmpfs)
+}
+
+fn build_devfs_root() -> Cap<DEntry> {
+    let payload = MountPayload::new_cap(
+        tx_fs::devfs::Devfs::fs_ops_arc(),
+        tx_fs::devfs::Devfs::fs_page_backing_arc(),
+        None,
+        DevId::new(202),
+        MountOptions::default(),
+        "devfs-fdops",
+        SourceLabel::Static("devfs-fdops"),
+    )
+    .expect("devfs mount payload");
+
+    let root_rnode = {
+        let raw = RNode::new(
+            tx_fs::devfs::DEVFS_ROOT_OBJECT_ID,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let res = reserve_for::<RNode>().expect("devfs rnode reservation");
+        sign_for(res, raw)
+    };
+
+    let _mount = MountIdentity::new_cap(
+        MountId::new(22),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("devfs mount identity");
+
+    DEntry::new_cap(InlineName::ROOT, root_rnode).expect("devfs root dentry")
+}
+
+fn build_procfs_root() -> Cap<DEntry> {
+    let procfs = tx_fs::procfs::Procfs::new();
+    let fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
+    let page_backing = Arc::new(tx_fs::procfs::Procfs::new())
+        as Arc<dyn tx_subsystems::page_backed::FsPageBacking>;
+    let payload = MountPayload::new_cap(
+        fs_ops,
+        page_backing,
+        None,
+        DevId::new(203),
+        MountOptions::default(),
+        "procfs-fdops",
+        SourceLabel::Static("procfs-fdops"),
+    )
+    .expect("procfs mount payload");
+
+    let guard = ebr_guard();
+    let meta = match procfs.load_inode_meta(tx_fs::procfs::PROCFS_ROOT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load procfs root meta failed: {other:?}"),
+    };
+    let root_rnode =
+        match procfs.materialise_rnode(tx_fs::procfs::PROCFS_ROOT_ID, meta, &payload, &guard) {
+            StepOutcome::Done(rnode) => rnode,
+            other => panic!("materialise procfs root failed: {other:?}"),
+        };
+
+    let _mount = MountIdentity::new_cap(
+        MountId::new(23),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("procfs mount identity");
+
+    DEntry::new_cap(InlineName::ROOT, root_rnode).expect("procfs root dentry")
+}
+
+fn install_ttys0_console() {
+    let guard = ebr_guard();
+    let tty = match register_hardware("ttyS0", 0, &NOOP_TTY_BINDING, &guard) {
+        StepOutcome::Done(tty) => tty,
+        other => panic!("register_hardware(ttyS0) failed: {other:?}"),
+    };
+    assert_eq!(
+        register_console_alias("console", tty),
+        StepOutcome::Done(())
+    );
+}
+
+fn install_ttys1() {
+    let guard = ebr_guard();
+    match register_hardware("ttyS1", 1, &NOOP_TTY_BINDING, &guard) {
+        StepOutcome::Done(_) => {}
+        other => panic!("register_hardware(ttyS1) failed: {other:?}"),
+    }
 }
 
 /// Bootstrap an init process whose cwd is `root_dentry`. Returns
@@ -124,9 +271,482 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
     v
 }
 
+fn openat_path(ctx: &SyscallCtx<'static>, dirfd: i32, path: &[u8], flags: u32) -> SyscallResult {
+    let path = nul_terminate(path);
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            dirfd as i64 as u64,
+            path.as_ptr() as u64,
+            flags as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    block_on(dispatch::<ShimsTestPmap>(req, ctx))
+}
+
+fn read_u16_at(buf: &[u8], off: usize) -> u16 {
+    u16::from_ne_bytes(buf[off..off + 2].try_into().expect("u16 field"))
+}
+
+fn read_u32_at(buf: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes(buf[off..off + 4].try_into().expect("u32 field"))
+}
+
+fn read_u64_at(buf: &[u8], off: usize) -> u64 {
+    u64::from_ne_bytes(buf[off..off + 8].try_into().expect("u64 field"))
+}
+
 // ----------------------------------------------------------------
 // openat
 // ----------------------------------------------------------------
+
+#[test]
+fn dispatch_openat_ttys0_auto_acquires_controlling_tty() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let session = proc_cap.pgrp_cap().session_cap();
+    assert!(session.controlling_tty_cap().is_none());
+
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let result = openat_path(&ctx, AT_FDCWD, b"ttyS0", O_RDWR);
+    let fd = match result {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat ttyS0 failed: {other:?}"),
+    };
+    assert!(proc_cap.fd(fd).is_some());
+    assert!(
+        session.controlling_tty_cap().is_some(),
+        "session leader opening ttyS0 without O_NOCTTY should acquire ctty"
+    );
+}
+
+#[test]
+fn dispatch_openat_ttys0_o_noctty_does_not_acquire_controlling_tty() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let session = proc_cap.pgrp_cap().session_cap();
+
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let result = openat_path(&ctx, AT_FDCWD, b"ttyS0", O_RDWR | O_NOCTTY);
+    match result {
+        SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
+        other => panic!("openat ttyS0 O_NOCTTY failed: {other:?}"),
+    }
+    assert!(
+        session.controlling_tty_cap().is_none(),
+        "O_NOCTTY open should not acquire controlling tty"
+    );
+}
+
+#[test]
+fn dispatch_openat_ttys0_non_session_leader_does_not_acquire_controlling_tty() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (parent, _parent_thread) = bootstrap_with_cwd(root);
+    let child = step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader thread");
+    let session = child.pgrp_cap().session_cap();
+    assert_ne!(
+        child.pid.0, session.sid.0,
+        "forked child should not be a session leader"
+    );
+
+    let ctx = make_ctx(child.clone(), child_thread);
+    let result = openat_path(&ctx, AT_FDCWD, b"ttyS0", O_RDWR);
+    match result {
+        SyscallResult::Return(fd) => assert!(child.fd(fd as u32).is_some()),
+        other => panic!("openat ttyS0 by non-session-leader failed: {other:?}"),
+    }
+    assert!(
+        session.controlling_tty_cap().is_none(),
+        "non-session-leader open must not acquire controlling tty"
+    );
+}
+
+#[test]
+fn dispatch_openat_ttys1_after_existing_ctty_does_not_rebind() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    install_ttys1();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let session = proc_cap.pgrp_cap().session_cap();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    match openat_path(&ctx, AT_FDCWD, b"ttyS0", O_RDWR) {
+        SyscallResult::Return(_) => {}
+        other => panic!("openat ttyS0 failed: {other:?}"),
+    }
+    let first = session
+        .controlling_tty_cap()
+        .expect("ttyS0 open should bind ctty");
+
+    match openat_path(&ctx, AT_FDCWD, b"ttyS1", O_RDWR) {
+        SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
+        other => panic!("openat ttyS1 should still return fd: {other:?}"),
+    }
+    let after = session
+        .controlling_tty_cap()
+        .expect("existing controlling tty should remain bound");
+    assert_eq!(after, first, "second TTY open must not rebind ctty");
+}
+
+#[test]
+fn dispatch_openat_dev_tty_without_controlling_tty_returns_enxio() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let result = openat_path(&ctx, AT_FDCWD, b"tty", O_RDWR);
+    assert_eq!(result, SyscallResult::Error(E_NXIO));
+}
+
+#[test]
+fn dispatch_openat_dev_tty_after_binding_opens_same_tty() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let session = proc_cap.pgrp_cap().session_cap();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let first = openat_path(&ctx, AT_FDCWD, b"console", O_RDWR);
+    match first {
+        SyscallResult::Return(_) => {}
+        other => panic!("openat console failed: {other:?}"),
+    }
+    let controlling = session
+        .controlling_tty_cap()
+        .expect("console open should bind ctty");
+
+    let second = openat_path(&ctx, AT_FDCWD, b"tty", O_RDWR);
+    let fd = match second {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat tty failed: {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("fd from /dev/tty open");
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => assert_eq!(*tty, controlling),
+        other => panic!("expected /dev/tty StructBacked::Tty, got {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_openat_tty_char_o_trunc_is_noop() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let first = openat_path(&ctx, AT_FDCWD, b"ttyS0", O_RDWR | O_TRUNC);
+    match first {
+        SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
+        other => panic!("openat ttyS0 O_TRUNC should be a char-device no-op: {other:?}"),
+    }
+
+    let second = openat_path(&ctx, AT_FDCWD, b"tty", O_RDWR | O_TRUNC);
+    match second {
+        SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
+        other => panic!("openat /dev/tty O_TRUNC should be a char-device no-op: {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_dev_tty_stat_access_and_statx_are_caller_relative() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let ctx = make_ctx(proc_cap, thread);
+
+    match openat_path(&ctx, AT_FDCWD, b"console", O_RDWR) {
+        SyscallResult::Return(_) => {}
+        other => panic!("openat console should bind controlling tty: {other:?}"),
+    }
+
+    let path = nul_terminate(b"tty");
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let stat_req = SyscallRequest::new(
+        NR_NEWFSTATAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            statbuf.as_mut_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(stat_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    let mode = read_u32_at(&statbuf, STAT_MODE_OFF);
+    assert_eq!(mode & 0o170000, 0o020000, "expected S_IFCHR; got {mode:#o}");
+    assert_ne!(
+        read_u64_at(&statbuf, STAT_RDEV_OFF),
+        0,
+        "/dev/tty needs a device rdev"
+    );
+
+    let access_req = SyscallRequest::new(
+        NR_FACCESSAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (F_OK | R_OK | W_OK) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(access_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let statx_req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            0,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(statx_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    let statx_mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
+    assert_eq!(
+        statx_mode & 0o170000,
+        0o020000,
+        "expected statx S_IFCHR; got {statx_mode:#o}"
+    );
+    assert_eq!(read_u32_at(&statxbuf, STATX_RDEV_MAJOR_OFF), 5);
+    assert_eq!(read_u32_at(&statxbuf, STATX_RDEV_MINOR_OFF), 0);
+    drop(path);
+}
+
+#[test]
+fn dispatch_devfs_tty_alias_stat_reports_hardware_rdev() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root);
+    let ctx = make_ctx(proc_cap, thread);
+
+    for name in [b"ttyS0".as_slice(), b"console".as_slice()] {
+        let path = nul_terminate(name);
+        let mut statbuf = vec![0u8; STAT_BYTES];
+        let stat_req = SyscallRequest::new(
+            NR_NEWFSTATAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                statbuf.as_mut_ptr() as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(
+            block_on(dispatch::<ShimsTestPmap>(stat_req, &ctx)),
+            SyscallResult::Return(0),
+            "newfstatat({})",
+            core::str::from_utf8(name).unwrap()
+        );
+        let mode = read_u32_at(&statbuf, STAT_MODE_OFF);
+        assert_eq!(mode & 0o170000, 0o020000, "expected S_IFCHR");
+        assert_eq!(
+            read_u64_at(&statbuf, STAT_RDEV_OFF),
+            0x440,
+            "{} should report ttyS0 rdev 4:64",
+            core::str::from_utf8(name).unwrap()
+        );
+
+        let mut statxbuf = vec![0u8; STATX_BYTES];
+        let statx_req = SyscallRequest::new(
+            NR_STATX,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                0,
+                crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+                statxbuf.as_mut_ptr() as u64,
+                0,
+            ],
+        );
+        assert_eq!(
+            block_on(dispatch::<ShimsTestPmap>(statx_req, &ctx)),
+            SyscallResult::Return(0),
+            "statx({})",
+            core::str::from_utf8(name).unwrap()
+        );
+        assert_eq!(read_u32_at(&statxbuf, STATX_RDEV_MAJOR_OFF), 4);
+        assert_eq!(read_u32_at(&statxbuf, STATX_RDEV_MINOR_OFF), 64);
+        drop(path);
+    }
+}
+
+#[test]
+fn dispatch_dev_tty_stat_without_controlling_tty_returns_enxio() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let root = build_devfs_root();
+    let (_proc_cap, thread) = bootstrap_with_cwd(root);
+    let ctx = make_ctx(_proc_cap, thread);
+
+    let path = nul_terminate(b"tty");
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let req = SyscallRequest::new(
+        NR_NEWFSTATAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            statbuf.as_mut_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Error(E_NXIO)
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_procfs_fd_readlink_renders_tty_target_path() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let dev_root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(dev_root);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let fd = match openat_path(&ctx, AT_FDCWD, b"ttyS0", O_RDWR) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("openat ttyS0 should succeed: {other:?}"),
+    };
+
+    match step_chdir(&proc_cap, build_procfs_root()) {
+        tx_subsystems::process::ChdirOutcome::Replaced { .. } => {}
+        tx_subsystems::process::ChdirOutcome::ZombieIgnored => panic!("init bootstrap zombified"),
+    }
+
+    let proc_path = alloc::format!("{}/fd/{}", proc_cap.pid.0, fd);
+    let path = nul_terminate(proc_path.as_bytes());
+    let mut buf = vec![0u8; 64];
+    let req = SyscallRequest::new(
+        NR_READLINKAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ],
+    );
+    let n = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(n) => n as usize,
+        other => panic!("readlinkat /proc/<pid>/fd/{fd}: {other:?}"),
+    };
+    assert_eq!(&buf[..n], b"/dev/ttyS0");
+    drop(path);
+}
+
+#[test]
+fn dispatch_proc_self_fd_readlink_uses_caller_process_fd_table() {
+    let _setup = fd_ops_setup();
+    install_ttys0_console();
+    let dev_root = build_devfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(dev_root);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let fd = match openat_path(&ctx, AT_FDCWD, b"ttyS0", O_RDWR) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("openat ttyS0 should succeed: {other:?}"),
+    };
+
+    let proc_path = alloc::format!("/proc/self/fd/{}", fd);
+    let path = nul_terminate(proc_path.as_bytes());
+    let mut buf = vec![0u8; 64];
+    let req = SyscallRequest::new(
+        NR_READLINKAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ],
+    );
+    let n = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(n) => n as usize,
+        other => panic!("readlinkat /proc/self/fd/{fd}: {other:?}"),
+    };
+    assert_eq!(&buf[..n], b"/dev/ttyS0");
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let stat_req = SyscallRequest::new(
+        NR_NEWFSTATAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            statbuf.as_mut_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(stat_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    let mode = read_u32_at(&statbuf, STAT_MODE_OFF);
+    assert_eq!(mode & 0o170000, 0o020000, "expected S_IFCHR");
+    assert_eq!(read_u64_at(&statbuf, STAT_RDEV_OFF), 0x440);
+
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let statx_req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            0,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(statx_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(read_u32_at(&statxbuf, STATX_RDEV_MAJOR_OFF), 4);
+    assert_eq!(read_u32_at(&statxbuf, STATX_RDEV_MINOR_OFF), 64);
+    drop(path);
+}
 
 /// `openat(AT_FDCWD, "/f", O_RDONLY)` against an existing tmpfs
 /// file returns the lowest unused fd (which, with the bootstrap
@@ -172,6 +792,45 @@ fn dispatch_openat_existing_file_o_rdonly_returns_fd() {
         other => panic!("openat existing file: {other:?}"),
     }
     drop(path);
+}
+
+#[test]
+fn dispatch_openat_o_nofollow_on_final_symlink_returns_neg_eloop() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"target",
+        0o100644,
+        &owner_cred,
+        &guard,
+    ) {
+        StepOutcome::Done(_) => {}
+        other => panic!("create_inode target: {other:?}"),
+    }
+    match tmpfs.symlink(
+        TMPFS_ROOT_OBJECT_ID,
+        b"link",
+        b"target",
+        &owner_cred,
+        &guard,
+    ) {
+        StepOutcome::Done(_) => {}
+        other => panic!("symlink link -> target: {other:?}"),
+    }
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let result = openat_path(&ctx, AT_FDCWD, b"/link", O_RDONLY | O_NOFOLLOW);
+    assert_eq!(result, SyscallResult::Error(E_LOOP));
 }
 
 /// `openat` reports `EMFILE` before path lookup once the visible fd
@@ -270,6 +929,94 @@ fn dispatch_openat_o_directory_regular_file_returns_neg_enotdir() {
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NOTDIR));
+    drop(path);
+}
+
+#[test]
+fn dispatch_openat_o_direct_preserves_regular_file_status_flag() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let path = nul_terminate(b"/f");
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (O_RDONLY | O_DIRECT) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    let fd = match result {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat O_DIRECT: {other:?}"),
+    };
+    assert!(
+        proc_cap
+            .fd(fd)
+            .expect("O_DIRECT fd installed")
+            .flags()
+            .packet
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_o_direct_write_rejects_unaligned_user_buffer() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let path = nul_terminate(b"/f");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (O_RDWR | O_DIRECT) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat O_DIRECT: {other:?}"),
+    };
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            crate::linux_syscall::NR_WRITE,
+            [fd, 1, tx_subsystems::vm::USER_PAGE_SIZE as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
     drop(path);
 }
 
@@ -393,6 +1140,390 @@ fn dispatch_openat_o_creat_creates_new_file() {
         "tmpfs should now resolve /new: {outcome:?}"
     );
     drop(path);
+}
+
+#[test]
+fn dispatch_openat_dirfd_relative_o_creat_creates_in_directory() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (mnt_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"mnt", 0o755, &owner_cred, &guard) {
+        StepOutcome::Done(created) => created,
+        other => panic!("mkdir mnt for openat dirfd test: {other:?}"),
+    };
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let dir_path = nul_terminate(b"/mnt");
+    let dir_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            dir_path.as_ptr() as u64,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let dir_fd = match block_on(dispatch::<ShimsTestPmap>(dir_req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("openat /mnt should return a directory fd: {other:?}"),
+    };
+
+    let child_path = nul_terminate(b"test_openat.txt");
+    let child_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            dir_fd as u64,
+            child_path.as_ptr() as u64,
+            (O_RDWR | O_CREAT) as u64,
+            0o600,
+            0,
+            0,
+        ],
+    );
+    let child_fd = match block_on(dispatch::<ShimsTestPmap>(child_req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("dirfd-relative openat O_CREAT should create file: {other:?}"),
+    };
+    assert!(child_fd >= 0);
+    assert!(proc_cap.fd(child_fd as u32).is_some());
+
+    let guard = ebr_guard();
+    let lookup = tmpfs.lookup(mnt_id, b"test_openat.txt", &guard);
+    assert!(
+        matches!(lookup, StepOutcome::Done(_)),
+        "dirfd-relative O_CREAT should create under /mnt: {lookup:?}"
+    );
+    drop(child_path);
+    drop(dir_path);
+}
+
+#[test]
+fn dispatch_openat_after_mount_umount_creates_on_uncovered_mountpoint() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (mnt_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"mnt", 0o755, &owner_cred, &guard) {
+        StepOutcome::Done(created) => created,
+        other => panic!("mkdir mnt for mount/umount openat test: {other:?}"),
+    };
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let mnt_ns = MountNamespace::new_cap(root_mount).expect("mount namespace");
+    step_set_mount_namespace(&proc_cap, mnt_ns).expect("install mount namespace");
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let source = nul_terminate(b"none");
+    let target = nul_terminate(b"/mnt");
+    let fstype = nul_terminate(b"tmpfs");
+    let mount_req = SyscallRequest::new(
+        NR_MOUNT,
+        [
+            source.as_ptr() as u64,
+            target.as_ptr() as u64,
+            fstype.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(mount_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let umount_req = SyscallRequest::new(NR_UMOUNT2, [target.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(umount_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let dir_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            target.as_ptr() as u64,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let dir_fd = match block_on(dispatch::<ShimsTestPmap>(dir_req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("openat /mnt after umount should return a directory fd: {other:?}"),
+    };
+
+    let child_path = nul_terminate(b"test_openat.txt");
+    let child_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            dir_fd as u64,
+            child_path.as_ptr() as u64,
+            (O_RDWR | O_CREAT) as u64,
+            0o600,
+            0,
+            0,
+        ],
+    );
+    let child_fd = match block_on(dispatch::<ShimsTestPmap>(child_req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("dirfd-relative openat O_CREAT after umount should create file: {other:?}"),
+    };
+    assert!(child_fd >= 0);
+
+    let guard = ebr_guard();
+    let lookup = tmpfs.lookup(mnt_id, b"test_openat.txt", &guard);
+    assert!(
+        matches!(lookup, StepOutcome::Done(_)),
+        "file should be created on the uncovered /mnt directory, not the stale mounted tmpfs: {lookup:?}"
+    );
+    drop(child_path);
+    drop(fstype);
+    drop(target);
+    drop(source);
+}
+
+#[test]
+fn dispatch_openat_creat_uses_process_mount_namespace_without_global_mount_table() {
+    let _setup = fd_ops_setup();
+    let (_legacy_root_dentry, root_tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    let root_dentry = root_mount.root_dentry().clone();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (mnt_id, _) =
+        match root_tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"mnt", 0o755, &owner_cred, &guard) {
+            StepOutcome::Done(created) => created,
+            other => panic!("mkdir mnt for namespace-only openat test: {other:?}"),
+        };
+    let mountpoint = match tx_subsystems::vfs::walker::step_walk(
+        root_dentry.clone(),
+        b"/mnt",
+        &owner_cred,
+        &guard,
+    ) {
+        StepOutcome::Done(dentry) => dentry,
+        other => panic!("walk /mnt for namespace-only openat test: {other:?}"),
+    };
+    drop(guard);
+
+    let (child_root, child_tmpfs, child_mount) = build_tmpfs_root_with_mount();
+    let child_mount = MountIdentity::new_cap_with_root_dentry(
+        MountId::new(121),
+        Some(mountpoint.clone()),
+        child_root,
+        Some(root_mount.clone()),
+        child_mount
+            .payload_cap()
+            .expect("child payload alive")
+            .into_cap(),
+        MountFlags::empty(),
+    )
+    .expect("namespace-only child mount");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry.clone());
+    let namespace = MountNamespace::new_cap(root_mount.clone()).expect("mount namespace");
+    namespace.register_mount(&mountpoint, child_mount.clone());
+    step_set_mount_namespace(&proc_cap, namespace).expect("install mount namespace");
+    match step_chdir_with_mount(&proc_cap, root_dentry, root_mount) {
+        tx_subsystems::process::ChdirOutcome::Replaced { .. } => {}
+        tx_subsystems::process::ChdirOutcome::ZombieIgnored => panic!("init bootstrap zombified"),
+    }
+    let cwd_binding = proc_cap
+        .cwd_binding()
+        .expect("namespace-only openat test needs mounted cwd");
+    let mount_namespace = proc_cap
+        .mount_namespace_cap()
+        .expect("namespace-only openat test needs mount namespace");
+    let guard = ebr_guard();
+    match tx_subsystems::vfs::walker::step_walk_in_mount_namespace_with_origin_mount(
+        cwd_binding.dentry,
+        &cwd_binding.mount,
+        b"/mnt",
+        &owner_cred,
+        &mount_namespace,
+        &guard,
+    ) {
+        StepOutcome::Done(resolved) => assert_eq!(
+            resolved.dentry.rnode().fs_object_id(),
+            TMPFS_ROOT_OBJECT_ID,
+            "namespace walk must cross /mnt to child tmpfs root"
+        ),
+        other => panic!("namespace walk /mnt before openat failed: {other:?}"),
+    }
+    drop(guard);
+
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let path = nul_terminate(b"/mnt/testshm");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK) as u64,
+            0o600,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("namespace-only openat O_CREAT should create in mounted tmpfs: {other:?}"),
+    };
+    assert!(fd >= 0);
+
+    let guard = ebr_guard();
+    let child_lookup = child_tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"testshm", &guard);
+    assert!(
+        matches!(child_lookup, StepOutcome::Done(_)),
+        "openat must create in namespace-mounted child tmpfs: {child_lookup:?}"
+    );
+    let root_lookup = root_tmpfs.lookup(mnt_id, b"testshm", &guard);
+    assert!(
+        matches!(root_lookup, StepOutcome::Err(step_engine::Errno::ENOENT)),
+        "openat must not fall back to the uncovered parent tmpfs: {root_lookup:?}"
+    );
+    drop(guard);
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    let guard = ebr_guard();
+    let child_after_unlink = child_tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"testshm", &guard);
+    assert!(
+        matches!(
+            child_after_unlink,
+            StepOutcome::Err(step_engine::Errno::ENOENT)
+        ),
+        "unlinkat must remove from namespace-mounted child tmpfs: {child_after_unlink:?}"
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_umount2_in_cloned_mount_namespace_preserves_parent_and_global_mount() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    let root_payload = root_mount
+        .payload_cap()
+        .expect("root mount payload")
+        .into_cap();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (mnt_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"mnt", 0o755, &owner_cred, &guard) {
+        StepOutcome::Done(created) => created,
+        other => panic!("mkdir mnt for cloned umount test: {other:?}"),
+    };
+    drop(guard);
+
+    let (parent, parent_thread) = bootstrap_with_cwd(root_dentry.clone());
+    let parent_namespace = MountNamespace::new_cap(root_mount).expect("parent mount namespace");
+    step_set_mount_namespace(&parent, parent_namespace.clone()).expect("install parent namespace");
+    let parent_ctx = make_ctx(parent.clone(), parent_thread);
+
+    let source = nul_terminate(b"none");
+    let target = nul_terminate(b"/mnt");
+    let fstype = nul_terminate(b"tmpfs");
+    let mount_req = SyscallRequest::new(
+        NR_MOUNT,
+        [
+            source.as_ptr() as u64,
+            target.as_ptr() as u64,
+            fstype.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(mount_req, &parent_ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mountpoint = parent_namespace
+        .root_dentry()
+        .cached_child(InlineName::new(b"mnt").expect("mountpoint name"))
+        .expect("cached mountpoint");
+    let parent_mount = parent_namespace
+        .mount_for(&mountpoint)
+        .expect("parent namespace mount");
+    assert_eq!(
+        mount_for(&root_payload, mnt_id)
+            .expect("legacy global mount")
+            .key(),
+        parent_mount.key()
+    );
+
+    let child = tx_subsystems::process::step_fork_with_options::<ShimsTestPmap>(
+        &parent,
+        tx_subsystems::process::ForkOptions {
+            clone_newns: true,
+            ..tx_subsystems::process::ForkOptions::default()
+        },
+    )
+    .expect("fork child with CLONE_NEWNS");
+    let child_namespace = child.mount_namespace_cap().expect("child mount namespace");
+    let child_mount = child_namespace
+        .mount_for(&mountpoint)
+        .expect("child namespace mount");
+    assert_ne!(child_mount.key(), parent_mount.key());
+
+    let child_ctx = make_ctx(child.clone(), first_thread(&child));
+    let child_umount = SyscallRequest::new(NR_UMOUNT2, [target.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(child_umount, &child_ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(child_namespace.mount_for(&mountpoint).is_none());
+    assert_eq!(
+        parent_namespace
+            .mount_for(&mountpoint)
+            .expect("parent mount remains")
+            .key(),
+        parent_mount.key()
+    );
+    assert_eq!(
+        mount_for(&root_payload, mnt_id)
+            .expect("legacy global mount remains")
+            .key(),
+        parent_mount.key()
+    );
+
+    let parent_umount = SyscallRequest::new(NR_UMOUNT2, [target.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(parent_umount, &parent_ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(parent_namespace.mount_for(&mountpoint).is_none());
+    assert!(mount_for(&root_payload, mnt_id).is_none());
 }
 
 /// `openat(.., O_CREAT | O_EXCL)` against an *existing* file
@@ -572,7 +1703,7 @@ fn dispatch_openat_o_trunc_truncates_stale_cached_dentry() {
 }
 
 /// `openat(.., O_RDONLY | O_CLOEXEC)` sets the cloexec bit on the
-/// returned fd. The bit is consulted by `step_close_cloexec_fds`
+/// returned fd. The bit is consulted by `CloseCloexecFdsOp`
 /// at exec time.
 #[test]
 fn dispatch_openat_o_cloexec_sets_fd_cloexec_bit() {

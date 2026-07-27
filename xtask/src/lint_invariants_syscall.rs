@@ -123,7 +123,7 @@ pub(crate) fn lint_invariants_syscall_adhoc_loop(root: &Path) -> Result<()> {
             // Check for alias dispatch patterns in match arms
             for (prefix, alias_name) in OUTCOME_ALIASES {
                 for variant in DISPATCH_VARIANTS {
-                    let pattern = format!("{}::{}", prefix, variant);
+                    let pattern = format!("{prefix}::{variant}");
                     if code_part.contains(&pattern) {
                         // Skip if inside a test block
                         if is_in_test_context(&text, line_num) {
@@ -159,10 +159,9 @@ pub(crate) fn lint_invariants_syscall_adhoc_loop(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "files with ad-hoc alias loops: {:>4}  (ceiling {})  {}",
-        file_count, MAX_SYSCALL_ADHOC_LOOP_FILES, status
+        "files with ad-hoc alias loops: {file_count:>4}  (ceiling {MAX_SYSCALL_ADHOC_LOOP_FILES})  {status}"
     );
-    println!("total ad-hoc alias sites:      {:>4}", site_count);
+    println!("total ad-hoc alias sites:      {site_count:>4}");
 
     if !adhoc_files.is_empty() {
         println!();
@@ -319,8 +318,7 @@ pub(crate) fn lint_invariants_syscall_no_await(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        ".await in sys_* fn bodies: {:>4}  (ceiling {})  {}",
-        count, MAX_SYSCALL_AWAIT_SITES, status
+        ".await in sys_* fn bodies: {count:>4}  (ceiling {MAX_SYSCALL_AWAIT_SITES})  {status}"
     );
 
     for v in &violations {
@@ -421,10 +419,7 @@ pub(crate) fn lint_invariants_syscall_ctx_bridge(root: &Path) -> Result<()> {
     } else {
         0.0
     };
-    println!(
-        "sys_* fns bridged to ScriptCtx: {:>3}/{:>3}  ({:.0}%)",
-        grand_bridged, grand_total, pct
-    );
+    println!("sys_* fns bridged to ScriptCtx: {grand_bridged:>3}/{grand_total:>3}  ({pct:.0}%)");
 
     if grand_total > 0 {
         println!();
@@ -440,10 +435,7 @@ pub(crate) fn lint_invariants_syscall_ctx_bridge(root: &Path) -> Result<()> {
     }
 
     println!();
-    println!(
-        "  Target: {} bridging (all sys_* fns use ScriptCtx).",
-        _SYSCALL_CTX_BRIDGE_TARGET
-    );
+    println!("  Target: {_SYSCALL_CTX_BRIDGE_TARGET} bridging (all sys_* fns use ScriptCtx).");
     println!("  This metric is informational — no ratchet gate yet.");
 
     Ok(())

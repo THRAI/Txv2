@@ -11,7 +11,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-K="$ROOT/target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt"
+K="$ROOT/target/riscv64gc-unknown-none-elf/release/tx-kernel-riscv64-qemu-virt"
 IMG="$ROOT/local-images/alpine-linux-riscv64-ext4fs.img"
 WORK="$(mktemp -d /tmp/verifygit-XXXXXX)"
 HTTP_PORT=$(( (RANDOM % 2000) + 19000 ))

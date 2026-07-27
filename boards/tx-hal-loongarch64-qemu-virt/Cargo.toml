@@ -16,3 +16,6 @@ la64-boot-trace = []
 [lib]
 path = "src/lib.rs"
 doctest = false
+
+[lints]
+workspace = true

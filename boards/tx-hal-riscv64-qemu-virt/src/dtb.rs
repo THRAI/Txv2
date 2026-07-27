@@ -294,7 +294,10 @@ mod tests {
         assert_eq!(boot_info.cmdline, Some("console=hvc0"));
         assert_eq!(Platform::platform_info().timebase_frequency_hz, 10_000_000);
         assert_eq!(Platform::platform_info().possible_cpu_count, 4);
-        assert_eq!(<Platform as tx_hal::TimeIf>::frequency_hz(), 10_000_000);
+        assert_eq!(
+            <Platform as tx_hal::MonotonicCounterIf>::frequency_hz(),
+            10_000_000
+        );
 
         unsafe {
             BootStaticBag::<IdentityLive>::reset_global_for_test();

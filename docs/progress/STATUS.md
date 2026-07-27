@@ -1,3 +1,24 @@
+- 2026-07-27 (**merge main → feature-network-refactor 完成**;16 冲突全解,两架构编译通过,LTP 未跑).
+  **前置审计**(`.v6work/PR54_AUDIT.md`):main 的 `dd9435f3`(PR#54 codex/network-time-integration,718 文件)
+  **不是网络增量而是回退** —— 用 blob 身份坐实:main 的 102 个 net 文件里 **50 个与历史祖先逐字节相同、
+  零新增编辑**(`tcp.rs`→2026-06-13、`ether.rs`→2026-06-02、`udp.rs`→P2-S6 DNS 之前);删掉
+  `clock.rs`/`file_ops.rs`/`adapter.rs`/`external_connect_tests.rs`;`FileOps` trait 全树 0 命中;
+  `step_connect.rs` 的 `external` 0 命中。**R4a 实证**:epoll-on-socket 在 main 上无限超时立即返回 0,
+  feature 正确停泊。**合并策略**:网络树按路径整取 feature(79 文件,含 `socket.rs` —— 它只有 main 改过、
+  连冲突都不报),非网络以 main 为底 + 回植 feature 的 5 个修复(sa_restorer/O_TRUNC/dentry 陈旧 walk/
+  mprotect PrivatePageSet/ext4 容量);syscall 层(`socket.rs`+`helpers.rs`)反过来取 main + 回植 17 行
+  (P2-S5 端口轮转 + V5-3 v6 源选择)。**C 类回植**(`.v6work/CCLASS.md`,机械筛 715→116→34 文件):
+  C-2 DGRAM ICMP recv 不带 IPv4 头(+新增 dgram 测试);C-1 设备改名**未做,单独立项**。
+  **又抓到 3 处 main 回退**:`socket.rs` 删 P2-S5 端口轮转、`mod.rs` 删 `net_set_now_ns` 调用(祖先有)、
+  `virtio/net.rs` **重新引入中断抑制 bug**(`disable_interrupts()` 无配对重新使能 → 首个网络 IRQ 永久静音,
+  正是 feature 注释里记录的 P2 卡死根因;已核实 main 全树无 `enable_interrupts` 调用方)。
+  **验证**:rv64+la64 `full-build: ok`;单测集合差 **0 真回归**(47 新增失败中 43 个 `page_backed` 隔离复跑
+  全过=级联受害者,4 个 main 上也失败);smoltcp 上游套件 **591/0**;R4a 探针 **2/2**(已落进树当哨兵)。
+  **遗留**:① lint 两项相对 main 回归 —— `time-wake-retired` 434 站点(feature net 早于 main 的 post 机制,
+  结构性)+ `notification-boundary` 4 站点,需决策抬 ceiling 还是改造;② feature 既有缺陷:4 个 bridge_tests
+  的 `bridge_forwarded>=2` 不过(判别实验已证与合并无关,长期被字节数断言掩盖);③ LTP 四 lane 未跑。
+  **坑**:大规模合并后 cargo 喂陈旧产物报假 `unresolved import`,须 touch 所有 crate 根强制重建。
+
 - 2026-07-26 (**HTTPS 吞吐塌方定性完成:真根因是 syscall 路径固定开销,不是网络** — 只入 harness,未修性能).
   接着上一条(SWS 修好但 HTTPS 522KB 仍 284 s)继续追,**三个假设连环证伪**:① **TCP RX 丢唤醒** ❌ 真实互联网
   纯 HTTP 522KB **1 s** 跑完、sha256 全对;② **AF_UNIX socketpair 特殊** ❌ socketpair 与 pipe 在每个 chunk
@@ -233,6 +254,20 @@
   serialize 路)。xtask unit 未跑(本谱系已知挂,既定裁定用 QEMU 验)。**Next**:la64 重建+
   verify-git-net-la64.sh(push 前必补);全量 LTP 对账;考虑退役 STAT_META_OVERRIDES。Blocker:无。改动与
   未提交的 git-clone 猎杀 5 连修同文件纠缠,提交时机由用户定。
+- 2026-07-18 (merge main→final-test + 两大 post-merge 修复). main 76 提交并入:net 重构(#52,55 文件)全量取
+  main;9 文本+3 语义冲突逐个核对解——rv boot_static 保 final-test 动态 MMIO 发现+补 main goldfish-rtc 静态区
+  (GENERATED_MMIO_REGIONS +1→+2)、tx-hal uart_irq()+NET_IRQ 两侧都留、exec LTP 取 final-test 自洽版(main 版
+  依赖 main 侧才有的 LtpArgs 方法)、ext4 step_chmod 留带权限检查版、thread_future 留 5 寄存器诊断版。
+  **修① fork eager-copy 收窄(方案C)**:main 54fba845 fork 全量急拷父 pmap 常驻页致 gcc/rustc fork+exec 分钟级
+  卡死(rustc hello >5min 不响应 Ctrl-C);收窄为只拷**可写**私有区间——只读私有页(rustc 几百 MB .so/.rlib 映射
+  =常驻大头)refault 必然正确故跳过 → rustc 8s,git argv 正确性保留(remote-https E2BIG 消失)。
+  **修② 文件页容器 8MiB 上限**:tmpfs/ext4 PAGE_CAP day-1 定 2048 页=8MiB(为 libcbench 5MB tmpfile 设)→
+  git clone pack 17.58MiB 写盘 EINVAL(tmpfs/ext4 同挂);双常量→65536(256MiB),页懒分配(稀疏 BTreeMap)零
+  内存成本,tests 断言改引用常量。验证:rv+la release 编译+boot:ok;HAL/kernel/ext4/tmpfs host 绿(tx-subsystems
+  ~322 失败=既有跨测试全局状态隔离问题,net/page_backed 失败测试单跑全过,与合并无关);dd 16MiB 双 FS 过;
+  git clone 真 xv6 **7/7**(git:// ext4+tmpfs、https+宿主代理×5,均全新启动)。**已知遗留**:index-pack 偶发
+  内存正确性 bug(用户两次异症:NULL segv pc=0x2b9960 / write ENOENT,我方 7 连过;疑与 0.4% argv 页竞态同族,
+  或首崩后同会话状态污染)。Next:全新启动复测 clone;可选 user-segv 现场 VMA dump 诊断;根因排决赛后。Blocker:无。
 - 2026-07-16 (修复 busybox writev→ext4 跨进程写丢失 — 决赛 git 题隐患). 病象:shell 重定向写
   ext4 文件(`echo>f`/`cat>f`/`printf>f`,builtin 与 applet 都算),**另一个进程读到空**(git 提交进去的
   README 是空的);`write()`/`cp`/`dd`/git 自己写正常,`sync` 无效,同进程读正常。**逐步实验定根因**(非
@@ -17984,3 +18019,13 @@
 - `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
 - `docs/progress/research/2026-04-30-reactor-third-wave-scout.md`
 - `docs/progress/research/2026-04-30-reactor-third-wave-audit.md`
+- 2026-07-24 (network/time integration publication blocked).
+  A clean worktree on `codex/network-time-integration` carries the time facade
+  and the candidate owner-aware reactor/network-delegate sequence, but the
+  first closure check is blocked before publication: current `origin/main`
+  lacks the source branch's `tx-observe` `l2_producer` API and the uncommitted
+  `tx-substrate::publication` module that the selected reactor code imports.
+  `cargo check -p tx-time -p tx-services -p tx-reactor -p tx-substrate` stops
+  on those missing APIs. No push was performed; the original dirty source
+  worktree was not changed. Next: explicitly approve either a broader
+  observation/publication baseline migration or a reduced time-only publish.

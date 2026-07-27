@@ -27,6 +27,7 @@ DEFAULT_PRIVATE_DATA = ROOT / "target/oscomp/custom-run/testdata"
 DEFAULT_SUBMIT = ROOT / "target/oscomp/submit"
 DEFAULT_SERIAL = ROOT / "target/oscomp/custom-run/os_serial_out_rv.txt"
 DEFAULT_BUSYBOX = ROOT / "tools/images/vendor/busybox-riscv64-musl"
+PTHREAD_COND_SIGNAL_PROBE = ROOT / "tools/shell-tests/pthread_cond_signal_probe.c"
 LIBCBENCH_SOURCE = ROOT / "external/libc-bench"
 TX_OBSERVE_BEGIN_NR = 333
 TX_OBSERVE_TRACE_ON_NR = 334
@@ -414,11 +415,12 @@ def prepare_payload(args: argparse.Namespace, elf: Path, binary_name: str, scrip
 
 
 def qemu_cmdline(group: str, observe_threshold: int | None) -> str:
-    parts = [f"tx.oscomp.groups={group}"]
+    parts = ["tx.boot.mode=oscomp", "init=/tx-test-init", "tx.test_init=1"]
     if observe_threshold is not None:
-        parts.insert(0, f"tx.oscomp.observe_threshold={observe_threshold}")
+        parts.append(f"tx.oscomp.observe_threshold={observe_threshold}")
     else:
-        parts.insert(0, "tx.oscomp.observe=0")
+        parts.append("tx.oscomp.observe=0")
+    parts.append(f"tx.oscomp.groups={group}")
     return " ".join(parts)
 
 
@@ -463,6 +465,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     mode.add_argument("--c", dest="c_source", type=Path, help="Compile this C source as the guest ELF")
     mode.add_argument("--elf", type=Path, help="Use an existing RV64 static ELF")
     mode.add_argument("--libcbench", action="store_true", help="Rebuild and inject external/libc-bench")
+    mode.add_argument(
+        "--pthread-cond-signal-probe",
+        action="store_true",
+        help="Compile and run tools/shell-tests/pthread_cond_signal_probe.c",
+    )
     parser.add_argument("--cc", default=default_cc())
     parser.add_argument("--cflag", action="append", dest="cflags", default=[], help="Extra C compiler flag")
     parser.add_argument("--name", default="custom-elf", help="Injected binary name for --c/--elf")
@@ -569,6 +576,19 @@ def main(argv: list[str]) -> int:
         slot = "libcbench-musl"
         script_name = SCRIPT_FOR_SLOT[slot]
         marker_group = "libcbench-musl"
+    elif args.pthread_cond_signal_probe:
+        if not PTHREAD_COND_SIGNAL_PROBE.exists():
+            raise RuntimeError(f"missing probe source: {PTHREAD_COND_SIGNAL_PROBE}")
+        slot = args.slot
+        script_name = SCRIPT_FOR_SLOT[slot]
+        marker_group = (
+            args.marker_group
+            if args.marker_group != "custom-run"
+            else "pthread-cond-signal-probe"
+        )
+        binary_name = args.name if args.name != "custom-elf" else "pthread-cond-signal-probe"
+        elf = args.build_dir / binary_name
+        compile_c(PTHREAD_COND_SIGNAL_PROBE, elf, args.cc, args.cflags)
     else:
         slot = args.slot
         script_name = SCRIPT_FOR_SLOT[slot]

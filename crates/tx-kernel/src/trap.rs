@@ -1,7 +1,8 @@
 use tx_hal::{
-    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, TrapAction, TrapFrameMut,
-    TxPlatform, VirtAddr,
+    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, SmpIf, TrapAction,
+    TrapFrameMut, TxPlatform, VirtAddr,
 };
+use tx_services::time::platform::HalDeadlineTimer;
 use tx_shims::linux_syscall::numbers::{NR_RT_SIGPROCMASK, NR_SET_TID_ADDRESS};
 use tx_shims::linux_syscall::SyscallResult;
 
@@ -50,7 +51,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     }
 
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
-        P::cancel_deadline();
+        HalDeadlineTimer::<P>::new().cancel_deadline();
         if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
             emit_debug_counter(b"debug.trap.timer_user", view.view().pc.0 as i64);
             let hart = <P as PercpuIf>::current_cpu_id().0;
@@ -64,7 +65,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Resume
     }
 
-    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId) -> TrapAction {
         let irq = P::claim();
         if irq == 0 {
             return TrapAction::Resume;
@@ -74,41 +75,13 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         P::complete(irq);
 
         match handled {
-            IrqHandled::Wake => {
-                // A device IRQ that interrupted a *user* slice must
-                // follow the timer-preemption hand-off discipline
-                // before asking for Reschedule: from-user Reschedule
-                // longjmps back into `run_thread`, whose
-                // userspace-run wait only resolves via a slot record.
-                // Without `hand_off_timer_preempt` the thread parks
-                // forever on an unresolvable wait (P2 external-connect
-                // resume hang, 2026-07-03).
-                if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
-                    let hart = <P as PercpuIf>::current_cpu_id().0;
-                    let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
-                    if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
-                        crate::init::mark_boot_reactor_userspace_preempt(cpu);
-                    }
-                    return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
-                }
-                TrapAction::Reschedule
-            }
+            IrqHandled::Wake => TrapAction::Reschedule,
             IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
         }
     }
 
     fn on_ipi(_cpu: CpuId) -> TrapAction {
-        if P::pending_ipi(IpiKind::Membarrier) {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            P::ack_ipi(IpiKind::Membarrier);
-        }
-        if P::pending_ipi(IpiKind::Reschedule) {
-            P::ack_ipi(IpiKind::Reschedule);
-        }
-        if P::pending_ipi(IpiKind::TlbShootdown) {
-            P::ack_ipi(IpiKind::TlbShootdown);
-        }
-        TrapAction::Resume
+        dispatch_pending_ipis::<P>()
     }
 
     fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
@@ -127,13 +100,68 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // corrupted on signal return) tears down the whole run instead of
         // just that one process.
         let hart = <P as PercpuIf>::current_cpu_id().0;
-        let outcome =
-            trap_handoff::hand_off_user_fatal(hart, &view, 0, fault.address.0 as u64);
+        let outcome = trap_handoff::hand_off_user_fatal(hart, &view, 0, fault.address.0 as u64);
         let action = trap_handoff::outcome_to_trap_action(&outcome);
         if matches!(action, TrapAction::Terminate) {
             log_page_fault_handoff_failure::<P>(hart, &outcome);
         }
         action
+    }
+}
+
+fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
+    let mut action = TrapAction::Resume;
+    if P::pending_ipi(IpiKind::Maintenance) {
+        P::ack_ipi(IpiKind::Maintenance);
+        action = TrapAction::Reschedule;
+    }
+    if P::pending_ipi(IpiKind::Membarrier) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        P::ack_ipi(IpiKind::Membarrier);
+    }
+    if P::pending_ipi(IpiKind::Reschedule) {
+        P::ack_ipi(IpiKind::Reschedule);
+    }
+    if P::pending_ipi(IpiKind::TlbShootdown) {
+        P::ack_ipi(IpiKind::TlbShootdown);
+    }
+    action
+}
+
+#[cfg(test)]
+mod ipi_tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    static MAINTENANCE_PENDING: AtomicBool = AtomicBool::new(false);
+    static MAINTENANCE_ACKED: AtomicBool = AtomicBool::new(false);
+
+    struct TestSmp;
+
+    impl SmpIf for TestSmp {
+        fn pending_ipi(kind: IpiKind) -> bool {
+            kind == IpiKind::Maintenance && MAINTENANCE_PENDING.load(Ordering::Acquire)
+        }
+
+        fn ack_ipi(kind: IpiKind) {
+            if kind == IpiKind::Maintenance {
+                MAINTENANCE_PENDING.store(false, Ordering::Release);
+                MAINTENANCE_ACKED.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_ipi_only_acknowledges_and_reschedules() {
+        MAINTENANCE_ACKED.store(false, Ordering::Release);
+        MAINTENANCE_PENDING.store(true, Ordering::Release);
+
+        let action = dispatch_pending_ipis::<TestSmp>();
+
+        assert_eq!(action, TrapAction::Reschedule);
+        assert!(MAINTENANCE_ACKED.load(Ordering::Acquire));
+        assert!(!MAINTENANCE_PENDING.load(Ordering::Acquire));
     }
 }
 
@@ -310,8 +338,8 @@ fn direct_syscall_preconditions(
     process: &tx_subsystems::process::ProcessIdentity,
 ) -> bool {
     use tx_shims::linux_syscall::numbers::{
-        NR_CLOCK_GETTIME, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETTID,
-        NR_GETTIMEOFDAY, NR_GETUID,
+        NR_CLOCK_GETTIME, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETTID, NR_GETTIMEOFDAY,
+        NR_GETUID,
     };
     match nr {
         NR_RT_SIGPROCMASK => {
@@ -340,10 +368,7 @@ fn emit_debug_counter(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -369,10 +394,7 @@ fn emit_direct_sigprocmask_detail_duration(nr: u64, name: &[u8], start_ns: u64) 
     }
     if let Some(observer) = tx_observe::current() {
         let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            dur.min(i64::MAX as u64) as i64,
-        );
+        observer.debug_counter(name, dur.min(i64::MAX as u64) as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -386,10 +408,7 @@ fn emit_direct_sigprocmask_detail_value(nr: u64, name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }

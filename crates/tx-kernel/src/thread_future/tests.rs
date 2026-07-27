@@ -12,14 +12,14 @@
 use core::future::Future;
 use core::mem::size_of;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::sync::Mutex;
 
 use crate::adapter::boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr, UserspaceTrapInfo,
 };
-use crate::adapter::step_engine::PayloadCap;
+use crate::adapter::step_engine::{Cap, PayloadCap};
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
     ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
@@ -28,8 +28,9 @@ use tx_hal::{
 use tx_shims::linux_syscall::{
     dispatch, dispatch_cap_only_immediate, SyscallCtx, SyscallResult, FUTEX_PRIVATE_FLAG,
     FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_EXIT_GROUP, NR_FUTEX, NR_GETPPID, NR_PSELECT6,
-    NR_READ, NR_READV, NR_WRITE, NR_WRITEV,
+    NR_READ, NR_READV, NR_SETITIMER, NR_WRITE, NR_WRITEV,
 };
+use tx_substrate::wake::MailboxEvent;
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
 use tx_subsystems::signal::{SigDisposition, Signum};
@@ -43,13 +44,30 @@ use tx_subsystems::vm::{
 };
 
 use crate::thread_future::{
+    fatal_signal_teardown_with_posts, handle_page_fault_trap, interrupted_syscall_signal_errno,
     pf_access_to_vm_access, restore_sigreturn_frame, run_thread, siginfo_to_user_abi,
+    signal_frame_source_context, signal_saved_context_with_pending_return,
     syscall_return_consumes_hot_budget, syscall_return_may_publish_wake_handoff,
     syscall_return_needs_handoff, PerHartSlotted,
 };
 use crate::trap::direct_trap_syscall_needs_wake_handoff;
 
 const TEST_PAGE_SIZE: usize = 4096;
+const ITIMER_REAL: u64 = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TestTimeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TestItimerval {
+    it_interval: TestTimeval,
+    it_value: TestTimeval,
+}
 
 /// Serialise against every other tx-kernel host test that touches
 /// global INIT_PROCESS, the per-hart slot table, and the epoch
@@ -137,18 +155,36 @@ impl tx_hal::SignalFrameIf for TestPlatform {
         }
     }
 }
-impl tx_hal::IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
 
-impl tx_hal::TimeIf for TestPlatform {
-    fn read_ns() -> u64 {
-        0
+impl tx_hal::IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+}
+
+impl tx_hal::MonotonicCounterIf for TestPlatform {
+    fn read_ns() -> u64 {
+        TEST_MONOTONIC_NS.load(Ordering::Acquire)
+    }
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+static TEST_MONOTONIC_NS: AtomicU64 = AtomicU64::new(0);
+static TEST_HAL_DEADLINE_ARM_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+impl tx_hal::DeadlineTimerIf for TestPlatform {
+    fn set_deadline_ns(_deadline: u64) {
+        TEST_HAL_DEADLINE_ARM_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for TestPlatform {}
 
 impl tx_hal::PercpuIf for TestPlatform {}
 impl tx_hal::CacheIf for TestPlatform {}
@@ -209,6 +245,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_init_process();
     tx_subsystems::cross_crate_test_support::reset_pid_counter();
     tx_subsystems::cross_crate_test_support::reset_tid_counter();
+    TEST_MONOTONIC_NS.store(0, Ordering::Release);
     // Ensure the per-hart slot is empty across tests.
     let _ = clear_current_thread_payload(0);
     USERSPACE_A0_LOG
@@ -510,6 +547,75 @@ fn run_thread_future_stays_within_clone_submit_budget() {
     );
 }
 
+fn post_default_sigterm(thread: &Cap<tx_subsystems::thread_runtime::ThreadIdentity>) {
+    tx_subsystems::thread_runtime::execution::post_signal_with_post(
+        thread,
+        Signum::SIGTERM,
+        tx_subsystems::signal::adapter::step_engine::SignalRouting::ProcessDirected,
+        None,
+        |weak, event| {
+            if let Some(mailbox) = weak.upgrade() {
+                let _ = mailbox.post(event);
+            }
+        },
+    );
+}
+
+#[test]
+fn run_thread_fatal_retry_yields_before_rechecking_ast() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    post_default_sigterm(&leader);
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&init, &leader)
+        .expect("reserve exec lifecycle");
+
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let mut wrapped =
+        PerHartSlotted::<TestPlatform, _>::new(leader.clone(), payload.clone(), future);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(
+        payload.active_userspace_request().is_none(),
+        "deferred fatal exit must release the unentered userspace request"
+    );
+    assert!(
+        payload.interrupt_summary().deliverable_signal,
+        "deferred fatal exit must requeue the signal before yielding"
+    );
+    assert!(!init.is_zombie());
+
+    drop(exec_prep);
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Ready(())));
+    assert!(init.is_zombie());
+    assert_eq!(init.terminating_signal(), Some(Signum::SIGTERM));
+}
+
+#[test]
+fn run_thread_completed_fatal_returns_without_extra_yield() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    post_default_sigterm(&leader);
+
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload, future);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Ready(())));
+    assert!(init.is_zombie());
+    assert_eq!(init.terminating_signal(), Some(Signum::SIGTERM));
+}
+
 #[test]
 fn futex_wake_return_reenters_userspace_without_mailbox_event() {
     let _g = setup();
@@ -705,6 +811,119 @@ fn per_hart_slotted_binds_current_task_mailbox() {
             .and_then(|mailbox| mailbox.upgrade())
             .is_some(),
         "payload retains a weak handle to the task mailbox after poll",
+    );
+}
+
+#[test]
+fn entry_timer_poll_rearms_periodic_itimer_with_current_timer_context() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread");
+    let aspace = init.aspace_cap().expect("init aspace");
+    let _ = tx_subsystems::signal::step_sigaction(
+        &init,
+        Signum::new(14).expect("SIGALRM"),
+        SigDisposition::Handler(0xCAFE),
+    );
+
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let observed_for_inner = std::sync::Arc::clone(&observed);
+    let reactor = std::sync::Arc::new(crate::adapter::boot_runtime::Reactor::new());
+    let reactor_for_inner = std::sync::Arc::clone(&reactor);
+    let init_for_inner = init.clone();
+    let leader_for_inner = leader.clone();
+    let aspace_for_inner = aspace.clone();
+    let inner = async move {
+        let hart = <TestPlatform as tx_hal::SmpIf>::current_cpu_id().0;
+        let mailbox = crate::adapter::boot_runtime::current_task_mailbox(hart)
+            .expect("reactor should expose current task mailbox while polling");
+        let registrar = crate::adapter::boot_runtime::current_deadline_registrar(hart)
+            .expect("reactor should expose current deadline registrar while polling");
+        let ctx = SyscallCtx::new(
+            init_for_inner.clone(),
+            leader_for_inner.clone(),
+            aspace_for_inner.clone(),
+        )
+        .with_mailbox(std::sync::Arc::clone(&mailbox))
+        .with_timer_registrar(registrar);
+        let new_timer = TestItimerval {
+            it_interval: TestTimeval {
+                tv_sec: 0,
+                tv_usec: 2,
+            },
+            it_value: TestTimeval {
+                tv_sec: 0,
+                tv_usec: 1,
+            },
+        };
+
+        let set = dispatch::<TestPlatform>(
+            SyscallRequest::new(
+                NR_SETITIMER,
+                [
+                    ITIMER_REAL,
+                    &new_timer as *const TestItimerval as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )
+        .await;
+        assert_eq!(set, SyscallResult::Return(0));
+        let first_deadline = reactor_for_inner
+            .next_deadline_ns()
+            .expect("periodic ITIMER_REAL should register first deadline");
+
+        TEST_MONOTONIC_NS.store(first_deadline + 1, Ordering::Release);
+        assert_eq!(reactor_for_inner.advance_time_to(first_deadline + 1), 1);
+        assert_eq!(
+            mailbox.len(),
+            1,
+            "signal timer fire should post a SignalTimerFired wake hint to the current mailbox",
+        );
+        assert_eq!(
+            reactor_for_inner.next_deadline_ns(),
+            None,
+            "manual fire removes the old entry before entry-side poll rearm",
+        );
+
+        TEST_HAL_DEADLINE_ARM_COUNT.store(0, Ordering::Release);
+        assert!(
+            super::poll_entry_timers_and_liveness::<TestPlatform>(&leader_for_inner),
+            "entry timer poll should keep live thread/process running",
+        );
+        assert_eq!(
+            TEST_HAL_DEADLINE_ARM_COUNT.load(Ordering::Acquire),
+            0,
+            "entry timer poll must leave current-hart HAL deadline programming to the reactor",
+        );
+        assert!(
+            mailbox
+                .poll_select(|event| match event {
+                    MailboxEvent::SignalTimerFired { .. } =>
+                        tx_substrate::wake::mailbox::MailboxPollAction::Take,
+                    _ => tx_substrate::wake::mailbox::MailboxPollAction::Keep,
+                })
+                .is_none(),
+            "entry timer poll should consume stale SignalTimerFired wake hints",
+        );
+        *observed_for_inner.lock().unwrap_or_else(|e| e.into_inner()) =
+            reactor_for_inner.next_deadline_ns().is_some();
+    };
+
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload, inner);
+    let _task = reactor.submit_task(wrapped);
+    let result = reactor.run_until_idle();
+
+    assert_eq!(result.completed, 1);
+    assert!(
+        *observed.lock().unwrap_or_else(|e| e.into_inner()),
+        "entry-side timer poll should rearm periodic ITIMER_REAL through current timer context",
     );
 }
 
@@ -1013,9 +1232,19 @@ fn thread_future_pf_err_routes_sigsegv_and_zombifies() {
 
     // Phase B: run_thread routes VM-fault Err through
     // deliver_synchronous_fault per SIGNAL_v1 §20. The default-action
-    // path in deliver_synchronous_fault calls step_exit_group_with_signal,
-    // which is what this test exercises directly.
-    tx_subsystems::process::execution::step_exit_group_with_signal(&init, Signum::SIGSEGV);
+    // path reaches the fatal group-exit transition, which this test
+    // exercises directly with explicit no-context posts.
+    tx_subsystems::process::execution::step_exit_group_with_signal_with_posts(
+        &init,
+        Signum::SIGSEGV,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
 
     assert!(init.is_zombie(), "SIGSEGV routing zombifies process");
     assert_eq!(
@@ -1029,6 +1258,192 @@ fn thread_future_pf_err_routes_sigsegv_and_zombifies() {
         drain_pending_syscall_return(&payload).is_none(),
         "PageFault Err must not write pending_syscall_return"
     );
+}
+
+#[test]
+fn thread_future_pf_err_retries_while_exec_owns_lifecycle() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread");
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&init, &leader)
+        .expect("reserve exec lifecycle");
+    let fault = PageFaultInfo {
+        addr: UserAddr::new(0xdead_1000),
+        access: PageFaultAccess::Write,
+        present: false,
+    };
+
+    let control = block_on(handle_page_fault_trap::<TestPlatform>(
+        &leader, &payload, fault,
+    ));
+
+    assert!(matches!(
+        control,
+        super::ThreadLoopControl::YieldBeforeContinue
+    ));
+    assert!(!init.is_zombie(), "retry must leave the process live");
+    assert!(
+        !leader.is_zombie(),
+        "retry must leave the faulting thread live"
+    );
+    drop(exec_prep);
+}
+
+#[test]
+fn run_thread_page_fault_retry_yields_before_reentering_userspace() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread");
+    let mut initial_ctx = tx_hal::UserTrapContext::empty();
+    initial_ctx.regs[10] = 77;
+    payload.store_saved_user_context(Some(initial_ctx));
+
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let mut wrapped =
+        PerHartSlotted::<TestPlatform, _>::new(leader.clone(), payload.clone(), future);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(
+        USERSPACE_A0_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len(),
+        1,
+    );
+    let active = payload
+        .active_userspace_request()
+        .expect("first userspace request published");
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&init, &leader)
+        .expect("reserve exec lifecycle");
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(
+            active,
+            UserspaceTrapInfo::PageFault(PageFaultInfo {
+                addr: UserAddr::new(0xdead_2000),
+                access: PageFaultAccess::Write,
+                present: false,
+            }),
+        )
+        .expect("resolve wait with failing PageFault");
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(
+        USERSPACE_A0_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len(),
+        1,
+        "Retry must yield before another userspace entry",
+    );
+    assert!(
+        payload.active_userspace_request().is_none(),
+        "Retry yield must not retain the consumed userspace request",
+    );
+    assert!(!init.is_zombie());
+    assert!(!leader.is_zombie());
+
+    drop(exec_prep);
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(
+        USERSPACE_A0_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len(),
+        2,
+        "after the exec lane releases, the future may reenter userspace",
+    );
+}
+
+#[test]
+fn fatal_signal_teardown_uses_injected_mailbox_post() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread");
+    let mailbox =
+        std::sync::Arc::new(tx_subsystems::signal::adapter::step_engine::TaskMailbox::new());
+    payload.bind_mailbox(std::sync::Arc::downgrade(&mailbox));
+
+    let injected_signal_posts = AtomicUsize::new(0);
+    let injected_wake_posts = AtomicUsize::new(0);
+    let control = fatal_signal_teardown_with_posts(
+        &init,
+        Signum::SIGSEGV,
+        |weak, event| {
+            injected_signal_posts.fetch_add(1, Ordering::SeqCst);
+            let mailbox = weak.upgrade().expect("bound mailbox is live");
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| {
+            injected_wake_posts.fetch_add(1, Ordering::SeqCst);
+            mailbox.post(event)
+        },
+    );
+
+    assert!(matches!(control, super::ThreadLoopControl::Exit));
+    assert_eq!(
+        injected_signal_posts.load(Ordering::SeqCst),
+        1,
+        "thread_future fatal teardown must use the injected post boundary",
+    );
+    assert!(leader.is_zombie(), "fatal teardown zombifies the leader");
+    assert_eq!(
+        init.exit_status(),
+        Some(ExitStatus::Signaled(Signum::SIGSEGV)),
+    );
+    match mailbox.poll().expect("terminal signal wake event") {
+        tx_subsystems::signal::adapter::step_engine::MailboxEvent::SignalDelivered {
+            signum,
+            ..
+        } => assert_eq!(signum, Signum::SIGKILL.raw() as u32),
+        other => panic!("expected SignalDelivered, got {other:?}"),
+    }
+}
+
+#[test]
+fn fatal_signal_teardown_retries_while_exec_owns_lifecycle() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let _payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread");
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&init, &leader)
+        .expect("reserve exec lifecycle");
+
+    let control = fatal_signal_teardown_with_posts(
+        &init,
+        Signum::SIGSEGV,
+        |weak, event| {
+            if let Some(mailbox) = weak.upgrade() {
+                let _ = mailbox.post(event);
+            }
+        },
+        |mailbox, event| mailbox.post(event),
+    );
+
+    assert!(matches!(control, super::ThreadLoopControl::Continue));
+    assert!(
+        !init.is_zombie(),
+        "retry must not detach the process payload"
+    );
+    assert!(
+        !leader.is_zombie(),
+        "retry must not terminate the exec initiator"
+    );
+    drop(exec_prep);
 }
 
 // ----- ExecCommitted dispatch (Wave 4 / Phase 6 of the ELF-loader plan) -----
@@ -1283,13 +1698,19 @@ fn thread_future_sigreturn_recomputes_summary_for_restored_blocked_sigcancel() {
     let sigcancel = Signum::new(33).expect("musl SIGCANCEL");
 
     tx_subsystems::signal::step_sigaction(&init, sigcancel, SigDisposition::Handler(0xCAFE));
-    tx_subsystems::thread_runtime::execution::post_signal(
+    tx_subsystems::thread_runtime::execution::post_signal_with_post(
         &leader,
         sigcancel,
         tx_subsystems::signal::adapter::step_engine::SignalRouting::ThreadDirected {
             tid: leader.tid.0 as u64,
         },
         None,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
     );
     assert!(
         payload.interrupt_summary().deliverable_signal,
@@ -1353,5 +1774,102 @@ fn thread_future_siginfo_to_user_abi_matches_musl_siginfo_prefix() {
     assert_eq!(
         u32::from_le_bytes(abi.bytes[20..24].try_into().unwrap()),
         456
+    );
+}
+
+#[test]
+fn sigcancel_frame_keeps_interrupted_syscall_pc_for_glibc_cancel_check() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let mut orig = tx_hal::UserTrapContext::empty();
+    orig.pc = 0x8bdea;
+    orig.regs[2] = 0x7000;
+    orig.regs[10] = 32;
+    payload.store_pending_syscall_return(Some(Err(4)));
+
+    let saved = signal_saved_context_with_pending_return(&payload, orig, None);
+    let frame = signal_frame_source_context(Signum::GLIBC_SIGCANCEL, orig, saved);
+
+    assert_eq!(frame.pc, 0x8bdea);
+    assert_eq!(
+        frame.regs[10],
+        (-4i64) as usize,
+        "SIGCANCEL frame keeps the interrupted PC but restores syscall return registers"
+    );
+    assert_eq!(
+        saved.regs[10],
+        (-4i64) as usize,
+        "sigreturn context still carries the interrupted syscall result"
+    );
+    assert!(
+        drain_pending_syscall_return(&payload).is_none(),
+        "pending syscall return must be drained before handler entry"
+    );
+}
+
+#[test]
+fn ordinary_signal_frame_carries_applied_syscall_return() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let mut orig = tx_hal::UserTrapContext::empty();
+    orig.pc = 0x1111;
+    orig.regs[10] = 7;
+    payload.store_pending_syscall_return(Some(Ok(123)));
+
+    let saved = signal_saved_context_with_pending_return(&payload, orig, None);
+    let frame = signal_frame_source_context(Signum::SIGCHLD, orig, saved);
+
+    assert_eq!(saved.regs[10], 123);
+    assert_eq!(
+        frame.regs[10], 123,
+        "non-SIGCANCEL handlers expose the resolved syscall return in ucontext"
+    );
+}
+
+#[test]
+fn non_restart_signal_frame_carries_pending_eintr_return() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let mut orig = tx_hal::UserTrapContext::empty();
+    orig.pc = 0x3336;
+    orig.regs[10] = 0xcc5288;
+    payload.store_pending_syscall_return(Some(Err(4)));
+
+    let saved = signal_saved_context_with_pending_return(&payload, orig, None);
+    let frame = signal_frame_source_context(Signum::SIGTERM, orig, saved);
+
+    assert_eq!(saved.pc, 0x3336);
+    assert_eq!(saved.regs[10], (-4i64) as usize);
+    assert_eq!(frame.pc, 0x3336);
+    assert_eq!(frame.regs[10], (-4i64) as usize);
+}
+
+#[test]
+fn sleeping_syscall_signal_context_uses_eintr_when_no_pending_return() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    payload.set_proc_sleeping(true);
+    let mut orig = tx_hal::UserTrapContext::empty();
+    orig.pc = 0x2222;
+    orig.regs[10] = 0xcc5288;
+
+    let action = tx_subsystems::signal::SigActionEntry {
+        disposition: SigDisposition::Handler(0xCAFE),
+        flags: tx_subsystems::signal::SaFlags::new(0),
+        sa_mask: tx_subsystems::signal::SignalMask::EMPTY,
+        restorer: 0,
+    };
+    let saved = signal_saved_context_with_pending_return(
+        &payload,
+        orig,
+        interrupted_syscall_signal_errno(&payload, Signum::GLIBC_SIGCANCEL, action),
+    );
+    let frame = signal_frame_source_context(Signum::GLIBC_SIGCANCEL, orig, saved);
+
+    assert_eq!(frame.pc, 0x2222);
+    assert_eq!(
+        frame.regs[10],
+        (-4i64) as usize,
+        "signal-interrupted sleeping syscall must restore EINTR, not stale a0"
     );
 }

@@ -61,10 +61,7 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value as i64,
-        );
+        observer.debug_counter(name, value as i64);
     }
 }
 
@@ -157,16 +154,19 @@ impl<P: TxPlatform> CoreInit<P> {
         if removed != 0 && step_engine::borrow_current_guard().is_none() {
             let first = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             let second = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
-            let vm_recipe_reclaims =
-                tx_subsystems::vm::drain_deferred_recipe_reclaims(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             emit_child_submit_marker(
                 "debug.child_submit.ebr_reclaimed",
-                first.reclaimed.saturating_add(second.reclaimed) as i64,
+                first
+                    .bag_reclaimed
+                    .saturating_add(second.bag_reclaimed)
+                    .saturating_add(first.publication_dropped)
+                    .saturating_add(second.publication_dropped) as i64,
             );
-            emit_child_submit_marker("debug.child_submit.ebr_remaining", second.remaining as i64);
             emit_child_submit_marker(
-                "debug.child_submit.vm_recipe_reclaimed",
-                vm_recipe_reclaims as i64,
+                "debug.child_submit.ebr_remaining",
+                second
+                    .bag_remaining
+                    .saturating_add(second.publication_remaining) as i64,
             );
         } else if removed != 0 {
             emit_child_submit_marker(
@@ -364,10 +364,7 @@ fn emit_child_submit_marker(name: &str, value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name.as_bytes())),
-            value,
-        );
+        observer.debug_counter(name.as_bytes(), value);
         tx_observe::dump_registered_if_requested();
     }
 }

@@ -1,10 +1,7 @@
 //! PR-3D-3 (D2/D4): per-process `exit_source` `WaitSource` integration tests.
 //!
-//! Pin the new task-mailbox-based wake path that runs in parallel
-//! with the legacy `Channel`+`Waker` path on per-process exit. The
-//! legacy path is exercised by
-//! `crates/tx-subsystems/src/process/tests/exit_source.rs`; this file
-//! pins the new path so PR-3D-4..5 reviewers see what a migrated
+//! Pin the task-mailbox-based wake path on per-process exit. This file
+//! pins the endpoint path so PR-3D-4..5 reviewers see what a migrated
 //! consumer looks like end-to-end.
 //!
 //! Exit-source wake-key model: one `WaitSource` per `ProcessPayload`,
@@ -12,8 +9,7 @@
 //! per object" shape, even simpler than pipe's two ports per pipe or
 //! futex's 256 buckets. The fire site is `post_sigchld_to_parent`:
 //! every time SIGCHLD posts (child mark_zombie / process exit_group),
-//! the parent's `exit_wait_source.notify` fires alongside the legacy
-//! `Channel.fire`.
+//! the parent's `exit_wait_source.notify` fires.
 //!
 //! Invariants pinned (bundled into a single `#[test]` per the cred-
 //! zone integration-test precedent: `reset_*_for_test` helpers are
@@ -23,7 +19,7 @@
 //! 1. **blocked-waitpid-woken-on-child-mark_zombie**. A waiter
 //!    registers a `TaskMailbox` against the parent's
 //!    `exit_wait_source` while no child has zombified; child
-//!    `step_exit_group` calls `post_sigchld_to_parent` which posts a
+//!    group exit calls `post_sigchld_to_parent` which posts a
 //!    `MailboxEvent::SourceFired` with the registration's generation
 //!    and the `EXIT_SOURCE_CHILD_ZOMBIFIED` interest.
 //! 2. **dropped-child-cleanup-retires-source**. The child's own
@@ -32,39 +28,42 @@
 //!    (payload drops). Subscribers we cloned the `Arc<WaitSource>`
 //!    out to before zombify still hold the strong ref and observe
 //!    no spurious posts after payload drop.
-//! 3. **D2-coexistence: legacy_channel_still_fires**. The parent's
-//!    legacy `Channel`-side awaiter (`fire_exit_source` return value
-//!    \> 0 when an awaiter was parked) keeps firing alongside the new
-//!    path. Pinned indirectly via re-using the source: the new
-//!    `MailboxEvent::SourceFired` post must coexist with — not
-//!    replace — the legacy channel-fire.
+//! 3. **endpoint-wait-resolves-on-child-mark_zombie**. A future created
+//!    through `wait_on_endpoint(parent.exit_endpoint(), EXIT_SOURCE_CHILD_ZOMBIFIED)`
+//!    parks before a child zombifies and resolves after the parent's exit
+//!    source fires.
 //! 4. **idempotency: double-mark_zombie-no-double-fire-from-process-
 //!    payload**. A process can only zombify once; the second call to
-//!    `step_exit_group` is a no-op (payload already gone, returns
+//!    group exit is a no-op (payload already gone, returns
 //!    early). The parent's source therefore receives exactly one
 //!    `SourceFired` event for the single zombify transition.
 //! 5. **WaitSourceId-round-trip**. The `WaitSource::id()` of the
 //!    parent's `exit_wait_source` matches the `u64` returned by
-//!    `ProcessIdentity::exit_source_id()` (the same `u64` the legacy
+//!    `ProcessIdentity::exit_source_id()` (the same `u64` the compatibility
 //!    `wait_source` resolver published). PR-3D-3's "same id
 //!    namespace" pin.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 
 use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_subsystems::process::adapter::step_engine::{Cap, InterestMask, WaitSourceId};
-use tx_subsystems::process::adapter::wait_routing::{
-    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
-};
+use tx_substrate::step::InterestMask;
+use tx_substrate::wake::{WaitGeneration, WaitRegistrationGuard};
+use tx_subsystems::process::adapter::step_engine::{Cap, WaitSourceId};
+use tx_subsystems::process::adapter::wait_routing::{MailboxEvent, TaskMailbox, WaitSource};
 
 use tx_subsystems::process::structure::{ProcessIdentity, EXIT_SOURCE_CHILD_ZOMBIFIED};
-use tx_subsystems::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
+use tx_subsystems::process::{
+    bootstrap_init_process, step_exit_group_with_posts, step_fork, ExitStatus,
+};
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
@@ -128,6 +127,20 @@ impl PmapIf for StubPmap {
 
 fn fresh_aspace() -> Cap<AddressSpace> {
     AddressSpace::new_cap_for_platform::<StubPmap>().expect("fresh aspace")
+}
+
+fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    step_exit_group_with_posts(
+        process,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
 }
 
 /// Helper: register `mailbox` against the parent's exit source and
@@ -199,6 +212,14 @@ fn exit_wait_source_invariants_round_trip() {
         WaitSourceId::new(parent_source_id),
         "exit_wait_source.id() must match exit_source_id (same u64 namespace)",
     );
+    let parent_endpoint = parent
+        .exit_endpoint()
+        .expect("live parent has exit endpoint");
+    assert_eq!(
+        tx_substrate::wake::WaitEndpoint::source_id(&parent_endpoint),
+        WaitSourceId::new(parent_source_id),
+        "exit_endpoint source id must match exit_source_id",
+    );
 
     // ---- (1) blocked-waitpid-woken-on-child-mark_zombie ------------
     let mailbox = Arc::new(TaskMailbox::new());
@@ -226,36 +247,22 @@ fn exit_wait_source_invariants_round_trip() {
         "child exit_wait_source id matches child carrier id",
     );
 
-    // Drive the legacy-channel awaiter for the D2 coexistence pin
-    // (invariant 3): an awaiter parked on the legacy `Channel` must
-    // also resolve when the new path fires, because the same
-    // `fire_exit_source` site fires both.
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn no_op(_: *const ()) {}
-    fn waker_clone(_: *const ()) -> RawWaker {
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
-    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
-    // SAFETY: vtable functions are no-ops.
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-
-    let legacy_channel = tx_subsystems::wait_source::lookup_wait_channel(parent_source_id)
-        .expect("legacy resolver still has the carrier");
-    let mut legacy_wait = legacy_channel.wait(Mask::from_bits(EXIT_SOURCE_CHILD_ZOMBIFIED));
-    let pre_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
+    // Drive an endpoint awaiter for invariant 3: an awaiter parked on
+    // the parent's exit endpoint must resolve when the source fires.
+    let waker = core::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut endpoint_wait =
+        tx_subsystems::wait_source::wait_on_endpoint(&parent_endpoint, EXIT_SOURCE_CHILD_ZOMBIFIED);
+    let pre_endpoint = Pin::new(&mut endpoint_wait).poll(&mut cx);
     assert!(
-        matches!(pre_legacy, Poll::Pending),
-        "no fires yet → legacy Pending"
+        matches!(pre_endpoint, Poll::Pending),
+        "no fires yet -> endpoint wait Pending"
     );
 
     // The single zombify transition for the child — fires both paths
-    // via `post_sigchld_to_parent` → `parent.fire_exit_source(...)`.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    // via `post_sigchld_to_parent` →
+    // `parent.fire_exit_source_with_post(...)`.
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     // (1) new path posted exactly one event.
     assert_source_fired_for(
@@ -269,11 +276,11 @@ fn exit_wait_source_invariants_round_trip() {
         "new path posts exactly one event per zombify transition"
     );
 
-    // (3) D2-coexistence: legacy `Channel.wait` future also resolves.
-    let post_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
+    // (3) endpoint future also resolves.
+    let post_endpoint = Pin::new(&mut endpoint_wait).poll(&mut cx);
     assert!(
-        matches!(post_legacy, Poll::Ready(_)),
-        "legacy Channel.fire on post_sigchld_to_parent must release the parked awaiter",
+        matches!(post_endpoint, Poll::Ready(_)),
+        "post_sigchld_to_parent must release the parked endpoint awaiter",
     );
 
     // ---- (2) dropped-child-cleanup-retires-source ------------------
@@ -293,8 +300,8 @@ fn exit_wait_source_invariants_round_trip() {
     assert_eq!(child_source_strong.subscriber_count(), 0);
 
     // ---- (4) idempotency: double-mark_zombie no double-fire -------
-    // A second `step_exit_group` on an already-zombie process is a
-    // no-op (the payload-guard arm returns early, `fire_exit_source`
+    // A second group exit on an already-zombie process is a
+    // no-op (the payload-guard arm returns early, `fire_exit_source_with_post`
     // returns 0). Re-register a fresh mailbox to assert no new event
     // arrives on the *child's* source from the double-call. The
     // child's source has no subscribers but that's fine — we're
@@ -311,17 +318,17 @@ fn exit_wait_source_invariants_round_trip() {
     assert!(mailbox2.is_empty());
 
     // Second zombify call on the same child — payload is already
-    // None; step_exit_group's `if let Some(payload) = ...` arm is
+    // None; group exit's `if let Some(payload) = ...` arm is
     // skipped; but post_sigchld_to_parent still runs (it's outside
     // the payload-guard) and operates on the parent's source. We
     // pin that the operation is safe and does not double-fire from
-    // the *child's* state — fire_exit_source on the parent is called
+    // the *child's* state — fire_exit_source_with_post on the parent is called
     // a second time, which is a legitimate notify (the parent is
     // still live; both paths re-fire). This is the "idempotency"
     // semantic the spec calls out: the production caller only zombifies
     // once per child; double-calling is documented as safe (no panic,
     // no UB). We test the safety, not no-double-fire-from-double-call.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     assert!(child.is_zombie(), "still zombie");
 
     // A SourceFired event is permitted here (post_sigchld_to_parent

@@ -10,19 +10,19 @@ use alloc::vec::Vec;
 
 use crate::execution::{Errno, Guard};
 use crate::mount::MountNamespace;
+use crate::vfs::FsOps;
 use crate::vfs::adapter::step_engine::Cap;
 use crate::vfs::structure::{Credential, DEntry};
 use crate::vfs::walker;
-use crate::vfs::FsOps;
 
 use super::error::classify;
 use super::state::{
     FinalSymlinkPolicy, IORequest, IOResult, KernelStep, PathResolution, ResumeToken, WalkCause,
-    WalkMode, WalkState, WalkingState,
+    WalkMode, WalkState, WalkingState, try_copy_path,
 };
 use super::step::{
-    kernel_step, kernel_step_after_lookup_io, kernel_step_after_materialise_io,
-    kernel_step_after_meta_io, kernel_step_after_readlink_io, TerminalRules,
+    TerminalRules, kernel_step, kernel_step_after_lookup_io, kernel_step_after_materialise_io,
+    kernel_step_after_meta_io, kernel_step_after_readlink_io,
 };
 
 /// Drive a walk from start to terminal, synchronously.
@@ -56,7 +56,30 @@ pub fn walk_to_completion_with_mount_namespace(
     mount_namespace: Option<&Cap<MountNamespace>>,
     guard: &Guard<'_>,
 ) -> Result<PathResolution, Errno> {
-    let (current, remaining, mount_root, must_be_directory) = initial_walk_frame(rooted_at, path);
+    walk_to_completion_with_mount_namespace_and_origin(
+        rooted_at,
+        path,
+        mode,
+        policy,
+        cred,
+        mount_namespace,
+        None,
+        guard,
+    )
+}
+
+pub fn walk_to_completion_with_mount_namespace_and_origin(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    origin_mount: Option<&Cap<crate::mount::MountIdentity>>,
+    guard: &Guard<'_>,
+) -> Result<PathResolution, Errno> {
+    let (current, remaining, mount_root, current_mount, mount_root_mount, must_be_directory) =
+        initial_walk_frame(rooted_at, path, mount_namespace, origin_mount)?;
 
     let _fs_ops: Arc<dyn FsOps> = walker::fs_ops_for(&current, guard)
         .or_else(|| walker::fs_ops_for(&mount_root, guard))
@@ -89,6 +112,8 @@ pub fn walk_to_completion_with_mount_namespace(
         remaining,
         hop_count: 0,
         mount_root,
+        current_mount,
+        mount_root_mount,
         must_be_directory,
     });
 
@@ -119,7 +144,11 @@ pub fn walk_to_completion_with_mount_namespace(
         let mount_payload = walker::mount_payload_for(&walking.current, guard)
             .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
 
-        let walking_state = walking.clone();
+        let diagnostic_current = walking.current.clone();
+        let mut diagnostic_remaining = [0u8; 128];
+        let diagnostic_len = walking.remaining.len().min(diagnostic_remaining.len());
+        diagnostic_remaining[..diagnostic_len]
+            .copy_from_slice(&walking.remaining[..diagnostic_len]);
         let rules = TerminalRules::new(mode, policy);
         match kernel_step(
             walking,
@@ -133,7 +162,7 @@ pub fn walk_to_completion_with_mount_namespace(
             KernelStep::Continue(next) => state = next,
             KernelStep::Error(cause) => {
                 // Capture walker failure context before returning.
-                let rn = walking_state.current.rnode();
+                let rn = diagnostic_current.rnode();
                 let errno = classify(&cause);
                 let stage = match &cause {
                     WalkCause::TraverseDenied => 30,
@@ -147,9 +176,9 @@ pub fn walk_to_completion_with_mount_namespace(
                 };
                 super::diagnostic::record_ctx(
                     stage,
-                    walking_state.current.name().as_bytes(),
+                    diagnostic_current.name().as_bytes(),
                     rn.fs_object_id(),
-                    &walking_state.remaining,
+                    &diagnostic_remaining[..diagnostic_len],
                     rn.containing_mount_weak().is_some(),
                 );
                 // Also stamp the legacy diag for old sentinel compatibility.
@@ -187,13 +216,41 @@ pub fn run_walker_with_mount_namespace(
     mount_namespace: Option<&Cap<MountNamespace>>,
     guard: &Guard<'_>,
 ) -> WalkState {
-    let (current, remaining, mount_root, must_be_directory) = initial_walk_frame(rooted_at, path);
+    run_walker_with_mount_namespace_and_origin(
+        rooted_at,
+        path,
+        mode,
+        policy,
+        cred,
+        mount_namespace,
+        None,
+        guard,
+    )
+}
+
+pub fn run_walker_with_mount_namespace_and_origin(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    origin_mount: Option<&Cap<crate::mount::MountIdentity>>,
+    guard: &Guard<'_>,
+) -> WalkState {
+    let (current, remaining, mount_root, current_mount, mount_root_mount, must_be_directory) =
+        match initial_walk_frame(rooted_at, path, mount_namespace, origin_mount) {
+            Ok(frame) => frame,
+            Err(errno) => return WalkState::Error(WalkCause::FsOpsRejected(errno)),
+        };
     drive_walk_state(
         WalkingState {
             current,
             remaining,
             hop_count: 0,
             mount_root,
+            current_mount,
+            mount_root_mount,
             must_be_directory,
         },
         mode,
@@ -262,15 +319,43 @@ pub fn resume_walker_after_io(
 fn initial_walk_frame(
     rooted_at: Cap<DEntry>,
     path: &[u8],
-) -> (Cap<DEntry>, Vec<u8>, Cap<DEntry>, bool) {
-    let mount_root = walker::mount_root_dentry(&rooted_at);
-    let (current, remaining): (Cap<DEntry>, Vec<u8>) = if path.first() == Some(&b'/') {
-        (mount_root.clone(), path[1..].to_vec())
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    origin_mount: Option<&Cap<crate::mount::MountIdentity>>,
+) -> Result<
+    (
+        Cap<DEntry>,
+        Vec<u8>,
+        Cap<DEntry>,
+        Option<Cap<crate::mount::MountIdentity>>,
+        Option<Cap<crate::mount::MountIdentity>>,
+        bool,
+    ),
+    Errno,
+> {
+    let (mount_root, mount_root_mount) = match mount_namespace {
+        Some(namespace) => (namespace.root_dentry(), Some(namespace.root().clone())),
+        None => (walker::mount_root_dentry(&rooted_at), None),
+    };
+    let absolute = path.first() == Some(&b'/');
+    let (current, remaining): (Cap<DEntry>, Vec<u8>) = if absolute {
+        (mount_root.clone(), try_copy_path(&path[1..])?)
     } else {
-        (rooted_at, path.to_vec())
+        (rooted_at, try_copy_path(path)?)
     };
     let must_be_directory = remaining.last().copied() == Some(b'/');
-    (current, remaining, mount_root, must_be_directory)
+    let current_mount = if absolute {
+        mount_root_mount.clone()
+    } else {
+        origin_mount.cloned().or_else(|| mount_root_mount.clone())
+    };
+    Ok((
+        current,
+        remaining,
+        mount_root,
+        current_mount,
+        mount_root_mount,
+        must_be_directory,
+    ))
 }
 
 fn apply_io_result(
@@ -350,10 +435,7 @@ fn apply_io_result(
                 mount_namespace,
             ))
         }
-        (
-            IORequest::MaterialiseRnode { fs_object_id, meta },
-            IOResult::MaterialiseRnode(Ok(rnode)),
-        ) => {
+        (IORequest::MaterialiseRnode { .. }, IOResult::MaterialiseRnode(Ok(rnode))) => {
             let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
                 .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
             let rules = TerminalRules::new(mode, policy);
@@ -362,8 +444,6 @@ fn apply_io_result(
                     token.walking,
                     mount_payload,
                     mount_namespace,
-                    fs_object_id,
-                    meta,
                     rnode,
                     cred,
                     rules,

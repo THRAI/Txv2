@@ -9,11 +9,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::ZoneError;
 
 const STATE_MASK: u64 = 0x7;
+const HAS_NEXT_BIT: u64 = 1 << 3;
+const GENERATION_EXHAUSTED_BIT: u64 = 1 << 4;
 const RETAIN_SHIFT: u64 = 16;
 const RETAIN_MASK: u64 = 0xffff_ffff;
 const GENERATION_SHIFT: u64 = 48;
-/// Retain count value used as a no-upgrade barrier after the last Cap drops.
-pub const RETAIN_SENTINEL_DEAD: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -24,10 +24,8 @@ pub enum SlotState {
     Reserved = 1,
     /// Slot contains a published object and may be retained by `Cap<T>`.
     Live = 2,
-    /// Semantic death has happened; upgrades are blocked, but EBR has not run.
-    Dead = 3,
     /// Slot has been queued to EBR and awaits the reclaim callback.
-    Retiring = 4,
+    Retiring = 3,
 }
 
 impl SlotState {
@@ -36,8 +34,7 @@ impl SlotState {
             0 => Some(Self::Free),
             1 => Some(Self::Reserved),
             2 => Some(Self::Live),
-            3 => Some(Self::Dead),
-            4 => Some(Self::Retiring),
+            3 => Some(Self::Retiring),
             _ => None,
         }
     }
@@ -47,7 +44,8 @@ impl SlotState {
 pub struct SlotWord(u64);
 
 impl SlotWord {
-    /// Layout: bits [2:0] state, [47:16] retain, [63:48] generation.
+    /// Layout: state [2:0], flags [4:3], payload [47:16], generation [63:48].
+    /// Payload is retain while Live and the raw next SlotKey while Retiring.
     pub const fn new(generation: u16, retain: u32, state: SlotState) -> Self {
         Self(
             ((generation as u64) << GENERATION_SHIFT)
@@ -68,6 +66,18 @@ impl SlotWord {
         ((self.0 >> RETAIN_SHIFT) & RETAIN_MASK) as u32
     }
 
+    pub fn has_next(self) -> bool {
+        self.0 & HAS_NEXT_BIT != 0
+    }
+
+    pub fn generation_exhausted(self) -> bool {
+        self.0 & GENERATION_EXHAUSTED_BIT != 0
+    }
+
+    pub fn retiring_next_raw(self) -> Option<u32> {
+        self.has_next().then_some(self.retain())
+    }
+
     pub fn state(self) -> SlotState {
         SlotState::from_bits(self.0 & STATE_MASK).unwrap_or(SlotState::Retiring)
     }
@@ -84,9 +94,22 @@ impl SlotWord {
         Self((self.0 & !STATE_MASK) | state as u64)
     }
 
+    pub fn with_retiring_next(self, next: Option<u32>) -> Self {
+        let word = self.with_retain(next.unwrap_or(0));
+        if next.is_some() {
+            Self(word.0 | HAS_NEXT_BIT)
+        } else {
+            Self(word.0 & !HAS_NEXT_BIT)
+        }
+    }
+
+    pub fn clear_retiring_link(self) -> Self {
+        Self(self.with_retain(0).0 & !HAS_NEXT_BIT)
+    }
+
     pub fn inc_retain(self) -> Result<Self, ZoneError> {
         let retain = self.retain();
-        if retain == RETAIN_SENTINEL_DEAD {
+        if retain == u32::MAX {
             return Err(ZoneError::RetainOverflow);
         }
         Ok(self.with_retain(retain + 1))
@@ -94,14 +117,19 @@ impl SlotWord {
 
     pub fn dec_retain(self) -> Result<Self, ZoneError> {
         let retain = self.retain();
-        if retain == 0 || retain == RETAIN_SENTINEL_DEAD {
+        if retain == 0 {
             return Err(ZoneError::InvalidState);
         }
         Ok(self.with_retain(retain - 1))
     }
 
-    pub fn inc_generation(self) -> Self {
-        self.with_generation(self.generation().wrapping_add(1))
+    pub fn next_free_generation(self) -> Self {
+        let cleared = self.clear_retiring_link().with_state(SlotState::Free);
+        if self.generation() == u16::MAX {
+            Self(cleared.0 | GENERATION_EXHAUSTED_BIT)
+        } else {
+            cleared.with_generation(self.generation() + 1)
+        }
     }
 }
 

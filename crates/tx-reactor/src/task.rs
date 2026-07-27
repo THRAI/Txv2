@@ -43,6 +43,10 @@ impl TaskGeneration {
         self.0
     }
 
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }
@@ -137,7 +141,11 @@ impl Task {
         emit_task_submit_debug(b"debug.task.submit.future_box.after", handle.id);
         let wake_state = Arc::new(TaskWakeState::new(handle.id, wake_queue));
         emit_task_submit_debug(b"debug.task.submit.wake_state.after", handle.id);
-        let mailbox = Arc::new(TaskMailbox::new().with_task_id(handle.id.0 as u32));
+        let mailbox = Arc::new(
+            TaskMailbox::new()
+                .with_task_id(handle.id.0 as u32)
+                .with_scheduler_owner(handle.id.0, handle.generation.value()),
+        );
         emit_task_submit_debug(b"debug.task.submit.mailbox.after", handle.id);
         Self {
             id: handle.id,
@@ -410,6 +418,24 @@ impl TaskTable {
         }
     }
 
+    pub(crate) fn make_owner_runnable_with_hint(
+        &mut self,
+        id: TaskId,
+        generation: TaskGeneration,
+    ) -> Option<(TaskKey, MailboxSchedulerHint)> {
+        let task = self.slots.get_mut(id.index())?.task.as_mut()?;
+        if task.generation != generation {
+            return None;
+        }
+        match task.status {
+            TaskStatus::Parked => task.status = TaskStatus::Runnable,
+            TaskStatus::Runnable => {}
+            TaskStatus::Polling | TaskStatus::Completed | TaskStatus::Cancelled => return None,
+        }
+        let hint = task.mailbox.take_scheduler_hint();
+        Some((task.handle(), hint))
+    }
+
     pub(crate) fn is_idle(&self) -> bool {
         self.slots.iter().all(|slot| {
             let Some(task) = slot.task.as_ref() else {
@@ -533,10 +559,7 @@ fn emit_task_submit_value(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -578,26 +601,51 @@ pub fn current_task_mailbox(hart: usize) -> Option<Arc<TaskMailbox>> {
         .and_then(|slot| slot.lock().clone())
 }
 
+/// Return the task mailbox for the currently-polled task when the runtime can
+/// identify it unambiguously.
+///
+/// Generic wait futures do not carry a hart id. During normal single-hart or
+/// sequential host polling there is exactly one current mailbox slot set, and
+/// this helper lets those futures bind to the task-owned mailbox. If more than
+/// one hart is polling at the same time, the helper returns `None` rather than
+/// guessing; callers then use their standalone fallback.
+pub(crate) fn current_poll_task_mailbox() -> Option<Arc<TaskMailbox>> {
+    let mut found = None;
+    for slot in &CURRENT_MAILBOX {
+        let mailbox = slot.lock().clone();
+        if mailbox.is_some() {
+            if found.is_some() {
+                return None;
+            }
+            found = mailbox;
+        }
+    }
+    found
+}
+
 // -----------------------------------------------------------------------
-// drive-taskmb: timer wheel trampoline (same pattern as CURRENT_MAILBOX)
+// drive-taskmb: deadline registrar trampoline (same pattern as CURRENT_MAILBOX)
 // -----------------------------------------------------------------------
 
-use tx_substrate::wake::timer::TimerWheel;
+use tx_services::time::DeadlineRegistrarHandle;
 
-/// Per-hart slots for the current reactor's timer wheel.
-static CURRENT_TIMER_WHEEL: [SpinLock<Option<TimerWheel>>; MAX_HARTS] =
+/// Per-hart slots for the current reactor's deadline registrar.
+static CURRENT_DEADLINE_REGISTRAR: [SpinLock<Option<DeadlineRegistrarHandle>>; MAX_HARTS] =
     [const { SpinLock::new(None) }; MAX_HARTS];
 
-/// Set the current reactor's timer wheel for `hart` (called by reactor before poll).
-pub(crate) fn set_current_timer_wheel(hart: usize, wheel: Option<TimerWheel>) {
-    if let Some(slot) = CURRENT_TIMER_WHEEL.get(hart) {
-        *slot.lock() = wheel;
+/// Set the current reactor's deadline registrar for `hart` (called before poll).
+pub(crate) fn set_current_deadline_registrar(
+    hart: usize,
+    registrar: Option<DeadlineRegistrarHandle>,
+) {
+    if let Some(slot) = CURRENT_DEADLINE_REGISTRAR.get(hart) {
+        *slot.lock() = registrar;
     }
 }
 
-/// Read the current reactor's timer wheel for `hart` (called by trampoline / `run_thread`).
-pub fn current_timer_wheel(hart: usize) -> Option<TimerWheel> {
-    CURRENT_TIMER_WHEEL
+/// Read the current reactor's deadline registrar facade for `hart`.
+pub fn current_deadline_registrar(hart: usize) -> Option<DeadlineRegistrarHandle> {
+    CURRENT_DEADLINE_REGISTRAR
         .get(hart)
         .and_then(|slot| slot.lock().clone())
 }

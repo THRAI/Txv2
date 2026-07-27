@@ -19,6 +19,7 @@ __pycache__/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 /document/ljs
+/ljs
 
 # generated vendor snapshot
 /third_party/

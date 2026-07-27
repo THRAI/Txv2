@@ -11,7 +11,7 @@ doctest = false
 
 [features]
 # Exposes `tx_observe::testing` for integration tests in sibling crates.
-# Pulls in `std` for `Mutex` and `Vec`; do not enable in kernel builds.
+# Kept no_std: the helper uses alloc-backed buffers plus an atomic test lock.
 testing = []
 
 [dependencies]

@@ -8,8 +8,8 @@
 //!
 //! | Op | Syscalls | Backend call |
 //! |----|----------|-------------|
-//! | ChmodOp | fchmodat | FsOps::step_chmod |
-//! | ChownOp | fchownat | FsOps::step_chown |
+//! | ChmodOp | fchmodat | FsOps::chmod_inode |
+//! | ChownOp | fchownat | FsOps::chown_inode |
 //! | AccessOp | faccessat, faccessat2 | walker-only |
 //! | MkdirOp | mkdirat | FsOps::mkdir |
 //! | UnlinkOp | unlinkat | FsOps::unlink |
@@ -64,7 +64,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
             }
         };
         let fs_ops = walker::fs_ops_for(&target, &__guard).expect("NoFsOps for ChmodOp");
-        fs_ops.step_chmod(
+        fs_ops.chmod_inode(
             target.rnode().fs_object_id(),
             self.mode,
             self.cred,
@@ -109,7 +109,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
             }
         };
         let fs_ops = walker::fs_ops_for(&target, &__guard).expect("NoFsOps for ChownOp");
-        fs_ops.step_chown(
+        fs_ops.chown_inode(
             target.rnode().fs_object_id(),
             self.uid,
             self.gid,
@@ -641,10 +641,13 @@ pub struct LstatOp<'a> {
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
-    type Output = InodeMeta;
+    type Output = (InodeMeta, FsObjectId);
     type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<InodeMeta, NoProgress> {
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<(InodeMeta, FsObjectId), NoProgress> {
         let __guard = step_engine::guard();
         let target = match self.target.take() {
             Some(d) => d,
@@ -665,7 +668,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
                 d
             }
         };
-        StepOutcome::done(live_meta_for_dentry(&target, &__guard))
+        let ino = target.rnode().fs_object_id();
+        StepOutcome::done((live_meta_for_dentry(&target, &__guard), ino))
     }
 }
 
@@ -718,6 +722,54 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatxOp<'a> {
 
 impl OneShotStepOp<ProcessIdentity> for StatxOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for StatxOp<'_> {}
+
+// ============================================================================
+// LstatxOp — statx with AT_SYMLINK_NOFOLLOW
+// ============================================================================
+
+pub struct LstatxOp<'a> {
+    pub rooted_at: &'a Cap<DEntry>,
+    pub path: &'a [u8],
+    pub cred: &'a Credential,
+    pub target: Option<Cap<DEntry>>,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for LstatxOp<'a> {
+    type Output = (StatxResult, FsObjectId);
+    type Progress = NoProgress;
+
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<(StatxResult, FsObjectId), NoProgress> {
+        let __guard = step_engine::guard();
+        let target = match self.target.take() {
+            Some(d) => d,
+            None => {
+                let rooted_at = self.rooted_at.clone();
+                let d = match super::resolution::driver::walk_to_completion(
+                    rooted_at,
+                    self.path,
+                    super::resolution::state::WalkMode::EntityUnfollowed,
+                    super::resolution::state::FinalSymlinkPolicy::NoFollow,
+                    self.cred,
+                    &__guard,
+                ) {
+                    Ok(resolved) => resolved.dentry,
+                    Err(e) => return StepOutcome::err(e.into()),
+                };
+                self.target = Some(d.clone());
+                d
+            }
+        };
+        let ino = target.rnode().fs_object_id();
+        let meta = live_meta_for_dentry(&target, &__guard);
+        StepOutcome::done((StatxResult { meta }, ino))
+    }
+}
+
+impl OneShotStepOp<ProcessIdentity> for LstatxOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for LstatxOp<'_> {}
 
 fn live_meta_for_dentry(target: &Cap<DEntry>, guard: &crate::execution::Guard<'_>) -> InodeMeta {
     // Prefer the FS's live metadata so chmod/chown/truncate/write updates
@@ -998,7 +1050,7 @@ impl<I: SubjectIdentity> StepOp<I> for PpollOp {
             // the fd becomes readable.
             if self.timeout_ms.is_some() {
                 // Timeout: for now, yield without timeout (the
-                // TimerWheel fire path needs deadline plumbing).
+                // Deadline-domain expiry needs plumbing).
                 // Future: combine OnWaitSource + OnTimer via
                 // composite yield.
                 return notification::ppoll_wait(self.wait_source_id, self.interests);

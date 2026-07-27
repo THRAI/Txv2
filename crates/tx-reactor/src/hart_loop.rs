@@ -5,18 +5,12 @@
 //!
 //! ## PR-7B integration point: DelegateTimeout fires
 //!
-//! `tx-substrate`'s `DelegateRegistry` and the `TimerWheel` now live
-//! in the same crate (per D6 the wheel moved down to substrate's
-//! `wake::timer`; the reactor re-exports it through
-//! [`crate::timer::TimerWheel`] for back-compat). The reactor-side
-//! glue that routes a fired `DelegateTimeout` timer to
-//! `registry.mark_timed_out(...)` lives on the wheel itself, in
-//! [`crate::timer::TimerWheel::fire_due_delegate_timeouts`]. The
+//! `tx-substrate`'s `DelegateRegistry` and the concrete timer registry now live
+//! below the reactor-facing time facade. The reactor-side glue that routes a
+//! fired `DelegateTimeout` timer to the registry delegate timeout transition
+//! lives behind the time driver boundary. The
 //! hart-loop tick handler is the natural caller — drive it after
-//! [`HartLoopRuntime::advance_hart_loop_time`] returns. PR-8B (the
-//! wheel-mechanics PR) folds this into the wheel's primary fire path;
-//! until then the call is explicit so tests and any future caller
-//! can exercise the routing without rearchitecting the loop.
+//! [`HartLoopRuntime::advance_hart_loop_time`] returns.
 
 use crate::{
     dispatch::{RescheduleSignal, WakeDispatchReport},
@@ -24,6 +18,7 @@ use crate::{
     runtime::{HartRuntimeView, Reactor, RunStats},
     scheduler::HartId,
 };
+pub use tx_time::driver::CurrentHartDeadlineAction as HartLoopDeadlineAction;
 
 /// Whether the outer runtime should immediately step again or enter its idle path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,31 +35,6 @@ impl HartLoopDecision {
     }
 }
 
-/// Platform-neutral timer programming request for the outer runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HartLoopDeadlineAction {
-    /// Arm the platform timer for an absolute reactor deadline.
-    Arm { deadline_ns: u64 },
-    /// Cancel the platform timer because the reactor has no pending deadline.
-    Cancel,
-}
-
-impl HartLoopDeadlineAction {
-    pub const fn from_next_deadline(next_deadline_ns: Option<u64>) -> Self {
-        match next_deadline_ns {
-            Some(deadline_ns) => Self::Arm { deadline_ns },
-            None => Self::Cancel,
-        }
-    }
-
-    pub const fn next_deadline_ns(self) -> Option<u64> {
-        match self {
-            Self::Arm { deadline_ns } => Some(deadline_ns),
-            Self::Cancel => None,
-        }
-    }
-}
-
 /// Result of one bounded platform-independent hart loop step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HartLoopStep {
@@ -74,6 +44,7 @@ pub struct HartLoopStep {
     pub wake_dispatch: WakeDispatchReport,
     pub consumed_markers: PreemptMarkers,
     pub timer_wakes: usize,
+    pub deadline_changed: bool,
     pub next_deadline_ns: Option<u64>,
     pub deadline_action: HartLoopDeadlineAction,
     pub decision: HartLoopDecision,
@@ -87,6 +58,7 @@ impl HartLoopStep {
         wake_dispatch: WakeDispatchReport,
         consumed_markers: PreemptMarkers,
         timer_wakes: usize,
+        deadline_changed: bool,
         next_deadline_ns: Option<u64>,
     ) -> Self {
         let deadline_action = HartLoopDeadlineAction::from_next_deadline(next_deadline_ns);
@@ -94,6 +66,7 @@ impl HartLoopStep {
             || wake_dispatch.placements > 0
             || !consumed_markers.is_empty()
             || timer_wakes > 0
+            || deadline_changed
         {
             HartLoopDecision::Continue
         } else {
@@ -107,6 +80,7 @@ impl HartLoopStep {
             wake_dispatch,
             consumed_markers,
             timer_wakes,
+            deadline_changed,
             next_deadline_ns,
             deadline_action,
             decision,
@@ -134,6 +108,29 @@ impl HartLoopStep {
 pub trait HartLoopRuntime {
     fn advance_hart_loop_time(&mut self, now_ns: u64) -> usize;
 
+    fn hart_loop_next_deadline_ns(&self) -> Option<u64>;
+
+    fn advance_hart_loop_time_with_reschedule<S>(
+        &mut self,
+        hart: HartId,
+        now_ns: u64,
+        signal: &mut S,
+    ) -> (usize, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        let _ = hart;
+        let _ = signal;
+        (
+            self.advance_hart_loop_time(now_ns),
+            WakeDispatchReport::empty(),
+        )
+    }
+
+    fn hart_loop_deadline_change_pending(&mut self) -> bool {
+        false
+    }
+
     fn drain_hart_loop_wakes<S>(
         &mut self,
         current_hart: HartId,
@@ -147,8 +144,6 @@ pub trait HartLoopRuntime {
     fn run_hart_loop_ready<S>(&mut self, hart: HartId, signal: &mut S) -> RunStats
     where
         S: RescheduleSignal;
-
-    fn hart_loop_next_deadline_ns(&self) -> Option<u64>;
 }
 
 /// Minimal clock adapter used by the platform-independent step shell.
@@ -191,8 +186,10 @@ where
     R: HartLoopRuntime,
     S: RescheduleSignal,
 {
-    let timer_wakes = runtime.advance_hart_loop_time(now_ns);
-    let wake_dispatch = runtime.drain_hart_loop_wakes(hart, signal);
+    let (timer_wakes, mut wake_dispatch) =
+        runtime.advance_hart_loop_time_with_reschedule(hart, now_ns, signal);
+    wake_dispatch.merge(runtime.drain_hart_loop_wakes(hart, signal));
+    let deadline_changed = runtime.hart_loop_deadline_change_pending();
     let consumed_markers = runtime.consume_hart_loop_markers(hart);
     let stats = runtime.run_hart_loop_ready(hart, signal);
     let next_deadline_ns = runtime.hart_loop_next_deadline_ns();
@@ -204,6 +201,7 @@ where
         wake_dispatch,
         consumed_markers,
         timer_wakes,
+        deadline_changed,
         next_deadline_ns,
     )
 }
@@ -213,6 +211,26 @@ impl HartLoopRuntime for Reactor {
         self.advance_time_to(now_ns)
     }
 
+    fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
+        self.next_deadline_ns()
+    }
+
+    fn advance_hart_loop_time_with_reschedule<S>(
+        &mut self,
+        hart: HartId,
+        now_ns: u64,
+        signal: &mut S,
+    ) -> (usize, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        self.advance_time_to_from_hart_with_reschedule(now_ns, hart, signal)
+    }
+
+    fn hart_loop_deadline_change_pending(&mut self) -> bool {
+        self.deadline_change_pending()
+    }
+
     fn drain_hart_loop_wakes<S>(
         &mut self,
         current_hart: HartId,
@@ -233,10 +251,6 @@ impl HartLoopRuntime for Reactor {
         S: RescheduleSignal,
     {
         self.run_until_idle_on_hart_with_reschedule(hart, signal)
-    }
-
-    fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
-        self.next_deadline_ns()
     }
 }
 
@@ -245,6 +259,26 @@ impl HartLoopRuntime for HartRuntimeView<'_> {
         self.advance_time_to(now_ns)
     }
 
+    fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
+        self.next_deadline_ns()
+    }
+
+    fn advance_hart_loop_time_with_reschedule<S>(
+        &mut self,
+        hart: HartId,
+        now_ns: u64,
+        signal: &mut S,
+    ) -> (usize, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        self.advance_time_to_with_reschedule(now_ns, hart, signal)
+    }
+
+    fn hart_loop_deadline_change_pending(&mut self) -> bool {
+        self.deadline_change_pending()
+    }
+
     fn drain_hart_loop_wakes<S>(
         &mut self,
         current_hart: HartId,
@@ -265,10 +299,6 @@ impl HartLoopRuntime for HartRuntimeView<'_> {
         S: RescheduleSignal,
     {
         self.run_until_idle_on_hart_with_reschedule(hart, signal)
-    }
-
-    fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
-        self.next_deadline_ns()
     }
 }
 
@@ -392,6 +422,10 @@ mod step_op_wraps {
             self.timer_wakes
         }
 
+        fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
+            self.next_deadline_ns
+        }
+
         fn drain_hart_loop_wakes<S>(
             &mut self,
             _current_hart: HartId,
@@ -412,10 +446,6 @@ mod step_op_wraps {
             S: RescheduleSignal,
         {
             self.stats
-        }
-
-        fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
-            self.next_deadline_ns
         }
     }
 

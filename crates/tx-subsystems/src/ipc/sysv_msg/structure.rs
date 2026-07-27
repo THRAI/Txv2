@@ -14,7 +14,7 @@ use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
     Cap, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
 };
-use crate::process::adapter::wait_routing::Channel;
+use crate::process::adapter::wait_routing::WaitSource;
 use crate::process::nsproxy::SysvKey;
 
 // ---------------------------------------------------------------------------
@@ -88,22 +88,28 @@ pub struct MsgQueuePayload {
     /// Number of messages currently in the queue. Atomic so readers
     /// can check emptiness without locking the message vec.
     pub msg_count: AtomicU32,
-    /// Wake channel for blocked senders (fired when a receiver drains
-    /// bytes, making space available).
-    pub send_channel: Channel,
-    /// Wake channel for blocked receivers (fired when a sender pushes
-    /// a message).
-    pub recv_channel: Channel,
     /// Registered wait-source ids for poll/select integration.
     pub send_source_id: u64,
     pub recv_source_id: u64,
-    pub send_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
-    pub recv_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
+    pub send_source: alloc::sync::Arc<WaitSource>,
+    pub recv_source: alloc::sync::Arc<WaitSource>,
+}
+
+impl MsgQueuePayload {
+    /// Sender-side endpoint fired when queue space becomes available.
+    pub fn send_endpoint(&self) -> &alloc::sync::Arc<WaitSource> {
+        &self.send_source
+    }
+
+    /// Receiver-side endpoint fired when a message becomes available.
+    pub fn recv_endpoint(&self) -> &alloc::sync::Arc<WaitSource> {
+        &self.recv_source
+    }
 }
 
 impl Drop for MsgQueuePayload {
     fn drop(&mut self) {
-        crate::ipc::sysv_msg::notification::release_wait_channels(
+        crate::ipc::sysv_msg::notification::release_wait_sources(
             self.send_source_id,
             self.recv_source_id,
         );
@@ -170,8 +176,8 @@ pub(crate) fn register_msg(
     use crate::process::adapter::step_engine::sign;
     let msqid = NEXT_MSGID.fetch_add(1, Ordering::Relaxed);
 
-    let (send_channel, recv_channel, send_source_id, recv_source_id, send_source, recv_source) =
-        crate::ipc::sysv_msg::notification::new_wait_channels();
+    let (send_source_id, recv_source_id, send_source, recv_source) =
+        crate::ipc::sysv_msg::notification::new_wait_sources();
 
     let identity = sign(MsgQueueIdentity {
         key,
@@ -192,8 +198,6 @@ pub(crate) fn register_msg(
         max_msg_size,
         queue_seq: AtomicU64::new(0),
         msg_count: AtomicU32::new(0),
-        send_channel,
-        recv_channel,
         send_source_id,
         recv_source_id,
         send_source,

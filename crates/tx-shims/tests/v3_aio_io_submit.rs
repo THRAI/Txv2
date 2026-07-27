@@ -45,8 +45,9 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    Arch, Asid, DeadlineTimerIf, EntropyIf, MonotonicCounterIf, PhysAddr, PlatformConfig,
+    PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
 use tx_shims::adapter::step_engine::{Cap, OnBehalfOfAbort};
@@ -124,16 +125,23 @@ impl tx_hal::ConsoleIf for StubPmap {
 }
 impl tx_hal::SmpIf for StubPmap {}
 
-impl TimeIf for StubPmap {
+impl MonotonicCounterIf for StubPmap {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+impl DeadlineTimerIf for StubPmap {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for StubPmap {}
 
 // -------- Setup -----------------------------------------------------
 

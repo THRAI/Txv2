@@ -265,11 +265,16 @@ impl SignalFrameIf for Platform {
         let siginfo_addr = frame_addr + offset_of!(Rv64SignalFrame, siginfo);
         let ucontext_addr = frame_addr + offset_of!(Rv64SignalFrame, ucontext);
         let trampoline_pc = frame_addr + offset_of!(Rv64SignalFrame, trampoline);
+        let return_pc = if setup.restorer_pc.addr() != 0 {
+            setup.restorer_pc.addr()
+        } else {
+            trampoline_pc
+        };
 
         tf.set_pc(VirtAddr(setup.handler_pc.addr()));
         tf.set_sp(VirtAddr(frame_addr));
         tf.set_signal_handler_regs(SignalHandlerRegs {
-            return_pc: VirtAddr(trampoline_pc),
+            return_pc: VirtAddr(return_pc),
             args: [setup.sig_no as usize, siginfo_addr, ucontext_addr],
         });
 
@@ -370,12 +375,17 @@ impl SignalFrameIf for Platform {
         };
 
         let trampoline_pc = frame_addr + offset_of!(Rv64SignalFrame, trampoline);
+        let return_pc = if setup.restorer_pc.addr() != 0 {
+            setup.restorer_pc.addr()
+        } else {
+            trampoline_pc
+        };
 
         // Build handler-entry UserTrapContext.
         let mut handler_ctx = *ctx;
         handler_ctx.pc = setup.handler_pc.addr();
         handler_ctx.regs[2] = frame_addr; // sp
-        handler_ctx.regs[1] = trampoline_pc; // ra
+        handler_ctx.regs[1] = return_pc; // ra
         let siginfo_addr = frame_addr + offset_of!(Rv64SignalFrame, siginfo);
         let ucontext_addr = frame_addr + offset_of!(Rv64SignalFrame, ucontext);
         handler_ctx.regs[10] = setup.sig_no as usize; // a0
@@ -413,6 +423,26 @@ mod tests {
     fn align_down_rounds_to_requested_boundary() {
         assert_eq!(align_down(0x100f, 16), 0x1000);
         assert_eq!(align_down(0x1000, 16), 0x1000);
+    }
+
+    #[test]
+    fn prepared_signal_frame_uses_explicit_restorer_when_supplied() {
+        let mut context = UserTrapContext::empty();
+        context.regs[2] = 0x8000;
+        let setup = SignalFrameWrite {
+            stack_top: UserPtr::new(context.regs[2]),
+            sig_no: 10,
+            siginfo: tx_hal::UserSigInfoAbi::ZERO,
+            old_mask: tx_hal::UserSignalMaskAbi::EMPTY,
+            flags: tx_hal::UserSaFlagsAbi::EMPTY,
+            handler_pc: UserPtr::new(0x5000),
+            restorer_pc: UserPtr::new(0x6000),
+        };
+
+        let (handler_ctx, _) =
+            <Platform as SignalFrameIf>::prepare_signal_frame(&context, &setup).expect("prepare");
+        assert_eq!(handler_ctx.pc, 0x5000);
+        assert_eq!(handler_ctx.regs[1], 0x6000);
     }
 
     /// Verify that `uc_mcontext.__gregs[0]` (the PC field musl reads via

@@ -10,11 +10,102 @@ use crate::linux_syscall::{
     FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, NR_FUTEX,
 };
 use std::sync::Arc;
-use tx_substrate::wake::{MailboxSchedulerHint, TaskMailbox, TimerWheel};
+use tx_services::time::{
+    DeadlineDomain, DeadlineNs, DeadlineRegistrarHandle, TimeError, TimerRole, TimerTarget,
+    TimerToken,
+};
+use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 
 const E_INVAL: i32 = 22;
 const E_AGAIN: i32 = 11;
 const E_TIMEDOUT: i32 = 110;
+
+static FUTEX_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_futex_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    FUTEX_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post_with_scheduler_hint(event, hint)
+}
+
+struct RecordedDeadline {
+    token: TimerToken,
+    role: TimerRole,
+    mailbox: Option<std::sync::Weak<TaskMailbox>>,
+}
+
+#[derive(Default)]
+struct RecordingDeadlineDomain {
+    next_token: core::sync::atomic::AtomicU64,
+    deadlines: std::sync::Mutex<Vec<RecordedDeadline>>,
+}
+
+impl RecordingDeadlineDomain {
+    fn registration(&self) -> (TimerRole, bool) {
+        let deadlines = self.deadlines.lock().expect("deadline domain lock");
+        let deadline = deadlines
+            .first()
+            .expect("finite FUTEX_WAIT should register a deadline");
+        (deadline.role, deadline.mailbox.is_some())
+    }
+
+    fn fire_next(&self) -> bool {
+        let deadline = self.deadlines.lock().expect("deadline domain lock").pop();
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        let Some(mailbox) = deadline.mailbox.and_then(|mailbox| mailbox.upgrade()) else {
+            return false;
+        };
+        mailbox.post(MailboxEvent::TimerFired {
+            token: deadline.token,
+        })
+    }
+}
+
+impl DeadlineDomain for RecordingDeadlineDomain {
+    fn register_deadline(
+        &self,
+        _deadline_ns: DeadlineNs,
+        role: TimerRole,
+        target: TimerTarget,
+    ) -> Result<TimerToken, TimeError> {
+        let token = TimerToken::new(
+            self.next_token
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel)
+                .saturating_add(1),
+        );
+        let mailbox = match target {
+            TimerTarget::TaskMailbox(mailbox) => Some(mailbox),
+            _ => None,
+        };
+        self.deadlines
+            .lock()
+            .expect("deadline domain lock")
+            .push(RecordedDeadline {
+                token,
+                role,
+                mailbox,
+            });
+        Ok(token)
+    }
+
+    fn cancel_deadline(&self, token: TimerToken) -> bool {
+        let mut deadlines = self.deadlines.lock().expect("deadline domain lock");
+        let Some(index) = deadlines
+            .iter()
+            .position(|deadline| deadline.token == token)
+        else {
+            return false;
+        };
+        deadlines.swap_remove(index);
+        true
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -109,11 +200,17 @@ fn map_user_timespec(ctx: &SyscallCtx<'_>, ts: TestTimespec) -> u64 {
     uaddr as u64
 }
 
-fn ctx_with_mailbox_and_timer(ctx: SyscallCtx<'static>) -> (SyscallCtx<'static>, TimerWheel) {
+fn ctx_with_mailbox_and_deadline_domain(
+    ctx: SyscallCtx<'static>,
+) -> (SyscallCtx<'static>, Arc<RecordingDeadlineDomain>) {
     let mailbox = Arc::new(TaskMailbox::new());
-    let wheel = TimerWheel::new();
-    let ctx = ctx.with_mailbox(mailbox).with_timer_wheel(wheel.clone());
-    (ctx, wheel)
+    let deadline_domain = Arc::new(RecordingDeadlineDomain::default());
+    let ctx = ctx
+        .with_mailbox(mailbox)
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(
+            deadline_domain.clone(),
+        ));
+    (ctx, deadline_domain)
 }
 
 /// `futex(uaddr, FUTEX_WAIT, val, ...)` with `*uaddr != val`
@@ -149,7 +246,7 @@ fn dispatch_futex_wait_with_zero_timeout_returns_neg_etimedout() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let (ctx, _wheel) = ctx_with_mailbox_and_timer(ctx);
+    let (ctx, _deadline_domain) = ctx_with_mailbox_and_deadline_domain(ctx);
     let uaddr = map_user_futex_word(&ctx, 0x1234);
     let timeout = map_user_timespec(
         &ctx,
@@ -162,6 +259,63 @@ fn dispatch_futex_wait_with_zero_timeout_returns_neg_etimedout() {
     let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x1234, timeout, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_TIMEDOUT));
+}
+
+#[test]
+fn dispatch_futex_wait_positive_timeout_uses_deadline_abort_task_mailbox() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let (ctx, deadline_domain) = ctx_with_mailbox_and_deadline_domain(ctx);
+    let uaddr = map_user_futex_word(&ctx, 0x1234);
+    let timeout = map_user_timespec(
+        &ctx,
+        TestTimespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        },
+    );
+
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x1234, timeout, 0, 0]);
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    for _ in 0..4 {
+        let poll = pinned.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll, Poll::Pending),
+            "matching FUTEX_WAIT with finite positive timeout should park before expiry; got {poll:?}"
+        );
+        if deadline_domain
+            .deadlines
+            .lock()
+            .expect("deadline domain lock")
+            .len()
+            == 1
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        deadline_domain.registration(),
+        (TimerRole::DeadlineAbort, true),
+        "finite FUTEX_WAIT must register DeadlineAbort against a task mailbox"
+    );
+    assert_eq!(
+        deadline_domain.fire_next(),
+        true,
+        "registered FUTEX_WAIT deadline should target a live task mailbox"
+    );
+
+    for _ in 0..16 {
+        if let Poll::Ready(result) = pinned.as_mut().poll(&mut cx) {
+            assert_eq!(result, SyscallResult::Error(E_TIMEDOUT));
+            return;
+        }
+    }
+    panic!("FUTEX_WAIT did not resolve after unified timer expiry");
 }
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)` reports actual registered
@@ -207,6 +361,42 @@ fn direct_trap_futex_wake_uses_wake_handoff_hint() {
     assert_eq!(
         mailbox.take_scheduler_hint(),
         MailboxSchedulerHint::WakeHandoff
+    );
+}
+
+#[test]
+fn dispatch_futex_wake_uses_syscall_ctx_mailbox_ref_post_with_hint() {
+    let _setup = futex_setup();
+    FUTEX_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    let (proc_cap, thread) = fresh_proc_thread();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(mailbox.clone())
+        .with_mailbox_ref_post_with_hint(counting_futex_ref_post_with_hint);
+    let uaddr = map_user_futex_word(&ctx, 0x1234);
+
+    let wait_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x1234, 0, 0, 0]);
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let mut wait = Box::pin(dispatch::<ShimsTestPmap>(wait_req, &ctx));
+    assert!(
+        matches!(wait.as_mut().poll(&mut cx), Poll::Pending),
+        "matching futex wait should park before the wake"
+    );
+
+    let wake_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE as u64, 1, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(wake_req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(1));
+    assert_eq!(
+        FUTEX_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "FUTEX_WAKE should publish exact wait-source delivery through SyscallCtx"
+    );
+    assert_eq!(
+        mailbox.take_scheduler_hint(),
+        MailboxSchedulerHint::WakeHandoff,
+        "the injected mailbox-ref route must preserve futex's handoff hint"
     );
 }
 
@@ -294,7 +484,7 @@ fn dispatch_futex_wait_bitset_with_zero_timeout_returns_neg_etimedout() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let (ctx, _wheel) = ctx_with_mailbox_and_timer(ctx);
+    let (ctx, _deadline_domain) = ctx_with_mailbox_and_deadline_domain(ctx);
     let uaddr = map_user_futex_word(&ctx, 0x1234);
     let timeout = map_user_timespec(
         &ctx,
@@ -317,7 +507,7 @@ fn dispatch_futex_wait_bitset_uses_absolute_monotonic_timeout() {
     let _setup = futex_setup();
     let (proc_cap, thread) = fresh_proc_thread();
     let ctx = make_ctx(proc_cap, thread);
-    let (ctx, _wheel) = ctx_with_mailbox_and_timer(ctx);
+    let (ctx, _deadline_domain) = ctx_with_mailbox_and_deadline_domain(ctx);
     let uaddr = map_user_futex_word(&ctx, 0x1234);
     let timeout = map_user_timespec(
         &ctx,

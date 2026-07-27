@@ -18,6 +18,8 @@ siphasher = "1"
 memmap2 = "0.9"
 object = "0.39"
 rustc-demangle = "0.1"
+flate2 = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

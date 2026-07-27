@@ -33,6 +33,8 @@ pub mod wait_routing {
     }
 
     pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+        // `wake::notify` reports how many waiters it woke; the mirror path
+        // has no use for the count.
+        let _woken = tx_substrate::wake::notify(source, mask_bits);
     }
 }

@@ -53,13 +53,17 @@ const TMPFS_FIRST_FREE_OBJECT_ID: u64 = 3;
 /// `PageContainer::new` requires a fixed `page_count` capacity at
 /// allocation time (see `PageContainer::check_bounds`); tmpfs files
 /// are created with this cap and `size_bytes` grows lazily through
-/// `step_write` / `step_truncate`. 8 MiB ÷ 4 KiB pages covers the
-/// musl libcbench `tmpfile()` stdio path, which writes 5,000,000
-/// bytes before reading the same file back.
+/// `step_write` / `step_truncate`. 256 MiB ÷ 4 KiB pages: the original
+/// 8 MiB day-1 cap (sized for musl libcbench's 5,000,000-byte
+/// `tmpfile()` path) made every >8 MiB write fail with EINVAL — first
+/// hit by `git clone`'s pack file (~8 MiB for xv6-riscv) at the
+/// index-pack write (finals git Task2). Pages are lazy (sparse
+/// `PageCacheIndex` BTreeMap), so the larger cap costs no memory up
+/// front; it only bounds a single file's resident dirty pages.
 // TODO(phase-vfs-tmpfs-grow): teach `PageContainer` to grow `page_count`
 // on demand so tmpfs files are bounded only by global swap pressure
 // rather than by this static cap.
-const TMPFS_FILE_PAGE_CAP: u64 = 2048;
+const TMPFS_FILE_PAGE_CAP: u64 = 65536;
 
 /// Maximum length of an inline symlink target, in bytes.
 ///
@@ -150,8 +154,7 @@ struct ReaddirEntrySnapshot {
 fn dir_entry_from_readdir_snapshot(
     snapshot: ReaddirEntrySnapshot,
 ) -> Result<(DirEntry, DirCursor), step_engine::Errno> {
-    let entry = DirEntry::new(snapshot.child_id, snapshot.kind, snapshot.name.as_bytes())
-        .map_err(step_engine::Errno::from)?;
+    let entry = DirEntry::new(snapshot.child_id, snapshot.kind, snapshot.name.as_bytes())?;
     Ok((entry, snapshot.next_cursor))
 }
 
@@ -305,7 +308,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&parent) else {
@@ -389,7 +392,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         // `mknod(2)` file types. Directories and symlinks have their own
         // entry points (`mkdir` / `symlink`); everything else — regular,
@@ -495,7 +498,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -546,11 +549,11 @@ impl FsOps for Tmpfs {
     ) -> StepOutcome<(), NoProgress> {
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let new_key = match InlineName::new(new_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         if old_parent == new_parent && old_key == new_key {
             return StepOutcome::done(());
@@ -722,7 +725,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mode = (mode & !S_IFMT) | S_IFDIR;
         let mut meta = InodeMeta::new(InodeKind::Directory, mode);
@@ -770,7 +773,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         {
@@ -833,7 +836,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
 
         {
@@ -1051,8 +1054,8 @@ impl FsOps for Tmpfs {
     /// in-depth for kernel-internal callers (none today) and the
     /// canonical site if the syscall-arm gate ever changes.
     /// Preserves `S_IFMT` (file kind is immutable through chmod).
-    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
-    fn step_chmod(
+    /// Per the DAC + setuid plan §"FsOps::chmod_inode / chown_inode".
+    fn chmod_inode(
         &self,
         fs_object_id: FsObjectId,
         new_mode: u16,
@@ -1064,7 +1067,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&inode.meta, cred) {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         // Preserve the IFMT bits from the existing meta — kind is
         // immutable through chmod (matches `serialize_inode_meta`).
@@ -1084,8 +1087,8 @@ impl FsOps for Tmpfs {
     /// consumes). Linux's silent-clear rule always drops `S_ISUID`
     /// and drops `S_ISGID` when the file has group-execute set
     /// (matches LTP `chown02`/`chown03`).
-    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
-    fn step_chown(
+    /// Per the DAC + setuid plan §"FsOps::chmod_inode / chown_inode".
+    fn chown_inode(
         &self,
         fs_object_id: FsObjectId,
         new_uid: Option<u32>,
@@ -1100,7 +1103,7 @@ impl FsOps for Tmpfs {
         if let Err(e) =
             tx_subsystems::vfs::predicates::check_chown_perm(&inode.meta, new_uid, new_gid, cred)
         {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         if let Some(u) = new_uid {
             inode.meta.uid = u;
