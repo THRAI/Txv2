@@ -366,6 +366,29 @@ impl<P: TxPlatform> CoreInit<P> {
                                 break;
                             }
                             Poll::Pending => {
+                                if i == 0 || (i + 1) % 16384 == 0 {
+                                    let n =
+                                        tx_subsystems::device::page_container_file_io_service_runtimes_snapshot()
+                                            .len();
+                                    let newly =
+                                        tx_subsystems::device::submit_pending_file_io_service_runtimes();
+                                    Self::write_board_sentinel_prefix();
+                                    tx_hal::console_write_str::<P>(":runsh:probe:i=");
+                                    Self::write_decimal_unsigned(i);
+                                    tx_hal::console_write_str::<P>(":fileio-runtimes=");
+                                    Self::write_decimal_unsigned(n);
+                                    tx_hal::console_write_str::<P>(":newly=");
+                                    Self::write_decimal_unsigned(newly);
+                                    tx_hal::console_write_str::<P>(":irq-enabled=");
+                                    tx_hal::console_write_str::<P>(
+                                        if <P as tx_hal::IrqIf>::interrupts_enabled() {
+                                            "y"
+                                        } else {
+                                            "n"
+                                        },
+                                    );
+                                    tx_hal::console_write_str::<P>("\n");
+                                }
                                 if (i + 1) % 262144 == 0 {
                                     Self::write_board_sentinel_prefix();
                                     tx_hal::console_write_str::<P>(":runsh:probe:hb=");
