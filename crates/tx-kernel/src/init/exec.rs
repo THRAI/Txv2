@@ -300,7 +300,15 @@ impl<P: TxPlatform> CoreInit<P> {
                 use tx_scripts::process::exec::ExecError;
                 let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
                 let mut outcome = Err(ExecError::Retry);
+                // PROBE: does the park target ever move? A source id that is
+                // identical across every restart means the backing I/O never
+                // started; a moving one means progress that just never finishes.
+                let mut first_src: Option<u64> = None;
+                let mut distinct_srcs = 0usize;
+                let mut attempts = 0usize;
+                let mut reactor_steps_ran = 0usize;
                 for _ in 0..RUNSH_EXEC_RESTART_BUDGET {
+                    attempts += 1;
                     outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                         &init,
                         &thread,
@@ -309,6 +317,21 @@ impl<P: TxPlatform> CoreInit<P> {
                         envp,
                         &cred,
                     ));
+                    if let Err(ExecError::Deferred(shape)) = &outcome {
+                        if let tx_substrate::step::YieldShape::OnWaitSource { source, .. }
+                        | tx_substrate::step::YieldShape::OnEdge { source, .. } = shape
+                        {
+                            let raw = source.raw();
+                            match first_src {
+                                None => {
+                                    first_src = Some(raw);
+                                    distinct_srcs = 1;
+                                }
+                                Some(f) if f != raw => distinct_srcs += 1,
+                                _ => {}
+                            }
+                        }
+                    }
                     match outcome {
                         Err(ExecError::Retry) | Err(ExecError::Deferred(_)) => {
                             // The image read parks on a file-I/O service task
@@ -318,7 +341,9 @@ impl<P: TxPlatform> CoreInit<P> {
                             // probes the idle window and never runs the task —
                             // with it the loop spins to the budget and still
                             // reports `deferred`.
-                            let _ = Self::boot_reactor_once(cpu);
+                            if Self::boot_reactor_once(cpu).is_some() {
+                                reactor_steps_ran += 1;
+                            }
                         }
                         _ => break,
                     }
@@ -327,6 +352,14 @@ impl<P: TxPlatform> CoreInit<P> {
                 // says which wait object never fired instead of just "deferred".
                 if let Err(ExecError::Deferred(shape)) = &outcome {
                     use tx_substrate::step::YieldShape as Y;
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":runsh:probe:attempts=");
+                    Self::write_decimal_unsigned(attempts);
+                    tx_hal::console_write_str::<P>(":distinct-park-srcs=");
+                    Self::write_decimal_unsigned(distinct_srcs);
+                    tx_hal::console_write_str::<P>(":reactor-steps-ran=");
+                    Self::write_decimal_unsigned(reactor_steps_ran);
+                    tx_hal::console_write_str::<P>("\n");
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":runsh:deferred-on:");
                     match shape {
