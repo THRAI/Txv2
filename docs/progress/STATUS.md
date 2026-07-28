@@ -1,3 +1,30 @@
+- 2026-07-28 (**引导期 exec 从 ext4 起不来 = main 既有,不是合并回归;已用同 harness 对照钉死**).
+  合并后 git 端到端 0/8、oscomp suite 也起不来,追下去发现两条通道挂在同一个根因上:
+  引导期 exec (`init/exec.rs` 的 `bootstrap_block_on(exec_script)`) 遇到冷页 fetch 会拿到
+  `ExecError::Deferred` 并直接判失败。`tx.runsh` 跑 Alpine 动态 busybox 中招,main 自己的
+  oscomp sdcard lane 跑 `/musl/musl/busybox` **同样中招**。**对照实验**:同一份
+  `.v6work/suite-run.sh` + 同一个 sdcard 镜像,分别喂合并内核与 main 基线内核
+  (`Txv2-main-baseline`,当场重建 debug),两份日志归一化后 **68 行 vs 68 行、序列完全等价**,
+  差异只有 3 处噪音(net 探测跳过原因/panic 路径/pagealloc 计数)。main 侧显示
+  `sdcard:fail:other`、合并侧显示 `sdcard:fail:deferred`,是同一个错误——差别只在合并侧补齐了
+  `exec_error_tag` 的 6 个新变体(main 的 tag 函数把它们全塞进 `_ => "other"` 兜底,这正是
+  最初误判的直接原因)。**根因**:`materialize_file_page` 的 fetch 是有主协议
+  (`Owner`/`Joined`/`Cached`),而引导期用一次性 `block_on` 驱动,拿不到 resume 语义;
+  活的 `execve` (`proc.rs:611`) 用的是 `ExecScriptOp` + `tx_scripts::drive`(park 后 resume
+  同一个 op),那才是正确范式,但它需要一个已经在跑的反应堆——引导期恰恰还没有。
+  试过把正确范式搬进引导期(跨 poll 持有 future + Pending 时 `boot_reactor_once`),引导直接
+  卡死在第一次 poll 前:`boot_reactor_once` 从 exec future 的 poll 循环里调属重入自锁,已回退
+  (引导卡死比快速失败更糟)。**结论**:引导期 exec 结构性无法跑冷的 ext4 镜像,与驱动写法无关;
+  出路是把它移出引导期(引导 exec 一个静态 shell,由它在用户态走正常 execve)。
+  **验证**:两架构 full-build ok;tx-subsystems 单测集合差相对 main 0 真回归(43 个 page_backed
+  新增失败逐个隔离复跑全过=级联受害者);vendored smoltcp 591/0;R4a epoll-on-socket 探针 2/2
+  (已落树当哨兵);lint 相对 main 无新增失败(两处 ceiling 抬升带决策说明,time-layering 修到 0)。
+  **踩坑记录**:仓库有两个内核产物——`verify-git-net.sh` 用 release、`suite-run.sh` 用 debug;
+  只重建 release 就去跑 suite 会验到旧 debug 内核(本轮实际发生,把 `deferred` 误看成 `other`)。
+  **下一步**:定 `tx.runsh` 出路(需确认 alpine 镜像有无静态 shell);C-1 设备改名回植待做;
+  feature 网桥转发帧数不足(4 个 bridge_tests,main 通过)已判为 feature 既有缺陷,独立立项。
+  **阻塞**:git 端到端与 netperf/iperf 都走引导期 exec,在上面那条出路定下来之前无法验证。
+
 - 2026-07-27 (**merge main → feature-network-refactor 完成**;16 冲突全解,两架构编译通过,LTP 未跑).
   **前置审计**(`.v6work/PR54_AUDIT.md`):main 的 `dd9435f3`(PR#54 codex/network-time-integration,718 文件)
   **不是网络增量而是回退** —— 用 blob 身份坐实:main 的 102 个 net 文件里 **50 个与历史祖先逐字节相同、
