@@ -22,6 +22,10 @@ use crate::adapter::step_engine::{self as step_engine};
 #[cfg(test)]
 use crate::adapter::step_engine::{StepOutcome, page_allocator};
 
+/// `tx.runsh` exec restarts allowed before reporting failure. Each restart
+/// re-runs reversible Phase-1 preparation after driving the boot reactor once.
+const RUNSH_EXEC_RESTART_BUDGET: usize = 4096;
+
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
@@ -283,14 +287,66 @@ impl<P: TxPlatform> CoreInit<P> {
                     b"TERM=linux",
                 ];
                 let argv: &[&[u8]] = &[b"sh", script.as_bytes()];
-                let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                    &init,
-                    &thread,
-                    b"/musl/bin/busybox",
-                    argv,
-                    envp,
-                    &cred,
-                ));
+                // `/musl/bin/busybox` is DYNAMIC (Alpine), unlike the static
+                // ET_EXEC the sdcard lane runs. main's exec rewrite made image
+                // reads restartable: a page that is not resident yet aborts
+                // reversible preparation with `Deferred(shape)` (park and
+                // restart from Phase 1) or `Retry`. Neither is a failure, and
+                // `bootstrap_block_on` cannot see them — they are `Err` values,
+                // not `Poll::Pending`. Drive the boot reactor between attempts
+                // so the block I/O behind the interpreter/library reads can
+                // land, then restart. Bounded so a genuinely stuck read still
+                // reports instead of hanging boot.
+                use tx_scripts::process::exec::ExecError;
+                let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+                let mut outcome = Err(ExecError::Retry);
+                for _ in 0..RUNSH_EXEC_RESTART_BUDGET {
+                    outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                        &init,
+                        &thread,
+                        b"/musl/bin/busybox",
+                        argv,
+                        envp,
+                        &cred,
+                    ));
+                    match outcome {
+                        Err(ExecError::Retry) | Err(ExecError::Deferred(_)) => {
+                            // The image read parks on a file-I/O service task
+                            // that only exists once submitted to the boot
+                            // reactor, so the retry has to actually STEP the
+                            // reactor. `poll_boot_reactor_idle_window` only
+                            // probes the idle window and never runs the task —
+                            // with it the loop spins to the budget and still
+                            // reports `deferred`.
+                            let _ = Self::boot_reactor_once(cpu);
+                        }
+                        _ => break,
+                    }
+                }
+                // DIAG: name what the exec parked on, so a stuck restart loop
+                // says which wait object never fired instead of just "deferred".
+                if let Err(ExecError::Deferred(shape)) = &outcome {
+                    use tx_substrate::step::YieldShape as Y;
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":runsh:deferred-on:");
+                    match shape {
+                        Y::OnWaitSource { source, interests } => {
+                            tx_hal::console_write_str::<P>("wait-source:src=");
+                            Self::write_decimal_unsigned(source.raw() as usize);
+                            tx_hal::console_write_str::<P>(":interests=");
+                            Self::write_decimal_unsigned(interests.raw() as usize);
+                        }
+                        Y::OnAgent { .. } => tx_hal::console_write_str::<P>("agent"),
+                        Y::OnTimer { .. } => tx_hal::console_write_str::<P>("timer"),
+                        Y::OnEdge { source, interests } => {
+                            tx_hal::console_write_str::<P>("edge:src=");
+                            Self::write_decimal_unsigned(source.raw() as usize);
+                            tx_hal::console_write_str::<P>(":interests=");
+                            Self::write_decimal_unsigned(interests.raw() as usize);
+                        }
+                    }
+                    tx_hal::console_write_str::<P>("\n");
+                }
                 Self::write_board_sentinel_prefix();
                 match outcome {
                     Ok(()) => tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:ok\n"),
