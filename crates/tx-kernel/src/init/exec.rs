@@ -24,7 +24,7 @@ use crate::adapter::step_engine::{StepOutcome, page_allocator};
 
 /// `tx.runsh` exec restarts allowed before reporting failure. Each restart
 /// re-runs reversible Phase-1 preparation after driving the boot reactor once.
-const RUNSH_EXEC_RESTART_BUDGET: usize = 4096;
+const RUNSH_EXEC_POLL_BUDGET: usize = 1 << 16;
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -297,97 +297,102 @@ impl<P: TxPlatform> CoreInit<P> {
                 // so the block I/O behind the interpreter/library reads can
                 // land, then restart. Bounded so a genuinely stuck read still
                 // reports instead of hanging boot.
-                use tx_scripts::process::exec::ExecError;
                 let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-                let mut outcome = Err(ExecError::Retry);
-                // PROBE: does the park target ever move? A source id that is
-                // identical across every restart means the backing I/O never
-                // started; a moving one means progress that just never finishes.
-                let mut first_src: Option<u64> = None;
-                let mut distinct_srcs = 0usize;
-                let mut attempts = 0usize;
-                let mut reactor_steps_ran = 0usize;
-                for _ in 0..RUNSH_EXEC_RESTART_BUDGET {
-                    attempts += 1;
-                    outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                        &init,
-                        &thread,
-                        b"/musl/bin/busybox",
-                        argv,
-                        envp,
-                        &cred,
-                    ));
-                    if let Err(ExecError::Deferred(shape)) = &outcome {
-                        if let tx_substrate::step::YieldShape::OnWaitSource { source, .. }
-                        | tx_substrate::step::YieldShape::OnEdge { source, .. } = shape
-                        {
-                            let raw = source.raw();
-                            match first_src {
-                                None => {
-                                    first_src = Some(raw);
-                                    distinct_srcs = 1;
+                // A per-task mailbox is REQUIRED here. Without one,
+                // `drive`'s `resolve_on_wait_source` takes its no-mailbox
+                // branch and returns `ResumeOutcome::Retry` *without
+                // awaiting*, so `drive` spins inside a single `poll()` —
+                // the caller never sees `Pending` and never gets a chance
+                // to run the reactor that would complete the page fetch.
+                // `sys_execve` always has one via its `SyscallCtx`.
+                let mailbox = alloc::sync::Arc::new(
+                    tx_subsystems::signal::adapter::step_engine::TaskMailbox::new(),
+                );
+                let mut script_ctx =
+                    tx_shims::KernelScriptCtx::new().with_mailbox(alloc::sync::Arc::clone(&mailbox));
+                let op = tx_scripts::process::exec::ExecScriptOp::<P>::new(
+                    &init,
+                    &thread,
+                    b"/musl/bin/busybox",
+                    argv,
+                    envp,
+                    &cred,
+                );
+
+                let outcome = {
+                    use core::pin::Pin;
+                    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+                    unsafe fn clone_raw(_d: *const ()) -> RawWaker {
+                        RawWaker::new(core::ptr::null(), &VT)
+                    }
+                    unsafe fn noop_raw(_d: *const ()) {}
+                    static VT: RawWakerVTable =
+                        RawWakerVTable::new(clone_raw, noop_raw, noop_raw, noop_raw);
+                    let raw = RawWaker::new(core::ptr::null(), &VT);
+                    // SAFETY: no-op vtable never dereferences `data`.
+                    let waker = unsafe { Waker::from_raw(raw) };
+                    let mut cx = Context::from_waker(&waker);
+                    let mut fut = tx_scripts::drive(
+                        op,
+                        &mut script_ctx,
+                        tx_substrate::step::DriveMode::Waiting,
+                        Some(&mailbox),
+                        None,
+                        None,
+                    );
+                    // SAFETY: `fut` is a local never moved after this point.
+                    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+                    let mut result = None;
+                    for i in 0..RUNSH_EXEC_POLL_BUDGET {
+                        if i == 0 {
+                        }
+                        let polled = pinned.as_mut().poll(&mut cx);
+                        if i == 0 {
+                            Self::write_board_sentinel_prefix();
+                            tx_hal::console_write_str::<P>(":runsh:probe:after-poll0:");
+                            tx_hal::console_write_str::<P>(match polled {
+                                Poll::Ready(_) => "ready",
+                                Poll::Pending => "pending",
+                            });
+                            tx_hal::console_write_str::<P>("\n");
+                        }
+                        match polled {
+                            Poll::Ready(v) => {
+                                Self::write_board_sentinel_prefix();
+                                tx_hal::console_write_str::<P>(":runsh:probe:polls=");
+                                Self::write_decimal_unsigned(i + 1);
+                                tx_hal::console_write_str::<P>("\n");
+                                result = Some(v);
+                                break;
+                            }
+                            Poll::Pending => {
+                                if (i + 1) % 262144 == 0 {
+                                    Self::write_board_sentinel_prefix();
+                                    tx_hal::console_write_str::<P>(":runsh:probe:hb=");
+                                    Self::write_decimal_unsigned(i + 1);
+                                    tx_hal::console_write_str::<P>("\n");
                                 }
-                                Some(f) if f != raw => distinct_srcs += 1,
-                                _ => {}
+                                if i == 0 {
+                                }
+                                let _ = Self::boot_reactor_once(cpu);
+                                if i == 0 {
+                                }
                             }
                         }
                     }
-                    match outcome {
-                        Err(ExecError::Retry) | Err(ExecError::Deferred(_)) => {
-                            // The image read parks on a file-I/O service task
-                            // that only exists once submitted to the boot
-                            // reactor, so the retry has to actually STEP the
-                            // reactor. `poll_boot_reactor_idle_window` only
-                            // probes the idle window and never runs the task —
-                            // with it the loop spins to the budget and still
-                            // reports `deferred`.
-                            if Self::boot_reactor_once(cpu).is_some() {
-                                reactor_steps_ran += 1;
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                // DIAG: name what the exec parked on, so a stuck restart loop
-                // says which wait object never fired instead of just "deferred".
-                if let Err(ExecError::Deferred(shape)) = &outcome {
-                    use tx_substrate::step::YieldShape as Y;
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":runsh:probe:attempts=");
-                    Self::write_decimal_unsigned(attempts);
-                    tx_hal::console_write_str::<P>(":distinct-park-srcs=");
-                    Self::write_decimal_unsigned(distinct_srcs);
-                    tx_hal::console_write_str::<P>(":reactor-steps-ran=");
-                    Self::write_decimal_unsigned(reactor_steps_ran);
-                    tx_hal::console_write_str::<P>("\n");
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":runsh:deferred-on:");
-                    match shape {
-                        Y::OnWaitSource { source, interests } => {
-                            tx_hal::console_write_str::<P>("wait-source:src=");
-                            Self::write_decimal_unsigned(source.raw() as usize);
-                            tx_hal::console_write_str::<P>(":interests=");
-                            Self::write_decimal_unsigned(interests.raw() as usize);
-                        }
-                        Y::OnAgent { .. } => tx_hal::console_write_str::<P>("agent"),
-                        Y::OnTimer { .. } => tx_hal::console_write_str::<P>("timer"),
-                        Y::OnEdge { source, interests } => {
-                            tx_hal::console_write_str::<P>("edge:src=");
-                            Self::write_decimal_unsigned(source.raw() as usize);
-                            tx_hal::console_write_str::<P>(":interests=");
-                            Self::write_decimal_unsigned(interests.raw() as usize);
-                        }
-                    }
-                    tx_hal::console_write_str::<P>("\n");
-                }
+                    result
+                };
                 Self::write_board_sentinel_prefix();
                 match outcome {
-                    Ok(()) => tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:ok\n"),
-                    Err(ref e) => {
-                        tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:fail:");
-                        tx_hal::console_write_str::<P>(exec_error_tag(e));
+                    Some(Ok(())) => tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:ok\n"),
+                    Some(Err(errno)) => {
+                        tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:fail:errno=");
+                        Self::write_decimal_unsigned(errno as usize);
                         tx_hal::console_write_str::<P>("\n");
                     }
+                    None => tx_hal::console_write_str::<P>(
+                        ":bootstrap-exec:runsh:fail:poll-budget\n",
+                    ),
                 }
                 return;
             }
