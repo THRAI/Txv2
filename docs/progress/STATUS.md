@@ -1,3 +1,26 @@
+- 2026-07-30 (**feature-network-refactor 合并保真度/结构审计完成，Alpine RV64 curl 已落并真机验收**).
+  对当前 `6503312f` 与 07-27 merge `6d41a347` 的 feature parent `90939012`
+  做 blob、调用点和当前实现复核：P0/P1/P4 完整保留，P2 外部 TCP/UDP 数据面、
+  P3-B 单 `SocketImpl`/TCP 单锁及 P3-C 资源收敛仍在；两个明确回退是 **NET_IRQ
+  top/bottom-half 未接入**（当前靠 10 ms RX poll floor）和 **Socket FileOps
+  只有实现、生产 read/write/poll/close 等又回到类型特判**。其余主要欠账：
+  TCP 外层/smoltcp/shutdown/readiness 多状态源，动态 buffer/keepalive/TTL/nodelay
+  sockopt 只改报告值，L2/L3 仅拆文件未拆所有权，wait 双轨，动态 rtnetlink
+  对象泄漏，端口/索引/MSS/MTU 硬编码，以及 IP_HDRINCL/IPv6 fragmentation/NDP
+  校验/VLAN data path 等功能缺口。详细证据与优先级见
+  `docs/progress/research/2026-07-30-network-refactor-merge-structural-audit.md`。
+  镜像侧把真实 RV64 `curl` 加入默认 Alpine 包闭包，并修复 `latest-stable`
+  metadata 永久缓存导致包轮换后 404；默认 rootfs/cpio 已重建。**验证**：
+  `bash -n`、`git diff --check`、`cargo xtask image cpio --profile alpine
+  --target rv64-qemu`；QEMU Guest `curl 8.21.0` 通过 SLIRP 请求宿主
+  `http://10.0.2.2:18080/index.html`，得到 HTTP 200、`TX_CURL_HOST_OK`、rc=0。
+  `cargo -q xtask unit` 仍仅有既有 3 个 tx-shims 断言和 tx-ext4 陈旧
+  `with_target` API（tx-kernel 114/114、tx-scripts 166/166）；progress validate
+  仍被既有 07-24 JSON 的 `completed` 旧状态阻断，docs lint 仍为既有 23 断链。
+  **Next**：先分别恢复 NET_IRQ 和 FileOps 两个回退，再立项 TCP 状态/options
+  单一真相；L2/L3 所有权和 wait 收敛另做大改计划。**Blocker**：curl 无；
+  Alpine 长期 bit-for-bit 复现仍需固定 branch/checksum。
+
 - 2026-07-30 (**续接 07-27～07-29 Claude 的 Git 修复：3/8 → 干净 8/8**).
   原症状是 HTTP pack 已收 100% 后 `index-pack` 永不返回、QEMU 单核满载；两百万次
   `Continue` 看门狗把所有者钉到 `vfs::FileFsyncOp`。根因链共三段：① page-backed fsync
@@ -13,7 +36,8 @@
   同轮 tx-kernel `114/114`、tx-scripts `166/166`。详细根因/证据见
   `msp/debug-logs/2026-07-30-git-clone-fsync-dns-fork-repair.md`。**Next**：另立范围处理
   UDP inline/device 队列的 SMP 原子所有权，以及 planner Yield/部分 Bio admission 的终态；
-  6E ordered-JBD2 前不宣称断电持久化。**Blocker**：本次 Git 路径无；改动尚未提交。
+  6E ordered-JBD2 前不宣称断电持久化。**Blocker**：本次 Git 路径无；修复已提交为
+  `6503312f`。
 
 - 2026-07-28 (**引导期 exec 从 ext4 起不来 = main 既有,不是合并回归;已用同 harness 对照钉死**).
   合并后 git 端到端 0/8、oscomp suite 也起不来,追下去发现两条通道挂在同一个根因上:
