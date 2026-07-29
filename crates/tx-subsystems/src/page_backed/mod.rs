@@ -117,6 +117,8 @@ struct PageCacheEntry {
     ppn: Ppn,
     pin: PageCachePin,
     marks: PageMarks,
+    /// Monotonic content generation used to validate writeback completion.
+    dirty_generation: u64,
 }
 
 impl PageCacheEntry {
@@ -128,6 +130,7 @@ impl PageCacheEntry {
                 referenced: true,
                 ..PageMarks::new()
             },
+            dirty_generation: 0,
         }
     }
 }
@@ -138,6 +141,7 @@ impl core::fmt::Debug for PageCacheEntry {
             .field("ppn", &self.ppn)
             .field("pin", &self.pin)
             .field("marks", &self.marks)
+            .field("dirty_generation", &self.dirty_generation)
             .finish()
     }
 }
@@ -245,6 +249,20 @@ impl PageCacheIndex {
         let Some(entry) = self.pages.get_mut(&page) else {
             return Err(PageCacheError::MissingPage);
         };
+        entry.dirty_generation = entry.dirty_generation.wrapping_add(1);
+        entry.marks.dirty = true;
+        entry.marks.referenced = true;
+        Ok(())
+    }
+
+    fn mark_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn) -> Result<(), PageCacheError> {
+        let Some(entry) = self.pages.get_mut(&page) else {
+            return Err(PageCacheError::MissingPage);
+        };
+        if entry.ppn != ppn {
+            return Err(PageCacheError::MismatchedFrame { current: entry.ppn });
+        }
+        entry.dirty_generation = entry.dirty_generation.wrapping_add(1);
         entry.marks.dirty = true;
         entry.marks.referenced = true;
         Ok(())
@@ -665,6 +683,10 @@ impl PageContainer {
 
     pub fn page_marks(&self, page: PageIndex) -> Option<PageMarks> {
         self.state.lock().pages.marks(page)
+    }
+
+    fn mark_completed_write(&self, page: PageIndex, ppn: Ppn) -> Result<(), PageCacheError> {
+        self.state.lock().pages.mark_dirty_if_match(page, ppn)
     }
 
     pub fn materialize_anon(

@@ -1152,11 +1152,6 @@ fn thread_future_sigreturn_restores_user_edited_frame_context_and_mask() {
     let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
     let aspace = init.aspace_cap().expect("aspace alive");
 
-    let mut parked = tx_hal::UserTrapContext::empty();
-    parked.pc = 0x1234_5678;
-    parked.regs[10] = 0xdead_beef;
-    payload.store_saved_signal_context(Some(parked));
-
     let mut handler_ctx = tx_hal::UserTrapContext::empty();
     handler_ctx.regs[2] = 0x7000;
     payload.store_saved_user_context(Some(handler_ctx));
@@ -1214,11 +1209,6 @@ fn thread_future_sigreturn_preserves_user_blocked_sigcancel_mask() {
         .expect("INIT_PROCESS populated post-bootstrap");
     let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
     let aspace = init.aspace_cap().expect("aspace alive");
-
-    let mut parked = tx_hal::UserTrapContext::empty();
-    parked.pc = 0x1234_5678;
-    parked.regs[10] = 0xdead_beef;
-    payload.store_saved_signal_context(Some(parked));
 
     let mut handler_ctx = tx_hal::UserTrapContext::empty();
     handler_ctx.regs[2] = 0x7000;

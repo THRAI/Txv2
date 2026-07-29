@@ -19,7 +19,7 @@ pub use private::{
 };
 pub use range_lock::{
     AcquirePairResult, AcquireResult, LockMode, PendingWriter, RangeGuard, RangeGuardPair,
-    RangeLock, WouldBlock, RANGE_LOCK_RELEASE_MASK,
+    RangeLock, RangeLockDiagnosticSnapshot, WouldBlock, RANGE_LOCK_RELEASE_MASK,
 };
 pub use types::{
     AccessMode, AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserPage, UserPageIter,

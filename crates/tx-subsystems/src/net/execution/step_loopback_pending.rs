@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use smoltcp::socket::PollAt;
 use smoltcp::time::Instant;
 use tx_substrate::zone::{Cap, PayloadCap};
 
@@ -9,7 +10,8 @@ use crate::net::structure::{Ipv4Address, SocketIdentity, SocketProtocol, TcpStat
 
 use super::{
     step_process_loopback_icmp_on_iface, step_process_loopback_tcp,
-    step_process_loopback_udp_on_iface, step_tcp_loopback_handshake_on_iface,
+    step_process_loopback_udp_on_iface, step_socket_close::finalize_tcp_close_if_complete,
+    step_tcp_loopback_handshake_on_iface,
 };
 
 pub const LOOPBACK_POLL_BUDGET_DEFAULT: LoopbackPollBudget = LoopbackPollBudget {
@@ -49,6 +51,8 @@ pub struct LoopbackPendingOutcome {
     pub packets_seen: usize,
     pub sockets_touched: usize,
     pub wakes_fired: usize,
+    pub tcp_work_remaining: bool,
+    pub next_deadline: Option<Instant>,
 }
 
 impl Default for LoopbackPollBudget {
@@ -65,6 +69,10 @@ impl LoopbackPendingOutcome {
             || self.icmp_bytes_moved != 0
             || self.tx_packets != 0
             || self.packets_seen != 0
+    }
+
+    pub fn needs_reschedule(&self) -> bool {
+        self.made_progress() || self.tcp_work_remaining
     }
 
     pub fn merge(&mut self, other: Self) {
@@ -84,6 +92,8 @@ impl LoopbackPendingOutcome {
         self.packets_seen += other.packets_seen;
         self.sockets_touched += other.sockets_touched;
         self.wakes_fired += other.wakes_fired;
+        self.tcp_work_remaining |= other.tcp_work_remaining;
+        self.next_deadline = earliest_deadline(self.next_deadline, other.next_deadline);
     }
 }
 
@@ -108,7 +118,7 @@ pub fn step_process_loopback_pending(
 }
 
 pub fn step_process_loopback_pending_in_namespace(
-    _now: Instant,
+    now: Instant,
     net_namespace: PayloadCap<NetNamespacePayload>,
     iface: &LoopbackIface,
     budget: LoopbackPollBudget,
@@ -138,25 +148,45 @@ pub fn step_process_loopback_pending_in_namespace(
                 outcome.wakes_fired += connect.wakes_fired;
             }
             StepOutcome::Err(_) => outcome.tcp_connect_failed += 1,
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                outcome.tcp_connect_failed += 1
-            }
+            // A TCP handshake is an incremental protocol state machine.
+            // Continue/Yield means the tuple remains reserved and the next
+            // delegate pass resumes it; it is not a refused connection.
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {}
         }
     }
 
     let mut tcp_connections_seen = Vec::new();
-    for socket in table
+    let tcp_connections = table
         .snapshot_tcp_connections(guard)
         .into_iter()
         .filter(is_tcp_connected)
-    {
-        if !remember_socket(&mut tcp_connections_seen, &socket) {
+        .filter(|socket| remember_socket(&mut tcp_connections_seen, socket))
+        .collect::<Vec<_>>();
+
+    // Finalization is part of close ownership, not an optional side effect of
+    // finding immediate protocol work. A socket in Closed/TimeWait may report
+    // no due-now work and would otherwise remain in the connection table
+    // forever.
+    for socket in &tcp_connections {
+        let _ = finalize_tcp_close_if_complete(socket, guard);
+    }
+
+    let mut tcp_candidates = tcp_connections
+        .iter()
+        .filter(|socket| has_tcp_loopback_work(socket, iface, now))
+        .cloned()
+        .collect::<Vec<_>>();
+    let tcp_window_len = budget.tcp_connected.min(tcp_candidates.len());
+    outcome.tcp_work_remaining = tcp_candidates.len() > tcp_window_len;
+    if tcp_window_len != 0 {
+        let start = table.claim_tcp_loopback_poll_start(tcp_candidates.len(), tcp_window_len);
+        tcp_candidates.rotate_left(start);
+    }
+
+    for socket in tcp_candidates.into_iter().take(tcp_window_len) {
+        if finalize_tcp_close_if_complete(&socket, guard) {
             continue;
         }
-        if outcome.tcp_transfer_attempted >= budget.tcp_connected {
-            break;
-        }
-
         outcome.tcp_transfer_attempted += 1;
         match step_process_loopback_tcp(&socket, budget.tcp_transfer_bytes, iface, guard) {
             StepOutcome::Done(transfer) => {
@@ -170,11 +200,42 @@ pub fn step_process_loopback_pending_in_namespace(
                     + usize::from(transfer.source_send_broken)
                     + usize::from(transfer.peer_recv_broken)
                     + usize::from(transfer.peer_send_broken);
+                let _ = finalize_tcp_close_if_complete(&socket, guard);
             }
             StepOutcome::Err(_) => outcome.tcp_transfer_failed += 1,
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 outcome.tcp_transfer_failed += 1
             }
+        }
+    }
+
+    // Processing a flow changes both endpoints' smoltcp states. Re-read every
+    // connection after the bounded pass so a newly-created FIN/ACK/data action
+    // cannot be lost merely because it was absent from the pre-pass snapshot.
+    // Future protocol timers are returned to the delegate supervisor instead
+    // of waiting for an unrelated syscall to kick POLL.
+    for socket in &tcp_connections {
+        if finalize_tcp_close_if_complete(socket, guard) {
+            continue;
+        }
+        let Some(payload) = socket.acquire_operational() else {
+            continue;
+        };
+        let Some(raw) = payload.raw_tcp_socket() else {
+            continue;
+        };
+        match raw.poll_at() {
+            PollAt::Now => outcome.tcp_work_remaining = true,
+            PollAt::Time(deadline) if deadline <= now => {
+                outcome.tcp_work_remaining = true;
+            }
+            PollAt::Time(deadline) => {
+                outcome.next_deadline = earliest_deadline(outcome.next_deadline, Some(deadline));
+            }
+            PollAt::Ingress => {}
+        }
+        if has_tcp_loopback_ingress(socket, iface) {
+            outcome.tcp_work_remaining = true;
         }
     }
 
@@ -271,6 +332,58 @@ fn is_tcp_connected(socket: &Cap<SocketIdentity>) -> bool {
             SocketProtocol::Tcp(TcpState::Connected { .. })
         )
     })
+}
+
+fn has_tcp_loopback_work(
+    socket: &Cap<SocketIdentity>,
+    iface: &LoopbackIface,
+    now: Instant,
+) -> bool {
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+    ) {
+        return false;
+    }
+    if let Some(raw) = payload.raw_tcp_socket() {
+        match raw.poll_at() {
+            PollAt::Now => return true,
+            PollAt::Time(deadline) if deadline <= now => return true,
+            PollAt::Time(_) | PollAt::Ingress => {}
+        }
+    }
+
+    has_tcp_loopback_ingress(socket, iface)
+}
+
+fn has_tcp_loopback_ingress(socket: &Cap<SocketIdentity>, iface: &LoopbackIface) -> bool {
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    let SocketProtocol::Tcp(TcpState::Connected { local, remote }) = payload.protocol_snapshot()
+    else {
+        return false;
+    };
+    iface.has_ingress_matching(|packet| {
+        crate::net::protocol::SmoltcpTcpSegment::packet_endpoints(packet).is_some_and(
+            |(packet_src, packet_dst)| {
+                (packet_src == local && packet_dst == remote)
+                    || (packet_src == remote && packet_dst == local)
+            },
+        )
+    })
+}
+
+fn earliest_deadline(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.min(candidate)),
+        (Some(current), None) => Some(current),
+        (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
 }
 
 fn has_udp_loopback_tx_pending(socket: &Cap<SocketIdentity>, iface: &LoopbackIface) -> bool {

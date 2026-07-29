@@ -1910,8 +1910,10 @@ async fn sys_pipe_write_buffered<'a>(
     }
 }
 
-async fn sys_pipe_read_buffered<'a>(
+async fn sys_pipe_read_buffered<'a, P: tx_hal::ConsoleIf>(
     payload: &Cap<tx_subsystems::pipe::PipePayload>,
+    fd: i32,
+    lane: &str,
     buf_ptr: usize,
     len: usize,
     nonblocking: bool,
@@ -1949,22 +1951,127 @@ async fn sys_pipe_read_buffered<'a>(
     {
         Ok(total) => {
             if total > 0 {
-                if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                if let Err(failure) = super::user_copy::bootstrap_copy_to_user_wait_diagnosed(
                     &ctx.aspace,
                     buf_ptr as u64,
                     &staging[..total],
                 )
                 .await
                 {
-                    return SyscallResult::error_from(errno);
+                    if failure.errno == tx_subsystems::execution::Errno::EIO {
+                        report_pipe_read_eio::<P>(
+                            "copy-to-user",
+                            lane,
+                            fd,
+                            payload,
+                            buf_ptr,
+                            len,
+                            Some(total),
+                            Some(failure),
+                            ctx,
+                        );
+                    }
+                    return SyscallResult::error_from(failure.errno);
                 }
             }
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EIO {
+                report_pipe_read_eio::<P>(
+                    "pipe-drive",
+                    lane,
+                    fd,
+                    payload,
+                    buf_ptr,
+                    len,
+                    None,
+                    None,
+                    ctx,
+                );
+            }
             SyscallResult::error_from(errno)
         }
+    }
+}
+
+fn report_pipe_read_eio<P: tx_hal::ConsoleIf>(
+    stage: &str,
+    lane: &str,
+    fd: i32,
+    payload: &Cap<tx_subsystems::pipe::PipePayload>,
+    buf_ptr: usize,
+    len: usize,
+    copied: Option<usize>,
+    copy_failure: Option<super::user_copy::UserCopyWaitFailure>,
+    ctx: &SyscallCtx<'_>,
+) {
+    use tx_subsystems::vm::{UserPage, UserVirtAddr, USER_PAGE_SIZE};
+
+    let pipe = payload.diagnostic_snapshot();
+    let pmap_stats = ctx.aspace.pmap().stats();
+    let range_locks = ctx.aspace.range_lock().diagnostic_snapshot();
+    let comm = ctx.process.comm();
+    let comm_len = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    let comm = core::str::from_utf8(&comm[..comm_len]).unwrap_or("<non-utf8>");
+    tx_hal::console_write_str::<P>(&alloc::format!(
+        "txkernel:pipe-read-eio:stage={stage}:copy_failure={copy_failure:?}:lane={lane}:pid={}:tid={}:comm={comm}:fd={fd}:buf={buf_ptr:#x}:len={len}:copied={}:aspace={}:pipe_raw={:#x}:readers={}:writers={}:bytes={}:slots={}/{}:gift_slots={}:tmp_pages={}:write_avail={}:read_source={:#x}:write_source={:#x}:pmap_mapped={}:pmap_reservations={}:pmap_commits={}:pmap_rollbacks={}:pmap_shootdowns={}:range_active={}:range_pending={}:range_source={:#x}\n",
+        ctx.process.pid.0,
+        ctx.thread.tid.0,
+        copied.map(|value| value as i64).unwrap_or(-1),
+        ctx.aspace.futex_identity(),
+        payload.raw(),
+        pipe.readers,
+        pipe.writers,
+        pipe.buffered_bytes,
+        pipe.occupied_slots,
+        pipe.max_slots,
+        pipe.reserved_gift_slots,
+        pipe.temporary_pages,
+        pipe.available_write_bytes,
+        pipe.reader_wait_source_id,
+        pipe.writer_wait_source_id,
+        pmap_stats.mapped_pages,
+        pmap_stats.reservations,
+        pmap_stats.commits,
+        pmap_stats.rollbacks,
+        pmap_stats.shootdowns,
+        range_locks.active,
+        range_locks.pending_writers,
+        range_locks.wait_source_id,
+    ));
+
+    if len == 0 {
+        return;
+    }
+    let first_page_addr = buf_ptr & !(USER_PAGE_SIZE - 1);
+    let end_addr = buf_ptr.saturating_add(len.saturating_sub(1));
+    let last_page_addr = end_addr & !(USER_PAGE_SIZE - 1);
+    let mut page_addr = first_page_addr;
+    let mut emitted = 0usize;
+    while page_addr <= last_page_addr && emitted < 4 {
+        let recipe = ctx.aspace.lookup(UserVirtAddr(page_addr));
+        let mapping = ctx
+            .aspace
+            .pmap()
+            .lookup(UserPage(page_addr / USER_PAGE_SIZE));
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:pipe-read-eio:vm-page={page_addr:#x}:recipe={recipe:?}:pmap={mapping:?}\n"
+        ));
+        emitted += 1;
+        let Some(next) = page_addr.checked_add(USER_PAGE_SIZE) else {
+            break;
+        };
+        page_addr = next;
+    }
+    if page_addr <= last_page_addr {
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:pipe-read-eio:vm-pages-truncated:first={first_page_addr:#x}:last={last_page_addr:#x}:shown={emitted}\n"
+        ));
     }
 }
 
@@ -2351,7 +2458,16 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
         if len == 0 {
             return SyscallResult::Return(0);
         }
-        return sys_pipe_read_buffered(&rx, buf_ptr, len, file.flags().nonblocking, ctx).await;
+        return sys_pipe_read_buffered::<P>(
+            &rx,
+            fd,
+            "socketpair",
+            buf_ptr,
+            len,
+            file.flags().nonblocking,
+            ctx,
+        )
+        .await;
     }
 
     // POSIX: read(2) on a descriptor not opened for reading fails with
@@ -2396,7 +2512,16 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
     }
 
     if let Some((pipe, tx_subsystems::pipe::PipeSide::Reader)) = file.pipe_endpoint() {
-        return sys_pipe_read_buffered(&pipe, buf_ptr, len, file.flags().nonblocking, ctx).await;
+        return sys_pipe_read_buffered::<P>(
+            &pipe,
+            fd,
+            "pipe",
+            buf_ptr,
+            len,
+            file.flags().nonblocking,
+            ctx,
+        )
+        .await;
     }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).

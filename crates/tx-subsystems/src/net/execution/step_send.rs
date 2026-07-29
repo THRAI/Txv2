@@ -58,7 +58,7 @@ pub fn step_send(
     }
 
     let Some(reserve) = payload.reserve_send_space(len) else {
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &payload);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
 
@@ -66,12 +66,12 @@ pub fn step_send(
         if reserve.needs_poll_kick {
             net_delegate_kick_poll();
         }
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &payload);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
 
     if reserve.became_full {
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &payload);
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
@@ -131,7 +131,7 @@ pub fn step_send_kernel_bytes(
     let reserve = match payload.reserve_send_bytes_with_flags(bytes, flags) {
         Ok(Some(reserve)) => reserve,
         Ok(None) => {
-            socket.readiness.clear_send(SendWireSet::SPACE);
+            clear_send_space_if_full(socket, &payload);
             return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
         }
         Err(errno) => return StepOutcome::Err(errno),
@@ -141,12 +141,12 @@ pub fn step_send_kernel_bytes(
         if reserve.needs_poll_kick {
             net_delegate_kick_poll();
         }
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &payload);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
 
     if reserve.became_full {
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &payload);
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
@@ -287,7 +287,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     let reserve = match payload.reserve_send_bytes_to_with_flags(dst, bytes, flags) {
         Ok(Some(reserve)) => reserve,
         Ok(None) => {
-            socket.readiness.clear_send(SendWireSet::SPACE);
+            clear_send_space_if_full(socket, &payload);
             return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
         }
         Err(errno) => return StepOutcome::Err(errno),
@@ -297,18 +297,33 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         if kick_poll && reserve.needs_poll_kick {
             net_delegate_kick_poll();
         }
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &payload);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
 
     if reserve.became_full {
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &payload);
     }
 
     if kick_poll && (!flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick) {
         net_delegate_kick_poll();
     }
     StepOutcome::Done(reserve.bytes)
+}
+
+/// Clear the cached writable level without erasing a concurrent producer wake.
+///
+/// Reserving send space and updating the readiness queue cannot share one lock:
+/// the former is owned by the protocol-specific socket while the latter is a
+/// bus queue.  Consequently another CPU may drain/ACK bytes and publish SPACE
+/// after the reserve observed a full ring but before this CPU clears SPACE.
+/// Clear first and then re-read the authoritative ring; if space reopened, put
+/// the level back so both already-registered and later waiters observe it.
+pub(super) fn clear_send_space_if_full(socket: &Cap<SocketIdentity>, payload: &SocketPayload) {
+    socket.readiness.clear_send(SendWireSet::SPACE);
+    if payload.io_snapshot().send_space != 0 {
+        socket.readiness.fire_send(SendWireSet::SPACE);
+    }
 }
 
 pub(super) fn send_flags_error(flags: SendRecvFlags) -> Option<Errno> {
@@ -685,7 +700,7 @@ fn send_external_icmpv6_echo(
         }
     };
     if payload.enqueue_icmp6_tx_echo(request).is_none() {
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, payload);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
     net_delegate_kick_poll();

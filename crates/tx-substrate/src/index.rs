@@ -137,16 +137,49 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
         })
     }
 
-    /// Observe a committed value under an epoch guard.
-    pub fn lookup<'g>(&self, key: &K, _guard: &'g Guard<'_>) -> Option<IndexRef<'g, K, V>> {
-        let _lock = self.lock.lock();
+    /// Observe a committed value while holding the index read critical
+    /// section.
+    ///
+    /// `Index` stores keys and values inline and `withdraw()` may immediately
+    /// move them out and reuse the slot.  Consequently an epoch guard alone
+    /// cannot protect a borrowed slot: the slot storage itself is not retired
+    /// through EBR.  Keep the index lock in `IndexRef` so the key/value remain
+    /// initialized until the caller has cloned or copied what it needs.
+    pub fn lookup<'i>(&'i self, key: &K, _guard: &Guard<'_>) -> Option<IndexRef<'i, K, V>> {
+        let lock = self.lock.lock();
 
         for entry in &self.entries {
             let state = unsafe { *entry.state.get() };
             if state == COMMITTED && unsafe { (*entry.key.get()).assume_init_ref() == key } {
                 let key = unsafe { &*(*entry.key.get()).as_ptr() };
                 let value = unsafe { &*(*entry.value.get()).as_ptr() };
-                return Some(IndexRef { key, value });
+                return Some(IndexRef {
+                    key,
+                    value,
+                    _lock: lock,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Copy a stable projection of a committed value while holding the index
+    /// lock, then release the lock before returning it.
+    ///
+    /// This is the preferred lookup form for values that expose a compact
+    /// identity token (for example a zone `Cap` raw key).  The caller can
+    /// upgrade that token under its epoch guard after this function returns,
+    /// avoiding both a borrowed inline slot and lock-order coupling between
+    /// the index and the value's own lifetime machinery.
+    pub fn lookup_project<R>(&self, key: &K, project: impl FnOnce(&V) -> R) -> Option<R> {
+        let _lock = self.lock.lock();
+
+        for entry in &self.entries {
+            let state = unsafe { *entry.state.get() };
+            if state == COMMITTED && unsafe { (*entry.key.get()).assume_init_ref() == key } {
+                let value = unsafe { (*entry.value.get()).assume_init_ref() };
+                return Some(project(value));
             }
         }
 
@@ -362,6 +395,7 @@ impl<K, V, const N: usize> Drop for CommittedReservation<'_, K, V, N> {
 pub struct IndexRef<'g, K, V> {
     key: &'g K,
     value: &'g V,
+    _lock: SpinGuard<'g>,
 }
 
 impl<K, V> IndexRef<'_, K, V> {

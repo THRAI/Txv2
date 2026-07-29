@@ -48,12 +48,13 @@ pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
     MapPlacement, PendingWriter, PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot,
     PrivateFrameState, PrivatePageError, PrivatePageSet, Prot, RangeGuard, RangeGuardPair,
-    RangeLock, UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr,
-    VmBacking, VmCap, VmEntry, VmEntryBacking, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
-    VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
-    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
-    WouldBlock, FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
+    RangeLock, RangeLockDiagnosticSnapshot, UfdRegistration, UserPage, UserPageIter, UserRange,
+    UserRangeError, UserVirtAddr, VmBacking, VmCap, VmEntry, VmEntryBacking, VmEntryError,
+    VmEntryFlags, VmEntryProtectRewrite, VmEntryRewrite, VmFault, VmFaultError,
+    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultMaterializationStep,
+    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmPageOff,
+    VmRemapOutcome, VmRemapPlacement, VmRemapRequest, WouldBlock, FULL_USER_V1_TOP,
+    RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
 };
 pub use user_access::UserAccessKind;
 

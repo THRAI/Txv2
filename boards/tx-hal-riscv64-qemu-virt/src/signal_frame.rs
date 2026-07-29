@@ -253,7 +253,11 @@ impl SignalFrameIf for Platform {
         setup: &SignalFrameWrite,
     ) -> Result<(UserTrapContext, SignalFrameBytes), FaultInfo> {
         let frame_size = size_of::<Rv64SignalFrame>();
-        let user_sp = UserPtr::<u8>::new(ctx.regs[2]); // sp = x2
+        // `thread_future` has already selected either the interrupted stack or
+        // the registered SA_ONSTACK alternate stack.  The architecture layer
+        // must honour that placement; using ctx.sp here silently ignored
+        // sigaltstack and made nested handlers overwrite unrelated frames.
+        let user_sp = setup.stack_top;
 
         let Some(unrounded) = user_sp.addr().checked_sub(frame_size) else {
             return Err(FaultInfo {

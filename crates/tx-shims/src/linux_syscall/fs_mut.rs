@@ -225,7 +225,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let mode = args[2] as u16;
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),

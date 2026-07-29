@@ -623,18 +623,23 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Return(0);
     }
 
+    let mut closed = alloc::vec::Vec::new();
     for fd in open_keys.range(first..=last).copied() {
         let file_to_close = ctx.process.set_fd(fd, None);
         if let Some(file) = file_to_close {
             file.flock_release();
             fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
-            maybe_close_socket_file_after_fd_remove(&file);
+            closed.push(file);
         }
     }
     for fd in cloexec_keys.range(first..=last).copied() {
         ctx.process.set_fd_cloexec(fd, false);
     }
-    SyscallResult::Return(0)
+    let guard = step_engine::guard();
+    match tx_subsystems::process::finalize_detached_open_files(&closed, &guard) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+    }
 }
 
 /// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
@@ -679,7 +684,7 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 // goes through `FsOps::create_inode`, also free-fn. When walker /
 // open / create gain StepOp wraps, thread `&mut KernelScriptCtx`
 // here and replace the synchronous-poll dance with the wrap form.
-pub(super) async fn sys_openat<'a, P: PmapIf>(
+pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     dirfd: i32,
     path_uaddr: u64,
     flags: u32,
@@ -699,10 +704,25 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
     // walker — let it through so the lookup-side error wins.
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+        Err(ReadCStrError::Fault(errno)) => {
+            if errno == Errno::EIO {
+                let recipe = ctx
+                    .aspace
+                    .lookup(tx_subsystems::vm::UserVirtAddr(path_uaddr as usize));
+                let mapping = ctx.aspace.pmap().lookup(tx_subsystems::vm::UserPage(
+                    path_uaddr as usize / tx_subsystems::vm::USER_PAGE_SIZE,
+                ));
+                tx_hal::console_write_str::<P>(&alloc::format!(
+                    "txkernel:openat-eio:stage=path-copy:pid={}:tid={}:dirfd={dirfd}:path_ptr={path_uaddr:#x}:flags={flags:#x}:mode={mode:#x}:recipe={recipe:?}:pmap={mapping:?}\n",
+                    ctx.process.pid.0,
+                    ctx.thread.tid.0,
+                ));
+            }
+            return SyscallResult::error_from(errno);
+        }
     };
 
     // Decode the open flags. Access-mode picks the read/write pair;
@@ -958,7 +978,16 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         {
             Ok(file) => file,
             Err(v3errno) => {
-                return SyscallResult::error_from(Errno::from(v3errno));
+                let errno = Errno::from(v3errno);
+                if errno == Errno::EIO {
+                    let path_text = core::str::from_utf8(&path).unwrap_or("<non-utf8>");
+                    tx_hal::console_write_str::<P>(&alloc::format!(
+                        "txkernel:openat-eio:stage=open-drive:pid={}:tid={}:dirfd={dirfd}:flags={flags:#x}:mode={mode:#x}:path={path_text:?}\n",
+                        ctx.process.pid.0,
+                        ctx.thread.tid.0,
+                    ));
+                }
+                return SyscallResult::error_from(errno);
             }
         };
         if want_directory && openfile.rnode().meta().kind() != InodeKind::Directory {
@@ -1041,20 +1070,30 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EISDIR_VALUE);
         }
         use StepOutcome as V3Trunc;
-        let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
-            Some(b) => b,
-            None => return SyscallResult::Error(ENOSYS_VALUE),
-        };
         let fs_object_id = dentry.rnode().fs_object_id();
         let guard = step_engine::guard();
-        match fs_page_backing.truncate(fs_object_id, 0, &guard) {
-            V3Trunc::Done(()) => {}
-            V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
+        let truncate_result: Result<(), Errno> = match dentry.rnode().backing() {
+            RNodeBacking::PageBacked { pc } => {
+                match tx_subsystems::page_backed::step_truncate(pc, 0, &guard) {
+                    V3Trunc::Done(()) => Ok(()),
+                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
+                    V3Trunc::Err(errno) => Err(Errno::from(errno)),
+                }
             }
-            V3Trunc::Err(errno) => {
-                return SyscallResult::error_from(Errno::from(errno));
+            _ => {
+                let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
+                    Some(b) => b,
+                    None => return SyscallResult::Error(ENOSYS_VALUE),
+                };
+                match fs_page_backing.truncate(fs_object_id, 0, &guard) {
+                    V3Trunc::Done(()) => Ok(()),
+                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
+                    V3Trunc::Err(errno) => Err(Errno::from(errno)),
+                }
             }
+        };
+        if let Err(errno) = truncate_result {
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -1108,40 +1147,19 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let file_to_close = ctx.process.fd(fd);
-    // Write back dirty data + logical size before dropping the fd. There
-    // is no background writeback daemon, so close is the flush point for
-    // page-backed files; without it a fresh reopen reads the stale
-    // (create-time, zero) inode size and empty data. The descriptor is
-    // removed even if writeback fails, but close returns that writeback
-    // error so userspace cannot mistake lost data for a successful close.
-    let mut flush_error = None;
-    if let Some(file) = &file_to_close {
-        if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
-            let guard = step_engine::guard();
-            flush_error = match tx_subsystems::page_backed::step_fsync(&pc, &guard) {
-                tx_substrate::step::StepOutcome::Done(()) => None,
-                tx_substrate::step::StepOutcome::Err(errno) => Some(Errno::from(errno)),
-                tx_substrate::step::StepOutcome::Continue { .. }
-                | tx_substrate::step::StepOutcome::Yield { .. } => Some(Errno::EIO),
-            };
-        }
-    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),
         fd,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(()) => {
-            if let Some(file) = file_to_close {
-                file.flock_release();
-                fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
-                maybe_close_socket_file_after_fd_remove(&file);
-            }
-            match flush_error {
-                Some(errno) => SyscallResult::error_from(errno),
-                None => SyscallResult::Return(0),
+        Ok(file) => {
+            file.flock_release();
+            fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
+            let guard = step_engine::guard();
+            match tx_subsystems::process::finalize_detached_open_files([&file], &guard) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(Errno::from(errno)),
             }
         }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
@@ -1197,19 +1215,6 @@ pub(super) fn sys_dup3<'a>(
     if newfd >= soft_limit {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    // dup2/dup3 silently closes whatever is currently at `newfd`. That close
-    // is a flush point for page-backed files (same as `sys_close`) — a shell
-    // restoring a redirected fd (`echo >f`) reaps the file only this way, so
-    // without the flush its data + inode size never persist for a fresh
-    // cross-process reopen. No-op when newfd == oldfd (POSIX: no close).
-    if oldfd != newfd {
-        if let Some(file) = ctx.process.fd(newfd) {
-            if let Some(pc) = crate::linux_syscall::vm::extract_page_container(&file) {
-                let guard = step_engine::guard();
-                let _ = tx_subsystems::page_backed::step_fsync(&pc, &guard);
-            }
-        }
-    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = Dup3Op {
         process: ctx.process.clone(),
@@ -1218,7 +1223,15 @@ pub(super) fn sys_dup3<'a>(
         flags,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(fd) => SyscallResult::Return(fd as i64),
+        Ok((fd, replaced)) => {
+            if let Some(file) = replaced {
+                file.flock_release();
+                fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
+                let guard = step_engine::guard();
+                let _ = tx_subsystems::process::finalize_detached_open_files([&file], &guard);
+            }
+            SyscallResult::Return(fd as i64)
+        }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

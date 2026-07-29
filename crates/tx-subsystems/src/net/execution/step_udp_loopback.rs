@@ -4,12 +4,13 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_write_target;
 use crate::net::namespace::initial_loopback_iface;
 use crate::net::protocol::{LoopbackIface, PollContext, UDP_IPV4_MAX_PAYLOAD_BYTES};
-use crate::net::structure::{
-    IpEndpoint, SendRecvFlags, SendWireSet, SocketIdentity, SocketProtocol, UdpInner,
-};
+use crate::net::structure::{IpEndpoint, SendRecvFlags, SocketIdentity, SocketProtocol, UdpInner};
 
 use super::step_send::send_flags_error;
-use super::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
+use super::{
+    socket_send_wait_token, step_send::clear_send_space_if_full, yield_bytes_on_token,
+    ByteStepOutcome,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LoopbackUdpTransferOutcome {
@@ -154,7 +155,7 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
         match source_payload.reserve_send_bytes_to_with_flags(Some(destination), bytes, flags) {
             Ok(Some(reserve)) => reserve,
             Ok(None) => {
-                socket.readiness.clear_send(SendWireSet::SPACE);
+                clear_send_space_if_full(socket, &source_payload);
                 return yield_bytes_on_token(
                     tx_substrate::step::ByteProgress::EMPTY,
                     socket_send_wait_token(socket),
@@ -163,7 +164,7 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
             Err(errno) => return tx_substrate::step::StepOutcome::Err(errno),
         };
     if reserve.became_full {
-        socket.readiness.clear_send(SendWireSet::SPACE);
+        clear_send_space_if_full(socket, &source_payload);
     }
     if flags.contains(SendRecvFlags::MSG_MORE) {
         return tx_substrate::step::StepOutcome::Done(reserve.bytes);

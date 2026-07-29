@@ -18,13 +18,12 @@ use tx_subsystems::net::{
     step_sctp_peeloff, step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
     step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
-    step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
-    step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
-    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, NetNamespacePayload, PollMask,
-    RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd,
-    SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence, SocketProtocol,
-    SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred,
-    UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    step_socket_open_file_in_namespace, step_unix_socketpair_connect, AddressFamily, ConnectionKey,
+    IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption,
+    NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl,
+    SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence,
+    SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
+    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -39,8 +38,11 @@ const SOCKADDR_UN_PATH_BYTES: usize = 108;
 const SOCKADDR_NL_BYTES: u32 = 12;
 const SOCKADDR_LL_BYTES: u32 = 20;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
-const EPHEMERAL_PORT_START: u16 = 49_152;
-const EPHEMERAL_PORT_END: u16 = 49_216;
+// Linux's default local port range is 32768..60999 (inclusive).  The previous
+// 64-port staging range was exhausted by a few concurrent/repeated CAgent HTTP
+// waves while gracefully closing TCP sockets were still in flight.
+const EPHEMERAL_PORT_START: u16 = 32_768;
+const EPHEMERAL_PORT_END: u16 = 61_000;
 
 /// Shared rotation offset for ephemeral-port allocation (P2-S5). Every
 /// scan (connect autobind and bind(port=0) alike) starts one slot past
@@ -201,7 +203,7 @@ pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if !matches!(kind, SocketKind::UnixDatagram | SocketKind::UnixStream) {
         return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
     }
-    if let Err(errno) = validate_user_range(ctx, sv, 8, UserAccessKind::Write) {
+    if let Err(errno) = validate_user_range_wait(ctx, sv, 8, UserAccessKind::Write).await {
         return SyscallResult::Error(errno_to_i32(errno));
     }
 
@@ -414,7 +416,7 @@ async fn accept_impl<'a, P: TimeIf>(
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::ItimerExpired
+                        SocketWaitWake::Interrupted
                     ) {
                         return SyscallResult::Error(EINTR_VALUE);
                     }
@@ -485,10 +487,6 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 return SyscallResult::Return(0);
             }
             StepOutcome::Yield { shape, .. } => {
-                let connected = match drive_tcp_loopback_after_connect(&socket) {
-                    Ok(connected) => connected || !socket_is_tcp_connecting(&socket),
-                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-                };
                 if nonblocking {
                     let errno = if was_connecting {
                         Errno::EALREADY
@@ -497,12 +495,23 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     };
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
-                if connected {
+                // TCP protocol progression is owned exclusively by the network
+                // delegate.  Do not run the loopback handshake from the
+                // syscall CPU as well: two drivers can otherwise both observe
+                // Connecting, one completes the handshake, and the other
+                // converts smoltcp's resulting InvalidState into a spurious
+                // ECONNREFUSED.
+                if !socket_is_tcp_connecting(&socket) {
                     return SyscallResult::Return(0);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
                     waited_for_connect = true;
-                    let _ = future.await;
+                    if matches!(
+                        wait_on_socket_interruptible(future, ctx).await,
+                        SocketWaitWake::Interrupted
+                    ) {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -919,7 +928,12 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                         return SyscallResult::Error(EAGAIN_VALUE);
                     }
                     if let Some(future) = wait_on_yield_shape(shape) {
-                        let _ = future.await;
+                        if matches!(
+                            wait_on_socket_interruptible(future, ctx).await,
+                            SocketWaitWake::Interrupted
+                        ) {
+                            return SyscallResult::Error(EINTR_VALUE);
+                        }
                     } else {
                         return SyscallResult::Error(EIO_VALUE);
                     }
@@ -976,7 +990,12 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if matches!(
+                        wait_on_socket_interruptible(future, ctx).await,
+                        SocketWaitWake::Interrupted
+                    ) {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -1275,7 +1294,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 };
                 if matches!(
                     wait_on_socket_or_itimer::<P>(future, ctx).await,
-                    SocketWaitWake::ItimerExpired
+                    SocketWaitWake::Interrupted
                 ) {
                     if recv_queued_len(&socket) > 0 {
                         yielded_before_wait = false;
@@ -1354,7 +1373,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::ItimerExpired
+                        SocketWaitWake::Interrupted
                     ) {
                         if recv_queued_len(&socket) > 0 {
                             continue;
@@ -1814,7 +1833,12 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                         return SyscallResult::Error(EAGAIN_VALUE);
                     }
                     if let Some(future) = wait_on_yield_shape(shape) {
-                        let _ = future.await;
+                        if matches!(
+                            wait_on_socket_interruptible(future, ctx).await,
+                            SocketWaitWake::Interrupted
+                        ) {
+                            return SyscallResult::Error(EINTR_VALUE);
+                        }
                     } else {
                         return SyscallResult::Error(EIO_VALUE);
                     }
@@ -1869,7 +1893,12 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if matches!(
+                        wait_on_socket_interruptible(future, ctx).await,
+                        SocketWaitWake::Interrupted
+                    ) {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -2185,7 +2214,7 @@ async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::ItimerExpired
+                        SocketWaitWake::Interrupted
                     ) {
                         if recv_queued_len(&socket) > 0 {
                             continue;
@@ -3921,16 +3950,15 @@ pub(super) fn sys_shutdown<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
 }
 
 pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
-    // `CloseOp` has already removed the fd-table entry. The `Cap` passed here
-    // is the syscall's temporary reference; if anything else still retains the
-    // same open-file description (dup, fork, or another in-kernel owner), the
-    // underlying socket must stay alive.
-    if file.retain_count() > 1 {
+    // `Cap` clones are internal lifetime pins and say nothing about whether a
+    // dup/fork descriptor still exists.  fd-table mutations maintain the
+    // socket's explicit descriptor count; only zero is a last close.
+    if file
+        .socket_identity()
+        .is_some_and(|socket| socket.fd_ref_count() != 0)
+    {
         return;
     }
-    // P3-S5 (D13): the close protocol is the kind's FileOps hook now
-    // (sockets run step_socket_close); the retain-count two-phase timing
-    // stays here per the plan's conservative ruling.
     let Some(ops) = file.file_ops() else {
         return;
     };
@@ -3939,7 +3967,10 @@ pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
 }
 
 pub(super) fn can_fast_close_stateless_netlink_socket(file: &Cap<OpenFile>) -> bool {
-    if file.retain_count() > 2 {
+    if file
+        .socket_identity()
+        .is_some_and(|socket| socket.fd_ref_count() != 0)
+    {
         return false;
     }
     socket_identity_from_file(file).is_ok_and(|socket| is_netlink_socket_kind(socket.kind))

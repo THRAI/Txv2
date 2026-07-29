@@ -1164,8 +1164,8 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     const HANDLER_ADDR: u64 = 0xCAFE_F00D_DEAD_BEEFu64;
-    let act: [u64; 4] = [HANDLER_ADDR, 0, 0, 0]; // handler/flags/mask/unused
-    let mut oldact: [u64; 4] = [0xDEADu64; 4];
+    let act: [u64; 3] = [HANDLER_ADDR, 0, 0]; // handler/flags/mask
+    let mut oldact: [u64; 3] = [0xDEADu64; 3];
 
     // Install: oldact reports prev (Default == 0).
     let r1 = block_on(dispatch::<ShimsTestPmap>(
@@ -1189,7 +1189,7 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
     );
 
     // Query (act == NULL): oldact reports the just-installed handler.
-    let mut oldact2: [u64; 4] = [0xDEADu64; 4];
+    let mut oldact2: [u64; 3] = [0xDEADu64; 3];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,
@@ -1222,10 +1222,8 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     const SA_RESTART: u64 = 0x1000_0000;
     const FLAGS: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     const MASK: u64 = u64::MAX;
-    const UNUSED: u64 = 0x4444_5555_6666_7777;
-
-    let act: [u64; 4] = [HANDLER_ADDR, FLAGS, MASK, UNUSED];
-    let mut oldact: [u64; 4] = [0xDEADu64; 4];
+    let act: [u64; 3] = [HANDLER_ADDR, FLAGS, MASK];
+    let mut oldact: [u64; 3] = [0xDEADu64; 3];
 
     let r1 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
@@ -1242,9 +1240,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
         &ctx,
     ));
     assert_eq!(r1, SyscallResult::Return(0));
-    assert_eq!(oldact, [0, 0, 0, 0]);
+    assert_eq!(oldact, [0, 0, 0]);
 
-    let mut observed: [u64; 4] = [0xDEADu64; 4];
+    let mut observed: [u64; 3] = [0xDEADu64; 3];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,

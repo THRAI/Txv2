@@ -190,6 +190,35 @@ impl<T: 'static> Cap<T> {
         }
     }
 
+    /// Upgrade a raw cap key observed while `guard` was pinned.
+    ///
+    /// The guard prevents a retired zone slot from being reclaimed and reused
+    /// between copying the raw key from a publication table and incrementing
+    /// its retain count here.  A concurrent final release changes the slot out
+    /// of `Live`, in which case the upgrade cleanly returns `None`.
+    pub fn try_clone_raw_live(raw: u32, guard: &Guard<'_>) -> Option<Self> {
+        let _ = guard;
+        let key = SlotKey::from_raw(raw);
+        let slot = registry::slot_for::<T>(key)?;
+        let meta = unsafe { slot.as_ref().meta() };
+        loop {
+            let cur = meta.load(Ordering::Acquire);
+            if cur.state() != SlotState::Live {
+                return None;
+            }
+            let new = cur.inc_retain().ok()?;
+            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    return Some(Self {
+                        raw,
+                        _marker: PhantomData,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     pub(crate) fn try_retire_slot(slot: NonNull<Slot<T>>) {
         let meta = unsafe { slot.as_ref().meta() };
         loop {

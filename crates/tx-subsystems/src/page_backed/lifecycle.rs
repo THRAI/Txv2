@@ -9,18 +9,23 @@ impl PageCacheIndex {
         drop(self.pages.split_off(&first));
     }
 
-    fn dirty_pages(&self) -> Vec<(PageIndex, Ppn)> {
+    fn dirty_pages(&self) -> Vec<(PageIndex, Ppn, u64)> {
         self.pages
             .iter()
-            .filter_map(|(page, entry)| entry.marks.dirty.then_some((*page, entry.ppn)))
+            .filter_map(|(page, entry)| {
+                entry
+                    .marks
+                    .dirty
+                    .then_some((*page, entry.ppn, entry.dirty_generation))
+            })
             .collect()
     }
 
-    fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn) {
+    fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn, dirty_generation: u64) {
         let Some(entry) = self.pages.get_mut(&page) else {
             return;
         };
-        if entry.ppn == ppn {
+        if entry.ppn == ppn && entry.dirty_generation == dirty_generation {
             entry.marks.dirty = false;
             entry.marks.writeback = false;
         }
@@ -46,12 +51,15 @@ impl PageContainer {
         }
     }
 
-    fn dirty_pages_snapshot(&self) -> Vec<(PageIndex, Ppn)> {
+    fn dirty_pages_snapshot(&self) -> Vec<(PageIndex, Ppn, u64)> {
         self.state.lock().pages.dirty_pages()
     }
 
-    fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn) {
-        self.state.lock().pages.clear_dirty_if_match(page, ppn);
+    fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn, dirty_generation: u64) {
+        self.state
+            .lock()
+            .pages
+            .clear_dirty_if_match(page, ppn, dirty_generation);
     }
 }
 
@@ -106,7 +114,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
     };
 
     let mut pages_so_far: u32 = 0;
-    for (page, ppn) in pc.dirty_pages_snapshot() {
+    for (page, ppn, dirty_generation) in pc.dirty_pages_snapshot() {
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return V3::err(Errno::EINVAL.into());
         };
@@ -117,7 +125,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
             guard,
         ) {
             V3::Done(()) => {
-                pc.clear_dirty_if_match(page, ppn);
+                pc.clear_dirty_if_match(page, ppn, dirty_generation);
                 pages_so_far = pages_so_far.saturating_add(1);
             }
             V3::Continue { progress: _ } => {
@@ -147,9 +155,10 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
     }
 
-    // Persist the logical size once data blocks are written back:
-    // `flush_page` writes data only, so without this a fresh reopen
-    // sees the inode's stale (create-time) size and reads zero bytes.
+    // `flush_page` writes data blocks only, so persist the logical size when
+    // this fsync actually wrote dirty data.  Do not rewrite inode metadata for
+    // a clean/read-only file: close() reaches this path as well, and touching
+    // clean inputs invalidates Cargo fingerprints on the next invocation.
     if pages_so_far > 0 {
         let size = pc.size_bytes();
         match mount

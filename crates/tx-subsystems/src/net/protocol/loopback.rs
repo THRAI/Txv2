@@ -136,6 +136,31 @@ impl LoopbackIface {
         self.loopback_queue.lock().pop_front()
     }
 
+    /// Remove the first packet accepted by `predicate` without disturbing the
+    /// relative order of any other packet.
+    ///
+    /// A loopback TCP handshake may run inline on several CPUs at once.  A
+    /// pop/inspect/requeue loop is not sufficient there: another CPU can
+    /// observe the temporarily removed queue head and both handshakes can
+    /// consume each other's packets.  Selection therefore has to be one
+    /// atomic queue operation.  The queue lock is held only while locating and
+    /// removing one packet; protocol processing remains outside the lock.
+    pub fn take_ingress_matching(
+        &self,
+        mut predicate: impl FnMut(&LoopbackIpPacket) -> bool,
+    ) -> Option<LoopbackIpPacket> {
+        let mut queue = self.loopback_queue.lock();
+        let index = queue.iter().position(&mut predicate)?;
+        queue.remove(index)
+    }
+
+    pub fn has_ingress_matching(
+        &self,
+        mut predicate: impl FnMut(&LoopbackIpPacket) -> bool,
+    ) -> bool {
+        self.loopback_queue.lock().iter().any(&mut predicate)
+    }
+
     pub fn pending_packets(&self) -> usize {
         self.loopback_queue.lock().len()
     }

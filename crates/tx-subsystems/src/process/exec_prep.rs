@@ -53,31 +53,8 @@ pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
     // closed; future fcntl(F_SETFD) calls start from a clean state.
     process.clear_fd_cloexec();
 
-    // Multiple CLOEXEC descriptors may alias one open-file description.
-    // Notify exactly once, and only when this batch removed every live
-    // descriptor reference. This mirrors the process-exit close path.
-    let mut seen_files = Vec::new();
-    for file in &closed {
-        let raw_file = file.raw();
-        if seen_files.contains(&raw_file) {
-            continue;
-        }
-        seen_files.push(raw_file);
-
-        let closed_refs = closed
-            .iter()
-            .filter(|candidate| candidate.raw() == raw_file)
-            .count() as u32;
-        if file.retain_count() > closed_refs {
-            continue;
-        }
-
-        let Some(ops) = file.file_ops() else {
-            continue;
-        };
-        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        ops.on_last_close(&guard);
-    }
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+    let _ = super::execution::finalize_detached_open_files(&closed, &guard);
 }
 
 /// Reset every user-installed signal disposition on `process` to

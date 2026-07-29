@@ -35,11 +35,12 @@ pub fn step_accept(
     };
 
     let Some(pop) = payload.pop_accept_entry() else {
+        clear_accept_pending_if_empty(socket, &payload);
         return yield_on_token(socket_accept_wait_token(socket));
     };
 
     if pop.became_empty {
-        socket.readiness.clear_accept(AcceptWireSet::HAS_PENDING);
+        clear_accept_pending_if_empty(socket, &payload);
     }
     if let Some(child_payload) = pop.entry.child.acquire_operational() {
         child_payload.with_protocol_mut(|protocol| {
@@ -63,4 +64,17 @@ pub fn step_accept(
         peer: pop.entry.peer,
         unix_peer: pop.entry.unix_peer,
     })
+}
+
+fn clear_accept_pending_if_empty(
+    socket: &Cap<SocketIdentity>,
+    payload: &crate::net::structure::SocketPayload,
+) {
+    socket.readiness.clear_accept(AcceptWireSet::HAS_PENDING);
+    // Promotion can enqueue a child after pop/empty-check released the
+    // backlog lock but before HAS_PENDING is cleared.  Re-read the real queue
+    // after clearing so that incoming connection cannot lose its wake.
+    if payload.accept_queue_len() != 0 {
+        socket.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+    }
 }

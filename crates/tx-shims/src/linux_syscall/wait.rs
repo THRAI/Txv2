@@ -5,6 +5,7 @@
 //! the `WaitSource`; the syscall driver only subscribes its task mailbox and
 //! re-polls the subsystem after a matching wake.
 
+use core::future::poll_fn;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -18,6 +19,13 @@ use crate::adapter::reactor_entry::{
 use crate::adapter::step_engine::{InterestMask, WaitSourceId};
 
 use super::SyscallCtx;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WaitSourceDeadline {
+    Source,
+    Deadline,
+    NotInstalled,
+}
 
 pub(super) async fn await_wait_source(
     ctx: &SyscallCtx<'_>,
@@ -62,6 +70,58 @@ where
     MailboxSourceFuture { mailbox, active }.await;
     drop(registration);
     true
+}
+
+/// Atomically subscribe to a semantic wait source and then wait for either
+/// that source (including a signal mailbox event) or an absolute reactor
+/// deadline.
+///
+/// POSIX timers are process objects, while a blocking `wait4` is parked on the
+/// parent's child-exit source.  Merely programming the hart timer is not
+/// sufficient: when the timer interrupt fires, the parked `wait4` task still
+/// has no reason to run and therefore cannot post the POSIX signal.  Combining
+/// the two wake sources here gives the timer deadline its own waker without
+/// polling and without weakening the child-exit lost-wakeup recheck.
+pub(super) async fn await_wait_source_if_until<F>(
+    ctx: &SyscallCtx<'_>,
+    source: WaitSourceId,
+    interests: InterestMask,
+    deadline_ns: u64,
+    still_blocked: F,
+) -> WaitSourceDeadline
+where
+    F: FnOnce() -> bool,
+{
+    let Some(mailbox) = ctx.mailbox.as_ref() else {
+        return WaitSourceDeadline::NotInstalled;
+    };
+    let Some(wait_source) = lookup_source(source) else {
+        return WaitSourceDeadline::NotInstalled;
+    };
+    let Some(mut deadline) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+        return WaitSourceDeadline::NotInstalled;
+    };
+
+    let generation = mailbox.next_generation();
+    let active = ActiveWait::new(generation, source, interests);
+    let prepared = wait_source.prepare(Arc::downgrade(mailbox), generation, interests);
+    let Some(registration) = prepared.install_if(still_blocked) else {
+        return WaitSourceDeadline::Source;
+    };
+
+    let mut source = MailboxSourceFuture { mailbox, active };
+    let outcome = poll_fn(|cx| {
+        if Pin::new(&mut source).poll(cx).is_ready() {
+            return Poll::Ready(WaitSourceDeadline::Source);
+        }
+        if Pin::new(&mut deadline).poll(cx).is_ready() {
+            return Poll::Ready(WaitSourceDeadline::Deadline);
+        }
+        Poll::Pending
+    })
+    .await;
+    drop(registration);
+    outcome
 }
 
 pub(super) async fn await_any_wait_source(

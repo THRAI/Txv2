@@ -333,7 +333,13 @@ impl<P: TxPlatform> CoreInit<P> {
                     )
                     .await;
                 },
+                // The network state machine has one protocol owner. Pin both
+                // its future and its timer publisher to the same hart so the
+                // delegate's wait registration, wake routing, and protocol
+                // ownership cannot move independently between polls. User
+                // processes remain movable across every online CPU.
                 tx_reactor::InitialSchedMeta::kernel()
+                    .pinned()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
             )
         })
@@ -345,6 +351,7 @@ impl<P: TxPlatform> CoreInit<P> {
             reactor.submit_task_with_meta(
                 boot_net_deadline_task(runtime),
                 tx_reactor::InitialSchedMeta::kernel()
+                    .pinned()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
             )
         })

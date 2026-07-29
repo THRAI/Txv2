@@ -104,17 +104,15 @@ where
 {
     fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
         match self.with_pager(|pager| pager.filesystem_stats()) {
-            Ok(stats) => {
-                StepOutcome::done(FilesystemStats {
-                    block_size: stats.block_size,
-                    total_blocks: stats.total_blocks,
-                    free_blocks: stats.free_blocks,
-                    available_blocks: stats.available_blocks,
-                    total_inodes: stats.total_inodes,
-                    free_inodes: stats.free_inodes,
-                    max_name_len: stats.max_name_len,
-                })
-            }
+            Ok(stats) => StepOutcome::done(FilesystemStats {
+                block_size: stats.block_size,
+                total_blocks: stats.total_blocks,
+                free_blocks: stats.free_blocks,
+                available_blocks: stats.available_blocks,
+                total_inodes: stats.total_inodes,
+                free_inodes: stats.free_inodes,
+                max_name_len: stats.max_name_len,
+            }),
             Err(err) => StepOutcome::err(err.into()),
         }
     }

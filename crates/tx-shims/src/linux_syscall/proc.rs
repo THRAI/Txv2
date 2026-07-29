@@ -523,7 +523,7 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::Cons
     let envp_uaddr = args[2];
 
     // ----- Step 1: bounded read of the path -----
-    let path_buf = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path_buf = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -1224,7 +1224,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 ///
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
-pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_wait4<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let pid = args[0] as i64 as i32;
     let wstatus_uaddr = args[1];
     let options = args[2] as i32;
@@ -1307,6 +1310,12 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 shape: YieldShape::OnWaitSource { source, interests },
                 ..
             } => {
+                // A process-directed POSIX/interval timer must be able to
+                // interrupt wait4 even though this task is parked on the
+                // child-exit source. Poll once before sleeping both to deliver
+                // an already-due signal and to obtain the next deadline.
+                let posix_deadline = poll_due_posix_timers::<P>(&ctx.process);
+                let itimer_deadline = poll_due_itimers::<P>(&ctx.process);
                 // Make the blocking wait signal-interruptible. The loop re-runs
                 // `op.step()` at the top, so any reapable child is collected
                 // *before* this check — that keeps a child-exit SIGCHLD from
@@ -1323,15 +1332,46 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 // the exit source's notification lock. This closes the SMP
                 // window between the no-zombie observation in op.step() and
                 // publishing the parent as an exit-source subscriber.
-                let parked = super::await_wait_source_if(ctx, source, interests, || {
-                    tx_subsystems::process::execution::waitpid_would_block(
-                        &ctx.process,
-                        target,
+                let deadline = match (posix_deadline, itimer_deadline) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                    (None, None) => None,
+                };
+                if let Some(deadline_ns) = deadline {
+                    match super::await_wait_source_if_until(
+                        ctx,
+                        source,
+                        interests,
+                        deadline_ns,
+                        || {
+                            tx_subsystems::process::execution::waitpid_would_block(
+                                &ctx.process,
+                                target,
+                            )
+                        },
                     )
-                })
-                .await;
-                if !parked {
-                    continue;
+                    .await
+                    {
+                        super::WaitSourceDeadline::Deadline => {
+                            // This call posts the due signal. The top of the
+                            // loop rechecks children first; if none is ready,
+                            // the signal-interrupt check above returns EINTR.
+                            let _ = poll_due_posix_timers::<P>(&ctx.process);
+                            let _ = poll_due_itimers::<P>(&ctx.process);
+                        }
+                        super::WaitSourceDeadline::Source => {}
+                        super::WaitSourceDeadline::NotInstalled => {
+                            tx_reactor::yield_now().await;
+                        }
+                    }
+                } else {
+                    let parked = super::await_wait_source_if(ctx, source, interests, || {
+                        tx_subsystems::process::execution::waitpid_would_block(&ctx.process, target)
+                    })
+                    .await;
+                    if !parked {
+                        continue;
+                    }
                 }
             }
             WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),

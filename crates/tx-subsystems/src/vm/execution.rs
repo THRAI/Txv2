@@ -134,18 +134,16 @@ impl AddressSpace {
         loop {
             match parent
                 .range_lock
-                .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
+                .acquire_step_rich(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
             {
-                V3StepOutcome::Done(full_guard) => {
+                crate::vm::AcquireResult::Acquired(full_guard) => {
                     return Self::fork_aspace_reserved::<P>(parent, full_guard);
                 }
-                V3StepOutcome::Yield { shape, .. } => {
-                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
-                        return Err(VmMapError::WouldBlock);
-                    };
-                    await_range_lock(token).await;
+                crate::vm::AcquireResult::WouldBlock(blocked) => {
+                    let token = blocked.wait_token();
+                    drop(blocked);
+                    await_range_lock(&parent.range_lock, token).await;
                 }
-                _ => unreachable_acquire_step(),
             }
         }
     }
@@ -329,7 +327,7 @@ impl AddressSpace {
             let outcome = match self.try_fault_script_resolve(page_range, fault)? {
                 FaultScriptResolve::Done(outcome) => outcome,
                 FaultScriptResolve::Wait(token) => {
-                    await_range_lock(token).await;
+                    await_range_lock(&self.range_lock, token).await;
                     continue;
                 }
             };
@@ -365,7 +363,7 @@ impl AddressSpace {
                 }
                 FaultScriptPublish::Wait(token) => {
                     emit_vm_trace(b"debug.vm.fault.script.wait", 1);
-                    await_range_lock(token).await;
+                    await_range_lock(&self.range_lock, token).await;
                     continue;
                 }
                 FaultScriptPublish::Retry => {
@@ -388,20 +386,18 @@ impl AddressSpace {
         emit_vm_trace(b"debug.vm.fault.resolve.phase", 0);
         let _guard = match self
             .range_lock
-            .acquire_step(page_range, LockMode::Materializer)
+            .acquire_step_rich(page_range, LockMode::Materializer)
         {
-            V3StepOutcome::Done(guard) => {
+            crate::vm::AcquireResult::Acquired(guard) => {
                 emit_vm_trace(b"debug.vm.fault.resolve.phase", 1);
                 guard
             }
-            V3StepOutcome::Yield { shape, .. } => {
-                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
-                    emit_vm_trace(b"debug.vm.fault.resolve.wait", 1);
-                    return Ok(FaultScriptResolve::Wait(token));
-                }
-                unreachable_acquire_step()
+            crate::vm::AcquireResult::WouldBlock(blocked) => {
+                let token = blocked.wait_token();
+                drop(blocked);
+                emit_vm_trace(b"debug.vm.fault.resolve.wait", 1);
+                return Ok(FaultScriptResolve::Wait(token));
             }
-            _ => unreachable_acquire_step(),
         };
         let outcome = require_fault_recipe(self, fault)?;
         emit_vm_trace(
@@ -424,21 +420,19 @@ impl AddressSpace {
         emit_vm_trace(b"debug.vm.fault.publish.phase", 0);
         let _guard = match self
             .range_lock
-            .acquire_step(outcome.page_range, LockMode::Materializer)
+            .acquire_step_rich(outcome.page_range, LockMode::Materializer)
         {
-            V3StepOutcome::Done(guard) => {
+            crate::vm::AcquireResult::Acquired(guard) => {
                 emit_vm_trace(b"debug.vm.fault.publish.phase", 1);
                 guard
             }
-            V3StepOutcome::Yield { shape, .. } => {
-                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
-                    drop(materialization);
-                    emit_vm_trace(b"debug.vm.fault.publish.wait", 1);
-                    return Ok(FaultScriptPublish::Wait(token));
-                }
-                unreachable_acquire_step()
+            crate::vm::AcquireResult::WouldBlock(blocked) => {
+                let token = blocked.wait_token();
+                drop(blocked);
+                drop(materialization);
+                emit_vm_trace(b"debug.vm.fault.publish.wait", 1);
+                return Ok(FaultScriptPublish::Wait(token));
             }
-            _ => unreachable_acquire_step(),
         };
         self.try_fault_script_publish_locked(outcome, materialization)
     }
@@ -504,17 +498,15 @@ impl AddressSpace {
         // reservation before the async caller awaits and retries.
         let _page_guard = match self
             .range_lock
-            .acquire_step(outcome.page_range, LockMode::Materializer)
+            .acquire_step_rich(outcome.page_range, LockMode::Materializer)
         {
-            V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield { shape, .. } => {
-                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
-                    emit_vm_trace(b"debug.vm.fault.materialize.wait", 2);
-                    return Ok(FaultScriptPublish::Wait(token));
-                }
-                unreachable_acquire_step()
+            crate::vm::AcquireResult::Acquired(guard) => guard,
+            crate::vm::AcquireResult::WouldBlock(blocked) => {
+                let token = blocked.wait_token();
+                drop(blocked);
+                emit_vm_trace(b"debug.vm.fault.materialize.wait", 2);
+                return Ok(FaultScriptPublish::Wait(token));
             }
-            _ => unreachable_acquire_step(),
         };
         let page = outcome.page_range.start().containing_page();
         if let Some(existing) = self.pmap.lookup(page) {
@@ -1115,7 +1107,7 @@ impl AddressSpace {
                 crate::vm::AcquireResult::WouldBlock(blocked) => {
                     let token = blocked.wait_token();
                     pending = blocked.pending_writer();
-                    await_range_lock(token).await;
+                    await_range_lock(&self.range_lock, token).await;
                 }
             }
         }
@@ -1504,7 +1496,13 @@ impl MapReservation<'_> {
 /// a `WaitToken`). Resolved through the global wait-source registry; if the
 /// token's channel has been retired the await is a no-op and the caller's
 /// retry loop runs immediately.
-async fn await_range_lock(token: WaitToken) {
+async fn await_range_lock(range_lock: &crate::vm::RangeLock, token: WaitToken) {
+    if token.source_id() == range_lock.wait_source_id() {
+        if let Some(observed) = token.observed_generation() {
+            range_lock.wait_for_release_since(observed).await;
+            return;
+        }
+    }
     if let Some(wait) = crate::wait_source::wait_on_token(token) {
         let _ = wait.await;
     }

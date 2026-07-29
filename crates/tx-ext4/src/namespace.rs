@@ -195,7 +195,7 @@ where
             Err(e) => return StepOutcome::err(e.into()),
         };
         let now_sec = current_ext4_time_sec();
-        match self.with_pager(|pager| {
+        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
             pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
         }) {
             Ok(new_ino) => {
@@ -228,7 +228,9 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager(|pager| pager.unlink_inode(parent_ino, name, target_ino)) {
+        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+            pager.unlink_inode(parent_ino, name, target_ino)
+        }) {
             Ok(remaining_links) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 self.invalidate_inode_meta(target_ino);
@@ -261,7 +263,7 @@ where
             Err(e) => return StepOutcome::err(e.into()),
         };
 
-        match self.with_pager(|pager| {
+        match self.with_pager_namespace_mutation(&[old_parent_ino, new_parent_ino], |pager| {
             pager.rename_inode(old_parent_ino, old_name, new_parent_ino, new_name)
         }) {
             Ok(outcome) => {
@@ -309,7 +311,9 @@ where
         if meta.mode & 0xF000 == 0x4000 {
             return StepOutcome::err(Errno::EPERM.into());
         }
-        match self.with_pager(|pager| pager.link_inode(parent_ino, name, target_ino)) {
+        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+            pager.link_inode(parent_ino, name, target_ino)
+        }) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 self.invalidate_inode_meta(target_ino);
@@ -340,7 +344,7 @@ where
             Err(e) => return StepOutcome::err(e.into()),
         }
         let now_sec = current_ext4_time_sec();
-        match self.with_pager(|pager| {
+        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
             pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
         }) {
             Ok(new_ino) => {
@@ -373,7 +377,9 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager(|pager| pager.unlink_directory(parent_ino, name, target_ino)) {
+        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+            pager.unlink_directory(parent_ino, name, target_ino)
+        }) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 self.invalidate_inode_meta(target_ino);

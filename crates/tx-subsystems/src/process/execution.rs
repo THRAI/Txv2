@@ -1081,8 +1081,8 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
             b"debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
             || payload.drain_fds(),
         );
-        close_socket_files_for_process_exit(&closed_fds);
-        flush_page_backed_files_for_process_exit(&closed_fds);
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let _ = finalize_detached_open_files(closed_fds.values(), &guard);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
             || drop(closed_fds),
@@ -1101,20 +1101,39 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     post_sigchld_to_parent(process);
 }
 
-fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+/// Run the post-fd-table-removal protocol for the exact open-file
+/// descriptions detached by close, close_range, dup3 replacement, exec or
+/// process exit.
+///
+/// fd-table removal and finalization are deliberately separate: removal must
+/// be atomic under the process fd lock, while writeback and socket teardown
+/// can perform substantial work and must run after that lock is released.
+///
+/// Page-backed files are flushed because txKernel currently has no background
+/// writeback daemon.  Socket `on_last_close` runs only after the explicit
+/// descriptor count reaches zero; internal Cap clones are lifetime pins and
+/// must not delay FIN/EOF publication.
+pub fn finalize_detached_open_files<'a>(
+    files: impl IntoIterator<Item = &'a Cap<OpenFile>>,
+    guard: &step_engine::Guard<'_>,
+) -> Result<(), step_engine::Errno> {
     let mut seen_files = Vec::new();
-    for file in fds.values() {
+    let mut first_error = None;
+    for file in files {
         let raw_file = file.raw();
         if seen_files.contains(&raw_file) {
             continue;
         }
         seen_files.push(raw_file);
 
-        let drained_refs = fds
-            .values()
-            .filter(|candidate| candidate.raw() == raw_file)
-            .count() as u32;
-        if file.retain_count() > drained_refs {
+        if let Err(errno) = flush_page_backed_open_file(file, guard) {
+            first_error.get_or_insert(errno);
+        }
+
+        if file
+            .socket_identity()
+            .is_some_and(|socket| socket.fd_ref_count() != 0)
+        {
             continue;
         }
 
@@ -1124,36 +1143,26 @@ fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
             continue;
         };
 
-        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        ops.on_last_close(&guard);
+        ops.on_last_close(guard);
     }
+    first_error.map_or(Ok(()), Err)
 }
 
-/// Flush dirty data + logical size for page-backed files dropped on process
-/// exit. There is no background writeback daemon, so close is the flush point
-/// for page-backed files. The explicit `close(2)` syscall already flushes
-/// (see `sys_close`), but a process that never calls `close` on a written file
-/// — e.g. a busybox applet whose redirected stdout (`cat >f`) is reaped only
-/// by exit — otherwise has its fd dropped here without a flush, so a fresh
-/// cross-process reopen sees the stale (create-time, zero) inode size and reads
-/// nothing. Best-effort and idempotent: a clean PC flushes nothing, and the
-/// ext4 flush path is synchronous (`Done`).
-fn flush_page_backed_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+pub fn flush_page_backed_open_file(
+    file: &Cap<OpenFile>,
+    guard: &step_engine::Guard<'_>,
+) -> Result<(), step_engine::Errno> {
     use crate::vfs::structure::{OpenFileBacking, RNodeBacking};
-    let mut seen_files = Vec::new();
-    for file in fds.values() {
-        if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
-            continue;
-        }
-        let raw_file = file.raw();
-        if seen_files.contains(&raw_file) {
-            continue;
-        }
-        seen_files.push(raw_file);
-        if let RNodeBacking::PageBacked { pc } = file.rnode().backing() {
-            let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-            let _ = crate::page_backed::step_fsync(&pc, &guard);
-        }
+    if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
+        return Ok(());
+    }
+    let RNodeBacking::PageBacked { pc } = file.rnode().backing() else {
+        return Ok(());
+    };
+    match crate::page_backed::step_fsync(pc, guard) {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Err(errno) => Err(errno),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(step_engine::Errno::EIO),
     }
 }
 
@@ -2169,17 +2178,16 @@ pub struct CloseOp {
 }
 
 impl StepOp<crate::process::ProcessIdentity> for CloseOp {
-    type Output = ();
+    type Output = Cap<OpenFile>;
     type Progress = NoProgress;
     fn step(
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
-    ) -> StepOutcome<(), NoProgress> {
-        if self.process.fd(self.fd).is_none() {
-            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
+    ) -> StepOutcome<Cap<OpenFile>, NoProgress> {
+        match self.process.set_fd(self.fd, None) {
+            Some(file) => StepOutcome::Done(file),
+            None => StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         }
-        let _prev = self.process.set_fd(self.fd, None);
-        StepOutcome::Done(())
     }
 }
 
@@ -2224,12 +2232,12 @@ pub struct Dup3Op {
 }
 
 impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
-    type Output = u32;
+    type Output = (u32, Option<Cap<OpenFile>>);
     type Progress = NoProgress;
     fn step(
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
-    ) -> StepOutcome<u32, NoProgress> {
+    ) -> StepOutcome<(u32, Option<Cap<OpenFile>>), NoProgress> {
         if self.oldfd == self.newfd {
             return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EINVAL);
         }
@@ -2243,10 +2251,10 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
         };
         super::structure::incr_pipe_fd_ref(&file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
-        let _prev = self
+        let previous = self
             .process
             .install_fd_with_cloexec(self.newfd, file, want_cloexec);
-        StepOutcome::Done(self.newfd)
+        StepOutcome::Done((self.newfd, previous))
     }
 }
 

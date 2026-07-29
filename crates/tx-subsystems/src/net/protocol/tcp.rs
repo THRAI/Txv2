@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use smoltcp::iface::{Config, Interface};
 use smoltcp::phy::{ChecksumCapabilities, Loopback, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, PollAt};
 use smoltcp::time::Duration;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpEndpoint as SmoltcpIpEndpoint, IpProtocol, IpRepr, Ipv4Packet,
@@ -104,6 +104,7 @@ pub struct SmoltcpTcpRepr {
 pub struct SmoltcpTcpProcessPublish {
     pub connected: bool,
     pub recv_readable: bool,
+    pub received_bytes: usize,
     pub send_writable: bool,
     pub recv_closed: bool,
     pub send_closed: bool,
@@ -361,6 +362,23 @@ impl RawTcpSocket {
         self.inner.lock().socket.state()
     }
 
+    pub fn poll_due_now(&self) -> bool {
+        with_context(|cx| match self.inner.lock().socket.poll_at(cx) {
+            PollAt::Now => true,
+            PollAt::Time(deadline) => deadline <= cx.now(),
+            PollAt::Ingress => false,
+        })
+    }
+
+    /// Return smoltcp's authoritative scheduling request for this socket.
+    ///
+    /// The delegate needs the full `PollAt`, rather than only a due-now
+    /// boolean, so established and gracefully-closing streams can arm their
+    /// retransmit/TIME-WAIT deadline while no packet is currently queued.
+    pub fn poll_at(&self) -> PollAt {
+        with_context(|cx| self.inner.lock().socket.poll_at(cx))
+    }
+
     pub fn protocol_runtime_state(&self) -> RawTcpProtocolState {
         self.inner.lock().protocol_state
     }
@@ -385,15 +403,22 @@ impl RawTcpSocket {
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
             let before = observe_socket(&inner.socket);
+            let recv_before = inner.socket.recv_queue();
             let tcp_repr = segment.tcp.as_repr(&segment.payload);
-            let _reply = if inner.socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
+            let accepted = inner.socket.accepts(cx, &segment.ip_repr, &tcp_repr);
+            let _reply = if accepted {
                 inner.socket.process(cx, &segment.ip_repr, &tcp_repr)
             } else {
                 None
             };
             let after = observe_socket(&inner.socket);
+            let recv_after = inner.socket.recv_queue();
             let protocol_state = &mut inner.protocol_state;
             let mut publish = SmoltcpTcpProcessPublish::default();
+            // Count bytes actually admitted to the receive ring, not merely
+            // bytes carried by the segment. Retransmitted/duplicate segments
+            // carry payload but do not move the stream forward.
+            publish.received_bytes = recv_after.saturating_sub(recv_before);
             // Edge-detect "just became connected" from the smoltcp state
             // itself: TCP never re-enters the active set without a reset,
             // so this fires exactly once per connection.
@@ -403,7 +428,12 @@ impl RawTcpSocket {
             if before.can_send != after.can_send && after.can_send {
                 publish.send_writable = true;
             }
-            if matches!(segment.tcp.control, TcpControl::Fin) && !protocol_state.is_recv_shut {
+            // Publish EOF only when smoltcp's state machine has accepted an
+            // in-order FIN. Looking at the raw packet flag is incorrect:
+            // smoltcp intentionally defers a FIN that arrives beyond a hole
+            // in the receive sequence space.
+            if !before.recv_fin_received && after.recv_fin_received && !protocol_state.is_recv_shut
+            {
                 protocol_state.is_recv_shut = true;
                 publish.recv_readable = true;
                 publish.recv_closed = true;
@@ -564,6 +594,34 @@ impl SmoltcpTcpSegment {
         Some(Self::from_reprs(IpRepr::Ipv6(ipv6_repr), tcp_repr))
     }
 
+    /// Read only the TCP four-tuple from a queued packet.
+    ///
+    /// Unlike `parse_ipv4_packet`, this does not copy the TCP payload.  It is
+    /// therefore safe to use while the short loopback-queue selection lock is
+    /// held.
+    pub fn packet_endpoints(packet: &LoopbackIpPacket) -> Option<(IpEndpoint, IpEndpoint)> {
+        if let Ok(ipv4) = Ipv4Packet::new_checked(packet.as_bytes()) {
+            if ipv4.next_header() != IpProtocol::Tcp {
+                return None;
+            }
+            let tcp = TcpPacket::new_checked(ipv4.payload()).ok()?;
+            return Some((
+                IpEndpoint::new(from_smoltcp_ipv4(ipv4.src_addr()), tcp.src_port()),
+                IpEndpoint::new(from_smoltcp_ipv4(ipv4.dst_addr()), tcp.dst_port()),
+            ));
+        }
+
+        let ipv6 = Ipv6Packet::new_checked(packet.as_bytes()).ok()?;
+        if ipv6.next_header() != IpProtocol::Tcp {
+            return None;
+        }
+        let tcp = TcpPacket::new_checked(ipv6.payload()).ok()?;
+        Some((
+            IpEndpoint::new_v6(from_smoltcp_ipv6(ipv6.src_addr()), tcp.src_port()),
+            IpEndpoint::new_v6(from_smoltcp_ipv6(ipv6.dst_addr()), tcp.dst_port()),
+        ))
+    }
+
     pub fn src_endpoint(&self) -> Option<IpEndpoint> {
         match self.ip_repr.src_addr() {
             IpAddress::Ipv4(addr) => {
@@ -634,6 +692,7 @@ struct SocketProtocolObservation {
     can_send: bool,
     may_send: bool,
     is_active: bool,
+    recv_fin_received: bool,
 }
 
 fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
@@ -641,6 +700,7 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
         state: socket.state(),
         can_send: socket.can_send(),
         may_send: socket.may_send(),
+        recv_fin_received: socket.recv_fin_received(),
         is_active: matches!(
             socket.state(),
             tcp::State::Established

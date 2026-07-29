@@ -47,6 +47,24 @@ fn onsite_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
         .any(|token| token == "tx.profile=onsite")
 }
 
+fn buildstorm_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
+    let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
+        return false;
+    };
+    cmdline
+        .split_ascii_whitespace()
+        .any(|token| token == "tx.profile=buildstorm")
+}
+
+fn cagent_diag_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
+    let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
+        return false;
+    };
+    cmdline
+        .split_ascii_whitespace()
+        .any(|token| token == "tx.profile=cagentdiag")
+}
+
 /// Select the finals autorun only for a block-backed root and only when the
 /// caller did not explicitly choose another init lane.  The official judge
 /// supplies neither a cmdline nor an initrd, so it lands here naturally.
@@ -583,12 +601,33 @@ impl<P: TxPlatform> CoreInit<P> {
         // architecture-neutral (the image supplies the RV64/LA64 Bash and
         // dynamic loader) and avoids requiring an `/init` file on the disk.
         if final_testcode_autorun_enabled::<P>() {
-            let envp: &[&[u8]] = &[
+            let default_envp: &[&[u8]] = &[
                 b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 b"HOME=/root",
                 b"TMPDIR=/tmp",
                 b"TERM=linux",
             ];
+            let buildstorm_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+                b"TX_FINAL_MODE=buildstorm-only",
+            ];
+            let cagent_diag_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+                b"TX_FINAL_MODE=cagent-diag",
+            ];
+            let envp = if cagent_diag_profile_enabled::<P>() {
+                cagent_diag_envp
+            } else if buildstorm_profile_enabled::<P>() {
+                buildstorm_envp
+            } else {
+                default_envp
+            };
             let argv: &[&[u8]] = &[b"bash", b"-c", FINAL_TESTCODE];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,

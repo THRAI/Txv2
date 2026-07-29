@@ -56,5 +56,6 @@ fn committed_lookup_is_guard_observed_without_cloning_value() {
 
     assert_eq!(observed.key(), &8);
     assert_eq!(observed.value().number, 12);
+    drop(observed);
     assert!(index.lookup(&9, &guard).is_none());
 }

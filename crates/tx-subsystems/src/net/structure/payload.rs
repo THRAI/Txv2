@@ -124,6 +124,10 @@ pub struct SocketPayload {
     pub(crate) tcp_backlog: SpinMutex<TcpBacklog>,
     pub shutdown_rd: AtomicBool,
     pub shutdown_wr: AtomicBool,
+    /// The final open-file reference has been closed and TCP teardown is now
+    /// owned by the network delegate.  The payload remains installed until
+    /// queued data and the FIN exchange have completed.
+    tcp_close_requested: AtomicBool,
 }
 
 impl SocketPayload {
@@ -207,6 +211,7 @@ impl SocketPayload {
             tcp_backlog: SpinMutex::new(TcpBacklog::new()),
             shutdown_rd: AtomicBool::new(false),
             shutdown_wr: AtomicBool::new(false),
+            tcp_close_requested: AtomicBool::new(false),
         };
         payload
     }
@@ -233,6 +238,16 @@ impl SocketPayload {
 
     pub fn shutdown_wr(&self) -> bool {
         self.shutdown_wr.load(Ordering::Acquire)
+    }
+
+    /// Mark a connected TCP socket for delegate-owned graceful teardown.
+    /// Returns true exactly once, for the caller that must start `close()`.
+    pub(crate) fn request_tcp_close(&self) -> bool {
+        !self.tcp_close_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn tcp_close_requested(&self) -> bool {
+        self.tcp_close_requested.load(Ordering::Acquire)
     }
 
     pub fn protocol_snapshot(&self) -> SocketProtocol {

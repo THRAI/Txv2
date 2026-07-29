@@ -181,8 +181,6 @@ pub(super) use helpers::*;
 mod wait;
 pub(super) use wait::*;
 
-pub use time::maybe_deliver_itimer_signal;
-
 #[cfg(test)]
 mod tests;
 
@@ -441,36 +439,24 @@ pub(super) const SIGSETSIZE_BYTES: u64 = 8;
 /// Minimum alternate signal stack size (Linux: MINSIGSTKSZ = 2048).
 pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
-/// on RV64 generic ABI.
+/// on the RV64/LA64 generic ABI.
 ///
-/// Layout decision: Linux's `arch/riscv/include/uapi/asm/signal.h`
-/// pulls in `asm-generic/signal.h`, which defines the kernel
-/// (uapi) `struct sigaction` as four 64-bit fields:
+/// Both architectures include `asm-generic/signal.h` without defining
+/// `SA_RESTORER`, so the kernel ABI contains exactly three 64-bit words:
 ///
 /// ```text
 /// struct sigaction {
 ///     __sighandler_t  sa_handler;   // 8B
 ///     unsigned long   sa_flags;     // 8B
-///     __sigrestore_t  sa_restorer;  // 8B  (present under SA_RESTORER)
 ///     sigset_t        sa_mask;      // 8B  (single u64 bitset, sigsetsize=8)
 /// };
 /// ```
 ///
-/// So the rt_sigaction syscall takes a 32-byte buffer. The plan's
-/// "16 bytes" hint applied to the legacy `__OLD_SIGACTION` shape used
-/// by the (deprecated) `sigaction()` syscall — the modern
-/// `rt_sigaction` syscall uses the 32-byte form. We pin the modern
-/// shape because (a) Linux RV64 has no `sigaction()` syscall at all
-/// (it only ships `rt_sigaction`, NR_134) and (b) `__sa_restorer` is
-/// part of the ABI even when SA_RESTORER is unset (kernel reads all
-/// four words and ignores the restorer bits unless the flag is set).
-///
-/// Citation: linux/include/uapi/asm-generic/signal.h
-/// `struct sigaction { __sighandler_t sa_handler; unsigned long
-///  sa_flags; __ARCH_HAS_SA_RESTORER ? __sigrestore_t sa_restorer;
-///  sigset_t sa_mask; };` — RV64 enables `__ARCH_HAS_SA_RESTORER`
-/// transitively (the field is always emitted at the ABI level).
-pub(super) const SIGACTION_BYTES: usize = 32;
+/// In particular this is **not** libc's public 152-byte `struct sigaction`.
+/// Glibc translates that public object to this 24-byte kernel image before
+/// issuing syscall 134. Writing a fourth word here corrupts the wrapper's
+/// stack and makes concurrent signal delivery fail nondeterministically.
+pub(super) const SIGACTION_BYTES: usize = 24;
 
 /// Per-syscall context resolved by the trap-shell wrapper: the calling
 /// process / thread, the bound address space, and the bookkeeping the
@@ -935,7 +921,6 @@ async fn dispatch_inner<
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
         nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
-        nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
         nr if nr == NR_SETRLIMIT => return sys_setrlimit(req.args, ctx),
@@ -989,6 +974,7 @@ async fn dispatch_inner<
 
     // ── Lanes 2+3: Script-based (OneShotStepOp + Full async drive) ──
     match req.nr {
+        nr if nr == NR_GETRANDOM => sys_getrandom(req.args, ctx).await,
         nr if nr == NR_WRITE => sys_write(req.args, ctx).await,
         nr if nr == NR_WRITEV => sys_writev(req.args, ctx).await,
         nr if nr == NR_READ => sys_read::<P>(req.args, ctx).await,
@@ -1057,7 +1043,7 @@ async fn dispatch_inner<
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_UNSHARE => sys_unshare(req.args, ctx),
         nr if nr == NR_SETNS => sys_setns(req.args, ctx),
-        nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
+        nr if nr == NR_WAIT4 => sys_wait4::<P>(req.args, ctx).await,
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),

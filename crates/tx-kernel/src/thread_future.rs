@@ -459,10 +459,6 @@ pub async fn run_thread<P: TxPlatform>(
                             encoded as usize;
                     }
 
-                    // Save pre-handler context for sigreturn (now
-                    // carrying the applied syscall return in a0).
-                    payload.store_saved_signal_context(Some(orig_ctx));
-
                     let handler = match action.disposition {
                         tx_subsystems::signal::SigDisposition::Handler(addr) => addr,
                         _ => continue,
@@ -474,7 +470,6 @@ pub async fn run_thread<P: TxPlatform>(
                     let return_mask = payload
                         .take_sigsuspend_restore_mask()
                         .unwrap_or(handler_base_mask);
-                    payload.store_saved_signal_mask(Some(return_mask));
                     let mut new_mask = handler_base_mask.union(action.sa_mask);
                     if !action
                         .flags
@@ -488,18 +483,29 @@ pub async fn run_thread<P: TxPlatform>(
                         .unwrap_or(tx_hal::UserSigInfoAbi::ZERO);
 
                     // Build the signal frame write descriptor.
+                    let current_sp = user_sp_from_context::<P>(&orig_ctx);
                     let stack_top = if action
                         .flags
                         .contains(tx_subsystems::signal::SaFlags::ONSTACK)
                     {
                         payload
                             .alt_stack()
-                            .map(|(base, size)| tx_hal::UserPtr::<u8>::new(base + size))
-                            .unwrap_or_else(|| {
-                                tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx))
+                            .and_then(|(base, size)| {
+                                let end = base.checked_add(size)?;
+                                // Linux does not restart at the alternate
+                                // stack's top when a second handler nests
+                                // while already on that stack. Doing so would
+                                // overwrite the outer signal frame. Keep
+                                // growing down from the interrupted SP instead.
+                                Some(if (base..end).contains(&current_sp) {
+                                    tx_hal::UserPtr::<u8>::new(current_sp)
+                                } else {
+                                    tx_hal::UserPtr::<u8>::new(end)
+                                })
                             })
+                            .unwrap_or_else(|| tx_hal::UserPtr::<u8>::new(current_sp))
                     } else {
-                        tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&orig_ctx))
+                        tx_hal::UserPtr::<u8>::new(current_sp)
                     };
                     let setup = tx_hal::SignalFrameWrite {
                         stack_top,
@@ -676,9 +682,6 @@ pub async fn run_thread<P: TxPlatform>(
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
-                ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal::<P>(
-                    ctx, &process, &thread, &aspace,
-                );
                 if let Some(sysno) = last_entry_sysno {
                     emit_syscall_roundtrip_marker(sysno, b"debug.thread.enter.before");
                 }
@@ -878,6 +881,10 @@ pub async fn run_thread<P: TxPlatform>(
                     }
                 };
                 payload.set_proc_sleeping(false);
+
+                if matches!(result, tx_shims::linux_syscall::SyscallResult::Error(5)) {
+                    log_syscall_eio::<P>(&req, &process, &thread, &payload);
+                }
 
                 dump_observe_threshold_if_ready::<P>();
 
@@ -1199,6 +1206,68 @@ fn dump_observe_threshold_if_ready<P: TxPlatform>() {
         tx_observe::dump_console_hex::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
         tx_hal::console_write_str::<P>(":observe:dump:threshold\n");
         <P as tx_hal::PowerIf>::system_off();
+    }
+}
+
+/// Print one complete record when a userspace syscall returns `EIO`.
+///
+/// This sits after every dispatch lane (direct, one-shot, hot, and generic), so
+/// it identifies the actual failing syscall even when libc reports only that a
+/// child process was "never executed". Normal syscall traffic is silent.
+fn log_syscall_eio<P: TxPlatform>(
+    req: &SyscallRequest,
+    process: &Cap<tx_subsystems::process::ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    payload: &PayloadCap<ThreadPayload>,
+) {
+    let comm = process.comm();
+    let comm_len = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    let comm = core::str::from_utf8(&comm[..comm_len]).unwrap_or("<non-utf8>");
+    let saved = payload.saved_user_context();
+    let pc = saved.as_ref().map(|ctx| ctx.pc).unwrap_or(0);
+    let sp = saved.as_ref().map(user_sp_from_context::<P>).unwrap_or(0);
+    let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+
+    if let Some(aspace) = process.aspace_cap() {
+        let pmap = aspace.pmap().stats();
+        let range = aspace.range_lock().diagnostic_snapshot();
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:syscall-eio:pid={}:tid={}:comm={comm}:hart={hart}:nr={}:a0={:#x}:a1={:#x}:a2={:#x}:a3={:#x}:a4={:#x}:a5={:#x}:pc={pc:#x}:sp={sp:#x}:aspace={}:pmap_mapped={}:pmap_reservations={}:pmap_commits={}:pmap_rollbacks={}:pmap_shootdowns={}:range_active={}:range_pending={}:range_source={:#x}\n",
+            process.pid.0,
+            thread.tid.0,
+            req.nr,
+            req.args[0],
+            req.args[1],
+            req.args[2],
+            req.args[3],
+            req.args[4],
+            req.args[5],
+            aspace.futex_identity(),
+            pmap.mapped_pages,
+            pmap.reservations,
+            pmap.commits,
+            pmap.rollbacks,
+            pmap.shootdowns,
+            range.active,
+            range.pending_writers,
+            range.wait_source_id,
+        ));
+    } else {
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:syscall-eio:pid={}:tid={}:comm={comm}:hart={hart}:nr={}:a0={:#x}:a1={:#x}:a2={:#x}:a3={:#x}:a4={:#x}:a5={:#x}:pc={pc:#x}:sp={sp:#x}:aspace=none\n",
+            process.pid.0,
+            thread.tid.0,
+            req.nr,
+            req.args[0],
+            req.args[1],
+            req.args[2],
+            req.args[3],
+            req.args[4],
+            req.args[5],
+        ));
     }
 }
 

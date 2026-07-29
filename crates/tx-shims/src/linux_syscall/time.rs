@@ -4,15 +4,9 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use alloc::collections::{BTreeMap, BTreeSet};
-use core::mem::{offset_of, size_of};
-
 use crate::adapter::step_engine::{Cap, SpinMutex};
+use alloc::collections::{BTreeMap, BTreeSet};
 use tx_subsystems::process::ProcessIdentity;
-
-use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext};
-use tx_subsystems::signal::step_kill_process;
-use tx_subsystems::thread_runtime::ThreadIdentity;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -39,35 +33,6 @@ pub(super) struct ItimervalLayout {
 // inside the following blocking syscall. Keep one interrupt token so that wait
 // paths still observe the signal as `-EINTR`.
 static ITIMER_REAL_DELIVERED_INTERRUPTS: SpinMutex<BTreeSet<u32>> = SpinMutex::new(BTreeSet::new());
-
-const SIGALRM_RAW: u8 = 14;
-const RV64_SIGFRAME_ALIGN: usize = 16;
-const RV64_SIGFRAME_MAGIC: u64 = 0x5458_5632_5349_4731; // "TXV2SIG1"
-const RV64_SIGFRAME_VERSION: u32 = 1;
-const RV64_RT_SIGRETURN_SYSCALL: u32 = 139;
-const RV64_ECALL: u32 = 0x0000_0073;
-
-const fn rv64_addi(rd: u32, rs1: u32, imm: u32) -> u32 {
-    ((imm & 0x0fff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
-}
-
-const RV64_SIGRETURN_TRAMPOLINE: [u32; 2] =
-    [rv64_addi(17, 0, RV64_RT_SIGRETURN_SYSCALL), RV64_ECALL];
-
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub(super) struct CompatSignalFrame {
-    pub(super) magic: u64,
-    pub(super) version: u32,
-    pub(super) frame_size: u32,
-    pub(super) sig_no: u32,
-    pub(super) _reserved0: u32,
-    pub(super) flags: u64,
-    pub(super) siginfo: UserSigInfoAbi,
-    pub(super) saved_mask: UserSignalMaskAbi,
-    pub(super) user_context: UserTrapContext,
-    pub(super) trampoline: [u32; 2],
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -459,19 +424,6 @@ fn parse_itimerval(value: ItimervalLayout) -> Option<(u64, u64)> {
     Some((interval_ns, value_ns))
 }
 
-fn signal_unblocked_on_any_thread(
-    process: &Cap<ProcessIdentity>,
-    signal: tx_subsystems::signal::Signum,
-) -> bool {
-    let Some(threads) = process.threads_snapshot() else {
-        return false;
-    };
-    threads.iter().any(|thread| match thread.payload_cap() {
-        Some(payload) => !payload.signal_mask().is_blocked(signal),
-        None => false,
-    })
-}
-
 pub(super) fn sys_getitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let which = args[0] as u32;
     let curr_value_ptr = args[1];
@@ -558,9 +510,11 @@ pub fn poll_due_itimers<P: TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64
 
             if timer.deadline_ns <= now_ns {
                 if let Some(signal) = signal_for_itimer(*which) {
-                    if signal_unblocked_on_any_thread(process, signal)
-                        && deliver_len < to_deliver.len()
-                    {
+                    // A blocked signal is still generated and remains pending;
+                    // the mask controls delivery, not timer expiry.  Dropping
+                    // it here made timeout(1)'s watchdog disappear when expiry
+                    // raced with a temporary sigsuspend mask.
+                    if deliver_len < to_deliver.len() {
                         to_deliver[deliver_len] = Some(signal);
                         deliver_len += 1;
                     }
@@ -669,139 +623,6 @@ pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
 
 pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
     ITIMER_REAL_DELIVERED_INTERRUPTS.lock().remove(&pid)
-}
-
-fn take_due_itimer_real<P: TimeIf>(pid: u32) -> bool {
-    with_interval_timers(|timers| {
-        let key = (pid, ITIMER_REAL);
-        let Some(timer) = timers.get_mut(&key) else {
-            return false;
-        };
-        let now_ns = P::read_ns();
-        if timer.deadline_ns == 0 || timer.deadline_ns > now_ns {
-            return false;
-        }
-        if timer.interval_ns == 0 {
-            timers.remove(&key);
-        } else {
-            timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
-        }
-        true
-    })
-}
-
-pub fn maybe_deliver_itimer_signal<P: TimeIf + tx_hal::PlatformConfig>(
-    mut ctx: UserTrapContext,
-    process: &Cap<ProcessIdentity>,
-    thread: &Cap<ThreadIdentity>,
-    aspace: &AddressSpace,
-) -> UserTrapContext {
-    // This compatibility path predates the generic SignalFrameIf delivery
-    // path and emits an RV64-specific frame/trampoline using x2 as sp.
-    // LoongArch uses r2 as TLS and r3 as sp, so running this path there
-    // corrupts TLS and jumps into data on handler return.
-    if !matches!(P::ARCH, tx_hal::Arch::Riscv64) {
-        return ctx;
-    }
-
-    let Some(thread_payload) = thread.payload_cap() else {
-        return ctx;
-    };
-    if thread_payload.has_saved_signal_context() {
-        return ctx;
-    }
-    if !take_due_itimer_real::<P>(process.pid.0) {
-        return ctx;
-    }
-    ITIMER_REAL_DELIVERED_INTERRUPTS
-        .lock()
-        .insert(process.pid.0);
-
-    let Some(sig) = Signum::new(SIGALRM_RAW) else {
-        return ctx;
-    };
-    let Some(SigDisposition::Handler(handler)) = process.sig_disposition(sig) else {
-        let _ = step_kill_process(process, sig, None);
-        return ctx;
-    };
-
-    let Some(frame_addr) = ctx.regs[2]
-        .checked_sub(size_of::<CompatSignalFrame>())
-        .map(|addr| align_down(addr, RV64_SIGFRAME_ALIGN))
-    else {
-        return ctx;
-    };
-
-    let siginfo_addr = frame_addr + offset_of!(CompatSignalFrame, siginfo);
-    let ucontext_addr = frame_addr + offset_of!(CompatSignalFrame, user_context);
-    let trampoline_pc = frame_addr + offset_of!(CompatSignalFrame, trampoline);
-    let return_pc = sigaction_restorer(process, sig).unwrap_or(trampoline_pc);
-    let frame = CompatSignalFrame {
-        magic: RV64_SIGFRAME_MAGIC,
-        version: RV64_SIGFRAME_VERSION,
-        frame_size: size_of::<CompatSignalFrame>() as u32,
-        sig_no: u32::from(SIGALRM_RAW),
-        _reserved0: 0,
-        flags: UserSaFlagsAbi::EMPTY.bits,
-        siginfo: UserSigInfoAbi::ZERO,
-        saved_mask: UserSignalMaskAbi {
-            bits: thread_payload.signal_mask().raw_bits(),
-        },
-        user_context: ctx,
-        trampoline: RV64_SIGRETURN_TRAMPOLINE,
-    };
-
-    if bootstrap_write_user::<CompatSignalFrame>(aspace, frame_addr as u64, frame).is_err() {
-        return ctx;
-    }
-    if return_pc == trampoline_pc {
-        let Ok(trampoline_range) = UserRange::containing_page(UserVirtAddr::new(trampoline_pc))
-        else {
-            return ctx;
-        };
-        if aspace
-            .pmap()
-            .protect_range(trampoline_range, Prot::new(true, true, true))
-            .is_err()
-        {
-            return ctx;
-        }
-    }
-
-    ctx.pc = handler;
-    ctx.regs[1] = return_pc;
-    ctx.regs[2] = frame_addr;
-    ctx.regs[10] = usize::from(SIGALRM_RAW);
-    ctx.regs[11] = siginfo_addr;
-    ctx.regs[12] = ucontext_addr;
-    thread_payload.store_saved_signal_context(Some(frame.user_context));
-    ctx
-}
-
-fn sigaction_restorer(process: &Cap<ProcessIdentity>, sig: Signum) -> Option<usize> {
-    let restorer = process.sig_action_entry(sig)?.restorer;
-    (restorer != 0).then_some(restorer)
-}
-
-pub(super) fn read_compat_signal_frame(
-    aspace: &AddressSpace,
-    frame_addr: u64,
-) -> Result<CompatSignalFrame, i32> {
-    let frame =
-        bootstrap_read_user::<CompatSignalFrame>(aspace, frame_addr).map_err(errno_to_i32)?;
-    if frame.magic != RV64_SIGFRAME_MAGIC
-        || frame.version != RV64_SIGFRAME_VERSION
-        || frame.frame_size as usize != size_of::<CompatSignalFrame>()
-        || frame.trampoline != RV64_SIGRETURN_TRAMPOLINE
-    {
-        return Err(EINVAL_VALUE);
-    }
-    Ok(frame)
-}
-
-const fn align_down(value: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
-    value & !(align - 1)
 }
 
 #[cfg(test)]

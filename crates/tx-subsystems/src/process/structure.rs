@@ -2192,6 +2192,13 @@ pub(crate) fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
 }
 
 fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) {
+    if let Some(socket) = file.socket_identity() {
+        if increment {
+            socket.incr_fd_ref();
+        } else {
+            socket.decr_fd_ref();
+        }
+    }
     if let Some((payload, side)) = file.pipe_endpoint() {
         match (side, increment) {
             (crate::pipe::PipeSide::Reader, true) => payload.incr_reader(),

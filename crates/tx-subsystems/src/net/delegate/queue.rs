@@ -47,3 +47,12 @@ pub fn net_delegate_kick_tick() -> usize {
 pub fn net_delegate_clear(bits: DelegateWireSet) {
     net_delegate_queue().clear(bits.bits());
 }
+
+/// Atomically claim pending delegate work.
+///
+/// Keeping this separate from `net_delegate_clear` preserves the latter's
+/// reset/test semantics while preventing the runtime's old peek-then-clear
+/// lost-wakeup window.
+pub(crate) fn net_delegate_take(bits: DelegateWireSet) -> u64 {
+    net_delegate_queue().take(bits.bits())
+}

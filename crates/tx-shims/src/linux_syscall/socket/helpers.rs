@@ -185,27 +185,6 @@ pub(super) fn maybe_autobind_udp_sendto(
     Err(Errno::EADDRINUSE)
 }
 
-pub(super) fn drive_tcp_loopback_after_connect(
-    socket: &Cap<SocketIdentity>,
-) -> Result<bool, Errno> {
-    let Some(payload) = socket.acquire_operational() else {
-        return Ok(false);
-    };
-    if !matches!(
-        payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connecting { .. })
-    ) {
-        return Ok(false);
-    }
-    let guard = tx_substrate::epoch::guard();
-    match step_tcp_loopback_handshake(socket, &guard) {
-        StepOutcome::Done(_) => Ok(true),
-        StepOutcome::Err(Errno::EOPNOTSUPP) => Ok(false),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(false),
-    }
-}
-
 pub(super) fn bind_with_ephemeral_port(
     socket: &Cap<SocketIdentity>,
     addr: KernelSockAddr,
@@ -296,26 +275,6 @@ fn occupies_tcp_port(socket: &Cap<SocketIdentity>, family: AddressFamily, port: 
         .is_some_and(|payload| !payload.with_options(|options| options.ip.ipv6_v6only))
 }
 
-pub(super) fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) {
-    if written == 0 {
-        return;
-    }
-    let Some(payload) = socket.acquire_operational() else {
-        return;
-    };
-    if !matches!(
-        payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected { .. })
-    ) {
-        return;
-    }
-    let guard = tx_substrate::epoch::guard();
-    let _ = step_tcp_loopback_transfer(socket, written, &guard);
-    socket
-        .readiness
-        .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
-}
-
 pub(super) fn drive_udp_loopback_after_sendto(
     socket: &Cap<SocketIdentity>,
     written: usize,
@@ -351,7 +310,6 @@ pub(super) fn drive_udp_loopback_after_sendto(
 }
 
 pub(super) fn drive_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) -> bool {
-    drive_tcp_loopback_after_sendto(socket, written);
     drive_udp_loopback_after_sendto(socket, written)
 }
 
@@ -374,12 +332,36 @@ pub(super) async fn finish_sendto_progress(
 }
 
 pub(crate) fn drive_loopback_pending() {
-    let guard = tx_substrate::epoch::guard();
-    let _ = tx_subsystems::net::execution::step_process_loopback_pending_zero(
-        tx_subsystems::net::protocol::loopback_iface(),
-        tx_subsystems::net::execution::LOOPBACK_POLL_BUDGET_DEFAULT,
-        &guard,
-    );
+    // recv/poll paths may ask the protocol owner to make progress, but must
+    // never become a second protocol owner themselves.  In particular this
+    // used to scan and mutate every loopback connection on the calling CPU
+    // while the network delegate was doing the same work on another CPU.
+    tx_subsystems::net::delegate::net_delegate_kick_poll();
+}
+
+pub(super) fn sendto_can_drive_loopback_inline(
+    socket: &Cap<SocketIdentity>,
+    dst: Option<IpEndpoint>,
+) -> bool {
+    if socket.kind != SocketKind::Udp {
+        return false;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    match payload.protocol_snapshot() {
+        SocketProtocol::Udp(UdpInner::Bound { local }) => {
+            dst.is_some_and(|dst| local_allows_loopback_inline(local) && dst.is_loopback())
+        }
+        SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
+            local_allows_loopback_inline(local) && remote.is_loopback()
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn local_allows_loopback_inline(local: IpEndpoint) -> bool {
+    local.is_unspecified() || local.is_loopback()
 }
 
 pub(super) fn recv_ready_mask(mask: PollMask) -> bool {
@@ -414,31 +396,6 @@ pub(super) fn socket_recv_should_yield_after_success(
     bytes: usize,
 ) -> bool {
     bytes > 0 && matches!(socket.kind, SocketKind::Tcp | SocketKind::Sctp)
-}
-
-pub(super) fn sendto_can_drive_loopback_inline(
-    socket: &Cap<SocketIdentity>,
-    dst: Option<IpEndpoint>,
-) -> bool {
-    if socket.kind != SocketKind::Udp {
-        return false;
-    }
-    let Some(payload) = socket.acquire_operational() else {
-        return false;
-    };
-    match payload.protocol_snapshot() {
-        SocketProtocol::Udp(UdpInner::Bound { local }) => {
-            dst.is_some_and(|dst| local_allows_loopback_inline(local) && dst.is_loopback())
-        }
-        SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
-            local_allows_loopback_inline(local) && remote.is_loopback()
-        }
-        _ => false,
-    }
-}
-
-pub(super) fn local_allows_loopback_inline(local: IpEndpoint) -> bool {
-    local.is_unspecified() || local.is_loopback()
 }
 
 pub(super) fn tcp_effective_maxseg(socket: &Cap<SocketIdentity>) -> i32 {
@@ -830,6 +787,34 @@ pub(super) fn validate_user_range<'a>(
             StepOutcome::Err(e) => Err(Errno::from(e)),
             StepOutcome::Yield { .. } => Err(Errno::EIO),
         }
+    }
+}
+
+/// Wait-capable counterpart of [`validate_user_range`].
+///
+/// Runtime async syscalls must not expose a concurrent VM materializer as
+/// `EIO`.  In particular, Rust's process launcher places the descriptor pair
+/// returned by `socketpair(2)` on its stack; another hart may briefly own that
+/// page's RangeLock while the launcher is creating a child.  Await the
+/// reservation and retry instead of treating that normal SMP conflict as an
+/// I/O failure.
+pub(super) async fn validate_user_range_wait<'a>(
+    ctx: &SyscallCtx<'a>,
+    uaddr: u64,
+    len: usize,
+    access: UserAccessKind,
+) -> Result<(), Errno> {
+    #[cfg(not(target_os = "none"))]
+    {
+        validate_user_range(ctx, uaddr, len, access)
+    }
+
+    #[cfg(target_os = "none")]
+    {
+        let range = covering_user_range(uaddr, len).ok_or(Errno::EFAULT)?;
+        ctx.aspace
+            .reserve_user_range_for_access_wait(range, access)
+            .await
     }
 }
 
@@ -1843,7 +1828,36 @@ pub(super) fn socket_ready_wait_from_token(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SocketWaitWake {
     SocketReady,
-    ItimerExpired,
+    Interrupted,
+}
+
+fn socket_wait_interrupted(ctx: &SyscallCtx<'_>) -> bool {
+    tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process)
+}
+
+/// Wait for socket readiness under Linux's interruptible-sleep contract.
+///
+/// Socket readiness and POSIX signals have different publication sources, but
+/// they wake the same reactor task.  Re-check the authoritative interrupt
+/// predicate on every poll so a signal posted after wait registration aborts
+/// the slow syscall instead of leaving it parked on a socket-only mailbox.
+pub(super) async fn wait_on_socket_interruptible(
+    mut socket_future: SocketReadyWait,
+    ctx: &SyscallCtx<'_>,
+) -> SocketWaitWake {
+    if socket_wait_interrupted(ctx) {
+        return SocketWaitWake::Interrupted;
+    }
+    core::future::poll_fn(|cx| {
+        if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
+            return core::task::Poll::Ready(SocketWaitWake::SocketReady);
+        }
+        if socket_wait_interrupted(ctx) {
+            return core::task::Poll::Ready(SocketWaitWake::Interrupted);
+        }
+        core::task::Poll::Pending
+    })
+    .await
 }
 
 pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
@@ -1857,36 +1871,40 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
     // consumed at a syscall boundary leaves busybox ping's blocking recvfrom
     // with no armed deadline AND a pending SIGALRM: it parked until unrelated
     // traffic woke the socket (observed as a 361s stall in if-updown).
-    if tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process) {
-        return SocketWaitWake::ItimerExpired;
+    if socket_wait_interrupted(ctx) {
+        return SocketWaitWake::Interrupted;
     }
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
-        return SocketWaitWake::ItimerExpired;
+        return SocketWaitWake::Interrupted;
     }
     let Some(deadline_ns) = super::time::itimer_real_deadline_ns(pid) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
+        return wait_on_socket_interruptible(socket_future, ctx).await;
     };
     if <P as TimeIf>::read_ns() >= deadline_ns {
         super::time::fire_itimer_real::<P>(pid);
-        return SocketWaitWake::ItimerExpired;
+        return SocketWaitWake::Interrupted;
     }
     let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
+        return wait_on_socket_interruptible(socket_future, ctx).await;
     };
 
     let wake = core::future::poll_fn(|cx| {
         if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
             return core::task::Poll::Ready(SocketWaitWake::SocketReady);
         }
+        if socket_wait_interrupted(ctx) {
+            return core::task::Poll::Ready(SocketWaitWake::Interrupted);
+        }
         if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
-            return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
+            return core::task::Poll::Ready(SocketWaitWake::Interrupted);
         }
         core::task::Poll::Pending
     })
     .await;
-    if wake == SocketWaitWake::ItimerExpired {
+    if wake == SocketWaitWake::Interrupted
+        && !socket_wait_interrupted(ctx)
+        && <P as TimeIf>::read_ns() >= deadline_ns
+    {
         super::time::fire_itimer_real::<P>(pid);
     }
     wake

@@ -10,9 +10,12 @@
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
 use crate::vm::adapter::step_engine::{NoProgress, StepOutcome as V3StepOutcome};
-use crate::vm::adapter::wait_routing::{Channel, WaitSource};
+use crate::vm::adapter::wait_routing::{Channel, Mask, WaitSource};
 use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 use alloc::sync::Arc;
+use core::future::{poll_fn, Future};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::execution::WaitToken;
 
@@ -41,6 +44,7 @@ pub enum AcquirePairResult<'a> {
 pub struct WouldBlock<'a> {
     lock: &'a RangeLock,
     pending_writer: Option<PendingWriter<'a>>,
+    observed_release: u64,
 }
 
 impl<'a> WouldBlock<'a> {
@@ -57,7 +61,11 @@ impl<'a> WouldBlock<'a> {
     /// `wait_source::wait_on_token` to await the next release before
     /// retrying their try-acquire.
     pub fn wait_token(&self) -> WaitToken {
-        WaitToken::new(self.lock.wait_source_id, RANGE_LOCK_RELEASE_MASK)
+        WaitToken::with_observed_generation(
+            self.lock.wait_source_id,
+            RANGE_LOCK_RELEASE_MASK,
+            self.observed_release,
+        )
     }
 }
 
@@ -116,6 +124,15 @@ pub struct RangeLock {
     wait_channel: Channel,
     wait_source: Arc<WaitSource>,
     wait_source_id: u64,
+    release_generation: AtomicU64,
+}
+
+/// Read-only state captured only on an already-failing VM/user-copy path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RangeLockDiagnosticSnapshot {
+    pub active: usize,
+    pub pending_writers: usize,
+    pub wait_source_id: u64,
 }
 
 impl RangeLock {
@@ -126,6 +143,7 @@ impl RangeLock {
             wait_channel: wait_point.channel,
             wait_source: wait_point.source,
             wait_source_id: wait_point.source_id,
+            release_generation: AtomicU64::new(0),
         }
     }
 
@@ -134,6 +152,39 @@ impl RangeLock {
     /// wrappers that hand-build their own `WaitToken` values.
     pub fn wait_source_id(&self) -> u64 {
         self.wait_source_id
+    }
+
+    pub fn diagnostic_snapshot(&self) -> RangeLockDiagnosticSnapshot {
+        let state = self.state.lock();
+        RangeLockDiagnosticSnapshot {
+            active: state.active.len(),
+            pending_writers: state.pending_writers.len(),
+            wait_source_id: self.wait_source_id,
+        }
+    }
+
+    /// Wait until a reservation release that happened after `observed`.
+    ///
+    /// The channel subscription is installed before the generation is
+    /// re-read. Consequently a release cannot fall into the usual
+    /// "checked blocked, not subscribed yet" lost-wakeup window:
+    ///
+    /// * a release before subscription changes the generation and the
+    ///   future completes immediately;
+    /// * a release after subscription fires the channel and wakes it.
+    pub async fn wait_for_release_since(&self, observed: u64) {
+        let mut wait = self
+            .wait_channel
+            .wait(Mask::from_bits(RANGE_LOCK_RELEASE_MASK));
+        poll_fn(|cx| {
+            let event = Pin::new(&mut wait).poll(cx);
+            if self.release_generation.load(Ordering::Acquire) != observed || event.is_ready() {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
     }
 
     /// Canonical step-shaped acquire per VM_v1_2 §3.1. `Done` = the
@@ -191,6 +242,7 @@ impl RangeLock {
                     AcquireResult::WouldBlock(WouldBlock {
                         lock: self,
                         pending_writer: None,
+                        observed_release: self.release_generation.load(Ordering::Acquire),
                     })
                 } else {
                     state.acquire_active(self, range, mode)
@@ -217,6 +269,7 @@ impl RangeLock {
             return AcquirePairResult::WouldBlock(WouldBlock {
                 lock: self,
                 pending_writer: None,
+                observed_release: self.release_generation.load(Ordering::Acquire),
             });
         }
 
@@ -240,11 +293,13 @@ impl RangeLock {
                 AcquirePairResult::WouldBlock(WouldBlock {
                     lock: self,
                     pending_writer: None,
+                    observed_release: self.release_generation.load(Ordering::Acquire),
                 })
             }
             _ => AcquirePairResult::WouldBlock(WouldBlock {
                 lock: self,
                 pending_writer: None,
+                observed_release: self.release_generation.load(Ordering::Acquire),
             }),
         }
     }
@@ -256,6 +311,7 @@ impl RangeLock {
             return AcquireResult::WouldBlock(WouldBlock {
                 lock: self,
                 pending_writer: Some(pending),
+                observed_release: self.release_generation.load(Ordering::Acquire),
             });
         }
         state.release_pending_writer(pending.id, range);
@@ -266,12 +322,14 @@ impl RangeLock {
 
     fn release_active(&self, id: u64, range: UserRange) {
         self.state.lock().release_active(id, range);
+        self.release_generation.fetch_add(1, Ordering::Release);
         crate::vm::notification::notify_range_lock_released(&self.wait_channel, &self.wait_source);
     }
 
     fn release_pending_writer(&self, id: u64, range: UserRange) {
         if id != 0 {
             self.state.lock().release_pending_writer(id, range);
+            self.release_generation.fetch_add(1, Ordering::Release);
             crate::vm::notification::notify_range_lock_released(
                 &self.wait_channel,
                 &self.wait_source,
@@ -370,6 +428,7 @@ impl RangeLockState {
             None => AcquireResult::WouldBlock(WouldBlock {
                 lock,
                 pending_writer: None,
+                observed_release: lock.release_generation.load(Ordering::Acquire),
             }),
         }
     }
@@ -397,11 +456,13 @@ impl RangeLockState {
             return AcquireResult::WouldBlock(WouldBlock {
                 lock,
                 pending_writer: None,
+                observed_release: lock.release_generation.load(Ordering::Acquire),
             });
         }
         AcquireResult::WouldBlock(WouldBlock {
             lock,
             pending_writer: Some(PendingWriter { lock, id, range }),
+            observed_release: lock.release_generation.load(Ordering::Acquire),
         })
     }
 
@@ -469,6 +530,13 @@ impl<const N: usize> ReservationIntervalTree<N> {
             root: None,
             nodes: [const { ReservationNode::empty() }; N],
         }
+    }
+
+    fn len(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.reservation.is_some())
+            .count()
     }
 
     fn insert(&mut self, reservation: Reservation) -> bool {

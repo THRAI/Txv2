@@ -677,19 +677,7 @@ pub fn thread_pending_signal_interrupts(
             // be delivered. Without SA_RESTART the syscall returns EINTR; with
             // SA_RESTART, Linux delivers the handler then RESTARTS the syscall.
             // We have no syscall-restart machinery, so for SA_RESTART handlers
-            // we normally do NOT interrupt (returning EINTR would be a spurious,
-            // un-restarted failure — it broke netperf on benign SIGCHLD, and
-            // breaks LTP wait4/poll which rely on SA_RESTART, e.g. the tst
-            // harness's parent waitpid taking SIGUSR1/SIGALRM cleanup signals).
-            //
-            // The one exception is SIGINT: cyclictest's `kill -2 $hackbench`
-            // relies on hackbench's SIGINT handler running to reap its 400
-            // workers, and glibc's signal() installs that handler with
-            // SA_RESTART. SIGINT handlers are interactive-teardown handlers that
-            // siglongjmp/exit, so restart-vs-EINTR is moot, and no default-suite
-            // test relies on SIGINT restarting a syscall. Scope the override to
-            // SIGINT so other SA_RESTART signals keep correct (non-EINTR)
-            // behavior.
+            // we normally do NOT interrupt.
             !entry.flags.contains(SaFlags::RESTART) || sig == Signum::SIGINT
         }
     }
@@ -724,8 +712,7 @@ pub fn thread_pending_signal_ends_sigsuspend(
         pending &= !sig.bit();
         match payload.sig_actions().get(sig) {
             SigDisposition::Ignore => {}
-            SigDisposition::Default
-                if matches!(default_action(sig), DefaultAction::Ignore) => {}
+            SigDisposition::Default if matches!(default_action(sig), DefaultAction::Ignore) => {}
             SigDisposition::Default | SigDisposition::Handler(_) => return true,
         }
     }
@@ -1097,7 +1084,7 @@ pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
 /// task parked for those. Consulted by blocking socket waits before parking.
 pub fn pending_signal_interrupts_wait(
     thread: &Cap<crate::thread_runtime::ThreadIdentity>,
-    process: &Cap<ProcessIdentity>,
+    _process: &Cap<ProcessIdentity>,
 ) -> bool {
     let Some(summary) = thread
         .payload_cap()
@@ -1108,26 +1095,7 @@ pub fn pending_signal_interrupts_wait(
     if summary.termination {
         return true;
     }
-    if !summary.deliverable_signal {
-        return false;
-    }
-    // The summary bit is a denormalised hint; consult the real queues (the
-    // bit can be momentarily stale after an AST delivery).
-    let Some((sig, _source)) = select_next_signal(thread) else {
-        return false;
-    };
-    let disposition = match process.upgrade_operational() {
-        Ok(payload) => payload.sig_actions().get(sig),
-        Err(_) => return false,
-    };
-    match disposition {
-        SigDisposition::Handler(_) => true,
-        SigDisposition::Default => matches!(
-            default_action(sig),
-            DefaultAction::Term | DefaultAction::Core
-        ),
-        SigDisposition::Ignore => false,
-    }
+    summary.deliverable_signal && thread_pending_signal_interrupts(thread)
 }
 
 pub fn deliver_signal_if_handler(process: &Cap<ProcessIdentity>, sig: Signum) -> bool {

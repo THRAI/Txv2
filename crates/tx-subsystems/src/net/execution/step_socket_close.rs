@@ -1,17 +1,13 @@
 use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::net::namespace::net_namespace_payloads_snapshot;
+use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::SocketPayload;
 use crate::net::structure::{
     AcceptWireSet, ConnectionKey, IpEndpoint, RdsState, RecvWireSet, SendWireSet, SocketIdentity,
     SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
-
-use super::step_tcp_loopback::step_tcp_loopback_transfer;
-
-const TCP_CLOSE_FLUSH_PASSES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SocketCloseOutcome {
@@ -37,9 +33,10 @@ pub fn step_socket_close(
     };
 
     let mut bindings_withdrawn = 0;
-    let mut tcp_flushed_bytes = 0;
+    let tcp_flushed_bytes = 0;
     let mut peer_recv_woken = 0;
     let mut peer_send_woken = 0;
+    let mut deferred_tcp_close = false;
     let table = payload.socket_table();
     match payload.protocol_snapshot() {
         SocketProtocol::Tcp(TcpState::Bound { local }) => {
@@ -58,17 +55,26 @@ pub fn step_socket_close(
                 );
             }
         }
-        SocketProtocol::Tcp(TcpState::Connecting { local, remote })
-        | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
-            tcp_flushed_bytes += flush_tcp_tx_before_close(socket, guard);
-            if let Some(peer) = lookup_tcp_peer_connection(table, remote, local, guard) {
-                let peer_wakes = mark_tcp_peer_closed(&peer);
-                peer_recv_woken += peer_wakes.recv_woken;
-                peer_send_woken += peer_wakes.send_woken;
-            }
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => {
+            // A connect that has not completed owns no delivered stream data;
+            // aborting it is the normal close behaviour.
             bindings_withdrawn +=
                 withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(local, remote)));
             bindings_withdrawn += withdraw_tcp_bound_if_owner(table, socket, local, guard);
+        }
+        SocketProtocol::Tcp(TcpState::Connected { .. }) => {
+            // Normal TCP close is asynchronous.  Keep both the payload and its
+            // connection-table reference alive while the delegate drains the
+            // send queue and performs the FIN exchange.  The old fixed
+            // eight-pass inline flush followed by abort could publish EOF
+            // before the HTTP body reached the peer.
+            deferred_tcp_close = true;
+            if payload.request_tcp_close() {
+                if let Some(raw_tcp) = payload.raw_tcp_socket() {
+                    raw_tcp.close();
+                }
+                net_delegate_kick_poll();
+            }
         }
         SocketProtocol::Tcp(TcpState::Init | TcpState::Closed) => {}
         SocketProtocol::Sctp(TcpState::Bound { local }) => {
@@ -171,6 +177,20 @@ pub fn step_socket_close(
         | SocketProtocol::Packet(_) => {}
     }
 
+    if deferred_tcp_close {
+        let recv_woken = socket.readiness.fire_recv(RecvWireSet::BROKEN);
+        let send_woken = socket.readiness.fire_send(SendWireSet::BROKEN);
+        let accept_woken = socket.readiness.fire_accept(AcceptWireSet::BROKEN);
+        return StepOutcome::Done(SocketCloseOutcome {
+            payload_taken: false,
+            bindings_withdrawn,
+            tcp_flushed_bytes,
+            recv_woken,
+            send_woken,
+            accept_woken,
+        });
+    }
+
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
         raw_tcp.abort();
     }
@@ -192,72 +212,49 @@ pub fn step_socket_close(
     })
 }
 
-fn flush_tcp_tx_before_close(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> usize {
-    if let Some(payload) = socket.acquire_operational() {
-        if let Some(raw_tcp) = payload.raw_tcp_socket() {
-            let _ = raw_tcp.flush_corked_tx();
-        }
+/// Finish a delegate-owned TCP close only after smoltcp has completed the
+/// reliable byte/FIN exchange.  `TimeWait` is safe to detach for the in-kernel
+/// lossless loopback transport: the peer FIN has already been acknowledged.
+pub(super) fn finalize_tcp_close_if_complete(
+    socket: &Cap<SocketIdentity>,
+    guard: &Guard<'_>,
+) -> bool {
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    if !payload.tcp_close_requested() {
+        return false;
+    }
+    let SocketProtocol::Tcp(TcpState::Connected { local, remote }) = payload.protocol_snapshot()
+    else {
+        return false;
+    };
+    let Some(raw_tcp) = payload.raw_tcp_socket() else {
+        return false;
+    };
+    if raw_tcp.send_queued() != 0
+        || !matches!(
+            raw_tcp.protocol_state(),
+            smoltcp::socket::tcp::State::Closed | smoltcp::socket::tcp::State::TimeWait
+        )
+    {
+        return false;
     }
 
-    let mut moved_total = 0;
-    for _ in 0..TCP_CLOSE_FLUSH_PASSES {
-        let queued = socket
-            .acquire_operational()
-            .and_then(|payload| {
-                payload
-                    .raw_tcp_socket()
-                    .map(|raw_tcp| raw_tcp.send_queued())
-            })
-            .unwrap_or(0);
-        if queued == 0 {
-            break;
-        }
-
-        let moved = match step_tcp_loopback_transfer(socket, queued, guard) {
-            StepOutcome::Done(outcome) => outcome.bytes_moved,
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } | StepOutcome::Err(_) => 0,
-        };
-        if moved == 0 {
-            break;
-        }
-        moved_total += moved;
-    }
-    moved_total
+    let table = payload.socket_table();
+    let _ = table.withdraw_tcp_connection(ConnectionKey::new(local, remote));
+    let _ = withdraw_tcp_bound_if_owner(table, socket, local, guard);
+    let _ = socket.take_payload();
+    socket.readiness.fire_recv(RecvWireSet::BROKEN);
+    socket.readiness.fire_send(SendWireSet::BROKEN);
+    socket.readiness.fire_accept(AcceptWireSet::BROKEN);
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PeerCloseWakes {
     recv_woken: usize,
     send_woken: usize,
-}
-
-fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
-    let Some(payload) = peer.acquire_operational() else {
-        return PeerCloseWakes::default();
-    };
-    if let Some(raw_tcp) = payload.raw_tcp_socket() {
-        raw_tcp.mark_recv_closed_by_peer();
-    }
-    let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
-    let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
-    PeerCloseWakes {
-        recv_woken,
-        send_woken,
-    }
-}
-
-fn lookup_tcp_peer_connection(
-    table: &SocketTable,
-    remote: IpEndpoint,
-    local: IpEndpoint,
-    guard: &Guard<'_>,
-) -> Option<Cap<SocketIdentity>> {
-    let key = ConnectionKey::new(remote, local);
-    table.lookup_tcp_connection(key, guard).or_else(|| {
-        net_namespace_payloads_snapshot()
-            .into_iter()
-            .find_map(|namespace| namespace.socket_table().lookup_tcp_connection(key, guard))
-    })
 }
 
 fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {

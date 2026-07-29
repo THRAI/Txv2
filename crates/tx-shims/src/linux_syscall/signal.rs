@@ -459,8 +459,20 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
 
     const CHUNK_NS: u64 = 5_000_000;
     loop {
-        if let Some(deadline_ns) = poll_due_itimers::<P>(&ctx.process) {
-            P::set_deadline_ns(deadline_ns);
+        // `timeout(1)` uses a POSIX timer (`timer_create` /
+        // `timer_settime`) and then sleeps in `rt_sigsuspend`.  Checking only
+        // legacy setitimer timers here leaves SIGALRM permanently undelivered:
+        // the task wakes for each chunk, but nobody consumes the due POSIX
+        // timer.  Poll both timer namespaces and program the earliest next
+        // deadline, matching the run-thread checkpoint.
+        let posix_deadline = poll_due_posix_timers::<P>(&ctx.process);
+        let itimer_deadline = poll_due_itimers::<P>(&ctx.process);
+        match (posix_deadline, itimer_deadline) {
+            (Some(left), Some(right)) => P::set_deadline_ns(left.min(right)),
+            (Some(deadline_ns), None) | (None, Some(deadline_ns)) => {
+                P::set_deadline_ns(deadline_ns);
+            }
+            (None, None) => {}
         }
         // Interrupt only on a signal that POSIX says should break a blocking
         // syscall — NOT on benign pending signals such as SIGCHLD (default
@@ -516,10 +528,9 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
 /// `sigaltstack(ss, old_ss)` — Linux LP64 `stack_t` query/update.
 ///
 /// This records the registered alternate stack in
-/// `ThreadPayload.alt_stack` and reports it back through `old_ss`.
-/// Signal-frame delivery still uses the current user stack today, so
-/// `SA_ONSTACK` delivery semantics remain deferred; the syscall
-/// pointer contract itself is Linux/musl-shaped.
+/// `ThreadPayload.alt_stack`. Signal delivery uses it for `SA_ONSTACK` and
+/// nested delivery continues below the current SP instead of overwriting the
+/// outer frame.
 pub(super) fn sys_sigaltstack(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     let ss_ptr = args[0];
     let old_ss_ptr = args[1];
@@ -527,9 +538,31 @@ pub(super) fn sys_sigaltstack(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult
         return SyscallResult::Error(ESRCH_VALUE);
     };
 
+    let current_sp = payload
+        .saved_user_context()
+        .map(|saved| {
+            #[cfg(target_arch = "loongarch64")]
+            {
+                saved.regs[3]
+            }
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                saved.regs[2]
+            }
+        })
+        .unwrap_or(0);
+    let on_altstack = payload.alt_stack().is_some_and(|(base, size)| {
+        base.checked_add(size)
+            .is_some_and(|end| (base..end).contains(&current_sp))
+    });
+
     if old_ss_ptr != 0 {
         let (ss_sp, ss_flags, ss_size) = match payload.alt_stack() {
-            Some((base, size)) => (base as u64, 0, size as u64),
+            Some((base, size)) => (
+                base as u64,
+                if on_altstack { SS_ONSTACK } else { 0 },
+                size as u64,
+            ),
             None => (0, SS_DISABLE, 0),
         };
         let old = SigaltstackLayout {
@@ -545,6 +578,11 @@ pub(super) fn sys_sigaltstack(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult
     }
 
     if ss_ptr != 0 {
+        // Linux forbids replacing/disabling the alternate stack while the
+        // caller is executing on it.
+        if on_altstack {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
         let new = match bootstrap_read_user::<SigaltstackLayout>(&ctx.aspace, ss_ptr) {
             Ok(value) => value,
             Err(errno) => return SyscallResult::error_from(errno),
@@ -842,7 +880,7 @@ pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> Syscall
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
 /// §15.1.
 ///
-/// Decodes a 32-byte kernel `struct sigaction` (see `SIGACTION_BYTES`
+/// Decodes a 24-byte kernel `struct sigaction` (see `SIGACTION_BYTES`
 /// for the layout citation). `act_ptr == 0` queries the current
 /// disposition without changing it; `oldact_ptr == 0` discards the
 /// previous disposition.
@@ -876,8 +914,9 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         }
         let handler = read_u64_le(&bytes[0..8]);
         let flags = SaFlags::new(read_u64_le(&bytes[8..16]));
+        // RV64 and LA64 use asm-generic without SA_RESTORER:
+        // handler, flags, mask. Signal return uses our frame trampoline.
         let mask = SignalMask::new(read_u64_le(&bytes[16..24]));
-        let restorer = read_u64_le(&bytes[24..32]);
 
         // SIG_DFL == 0, SIG_IGN == 1 per Linux generic ABI; everything
         // else is a userspace function-pointer handler.
@@ -886,7 +925,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             1 => SigDisposition::Ignore,
             other => SigDisposition::Handler(other as usize),
         };
-        Some(SigActionEntry::new(disp, flags, mask, restorer as usize))
+        Some(SigActionEntry::new(disp, flags, mask, 0))
     };
 
     // If the caller wants the previous disposition, snapshot it
@@ -933,14 +972,12 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             SigDisposition::Ignore => 1,  // SIG_IGN
             SigDisposition::Handler(addr) => addr as u64,
         };
-        // Build a 32-byte image and copy out through the canonical
-        // user-VA lane. RV64 musl layout: 4×u64 little-endian
-        // (handler, flags, mask, unused/restorer).
+        // Build the RV64/LA64 generic kernel `struct sigaction` image:
+        // handler, flags, mask. There is no restorer word on either ABI.
         let mut image = [0u8; SIGACTION_BYTES];
         image[0..8].copy_from_slice(&handler_value.to_le_bytes());
         image[8..16].copy_from_slice(&prev_entry.flags.bits().to_le_bytes());
         image[16..24].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
-        image[24..32].copy_from_slice(&(prev_entry.restorer as u64).to_le_bytes());
         if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image) {
             return SyscallResult::error_from(errno);
         }
@@ -1229,13 +1266,10 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// `rt_sigreturn(...)` — Linux RV64 generic ABI
 /// `__NR_rt_sigreturn = 139`.
 ///
-/// Restore the pre-handler trap context that signal delivery parked
-/// in `payload.saved_signal_context` before flipping
-/// `saved_user_context` to the handler-entry context. After the
-/// handler `ret`s through the stack trampoline (`addi a7, 0, 139;
-/// ecall`), this syscall fires; we move the parked context back into
-/// `saved_user_context` so the thread re-enters userspace exactly
-/// where the signal interrupted it.
+/// Signal delivery stores the interrupted context and mask in the
+/// architecture-defined userspace frame. After the handler returns through
+/// the trampoline, the kernel return path decodes the frame at the caller's
+/// current SP, validates it, restores the mask/context, and resumes userspace.
 ///
 /// `SigreturnRestored` tells the syscall-return path in
 /// `thread_future` to skip its normal `pending_syscall_return` drain
@@ -1248,55 +1282,17 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// SIGCHLD-handler crash on 2026-05-18 (root cause traced through
 /// the trap-trace serial log).
 ///
-/// If no signal frame is in flight, the kernel has no parked
-/// context to restore. POSIX leaves this case undefined; we return
-/// `-EFAULT` defensively rather than corrupt the current context.
+/// There is deliberately no kernel-side "active frame" depth or shadow
+/// context. Nested handlers, fork from a handler, and user edits to ucontext
+/// all work because the userspace frame is authoritative.
 pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     let Some(payload) = ctx.thread.payload_cap() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
-
-    let current = payload.saved_user_context();
-    if let Some(current_ctx) = current {
-        if let Ok(frame) = read_compat_signal_frame(&ctx.aspace, current_ctx.regs[2] as u64) {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = SigprocmaskOp {
-                thread: ctx.thread.clone(),
-                how: SigmaskHow::SetMask,
-                next: SignalMask::new(frame.saved_mask.bits),
-            };
-            let _ = step_engine::drive_oneshot(&mut op, &mut script_ctx);
-            let _ = payload.take_saved_signal_context();
-            let _ = payload.take_saved_signal_mask();
-            payload.store_saved_user_context(Some(frame.user_context));
-            return SyscallResult::SigreturnContextRestored;
-        }
-    }
-
-    if let Some(saved) = payload.take_saved_signal_context() {
-        if let Some(mask) = payload.take_saved_signal_mask() {
-            payload.store_signal_mask(mask);
-        }
-        payload.store_saved_user_context(Some(saved));
-        return SyscallResult::SigreturnRestored;
-    }
-
-    let Some(current) = current else {
+    if payload.saved_user_context().is_none() {
         return SyscallResult::Error(EFAULT_VALUE);
-    };
-    let frame = match read_compat_signal_frame(&ctx.aspace, current.regs[2] as u64) {
-        Ok(frame) => frame,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = SigprocmaskOp {
-        thread: ctx.thread.clone(),
-        how: SigmaskHow::SetMask,
-        next: SignalMask::new(frame.saved_mask.bits),
-    };
-    let _ = step_engine::drive_oneshot(&mut op, &mut script_ctx);
-    payload.store_saved_user_context(Some(frame.user_context));
-    SyscallResult::SigreturnContextRestored
+    }
+    SyscallResult::SigreturnRestored
 }
 
 /// `rt_sigpending(set, sigsetsize)` — Linux RV64 generic ABI

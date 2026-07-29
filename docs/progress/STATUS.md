@@ -1,3 +1,21 @@
+- 2026-07-30 (BuildStorm socketpair SMP 预检查修复). Cargo/Rust 在启动 rustc 前使用
+  `socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC)` 建立 exec 错误通道；原同步
+  `validate_user_range` 在另一个 hart 暂时持有目标栈页 RangeLock 时，把正常的
+  `Yield` 竞争错误翻译为 `EIO`，导致子 rustc 显示 `(never executed)`。现新增等待版
+  用户区间校验，`sys_socketpair` 会等待锁释放并完整重试，真实非法地址仍返回
+  `EFAULT`；未改 TCP 数据面或其他同步 socket 调用。`cargo check -p tx-shims --lib`
+  通过，仅有分支原有 warning。Next：刷新 RV64 submit 内核并用 `-snapshot` 复跑联合
+  流程，确认不再出现 `nr=199 errno=5`。Blocker：动态 BuildStorm 复核尚未执行。
+- 2026-07-30 (CAgent 并发短连接乱序 FIN 修复). Txv2 的 TCP 包装层此前直接按
+  入站报文的 FIN 标志发布 EOF；而 smoltcp 在接收序列仍有缺口时会延迟该 FIN，导致
+  CAgent 客户端提前看到 EOF，随机得到空响应或截断 JSON。现由 smoltcp 暴露“已接受
+  in-order FIN”的权威状态，Txv2 仅在该状态发生跃迁时发布 EOF；缓冲数据仍先于 EOF
+  被 recv 消费。新增乱序 FIN 回归用例，旧实现稳定失败、修复后通过；TCP graceful
+  shutdown 模块 7/7 通过。RV64 release/submit 内核已刷新，QEMU 9.2.1、4 GiB、8 hart、
+  `-snapshot` 下连续 5 轮 CAgent 共 50/50 通过，0 reject、0 超时、0 诊断失败。统一
+  `cargo -q xtask unit` 仍被分支原有的 tx-shims 测试脚手架 9 个编译错误和
+  `run_thread` future 2112/2048 预算断言阻断；构建、tx-ext4、tx-scripts 均通过。
+  Next：在官方 16 GiB/8 hart 参数下复核 CAgent+BuildStorm 联合流程。Blocker：无。
 - 2026-07-26 (RV64 SMP 空闲核丢唤醒闭环). BuildStorm 计时构建已经完成
   `arceos-helloworld` 和 objcopy，但外层 `timeout` 永久停在 wait4。现场确认退出子进程
   已是 zombie、parent key 正确，而所有 AP 均睡在 `wfi`；这排除了“子进程没有退出”，并

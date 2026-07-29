@@ -171,16 +171,6 @@ pub struct ThreadPayload {
     /// `view.capture_user_context()`, restored before next userspace
     /// entry. Per `THREAD-5-1-STATE-PLACEMENT`.
     pub(crate) saved_user_context: SpinMutex<Option<UserTrapContext>>,
-    /// Saved signal context: the `UserTrapContext` that was active
-    /// before the most recent handler delivery.  Written by the AST
-    /// checkpoint in `thread_future` when `DeliverHandler` fires;
-    /// consumed by `sys_rt_sigreturn` to restore the original
-    /// execution state.  `None` when no handler is currently
-    /// executing.
-    pub(crate) saved_signal_context: SpinMutex<Option<UserTrapContext>>,
-    /// Signal mask active before the most recent handler delivery.
-    /// Restored together with `saved_signal_context` by `rt_sigreturn`.
-    pub(crate) saved_signal_mask: SpinMutex<Option<SignalMask>>,
     /// Mask to restore after a handler which interrupted `rt_sigsuspend`.
     ///
     /// `rt_sigsuspend` temporarily replaces the caller's mask while sleeping.
@@ -288,8 +278,6 @@ impl ThreadPayload {
             userspace_slot: UserspaceRunSlot::new(),
             active_request: SpinMutex::new(None),
             saved_user_context: SpinMutex::new(None),
-            saved_signal_context: SpinMutex::new(None),
-            saved_signal_mask: SpinMutex::new(None),
             sigsuspend_restore_mask: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
             mailbox: SpinMutex::new(None),
@@ -387,35 +375,6 @@ impl ThreadPayload {
     /// discipline.
     pub fn store_saved_user_context(&self, ctx: Option<UserTrapContext>) {
         *self.saved_user_context.lock() = ctx;
-    }
-
-    /// Replace the saved signal context. Called by signal delivery
-    /// to preserve the pre-handler context for `rt_sigreturn`.
-    pub fn store_saved_signal_context(&self, ctx: Option<UserTrapContext>) {
-        *self.saved_signal_context.lock() = ctx;
-    }
-
-    /// Whether a signal handler frame is currently in flight.
-    pub fn has_saved_signal_context(&self) -> bool {
-        self.saved_signal_context.lock().is_some()
-    }
-
-    /// Take (consume) the saved signal context. Called by
-    /// `rt_sigreturn` to retrieve the pre-handler context for
-    /// restoration into `saved_user_context`. Returns `None` if no
-    /// signal frame is in flight (stray `rt_sigreturn` call).
-    pub fn take_saved_signal_context(&self) -> Option<UserTrapContext> {
-        self.saved_signal_context.lock().take()
-    }
-
-    /// Replace the signal mask saved for the active signal frame.
-    pub fn store_saved_signal_mask(&self, mask: Option<SignalMask>) {
-        *self.saved_signal_mask.lock() = mask;
-    }
-
-    /// Take the signal mask saved for the active signal frame.
-    pub fn take_saved_signal_mask(&self) -> Option<SignalMask> {
-        self.saved_signal_mask.lock().take()
     }
 
     /// Publish the pre-`rt_sigsuspend` mask for the next handler frame.

@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak};
 use alloc::collections::BTreeMap;
@@ -17,6 +17,7 @@ use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
 pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
+const DIR_VERSION_SHARDS: usize = 256;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum OrphanState {
@@ -29,6 +30,16 @@ pub(crate) struct Ext4FsInstance<I> {
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
     inode_meta_cache: SpinMutex<InodeMetaCache>,
+    /// Lock-free namespace generations used to validate lookup/readdir cache
+    /// fills against concurrent directory mutations.
+    ///
+    /// The pager serializes on-disk operations, but cache insertion happens
+    /// after that pager guard is released. Without a generation, a reader can
+    /// read an old directory, a writer can commit and invalidate, and then the
+    /// reader can publish its old snapshot after the invalidation. Hashed
+    /// shards avoid a global namespace lock; collisions only cause harmless
+    /// extra cache misses.
+    dir_versions: [AtomicU64; DIR_VERSION_SHARDS],
     /// Per-inode page-cache coherence index. Every hard-link alias of a
     /// regular inode must materialise the same PageContainer while it is
     /// alive; separate containers would permit stale reads and writeback
@@ -55,6 +66,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
+            dir_versions: core::array::from_fn(|_| AtomicU64::new(0)),
             page_containers: SpinMutex::new(BTreeMap::new()),
             orphaned_inodes: SpinMutex::new(BTreeMap::new()),
             mount_pin: SpinMutex::new(None),
@@ -89,28 +101,73 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         f(&mut pager)
     }
 
+    pub(crate) fn with_pager_namespace_mutation<T>(
+        &self,
+        parents: &[InodeNo],
+        f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,
+    ) -> Result<T, Errno> {
+        self.with_pager(|pager| {
+            let value = f(pager)?;
+            for parent in parents {
+                self.bump_dir_version(*parent);
+            }
+            Ok(value)
+        })
+    }
+
+    fn dir_version(&self, inode: InodeNo) -> u64 {
+        self.dir_versions[dir_version_shard(inode)].load(Ordering::Acquire)
+    }
+
+    fn bump_dir_version(&self, inode: InodeNo) {
+        self.dir_versions[dir_version_shard(inode)].fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn lookup_cached(
         &self,
         parent: InodeNo,
         name: &[u8],
     ) -> Result<Option<InodeNo>, Errno> {
-        if let Some(cached) = self.lookup_cache.lock().get(parent, name) {
+        let version = self.dir_version(parent);
+        let lookup_cached = {
+            let mut cache = self.lookup_cache.lock();
+            cache.get(parent, name, version)
+        };
+        if let Some(cached) = lookup_cached {
             return Ok(cached);
         }
-        if let Some(cached) = self.dir_cache.lock().lookup(parent, name) {
-            self.lookup_cache
-                .lock()
-                .insert(parent, name, cached.unwrap_or(InodeNo::new(0)));
+
+        // Never nest dir_cache and lookup_cache. In Rust 2021 an `if let`
+        // scrutinee temporary can live through the body, so spelling this as
+        // `if let Some(..) = self.dir_cache.lock().lookup(..)` and then taking
+        // lookup_cache in the body creates the reverse of the invalidation
+        // order (lookup_cache -> dir_cache). Concurrent readdir + namespace
+        // mutation can then deadlock both CPUs. Copy the result out under one
+        // lock and release it before touching the other cache.
+        let dir_cached = {
+            let mut cache = self.dir_cache.lock();
+            cache.lookup(parent, name, version)
+        };
+        if let Some(cached) = dir_cached {
+            self.lookup_cache.lock().insert(
+                parent,
+                name,
+                cached.unwrap_or(InodeNo::new(0)),
+                version,
+            );
             return Ok(cached);
         }
-        let found = self.with_pager(|pager| pager.lookup(parent, name))?;
+        let (found, version) = self.with_pager(|pager| {
+            let found = pager.lookup(parent, name)?;
+            Ok((found, self.dir_version(parent)))
+        })?;
         // Cache negatives too (inode 0 sentinel): every shell command's PATH
         // search stats mostly-nonexistent names against testcases/bin
         // (~2800 entries); an uncached miss is a full linear directory scan
         // (~48 ms under TCG, measured) repeated for every command.
         self.lookup_cache
             .lock()
-            .insert(parent, name, found.unwrap_or(InodeNo::new(0)));
+            .insert(parent, name, found.unwrap_or(InodeNo::new(0)), version);
         Ok(found)
     }
 
@@ -132,31 +189,38 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Result<usize, Errno> {
-        if let Some(count) = self
-            .dir_cache
-            .lock()
-            .get(inode, start_offset, out, next_offsets)
+        let version = self.dir_version(inode);
+        if let Some(count) =
+            self.dir_cache
+                .lock()
+                .get(inode, start_offset, version, out, next_offsets)
         {
             return Ok(count);
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
         let mut cached_next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
-        let count = self.with_pager(|pager| {
-            pager.read_dir_entries_from_offset(
+        let (count, version) = self.with_pager(|pager| {
+            let count = pager.read_dir_entries_from_offset(
                 inode,
                 start_offset,
                 &mut entries,
                 &mut cached_next_offsets,
-            )
+            )?;
+            Ok((count, self.dir_version(inode)))
         })?;
-        self.dir_cache
-            .lock()
-            .insert(inode, start_offset, &entries, &cached_next_offsets, count);
+        self.dir_cache.lock().insert(
+            inode,
+            start_offset,
+            version,
+            &entries,
+            &cached_next_offsets,
+            count,
+        );
         {
             let mut lookup_cache = self.lookup_cache.lock();
             for entry in entries.iter().take(count) {
-                lookup_cache.insert(inode, entry.name(), entry.inode);
+                lookup_cache.insert(inode, entry.name(), entry.inode, version);
             }
         }
         out[..count].copy_from_slice(&entries[..count]);
@@ -312,6 +376,10 @@ fn inode_meta_is_dir(meta: InodeMetaLite) -> bool {
     meta.mode & 0xF000 == 0x4000
 }
 
+fn dir_version_shard(inode: InodeNo) -> usize {
+    inode.get() as usize % DIR_VERSION_SHARDS
+}
+
 const DIR_CACHE_ENTRIES: usize = 32;
 
 struct DirCache {
@@ -331,12 +399,13 @@ impl DirCache {
         &mut self,
         inode: InodeNo,
         start_offset: u64,
+        version: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Option<usize> {
         let (index, window_index) =
             self.entries.iter().enumerate().find_map(|(index, entry)| {
-                if !entry.valid || entry.inode != inode {
+                if !entry.valid || entry.inode != inode || entry.version != version {
                     return None;
                 }
                 if entry.start_offset == start_offset {
@@ -358,11 +427,11 @@ impl DirCache {
         Some(count)
     }
 
-    fn lookup(&mut self, inode: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
+    fn lookup(&mut self, inode: InodeNo, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
         let mut complete_first_window = None;
         let mut found_index = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            if !entry.valid || entry.inode != inode {
+            if !entry.valid || entry.inode != inode || entry.version != version {
                 continue;
             }
             if entry.start_offset == 0 && entry.count < READDIR_WINDOW_ENTRIES {
@@ -402,6 +471,7 @@ impl DirCache {
         &mut self,
         inode: InodeNo,
         start_offset: u64,
+        version: u64,
         entries: &[DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &[u64; READDIR_WINDOW_ENTRIES],
         count: usize,
@@ -430,6 +500,7 @@ impl DirCache {
         entry.valid = true;
         entry.inode = inode;
         entry.start_offset = start_offset;
+        entry.version = version;
         entry.count = count.min(READDIR_WINDOW_ENTRIES);
         entry.last_used = self.clock;
         entry.entries.clear();
@@ -453,6 +524,7 @@ struct DirCacheEntry {
     valid: bool,
     inode: InodeNo,
     start_offset: u64,
+    version: u64,
     count: usize,
     entries: Vec<DirEntryLite>,
     next_offsets: Vec<u64>,
@@ -465,6 +537,7 @@ impl DirCacheEntry {
             valid: false,
             inode: InodeNo::new(0),
             start_offset: 0,
+            version: 0,
             count: 0,
             entries: Vec::new(),
             next_offsets: Vec::new(),
@@ -582,11 +655,11 @@ impl LookupCache {
     /// `Some(Some(ino))` = cached hit. Negative entries reuse `inode == 0`
     /// (ext4 inode numbers start at 1) and are invalidated by the same
     /// `invalidate_parent` calls that cover create/unlink/rename.
-    fn get(&mut self, parent: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
+    fn get(&mut self, parent: InodeNo, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
         let index = self
             .entries
             .iter()
-            .position(|entry| entry.matches(parent, name))?;
+            .position(|entry| entry.matches(parent, name, version))?;
         self.clock = self.clock.wrapping_add(1);
         self.entries[index].last_used = self.clock;
         let inode = self.entries[index].inode;
@@ -597,7 +670,7 @@ impl LookupCache {
         }
     }
 
-    fn insert(&mut self, parent: InodeNo, name: &[u8], inode: InodeNo) {
+    fn insert(&mut self, parent: InodeNo, name: &[u8], inode: InodeNo, version: u64) {
         if name.len() > LOOKUP_CACHE_NAME_BYTES {
             return;
         }
@@ -614,7 +687,7 @@ impl LookupCache {
                     .map(|(index, _)| index)
                     .unwrap_or(0)
             });
-        self.entries[victim] = LookupCacheEntry::new(parent, name, inode, self.clock);
+        self.entries[victim] = LookupCacheEntry::new(parent, name, inode, version, self.clock);
     }
 
     fn invalidate_parent(&mut self, parent: InodeNo) {
@@ -631,6 +704,7 @@ struct LookupCacheEntry {
     valid: bool,
     parent: InodeNo,
     inode: InodeNo,
+    version: u64,
     name_len: u8,
     name: [u8; LOOKUP_CACHE_NAME_BYTES],
     last_used: u64,
@@ -642,26 +716,29 @@ impl LookupCacheEntry {
             valid: false,
             parent: InodeNo::new(0),
             inode: InodeNo::new(0),
+            version: 0,
             name_len: 0,
             name: [0; LOOKUP_CACHE_NAME_BYTES],
             last_used: 0,
         }
     }
 
-    fn new(parent: InodeNo, name: &[u8], inode: InodeNo, last_used: u64) -> Self {
+    fn new(parent: InodeNo, name: &[u8], inode: InodeNo, version: u64, last_used: u64) -> Self {
         let mut entry = Self::empty();
         entry.valid = true;
         entry.parent = parent;
         entry.inode = inode;
+        entry.version = version;
         entry.name_len = name.len() as u8;
         entry.name[..name.len()].copy_from_slice(name);
         entry.last_used = last_used;
         entry
     }
 
-    fn matches(&self, parent: InodeNo, name: &[u8]) -> bool {
+    fn matches(&self, parent: InodeNo, name: &[u8], version: u64) -> bool {
         self.valid
             && self.parent == parent
+            && self.version == version
             && self.name_len as usize == name.len()
             && &self.name[..name.len()] == name
     }
