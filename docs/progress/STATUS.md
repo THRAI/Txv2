@@ -1,3 +1,20 @@
+- 2026-07-30 (**续接 07-27～07-29 Claude 的 Git 修复：3/8 → 干净 8/8**).
+  原症状是 HTTP pack 已收 100% 后 `index-pack` 永不返回、QEMU 单核满载；两百万次
+  `Continue` 看门狗把所有者钉到 `vfs::FileFsyncOp`。根因链共三段：① page-backed fsync
+  未完成时原地 `Continue`，且异步请求缺少逐操作 wait/可靠 service kick/终态发布；
+  `/musl` 又没有 backend planner，改 Yield 后无人完成；② planner 写回成功未先回告
+  planner、直接 `BackendPlan::Err` 未终态化；③ `drive_udp_loopback_after_sendto` 无条件
+  破坏性弹出外部 UDP，DNS 包在 device-TX 前被吃掉。同步补强 fork/CoW：pmap-only 私有
+  常驻页先 seed 为 `SharedCow`，map-pin/publish 失败不再吞掉并映射 `ENOMEM`。修复后
+  fsync `22/22`、fork `6/6`、外部 UDP 留队 `1/1`、RV64 build 通过；无诊断注入的
+  `tools/verify-git-net.sh` 最终 **8/8**（HTTP/HTTPS clone、push、pull、DNS 全绿），串口
+  `msp/debug-logs/2026-07-30-git-net-8-of-8-clean.serial.log`。`cargo -q xtask unit`
+  仍仅有既有基线：3 个无关 tx-shims 断言和 tx-ext4 测试陈旧 `with_target` API；
+  同轮 tx-kernel `114/114`、tx-scripts `166/166`。详细根因/证据见
+  `msp/debug-logs/2026-07-30-git-clone-fsync-dns-fork-repair.md`。**Next**：另立范围处理
+  UDP inline/device 队列的 SMP 原子所有权，以及 planner Yield/部分 Bio admission 的终态；
+  6E ordered-JBD2 前不宣称断电持久化。**Blocker**：本次 Git 路径无；改动尚未提交。
+
 - 2026-07-28 (**引导期 exec 从 ext4 起不来 = main 既有,不是合并回归;已用同 harness 对照钉死**).
   合并后 git 端到端 0/8、oscomp suite 也起不来,追下去发现两条通道挂在同一个根因上:
   引导期 exec (`init/exec.rs` 的 `bootstrap_block_on(exec_script)`) 遇到冷页 fetch 会拿到

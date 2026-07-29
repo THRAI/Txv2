@@ -7,8 +7,9 @@ use tx_platform_adapter::notification_adapter;
 
 pub(crate) use wait_source::{
     is_wait_source, new_page_ready_wait, notify_page_ready_with_post, page_ready_endpoint,
-    page_ready_source_id, wait_source_parts, yield_on_page_ready_source, yield_on_wait_source,
-    PageReadyNotifier, PageReadyWait,
+    page_ready_source_id, page_ready_weak_notifier, upgrade_page_ready_notifier, wait_source_parts,
+    yield_on_page_ready_source, yield_on_wait_source, PageReadyNotifier, PageReadyWait,
+    PageReadyWeakNotifier,
 };
 
 #[notification_adapter(
@@ -17,7 +18,7 @@ pub(crate) use wait_source::{
     reason = "page_backed notification.rs owns wait-source yield relay helpers"
 )]
 mod wait_source {
-    use alloc::sync::Arc;
+    use alloc::sync::{Arc, Weak};
 
     use crate::page_backed::adapter::step_engine::{StepOutcome, StepProgress, YieldShape};
     use crate::page_backed::adapter::wait_routing::{self, MailboxEvent, TaskMailbox, WaitSource};
@@ -31,6 +32,11 @@ mod wait_source {
 
     pub(crate) struct PageReadyNotifier {
         source: Arc<WaitSource>,
+    }
+
+    pub(crate) struct PageReadyWeakNotifier {
+        source_id: u64,
+        source: Weak<WaitSource>,
     }
 
     impl PageReadyWait {
@@ -61,6 +67,14 @@ mod wait_source {
         }
     }
 
+    impl core::fmt::Debug for PageReadyWeakNotifier {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("PageReadyWeakNotifier")
+                .field("source_id", &self.source_id)
+                .finish_non_exhaustive()
+        }
+    }
+
     impl Drop for PageReadyWait {
         fn drop(&mut self) {
             wait_routing::unregister_source(self.source_id);
@@ -77,6 +91,22 @@ mod wait_source {
 
     pub(crate) fn page_ready_endpoint(wait: &PageReadyWait) -> &Arc<WaitSource> {
         wait.ready_endpoint()
+    }
+
+    pub(crate) fn page_ready_weak_notifier(wait: &PageReadyWait) -> PageReadyWeakNotifier {
+        PageReadyWeakNotifier {
+            source_id: wait.source_id,
+            source: Arc::downgrade(wait.ready_endpoint()),
+        }
+    }
+
+    pub(crate) fn upgrade_page_ready_notifier(
+        notifier: &PageReadyWeakNotifier,
+    ) -> Option<PageReadyNotifier> {
+        notifier
+            .source
+            .upgrade()
+            .map(|source| PageReadyNotifier { source })
     }
 
     pub(crate) fn notify_page_ready_with_post<F>(notifier: &PageReadyNotifier, post: F)

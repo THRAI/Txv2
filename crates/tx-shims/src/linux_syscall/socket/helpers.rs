@@ -319,7 +319,10 @@ pub(super) fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, writ
         .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
 }
 
-pub(super) fn drive_udp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) -> bool {
+pub(super) fn drive_udp_loopback_after_sendto(
+    socket: &Cap<SocketIdentity>,
+    written: usize,
+) -> bool {
     if written == 0 {
         return false;
     }
@@ -331,6 +334,16 @@ pub(super) fn drive_udp_loopback_after_sendto(socket: &Cap<SocketIdentity>, writ
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
     ) {
         return false;
+    }
+    // Loopback egress destructively removes the head datagram. Keep external
+    // traffic on the device-TX lane; otherwise a DNS query such as
+    // 10.0.2.3:53 is consumed locally and can never reach the NIC.
+    match payload
+        .raw_udp_socket()
+        .and_then(|raw| raw.peek_tx_datagram())
+    {
+        Some(datagram) if datagram.dst.is_loopback() => {}
+        _ => return false,
     }
     let guard = tx_substrate::epoch::guard();
     matches!(
@@ -421,7 +434,7 @@ pub(super) fn sendto_can_drive_loopback_inline(
             dst.is_some_and(|dst| local_allows_loopback_inline(local) && dst.is_loopback())
         }
         SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
-            local_allows_loopback_inline(local) && remote.is_loopback()
+            local_allows_loopback_inline(local) && dst.unwrap_or(remote).is_loopback()
         }
         _ => false,
     }

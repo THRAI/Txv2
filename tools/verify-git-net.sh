@@ -11,7 +11,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-K="$ROOT/target/riscv64gc-unknown-none-elf/release/tx-kernel-riscv64-qemu-virt"
+K="${TXKERNEL:-$ROOT/target/riscv64gc-unknown-none-elf/release/tx-kernel-riscv64-qemu-virt}"
 IMG="$ROOT/local-images/alpine-linux-riscv64-ext4fs.img"
 WORK="$(mktemp -d /tmp/verifygit-XXXXXX)"
 HTTP_PORT=$(( (RANDOM % 2000) + 19000 ))
@@ -35,9 +35,12 @@ say "== Txv2 git verification =="
 say "worktree : $ROOT"
 [ -f "$IMG" ] || { say "FATAL: image not found: $IMG"; exit 2; }
 if [ ! -f "$K" ]; then
+  [ -z "${TXKERNEL:-}" ] \
+    || { say "FATAL: TXKERNEL does not exist: $K"; exit 2; }
   say "kernel ELF missing — building (cargo xtask build --target rv64-qemu)..."
   ( cd "$ROOT" && cargo xtask build --target rv64-qemu ) >"$WORK/build.log" 2>&1 \
     || { say "FATAL: build failed (see $WORK/build.log)"; exit 2; }
+  [ -f "$K" ] || { say "FATAL: build completed but kernel is missing: $K"; exit 2; }
 fi
 say "kernel   : $K"
 say "ports    : http=$HTTP_PORT https=$HTTPS_PORT   marker=$MARKER"

@@ -910,6 +910,7 @@ pub enum VmMapError {
     WouldBlock,
     BackingOffsetOverflow,
     Pmap(VmPmapError),
+    PageAlloc(page_allocator::AllocError),
     Private(PrivatePageError),
 }
 

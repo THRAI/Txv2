@@ -43,8 +43,8 @@ use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmEntry, VmEntryBacking, VmFault,
-    VmFaultOutcome, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, PrivateFrame, PrivateFrameState, PrivatePageError, UserRange,
+    UserVirtAddr, VmEntry, VmEntryBacking, VmFault, VmFaultOutcome, USER_PAGE_SIZE,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 
@@ -518,7 +518,8 @@ fn resolve_user_page_addr(
     // for repeated user copies from pthread stack/TLS pages that are
     // already resident.
     emit_vm_user_trace(b"debug.vm.user.resolve.phase", 1);
-    if let Some(snapshot) = aspace.pmap.lookup(user_page) {
+    let cached = aspace.pmap.lookup(user_page);
+    if let Some(snapshot) = cached {
         if snapshot.prot.permits(kind.required_prot()) {
             emit_vm_user_trace(b"debug.vm.user.resolve.phase", 2);
             return match page_allocator::frame_kernel_addr(snapshot.ppn) {
@@ -561,6 +562,32 @@ fn resolve_user_page_addr(
     if !entry.prot.permits(kind.required_prot()) {
         emit_vm_user_trace(b"debug.vm.user.resolve.err", 3);
         return ResolveOutcome::Err(Errno::EFAULT);
+    }
+
+    // A fork can inherit an exact resident private frame through the pmap even
+    // when the per-entry private set has no row for it. Before a write fault
+    // falls back to the recipe backing, seed that resident frame as SharedCow.
+    // The normal private materializer will then copy from the inherited bytes
+    // instead of re-deriving a stale file-cache or zero page.
+    if kind == UserAccessKind::Write && !entry.flags.shared {
+        if let (Some(snapshot), Some(set), Some(page_off)) = (
+            cached,
+            entry.private(),
+            entry.page_offset_of(UserVirtAddr(page_addr)),
+        ) {
+            if set.lookup(page_off).is_none() {
+                let cache_pin = match page_allocator::acquire_cache_pin(snapshot.ppn) {
+                    Ok(pin) => pin,
+                    Err(_) => return ResolveOutcome::Err(Errno::EFAULT),
+                };
+                let frame =
+                    PrivateFrame::new(snapshot.ppn, PrivateFrameState::SharedCow, cache_pin);
+                match set.install_if_absent(page_off, frame) {
+                    Ok(_) | Err(PrivatePageError::Conflict { .. }) => {}
+                    Err(_) => return ResolveOutcome::Err(Errno::EFAULT),
+                }
+            }
+        }
     }
 
     // Pmap miss (or insufficient cached prot). Materialise via the

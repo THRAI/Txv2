@@ -1056,6 +1056,32 @@ fn file_page_container_cap_with_planner(
     .expect("page container cap")
 }
 
+fn file_page_container_cap(
+    fs_v3: Arc<dyn FsOps>,
+    page_backing_v3: Arc<dyn FsPageBacking>,
+    fs_object_id: FsObjectId,
+    page_count: u64,
+) -> step_engine::Cap<PageContainer> {
+    let mount = MountPayload::new_cap(
+        fs_v3,
+        page_backing_v3,
+        None,
+        DevId::new(8),
+        MountOptions::default(),
+        "mockfs",
+        SourceLabel::Static("mock"),
+    )
+    .expect("mount payload");
+    PageContainer::new_cap(
+        PageContainerKind::File {
+            mount: MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
+            fs_object_id,
+        },
+        page_count,
+    )
+    .expect("page container cap")
+}
+
 fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
     let pc = PageContainer::new_cap(pc.kind().clone(), pc.page_count())
         .expect("page container cap for open file");
@@ -3138,8 +3164,30 @@ fn file_fsync_submission_keeps_terminal_results_per_request_and_consumes_once() 
     let fs = Arc::new(RecordingFs::new());
     let pc = file_page_container(fs.clone(), fs, FsObjectId::new(101), 2);
 
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7104));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
     let first = pc.submit_file_fsync().expect("first fsync admission");
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7104
+            && interests.raw() == IoServiceKind::Page.mask_bits()
+    ));
     let second = pc.submit_file_fsync().expect("second fsync admission");
+    assert_eq!(
+        mailbox.poll(),
+        None,
+        "an already-runnable page service does not need a second kick"
+    );
     assert_ne!(first, second, "each fsync invocation owns a completion row");
     assert_eq!(
         pc.file_fsync_submission_state(first),
@@ -3446,10 +3494,18 @@ fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
     let mut op = crate::page_backed::FsyncOp::new(&pc);
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
 
-    assert_eq!(
-        op.step(&mut ctx),
-        V3Out::continue_with(crate::page_backed::adapter::step_engine::PageProgress::EMPTY)
-    );
+    let (source_id, interests) = match op.step(&mut ctx) {
+        V3Out::Yield { progress, shape } => {
+            assert_eq!(
+                progress,
+                crate::page_backed::adapter::step_engine::PageProgress::EMPTY
+            );
+            crate::page_backed::notification::wait_source_parts(&shape)
+                .expect("fsync should yield on its completion source")
+        }
+        other => panic!("expected pending fsync yield, got {other:?}"),
+    };
+    assert_eq!(interests, 0x1);
     let request = pc
         .state
         .lock()
@@ -3457,6 +3513,23 @@ fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
         .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
         .cloned()
         .expect("queued fsync request");
+    match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => assert_eq!(
+            crate::page_backed::notification::wait_source_parts(&shape),
+            Some((source_id, interests))
+        ),
+        other => panic!("expected the same pending fsync yield, got {other:?}"),
+    }
+    let source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(source_id))
+            .expect("registered fsync completion source");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription = source.register(
+        Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(interests),
+    );
     pc.state
         .lock()
         .file_io_service
@@ -3471,6 +3544,14 @@ fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
     pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
         .expect("completion drive");
 
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            ..
+        }) if seen_generation == generation && source.raw() == source_id
+    ));
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
     assert_eq!(pc.take_file_fsync_submission(request.id), None);
 }
@@ -3480,31 +3561,62 @@ fn vfs_fsync_op_waits_for_page_container_planner_completion() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
 
-    struct FsyncCompletionPlanner;
+    struct FsyncCompletionPlanner {
+        completions: SpinMutex<alloc::vec::Vec<crate::fs_iface::BackendPageCompletion>>,
+    }
 
     impl BackendPlanner for FsyncCompletionPlanner {
         fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            let kind = match request.op {
+                PageIoOp::Writeback => PageIoCompletionKind::WritebackFinished,
+                PageIoOp::Fsync => PageIoCompletionKind::Noop,
+                other => panic!("unexpected fsync planner op: {other:?}"),
+            };
             BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
                 PageCompletion::new(
                     request.id,
                     request.range,
                     PageIoResult::Done,
                     request.generation_hint.unwrap_or(PageGeneration::new(0)),
-                    PageIoCompletionKind::Noop,
+                    kind,
                 )
             ]))
+        }
+
+        fn complete_page_io(&self, completion: crate::fs_iface::BackendPageCompletion) {
+            self.completions.lock().push(completion);
         }
     }
 
     let fs = Arc::new(RecordingFs::new());
-    let planner: Arc<dyn BackendPlanner> = Arc::new(FsyncCompletionPlanner);
+    let planner = Arc::new(FsyncCompletionPlanner {
+        completions: SpinMutex::new(alloc::vec::Vec::new()),
+    });
     let pc = file_page_container_cap_with_planner(
         fs.clone(),
         fs.clone(),
         FsObjectId::new(103),
         2,
-        planner,
+        planner.clone(),
     );
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+    }
     let mut op = crate::vfs::FileFsyncOp {
         page_backing: fs,
         fs_object_id: FsObjectId::new(103),
@@ -3513,12 +3625,158 @@ fn vfs_fsync_op_waits_for_page_container_planner_completion() {
     };
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
 
-    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    let (source_id, interests) = match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => crate::page_backed::notification::wait_source_parts(&shape)
+            .expect("VFS fsync should yield on PageContainer completion"),
+        other => panic!("expected pending VFS fsync yield, got {other:?}"),
+    };
+    let source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(source_id))
+            .expect("registered VFS fsync completion source");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription = source.register(
+        Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(interests),
+    );
     for _ in 0..2 {
         pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
             .expect("fsync service drive");
     }
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            ..
+        }) if seen_generation == generation && source.raw() == source_id
+    ));
+    match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => assert_eq!(
+            crate::page_backed::notification::wait_source_parts(&shape),
+            Some((source_id, interests))
+        ),
+        other => panic!("expected fsync barrier yield after writeback, got {other:?}"),
+    }
+    for _ in 0..2 {
+        pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+            .expect("fsync barrier service drive");
+    }
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
+    assert!(!pc.page_marks(page).expect("page marks").dirty);
+    let completions = planner.completions.lock();
+    assert_eq!(completions.len(), 2);
+    assert_eq!(completions[0].op, PageIoOp::Writeback);
+    assert_eq!(completions[0].result, PageIoResult::Done);
+    assert_eq!(completions[1].op, PageIoOp::Fsync);
+    assert_eq!(completions[1].result, PageIoResult::Done);
+}
+
+#[test]
+fn vfs_fsync_op_wakes_and_returns_backend_planner_error() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct FsyncErrorPlanner;
+
+    impl BackendPlanner for FsyncErrorPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Err(Errno::EIO)
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(105),
+        2,
+        Arc::new(FsyncErrorPlanner),
+    );
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs,
+        fs_object_id: FsObjectId::new(105),
+        page_container: Some(pc.clone()),
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    let (source_id, interests) = match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => crate::page_backed::notification::wait_source_parts(&shape)
+            .expect("VFS fsync should yield on PageContainer completion"),
+        other => panic!("expected pending VFS fsync yield, got {other:?}"),
+    };
+    let source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(source_id))
+            .expect("registered VFS fsync error source");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription = source.register(
+        Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(interests),
+    );
+    for _ in 0..2 {
+        pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+            .expect("fsync error service drive");
+    }
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            ..
+        }) if seen_generation == generation && source.raw() == source_id
+    ));
+    assert_eq!(op.step(&mut ctx), V3Out::err(V3Errno::EIO));
+}
+
+#[test]
+fn vfs_fsync_op_uses_synchronous_page_flush_without_backend_planner() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_cap(fs.clone(), fs.clone(), FsObjectId::new(104), 2);
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+    }
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs,
+        fs_object_id: FsObjectId::new(104),
+        page_container: Some(pc.clone()),
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(op.step(&mut ctx), V3Out::done(()));
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert!(!pc.page_marks(page).expect("page marks").dirty);
+    assert!(matches!(
+        pc.state
+            .lock()
+            .file_page_slots
+            .get(&page)
+            .expect("page slot")
+            .snapshot()
+            .state,
+        PageSlotState::Resident { .. }
+    ));
 }
 
 #[test]
@@ -3550,10 +3808,11 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
     let mut op = crate::page_backed::FsyncOp::new(&pc);
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
 
-    assert_eq!(
-        op.step(&mut ctx),
-        V3Out::continue_with(crate::page_backed::adapter::step_engine::PageProgress::EMPTY)
-    );
+    let (source_id, interests) = match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => crate::page_backed::notification::wait_source_parts(&shape)
+            .expect("dirty-frontier fsync should yield on writeback"),
+        other => panic!("expected dirty-frontier fsync yield, got {other:?}"),
+    };
     let writeback = pc
         .state
         .lock()
@@ -3571,6 +3830,16 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
         .file_io_service
         .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
         .is_none());
+    let source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(source_id))
+            .expect("registered dirty-frontier completion source");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let wait_generation = mailbox.next_generation();
+    let _subscription = source.register(
+        Arc::downgrade(&mailbox),
+        wait_generation,
+        tx_substrate::step::InterestMask::new(interests),
+    );
     pc.state
         .lock()
         .file_io_service
@@ -3585,10 +3854,21 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
     pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
         .expect("writeback completion drive");
 
-    assert_eq!(
-        op.step(&mut ctx),
-        V3Out::continue_with(crate::page_backed::adapter::step_engine::PageProgress::EMPTY)
-    );
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation,
+            source,
+            ..
+        }) if generation == wait_generation && source.raw() == source_id
+    ));
+    match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => assert_eq!(
+            crate::page_backed::notification::wait_source_parts(&shape),
+            Some((source_id, interests))
+        ),
+        other => panic!("expected fsync barrier yield after writeback, got {other:?}"),
+    }
     assert!(pc
         .state
         .lock()

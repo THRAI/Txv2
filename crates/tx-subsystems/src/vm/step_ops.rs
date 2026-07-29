@@ -33,6 +33,7 @@ fn vmmap_error_to_errno(error: VmMapError) -> Errno {
         VmMapError::WouldBlock => Errno::EAGAIN,
         VmMapError::BackingOffsetOverflow => Errno::EINVAL,
         VmMapError::Pmap(_) => Errno::EIO,
+        VmMapError::PageAlloc(_) => Errno::ENOMEM,
         VmMapError::Private(_) => Errno::ENOMEM,
     }
 }
