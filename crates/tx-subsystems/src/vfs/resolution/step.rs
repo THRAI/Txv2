@@ -469,7 +469,17 @@ fn crossing_mount_for(
     guard: &Guard<'_>,
 ) -> Option<Cap<MountIdentity>> {
     if let Some(namespace) = mount_namespace {
-        return namespace.mount_for(child_dentry);
+        if let Some(mount) = namespace.mount_for(child_dentry) {
+            return Some(mount);
+        }
+        // The registered mountpoint DEntry is held weakly by its parent's
+        // child cache; a mutation invalidation on the parent (e.g. `mkdir
+        // /etc` invalidating "/") drops it, after which the walker holds a
+        // freshly materialised instance whose cap key cannot match. Fall
+        // back to object identity — still namespace-local.
+        return mount_payload.and_then(|payload| {
+            namespace.mount_for_mountpoint_object(payload, child_fs_object_id)
+        });
     }
 
     child_dentry

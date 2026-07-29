@@ -953,13 +953,49 @@ impl DEntry {
 /// - Output bytes are not validated as UTF-8 — POSIX paths are
 ///   byte sequences with `/` and `\0` reserved.
 pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
-    let mut components: alloc::vec::Vec<InlineName> = alloc::vec::Vec::new();
-    components.push(dentry.name());
+    render_dentry_path_in_namespace(dentry, None)
+}
 
-    let mut current = dentry.parent_hint();
-    while let Some(parent_cap) = current {
-        components.push(parent_cap.name());
-        current = parent_cap.parent_hint();
+/// Namespace-aware variant of [`render_dentry_path`]: when the parent-hint
+/// chain tops out at a mounted filesystem's root dentry, hop to that mount's
+/// mountpoint dentry and keep walking toward the namespace root.
+///
+/// Without the hop, a cwd inside a mount renders with the mountpoint
+/// component silently dropped — `cd /musl/root/t1` then `getcwd()` returned
+/// `/root/t1`, and every caller that round-trips the result through an
+/// absolute-path walk (git stores `getcwd()` output and re-opens
+/// `<cwd>/.git`) landed in a directory that does not exist. `None` keeps the
+/// plain chain rendering for callers with no namespace in scope.
+pub fn render_dentry_path_in_namespace(
+    dentry: &Cap<DEntry>,
+    namespace: Option<&Cap<crate::mount::MountNamespace>>,
+) -> Option<alloc::vec::Vec<u8>> {
+    let mut components: alloc::vec::Vec<InlineName> = alloc::vec::Vec::new();
+    let mut cursor: Cap<DEntry> = dentry.clone();
+    // Mount hops are bounded so a mis-registered mountpoint chain (a cycle)
+    // degrades to a truncated path instead of a hang.
+    let mut hops = 0usize;
+    loop {
+        components.push(cursor.name());
+        if let Some(parent) = cursor.parent_hint() {
+            cursor = parent;
+            continue;
+        }
+        // Chain top. If it is the root of a mounted fs, continue from the
+        // dentry the mount is attached to (e.g. `/musl`).
+        let Some(ns) = namespace else { break };
+        let Some(mount) = ns.mount_containing_dentry(&cursor) else {
+            break;
+        };
+        let Some(mountpoint) = mount.mountpoint() else {
+            // The namespace root mount: rendering is complete.
+            break;
+        };
+        if mountpoint.key() == cursor.key() || hops >= 8 {
+            break;
+        }
+        hops += 1;
+        cursor = mountpoint;
     }
 
     // components collected leaf → root; reverse for root → leaf rendering.

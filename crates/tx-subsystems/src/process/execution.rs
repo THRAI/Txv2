@@ -1618,7 +1618,12 @@ pub fn step_getcwd(target: &Cap<ProcessIdentity>) -> Option<alloc::vec::Vec<u8>>
     // publish
     let payload = target.upgrade_operational().ok()?;
     let cwd = payload.cwd()?;
-    crate::vfs::render_dentry_path(&cwd)
+    // Namespace-aware: a cwd inside a mounted fs (e.g. the sdcard ext4 at
+    // /musl) must render with its mountpoint prefix, or callers that
+    // round-trip getcwd() through an absolute walk resolve a directory
+    // that does not exist.
+    let ns = target.mount_namespace_cap();
+    crate::vfs::render_dentry_path_in_namespace(&cwd, ns.as_ref())
 }
 
 /// Day-1 setpgid: supports creating a fresh process group rooted at

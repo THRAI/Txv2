@@ -50,7 +50,7 @@ fn push_hex(buf: &mut [u8], n: &mut usize, value: u64) {
 }
 
 /// Emit one watch event line: `txkernel:vmwatch:<tag> <hex> <hex> ...`.
-pub(crate) fn probe_emit(tag: &str, vals: &[u64]) {
+pub fn probe_emit(tag: &str, vals: &[u64]) {
     let raw = SINK.load(Ordering::Acquire);
     if raw == NO_SINK {
         return;

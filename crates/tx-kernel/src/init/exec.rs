@@ -412,6 +412,21 @@ impl<P: TxPlatform> CoreInit<P> {
                         tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:fail:errno=");
                         Self::write_decimal_unsigned(errno as usize);
                         tx_hal::console_write_str::<P>("\n");
+                        // Same diagnostic the selected-init lane emits: which
+                        // component of the walk failed, and with what errno.
+                        let last_open_errno =
+                            tx_scripts::process::exec::script::EXEC_LAST_OPEN_ERRNO
+                                .load(core::sync::atomic::Ordering::Relaxed);
+                        let vfs_ctx = tx_subsystems::vfs::resolution::last_ctx();
+                        let mut rendered = [0u8; 256];
+                        let rendered_len =
+                            tx_subsystems::vfs::resolution::render_ctx(&vfs_ctx, &mut rendered);
+                        Self::write_board_sentinel_prefix();
+                        tx_hal::console_write_str::<P>(":runsh:diag:last-open-errno=");
+                        Self::write_decimal_unsigned(last_open_errno.max(0) as usize);
+                        tx_hal::console_write_str::<P>(":vfs:");
+                        tx_hal::console_write_bytes::<P>(&rendered[..rendered_len]);
+                        tx_hal::console_write_str::<P>("\n");
                     }
                     None => tx_hal::console_write_str::<P>(
                         ":bootstrap-exec:runsh:fail:poll-budget\n",
@@ -1689,7 +1704,7 @@ fn ltp_args_from_cmdline<P: tx_hal::TxPlatform>() -> LtpArgs<'static> {
     args
 }
 
-fn cmdline_value<P: tx_hal::TxPlatform>(key: &str) -> Option<&'static str> {
+pub(super) fn cmdline_value<P: tx_hal::TxPlatform>(key: &str) -> Option<&'static str> {
     let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
     for token in cmdline.split_ascii_whitespace() {
         let Some((token_key, value)) = token.split_once('=') else {

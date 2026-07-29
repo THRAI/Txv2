@@ -309,16 +309,24 @@ pub const EXECVE_PATH_MAX: usize = 4096;
 
 /// Maximum total argv + envp byte budget per `execve(2)` call.
 ///
-/// Linux's `ARG_MAX` is 128 KiB but the Phase 6 plan caps the inline
-/// buffer at 8 KiB to keep the same discipline as the `write` /
-/// `sigaction` arms. Overflow returns `-E2BIG`. Could be lifted to
-/// 128 KiB now that the user-VA `copy_from_user` lane has landed.
-pub const EXECVE_ARG_MAX_INLINE: usize = 8192;
+/// Set to Linux's `ARG_MAX` (128 KiB). The Phase 6 plan originally capped
+/// the inline buffer at 8 KiB, but git spawns its remote helpers /
+/// index-pack with a large inherited environment; at 8 KiB the tail of the
+/// environment — `GIT_DIR` among it — never reaches the child, and
+/// index-pack dies with "--stdin requires a git repository" while clone
+/// reports "invalid index-pack output". The user-VA `copy_from_user` lane
+/// makes the larger transient buffer safe; overflow still returns
+/// `-E2BIG`. (Restored from the pre-merge tree, B3 of the net-git
+/// enablements — the merge took main's exec rewrite, which reverted this
+/// to the Phase 6 value.)
+pub const EXECVE_ARG_MAX_INLINE: usize = 131_072;
 
-/// Maximum number of pointer slots walked through `argv` / `envp`
-/// before we give up. The Phase 6 plan caps at 256; in practice the
-/// total-byte cap (`EXECVE_ARG_MAX_INLINE`) bounds well below this.
-pub const EXECVE_VEC_MAX: usize = 256;
+/// Maximum number of pointer slots walked through `argv` / `envp` before
+/// we give up. Raised from 256 to 1024 so a large inherited git
+/// environment (remote-helper spawn) fits; the total-byte cap
+/// (`EXECVE_ARG_MAX_INLINE`) still bounds the aggregate. (Restored from
+/// the pre-merge tree alongside `EXECVE_ARG_MAX_INLINE`.)
+pub const EXECVE_VEC_MAX: usize = 1024;
 
 /// Linux generic ABI errno value for "function not implemented" (`ENOSYS`).
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every

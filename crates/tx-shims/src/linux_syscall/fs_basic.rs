@@ -624,7 +624,27 @@ fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
 
 fn queue_file_close_writeback(file: &Cap<OpenFile>) {
     if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
-        let _ = pc.queue_dirty_file_writeback();
+        // The async close-writeback admission only makes progress when the
+        // mount has a backend planner driving the L4 pipeline. The bootstrap
+        // sdcard ext4 deliberately has none (block-completion IRQs cannot be
+        // serviced while the bootstrap exec is the only thing running), so
+        // fall back to the synchronous flush — the same planner/no-planner
+        // split `FsyncOp` makes. Without this, every file written on that
+        // mount closed with its bytes still in the page cache: `git init`
+        // left `.git/HEAD` and `.git/config` existing but EMPTY, and git
+        // then reported "not a git repository".
+        let planner_backed = match pc.kind() {
+            tx_subsystems::page_backed::PageContainerKind::File { mount, .. } => {
+                mount.payload().backend_planner().is_some()
+            }
+            _ => true,
+        };
+        if planner_backed {
+            let _ = pc.queue_dirty_file_writeback();
+        } else {
+            let guard = step_engine::guard();
+            let _ = tx_subsystems::page_backed::step_fsync(&pc, &guard);
+        }
     }
 }
 

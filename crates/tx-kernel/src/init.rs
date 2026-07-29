@@ -724,7 +724,23 @@ impl<P: TxPlatform> CoreInit<P> {
             if boot_plan.args.mount_sdcard {
                 Self::mount_sdcard_at_musl();
             }
+            // `tx.runsh` runs Alpine userland out of the mounted ext4 image,
+            // but it still needs the kernel rootfs skeleton: `/bin/sh`
+            // shebang shims, `/tmp`, identity files, resolver databases. The
+            // lane boots without a mode flag, so `BootPlan` classifies it as
+            // `LinuxLike` and would skip all of that — and then git's helper
+            // spawn and the `overlay_image_dirs_for_runsh` bind mounts have
+            // nothing to attach to. The pre-merge tree had no such gate and
+            // always populated; force the legacy behaviour for this lane.
+            let runsh_lane = exec::cmdline_value::<P>("tx.runsh").is_some();
             match boot_plan.rootfs_setup {
+                _ if runsh_lane => {
+                    Self::populate_rootfs_shebang_shims();
+                    Self::populate_rootfs_tmp_dirs();
+                    Self::populate_rootfs_identity_files();
+                    Self::populate_rootfs_kernel_config();
+                    Self::populate_rootfs_network_databases();
+                }
                 RootfsSetup::LinuxLike => {
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":rootfs-shims:skip:");
@@ -1681,48 +1697,42 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{
-            mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
-            Ext4FileIoRuntimeBinder, JournalPagePool,
-        };
-        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
-        use tx_subsystems::io_manager::block::DeviceKey;
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
+        use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
         };
 
-        let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
-        let Some(geometry) = image.block_geometry(device) else {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
-            return;
-        };
-        // The pool holds the active ordered transaction's descriptor, commit,
-        // metadata journal copies, and later home-block checkpoint copies.
-        // Ext4Pager currently supports at most four inline extent mutations,
-        // so 32 pages leaves headroom without allowing unbounded staging.
-        let pool = match JournalPagePool::new(32) {
-            Ok(pool) => pool,
+        // Plain read-write mount, NOT the journal-discovering variant.
+        //
+        // `mount_ext4_read_write_with_discovered_journal` attaches a backend
+        // planner, which routes page fetches through the async io_manager
+        // (`try_materialize_file_page_from_backend_plan`). That path only
+        // completes once block-completion interrupts are being serviced,
+        // which is not true during bootstrap exec: the fetch for the first
+        // userspace image parks forever, `exec_script` never resolves, and
+        // boot falls through to `/init` -> ENOENT -> panic.
+        //
+        // Without the planner the fetch falls back to ext4's synchronous
+        // `fetch_page` (`tx-ext4/src/pager.rs`). That is what the pre-merge
+        // tree did and what `tools/verify-git-net.sh` passes 8/8 on.
+        // Journalled writeback for this mount is given up in exchange; the
+        // sdcard image is a test fixture, and the pre-merge tree ran the
+        // same way.
+        let mount_output = match mount_ext4_read_write(image) {
+            Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
                 return;
             }
         };
-        let mount_output =
-            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
-                Ok(out) => out,
-                Err(_) => {
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
-                    return;
-                }
-            };
-        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
-            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
-        )));
+        // No file-I/O service binder either, for the same reason as the
+        // missing backend planner below: the per-container service task it
+        // registers only makes progress once block completions are being
+        // delivered, which is not the case during bootstrap exec.
 
         let root_mount = ROOT_MOUNT
             .lock()
@@ -1757,7 +1767,22 @@ impl<P: TxPlatform> CoreInit<P> {
             publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"musl", musl_rnode_in_root);
 
         // Build the ext4 mount payload.
-        let ext4_payload = MountPayload::new_cap_with_backend_planner(
+        //
+        // NO backend planner on this mount, deliberately. A planner routes
+        // page fetches through the async io_manager
+        // (`try_materialize_file_page_from_backend_plan`), whose completion
+        // depends on a block-completion interrupt. The bootstrap exec that
+        // loads the first userspace image runs before any of that can be
+        // serviced: the fetch parks forever and `exec_script` never resolves,
+        // so `/musl/...` binaries are unloadable and boot falls through to
+        // `/init` -> ENOENT -> panic. Without a planner the fetch falls back
+        // to ext4's synchronous `fetch_page` (`tx-ext4/src/pager.rs`), which
+        // is what the pre-merge tree did and what `tools/verify-git-net.sh`
+        // passes 8/8 on.
+        //
+        // Scoped to this mount only: mounts created later, once the reactor
+        // and block IRQs are live, may attach a planner normally.
+        let ext4_payload = MountPayload::new_cap(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
@@ -1765,7 +1790,6 @@ impl<P: TxPlatform> CoreInit<P> {
             MountOptions::default(),
             "ext4",
             SourceLabel::Static("vda"),
-            mount_output.backend_planner(),
         )
         .expect("mount_sdcard_at_musl: ext4 payload reservation");
 
@@ -2683,16 +2707,27 @@ impl<P: TxPlatform> CoreInit<P> {
                 };
                 step_engine::sign_for(res, raw)
             };
-            // Mountpoint DEntry on the rootfs.
+            // Mountpoint DEntry on the rootfs — published into the root
+            // dentry's child cache, exactly like the `/musl` mountpoint.
+            //
+            // This is the load-bearing step. The walker's mount crossing
+            // (`crossing_mount_for`, vfs/resolution/step.rs) consults the
+            // mount NAMESPACE first, and `MountNamespace::mount_for` matches
+            // by DEntry cap key — the walker must hold the *same* DEntry
+            // instance we register. Publishing via `cache_child` makes the
+            // walker's lookup of e.g. "lib" under the root hit this instance
+            // (its rnode carries the authoritative tmpfs fs_object_id, so
+            // the resolution-authority filter accepts the cached child). A
+            // free-floating `DEntry::new_cap` — what the pre-merge tree did,
+            // when crossings were keyed by (payload, fs_object_id) — is
+            // invisible to the DEntry-keyed namespace: the walk then falls
+            // into the EMPTY tmpfs skeleton dir and the loader dies with
+            // ENOENT on /lib/ld-musl-riscv64.so.1.
             let Ok(skel_rnode) = RNode::new_cap(skel_id, skel_meta, RNodeBacking::Directory) else {
                 continue;
             };
-            let Ok(inline) = InlineName::new(name) else {
-                continue;
-            };
-            let Ok(mountpoint_dentry) = DEntry::new_cap(inline, skel_rnode) else {
-                continue;
-            };
+            let mountpoint_dentry =
+                publish_boot_mountpoint_dentry(root_mount.root_dentry(), name, skel_rnode);
             let Ok(overlay_mount) = MountIdentity::new_cap(
                 mount::allocate_mount_id(),
                 Some(mountpoint_dentry.clone()),
@@ -2705,10 +2740,12 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             mount::register_mount(&rootfs_payload, skel_id, overlay_mount.clone());
             if let Some(mnt_ns) = init_mount_namespace() {
-                // main keys namespace mounts by the mountpoint DEntry rather
-                // than (payload, fs_object_id) — hence the retained clone above.
                 mnt_ns.register_mount(&mountpoint_dentry, overlay_mount);
             }
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":runsh:overlay:");
+            tx_hal::console_write_bytes::<P>(name);
+            tx_hal::console_write_str::<P>(":ok\n");
         }
     }
 

@@ -229,11 +229,21 @@ impl AddressSpace {
             let fault = VmFault::new(page_addr, kind.required_prot());
             let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
                 Ok(o) => o,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
+                Err(e) => {
+                    // PROBE(git fork-exec EFAULT hunt): which VA, which error.
+                    crate::vm::probe::probe_emit(
+                        "resv-fault",
+                        &[page_addr.0 as u64, vm_fault_error_probe_code(&e)],
+                    );
+                    return V3::err(Errno::EFAULT.into());
+                }
             };
             let materialization = match outcome.materialize_pagebacked() {
                 Ok(m) => m,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
+                Err(_) => {
+                    crate::vm::probe::probe_emit("resv-mat", &[page_addr.0 as u64]);
+                    return V3::err(Errno::EFAULT.into());
+                }
             };
             // Publish the materialisation. `replace_existing` honours
             // the materialisation's own intent (private CoW path sets
@@ -250,6 +260,7 @@ impl AddressSpace {
                 )
                 .is_err()
             {
+                crate::vm::probe::probe_emit("resv-pub", &[page_addr.0 as u64]);
                 return V3::err(Errno::EFAULT.into());
             }
         }
@@ -760,5 +771,25 @@ fn resolve_user_page(
                 }
             }
         }
+    }
+}
+
+
+/// PROBE(git fork-exec EFAULT hunt): stable small codes for
+/// `VmFaultError` variants so the vmwatch line can carry the cause.
+fn vm_fault_error_probe_code(e: &crate::vm::VmFaultError) -> u64 {
+    use crate::vm::VmFaultError as E;
+    match e {
+        E::Range(_) => 1,
+        E::NoRecipe => 2,
+        E::ProtectionViolation => 3,
+        E::WouldBlock => 4,
+        E::BackingMismatch => 5,
+        E::BackingOffsetOverflow => 6,
+        E::PageBeyondSize => 7,
+        E::PageCache(_) => 8,
+        E::SpecialUnavailable => 9,
+        E::StaleRecipe => 10,
+        E::Pmap(_) => 11,
     }
 }
