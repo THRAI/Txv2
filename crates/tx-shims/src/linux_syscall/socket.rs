@@ -19,8 +19,8 @@ use tx_subsystems::net::{
     step_process_loopback_udp, step_recv_kernel_bytes, step_sctp_peeloff,
     step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
     step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
-    step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
-    step_socket_open_file_in_namespace, step_tcp_loopback_handshake,
+    step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_open_file_in_namespace,
+    step_tcp_loopback_handshake,
     step_tcp_loopback_transfer, step_unix_socketpair_connect, AddressFamily,
     ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr,
     LingerOption, NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags, SockAddrIn,
@@ -3766,12 +3766,11 @@ pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
     if file.retain_count() > 1 {
         return;
     }
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(_) => return,
+    let Some(ops) = file.file_ops() else {
+        return;
     };
     let guard = tx_substrate::epoch::guard();
-    let _ = step_socket_close(&socket, &guard);
+    ops.on_last_close(&guard);
 }
 
 pub(super) fn can_fast_close_stateless_netlink_socket(file: &Cap<OpenFile>) -> bool {

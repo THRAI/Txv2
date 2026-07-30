@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use tx_services::time::{
     ClockRead, DeadlineRegistrarHandle, TimekeeperClock, TimekeeperIf, timekeeper,
 };
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::device::{RtcAlarmEmulation, RtcTime};
 use tx_subsystems::tty::execution::{
     IoctlTcgetsOp, IoctlTcsetsOp, IoctlTiocgpgrpOp, IoctlTiocgwinszOp, IoctlTiocnottyOp,
@@ -504,15 +505,11 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => {
                     if (arg & O_NONBLOCK as u64) != 0 {
-                        if let OpenFileBacking::Rnode { rnode } = file.backing() {
-                            if let RNodeBacking::StructBacked {
-                                payload: StructPayload::Socket { identity },
-                            } = rnode.backing()
-                            {
-                                identity
-                                    .readiness
-                                    .fire_send(tx_subsystems::net::structure::SendWireSet::SPACE);
-                            }
+                        if let Some(ops) = file.file_ops() {
+                            let mut post = |mailbox: &TaskMailbox, event: MailboxEvent| {
+                                ctx.post_mailbox_ref_event(mailbox, event)
+                            };
+                            ops.on_set_fl_nonblock(&mut post);
                         }
                     }
                     SyscallResult::Return(0)

@@ -71,9 +71,15 @@ impl FileOps for Cap<SocketIdentity> {
         }
     }
 
-    fn on_set_fl_nonblock(&self) {
+    fn on_set_fl_nonblock(
+        &self,
+        post: &mut dyn FnMut(
+            &tx_substrate::wake::TaskMailbox,
+            tx_substrate::wake::MailboxEvent,
+        ) -> bool,
+    ) {
         self.readiness
-            .fire_send(crate::net::structure::SendWireSet::SPACE);
+            .fire_send_with_post(crate::net::structure::SendWireSet::SPACE, post);
     }
 
     fn on_last_close(&self, guard: &Guard<'_>) {

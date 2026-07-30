@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 
 use tx_substrate::bus::{RawPort, RawQueue};
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 use crate::net::adapter::wait_routing;
 use crate::sync::SpinMutex;
@@ -75,6 +76,16 @@ impl SocketReadiness {
         }
     }
 
+    fn notify_mirror_with_post(
+        slot: &SpinMutex<Option<Arc<wait_routing::WaitSource>>>,
+        bits: u64,
+        post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    ) {
+        if let Some(source) = &*slot.lock() {
+            wait_routing::notify_v3_source_with_post(source, bits, post);
+        }
+    }
+
     pub fn fire_recv(&self, set: RecvWireSet) -> usize {
         let wakes = self.recv_wq.fire(set.bits());
         Self::notify_mirror(&self.recv_src, set.bits());
@@ -88,6 +99,18 @@ impl SocketReadiness {
     pub fn fire_send(&self, set: SendWireSet) -> usize {
         let wakes = self.send_wq.fire(set.bits());
         Self::notify_mirror(&self.send_src, set.bits());
+        wakes
+    }
+
+    pub fn fire_send_with_post(
+        &self,
+        set: SendWireSet,
+        post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    ) -> usize {
+        let wakes = self
+            .send_wq
+            .fire_with_post(set.bits(), |mailbox, event| post(mailbox, event));
+        Self::notify_mirror_with_post(&self.send_src, set.bits(), post);
         wakes
     }
 

@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 use crate::adapter::step_engine::{
     self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
@@ -270,7 +271,12 @@ pub trait FileOps: Send + Sync {
 
     /// F_SETFL O_NONBLOCK side-effect hook (P3-S5). Sockets re-kick send
     /// readiness so writers parked behind a formerly-blocking fd re-poll.
-    fn on_set_fl_nonblock(&self) {}
+    fn on_set_fl_nonblock(
+        &self,
+        post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    ) {
+        let _ = post;
+    }
 
     /// Last-close teardown (P3-S5): the kind's close protocol, run by the
     /// close/exit lanes once no other retainer holds the open-file
