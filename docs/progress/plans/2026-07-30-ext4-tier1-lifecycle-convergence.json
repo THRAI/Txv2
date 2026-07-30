@@ -110,7 +110,7 @@
     {
       "id": "task-03-owned-file-io",
       "title": "Add PageDataLease and OwnedFileIoRequest",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-02-admission"
       ],
@@ -124,7 +124,7 @@
         "cargo test -p tx-subsystems --lib page_data_lease -- --test-threads=1",
         "cargo -q xtask unit"
       ],
-      "notes": "The submit-failure value must retain the complete bundle; finish is the only terminalizer for success, stale completion, and error."
+      "notes": "Completed at 3b4732be. PageBacked now owns one request record for writeback/read/control state, terminal completion retires its matching L4 row, and pre-admission fetch retirement consumes its control owner. Missing-owner completions leave PageSlot state unchanged. Verified cargo test -p tx-subsystems --lib owned_request_, cargo test -p tx-subsystems --lib page_backed -- --test-threads=1 (148 passed), cargo -q xtask unit, legacy dual-map cleanup scan, and git diff --check."
     },
     {
       "id": "task-04-page-backed-migration",
