@@ -19,6 +19,29 @@
   overlapping historical ext4 plans with one executable
   lifecycle-convergence plan.
 
+- 2026-07-30 (ext4 Tier 1 lifecycle convergence execution ledger).
+  Added the single executable plan
+  `docs/superpowers/plans/2026-07-30-ext4-tier1-lifecycle-convergence.md`
+  and its active progress ledger
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  The plan keeps the three lifecycle owners but makes the implementation
+  boundaries executable: L4 owns an admitted I/O payload until terminal return
+  while PageBacked owns the terminal route, the lease crosses the filesystem
+  boundary only as a neutral projection, MountPayload owns the shared runtime
+  cell, graph custody covers every data/journal/flush node, normal mutation
+  callers queue behind the single owner, lazy detach waits for the final
+  payload user, extending writes preflight before dirty publication, and the
+  capability ledger is the sole profile authority with a hash parity gate.
+  The three overlapping ext4 ledgers are now `canceled`; completed rows remain
+  historical evidence and all pending/in-progress rows are canceled. No Rust
+  or xtask implementation changed in this catch-up. Verification passed
+  `cargo xtask progress validate` for 39 records, `cargo xtask lint docs` (the
+  7 existing retired-vocabulary discussion warnings remain warnings), the plan
+  placeholder scan, and both unstaged and staged `git diff --check`. Product
+  acceptance remains blocked by the current
+  direct home-write paths, ignored FUA/recovery gaps, and absent live QEMU /
+  e2fsck / xfstests receipt. Next: execute Task 1 in an isolated worktree.
+
 - 2026-07-25 (memory/I-O ext4 implementation-readiness correction).
   Re-audited the canonical dual-plane plan against the current ext4,
   PageBacked, journal, namespace, and I/O-manager callsites. The architecture

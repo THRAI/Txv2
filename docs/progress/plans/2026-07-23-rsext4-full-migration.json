@@ -2,9 +2,9 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-07-23-rsext4-full-migration",
   "title": "Converge Tx-native ext4 on Tier 1 and Tier 2 Linux compatibility",
-  "status": "active",
+  "status": "canceled",
   "created": "2026-07-23",
-  "updated": "2026-07-25",
+  "updated": "2026-07-30",
   "owner": "ext4-migration-coordinator",
   "summary": "Keep ext4 as a Tx-native mounted kernel filesystem, close the controlled Tier 1 production profile, then add the declared Tier 2 mainstream Linux surface using Linux, e2fsprogs and xfstests as compatibility authorities; rsext4 remains an algorithm reference only.",
   "scope": {
@@ -78,7 +78,7 @@
     {
       "id": "p1-format-admission",
       "title": "Complete on-disk codecs, checksums and feature admission",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p0-ledger-fixtures"],
       "paths": ["crates/tx-ext4-format/src/ondisk.rs", "crates/tx-ext4-format/src/checksum.rs", "crates/tx-ext4-format/src/journal.rs"],
       "verification": ["cargo test -p tx-ext4-format", "e2fsck -fn on supported fixtures"],
@@ -87,7 +87,7 @@
     {
       "id": "p2-read-path",
       "title": "Close Tier 1 extent, htree and symlink read paths",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p1-format-admission"],
       "paths": ["crates/tx-ext4-format/src/extent", "crates/tx-ext4-format/src/directory", "crates/tx-ext4/src/read_backend.rs", "crates/tx-ext4/src/planner.rs"],
       "verification": ["cargo test -p tx-ext4-format", "cargo test -p tx-ext4 --lib --no-default-features", "RV64 QEMU read fixture witness"],
@@ -96,7 +96,7 @@
     {
       "id": "p3-mutation-contract",
       "title": "Define and implement the immutable mutation/read-set admission contract",
-      "status": "in-progress",
+      "status": "canceled",
       "depends_on": ["p1-format-admission"],
       "paths": ["docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md", "docs/design/05_filesystem/IO_MANAGER_v1.md", "crates/tx-ext4-format/src/mutation.rs", "crates/tx-ext4/src/journal.rs"],
       "verification": ["cargo xtask lint docs", "cargo test -p tx-ext4-format mutation", "cargo test -p tx-ext4 --lib --no-default-features journal"],
@@ -105,7 +105,7 @@
     {
       "id": "p4-setattr",
       "title": "Land chmod, chown, utimens and size setattr as the first journaled vertical slice",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p3-mutation-contract"],
       "paths": ["crates/tx-ext4-format", "crates/tx-ext4/src/namespace.rs", "crates/tx-subsystems/src/vfs", "crates/tx-shims/src/linux_syscall"],
       "verification": ["focused chmod/chown/utimens host tests", "pre/post-commit crash cuts", "chmod +x /musl libc.so, remount and exec guest witness"],
@@ -114,7 +114,7 @@
     {
       "id": "p5-allocator-extents",
       "title": "Close Tier 1 allocator, bounded extent mutation, sparse growth and truncate",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p3-mutation-contract"],
       "paths": ["crates/tx-ext4-format/src/allocator", "crates/tx-ext4-format/src/extent", "crates/tx-ext4/src/pager.rs", "crates/tx-ext4/src/planner.rs"],
       "verification": ["allocator and extent property tests", "profile-bound fragmented write/truncate/refill", "e2fsck -fn"],
@@ -123,7 +123,7 @@
     {
       "id": "p6-namespace",
       "title": "Close Tier 1 namespace mutations as atomic transactions",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p5-allocator-extents"],
       "paths": ["crates/tx-ext4-format/src/directory", "crates/tx-ext4/src/namespace.rs", "crates/tx-subsystems/src/vfs"],
       "verification": ["random namespace model comparison", "unlinked-open lifetime tests", "e2fsck -fn after every generated sequence"],
@@ -132,7 +132,7 @@
     {
       "id": "p7-jbd2",
       "title": "Complete ordered-mode JBD2, checkpoint, replay and fsync",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p4-setattr", "p5-allocator-extents", "p6-namespace"],
       "paths": ["crates/tx-ext4-format/src/journal.rs", "crates/tx-ext4-format/src/journal_replay.rs", "crates/tx-ext4/src/journal.rs"],
       "verification": ["1000 deterministic power cuts", "fsync durability model", "e2fsck -fn after replay"],
@@ -141,7 +141,7 @@
     {
       "id": "p8-cutover",
       "title": "Cut production RW ext4 over to the planner and retire legacy writes",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p2-read-path", "p7-jbd2"],
       "paths": ["crates/tx-ext4", "crates/tx-fs/src/tx_ext4_bridge.rs", "crates/tx-kernel/src/init.rs"],
       "verification": ["static boundary lints", "cargo -q xtask unit", "fresh RV64 QEMU RW ext4 witness"],
@@ -150,7 +150,7 @@
     {
       "id": "p9-acceptance",
       "title": "Close Tier 1 Linux interoperability and guest acceptance",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p8-cutover"],
       "paths": ["tools/ext4", "tools/shell-tests", "docs/progress"],
       "verification": ["BusyBox and Alpine ext4 suites", "musl loader chmod/remount/exec", "TCC and SQLite WAL", "LTP filesystem cases", "Linux-to-Tx and Tx-to-Linux image exchange"],
@@ -159,7 +159,7 @@
     {
       "id": "p10-extensions",
       "title": "Close Tier 2 mainstream Linux compatibility",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": ["p9-acceptance"],
       "paths": ["docs/design/05_filesystem", "crates/tx-ext4-format", "crates/tx-ext4", "crates/tx-subsystems/src/vfs"],
       "verification": ["arbitrary-depth extent and htree split/merge fixtures", "orphan, xattr, ACL, fallocate and direct-I/O crash/coherency tests", "versioned selected xfstests generic/ext4 manifest", "codec and planner fuzzing", "long SMP mutation campaign", "Linux-to-Tx and Tx-to-Linux image exchange", "e2fsck -fn"],
