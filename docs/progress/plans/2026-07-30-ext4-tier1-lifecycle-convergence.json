@@ -129,7 +129,7 @@
     {
       "id": "task-04-page-backed-migration",
       "title": "Migrate PageBacked submission, resume, completion, and fsync",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-03-owned-file-io"
       ],
@@ -144,7 +144,7 @@
         "rg -n 'abort_writeback|complete_writeback|release_file_io_read_target|abort_file_writeback_submission' crates/tx-subsystems/src/page_backed --glob '*.rs'",
         "cargo -q xtask unit"
       ],
-      "notes": "Remove parallel manual cleanup maps and route initial planning, queue failure, resume failure, device completion, stale generation, duplicate completion, and fsync through one owner table."
+      "notes": "Completed at a16958f2. Writeback leases and read targets are retained at admission by OwnedFileIoRequest; every initial/resume planning and queue failure reaches its one terminalizer. A completion requires a matching read/writeback payload, so a control-only owner is poison and cannot settle PageSlot. Legacy fsync submission rows were removed; FileFsyncState retains only the frontier and calls FsPageBacking::fsync_file after it completes. Verified cargo test -p tx-subsystems --lib page_backed -- --test-threads=1 (154 passed), Tier 1 admission tests, cargo -q xtask unit, static legacy cleanup scans, cargo xtask progress validate, cargo xtask lint docs, and git diff --check."
     },
     {
       "id": "task-05-mutation-handle",

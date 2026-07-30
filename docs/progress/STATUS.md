@@ -1,3 +1,23 @@
+- 2026-07-30 (ext4 Tier 1 PageBacked lifecycle migration).
+  Completed Task 4 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json` in
+  `a16958f2`. PageBacked now creates retained writeback leases and read targets
+  at admission, terminalizes every initial/resume planning or queue failure
+  through `OwnedFileIoRequest`, and rejects a completion whose owner does not
+  retain the matching read/writeback payload. This makes a residual control
+  owner poison rather than permission to clear a dirty/writeback PageSlot.
+  The parallel `fsync_submission` map is removed: fsync waits on its captured
+  frontier and then invokes `FsPageBacking::fsync_file`; both PageBacked and
+  VFS use that route. Verification passed `cargo test -p tx-subsystems --lib
+  page_backed -- --test-threads=1` (154 passed), the Tier 1 capability tests,
+  `cargo -q xtask unit` (639 + 114 + 34 + 166), `cargo xtask progress
+  validate` (39 records), `cargo xtask lint docs`, legacy cleanup scans, and
+  `git diff --check`. Repository-wide `cargo fmt --check` still reports
+  unrelated pre-existing formatting drift outside this lifecycle change.
+  Next: Task 5, introduce `MutationHandle` and owned cross-yield mutation
+  tokens. Blockers for product Tier 1 remain mutation settlement, FUA/recovery
+  wiring, mount settlement, and G0-G7 QEMU/e2fsck/xfstests evidence.
+
 - 2026-07-30 (ext4 Tier 1 lifecycle architecture convergence).
   Added the active `docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md` contract
   and linked it from the design index and ext4 project plan. The approved
