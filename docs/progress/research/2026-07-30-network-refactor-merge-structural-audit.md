@@ -2,7 +2,7 @@
 
 日期：2026-07-30
 
-当前基线：`feature-network-refactor @ 6503312f`
+当前基线：`feature-network-refactor @ 26e7d79c`
 
 合并提交：`6d41a347`
 
@@ -172,7 +172,56 @@ CURL_RC:0
 `2026-07-30-net-irq-restoration-design.md`。10 ms floor 仍作为明确 watchdog，
 不再是正常流量的主要推进路径。
 
-下一轮优先恢复 FileOps 生产统一入口，再处理 TCP 动态 option/状态单一真相；
-L2/L3 所有权拆分和 wait 收敛属于更大的结构重构，应按独立计划推进。curl
-当前无功能阻塞；长期可复现性仍建议把 `latest-stable` 换成固定 Alpine
-branch/源校验记录。
+## Socket 特判复核：不能机械“全删”
+
+2026-07-30 对照合并前 feature 锚点 `90939012`、P3-A 四个落地提交
+`1fea8ea7` / `372a352a` / `5a097f37` / `e3b426b4`、后续 netlink 修复
+`52718fa2` 和当前生产路径后，原审计里“普通 read/write/poll/fcntl/close
+都回 FileOps”的表述需要收窄：
+
+| 路径 | 合并前拍板 | 当前判定 |
+|---|---|---|
+| 普通 INET/INET6 `read/write` | 通用 VFS `step_read/step_write -> FileOps` | 合并回退，应恢复 |
+| netlink `write` | 显式走 `dispatch_netlink_send`，否则通用字节发送永久等待 | 必要特判，保留 |
+| 无 mailbox 的 bootstrap socket read gate | 未就绪直接 `EAGAIN`，不能进入阻塞 drive | 必要特判，保留；只保留 gate，不保留全量 `recvfrom` 转发 |
+| socket staging 上限 | 使用 64 KiB，而不是 TTY 的 4 KiB | 必要类型策略，保留 |
+| `sendto/recvfrom/sendmsg/...` | 解析 sockaddr/msghdr/iovec/cmsg/user memory 后调用 net step | socket ABI 本身，保留 |
+| `poll/select/epoll` | P3-S4 当时经 FileOps | main 后来新增统一 `query_fd_ready` facade；保留 facade，不应机械回滚，只需消除它与 FileOps 的重复真相 |
+| `F_SETFL(O_NONBLOCK)` | 通用 flag mutation 后调 `FileOps::on_set_fl_nonblock` | 当前又直接访问 socket readiness，属回退，应恢复 hook |
+| `close/close_range/process exit` | 保留 retain-count/两相时序 bolt-on，只把种类语义交给 `FileOps::on_last_close` | 当前又直接匹配 Socket 并调 net close，属回退；时序壳保留、分派恢复 hook |
+| socket ioctl | 因 Linux request 解码、`SyscallCtx` 和 usercopy 保留 shim 特判 | 必要特判，保留 |
+| splice 拒 socket | 当前未实现 splice-socket，返回 `EINVAL` 是合法能力边界 | 保留 |
+| `socketpair(AF_UNIX)` | `OpenFileBacking::SocketPair` 是双 PipePayload，不是 SocketIdentity | 独立形态，保留 |
+
+当前 `net/file_ops.rs` 与合并前 blob 完全一致，真正丢的是接线：
+
+- `OpenFile::step_read/step_write` 的 `StructPayload::Socket` 臂当前返回
+  `EINVAL`；
+- `sys_read/sys_write` 对所有 socket 整体转发到 `recvfrom/sendto`；
+- `F_SETFL`、last-close 和 process-exit 又直接匹配 Socket；
+- 全仓生产代码没有 `file.file_ops()` 调用，只有访问器定义；
+- P3-S2 判决测试
+  `open_file_read_write_delegate_to_socket_file_ops` 当前稳定失败于
+  `Err(EINVAL) != Done(4)`。
+
+恢复方案应分成可回滚的小步：
+
+1. 先恢复 VFS 的 Socket read/write 委派，使既有判决测试转绿；此时 syscall
+   转发仍挡在前面，用户态行为不变。
+2. 再摘掉普通 socket 的 `read/write -> sendto/recvfrom` 整体转发，同时显式
+   保留 netlink write、bootstrap gate 和 64 KiB staging；补齐 EINTR/itimer、
+   SIGPIPE、loopback fairness、大 UDP datagram、readv/writev 与 netlink
+   不挂死的回归见证。
+3. 保留当前 `query_fd_ready` 作为 poll/select/epoll 的统一 fd facade；单独
+   决定让它经 fd-neutral ops 查询，还是从 `FileOps` 删除已经被 facade
+   取代的 `PollMask` 方法。当前 `device::FileOps` 直接暴露
+   `crate::net::PollMask`，与 P3 文档“trait 对 net 零依赖”的目标矛盾，不能
+   原样照搬旧接线。
+4. 恢复 F_SETFL/last-close hooks，但保留 close 的 retain-count 两相时序；
+   ioctl、splice 拒绝、socketpair 和所有 socket 专属 syscall 不动。
+
+因此下一轮不是“消灭 socket 特判”，而是恢复**普通文件语义的统一入口**，
+把 Linux ABI、启动期和未实现能力边界的特判集中保留。完成后再处理 TCP
+动态 option/状态单一真相；L2/L3 所有权拆分和 wait 收敛属于更大的结构
+重构。curl 当前无功能阻塞；长期可复现性仍建议把 `latest-stable` 换成固定
+Alpine branch/源校验记录。

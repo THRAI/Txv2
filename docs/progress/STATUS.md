@@ -1,3 +1,23 @@
+- 2026-07-30 (**Socket/FileOps 特判边界复核完成；确认应选择性恢复，不能机械全删**).
+  已对照合并前 feature 锚点 `90939012`、P3-A 落地提交及当前
+  `26e7d79c`：`net/file_ops.rs` 实现未丢，丢的是 VFS/read-write/F_SETFL/
+  last-close 的生产接线；既有 P3-S2 判决测试当前稳定失败于
+  `Err(EINVAL) != Done(4)`，且全仓无生产 `file.file_ops()` 调用。与此同时，
+  合并前本来就有必须保留的特判：netlink `write`、无 mailbox bootstrap
+  read gate、64 KiB socket staging、socket ioctl、splice 拒绝和 pipe-backed
+  socketpair。main 新增的 `query_fd_ready` 已是 poll/select/epoll 的统一 fd
+  facade，也不应机械退回旧实现；需要单独消除其与 FileOps poll 方法的重复及
+  `device::FileOps -> net::PollMask` 层次泄漏。**Verification**：
+  `git diff 90939012..HEAD -- net/file_ops.rs` 为空；
+  `cargo test -p tx-subsystems --lib
+  open_file_read_write_delegate_to_socket_file_ops -- --nocapture` 精确复现失败。
+  详细分类和四步恢复边界见
+  `docs/progress/research/2026-07-30-network-refactor-merge-structural-audit.md`。
+  **Next**：先恢复 VFS Socket read/write 委派，再在保留 netlink/bootstrap/
+  64 KiB 例外的前提下摘除普通 socket syscall 转发，最后收编 F_SETFL/close
+  hook 并裁决 fd-neutral readiness 接口。**Blocker**：无；本轮只调查和记账，
+  未修改网络代码。
+
 - 2026-07-30 (**RV64 真实 NET_IRQ top/bottom-half 链恢复并完成 Git 全链验收**).
   恢复 `IrqIf::NET_IRQ=2`、virtio notification、外部 IRQ 用户帧 handoff 和
   `DeferredWake`；top half 仅把 claim 发布到 per-hart 原子状态机，owner-hart
