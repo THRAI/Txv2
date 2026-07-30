@@ -71,7 +71,7 @@
     {
       "id": "task-01-reconcile",
       "title": "Reconcile HEAD and historical journal slices",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
         "docs/progress/research/2026-07-30-ext4-lifecycle-slice-reconciliation.md",
@@ -83,7 +83,7 @@
         "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1",
         "git show --stat 1cee426a 9f39f58f 555e4a40"
       ],
-      "notes": "Inspect the three historical slices and selectively map tests and invariants; never cherry-pick a whole worktree patch."
+      "notes": "Completed at 101b98daec2fc1746d883d15715d2093e3ca850f. The reconciliation note maps 1cee426a checksum, 9f39f58f checkpoint-publication, and 555e4a40 recovery/cache/PageBacked witnesses by lifecycle owner; no historical patch was cherry-picked. Named baseline tests passed."
     },
     {
       "id": "task-02-admission",
