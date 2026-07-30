@@ -140,55 +140,69 @@ pub fn kernel_step(
     };
 
     // --- lookup / materialise, with parent-local dentry cache ---
+    //
+    // A DEntry cache is only an identity cache, not namespace authority.
+    // Namespace mutations invalidate the backend's parent/version cache, but
+    // the same directory can be represented by several DEntry aliases (cwd,
+    // dirfd and independently walked paths).  Invalidating one alias therefore
+    // cannot make every other alias coherent.  Revalidate the cached identity
+    // through FsOps::lookup before using it.  Ext4 answers this from its
+    // versioned lookup cache on an unchanged directory, while a rename,
+    // unlink or recreate forces the stale DEntry alias to be discarded.
     let parent_fs_object_id = current.rnode().fs_object_id();
-    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = if let Some(cached) =
-        current.cached_child(child_inline)
-    {
-        let rnode = cached.rnode().clone();
-        let fs_object_id = rnode.fs_object_id();
-        let meta = rnode.meta();
-        (cached, rnode, fs_object_id, meta)
-    } else {
-        let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
-            StepOutcome::Done(id) => id,
-            StepOutcome::Yield { .. } => {
-                let retry_remaining = remaining_with_component(&component, &remaining);
-                let request = IORequest::DirLookup {
-                    fs_object_id: parent_fs_object_id,
-                    name: component.clone().into_boxed_slice(),
-                };
-                let token = ResumeToken {
-                    walking: WalkingState {
-                        current,
-                        remaining: retry_remaining,
-                        hop_count,
-                        mount_root,
-                        must_be_directory,
-                    },
-                    request: request.clone(),
-                    mount_namespace: None,
-                    hop_count,
-                };
-                return KernelStep::NeedIO(request, token);
-            }
-            StepOutcome::Err(e) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
-                    e,
-                )));
-            }
-            StepOutcome::Continue { .. } => {
-                let retry_remaining = remaining_with_component(&component, &remaining);
-                // Re-enter lookup (v3 continue without yield).
-                return KernelStep::Continue(WalkState::Walking(WalkingState {
+    let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
+        StepOutcome::Done(id) => id,
+        StepOutcome::Yield { .. } => {
+            let retry_remaining = remaining_with_component(&component, &remaining);
+            let request = IORequest::DirLookup {
+                fs_object_id: parent_fs_object_id,
+                name: component.clone().into_boxed_slice(),
+            };
+            let token = ResumeToken {
+                walking: WalkingState {
                     current,
                     remaining: retry_remaining,
                     hop_count,
                     mount_root,
                     must_be_directory,
-                }));
-            }
-        };
+                },
+                request: request.clone(),
+                mount_namespace: None,
+                hop_count,
+            };
+            return KernelStep::NeedIO(request, token);
+        }
+        StepOutcome::Err(e) => {
+            current.remove_cached_child(child_inline);
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)));
+        }
+        StepOutcome::Continue { .. } => {
+            let retry_remaining = remaining_with_component(&component, &remaining);
+            return KernelStep::Continue(WalkState::Walking(WalkingState {
+                current,
+                remaining: retry_remaining,
+                hop_count,
+                mount_root,
+                must_be_directory,
+            }));
+        }
+    };
 
+    let cached_child = current.cached_child(child_inline);
+    let cached_child = match cached_child {
+        Some(cached) if cached.rnode().fs_object_id() == child_fs_object_id => Some(cached),
+        Some(_) => {
+            current.remove_cached_child(child_inline);
+            None
+        }
+        None => None,
+    };
+
+    let (child_dentry, child_rnode_cap, child_meta) = if let Some(cached) = cached_child {
+        let rnode = cached.rnode().clone();
+        let meta = rnode.meta();
+        (cached, rnode, meta)
+    } else {
         let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
             StepOutcome::Done(m) => m,
             StepOutcome::Yield { .. } => {
@@ -260,12 +274,7 @@ pub fn kernel_step(
             }
         };
         current.cache_child(child_dentry.clone());
-        (
-            child_dentry,
-            child_rnode_cap,
-            child_fs_object_id,
-            child_meta,
-        )
+        (child_dentry, child_rnode_cap, child_meta)
     };
 
     // --- mid-path non-directory check ---
@@ -893,15 +902,23 @@ pub(super) fn materialise_child(
         }
         InodeKind::Symlink => match fs_ops.read_link(child_fs_object_id, guard) {
             StepOutcome::Done(b) => {
-                // NOTE: symlink RNode created without containing_mount.
-                super::diagnostic::record_diag(7);
-                super::diagnostic::record_label(b"materialise:symlink-no-mount");
-                RNode::new_cap(
-                    child_fs_object_id,
-                    *child_meta,
-                    RNodeBacking::Symlink { target: b },
-                )
-                .map_err(|_| {
+                let result = if let Some(mp) = mount_payload {
+                    RNode::new_cap_in_mount(
+                        child_fs_object_id,
+                        *child_meta,
+                        RNodeBacking::Symlink { target: b },
+                        mp,
+                    )
+                } else {
+                    super::diagnostic::record_diag(7);
+                    super::diagnostic::record_label(b"materialise:symlink-no-mount");
+                    RNode::new_cap(
+                        child_fs_object_id,
+                        *child_meta,
+                        RNodeBacking::Symlink { target: b },
+                    )
+                };
+                result.map_err(|_| {
                     KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
                 })
             }

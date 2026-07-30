@@ -47,6 +47,7 @@ impl InodeNo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InodeMetaLite {
+    pub generation: u32,
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
@@ -1227,7 +1228,13 @@ impl<I: BlockImage> Ext4Pager<I> {
         // Clear the inode record before making its bitmap slot reusable. If
         // a later bitmap write fails, the result is a bounded disk-space leak
         // rather than a live inode pointing at blocks that may be reallocated.
-        self.write_inode(inode_no, &Inode::default())?;
+        let mut cleared = Inode::default();
+        // Preserve the incarnation counter in the free inode record.  The
+        // next allocation increments it before publishing the inode, so a
+        // reused bitmap slot can never alias live VFS/page-cache state from
+        // its previous occupant.
+        cleared.generation = inode.generation;
+        self.write_inode(inode_no, &cleared)?;
         self.free_block_ranges(&blocks)?;
         self.free_inode(inode_no)
     }
@@ -1411,6 +1418,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
 
         Err(Ext4FormatError::OutOfBounds)
+    }
+
+    fn next_inode_generation(&mut self, inode_no: InodeNo) -> Result<u32> {
+        let previous = self.read_inode(inode_no)?.generation;
+        let next = previous.wrapping_add(1);
+        Ok(if next == 0 { 1 } else { next })
     }
 
     /// Write `inode` directly into the inode table (no journal).
@@ -1701,7 +1714,15 @@ impl<I: BlockImage> Ext4Pager<I> {
         now_sec: u32,
     ) -> Result<InodeNo> {
         let new_ino = self.allocate_inode()?;
+        let generation = match self.next_inode_generation(new_ino) {
+            Ok(generation) => generation,
+            Err(err) => {
+                let _ = self.free_inode(new_ino);
+                return Err(err);
+            }
+        };
         let mut inode = Inode::default();
+        inode.generation = generation;
         inode.mode = Inode::S_IFREG | (mode & 0o7777);
         inode.uid = uid;
         inode.gid = gid;
@@ -1746,6 +1767,13 @@ impl<I: BlockImage> Ext4Pager<I> {
             .ok_or(Ext4FormatError::OutOfBounds)?;
 
         let new_ino = self.allocate_inode()?;
+        let generation = match self.next_inode_generation(new_ino) {
+            Ok(generation) => generation,
+            Err(err) => {
+                let _ = self.free_inode(new_ino);
+                return Err(err);
+            }
+        };
         let data_block = match self.allocate_block() {
             Ok(block) => block,
             Err(err) => {
@@ -1779,6 +1807,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
 
         let mut inode = Inode::default();
+        inode.generation = generation;
         inode.mode = Inode::S_IFDIR | (mode & 0o7777);
         inode.uid = uid;
         inode.gid = gid;
@@ -2416,6 +2445,7 @@ fn read_group_descs<I: BlockImage>(image: &I, superblock: &Superblock) -> Result
 
 fn inode_to_meta(inode: Inode) -> InodeMetaLite {
     InodeMetaLite {
+        generation: inode.generation,
         mode: inode.mode,
         uid: inode.uid,
         gid: inode.gid,

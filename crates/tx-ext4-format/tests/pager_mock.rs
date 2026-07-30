@@ -210,6 +210,7 @@ fn pager_reads_inode_meta_and_4k_pages() {
     assert_eq!(
         meta,
         InodeMetaLite {
+            generation: 0,
             mode: 0x8000 | 0o644,
             uid: 1000,
             gid: 1000,
@@ -845,6 +846,34 @@ fn hard_links_defer_then_reclaim_inode_and_blocks() {
     assert!(!BitmapView::new(pager.image().block(2)).is_set(48));
     assert_eq!(pager.allocate_inode().unwrap(), inode);
     assert_eq!(pager.allocate_block().unwrap(), 48);
+}
+
+#[test]
+fn reused_inode_gets_a_new_nonzero_generation() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let first = pager
+        .create_regular_file(InodeNo::new(2), b"generation-a", 0o644, 0, 0, 0)
+        .unwrap();
+    let first_generation = pager.inode_meta(first).unwrap().generation;
+    assert_ne!(first_generation, 0);
+
+    assert_eq!(
+        pager.unlink_inode(InodeNo::new(2), b"generation-a", first),
+        Ok(0)
+    );
+    pager.destroy_inode(first).unwrap();
+
+    let second = pager
+        .create_regular_file(InodeNo::new(2), b"generation-b", 0o644, 0, 0, 0)
+        .unwrap();
+    let second_generation = pager.inode_meta(second).unwrap().generation;
+
+    assert_eq!(second, first);
+    assert_ne!(second_generation, 0);
+    assert_ne!(second_generation, first_generation);
 }
 
 #[test]

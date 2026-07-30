@@ -1,5 +1,4 @@
 use core::cell::UnsafeCell;
-use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -44,11 +43,11 @@ pub(crate) struct Ext4FsInstance<I> {
     /// regular inode must materialise the same PageContainer while it is
     /// alive; separate containers would permit stale reads and writeback
     /// through one name to overwrite data written through another.
-    page_containers: SpinMutex<BTreeMap<u32, Weak<PageContainer>>>,
+    page_containers: SpinMutex<BTreeMap<FsObjectId, Weak<PageContainer>>>,
     /// Inodes whose namespace link count reached zero. Entries remain here
     /// while an RNode/OpenFile/mmap/PageContainer can still reach the payload;
     /// the last-payload callback retries `destroy_inode`.
-    orphaned_inodes: SpinMutex<BTreeMap<u32, OrphanState>>,
+    orphaned_inodes: SpinMutex<BTreeMap<FsObjectId, OrphanState>>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
@@ -182,6 +181,34 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(meta)
     }
 
+    /// Resolve and validate a persistent object incarnation.
+    ///
+    /// An inode bitmap slot can be reused immediately after reclamation.
+    /// Every backend entry point therefore validates both the low inode
+    /// number and the on-disk generation before touching data or metadata.
+    pub(crate) fn resolve_object(
+        &self,
+        fs_object_id: FsObjectId,
+    ) -> Result<(InodeNo, InodeMetaLite), Errno> {
+        let inode = inode_no(fs_object_id)?;
+        let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
+        if meta.mode == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if meta.generation != fs_object_id.inode_generation() {
+            return Err(Errno::ESTALE);
+        }
+        Ok((inode, meta))
+    }
+
+    pub(crate) fn object_id_for_inode(&self, inode: InodeNo) -> Result<FsObjectId, Errno> {
+        let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
+        if meta.mode == 0 {
+            return Err(Errno::ENOENT);
+        }
+        Ok(fs_object_id(inode, meta.generation))
+    }
+
     pub(crate) fn read_dir_entries_cached(
         &self,
         inode: InodeNo,
@@ -248,7 +275,6 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     /// between lookup metadata and materialisation on another CPU.
     pub(crate) fn get_or_create_page_container(
         &self,
-        inode: InodeNo,
         fs_object_id: FsObjectId,
         mount: MountPayloadPin,
         minimum_page_count: u64,
@@ -256,18 +282,18 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     ) -> Result<(Cap<PageContainer>, InodeMetaLite), Errno> {
         {
             let mut index = self.page_containers.lock();
-            if let Some(weak) = index.get(&inode.get()).copied() {
+            if let Some(weak) = index.get(&fs_object_id).copied() {
                 if let Some(container) = weak.upgrade(guard) {
                     drop(index);
-                    let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
+                    let (_, meta) = self.resolve_object(fs_object_id)?;
                     return Ok((container, meta));
                 }
-                index.remove(&inode.get());
+                index.remove(&fs_object_id);
             }
         }
 
-        let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
-        if meta.mode == 0 || meta.nlinks == 0 {
+        let (_, meta) = self.resolve_object(fs_object_id)?;
+        if meta.nlinks == 0 {
             return Err(Errno::ENOENT);
         }
         let page_count = meta
@@ -288,40 +314,40 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         // taking it: zone allocation can drain EBR and run a PageContainer
         // finalizer, which may re-enter this instance.
         let orphaned = self.orphaned_inodes.lock();
-        if orphaned.contains_key(&inode.get()) {
+        if orphaned.contains_key(&fs_object_id) {
             drop(orphaned);
             drop(container);
             return Err(Errno::ENOENT);
         }
         let mut index = self.page_containers.lock();
-        if let Some(weak) = index.get(&inode.get()).copied() {
+        if let Some(weak) = index.get(&fs_object_id).copied() {
             if let Some(existing) = weak.upgrade(guard) {
                 drop(index);
                 drop(orphaned);
                 drop(container);
-                let latest = self.with_pager(|pager| pager.inode_meta(inode))?;
+                let (_, latest) = self.resolve_object(fs_object_id)?;
                 return Ok((existing, latest));
             }
-            index.remove(&inode.get());
+            index.remove(&fs_object_id);
         }
-        let latest = self.with_pager(|pager| pager.inode_meta(inode))?;
-        if latest.mode == 0 || latest.nlinks == 0 {
+        let (_, latest) = self.resolve_object(fs_object_id)?;
+        if latest.nlinks == 0 {
             drop(index);
             drop(orphaned);
             drop(container);
             return Err(Errno::ENOENT);
         }
         container.set_size_bytes(latest.size);
-        index.insert(inode.get(), container.downgrade());
+        index.insert(fs_object_id, container.downgrade());
         drop(index);
         drop(orphaned);
         Ok((container, latest))
     }
 
-    pub(crate) fn mark_inode_orphaned(&self, inode: InodeNo) {
+    pub(crate) fn mark_inode_orphaned(&self, fs_object_id: FsObjectId) {
         self.orphaned_inodes
             .lock()
-            .insert(inode.get(), OrphanState::Pending);
+            .insert(fs_object_id, OrphanState::Pending);
     }
 
     /// Reclaim a zero-link inode only after its coherent PageContainer no
@@ -330,30 +356,46 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     /// the same final-payload gate as regular files.
     pub(crate) fn destroy_orphaned_inode(
         &self,
-        inode: InodeNo,
+        fs_object_id: FsObjectId,
         guard: &Guard<'_>,
     ) -> Result<(), Errno> {
+        let inode = inode_no(fs_object_id)?;
         {
             let mut orphaned = self.orphaned_inodes.lock();
-            if orphaned.get(&inode.get()) != Some(&OrphanState::Pending) {
+            if orphaned.get(&fs_object_id) != Some(&OrphanState::Pending) {
                 return Ok(());
             }
-            orphaned.insert(inode.get(), OrphanState::Reclaiming);
+            orphaned.insert(fs_object_id, OrphanState::Reclaiming);
+        }
+
+        let current = self.with_pager(|pager| pager.inode_meta(inode));
+        match current {
+            Ok(meta) if meta.mode != 0 && meta.generation == fs_object_id.inode_generation() => {}
+            Ok(_) | Err(Errno::ENOENT) => {
+                self.orphaned_inodes.lock().remove(&fs_object_id);
+                return Ok(());
+            }
+            Err(error) => {
+                self.orphaned_inodes
+                    .lock()
+                    .insert(fs_object_id, OrphanState::Pending);
+                return Err(error);
+            }
         }
 
         let mut containers = self.page_containers.lock();
-        if let Some(weak) = containers.get(&inode.get()).copied() {
+        if let Some(weak) = containers.get(&fs_object_id).copied() {
             if let Some(live) = weak.upgrade(guard) {
                 drop(containers);
                 self.orphaned_inodes
                     .lock()
-                    .insert(inode.get(), OrphanState::Pending);
+                    .insert(fs_object_id, OrphanState::Pending);
                 // Dropping this temporary reference outside every lock may
                 // itself be the last release and re-enter the callback.
                 drop(live);
                 return Ok(());
             }
-            containers.remove(&inode.get());
+            containers.remove(&fs_object_id);
         }
         drop(containers);
 
@@ -362,11 +404,11 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         let result = self.with_pager(|pager| pager.destroy_inode(inode));
         let mut orphaned = self.orphaned_inodes.lock();
         if result.is_ok() {
-            orphaned.remove(&inode.get());
+            orphaned.remove(&fs_object_id);
             drop(orphaned);
             self.inode_meta_cache.lock().invalidate(inode);
         } else {
-            orphaned.insert(inode.get(), OrphanState::Pending);
+            orphaned.insert(fs_object_id, OrphanState::Pending);
         }
         result
     }
@@ -616,6 +658,7 @@ impl InodeMetaCacheEntry {
             valid: false,
             inode: InodeNo::new(0),
             meta: InodeMetaLite {
+                generation: 0,
                 mode: 0,
                 uid: 0,
                 gid: 0,
@@ -796,15 +839,15 @@ impl<I> Drop for Ext4PagerGuard<'_, I> {
 }
 
 pub(crate) fn inode_no(fs_object_id: FsObjectId) -> Result<InodeNo, Errno> {
-    let raw = u32::try_from(fs_object_id.as_u64()).map_err(|_| Errno::ENOENT)?;
+    let raw = fs_object_id.inode_number();
     if raw == 0 {
         return Err(Errno::ENOENT);
     }
     Ok(InodeNo::new(raw))
 }
 
-pub(crate) fn fs_object_id(inode: InodeNo) -> FsObjectId {
-    FsObjectId::new(inode.get() as u64)
+pub(crate) fn fs_object_id(inode: InodeNo, generation: u32) -> FsObjectId {
+    FsObjectId::from_inode_generation(inode.get(), generation)
 }
 
 pub(crate) fn map_inode_meta(meta: InodeMetaLite) -> InodeMeta {

@@ -454,6 +454,168 @@ fn dump_process_summary<P: TxPlatform>() {
     console_write_str::<P>("\n");
 }
 
+/// Emit a one-shot process/wait snapshot for an SMP reactor-wide idle stall.
+///
+/// This is intentionally separate from the OOM dump above: the kernel calls
+/// it only after every online hart has reported an idle reactor for a bounded
+/// interval.  It does not run on ordinary syscall or scheduler hot paths.
+pub fn dump_smp_wait_diagnostics<P: TxPlatform>() {
+    console_write_str::<P>("txkernel:smp-stall:processes:begin\n");
+
+    for (pid, _) in crate::process::all_pids() {
+        let Some(process) = crate::process::process_by_pid(pid) else {
+            continue;
+        };
+        let children = process.children();
+        let zombie_children = children.iter().filter(|child| child.is_zombie()).count();
+        let threads = process.threads_snapshot().unwrap_or_default();
+        let fds = process.open_fds();
+        let comm_bytes = process.comm();
+
+        console_write_str::<P>("txkernel:smp-stall:proc:pid=");
+        write_usize::<P>(pid.0 as usize);
+        console_write_str::<P>(":ppid=");
+        write_usize::<P>(process.parent_pid().0 as usize);
+        console_write_str::<P>(":state=");
+        write_char::<P>(process.state_char() as char);
+        console_write_str::<P>(":children=");
+        write_usize::<P>(children.len());
+        console_write_str::<P>(":zombie_children=");
+        write_usize::<P>(zombie_children);
+        console_write_str::<P>(":threads=");
+        write_usize::<P>(threads.len());
+        console_write_str::<P>(":fds=");
+        write_usize::<P>(fds.len());
+        console_write_str::<P>(":comm=");
+        console_write_str::<P>(proc_comm_bytes(&comm_bytes));
+        console_write_str::<P>("\n");
+
+        for thread in threads {
+            let payload = thread.payload_cap();
+            console_write_str::<P>("txkernel:smp-stall:thread:pid=");
+            write_usize::<P>(pid.0 as usize);
+            console_write_str::<P>(":tid=");
+            write_usize::<P>(thread.tid.0 as usize);
+            console_write_str::<P>(":state=");
+            write_char::<P>(thread.proc_state_char() as char);
+            console_write_str::<P>(":futex=");
+            write_usize::<P>(crate::futex::thread_has_waiter(thread.tid.0) as usize);
+
+            if let Some(payload) = payload {
+                console_write_str::<P>(":sleeping=");
+                write_usize::<P>(payload.proc_sleeping() as usize);
+                if let Some(task) = payload.task() {
+                    console_write_str::<P>(":task=");
+                    write_usize::<P>(task.id().index());
+                    console_write_str::<P>("/");
+                    write_usize::<P>(task.generation().value() as usize);
+                } else {
+                    console_write_str::<P>(":task=none");
+                }
+                if let Some((nr, arg0, arg1)) = payload.active_syscall_diagnostic() {
+                    console_write_str::<P>(":syscall=");
+                    console_write_str::<P>(syscall_wait_name(nr));
+                    console_write_str::<P>(":nr=");
+                    write_usize::<P>(nr as usize);
+                    console_write_str::<P>(":a0=");
+                    write_hex_u64::<P>(arg0);
+                    console_write_str::<P>(":a1=");
+                    write_hex_u64::<P>(arg1);
+                } else {
+                    console_write_str::<P>(":syscall=none");
+                }
+            } else {
+                console_write_str::<P>(":payload=none");
+            }
+            console_write_str::<P>("\n");
+        }
+
+        for (fd, file) in fds {
+            if let Some((pipe, side)) = file.pipe_endpoint() {
+                dump_pipe_fd::<P>(
+                    pid.0,
+                    fd,
+                    match side {
+                        crate::pipe::PipeSide::Reader => "read",
+                        crate::pipe::PipeSide::Writer => "write",
+                    },
+                    &pipe,
+                );
+            }
+            if let Some((rx, tx)) = file.socketpair_endpoint() {
+                dump_pipe_fd::<P>(pid.0, fd, "socketpair-rx", &rx);
+                dump_pipe_fd::<P>(pid.0, fd, "socketpair-tx", &tx);
+            }
+        }
+    }
+
+    console_write_str::<P>("txkernel:smp-stall:processes:end\n");
+}
+
+fn dump_pipe_fd<P: TxPlatform>(
+    pid: u32,
+    fd: u32,
+    side: &str,
+    pipe: &crate::adapter::step_engine::Cap<crate::pipe::PipePayload>,
+) {
+    let state = pipe.diagnostic_snapshot();
+    console_write_str::<P>("txkernel:smp-stall:pipe:pid=");
+    write_usize::<P>(pid as usize);
+    console_write_str::<P>(":fd=");
+    write_usize::<P>(fd as usize);
+    console_write_str::<P>(":side=");
+    console_write_str::<P>(side);
+    console_write_str::<P>(":raw=");
+    write_hex_u64::<P>(pipe.raw() as u64);
+    console_write_str::<P>(":readers=");
+    write_usize::<P>(state.readers as usize);
+    console_write_str::<P>(":writers=");
+    write_usize::<P>(state.writers as usize);
+    console_write_str::<P>(":bytes=");
+    write_usize::<P>(state.buffered_bytes);
+    console_write_str::<P>(":slots=");
+    write_usize::<P>(state.occupied_slots);
+    console_write_str::<P>("/");
+    write_usize::<P>(state.max_slots);
+    console_write_str::<P>(":read_source=");
+    write_hex_u64::<P>(state.reader_wait_source_id);
+    console_write_str::<P>(":write_source=");
+    write_hex_u64::<P>(state.writer_wait_source_id);
+    console_write_str::<P>("\n");
+}
+
+fn syscall_wait_name(nr: u64) -> &'static str {
+    match nr {
+        23 => "dup",
+        24 => "dup3",
+        57 => "close",
+        59 => "pipe2",
+        63 => "read",
+        64 => "write",
+        65 => "readv",
+        66 => "writev",
+        72 => "pselect6",
+        73 => "ppoll",
+        93 => "exit",
+        94 => "exit_group",
+        98 => "futex",
+        101 => "nanosleep",
+        198 => "socket",
+        199 => "socketpair",
+        202 => "accept",
+        203 => "connect",
+        207 => "recvfrom",
+        211 => "sendmsg",
+        212 => "recvmsg",
+        220 => "clone",
+        221 => "execve",
+        260 => "wait4",
+        281 => "epoll_pwait",
+        435 => "clone3",
+        _ => "other",
+    }
+}
+
 fn proc_comm_bytes(bytes: &[u8; 16]) -> &str {
     let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     core::str::from_utf8(&bytes[..len]).unwrap_or("?")
@@ -483,6 +645,17 @@ fn write_usize<P: TxPlatform>(value: usize) {
         *dst = *src;
     }
     console_write_str::<P>(core::str::from_utf8(&out[..len]).unwrap_or("?"));
+}
+
+fn write_hex_u64<P: TxPlatform>(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [b'0'; 18];
+    out[1] = b'x';
+    for index in 0..16 {
+        let shift = (15 - index) * 4;
+        out[index + 2] = HEX[((value >> shift) & 0xf) as usize];
+    }
+    console_write_str::<P>(core::str::from_utf8(&out).unwrap_or("0x?"));
 }
 
 mod smoke {

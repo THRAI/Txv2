@@ -35,6 +35,11 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 /// tasks block on WaitSources rather than timer-backed futures.
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 const POLLING_IDLE_SPINS: usize = 256;
+/// Emit one wait-chain snapshot after the whole SMP reactor has made no task
+/// progress for this long. The snapshot is globally one-shot, so a real hang
+/// produces useful evidence without turning normal BuildStorm output into a
+/// periodic diagnostic stream.
+const SMP_STALL_DIAG_NS: u64 = 15_000_000_000;
 
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
 /// Switched to true when the userspace reactor phase begins, enabling
@@ -50,6 +55,9 @@ static BSP_REACTOR_TIMER_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
 /// every AP has returned from its current task poll and published itself here.
 static AP_REACTOR_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static AP_REACTOR_STOPPED_CPUS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_LAST_PROGRESS_NS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_STALL_DUMPED: AtomicBool = AtomicBool::new(false);
 
 /// Global root-mount slot retained for the kernel lifetime after
 /// `mount_rootfs_from_boot_media` bootstraps the process subsystem.
@@ -2193,14 +2201,17 @@ impl<P: TxPlatform> CoreInit<P> {
             if Self::poll_boot_reactor_idle_window(hart) {
                 continue;
             }
+            Self::note_reactor_hart_idle(cpu_id);
             let wait_state = P::prepare_interrupt_wait();
             if AP_REACTOR_STOP_REQUESTED.load(core::sync::atomic::Ordering::Acquire)
                 || Self::boot_reactor_has_runnable_work(hart)
             {
+                Self::note_reactor_hart_active(cpu_id);
                 P::cancel_interrupt_wait(wait_state);
                 continue;
             }
             P::wait_for_interrupt_prepared(wait_state);
+            Self::note_reactor_hart_active(cpu_id);
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
             }
@@ -2265,6 +2276,9 @@ impl<P: TxPlatform> CoreInit<P> {
         let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
             boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
         })?;
+        if step.ran_work() {
+            Self::note_reactor_progress(cpu_id, now_ns);
+        }
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
     }
@@ -2300,8 +2314,68 @@ impl<P: TxPlatform> CoreInit<P> {
             &mut signal,
             &mut slice_clock,
         )?;
+        if step.ran_work() {
+            Self::note_reactor_progress(cpu_id, now_ns);
+        }
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
+    }
+
+    pub(super) fn reset_smp_stall_diagnostic() {
+        REACTOR_IDLE_CPUS.store(0, Ordering::Release);
+        REACTOR_LAST_PROGRESS_NS.store(P::read_ns(), Ordering::Release);
+        REACTOR_STALL_DUMPED.store(false, Ordering::Release);
+    }
+
+    fn note_reactor_progress(cpu_id: CpuId, now_ns: u64) {
+        REACTOR_IDLE_CPUS.fetch_and(!Self::cpu_bit(cpu_id), Ordering::AcqRel);
+        REACTOR_LAST_PROGRESS_NS.store(now_ns, Ordering::Release);
+    }
+
+    pub(super) fn note_reactor_hart_active(cpu_id: CpuId) {
+        REACTOR_IDLE_CPUS.fetch_and(!Self::cpu_bit(cpu_id), Ordering::AcqRel);
+    }
+
+    pub(super) fn note_reactor_hart_idle(cpu_id: CpuId) {
+        let online = P::online_cpus().bits();
+        if online.count_ones() <= 1 {
+            return;
+        }
+        let idle = REACTOR_IDLE_CPUS.fetch_or(Self::cpu_bit(cpu_id), Ordering::AcqRel)
+            | Self::cpu_bit(cpu_id);
+        if idle & online != online {
+            return;
+        }
+
+        let now_ns = P::read_ns();
+        let last_ns = REACTOR_LAST_PROGRESS_NS.load(Ordering::Acquire);
+        if last_ns == 0 {
+            let _ = REACTOR_LAST_PROGRESS_NS.compare_exchange(
+                0,
+                now_ns,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return;
+        }
+        let stalled_ns = now_ns.saturating_sub(last_ns);
+        if stalled_ns < SMP_STALL_DIAG_NS
+            || REACTOR_STALL_DUMPED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+
+        tx_hal::console_write_str::<P>("txkernel:smp-stall:begin:idle_mask=");
+        Self::write_u64(idle & online);
+        tx_hal::console_write_str::<P>(":online_mask=");
+        Self::write_u64(online);
+        tx_hal::console_write_str::<P>(":stalled_ms=");
+        Self::write_u64(stalled_ns / 1_000_000);
+        tx_hal::console_write_str::<P>("\n");
+        tx_subsystems::zones::dump_smp_wait_diagnostics::<P>();
+        tx_hal::console_write_str::<P>("txkernel:smp-stall:end\n");
     }
 
     fn program_hart_loop_deadline(action: boot_runtime::hart_loop::HartLoopDeadlineAction) {

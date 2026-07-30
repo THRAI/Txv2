@@ -1180,8 +1180,8 @@ async fn dispatch_inner<
         // (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir`
         // / `umask`). `fchdir` returns `-ENOSYS` (carryover; OpenFile
         // has no DEntry hint to install via step_chdir).
-        nr if nr == NR_FSTAT => sys_fstat(req.args, ctx),
-        nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
+        nr if nr == NR_FSTAT => sys_fstat::<P>(req.args, ctx),
+        nr if nr == NR_NEWFSTATAT => sys_newfstatat::<P>(req.args, ctx).await,
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
         nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,
@@ -1204,7 +1204,7 @@ async fn dispatch_inner<
         nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
         nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
         nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
-        nr if nr == NR_STATX => sys_statx(req.args, ctx).await,
+        nr if nr == NR_STATX => sys_statx::<P>(req.args, ctx).await,
         // Slice 7 of the shell-prompt roadmap — fcntl extension +
         // day-1 misc syscalls. None individually heavy; each unblocks
         // a specific shell-startup path.
@@ -1229,7 +1229,7 @@ async fn dispatch_inner<
         // `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`
         // Slice 8.
         nr if nr == NR_MKDIRAT => sys_mkdirat(req.args, ctx).await,
-        nr if nr == NR_UNLINKAT => sys_unlinkat(req.args, ctx).await,
+        nr if nr == NR_UNLINKAT => sys_unlinkat::<P>(req.args, ctx).await,
         nr if nr == NR_SYMLINKAT => sys_symlinkat(req.args, ctx).await,
         nr if nr == NR_LINKAT => sys_linkat(req.args, ctx).await,
         nr if nr == NR_TRUNCATE => sys_truncate(req.args, ctx).await,

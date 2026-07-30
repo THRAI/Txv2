@@ -70,10 +70,12 @@ where
     I: BlockImage + Send + 'static,
 {
     let backend = Ext4FsInstance::open(image, read_only)?;
-    let root_fs_object_id = FsObjectId::new(EXT4_ROOT_INODE as u64);
-    let root_inode_meta = backend
-        .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE)))
-        .map(map_inode_meta)?;
+    let root_disk_meta = backend.with_pager(|pager| {
+        pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE))
+    })?;
+    let root_fs_object_id =
+        FsObjectId::from_inode_generation(EXT4_ROOT_INODE, root_disk_meta.generation);
+    let root_inode_meta = map_inode_meta(root_disk_meta);
 
     Ok(MountedExt4 {
         backend,

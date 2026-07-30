@@ -9,8 +9,7 @@ use tx_subsystems::vfs::structure::{
 };
 
 use crate::read_backend::{
-    cursor_from_offset, cursor_offset, fs_object_id as inode_fs_object_id, inode_no,
-    map_inode_meta, Ext4FsInstance, READDIR_WINDOW_ENTRIES,
+    cursor_from_offset, cursor_offset, map_inode_meta, Ext4FsInstance, READDIR_WINDOW_ENTRIES,
 };
 
 // ext4 dir-entry file_type codes (POSIX-shaped). Maps the on-disk byte
@@ -76,8 +75,8 @@ where
     ) -> StepOutcome<FsObjectId, NoProgress> {
         // Diagnostic: record that ext4 lookup was called (vs some other backend).
         tx_subsystems::vfs::resolution::diagnostic::record_diag(20);
-        let parent = match inode_no(parent) {
-            Ok(parent) => parent,
+        let parent = match self.resolve_object(parent) {
+            Ok((parent, _)) => parent,
             Err(err) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(21);
                 return StepOutcome::err(err.into());
@@ -85,7 +84,10 @@ where
         };
 
         match self.lookup_cached(parent, name) {
-            Ok(Some(inode)) => StepOutcome::done(inode_fs_object_id(inode)),
+            Ok(Some(inode)) => match self.object_id_for_inode(inode) {
+                Ok(id) => StepOutcome::done(id),
+                Err(err) => StepOutcome::err(err.into()),
+            },
             Ok(None) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(22); // ENOENT
                 StepOutcome::err(Errno::ENOENT.into())
@@ -102,15 +104,11 @@ where
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let (_, meta) = match self.resolve_object(fs_object_id) {
+            Ok(resolved) => resolved,
             Err(err) => return StepOutcome::err(err.into()),
         };
-
-        match self.inode_meta_cached(inode) {
-            Ok(meta) => StepOutcome::done(map_inode_meta(meta)),
-            Err(err) => StepOutcome::err(err.into()),
-        }
+        StepOutcome::done(map_inode_meta(meta))
     }
 
     fn serialize_inode_meta(
@@ -122,8 +120,8 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         match self.with_pager(|pager| {
@@ -152,14 +150,11 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let (inode, disk_meta) = match self.resolve_object(fs_object_id) {
+            Ok(resolved) => resolved,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let meta = match self.inode_meta_cached(inode) {
-            Ok(meta) => map_inode_meta(meta),
-            Err(err) => return StepOutcome::err(err.into()),
-        };
+        let meta = map_inode_meta(disk_meta);
         if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&meta, cred) {
             return StepOutcome::err(e.into());
         }
@@ -190,8 +185,8 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match inode_no(parent) {
-            Ok(v) => v,
+        let parent_ino = match self.resolve_object(parent) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
         let now_sec = current_ext4_time_sec();
@@ -204,7 +199,13 @@ where
                     Ok(m) => m,
                     Err(e) => return StepOutcome::err(e.into()),
                 };
-                StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
+                StepOutcome::done((
+                    tx_subsystems::vfs::structure::FsObjectId::from_inode_generation(
+                        new_ino.get(),
+                        meta.generation,
+                    ),
+                    map_inode_meta(meta),
+                ))
             }
             Err(e) => StepOutcome::err(e.into()),
         }
@@ -220,12 +221,12 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match inode_no(parent) {
-            Ok(v) => v,
+        let parent_ino = match self.resolve_object(parent) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let target_ino = match inode_no(target) {
-            Ok(v) => v,
+        let target_ino = match self.resolve_object(target) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
         match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
@@ -235,7 +236,7 @@ where
                 self.invalidate_lookup_cache_for(parent_ino);
                 self.invalidate_inode_meta(target_ino);
                 if remaining_links == 0 {
-                    self.mark_inode_orphaned(target_ino);
+                    self.mark_inode_orphaned(target);
                 }
                 StepOutcome::done(())
             }
@@ -254,12 +255,12 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let old_parent_ino = match inode_no(old_parent) {
-            Ok(v) => v,
+        let old_parent_ino = match self.resolve_object(old_parent) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let new_parent_ino = match inode_no(new_parent) {
-            Ok(v) => v,
+        let new_parent_ino = match self.resolve_object(new_parent) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
 
@@ -272,7 +273,11 @@ where
                 if let Some((displaced, remaining_links)) = outcome.displaced {
                     self.invalidate_inode_meta(displaced);
                     if remaining_links == 0 {
-                        self.mark_inode_orphaned(displaced);
+                        let displaced_id = match self.object_id_for_inode(displaced) {
+                            Ok(id) => id,
+                            Err(err) => return StepOutcome::err(err.into()),
+                        };
+                        self.mark_inode_orphaned(displaced_id);
                     }
                 }
                 StepOutcome::done(())
@@ -291,12 +296,12 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match inode_no(parent) {
-            Ok(v) => v,
+        let parent_ino = match self.resolve_object(parent) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let target_ino = match inode_no(target) {
-            Ok(v) => v,
+        let (target_ino, meta) = match self.resolve_object(target) {
+            Ok(resolved) => resolved,
             Err(e) => return StepOutcome::err(e.into()),
         };
         match self.lookup_cached(parent_ino, name) {
@@ -304,10 +309,6 @@ where
             Ok(None) => {}
             Err(e) => return StepOutcome::err(e.into()),
         }
-        let meta = match self.inode_meta_cached(target_ino) {
-            Ok(meta) => meta,
-            Err(e) => return StepOutcome::err(e.into()),
-        };
         if meta.mode & 0xF000 == 0x4000 {
             return StepOutcome::err(Errno::EPERM.into());
         }
@@ -334,8 +335,8 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match inode_no(parent) {
-            Ok(v) => v,
+        let parent_ino = match self.resolve_object(parent) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
         match self.with_pager(|pager| pager.lookup(parent_ino, name)) {
@@ -353,7 +354,13 @@ where
                     Ok(m) => m,
                     Err(e) => return StepOutcome::err(e.into()),
                 };
-                StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
+                StepOutcome::done((
+                    tx_subsystems::vfs::structure::FsObjectId::from_inode_generation(
+                        new_ino.get(),
+                        meta.generation,
+                    ),
+                    map_inode_meta(meta),
+                ))
             }
             Err(e) => StepOutcome::err(e.into()),
         }
@@ -369,12 +376,12 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match inode_no(parent) {
-            Ok(v) => v,
+        let parent_ino = match self.resolve_object(parent) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let target_ino = match inode_no(target) {
-            Ok(v) => v,
+        let target_ino = match self.resolve_object(target) {
+            Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
         match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
@@ -383,7 +390,7 @@ where
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 self.invalidate_inode_meta(target_ino);
-                self.mark_inode_orphaned(target_ino);
+                self.mark_inode_orphaned(target);
                 StepOutcome::done(())
             }
             Err(e) => StepOutcome::err(e.into()),
@@ -407,8 +414,8 @@ where
         cursor: DirCursor,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let offset = match cursor_offset(cursor) {
@@ -431,10 +438,14 @@ where
             Ok(name) => name,
             Err(err) => return StepOutcome::err(err.into()),
         };
+        let entry_id = match self.object_id_for_inode(entry.inode) {
+            Ok(id) => id,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         StepOutcome::done(Some((
             DirEntry {
                 name,
-                fs_object_id: inode_fs_object_id(entry.inode),
+                fs_object_id: entry_id,
                 kind: ext4_file_type_to_kind(entry.file_type),
             },
             cursor_from_offset(next_offsets[0]),
@@ -449,11 +460,7 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
-        match self.destroy_orphaned_inode(inode, guard) {
+        match self.destroy_orphaned_inode(fs_object_id, guard) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(err.into()),
         }
@@ -466,10 +473,9 @@ where
         mount: &Cap<MountPayload>,
         guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
+        if let Err(err) = self.resolve_object(fs_object_id) {
+            return StepOutcome::err(err.into());
+        }
         let pin = match self.mount_pin.lock().clone() {
             Some(p) => p,
             None => return StepOutcome::err(Errno::ENOSYS.into()),
@@ -482,7 +488,6 @@ where
         // O_APPEND writes compute `offset = size_bytes = PAGE_SIZE`, which
         // immediately exceeds `capacity = PAGE_SIZE`, yielding EINVAL.
         let (pc, disk_meta) = match self.get_or_create_page_container(
-            inode,
             fs_object_id,
             pin,
             EXT4_FILE_INITIAL_PAGE_WINDOW,
@@ -510,8 +515,8 @@ where
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         match self.with_pager(|pager| pager.read_symlink(inode)) {
@@ -533,6 +538,9 @@ fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {
     }
 
     InodeMetaLite {
+        // `write_inode_meta_journaled` preserves the on-disk generation; this
+        // value is intentionally not applied by the format layer.
+        generation: 0,
         mode: meta.mode,
         uid: meta.uid,
         gid: meta.gid,

@@ -19,7 +19,7 @@ use adapter::step_engine::{
 };
 
 use crate::execution::{Errno, Guard};
-use crate::mount::MountPayloadPin;
+use crate::mount::{FsObjectPin, MountPayloadPin};
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::{Ppn, UserPtr};
@@ -409,6 +409,11 @@ impl MaterializedPageSnapshot {
 #[derive(Debug)]
 pub struct PageContainer {
     kind: PageContainerKind,
+    /// Participates in the mount-wide persistent-object lifetime.  This is
+    /// separate from page-cache ownership: the final RNode or mapping and the
+    /// final PageContainer jointly determine when an unlinked inode may be
+    /// reclaimed.
+    _object_pin: Option<FsObjectPin>,
     page_count: u64,
     size_bytes: AtomicU64,
     state: PageContainerStateCell,
@@ -423,28 +428,6 @@ pub struct PageContainer {
 // does not preclude that.
 unsafe impl Send for PageContainer {}
 unsafe impl Sync for PageContainer {}
-
-impl Drop for PageContainer {
-    fn drop(&mut self) {
-        let PageContainerKind::File {
-            mount,
-            fs_object_id,
-        } = &self.kind
-        else {
-            return;
-        };
-
-        // A file mapping can outlive every RNode/OpenFile. Therefore the
-        // last file-backed PageContainer, rather than the last RNode, is the
-        // regular-file payload lifetime boundary. The backend still checks
-        // nlink/orphan state, so linked files take the cheap no-op path.
-        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        let _ = mount
-            .payload()
-            .fs_ops()
-            .destroy_inode(*fs_object_id, &guard);
-    }
-}
 
 #[derive(Debug)]
 struct PageContainerState {
@@ -612,8 +595,16 @@ fn record_map_pin_for_test() {
 impl PageContainer {
     pub fn new(kind: PageContainerKind, page_count: u64) -> Self {
         let capacity = page_count.saturating_mul(crate::vm::USER_PAGE_SIZE as u64);
+        let object_pin = match &kind {
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            } => Some(FsObjectPin::from_mount_pin(mount.clone(), *fs_object_id)),
+            _ => None,
+        };
         Self {
             kind,
+            _object_pin: object_pin,
             page_count,
             size_bytes: AtomicU64::new(capacity),
             state: PageContainerStateCell::new(PageContainerState {
@@ -675,6 +666,22 @@ impl PageContainer {
 
     pub fn resident_pages(&self) -> usize {
         self.state.lock().pages.len()
+    }
+
+    /// Snapshot the cache state used by rare, failure-only VFS diagnostics.
+    ///
+    /// Keep this as one lock acquisition so a diagnostic cannot report a
+    /// resident/dirty combination assembled from different SMP instants.
+    pub fn diagnostic_page_counts(&self) -> (usize, usize, usize) {
+        let state = self.state.lock();
+        let resident = state.pages.pages.len();
+        let dirty = state
+            .pages
+            .pages
+            .values()
+            .filter(|entry| entry.marks.dirty)
+            .count();
+        (resident, dirty, state.in_flight_file_pages.len())
     }
 
     pub fn lookup(&self, page: PageIndex) -> Option<Ppn> {

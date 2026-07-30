@@ -341,7 +341,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
         );
         if matches!(outcome, StepOutcome::Done(())) {
             parent.remove_cached_child(name);
-            let _ = fs_ops.destroy_inode(child.rnode().fs_object_id(), &__guard);
         }
         outcome
     }

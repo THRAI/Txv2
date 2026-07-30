@@ -14,6 +14,38 @@ use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::{self};
 use tx_subsystems::net::UnixSocketPath;
 
+fn report_unlinkat_enotdir<P: tx_hal::ConsoleIf>(
+    ctx: &SyscallCtx<'_>,
+    path: &[u8],
+    stage: &str,
+    parent: Option<&Cap<DEntry>>,
+    target: Option<&Cap<DEntry>>,
+    loaded_parent_kind: Option<InodeKind>,
+    loaded_target_kind: Option<InodeKind>,
+) {
+    let path = core::str::from_utf8(path).unwrap_or("<non-utf8>");
+    let parent_id = parent
+        .map(|dentry| dentry.rnode().fs_object_id().as_u64())
+        .unwrap_or(u64::MAX);
+    let parent_cached_kind = parent.map(|dentry| dentry.rnode().meta().kind());
+    let target_id = target
+        .map(|dentry| dentry.rnode().fs_object_id().as_u64())
+        .unwrap_or(u64::MAX);
+    let target_cached_kind = target.map(|dentry| dentry.rnode().meta().kind());
+    let comm_raw = ctx.process.comm();
+    let comm_len = comm_raw
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm_raw.len());
+    let comm = core::str::from_utf8(&comm_raw[..comm_len]).unwrap_or("<non-utf8>");
+    tx_hal::console_write_str::<P>(&alloc::format!(
+        "txkernel:unlinkat-enotdir:stage={stage}:pid={}:tid={}:comm={}:path={path}:parent_inode={parent_id}:parent_cached_kind={parent_cached_kind:?}:parent_loaded_kind={loaded_parent_kind:?}:target_inode={target_id}:target_cached_kind={target_cached_kind:?}:target_loaded_kind={loaded_target_kind:?}\n",
+        ctx.process.pid.0,
+        ctx.thread.tid.0,
+        comm,
+    ));
+}
+
 fn mount_is_read_only(dentry: &Cap<DEntry>) -> bool {
     if mount_payload_for_dentry(dentry)
         .is_some_and(|payload| payload.options.flags.contains(mount::MountFlags::READ_ONLY))
@@ -309,7 +341,10 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
 /// (rejects directory targets with `-EISDIR`); with `AT_REMOVEDIR` it
 /// dispatches through `FsOps::rmdir` (rejects non-directory targets
 /// with `-ENOTDIR`).
-pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_unlinkat<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let flags = args[2] as u32;
@@ -326,7 +361,12 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     }
     let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
         Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+        Err(e) => {
+            if e == ENOTDIR_VALUE {
+                report_unlinkat_enotdir::<P>(ctx, &path, "resolve-dirfd", None, None, None, None);
+            }
+            return SyscallResult::Error(e);
+        }
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&path);
@@ -338,7 +378,12 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     } else {
         match walk_from_process(rooted_at, parent_path, &cred, &ctx.process) {
             Ok(d) => d,
-            Err(e) => return SyscallResult::Error(e),
+            Err(e) => {
+                if e == ENOTDIR_VALUE {
+                    report_unlinkat_enotdir::<P>(ctx, &path, "parent-walk", None, None, None, None);
+                }
+                return SyscallResult::Error(e);
+            }
         }
     };
     if mount_is_read_only(&parent_dentry) {
@@ -360,7 +405,20 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                 }
                 return SyscallResult::Error(errno);
             }
-            Err(errno) => return SyscallResult::Error(errno),
+            Err(errno) => {
+                if errno == ENOTDIR_VALUE {
+                    report_unlinkat_enotdir::<P>(
+                        ctx,
+                        &path,
+                        "target-walk",
+                        Some(&parent_dentry),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                return SyscallResult::Error(errno);
+            }
         };
     let target_id = target_dentry.rnode().fs_object_id();
     let child_meta = {
@@ -374,6 +432,15 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let target_kind = child_meta.kind();
     let want_rmdir = (flags & AT_REMOVEDIR) != 0;
     if want_rmdir && target_kind != InodeKind::Directory {
+        report_unlinkat_enotdir::<P>(
+            ctx,
+            &path,
+            "target-type-check",
+            Some(&parent_dentry),
+            Some(&target_dentry),
+            None,
+            Some(target_kind),
+        );
         return SyscallResult::Error(ENOTDIR_VALUE);
     }
     if !want_rmdir && target_kind == InodeKind::Directory {
@@ -398,18 +465,35 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
-            // Offer an immediate destruction opportunity for backends whose
-            // payload is independently retained (tmpfs). ext4 observes the
-            // live coherent PageContainer and deliberately defers; its final
-            // container drop retries after every OpenFile/mmap is gone.
-            let guard = step_engine::guard();
-            let _ = fs_ops.destroy_inode(target_id, &guard);
-            drop(guard);
             drop(target_dentry);
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        V3::Err(errno) => {
+            let errno = Errno::from(errno);
+            if errno == Errno::ENOTDIR {
+                let guard = step_engine::guard();
+                let loaded_parent_kind = match fs_ops.load_inode_meta(parent_id, &guard) {
+                    V3::Done(meta) => Some(meta.kind()),
+                    _ => None,
+                };
+                let loaded_target_kind = match fs_ops.load_inode_meta(target_id, &guard) {
+                    V3::Done(meta) => Some(meta.kind()),
+                    _ => None,
+                };
+                drop(guard);
+                report_unlinkat_enotdir::<P>(
+                    ctx,
+                    &path,
+                    "backend-rmdir",
+                    Some(&parent_dentry),
+                    Some(&target_dentry),
+                    loaded_parent_kind,
+                    loaded_target_kind,
+                );
+            }
+            SyscallResult::error_from(errno)
+        }
     }
 }
 
@@ -1918,15 +2002,6 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
             old_parent_dentry.remove_cached_child_by_name(old_basename);
             new_parent_dentry.remove_cached_child_by_name(new_basename);
-            // `displaced_dentry` pins an overwritten target through commit.
-            // ext4 marks it orphaned and the live PageContainer gates this
-            // opportunity; final payload drop retries physical reclamation.
-            if (flags & RENAME_EXCHANGE) == 0 {
-                if let Some(displaced) = displaced_dentry.as_ref() {
-                    let guard = step_engine::guard();
-                    let _ = fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard);
-                }
-            }
             drop(displaced_dentry);
             SyscallResult::Return(0)
         }

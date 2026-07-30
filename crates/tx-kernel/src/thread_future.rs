@@ -747,6 +747,7 @@ pub async fn run_thread<P: TxPlatform>(
                 };
                 emit_syscall_roundtrip_marker(req.nr, b"debug.thread.process.after");
                 let sigreturn_ctx = payload.saved_user_context();
+                payload.begin_syscall_diagnostic(req.nr, req.args[0], req.args[1]);
                 payload.set_proc_sleeping(true);
                 let result = if let Some(result) =
                     tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, &thread)
@@ -881,6 +882,7 @@ pub async fn run_thread<P: TxPlatform>(
                     }
                 };
                 payload.set_proc_sleeping(false);
+                payload.end_syscall_diagnostic();
 
                 if matches!(result, tx_shims::linux_syscall::SyscallResult::Error(5)) {
                     log_syscall_eio::<P>(&req, &process, &thread, &payload);
@@ -1043,8 +1045,18 @@ pub async fn run_thread<P: TxPlatform>(
                             b"debug.thread.page_fault.err",
                             vm_fault_error_code(e),
                         );
-                        log_user_segv::<P>(&payload, info.addr.raw(), info.access, "pf", e);
-                        log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize);
+                        let pc = log_user_segv::<P>(
+                            &thread,
+                            &payload,
+                            info.addr.raw(),
+                            info.access,
+                            "pf",
+                            e,
+                        );
+                        log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize, "fault");
+                        if pc as usize != info.addr.raw() as usize {
+                            log_nearby_recipes::<P>(&aspace, pc as usize, "pc");
+                        }
                         deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                         tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
                         return;
@@ -1055,6 +1067,7 @@ pub async fn run_thread<P: TxPlatform>(
                 // Phase B: route fatal trap through canonical
                 // synchronous-fault entry per SIGNAL_v1 §20.
                 log_user_segv::<P>(
+                    &thread,
                     &payload,
                     0,
                     PageFaultAccess::Unknown,
@@ -1272,14 +1285,16 @@ fn log_syscall_eio<P: TxPlatform>(
 }
 
 fn log_user_segv<P: TxPlatform>(
+    thread: &Cap<ThreadIdentity>,
     payload: &ThreadPayload,
     fault_addr: u64,
     access: PageFaultAccess,
     kind: &str,
     error: tx_subsystems::vm::VmFaultError,
-) {
+) -> u64 {
     let ctx = payload.saved_user_context();
     let pc = ctx.as_ref().map(|c| c.pc as u64).unwrap_or(0);
+    let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
     tx_hal::console_write_str::<P>("txkernel:");
     tx_hal::console_write_str::<P>(P::BOARD);
     tx_hal::console_write_str::<P>(":user-segv:");
@@ -1297,6 +1312,22 @@ fn log_user_segv<P: TxPlatform>(
     write_hex_u64::<P>(pc);
     tx_hal::console_write_str::<P>(":addr=0x");
     write_hex_u64::<P>(fault_addr);
+    tx_hal::console_write_str::<P>(":tid=0x");
+    write_hex_u64::<P>(thread.tid.0 as u64);
+    tx_hal::console_write_str::<P>(":hart=0x");
+    write_hex_u64::<P>(hart as u64);
+    if let Some(process) = thread.upgrade_owner_proc() {
+        let comm = process.comm();
+        let comm_len = comm
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(comm.len());
+        let comm = core::str::from_utf8(&comm[..comm_len]).unwrap_or("<non-utf8>");
+        tx_hal::console_write_str::<P>(":pid=0x");
+        write_hex_u64::<P>(process.pid.0 as u64);
+        tx_hal::console_write_str::<P>(":comm=");
+        tx_hal::console_write_str::<P>(comm);
+    }
     // DIAG (board ls-crash): ra/sp/a0/a1/a2 to tell "bad entry PC" from
     // "ran a few instrs then jumped wild", and to inspect the stack ptr
     // and first args the loader/_start received.
@@ -1313,9 +1344,14 @@ fn log_user_segv<P: TxPlatform>(
         write_hex_u64::<P>(c.regs[12] as u64);
     }
     tx_hal::console_write_str::<P>("\n");
+    pc
 }
 
-fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
+fn log_nearby_recipes<P: TxPlatform>(
+    aspace: &AddressSpace,
+    lookup_addr: usize,
+    lookup_label: &str,
+) {
     let recipes = aspace.recipes_snapshot();
     let mut containing: Option<VmEntry> = None;
     let mut lower: Option<VmEntry> = None;
@@ -1324,18 +1360,18 @@ fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
     for entry in recipes.iter().cloned() {
         let start = entry.range.start().as_usize();
         let end = entry.range.end().as_usize();
-        if start <= fault_addr && fault_addr < end {
+        if start <= lookup_addr && lookup_addr < end {
             containing = Some(entry);
             break;
         }
-        if end <= fault_addr
+        if end <= lookup_addr
             && lower
                 .as_ref()
                 .is_none_or(|old| old.range.end().as_usize() < end)
         {
             lower = Some(entry.clone());
         }
-        if fault_addr < start
+        if lookup_addr < start
             && upper
                 .as_ref()
                 .is_none_or(|old| start < old.range.start().as_usize())
@@ -1348,8 +1384,10 @@ fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
     tx_hal::console_write_str::<P>(P::BOARD);
     tx_hal::console_write_str::<P>(":user-segv:recipes:count=0x");
     write_hex_u64::<P>(recipes.len() as u64);
-    tx_hal::console_write_str::<P>(":fault=0x");
-    write_hex_u64::<P>(fault_addr as u64);
+    tx_hal::console_write_str::<P>(":");
+    tx_hal::console_write_str::<P>(lookup_label);
+    tx_hal::console_write_str::<P>("=0x");
+    write_hex_u64::<P>(lookup_addr as u64);
     tx_hal::console_write_str::<P>("\n");
 
     if let Some(entry) = containing {

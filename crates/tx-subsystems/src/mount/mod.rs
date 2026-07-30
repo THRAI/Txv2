@@ -1,6 +1,7 @@
 //! Mount identity, payload, and backend bootstrap shells.
 
-use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -291,6 +292,12 @@ pub enum SourceLabel {
 
 pub struct MountPayload {
     payload_pin_count: AtomicU32,
+    /// Per-mount persistent-object coherence index.
+    ///
+    /// Every RNode and file PageContainer for one `FsObjectId` obtains the
+    /// same `FsObjectPin`.  The index is weak, so it does not retain an object
+    /// after the final namespace/open/mmap/cache holder disappears.
+    object_lifetimes: SpinMutex<BTreeMap<FsObjectId, ArcWeak<FsObjectLifetime>>>,
     pub fs_ops: Arc<dyn FsOps>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,
     pub backing: Option<Arc<dyn BlockDevice>>,
@@ -313,6 +320,7 @@ impl MountPayload {
     ) -> Self {
         Self {
             payload_pin_count: AtomicU32::new(0),
+            object_lifetimes: SpinMutex::new(BTreeMap::new()),
             fs_ops,
             fs_page_backing,
             backing,
@@ -354,6 +362,24 @@ impl MountPayload {
 
     pub fn fs_page_backing(&self) -> &Arc<dyn FsPageBacking> {
         &self.fs_page_backing
+    }
+
+    fn object_pin_from_mount(
+        &self,
+        mount: MountPayloadPin,
+        fs_object_id: FsObjectId,
+    ) -> FsObjectPin {
+        let mut objects = self.object_lifetimes.lock();
+        if let Some(existing) = objects.get(&fs_object_id).and_then(ArcWeak::upgrade) {
+            return FsObjectPin(existing);
+        }
+
+        let lifetime = Arc::new(FsObjectLifetime {
+            mount,
+            fs_object_id,
+        });
+        objects.insert(fs_object_id, Arc::downgrade(&lifetime));
+        FsObjectPin(lifetime)
     }
 }
 
@@ -408,6 +434,65 @@ impl Drop for MountPayloadPin {
             .fetch_sub(1, Ordering::AcqRel);
     }
 }
+
+/// Shared lifetime evidence for one persistent filesystem object.
+///
+/// `RNode` and `PageContainer` both hold this pin.  Consequently directories,
+/// symlinks, regular-file opens, and file mappings all participate in the same
+/// last-reference test.  The backend receives `destroy_inode` only after the
+/// final strong pin disappears; linked inodes remain a backend-checked no-op.
+pub struct FsObjectLifetime {
+    mount: MountPayloadPin,
+    fs_object_id: FsObjectId,
+}
+
+impl Drop for FsObjectLifetime {
+    fn drop(&mut self) {
+        let guard = crate::vfs::adapter::step_engine::borrow_current_guard()
+            .unwrap_or_else(crate::vfs::adapter::step_engine::guard);
+        let _ = self
+            .mount
+            .payload()
+            .fs_ops()
+            .destroy_inode(self.fs_object_id, &guard);
+    }
+}
+
+/// Cloneable holder for [`FsObjectLifetime`].
+#[derive(Clone)]
+pub struct FsObjectPin(Arc<FsObjectLifetime>);
+
+impl FsObjectPin {
+    pub fn acquire(mount: &Cap<MountPayload>, fs_object_id: FsObjectId) -> Self {
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(mount.clone()));
+        Self::from_mount_pin(pin, fs_object_id)
+    }
+
+    pub fn from_mount_pin(mount: MountPayloadPin, fs_object_id: FsObjectId) -> Self {
+        let payload = mount.payload().clone();
+        payload.object_pin_from_mount(mount, fs_object_id)
+    }
+
+    pub fn fs_object_id(&self) -> FsObjectId {
+        self.0.fs_object_id
+    }
+}
+
+impl core::fmt::Debug for FsObjectPin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FsObjectPin")
+            .field("fs_object_id", &self.fs_object_id())
+            .finish()
+    }
+}
+
+impl PartialEq for FsObjectPin {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FsObjectPin {}
 
 #[derive(Debug)]
 pub struct MountIdentity {

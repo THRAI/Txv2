@@ -7,7 +7,7 @@ use tx_subsystems::page_backed::{
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
-use crate::read_backend::{inode_no, Ext4FsInstance};
+use crate::read_backend::Ext4FsInstance;
 
 use page_allocator::ZeroPolicy;
 
@@ -126,8 +126,8 @@ where
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
@@ -152,8 +152,8 @@ where
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
@@ -177,8 +177,8 @@ where
         new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let now_sec = tx_subsystems::wall_clock::current_realtime_sec().min(u32::MAX as u64) as u32;
@@ -193,10 +193,13 @@ where
 
     fn fsync_file(
         &self,
-        _fs_object_id: FsObjectId,
+        fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::done(())
+        match self.resolve_object(fs_object_id) {
+            Ok(_) => StepOutcome::done(()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
     }
 
     // `fallocate` and `supports_reflink` inherit the trait defaults

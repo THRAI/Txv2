@@ -929,8 +929,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
             match unlink_outcome {
                 V3::Done(()) => {
                     dir_dentry.remove_cached_child_by_name(&tmp_name);
-                    let guard = step_engine::guard();
-                    let _ = fs_ops.destroy_inode(target_id, &guard);
                     opened = Some(openfile);
                     break;
                 }
@@ -2358,6 +2356,59 @@ fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
     meta
 }
 
+/// Emit one failure-focused record when a read-only regular-file descriptor
+/// is reported as empty. Rust's archive builder rejects exactly this state
+/// before mmap, and the record distinguishes a genuinely empty inode from a
+/// split live/disk size publication without tracing ordinary stat traffic.
+fn report_zero_pagebacked_fstat<P: tx_hal::ConsoleIf>(
+    ctx: &SyscallCtx<'_>,
+    fd: i32,
+    file: &Cap<OpenFile>,
+    reported: &InodeMeta,
+    syscall: &str,
+) {
+    if reported.size != 0 || !file.flags().read || file.flags().write {
+        return;
+    }
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return;
+    };
+    if rnode.meta().kind() != tx_subsystems::vfs::structure::InodeKind::Regular {
+        return;
+    }
+    let RNodeBacking::PageBacked { pc } = rnode.backing() else {
+        return;
+    };
+
+    let guard = step_engine::guard();
+    let disk_size = fs_ops_for_rnode(rnode)
+        .and_then(
+            |ops| match ops.load_inode_meta(rnode.fs_object_id(), &guard) {
+                StepOutcome::Done(meta) => Some(meta.size),
+                _ => None,
+            },
+        )
+        .unwrap_or(u64::MAX);
+    drop(guard);
+    let (resident, dirty, in_flight) = pc.diagnostic_page_counts();
+    let comm_raw = ctx.process.comm();
+    let comm_len = comm_raw
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm_raw.len());
+    let comm = core::str::from_utf8(&comm_raw[..comm_len]).unwrap_or("<non-utf8>");
+    tx_hal::console_write_str::<P>(&alloc::format!(
+        "txkernel:file-size-zero:syscall={syscall}:pid={}:tid={}:comm={comm}:fd={fd}:inode={}:pc={:#x}:pc_size={}:disk_size={disk_size}:cached_rnode_size={}:offset={}:resident={resident}:dirty={dirty}:in_flight={in_flight}\n",
+        ctx.process.pid.0,
+        ctx.thread.tid.0,
+        rnode.fs_object_id().as_u64(),
+        pc.raw(),
+        pc.size_bytes(),
+        rnode.meta().size,
+        file.offset(),
+    ));
+}
+
 fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
     match file.backing() {
         OpenFileBacking::Rnode { .. } => None,
@@ -2397,7 +2448,10 @@ fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
 /// - Unknown / closed fd → `-EBADF`.
 /// - `statbuf == 0` (NULL) → `-EFAULT`.
 /// - All other paths return `0` after writing the buffer.
-pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_fstat<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let fd = args[0] as i32;
     let statbuf_uaddr = args[1];
 
@@ -2419,6 +2473,7 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         }
         _ => (stat_meta_for_open_file(&file), fd as u64),
     };
+    report_zero_pagebacked_fstat::<P>(ctx, fd, &file, &meta, "fstat");
     let stat = inode_meta_to_stat(&meta, ino, stat_rdev_for_open_file(&file));
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
@@ -2454,7 +2509,10 @@ pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 /// inode metadata already used by `newfstatat`; unsupported sync
 /// policy bits are accepted because there is no cache coherency
 /// distinction in the current VFS layer.
-pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let flags = args[2] as u32;
@@ -2513,19 +2571,17 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     None => return SyscallResult::Error(EBADF_VALUE),
                 };
                 let (rmaj, rmin) = rdev_major_minor_for_open_file(&file);
+                let live_meta = stat_meta_for_open_file(&file);
+                report_zero_pagebacked_fstat::<P>(ctx, fd, &file, &live_meta, "statx");
                 match file.backing() {
                     OpenFileBacking::Rnode { rnode } => (
-                        StatxResult {
-                            meta: stat_meta_for_open_file(&file),
-                        },
+                        StatxResult { meta: live_meta },
                         rnode.fs_object_id(),
                         rmaj,
                         rmin,
                     ),
                     _ => (
-                        StatxResult {
-                            meta: stat_meta_for_open_file(&file),
-                        },
+                        StatxResult { meta: live_meta },
                         FsObjectId::new(fd as u64),
                         rmaj,
                         rmin,
@@ -2592,7 +2648,10 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 ///
 /// Path resolution mirrors `resolve_path_at`'s shape (using
 /// `step_walk` from cwd with `walker_cred`).
-pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let statbuf_uaddr = args[2];
@@ -2632,7 +2691,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         if dirfd == AT_FDCWD {
             (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
-            return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+            return sys_fstat::<P>([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
         }
     } else {
         let rooted_at: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {

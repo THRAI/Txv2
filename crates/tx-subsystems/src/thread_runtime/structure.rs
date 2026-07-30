@@ -253,6 +253,15 @@ pub struct ThreadPayload {
     /// awaiting syscall dispatch; blocking syscall futures should
     /// appear as sleeping to procfs observers.
     pub(crate) proc_sleeping: AtomicBool,
+    /// Syscall currently being driven by the thread future.
+    ///
+    /// These three atomics are diagnostic state only.  They let a one-shot
+    /// SMP idle dump distinguish a parent parked in `wait4`, a pthread parked
+    /// in `futex`, and a pipe reader parked in `read` without taking the
+    /// syscall future apart. `u64::MAX` means that no syscall is active.
+    active_syscall_nr: AtomicU64,
+    active_syscall_arg0: AtomicU64,
+    active_syscall_arg1: AtomicU64,
     /// `clear_child_tid` pointer from `set_tid_address`.  Written
     /// atomically to 0 on thread exit when futex wake is supported.
     pub clear_child_tid: SpinMutex<Option<u64>>,
@@ -285,6 +294,9 @@ impl ThreadPayload {
             stopped: core::sync::atomic::AtomicBool::new(false),
             alt_stack: SpinMutex::new(None),
             proc_sleeping: AtomicBool::new(false),
+            active_syscall_nr: AtomicU64::new(u64::MAX),
+            active_syscall_arg0: AtomicU64::new(0),
+            active_syscall_arg1: AtomicU64::new(0),
             clear_child_tid: SpinMutex::new(None),
             robust_list_head: SpinMutex::new(None),
             robust_list_len: SpinMutex::new(0),
@@ -344,6 +356,31 @@ impl ThreadPayload {
     /// Update the procfs sleep-state hint for syscall dispatch.
     pub fn set_proc_sleeping(&self, sleeping: bool) {
         self.proc_sleeping.store(sleeping, Ordering::Release);
+    }
+
+    /// Publish the syscall whose future is currently active.
+    pub fn begin_syscall_diagnostic(&self, nr: u64, arg0: u64, arg1: u64) {
+        self.active_syscall_arg0.store(arg0, Ordering::Relaxed);
+        self.active_syscall_arg1.store(arg1, Ordering::Relaxed);
+        self.active_syscall_nr.store(nr, Ordering::Release);
+    }
+
+    /// Clear the active-syscall diagnostic after dispatch completes.
+    pub fn end_syscall_diagnostic(&self) {
+        self.active_syscall_nr.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Snapshot the active syscall number and its first two arguments.
+    pub fn active_syscall_diagnostic(&self) -> Option<(u64, u64, u64)> {
+        let nr = self.active_syscall_nr.load(Ordering::Acquire);
+        if nr == u64::MAX {
+            return None;
+        }
+        Some((
+            nr,
+            self.active_syscall_arg0.load(Ordering::Relaxed),
+            self.active_syscall_arg1.load(Ordering::Relaxed),
+        ))
     }
 
     /// Borrow the userspace-run slot owned by this thread. The trap

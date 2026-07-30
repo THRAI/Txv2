@@ -958,6 +958,7 @@ impl<P: TxPlatform> CoreInit<P> {
         P::enable_timer_wakeups();
 
         // Enable concurrent poll on all harts (Phase 1a poll lease).
+        Self::reset_smp_stall_diagnostic();
         super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
 
         // Drive the BSP reactor loop until init zombifies. Each
@@ -1073,12 +1074,15 @@ impl<P: TxPlatform> CoreInit<P> {
                 if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
                     continue;
                 }
+                Self::note_reactor_hart_idle(loop_cpu);
                 let wait_state = P::prepare_interrupt_wait();
                 if Self::boot_reactor_has_runnable_work(boot_runtime::HartId(loop_cpu.0)) {
+                    Self::note_reactor_hart_active(loop_cpu);
                     P::cancel_interrupt_wait(wait_state);
                     continue;
                 }
                 P::wait_for_interrupt_prepared(wait_state);
+                Self::note_reactor_hart_active(loop_cpu);
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
