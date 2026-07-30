@@ -1,3 +1,28 @@
+- 2026-07-30 (**Socket/FileOps 生产接线按四步恢复，必要 socket 特判保留**).
+  `1ae1a789` 恢复 `OpenFile::step_read/step_write -> FileOps` 的 Socket 委派；
+  `8b7bd4ac` 让普通 INET/INET6 `read/write` 回到通用 fd 路径，同时保留
+  netlink `write`、bootstrap read gate 和 64 KiB staging，并在 net payload
+  层补齐 netlink 字节消费；`b2d4e1a6` 恢复 `F_SETFL(O_NONBLOCK)` 与
+  last-close/process-exit hooks，保留 retain-count/两相关闭时序，且 hook
+  通过 owner-aware post callback 同时唤醒 RawQueue/WaitSource；`438037f3`
+  确立 `query_fd_ready` 为 poll/select/epoll 的唯一 fd readiness facade，
+  删除 `FileOps` 重复 poll 接口及 `device -> net::PollMask` 层次泄漏。
+  ioctl、sendto/recvfrom/sendmsg、splice 拒绝和 pipe-backed socketpair 等
+  ABI/能力边界特判未动。**Verification**：tx-shims socket fdtable
+  **97/97**；`cargo xtask build --target rv64-qemu` 通过；真实 QEMU Git/DNS/
+  HTTP/HTTPS **9/9**，NET_IRQ
+  `claims=61/completions=61/wrong-hart=0/missing-device=0`。
+  `cargo -q xtask unit` 仍只有既有 3 个 tx-shims 断言和 tx-ext4 陈旧
+  `with_target` API；tx-subsystems 全 net filter 的首个 bridge 断言在改动前
+  `3f6f8dd7` 也失败，随后 epoch 锁中毒产生级联，不能作为本轮回归结论。
+  实施细节见
+  `docs/progress/research/2026-07-30-network-refactor-merge-structural-audit.md`。
+  **Next**：处理 TCP 外层/smoltcp/shutdown/readiness 与动态 sockopt 的多真相；
+  RawQueue/WaitSource 双载体、L2/L3 所有权和动态网络对象生命周期仍需独立设计。
+  **Blocker**：本项无；progress validate 仍被 07-24 plan 的旧状态
+  `completed` 阻断，docs lint 仍为既有 23 个断链；workspace unit 与 net
+  集合夹具基线另案处理。
+
 - 2026-07-30 (**Socket/FileOps 特判边界复核完成；确认应选择性恢复，不能机械全删**).
   已对照合并前 feature 锚点 `90939012`、P3-A 落地提交及当前
   `26e7d79c`：`net/file_ops.rs` 实现未丢，丢的是 VFS/read-write/F_SETFL/

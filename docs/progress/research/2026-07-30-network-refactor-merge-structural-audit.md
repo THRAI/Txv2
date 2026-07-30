@@ -225,3 +225,58 @@ CURL_RC:0
 动态 option/状态单一真相；L2/L3 所有权拆分和 wait 收敛属于更大的结构
 重构。curl 当前无功能阻塞；长期可复现性仍建议把 `latest-stable` 换成固定
 Alpine branch/源校验记录。
+
+## Socket/FileOps 四步实施结果
+
+2026-07-30 按上述边界完成恢复，当前实现锚点为 `438037f3`：
+
+1. `1ae1a789` 在 `vfs/execution.rs` 恢复 Socket 的
+   `OpenFile::step_read/step_write -> FileOps` 委派；既有 P3-S2 判决测试
+   `open_file_read_write_delegate_to_socket_file_ops` 转绿。
+2. `8b7bd4ac` 摘除普通 INET/INET6 socket 的
+   `read/write -> recvfrom/sendto` 整体转发。netlink `write` 仍显式走
+   `dispatch_netlink_send`，bootstrap read 仍只保留不进入阻塞 drive 的 gate，
+   socket staging 仍为 64 KiB。迁移中发现通用 FileOps read 会在 netlink
+   永久等待，根因不是必须新增 syscall 特判，而是
+   `SocketPayload::consume_recv_bytes_into` 漏了 NetlinkRoute/NetlinkNetfilter；
+   已在 payload 语义层补齐。
+3. `b2d4e1a6` 让 `F_SETFL(O_NONBLOCK)`、socket last close 和 process exit
+   经 `FileOps` hook 分派，关闭路径原有 retain-count、去重和两相时序不变。
+   第一版无参数 `on_set_fl_nonblock` 会绕过 owner-hart mailbox 发布；最终
+   hook 接收 post callback，由 `SocketReadiness::fire_send_with_post` 同时维护
+   RawQueue 和镜像 WaitSource，避免为了接口统一丢掉调度语义。
+4. `438037f3` 保留 main 合入后的 `query_fd_ready`，并让 bootstrap read gate
+   也使用该 facade；gate 在查询前只做有界 loopback pending 推进。删除
+   `FileOps::poll_mask/poll_wait_token` 和旧 socket helper，使
+   poll/select/epoll 的 fd-family readiness 查询只有一个生产入口，同时消除
+   `device::FileOps -> net::PollMask` 依赖。协议专属 `recvfrom` 等仍可使用
+   net step wait token；RawQueue/WaitSource 双载体本身尚未收敛。
+
+保留的特判与调查结论一致：netlink write、无 mailbox bootstrap gate、
+64 KiB staging、socket ABI 的 sockaddr/msghdr/cmsg/usercopy、ioctl、splice
+能力拒绝以及 pipe-backed AF_UNIX socketpair 都不是这轮应删除的对象。
+
+验证结果：
+
+- `cargo test -p tx-shims --lib linux_syscall::tests::socket_fdtable:: --
+  --test-threads=1`：**97 passed, 0 failed**，覆盖 TCP/UDP/netlink、poll/epoll、
+  F_SETFL 和 close/dup/exit。
+- `cargo xtask build --target rv64-qemu`：通过。
+- `TX_REQUIRE_NET_IRQ=1 tools/verify-git-net.sh`：真实 guest Git/DNS/HTTP/HTTPS
+  **9/9**；IRQ 为
+  `claims=61/completions=61/wrong-hart=0/missing-device=0`。
+- `cargo -q xtask unit`：tx-kernel **116/116**、tx-scripts **166/166**；
+  仍是既有 3 个 tx-shims 断言失败和 tx-ext4 测试陈旧
+  `BackendPageRequest::with_target` 编译错误。
+- tx-subsystems 全 `net::tests::` filter 的第一个实际失败是
+  `namespace_runtime_drives_container_ping_container_through_bridge`；
+  在改动前 `3f6f8dd7` 上单独运行同样失败于
+  `total.bridge_forwarded >= 2`，随后全局 epoch 测试锁中毒造成级联。因此它是
+  已知 bridge/夹具基线，不能归因于本轮 FileOps 迁移。
+- `cargo xtask progress validate` 仍被既有 07-24 plan 的旧状态
+  `completed` 阻断；`cargo xtask lint docs` 仍为既有 23 个断链，本次两份
+  progress 文档未出现在失败列表。
+
+原审计优先级 1（NET_IRQ）和 2（FileOps 生产入口）至此完成。下一项应是
+TCP 状态与动态 option 单一真相；wait 双载体、L2/L3 所有权、动态对象回收及
+功能缺口仍保持为独立结构工作，不能因 fd readiness facade 已统一而宣称解决。
