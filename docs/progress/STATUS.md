@@ -1,3 +1,23 @@
+- 2026-07-30 (**RV64 真实 NET_IRQ top/bottom-half 链恢复并完成 Git 全链验收**).
+  恢复 `IrqIf::NET_IRQ=2`、virtio notification、外部 IRQ 用户帧 handoff 和
+  `DeferredWake`；top half 仅把 claim 发布到 per-hart 原子状态机，owner-hart
+  bottom half 依次执行 device ACK/poll/kick、释放软件 slot、PLIC complete，
+  IRQ 上下文不拿 EBR guard。首次真机/GDB 发现 claim 虽到达，但无界 reactor
+  inner loop 会把 bottom half 推迟数十秒，10 ms watchdog 仍在掩盖数据面；
+  因而新增通用 `HartPollBudget`，BSP/AP 每 poll 一个 future 即返回，并在
+  poll 前后统一 drain UART/net bottom halves。同步修复 legacy
+  `RawQueueWaitFuture` 已订阅分支的 level recheck，并加入 opt-in IRQ 串口统计与
+  harness 断言。**Verification**：tx-reactor 全测试串行通过；tx-kernel IRQ
+  7/7、RawQueue 回归、RV64 HAL 93/93、LA64 HAL 53/53；rv64/la64 build 均通过；
+  QEMU Git/DNS/HTTP/HTTPS **9/9**，最终
+  `claims=59, completions=59, wrong-hart=0, missing-device=0`。设计与证据见
+  `docs/progress/research/2026-07-30-net-irq-restoration-design.md`，调试过程见
+  `msp/debug-logs/2026-07-30-net-irq-deferred-completion.md`。
+  **Next**：保留 10 ms RX floor 作为明确 watchdog，另做 cold-idle RX 压测后再决定
+  是否移除；LA64 须先确认 virtio-pci GSI，当前保持 `NET_IRQ=0`。
+  **Blocker**：本项无；workspace unit 仍是既有 3 个 tx-shims 断言和 tx-ext4
+  陈旧 `with_target`，docs lint 仍为既有 23 断链。
+
 - 2026-07-30 (**feature-network-refactor 合并保真度/结构审计完成，Alpine RV64 curl 已落并真机验收**).
   对当前 `6503312f` 与 07-27 merge `6d41a347` 的 feature parent `90939012`
   做 blob、调用点和当前实现复核：P0/P1/P4 完整保留，P2 外部 TCP/UDP 数据面、

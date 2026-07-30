@@ -883,7 +883,10 @@ where
         }
         TrapClass::ExternalInterrupt => {
             let _irq_context = crate::enter_irq_context();
-            K::on_external_irq(<Platform as tx_hal::SmpIf>::current_cpu_id())
+            K::on_external_irq(
+                <Platform as tx_hal::SmpIf>::current_cpu_id(),
+                frame.view_mut(),
+            )
         }
         TrapClass::InterprocessorInterrupt => {
             let _irq_context = crate::enter_irq_context();

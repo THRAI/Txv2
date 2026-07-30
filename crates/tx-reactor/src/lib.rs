@@ -43,8 +43,8 @@ pub use mailbox::{
     ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
 pub use runtime::{
-    HartRunStats, HartRuntimeView, Reactor, ReactorObservability, RunIdleReport, RunStats,
-    SharedReactor, SliceClock, TaskPublishReport,
+    HartPollBudget, HartRunStats, HartRuntimeView, Reactor, ReactorObservability, RunIdleReport,
+    RunStats, SharedReactor, SliceClock, TaskPublishReport,
 };
 pub use scheduler::{
     HartId, HartSchedulerLocal, InitialSchedMeta, LocalEnqueueRequest, MigrationPolicy,

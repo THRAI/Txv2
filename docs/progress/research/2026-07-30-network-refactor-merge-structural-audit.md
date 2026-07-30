@@ -166,7 +166,13 @@ CURL_RC:0
 - `cargo xtask lint docs`：仍为既有 23 个断链及 anchor/stale-vocabulary
   告警；本次新增 research/STATUS 未出现在失败列表
 
-建议下一轮先恢复 NET_IRQ 和 FileOps 两个合并回退，再处理 TCP 动态 option/
-状态单一真相；L2/L3 所有权拆分和 wait 收敛属于更大的结构重构，应按独立计划
-推进。curl 当前无功能阻塞；长期可复现性仍建议把 `latest-stable` 换成固定
-Alpine branch/源校验记录。
+2026-07-30 续记：优先级 1 的真实 NET_IRQ 链已经恢复，RV64 QEMU Git 全链
+9/9，IRQ 统计为 `claims=59/completions=59/wrong-hart=0/missing-device=0`；
+设计、实现边界和调试证据见
+`2026-07-30-net-irq-restoration-design.md`。10 ms floor 仍作为明确 watchdog，
+不再是正常流量的主要推进路径。
+
+下一轮优先恢复 FileOps 生产统一入口，再处理 TCP 动态 option/状态单一真相；
+L2/L3 所有权拆分和 wait 收敛属于更大的结构重构，应按独立计划推进。curl
+当前无功能阻塞；长期可复现性仍建议把 `latest-stable` 换成固定 Alpine
+branch/源校验记录。

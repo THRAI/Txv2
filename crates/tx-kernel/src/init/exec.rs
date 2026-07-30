@@ -631,6 +631,18 @@ impl<P: TxPlatform> CoreInit<P> {
         crate::irq::drain_uart_rx_pending::<P>()
     }
 
+    /// Run lock-taking device IRQ bottom halves in normal reactor context.
+    ///
+    /// UART consumes bytes buffered by its top half. Virtio-net clears the
+    /// level-triggered device source and completes its deferred controller
+    /// claim. Keeping both calls here makes the IRQ/task-context boundary
+    /// explicit at each reactor-loop call site.
+    pub(crate) fn drain_device_irq_bottom_halves() -> bool {
+        let drained_uart = Self::drain_pending_uart_rx_into_tty() != 0;
+        let drained_net = crate::irq::drain_net_rx_irq::<P>();
+        drained_uart || drained_net
+    }
+
     pub(super) fn drain_sbi_console_into_tty() -> usize {
         // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
         // command lines in a single SBI poll. The 64-byte cap left the
@@ -713,18 +725,15 @@ impl<P: TxPlatform> CoreInit<P> {
         // userspace trap (which is the only event that resolves the
         // thread future's pending wait).
         loop {
+            // Complete any outstanding controller transaction even if init
+            // became a zombie in the preceding reactor poll.
+            let drained_device_before_poll = Self::drain_device_irq_bottom_halves();
             if init.is_zombie() {
                 break;
             }
 
-            // UART IRQ handlers cannot touch TTY state directly
-            // because epoch guards are forbidden in IRQ context.
-            // They queue bytes in an IRQ-safe buffer and request a
-            // reactor wake; consume that buffer here in normal
-            // context before deciding whether there is runnable work.
-            let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
-            if had_uart || had_sbi {
+            if drained_device_before_poll || had_sbi {
                 continue;
             }
 
@@ -750,6 +759,11 @@ impl<P: TxPlatform> CoreInit<P> {
                 Some(step) => step,
                 None => break,
             };
+            // A device IRQ may interrupt the future that was just polled.
+            // The bounded reactor step has now committed that future and
+            // cleared task-local state, so this is the earliest safe
+            // task-context boundary for same-hart deferred completion.
+            let drained_device_after_poll = Self::drain_device_irq_bottom_halves();
             let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
             let submitted_child_after_poll = Self::drain_pending_child_submits();
 
@@ -786,6 +800,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 || drain_stats.publication_dropped > 0
                 || drain_stats.publication_remaining > 0;
             if step.should_idle()
+                && !drained_device_after_poll
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
                 && !drained_terminal_before_poll
@@ -818,12 +833,11 @@ impl<P: TxPlatform> CoreInit<P> {
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
-                // Drain UART RX bytes buffered by `uart_rx_irq_handler`
-                // during the preceding WFI sleep. The IRQ handler cannot
-                // call `epoch::guard()` (irq_depth > 0), so it stores raw
-                // bytes in `UART_RX_PENDING`; `drain_uart_rx_pending` runs
-                // here with irq_depth == 0 and feeds them to `step_ingest`.
-                let _ = crate::irq::drain_uart_rx_pending::<P>();
+                // Run device bottom halves immediately after wake. Net IRQ
+                // completion must happen on the claimant hart; UART ingestion
+                // likewise requires task context because it may create an
+                // epoch guard.
+                let _ = Self::drain_device_irq_bottom_halves();
                 // Also poll the SBI debug-console as a fallback for
                 // platforms where the UART IRQ is claimed by firmware
                 // (e.g. OpenSBI M-mode UART handling). Harmless when the
@@ -841,6 +855,20 @@ impl<P: TxPlatform> CoreInit<P> {
                 let _ = step_engine::drain_with_budget(usize::MAX);
                 let _ = step_engine::drain_with_budget(usize::MAX);
             }
+        }
+
+        if cmdline_bool::<P>("tx.net.irq_report") {
+            let stats = crate::irq::net_irq_stats();
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":irq:net:claims:");
+            Self::write_u64(stats.claims);
+            tx_hal::console_write_str::<P>(":completions:");
+            Self::write_u64(stats.completions);
+            tx_hal::console_write_str::<P>(":wrong-hart:");
+            Self::write_u64(stats.wrong_hart_drains);
+            tx_hal::console_write_str::<P>(":missing-device:");
+            Self::write_u64(stats.missing_device_drains);
+            tx_hal::console_write_str::<P>("\n");
         }
 
         // init zombified — emit the exit sentinel.

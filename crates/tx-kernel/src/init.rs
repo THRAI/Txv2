@@ -53,6 +53,9 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 /// tasks block on WaitSources rather than timer-backed futures.
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 const POLLING_IDLE_SPINS: usize = 256;
+/// Return from the reactor after each future poll so task-context device IRQ
+/// work runs promptly on the hart that claimed the interrupt.
+const REACTOR_POLLS_PER_DEVICE_IRQ_CHECK: usize = 1;
 
 fn platform_rtc_read_time_ns<P>() -> Result<u64, TimeError>
 where
@@ -2546,11 +2549,13 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
+        let drained_device_before_poll = Self::drain_device_irq_bottom_halves();
         let step = if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
             Self::boot_reactor_once_concurrent(cpu_id)
         } else {
             Self::boot_reactor_once(cpu_id)
         };
+        let drained_device_after_poll = Self::drain_device_irq_bottom_halves();
 
         // Reclaim terminal child tasks before publishing queued children so
         // hot pthread create/join loops reuse reactor task slots promptly.
@@ -2562,7 +2567,9 @@ impl<P: TxPlatform> CoreInit<P> {
         let submitted_child = Self::drain_pending_child_submits();
         let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
 
-        drained_terminal_before_submit
+        drained_device_before_poll
+            || drained_device_after_poll
+            || drained_terminal_before_submit
             || submitted_child
             || drained_terminal_after_poll
             || step.is_some_and(|step| !step.should_idle())
@@ -2575,7 +2582,13 @@ impl<P: TxPlatform> CoreInit<P> {
         // Force a guard acquire+drop to clear stale epoch state.
         drop(step_engine::guard());
         let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
-            boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
+            boot_runtime::hart_loop::step_hart_loop_at_with_poll_budget(
+                runtime,
+                hart,
+                now_ns,
+                &mut signal,
+                boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
+            )
         })?;
         Self::program_boot_reactor_deadline(hart);
         Some(step)
@@ -2610,11 +2623,12 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         let mut slice_clock = KernelSliceClock::<P>(core::marker::PhantomData);
-        let step = BOOT_REACTOR.run_hart_loop_concurrent_with_slice_clock(
+        let step = BOOT_REACTOR.run_hart_loop_concurrent_with_slice_clock_and_poll_budget(
             hart,
             now_ns,
             &mut signal,
             &mut slice_clock,
+            boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
         )?;
         Self::program_boot_reactor_deadline(hart);
         Some(step)

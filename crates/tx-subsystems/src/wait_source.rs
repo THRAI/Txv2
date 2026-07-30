@@ -354,7 +354,11 @@ impl Future for RawQueueWaitFuture {
         this.mailbox.register_waker(cx.waker().clone());
 
         let ready = if this.subscription.is_some() {
+            // RawQueue is level-triggered. A stale mailbox generation may
+            // suppress an old wake hint, but it must not suppress readiness
+            // that is still asserted by the producer.
             mailbox_ready(&this.mailbox, this.active_wait.as_ref())
+                || (this.queue.peek() & this.mask.bits() != 0)
         } else if this.queue.peek() & this.mask.bits() != 0 {
             true
         } else {
@@ -581,5 +585,38 @@ mod tests {
         assert!(wait_on_registered_source_id(id, 0x1).is_some());
         release_wait_source(id);
         assert!(wait_on_registered_source_id(id, 0x1).is_none());
+    }
+
+    #[test]
+    fn subscribed_raw_queue_rechecks_level_after_stale_mailbox_event() {
+        let queue = RawQueue::new();
+        let mut wait = RawQueueWaitFuture {
+            queue: queue.clone(),
+            mask: Mask::from_bits(0x4),
+            subscription: None,
+            mailbox: Arc::new(TaskMailbox::new()),
+            active_wait: None,
+        };
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
+        assert!(wait.subscription.is_some());
+
+        // Keep the old queue subscription but advance the driver's active
+        // generation. The resulting SourceFired event is intentionally stale;
+        // the queue's asserted level remains authoritative.
+        let generation = wait.mailbox.next_generation();
+        wait.active_wait = Some(ActiveWait::new(
+            generation,
+            queue.source_id(),
+            InterestMask::new(0x4),
+        ));
+        queue.fire(0x4);
+
+        assert!(matches!(
+            Pin::new(&mut wait).poll(&mut cx),
+            Poll::Ready(WaitOutcome::Ready)
+        ));
     }
 }

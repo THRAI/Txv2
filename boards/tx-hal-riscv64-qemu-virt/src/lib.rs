@@ -545,6 +545,9 @@ impl IrqIf for Platform {
     const UART_IRQ: u32 = 10;
     /// QEMU `virt` machine's goldfish RTC is wired at PLIC IRQ 11.
     const RTC_IRQ: u32 = GOLDFISH_RTC_IRQ;
+    /// `virtio1@0x1000_2000` is MMIO slot 1; QEMU wires slot N to
+    /// `VIRTIO_IRQ + N`, so the boot network device uses PLIC IRQ 2.
+    const NET_IRQ: u32 = 2;
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0

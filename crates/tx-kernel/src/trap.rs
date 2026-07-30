@@ -65,17 +65,36 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Resume
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
         let irq = P::claim();
         if irq == 0 {
             return TrapAction::Resume;
         }
 
         let handled = P::dispatch_irq(irq);
-        P::complete(irq);
+        // Most handlers finish their controller transaction in the trap.
+        // A deferred handler keeps the claim outstanding so a task-context
+        // bottom half can clear a level-triggered device source first. That
+        // bottom half owns the one matching same-context completion.
+        if !matches!(handled, IrqHandled::DeferredWake) {
+            P::complete(irq);
+        }
 
         match handled {
-            IrqHandled::Wake => TrapAction::Reschedule,
+            IrqHandled::Wake | IrqHandled::DeferredWake => {
+                // A from-user reschedule longjmps out of the board trap shell.
+                // Preserve the interrupted userspace run in its hart slot
+                // before requesting that jump, exactly as the timer path does.
+                if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
+                    let hart = <P as PercpuIf>::current_cpu_id().0;
+                    let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
+                    if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
+                        crate::init::mark_boot_reactor_userspace_preempt(cpu);
+                    }
+                    return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
+                }
+                TrapAction::Reschedule
+            }
             IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
         }
     }

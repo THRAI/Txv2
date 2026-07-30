@@ -1193,6 +1193,14 @@ pub trait IrqIf {
     /// userspace state.
     const RTC_IRQ: u32 = 0;
 
+    /// Platform-specific IRQ number for the boot network device.
+    ///
+    /// Boards without a proven external-interrupt route keep the `0` sentinel
+    /// default. The generic kernel uses a non-zero value to install a deferred
+    /// network handler; the platform remains responsible only for controller
+    /// mechanics and numbering.
+    const NET_IRQ: u32 = 0;
+
     fn in_irq_context() -> bool {
         false
     }
@@ -1232,6 +1240,10 @@ pub type IrqHandlerFn = fn(irq: u32) -> IrqHandled;
 pub enum IrqHandled {
     Done,
     Wake,
+    /// The handler requested a reactor wake and retained ownership of the
+    /// controller completion. It must later call [`IrqIf::complete`] exactly
+    /// once from the same controller context that performed the claim.
+    DeferredWake,
     NotMine,
 }
 

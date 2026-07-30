@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::marker::PhantomData;
 
 use crate::adapter::step_engine::{NoProgress, StepOutcome};
-use tx_hal::{Arch, TxPlatform};
+use tx_hal::{Arch, IrqIf, TxPlatform};
 use tx_subsystems::device::{
     register_block_devices, BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT,
     PhysicalBlockNumber,
@@ -159,12 +159,18 @@ impl<P: TxPlatform> KernelNetDevices<P> {
             Self::write_net_init_error::<P>(err);
             return StepOutcome::Done(());
         }
-        // RX is interrupt-driven (PLIC NET_IRQ → net_rx_irq_handler →
-        // drain_net_rx_pending kicks the delegate); without this the device
-        // never raises the line and inbound frames sit until a poll kick.
-        net.enable_interrupts();
-
-        self.register_eth0(net)
+        // Publish `eth0` before allowing the device to assert its line. The
+        // controller handler is installed earlier in boot, while virtio
+        // notifications remain disabled throughout `init()`.
+        match self.register_eth0(net) {
+            StepOutcome::Done(()) => {
+                if <P as IrqIf>::NET_IRQ != 0 {
+                    net.enable_interrupts();
+                }
+                StepOutcome::Done(())
+            }
+            other => other,
+        }
     }
 
     fn init_la64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {

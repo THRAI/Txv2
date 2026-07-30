@@ -390,16 +390,15 @@ impl<P: TxPlatform> CoreInit<P> {
                         BootNetDelegateDriver::<P>::new(runtime),
                         config,
                         move |next_deadline| {
-                            // RX poll floor: no RX interrupt is wired, so a
-                            // quiet established stream (reader blocked in
-                            // read(), smoltcp with no pending timers) yields
-                            // `next_deadline = None`; the timer then disarms
-                            // and the delegate sleeps forever while frames
-                            // pile up unprocessed in the virtio queue —
-                            // external bulk transfers stall right after the
-                            // initial syscall-driven burst (git clone froze
-                            // at ~20 KiB). Clamp the deadline so the
-                            // delegate always re-polls the device soon.
+                            // RX watchdog: the real NET_IRQ path is wired on
+                            // RV64, but QEMU virtio-mmio has historically
+                            // admitted a cold idle RX frame without a usable
+                            // interrupt. A quiet established stream (reader
+                            // blocked in read(), smoltcp with no pending
+                            // timers) can otherwise yield `next_deadline =
+                            // None` and sleep forever. Keep a 10 ms backstop
+                            // until that transport behavior has a stronger
+                            // witness; normal traffic wakes through IRQ first.
                             let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
                             let now =
                                 Instant::from_micros(micros.min(i64::MAX as u64) as i64);

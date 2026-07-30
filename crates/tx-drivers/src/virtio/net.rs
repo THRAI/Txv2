@@ -332,9 +332,10 @@ where
     // anywhere, so the FIRST net IRQ silenced the device forever (later
     // frames sat unnoticed until an unrelated delegate poll — root cause
     // of the P2 "server response never ACKed / read never wakes" stall).
-    // IRQ-rate throttling is already provided one level up by the PLIC
-    // mask window (top half masks the line, bottom half unmasks after
-    // ack+kick), so device-level suppression is unnecessary.
+    // IRQ-rate throttling is already provided one level up by the outstanding
+    // controller claim: the PLIC gateway does not forward this source again
+    // until the task-context bottom half ACKs/polls the device and completes
+    // that claim. Device-level suppression is therefore unnecessary.
 
     let poll_wakes = if rx_ready || tx_completed != 0 {
         stats.irq_polls.fetch_add(1, Ordering::Relaxed);
