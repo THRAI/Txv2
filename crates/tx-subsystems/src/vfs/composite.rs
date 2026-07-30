@@ -30,7 +30,7 @@ use crate::vfs::adapter::step_engine::{
 };
 use crate::vfs::notification;
 use crate::vfs::walker;
-use crate::vfs::{Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta};
+use crate::vfs::{Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNodeBacking};
 
 // ============================================================================
 // ChmodOp — fchmodat
@@ -733,7 +733,7 @@ fn live_meta_for_dentry(target: &Cap<DEntry>, guard: &crate::execution::Guard<'_
     // surface through all stat-family calls. The cached RNode meta is the
     // snapshot from materialisation time.
     let ino = target.rnode().fs_object_id();
-    match target.rnode().containing_mount_weak() {
+    let mut meta = match target.rnode().containing_mount_weak() {
         Some(weak) => match weak.upgrade(guard) {
             Some(payload) => match payload.fs_ops().load_inode_meta(ino, guard) {
                 StepOutcome::Done(m) => m,
@@ -742,7 +742,11 @@ fn live_meta_for_dentry(target: &Cap<DEntry>, guard: &crate::execution::Guard<'_
             None => target.rnode().meta(),
         },
         None => target.rnode().meta(),
+    };
+    if let RNodeBacking::PageBacked { pc } = target.rnode().backing() {
+        meta.size = pc.size_bytes();
     }
+    meta
 }
 
 // ============================================================================

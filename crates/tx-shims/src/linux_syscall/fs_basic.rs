@@ -17,7 +17,14 @@ pub(super) use dir_sync::{
     sys_sync, sys_syncfs,
 };
 
-static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
+#[derive(Clone, Copy)]
+struct StatTimeOverride {
+    atime: tx_subsystems::vfs::Timespec,
+    mtime: tx_subsystems::vfs::Timespec,
+    ctime: tx_subsystems::vfs::Timespec,
+}
+
+static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, StatTimeOverride>> =
     SpinMutex::new(BTreeMap::new());
 static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
     SpinMutex::new(BTreeMap::new());
@@ -34,15 +41,26 @@ static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_FS_OBJECT_ID_BA
 static NEXT_MEMFD_SECRET_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_SECRET_FS_OBJECT_ID_BASE);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
-    STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
+    STAT_META_OVERRIDES.lock().insert(
+        fs_object_id,
+        StatTimeOverride {
+            atime: meta.atime,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
+        },
+    );
 }
 
-pub(super) fn stat_meta_override_or(fs_object_id: FsObjectId, fallback: InodeMeta) -> InodeMeta {
-    STAT_META_OVERRIDES
-        .lock()
-        .get(&fs_object_id)
-        .copied()
-        .unwrap_or(fallback)
+pub(super) fn stat_meta_override_or(
+    fs_object_id: FsObjectId,
+    mut fallback: InodeMeta,
+) -> InodeMeta {
+    if let Some(times) = STAT_META_OVERRIDES.lock().get(&fs_object_id).copied() {
+        fallback.atime = times.atime;
+        fallback.mtime = times.mtime;
+        fallback.ctime = times.ctime;
+    }
+    fallback
 }
 
 /// Drain all stale entries from the global `STAT_META_OVERRIDES` map.

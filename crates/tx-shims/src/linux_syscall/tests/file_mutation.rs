@@ -22,9 +22,9 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_OPENAT,
-    NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, O_RDWR,
-    O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
+    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_NEWFSTATAT,
+    NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT,
+    NR_WRITE, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -38,6 +38,7 @@ const E_PERM: i32 = 1;
 const E_ACCES: i32 = 13;
 const E_NOSYS: i32 = 38;
 const STAT_BYTES: usize = 128;
+const STAT_SIZE_OFF: usize = 48;
 const STAT_ATIME_SEC_OFF: usize = 72;
 const STAT_MTIME_SEC_OFF: usize = 88;
 
@@ -1322,4 +1323,96 @@ fn dispatch_futimens_preserves_large_explicit_time_in_fstat() {
     assert_eq!(read_i64_at(&statbuf, STAT_ATIME_SEC_OFF), large);
     assert_eq!(read_i64_at(&statbuf, STAT_MTIME_SEC_OFF), large);
     drop(path);
+}
+
+#[test]
+fn dispatch_futimens_does_not_hide_later_page_container_size() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/f");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                O_RDWR as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /f: {other:?}"),
+    };
+
+    let times = [
+        TestTimespec {
+            tv_sec: 123,
+            tv_nsec: 0,
+        },
+        TestTimespec {
+            tv_sec: 456,
+            tv_nsec: 0,
+        },
+    ];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_UTIMENSAT, [fd, 0, times.as_ptr() as u64, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let payload = b"page-container-size";
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_WRITE,
+                [fd, payload.as_ptr() as u64, payload.len() as u64, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let mut fstatbuf = vec![0u8; STAT_BYTES];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_FSTAT, [fd, fstatbuf.as_mut_ptr() as u64, 0, 0, 0, 0],),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(read_i64_at(&fstatbuf, STAT_SIZE_OFF), payload.len() as i64);
+    assert_eq!(read_i64_at(&fstatbuf, STAT_ATIME_SEC_OFF), 123);
+    assert_eq!(read_i64_at(&fstatbuf, STAT_MTIME_SEC_OFF), 456);
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_NEWFSTATAT,
+                [
+                    AT_FDCWD as i64 as u64,
+                    path.as_ptr() as u64,
+                    statbuf.as_mut_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(read_i64_at(&statbuf, STAT_SIZE_OFF), payload.len() as i64);
+    assert_eq!(read_i64_at(&statbuf, STAT_ATIME_SEC_OFF), 123);
+    assert_eq!(read_i64_at(&statbuf, STAT_MTIME_SEC_OFF), 456);
 }
