@@ -1960,26 +1960,45 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
         if let Some(container) = &self.page_container {
-            return match self.state.advance(container) {
+            match self.state.advance(container) {
                 Err(errno) => V3::Err(errno.into()),
-                Ok(None) => V3::Continue {
+                Ok(
+                    crate::page_backed::FileFsyncFrontierAdvance::Submitted { .. }
+                    | crate::page_backed::FileFsyncFrontierAdvance::Waiting,
+                ) => V3::Continue {
                     progress: NoProgress,
                 },
-                Ok(Some(Ok(()))) => V3::Done(()),
-                Ok(Some(Err(errno))) => V3::Err(errno.into()),
-            };
-        }
-        let guard = step_engine::guard();
-        match self.page_backing.fsync_file(self.fs_object_id, &guard) {
-            V3::Done(()) => V3::Done(()),
-            V3::Err(e) => V3::Err(e),
-            V3::Continue { .. } => V3::Continue {
-                progress: NoProgress,
-            },
-            V3::Yield { shape, .. } => V3::Yield {
-                progress: NoProgress,
-                shape,
-            },
+                Ok(crate::page_backed::FileFsyncFrontierAdvance::Error(errno)) => {
+                    V3::Err(errno.into())
+                }
+                Ok(crate::page_backed::FileFsyncFrontierAdvance::Complete) => {
+                    let guard = step_engine::guard();
+                    match self.page_backing.fsync_file(self.fs_object_id, &guard) {
+                        V3::Done(()) => V3::Done(()),
+                        V3::Err(e) => V3::Err(e),
+                        V3::Continue { .. } => V3::Continue {
+                            progress: NoProgress,
+                        },
+                        V3::Yield { shape, .. } => V3::Yield {
+                            progress: NoProgress,
+                            shape,
+                        },
+                    }
+                }
+            }
+        } else {
+            let guard = step_engine::guard();
+            match self.page_backing.fsync_file(self.fs_object_id, &guard) {
+                V3::Done(()) => V3::Done(()),
+                V3::Err(e) => V3::Err(e),
+                V3::Continue { .. } => V3::Continue {
+                    progress: NoProgress,
+                },
+                V3::Yield { shape, .. } => V3::Yield {
+                    progress: NoProgress,
+                    shape,
+                },
+            }
         }
     }
 }

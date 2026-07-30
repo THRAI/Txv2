@@ -12,33 +12,32 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
-mod fsync_submission;
 pub mod notification;
 
 use adapter::step_engine::{
-    self as step_engine, AllocError, BitmapPageAllocator, ByteProgress, CachePin, Cap, DeviceFrame,
-    MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak, ZeroPolicy, Zone,
-    ZoneAllocated, ZoneError, page_allocator,
+    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
+    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak,
+    ZeroPolicy, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::{Errno, Guard};
 use crate::fs_iface::{BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
-    BlockPageCompletion, BlockPageRequestTracker, PageFrameRef, dispatch_backend_plan,
+    dispatch_backend_plan, BlockPageCompletion, BlockPageRequestTracker, PageFrameRef,
 };
 use crate::io_manager::block::{
     BlockCompletion, BlockCompletionSource, BlockDispatchExecutor, BlockQueue, BlockRequestId,
     BlockServiceDriver, BlockServiceNext, BlockTagTable, QueueError, SubmitOutcome,
 };
 use crate::io_manager::page::{
-    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
-    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
     service::{
         PageCompletionRoute, PageService, PageServiceBackendContext, PageServiceBackendDriven,
         PageServiceBackendOutcome, PageServiceBackendSubmitOutcome, PageServiceDrivenWork,
         PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWork,
         PageWaitInterest, PageWaiter,
     },
+    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
+    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
 };
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
@@ -66,8 +65,7 @@ pub use direct_io::{
     DirectIoWaitableSubmission,
 };
 pub use fs_page_backing::FsPageBacking;
-pub use fsync_submission::FsyncSubmissionState;
-pub use lifecycle::{FallocateOp, FsyncOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
 use lifecycle::{FileIoPayload, FileIoTerminalResult, OwnedFileIoRequest, PageDataLease};
 pub use range::{
     PageRange, RangeReservation, RangeReservationError, RangeReservationId, RangeReservationKind,
@@ -81,8 +79,8 @@ pub use slot::{
 use sparse_index::SparseIndex;
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
-    ReadToUserOp, WriteFromUserOp, step_read_to_kernel, step_read_to_user, step_write_from_kernel,
-    step_write_from_user,
+    step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
+    ReadToUserOp, WriteFromUserOp,
 };
 
 #[cfg(test)]
@@ -561,38 +559,24 @@ pub struct FileFsyncSession<'a> {
 #[derive(Default)]
 pub struct FileFsyncState {
     frontier: Option<FileFsyncFrontier>,
-    request: Option<PageIoRequestId>,
 }
 
 impl FileFsyncState {
     pub const fn new() -> Self {
-        Self {
-            frontier: None,
-            request: None,
-        }
+        Self { frontier: None }
     }
 
-    pub fn advance(&mut self, pc: &PageContainer) -> Result<Option<Result<(), Errno>>, Errno> {
+    pub fn advance(&mut self, pc: &PageContainer) -> Result<FileFsyncFrontierAdvance, Errno> {
         let frontier = self.frontier.get_or_insert_with(|| {
             pc.snapshot_file_fsync_frontier()
                 .expect("file PageContainer has an fsync frontier")
         });
         match pc.advance_file_fsync_frontier(frontier) {
-            FileFsyncFrontierAdvance::Submitted { .. } | FileFsyncFrontierAdvance::Waiting => {
-                return Ok(None);
-            }
-            FileFsyncFrontierAdvance::Error(errno) => return Err(errno),
-            FileFsyncFrontierAdvance::Complete => {}
+            advance @ (FileFsyncFrontierAdvance::Submitted { .. }
+            | FileFsyncFrontierAdvance::Waiting) => Ok(advance),
+            FileFsyncFrontierAdvance::Error(errno) => Err(errno),
+            FileFsyncFrontierAdvance::Complete => Ok(FileFsyncFrontierAdvance::Complete),
         }
-        let request = match self.request {
-            Some(request) => request,
-            None => {
-                let request = pc.submit_file_fsync().ok_or(Errno::EIO)?;
-                self.request = Some(request);
-                request
-            }
-        };
-        Ok(pc.take_file_fsync_submission(request))
     }
 }
 
@@ -711,7 +695,6 @@ struct PageContainerState {
     in_flight_file_pages: BTreeMap<PageIndex, FilePageFetch>,
     file_io_service: PageService,
     owned_file_requests: BTreeMap<PageIoRequestId, OwnedFileIoRequest>,
-    fsync_submissions: BTreeMap<PageIoRequestId, fsync_submission::FsyncSubmission>,
     background_graphs: BTreeSet<PageIoRequestId>,
     file_block_runtime: FileIoBlockRuntime,
     file_io_wake: Option<Arc<ServiceWakeSource>>,
@@ -999,7 +982,6 @@ impl PageContainer {
                 in_flight_file_pages: BTreeMap::new(),
                 file_io_service: PageService::new(1024),
                 owned_file_requests: BTreeMap::new(),
-                fsync_submissions: BTreeMap::new(),
                 background_graphs: BTreeSet::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
                 file_io_wake: None,
@@ -1584,6 +1566,20 @@ impl PageContainer {
             }
             return None;
         }
+        let Some(ppn) = state.pages.load(page).map(|entry| entry.ppn) else {
+            let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+            if let Some(slot) = state.file_page_slots.get(&page) {
+                let _ = slot.abort_writeback(writeback.generation);
+            }
+            return None;
+        };
+        let Ok(cache_pin) = page_allocator::acquire_cache_pin(ppn) else {
+            let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+            if let Some(slot) = state.file_page_slots.get(&page) {
+                let _ = slot.abort_writeback(writeback.generation);
+            }
+            return None;
+        };
         match state.file_io_service.submit(
             self.io_manager_key(),
             PageIoRange::new(page.as_u64(), 1),
@@ -1602,9 +1598,17 @@ impl PageContainer {
                     PageIoFlags::WRITEBACK,
                     Some(writeback.generation),
                 );
-                let previous = state
-                    .owned_file_requests
-                    .insert(id, OwnedFileIoRequest::control(request));
+                let owner = OwnedFileIoRequest::writeback(
+                    request,
+                    PageDataLease::single(
+                        IoDataLeaseId::new(id.raw()),
+                        PageLease {
+                            ppn,
+                            cache_pin: PageCachePin::Allocated(cache_pin),
+                        },
+                    ),
+                );
+                let previous = state.owned_file_requests.insert(id, owner);
                 debug_assert!(previous.is_none(), "L4 request identifiers are unique");
                 Some(id)
             }
@@ -1662,53 +1666,6 @@ impl PageContainer {
     pub fn begin_file_fsync_session(&self) -> Option<FileFsyncSession<'_>> {
         self.snapshot_file_fsync_frontier()
             .map(|frontier| FileFsyncSession { pc: self, frontier })
-    }
-
-    /// Register one waitable fsync request with L4.
-    ///
-    /// The row remains owned by the PageContainer until terminal L4 completion
-    /// is consumed, so re-entry can retain the request identity rather than
-    /// submit a second journal commit graph.
-    pub fn submit_file_fsync(&self) -> Option<PageIoRequestId> {
-        if !matches!(self.kind, PageContainerKind::File { .. }) || self.page_count == 0 {
-            return None;
-        }
-
-        let mut state = self.state.lock();
-        let id = state
-            .file_io_service
-            .submit(
-                self.io_manager_key(),
-                PageIoRange::new(0, self.page_count),
-                PageIoOp::Fsync,
-                PageIoPriority::Fsync,
-                PageIoFlags::BARRIER,
-                None,
-            )
-            .ok()?;
-        let submission = fsync_submission::FsyncSubmission::new(id);
-        debug_assert_eq!(submission.id(), id);
-        let previous = state.fsync_submissions.insert(id, submission);
-        debug_assert!(previous.is_none(), "L4 request identifiers are unique");
-        Some(id)
-    }
-
-    /// Observe an fsync request without consuming its terminal result.
-    pub fn file_fsync_submission_state(&self, id: PageIoRequestId) -> Option<FsyncSubmissionState> {
-        self.state
-            .lock()
-            .fsync_submissions
-            .get(&id)
-            .map(|submission| submission.state())
-    }
-
-    /// Consume an fsync terminal result exactly once and retire its row.
-    pub fn take_file_fsync_submission(&self, id: PageIoRequestId) -> Option<Result<(), Errno>> {
-        let mut state = self.state.lock();
-        let result = state.fsync_submissions.get_mut(&id)?.take()?;
-        let retired = state.fsync_submissions.remove(&id);
-        debug_assert!(retired.is_some());
-        Some(result)
     }
 
     pub fn advance_file_fsync_frontier(
@@ -1901,6 +1858,13 @@ impl PageContainer {
                             self.register_file_service_metadata(&request, outcome);
                         }
                         match queued {
+                            Ok(outcome @ PageServiceBackendSubmitOutcome::Err(_)) => {
+                                self.finish_owned_file_io_request(
+                                    &rollback_request,
+                                    FileIoTerminalResult::SubmitFailure,
+                                );
+                                work.push(PageServiceDrivenWork::BackendSubmission(outcome));
+                            }
                             Ok(outcome) => {
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                             }
@@ -1979,6 +1943,13 @@ impl PageContainer {
                             self.register_file_service_metadata(&page_request, outcome);
                         }
                         match queued {
+                            Ok(outcome @ PageServiceBackendSubmitOutcome::Err(_)) => {
+                                self.finish_owned_file_io_request(
+                                    &page_request,
+                                    FileIoTerminalResult::SubmitFailure,
+                                );
+                                work.push(PageServiceDrivenWork::BackendSubmission(outcome));
+                            }
                             Ok(outcome) => {
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome))
                             }
@@ -2104,9 +2075,6 @@ impl PageContainer {
                 self.notify_file_background_completion(&route.completion);
                 return None;
             }
-            if self.terminalize_file_fsync_submission(&route.completion) {
-                self.notify_file_backend_completion(&route.completion);
-            }
             return None;
         }
         if route.completion.range.page_count() != 1 {
@@ -2134,52 +2102,6 @@ impl PageContainer {
                 notify_waiters: !route.waiters.is_empty(),
             },
         )
-    }
-
-    fn terminalize_file_fsync_submission(
-        &self,
-        completion: &crate::io_manager::page::PageIoCompletion,
-    ) -> bool {
-        let result = match completion.result {
-            PageIoResult::Done => Ok(()),
-            PageIoResult::Err(errno) => Err(errno),
-        };
-        self.state
-            .lock()
-            .fsync_submissions
-            .get_mut(&completion.id)
-            .is_some_and(|submission| submission.complete(result))
-    }
-
-    fn notify_file_backend_completion(
-        &self,
-        completion: &crate::io_manager::page::PageIoCompletion,
-    ) {
-        let PageContainerKind::File {
-            mount,
-            fs_object_id,
-        } = &self.kind
-        else {
-            return;
-        };
-        let Some(planner) = mount.payload().backend_planner() else {
-            return;
-        };
-        planner.complete_page_io(crate::fs_iface::BackendPageCompletion::new(
-            FsObjectKey::new(fs_object_id.as_u64()),
-            completion.id,
-            PageIoOp::Fsync,
-            completion.result,
-        ));
-        if completion.result != PageIoResult::Done {
-            return;
-        }
-        let object = FsObjectKey::new(fs_object_id.as_u64());
-        match planner.take_background_graph(object) {
-            Ok(Some(graph)) => self.queue_file_background_graph(planner, object, graph),
-            Ok(None) => {}
-            Err(_) => {}
-        }
     }
 
     fn queue_file_background_graph(
@@ -2269,73 +2191,22 @@ impl PageContainer {
         if request.op != PageIoOp::Writeback || request.range.page_count() != 1 {
             return IoDataSource::None;
         }
-        let page = PageIndex::new(request.range.start_page());
-        let Some(ppn) = self.state.lock().pages.load(page).map(|entry| entry.ppn) else {
-            return IoDataSource::None;
-        };
-        let Ok(cache_pin) = page_allocator::acquire_cache_pin(ppn) else {
-            return IoDataSource::None;
-        };
-        let lease = PageLease {
-            ppn,
-            cache_pin: PageCachePin::Allocated(cache_pin),
-        };
-        let owner = OwnedFileIoRequest::writeback(
-            request.clone(),
-            PageDataLease::single(IoDataLeaseId::new(request.id.raw()), lease),
-        );
-        let source = owner.source();
-        let previous = self
-            .state
+        self.state
             .lock()
             .owned_file_requests
-            .insert(request.id, owner);
-        debug_assert!(matches!(
-            previous.map(OwnedFileIoRequest::take_payload),
-            None | Some(FileIoPayload::Control)
-        ));
-        source
+            .get(&request.id)
+            .map_or(IoDataSource::None, OwnedFileIoRequest::source)
     }
 
     fn file_io_target_for_submission(&self, request: &PageIoRequest) -> IoDataTarget {
         if request.op != PageIoOp::Read || request.range.page_count() != 1 {
             return IoDataTarget::None;
         }
-        if !self
-            .state
+        self.state
             .lock()
-            .in_flight_file_pages
-            .values()
-            .any(|fetch| fetch.request_id == Some(request.id))
-        {
-            return IoDataTarget::None;
-        }
-        let Ok(target) = allocate_cached_frame() else {
-            return IoDataTarget::None;
-        };
-        let frame = PageFrameRef::new(target.ppn);
-        let mut state = self.state.lock();
-        if !state
-            .in_flight_file_pages
-            .values()
-            .any(|fetch| fetch.request_id == Some(request.id))
-        {
-            return IoDataTarget::None;
-        }
-        let previous = state.owned_file_requests.insert(
-            request.id,
-            OwnedFileIoRequest::read(request.clone(), target),
-        );
-        debug_assert!(matches!(
-            previous.map(OwnedFileIoRequest::take_payload),
-            None | Some(FileIoPayload::Control)
-        ));
-        IoDataTarget::page_cache(
-            IoDataLeaseId::new(request.id.raw()),
-            frame,
-            0,
-            crate::vm::USER_PAGE_SIZE as u32,
-        )
+            .owned_file_requests
+            .get(&request.id)
+            .map_or(IoDataTarget::None, OwnedFileIoRequest::target)
     }
 
     fn prepare_owned_file_io_request(
@@ -2344,13 +2215,6 @@ impl PageContainer {
     ) -> (IoDataSource, IoDataTarget) {
         let source = self.file_io_source_for_submission(request);
         let target = self.file_io_target_for_submission(request);
-        if matches!(request.op, PageIoOp::Writeback | PageIoOp::Read) {
-            self.state
-                .lock()
-                .owned_file_requests
-                .entry(request.id)
-                .or_insert_with(|| OwnedFileIoRequest::control(request.clone()));
-        }
         (source, target)
     }
 
@@ -2363,15 +2227,29 @@ impl PageContainer {
         terminal: FileIoTerminalResult,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
         let owner = self.state.lock().owned_file_requests.remove(&request.id);
-        debug_assert!(
-            owner
-                .as_ref()
-                .is_none_or(|owner| owner.request().id == request.id)
-        );
+        debug_assert!(owner
+            .as_ref()
+            .is_none_or(|owner| owner.request().id == request.id));
         // PageService deliberately supports a completion racing ahead of the
         // submission turn. For PageBacked-owned I/O, this is the sole terminal
         // route, so retire the matching L4 row only after consuming its owner.
-        let _ = self.state.lock().file_io_service.retire_submission(request.id);
+        let _ = self
+            .state
+            .lock()
+            .file_io_service
+            .retire_submission(request.id);
+
+        let completion_requires_payload =
+            matches!(terminal, FileIoTerminalResult::Completion { .. });
+        let Some(owner_ref) = owner.as_ref() else {
+            return None;
+        };
+        if completion_requires_payload && !owner_ref.completes(request.op) {
+            // This is an owner-poison terminal route. It must consume the bad
+            // record and L4 row, but cannot independently settle PageSlot.
+            drop(owner);
+            return None;
+        }
 
         match request.op {
             PageIoOp::Writeback => {
@@ -3016,6 +2894,18 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
     ) -> FilePageFetchStart {
+        // A planner-owned L4 read must retain its destination before admission.
+        // Allocate it outside `state`: PageContainer's lock never covers frame
+        // allocation, and a direct-pager fetch has no L4 payload to retain.
+        let planner_present = matches!(
+            &self.kind,
+            PageContainerKind::File { mount, .. } if mount.payload().backend_planner().is_some()
+        );
+        let mut planned_target = if planner_present {
+            allocate_cached_frame().ok()
+        } else {
+            None
+        };
         loop {
             if let Some(materialized) = self.materialize_cached_page(page, access) {
                 return FilePageFetchStart::Cached(materialized);
@@ -3098,24 +2988,31 @@ impl PageContainer {
                 | PageSlotFetch::Resident { generation, .. }
                 | PageSlotFetch::Blocked { generation, .. } => generation,
             };
-            let request_id = state
-                .file_io_service
-                .submit(
-                    self.io_manager_key(),
-                    PageIoRange::new(page.as_u64(), 1),
-                    PageIoOp::Read,
-                    PageIoPriority::Demand,
-                    PageIoFlags::DEMAND,
-                    Some(generation),
-                )
-                .ok();
+            let mut submit = || {
+                state
+                    .file_io_service
+                    .submit(
+                        self.io_manager_key(),
+                        PageIoRange::new(page.as_u64(), 1),
+                        PageIoOp::Read,
+                        PageIoPriority::Demand,
+                        PageIoFlags::DEMAND,
+                        Some(generation),
+                    )
+                    .ok()
+            };
+            let request_id = if planner_present {
+                planned_target.as_ref().and_then(|_| submit())
+            } else {
+                submit()
+            };
             if request_id.is_none() {
                 if let Some(slot) = state.file_page_slots.get(&page) {
                     if slot.generation() == generation {
                         slot.invalidate();
                     }
                 }
-            } else if let Some(request_id) = request_id {
+            } else if let (Some(request_id), Some(target)) = (request_id, planned_target.take()) {
                 let request = PageIoRequest::new(
                     request_id,
                     self.io_manager_key(),
@@ -3127,7 +3024,7 @@ impl PageContainer {
                 );
                 let previous = state
                     .owned_file_requests
-                    .insert(request_id, OwnedFileIoRequest::control(request));
+                    .insert(request_id, OwnedFileIoRequest::read(request, target));
                 debug_assert!(previous.is_none(), "L4 request identifiers are unique");
             }
             state.in_flight_file_pages.insert(
@@ -3145,11 +3042,9 @@ impl PageContainer {
     ) -> Option<notification::PageReadyNotifier> {
         let routed_waiters = fetch.request_id.map_or_else(Vec::new, |request_id| {
             let owner = state.owned_file_requests.remove(&request_id);
-            debug_assert!(
-                owner
-                    .as_ref()
-                    .is_none_or(|owner| owner.request().id == request_id)
-            );
+            debug_assert!(owner
+                .as_ref()
+                .is_none_or(|owner| owner.request().id == request_id));
             state.file_io_service.retire_submission(request_id)
         });
         (!routed_waiters.is_empty())

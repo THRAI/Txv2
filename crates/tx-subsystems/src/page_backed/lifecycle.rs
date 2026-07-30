@@ -91,8 +91,31 @@ impl OwnedFileIoRequest {
         }
     }
 
+    pub(super) fn target(&self) -> IoDataTarget {
+        match &self.payload {
+            FileIoPayload::Read { target } => IoDataTarget::page_cache(
+                IoDataLeaseId::new(self.request.id.raw()),
+                PageFrameRef::new(target.ppn),
+                0,
+                crate::vm::USER_PAGE_SIZE as u32,
+            ),
+            FileIoPayload::Writeback { .. } | FileIoPayload::Control => IoDataTarget::None,
+        }
+    }
+
     pub(super) fn take_payload(self) -> FileIoPayload {
         self.payload
+    }
+
+    /// A device completion may settle a PageSlot only while the request still
+    /// retains the matching page-cache resource. A control record is enough to
+    /// roll back pre-submission failure, never to accept device success.
+    pub(super) fn completes(&self, op: PageIoOp) -> bool {
+        matches!(
+            (&self.payload, op),
+            (FileIoPayload::Writeback { .. }, PageIoOp::Writeback)
+                | (FileIoPayload::Read { .. }, PageIoOp::Read)
+        )
     }
 
     #[cfg(test)]
@@ -512,9 +535,38 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
 
         match self.state.advance(self.pc) {
             Err(errno) => V3::err(errno.into()),
-            Ok(None) => V3::continue_with(PageProgress::EMPTY),
-            Ok(Some(Ok(()))) => V3::done(()),
-            Ok(Some(Err(errno))) => V3::err(errno.into()),
+            Ok(FileFsyncFrontierAdvance::Submitted { .. } | FileFsyncFrontierAdvance::Waiting) => {
+                V3::continue_with(PageProgress::EMPTY)
+            }
+            Ok(FileFsyncFrontierAdvance::Error(errno)) => V3::err(errno.into()),
+            Ok(FileFsyncFrontierAdvance::Complete) => {
+                let guard = step_engine::guard();
+                match mount.payload().fs_page_backing.fsync_file(
+                    match self.pc.kind() {
+                        PageContainerKind::File { fs_object_id, .. } => *fs_object_id,
+                        PageContainerKind::Anon { .. } | PageContainerKind::Device { .. } => {
+                            unreachable!("file fsync operation has a file page container")
+                        }
+                    },
+                    &guard,
+                ) {
+                    V3::Done(()) => V3::done(()),
+                    V3::Continue { .. } => V3::continue_with(PageProgress::EMPTY),
+                    V3::Yield { shape, .. } => {
+                        let Some((carrier, interests)) =
+                            crate::page_backed::notification::wait_source_parts(&shape)
+                        else {
+                            return V3::err(step_engine::Errno::EIO);
+                        };
+                        crate::page_backed::notification::yield_on_wait_source(
+                            PageProgress::EMPTY,
+                            carrier,
+                            interests,
+                        )
+                    }
+                    V3::Err(errno) => V3::err(errno),
+                }
+            }
         }
     }
 }
@@ -560,8 +612,8 @@ mod v3_tests {
     use crate::execution::{Errno as V4Errno, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::page_backed::{
-        AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
-        allocate_cached_frame,
+        allocate_cached_frame, AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind,
+        PageIndex,
     };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
