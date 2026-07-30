@@ -361,6 +361,26 @@ impl RawTcpSocket {
         self.inner.lock().socket.state()
     }
 
+    pub fn set_nodelay(&self, enabled: bool) {
+        self.inner.lock().socket.set_nagle_enabled(!enabled);
+    }
+
+    pub fn nodelay(&self) -> bool {
+        !self.inner.lock().socket.nagle_enabled()
+    }
+
+    pub fn set_keep_alive_enabled(&self, enabled: bool, idle_secs: u32) {
+        self.inner.lock().socket.set_keep_alive(if enabled {
+            Some(Duration::from_secs(idle_secs as u64))
+        } else {
+            None
+        });
+    }
+
+    pub fn keep_alive_enabled(&self) -> bool {
+        self.inner.lock().socket.keep_alive().is_some()
+    }
+
     pub fn protocol_runtime_state(&self) -> RawTcpProtocolState {
         self.inner.lock().protocol_state
     }

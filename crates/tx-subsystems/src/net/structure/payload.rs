@@ -429,6 +429,43 @@ impl SocketPayload {
         self.imp.tcp()
     }
 
+    /// Update the SOL_SOCKET keepalive flag and the live TCP engine as one
+    /// socket-owned transition. Non-TCP sockets retain the Linux-compatible
+    /// round-trip flag even though they have no TCP keepalive engine.
+    pub fn set_socket_keep_alive(&self, enabled: bool) {
+        self.with_options_mut(|options| {
+            if let Some(raw_tcp) = self.imp.tcp() {
+                raw_tcp.set_keep_alive_enabled(enabled, options.tcp.keepidle);
+            }
+            options.socket.keep_alive = enabled;
+        });
+    }
+
+    pub fn socket_keep_alive(&self) -> bool {
+        self.imp.tcp().map_or_else(
+            || self.with_options(|options| options.socket.keep_alive),
+            RawTcpSocket::keep_alive_enabled,
+        )
+    }
+
+    pub fn set_tcp_nodelay(&self, enabled: bool) -> Result<(), crate::execution::Errno> {
+        let Some(raw_tcp) = self.imp.tcp() else {
+            return Err(crate::execution::Errno::ENOPROTOOPT);
+        };
+        self.with_options_mut(|options| {
+            raw_tcp.set_nodelay(enabled);
+            options.tcp.nodelay = enabled;
+        });
+        Ok(())
+    }
+
+    pub fn tcp_nodelay(&self) -> Result<bool, crate::execution::Errno> {
+        self.imp
+            .tcp()
+            .map(RawTcpSocket::nodelay)
+            .ok_or(crate::execution::Errno::ENOPROTOOPT)
+    }
+
     pub fn reset_raw_tcp_socket(&self) -> Result<(), crate::execution::Errno> {
         let Some(raw_tcp) = self.imp.tcp() else {
             return Err(crate::execution::Errno::EOPNOTSUPP);

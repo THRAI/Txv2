@@ -2230,7 +2230,7 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 Ok(on) => on,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
-            payload.with_options_mut(|opts| opts.socket.keep_alive = on);
+            payload.set_socket_keep_alive(on);
             Ok(())
         }
         (SOL_SOCKET, SO_BROADCAST) => {
@@ -2734,12 +2734,14 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
         }
         (IPPROTO_TCP, TCP_NODELAY) => {
+            if socket.kind != SocketKind::Tcp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
-            payload.with_options_mut(|opts| opts.tcp.nodelay = on);
-            Ok(())
+            payload.set_tcp_nodelay(on)
         }
         (IPPROTO_TCP, TCP_MAXSEG) => {
             let size = match read_sockopt_positive_usize(ctx, optval, optlen) {
@@ -3097,12 +3099,9 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.socket.dont_route as i32),
         ),
-        (SOL_SOCKET, SO_KEEPALIVE) => write_sockopt_i32(
-            ctx,
-            optval,
-            optlen_ptr,
-            payload.with_options(|o| o.socket.keep_alive as i32),
-        ),
+        (SOL_SOCKET, SO_KEEPALIVE) => {
+            write_sockopt_i32(ctx, optval, optlen_ptr, payload.socket_keep_alive() as i32)
+        }
         (SOL_SOCKET, SO_BROADCAST) => write_sockopt_i32(
             ctx,
             optval,
@@ -3498,12 +3497,15 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         {
             write_icmp6_filter(ctx, optval, optlen_ptr, &payload)
         }
-        (IPPROTO_TCP, TCP_NODELAY) => write_sockopt_i32(
-            ctx,
-            optval,
-            optlen_ptr,
-            payload.with_options(|o| o.tcp.nodelay as i32),
-        ),
+        (IPPROTO_TCP, TCP_NODELAY) => {
+            if socket.kind != SocketKind::Tcp {
+                Err(Errno::ENOPROTOOPT)
+            } else {
+                payload
+                    .tcp_nodelay()
+                    .and_then(|enabled| write_sockopt_i32(ctx, optval, optlen_ptr, enabled as i32))
+            }
+        }
         (IPPROTO_TCP, TCP_MAXSEG) => {
             write_sockopt_i32(ctx, optval, optlen_ptr, tcp_effective_maxseg(&socket))
         }

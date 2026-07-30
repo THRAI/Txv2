@@ -1,4 +1,5 @@
 use super::*;
+use crate::linux_syscall::{SO_KEEPALIVE, TCP_NODELAY};
 
 #[repr(C)]
 struct TestTlsCryptoInfo {
@@ -1356,6 +1357,116 @@ fn dispatch_setsockopt_getsockopt_round_trips_dontroute() {
     );
     assert_eq!(out, 1);
     assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+}
+
+#[test]
+fn dispatch_tcp_dynamic_nodelay_and_keepalive_update_live_engine() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+    let file = process.fd(fd as u32).expect("resolve TCP file");
+    let socket =
+        crate::linux_syscall::socket::socket_identity_from_file(&file).expect("resolve TCP socket");
+    let payload = socket.acquire_operational().expect("TCP payload");
+    let raw = payload.raw_tcp_socket().expect("raw TCP engine");
+    assert!(!raw.nodelay());
+    assert!(!raw.keep_alive_enabled());
+
+    let one: i32 = 1;
+    for (level, option) in [(IPPROTO_TCP, TCP_NODELAY), (SOL_SOCKET, SO_KEEPALIVE)] {
+        assert_eq!(
+            socket_req(
+                NR_SETSOCKOPT,
+                [
+                    fd as u64,
+                    level as u64,
+                    option as u64,
+                    (&one as *const i32) as u64,
+                    core::mem::size_of::<i32>() as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+    }
+    assert!(raw.nodelay(), "TCP_NODELAY must update the existing engine");
+    assert!(
+        raw.keep_alive_enabled(),
+        "SO_KEEPALIVE must update the existing engine"
+    );
+    for (level, option) in [(IPPROTO_TCP, TCP_NODELAY), (SOL_SOCKET, SO_KEEPALIVE)] {
+        let mut value = 0i32;
+        let mut value_len = core::mem::size_of::<i32>() as u32;
+        assert_eq!(
+            socket_req(
+                NR_GETSOCKOPT,
+                [
+                    fd as u64,
+                    level as u64,
+                    option as u64,
+                    (&mut value as *mut i32) as u64,
+                    (&mut value_len as *mut u32) as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+        assert_eq!(value, 1);
+    }
+
+    let zero: i32 = 0;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_KEEPALIVE as u64,
+                (&zero as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(!raw.keep_alive_enabled());
+
+    let udp_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                udp_fd as u64,
+                IPPROTO_TCP as u64,
+                TCP_NODELAY as u64,
+                (&one as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT))
+    );
+    let mut value = 0i32;
+    let mut value_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                udp_fd as u64,
+                IPPROTO_TCP as u64,
+                TCP_NODELAY as u64,
+                (&mut value as *mut i32) as u64,
+                (&mut value_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT))
+    );
 }
 
 #[test]
