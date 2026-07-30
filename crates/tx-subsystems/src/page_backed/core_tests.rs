@@ -1270,7 +1270,7 @@ fn file_page_container_drives_service_submission_under_existing_epoch_guard() {
 }
 
 #[test]
-fn file_page_service_completion_applies_matching_error_to_pageslot() {
+fn file_page_service_completion_without_owner_leaves_pageslot_fetching() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
     let fs = Arc::new(RecordingFs::new());
@@ -1304,7 +1304,7 @@ fn file_page_service_completion_applies_matching_error_to_pageslot() {
     assert_eq!(
         pc.file_page_slot_snapshot_for_test(page),
         Some(PageSlotSnapshot {
-            state: PageSlotState::Error { errno: Errno::EIO },
+            state: PageSlotState::Fetching,
             generation,
         })
     );
@@ -1346,7 +1346,7 @@ fn file_page_service_completion_rejects_stale_pageslot_generation() {
 }
 
 #[test]
-fn file_page_service_completion_installs_planned_read_frame() {
+fn file_page_service_completion_without_owner_does_not_install_read_frame() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
     let fs = Arc::new(RecordingFs::new());
@@ -1376,11 +1376,11 @@ fn file_page_service_completion_installs_planned_read_frame() {
     pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
         .expect("file service drive");
 
-    assert_eq!(pc.lookup(page), Some(ppn));
+    assert_eq!(pc.lookup(page), None);
     assert_eq!(
         pc.file_page_slot_snapshot_for_test(page),
         Some(PageSlotSnapshot {
-            state: PageSlotState::Resident { ppn },
+            state: PageSlotState::Fetching,
             generation,
         })
     );
@@ -1479,22 +1479,24 @@ fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
             && source.raw() == 0x7103
             && interests.raw() == IoServiceKind::Page.mask_bits()
     ));
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(
-            pc.io_manager_key(),
-            PageIoRange::new(page.as_u64(), 1),
-            PageIoOp::Writeback,
-        )
-        .is_some());
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
-        .is_none());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(
+                pc.io_manager_key(),
+                PageIoRange::new(page.as_u64(), 1),
+                PageIoOp::Writeback,
+            )
+            .is_some()
+    );
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
+            .is_none()
+    );
     assert_eq!(
         pc.file_page_slot_snapshot_for_test(page)
             .expect("slot")
@@ -3565,12 +3567,13 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
         )
         .cloned()
         .expect("writeback precedes fsync");
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-        .is_none());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+            .is_none()
+    );
     pc.state
         .lock()
         .file_io_service
@@ -3589,12 +3592,13 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
         op.step(&mut ctx),
         V3Out::continue_with(crate::page_backed::adapter::step_engine::PageProgress::EMPTY)
     );
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-        .is_some());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+            .is_some()
+    );
 }
 
 #[test]

@@ -4,6 +4,108 @@ use crate::page_backed::adapter::step_engine::{
 };
 use alloc::vec::Vec;
 
+/// PageBacked-owned DMA lease. Filesystem planners receive only its neutral
+/// `IoDataSource` projection; the cache pin remains with the request owner.
+#[derive(Debug)]
+pub(super) struct PageDataLease {
+    id: IoDataLeaseId,
+    pages: alloc::boxed::Box<[PageLease]>,
+}
+
+impl PageDataLease {
+    pub(super) fn single(id: IoDataLeaseId, page: PageLease) -> Self {
+        Self {
+            id,
+            pages: alloc::boxed::Box::new([page]),
+        }
+    }
+
+    pub(super) fn source(&self) -> IoDataSource {
+        let page = &self.pages[0];
+        IoDataSource::page_cache(
+            self.id,
+            PageFrameRef::new(page.ppn()),
+            0,
+            crate::vm::USER_PAGE_SIZE as u32,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum FileIoPayload {
+    Writeback { lease: PageDataLease },
+    Read { target: CachedFrame },
+    Control,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FileIoTerminalResult {
+    SubmitFailure,
+    Completion {
+        result: PageIoResult,
+        kind: PageIoCompletionKind,
+        generation: PageGeneration,
+        frame: Option<crate::fs_iface::PageFrameRef>,
+        notify_waiters: bool,
+    },
+}
+
+/// The sole PageBacked record that retains a request's page-cache resources
+/// until the terminal route consumes it.
+#[derive(Debug)]
+pub(super) struct OwnedFileIoRequest {
+    request: PageIoRequest,
+    payload: FileIoPayload,
+}
+
+impl OwnedFileIoRequest {
+    pub(super) fn writeback(request: PageIoRequest, lease: PageDataLease) -> Self {
+        Self {
+            request,
+            payload: FileIoPayload::Writeback { lease },
+        }
+    }
+
+    pub(super) fn read(request: PageIoRequest, target: CachedFrame) -> Self {
+        Self {
+            request,
+            payload: FileIoPayload::Read { target },
+        }
+    }
+
+    pub(super) fn control(request: PageIoRequest) -> Self {
+        Self {
+            request,
+            payload: FileIoPayload::Control,
+        }
+    }
+
+    pub(super) fn request(&self) -> &PageIoRequest {
+        &self.request
+    }
+
+    pub(super) fn source(&self) -> IoDataSource {
+        match &self.payload {
+            FileIoPayload::Writeback { lease } => lease.source(),
+            FileIoPayload::Read { .. } | FileIoPayload::Control => IoDataSource::None,
+        }
+    }
+
+    pub(super) fn take_payload(self) -> FileIoPayload {
+        self.payload
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_writeback(&self) -> bool {
+        matches!(self.payload, FileIoPayload::Writeback { .. })
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_read(&self) -> bool {
+        matches!(self.payload, FileIoPayload::Read { .. })
+    }
+}
+
 impl PageCacheIndex {
     fn withdraw_from(&mut self, first: PageIndex) {
         self.erase_from(first);
@@ -458,8 +560,8 @@ mod v3_tests {
     use crate::execution::{Errno as V4Errno, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::page_backed::{
-        allocate_cached_frame, AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind,
-        PageIndex,
+        AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
+        allocate_cached_frame,
     };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};

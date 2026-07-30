@@ -1,5 +1,6 @@
 use super::*;
 use crate::execution::Errno;
+use crate::io_manager::page::{PageIoCompletion, service::PageCompletionRoute};
 use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
 use crate::page_backed::adapter::step_engine::{
     self as step_engine, NoProgress, PageProgress as V3PageProgress, StepOutcome as V3Outcome,
@@ -94,6 +95,89 @@ fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageCo
 fn cached_frame_for_test() -> CachedFrame {
     setup_host_substrate();
     allocate_cached_frame().expect("cached frame")
+}
+
+#[test]
+fn owned_request_submit_failure_restores_writeback_and_releases_owner() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    );
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let generation = {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed cached page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("test must own fetch generation");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("make page resident");
+        slot.mark_dirty().expect("mark page dirty");
+        let writeback = slot.begin_writeback().expect("begin writeback");
+        state.pages.mark_dirty(page).expect("set dirty mark");
+        state
+            .pages
+            .set_mark(page, PageCacheMark::Writeback)
+            .expect("set writeback mark");
+        writeback.generation
+    };
+    let request = PageIoRequest::new(
+        PageIoRequestId::new(0x71),
+        pc.io_manager_key(),
+        PageIoRange::new(page.as_u64(), 1),
+        PageIoOp::Writeback,
+        PageIoPriority::BackgroundWriteback,
+        PageIoFlags::WRITEBACK,
+        Some(generation),
+    );
+
+    let (source, target) = pc.prepare_owned_file_io_request(&request);
+    assert!(matches!(source, IoDataSource::PageCache { frame, .. } if frame.ppn() == ppn));
+    assert_eq!(target, IoDataTarget::None);
+    assert_eq!(pc.file_io_owner_count_for_test(), 1);
+
+    pc.finish_owned_file_io_request(&request, FileIoTerminalResult::SubmitFailure);
+
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(pc.file_io_lease_count_for_test(), 0);
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page)
+            .expect("writeback slot")
+            .state,
+        PageSlotState::Dirty { ppn }
+    );
+    assert!(!pc.page_marks(page).expect("page marks").writeback);
+
+    let duplicate = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ),
+        frame: None,
+        waiters: alloc::vec![],
+    };
+    assert_eq!(pc.apply_file_io_completion_route(&duplicate), None);
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page)
+            .expect("writeback slot")
+            .state,
+        PageSlotState::Dirty { ppn }
+    );
 }
 
 #[test]
