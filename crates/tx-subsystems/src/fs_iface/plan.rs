@@ -1,5 +1,6 @@
 //! Neutral page-to-block planning IR.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::execution::{Errno, Guard};
@@ -118,6 +119,46 @@ impl IoDataSource {
             Self::None => None,
             Self::PageCache { lease, .. } | Self::Direct { lease, .. } => Some(*lease),
         }
+    }
+}
+
+/// Move-only projection of PageBacked-owned data leases for filesystem
+/// planning. It carries DMA-visible descriptors only; it has no PageSlot,
+/// cache-pin, or terminal-cleanup capability.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PageDataLeaseProjection {
+    segments: Box<[IoDataSource]>,
+}
+
+impl PageDataLeaseProjection {
+    pub fn new(segments: Box<[IoDataSource]>) -> Self {
+        Self { segments }
+    }
+
+    pub fn into_sources(self) -> Box<[IoDataSource]> {
+        self.segments
+    }
+}
+
+#[cfg(test)]
+mod page_data_lease_projection_tests {
+    use super::*;
+
+    #[test]
+    fn projection_transfers_only_neutral_sources() {
+        let projection = PageDataLeaseProjection::new(alloc::boxed::Box::new([
+            IoDataSource::page_cache(
+                IoDataLeaseId::new(7),
+                PageFrameRef::new(Ppn(0x42)),
+                0,
+                4096,
+            ),
+        ]));
+
+        assert!(matches!(
+            projection.into_sources().as_ref(),
+            [IoDataSource::PageCache { lease, .. }] if *lease == IoDataLeaseId::new(7)
+        ));
     }
 }
 
