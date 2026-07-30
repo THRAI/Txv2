@@ -75,7 +75,7 @@ where
     ) -> StepOutcome<FsObjectId, NoProgress> {
         // Diagnostic: record that ext4 lookup was called (vs some other backend).
         tx_subsystems::vfs::resolution::diagnostic::record_diag(20);
-        let parent = match self.resolve_object(parent) {
+        let parent_inode = match self.resolve_object(parent) {
             Ok((parent, _)) => parent,
             Err(err) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(21);
@@ -83,7 +83,7 @@ where
             }
         };
 
-        match self.lookup_cached(parent, name) {
+        match self.lookup_cached(parent, parent_inode, name) {
             Ok(Some(inode)) => match self.object_id_for_inode(inode) {
                 Ok(id) => StepOutcome::done(id),
                 Err(err) => StepOutcome::err(err.into()),
@@ -166,10 +166,7 @@ where
                 .map(|_| ())
         });
         match write {
-            Ok(()) => {
-                self.invalidate_inode_meta(inode);
-                StepOutcome::done(())
-            }
+            Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(err.into()),
         }
     }
@@ -190,11 +187,11 @@ where
             Err(e) => return StepOutcome::err(e.into()),
         };
         let now_sec = current_ext4_time_sec();
-        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+        match self.with_pager_namespace_mutation(&[parent], |pager| {
             pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
         }) {
             Ok(new_ino) => {
-                self.invalidate_lookup_cache_for(parent_ino);
+                self.invalidate_lookup_cache_for(parent);
                 let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
                     Ok(m) => m,
                     Err(e) => return StepOutcome::err(e.into()),
@@ -229,12 +226,11 @@ where
             Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+        match self.with_pager_namespace_mutation(&[parent], |pager| {
             pager.unlink_inode(parent_ino, name, target_ino)
         }) {
             Ok(remaining_links) => {
-                self.invalidate_lookup_cache_for(parent_ino);
-                self.invalidate_inode_meta(target_ino);
+                self.invalidate_lookup_cache_for(parent);
                 if remaining_links == 0 {
                     self.mark_inode_orphaned(target);
                 }
@@ -264,14 +260,13 @@ where
             Err(e) => return StepOutcome::err(e.into()),
         };
 
-        match self.with_pager_namespace_mutation(&[old_parent_ino, new_parent_ino], |pager| {
+        match self.with_pager_namespace_mutation(&[old_parent, new_parent], |pager| {
             pager.rename_inode(old_parent_ino, old_name, new_parent_ino, new_name)
         }) {
             Ok(outcome) => {
-                self.invalidate_lookup_cache_for(old_parent_ino);
-                self.invalidate_lookup_cache_for(new_parent_ino);
+                self.invalidate_lookup_cache_for(old_parent);
+                self.invalidate_lookup_cache_for(new_parent);
                 if let Some((displaced, remaining_links)) = outcome.displaced {
-                    self.invalidate_inode_meta(displaced);
                     if remaining_links == 0 {
                         let displaced_id = match self.object_id_for_inode(displaced) {
                             Ok(id) => id,
@@ -304,7 +299,7 @@ where
             Ok(resolved) => resolved,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.lookup_cached(parent_ino, name) {
+        match self.lookup_cached(parent, parent_ino, name) {
             Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
             Ok(None) => {}
             Err(e) => return StepOutcome::err(e.into()),
@@ -312,12 +307,11 @@ where
         if meta.mode & 0xF000 == 0x4000 {
             return StepOutcome::err(Errno::EPERM.into());
         }
-        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+        match self.with_pager_namespace_mutation(&[parent], |pager| {
             pager.link_inode(parent_ino, name, target_ino)
         }) {
             Ok(()) => {
-                self.invalidate_lookup_cache_for(parent_ino);
-                self.invalidate_inode_meta(target_ino);
+                self.invalidate_lookup_cache_for(parent);
                 StepOutcome::done(())
             }
             Err(e) => StepOutcome::err(e.into()),
@@ -345,11 +339,11 @@ where
             Err(e) => return StepOutcome::err(e.into()),
         }
         let now_sec = current_ext4_time_sec();
-        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+        match self.with_pager_namespace_mutation(&[parent], |pager| {
             pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
         }) {
             Ok(new_ino) => {
-                self.invalidate_lookup_cache_for(parent_ino);
+                self.invalidate_lookup_cache_for(parent);
                 let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
                     Ok(m) => m,
                     Err(e) => return StepOutcome::err(e.into()),
@@ -384,12 +378,11 @@ where
             Ok((v, _)) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager_namespace_mutation(&[parent_ino], |pager| {
+        match self.with_pager_namespace_mutation(&[parent], |pager| {
             pager.unlink_directory(parent_ino, name, target_ino)
         }) {
             Ok(()) => {
-                self.invalidate_lookup_cache_for(parent_ino);
-                self.invalidate_inode_meta(target_ino);
+                self.invalidate_lookup_cache_for(parent);
                 self.mark_inode_orphaned(target);
                 StepOutcome::done(())
             }
@@ -424,11 +417,16 @@ where
         };
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
         let mut next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
-        let count =
-            match self.read_dir_entries_cached(inode, offset, &mut entries, &mut next_offsets) {
-                Ok(count) => count,
-                Err(err) => return StepOutcome::err(err.into()),
-            };
+        let count = match self.read_dir_entries_cached(
+            fs_object_id,
+            inode,
+            offset,
+            &mut entries,
+            &mut next_offsets,
+        ) {
+            Ok(count) => count,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         if count == 0 {
             return StepOutcome::done(None);
         }

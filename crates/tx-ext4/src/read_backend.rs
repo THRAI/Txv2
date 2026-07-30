@@ -28,7 +28,6 @@ pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
-    inode_meta_cache: SpinMutex<InodeMetaCache>,
     /// Lock-free namespace generations used to validate lookup/readdir cache
     /// fills against concurrent directory mutations.
     ///
@@ -64,7 +63,6 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
-            inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
             dir_versions: core::array::from_fn(|_| AtomicU64::new(0)),
             page_containers: SpinMutex::new(BTreeMap::new()),
             orphaned_inodes: SpinMutex::new(BTreeMap::new()),
@@ -102,7 +100,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
 
     pub(crate) fn with_pager_namespace_mutation<T>(
         &self,
-        parents: &[InodeNo],
+        parents: &[FsObjectId],
         f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,
     ) -> Result<T, Errno> {
         self.with_pager(|pager| {
@@ -114,17 +112,18 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         })
     }
 
-    fn dir_version(&self, inode: InodeNo) -> u64 {
-        self.dir_versions[dir_version_shard(inode)].load(Ordering::Acquire)
+    fn dir_version(&self, object: FsObjectId) -> u64 {
+        self.dir_versions[dir_version_shard(object)].load(Ordering::Acquire)
     }
 
-    fn bump_dir_version(&self, inode: InodeNo) {
-        self.dir_versions[dir_version_shard(inode)].fetch_add(1, Ordering::AcqRel);
+    fn bump_dir_version(&self, object: FsObjectId) {
+        self.dir_versions[dir_version_shard(object)].fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn lookup_cached(
         &self,
-        parent: InodeNo,
+        parent: FsObjectId,
+        parent_inode: InodeNo,
         name: &[u8],
     ) -> Result<Option<InodeNo>, Errno> {
         let version = self.dir_version(parent);
@@ -157,7 +156,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             return Ok(cached);
         }
         let (found, version) = self.with_pager(|pager| {
-            let found = pager.lookup(parent, name)?;
+            let found = pager.lookup(parent_inode, name)?;
             Ok((found, self.dir_version(parent)))
         })?;
         // Cache negatives too (inode 0 sentinel): every shell command's PATH
@@ -168,17 +167,6 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             .lock()
             .insert(parent, name, found.unwrap_or(InodeNo::new(0)), version);
         Ok(found)
-    }
-
-    pub(crate) fn inode_meta_cached(&self, inode: InodeNo) -> Result<InodeMetaLite, Errno> {
-        if let Some(meta) = self.inode_meta_cache.lock().get(inode) {
-            return Ok(meta);
-        }
-        let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
-        if inode_meta_is_dir(meta) {
-            self.inode_meta_cache.lock().insert(inode, meta);
-        }
-        Ok(meta)
     }
 
     /// Resolve and validate a persistent object incarnation.
@@ -211,16 +199,17 @@ impl<I: BlockImage> Ext4FsInstance<I> {
 
     pub(crate) fn read_dir_entries_cached(
         &self,
+        fs_object_id: FsObjectId,
         inode: InodeNo,
         start_offset: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Result<usize, Errno> {
-        let version = self.dir_version(inode);
+        let version = self.dir_version(fs_object_id);
         if let Some(count) =
             self.dir_cache
                 .lock()
-                .get(inode, start_offset, version, out, next_offsets)
+                .get(fs_object_id, start_offset, version, out, next_offsets)
         {
             return Ok(count);
         }
@@ -234,10 +223,10 @@ impl<I: BlockImage> Ext4FsInstance<I> {
                 &mut entries,
                 &mut cached_next_offsets,
             )?;
-            Ok((count, self.dir_version(inode)))
+            Ok((count, self.dir_version(fs_object_id)))
         })?;
         self.dir_cache.lock().insert(
-            inode,
+            fs_object_id,
             start_offset,
             version,
             &entries,
@@ -247,7 +236,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         {
             let mut lookup_cache = self.lookup_cache.lock();
             for entry in entries.iter().take(count) {
-                lookup_cache.insert(inode, entry.name(), entry.inode, version);
+                lookup_cache.insert(fs_object_id, entry.name(), entry.inode, version);
             }
         }
         out[..count].copy_from_slice(&entries[..count]);
@@ -255,16 +244,9 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(count)
     }
 
-    /// Drop one inode's cached metadata after an in-place update
-    /// (chmod/chown), so the next `inode_meta_cached` re-reads disk.
-    pub(crate) fn invalidate_inode_meta(&self, inode: InodeNo) {
-        self.inode_meta_cache.lock().invalidate(inode);
-    }
-
-    pub(crate) fn invalidate_lookup_cache_for(&self, parent: InodeNo) {
+    pub(crate) fn invalidate_lookup_cache_for(&self, parent: FsObjectId) {
         self.lookup_cache.lock().invalidate_parent(parent);
         self.dir_cache.lock().invalidate(parent);
-        self.inode_meta_cache.lock().invalidate(parent);
     }
 
     /// Resolve or create the one coherent page cache for `inode`.
@@ -405,8 +387,6 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         let mut orphaned = self.orphaned_inodes.lock();
         if result.is_ok() {
             orphaned.remove(&fs_object_id);
-            drop(orphaned);
-            self.inode_meta_cache.lock().invalidate(inode);
         } else {
             orphaned.insert(fs_object_id, OrphanState::Pending);
         }
@@ -414,12 +394,9 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     }
 }
 
-fn inode_meta_is_dir(meta: InodeMetaLite) -> bool {
-    meta.mode & 0xF000 == 0x4000
-}
-
-fn dir_version_shard(inode: InodeNo) -> usize {
-    inode.get() as usize % DIR_VERSION_SHARDS
+fn dir_version_shard(object: FsObjectId) -> usize {
+    let raw = object.as_u64();
+    (raw ^ (raw >> 32)) as usize % DIR_VERSION_SHARDS
 }
 
 const DIR_CACHE_ENTRIES: usize = 32;
@@ -439,7 +416,7 @@ impl DirCache {
 
     fn get(
         &mut self,
-        inode: InodeNo,
+        object: FsObjectId,
         start_offset: u64,
         version: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
@@ -447,7 +424,7 @@ impl DirCache {
     ) -> Option<usize> {
         let (index, window_index) =
             self.entries.iter().enumerate().find_map(|(index, entry)| {
-                if !entry.valid || entry.inode != inode || entry.version != version {
+                if !entry.valid || entry.object != object || entry.version != version {
                     return None;
                 }
                 if entry.start_offset == start_offset {
@@ -469,11 +446,11 @@ impl DirCache {
         Some(count)
     }
 
-    fn lookup(&mut self, inode: InodeNo, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
+    fn lookup(&mut self, object: FsObjectId, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
         let mut complete_first_window = None;
         let mut found_index = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            if !entry.valid || entry.inode != inode || entry.version != version {
+            if !entry.valid || entry.object != object || entry.version != version {
                 continue;
             }
             if entry.start_offset == 0 && entry.count < READDIR_WINDOW_ENTRIES {
@@ -511,7 +488,7 @@ impl DirCache {
 
     fn insert(
         &mut self,
-        inode: InodeNo,
+        object: FsObjectId,
         start_offset: u64,
         version: u64,
         entries: &[DirEntryLite; READDIR_WINDOW_ENTRIES],
@@ -523,7 +500,7 @@ impl DirCache {
             .entries
             .iter()
             .position(|entry| {
-                !entry.valid || (entry.inode == inode && entry.start_offset == start_offset)
+                !entry.valid || (entry.object == object && entry.start_offset == start_offset)
             })
             .unwrap_or_else(|| {
                 if self.entries.len() < DIR_CACHE_ENTRIES {
@@ -540,7 +517,7 @@ impl DirCache {
             });
         let entry = &mut self.entries[victim];
         entry.valid = true;
-        entry.inode = inode;
+        entry.object = object;
         entry.start_offset = start_offset;
         entry.version = version;
         entry.count = count.min(READDIR_WINDOW_ENTRIES);
@@ -553,9 +530,9 @@ impl DirCache {
             .extend_from_slice(&next_offsets[..entry.count]);
     }
 
-    fn invalidate(&mut self, inode: InodeNo) {
+    fn invalidate(&mut self, object: FsObjectId) {
         for entry in &mut self.entries {
-            if entry.valid && entry.inode == inode {
+            if entry.valid && entry.object == object {
                 entry.valid = false;
             }
         }
@@ -564,7 +541,7 @@ impl DirCache {
 
 struct DirCacheEntry {
     valid: bool,
-    inode: InodeNo,
+    object: FsObjectId,
     start_offset: u64,
     version: u64,
     count: usize,
@@ -577,99 +554,12 @@ impl DirCacheEntry {
     fn empty() -> Self {
         Self {
             valid: false,
-            inode: InodeNo::new(0),
+            object: FsObjectId::new(0),
             start_offset: 0,
             version: 0,
             count: 0,
             entries: Vec::new(),
             next_offsets: Vec::new(),
-            last_used: 0,
-        }
-    }
-}
-
-const INODE_META_CACHE_ENTRIES: usize = 64;
-
-struct InodeMetaCache {
-    clock: u64,
-    entries: [InodeMetaCacheEntry; INODE_META_CACHE_ENTRIES],
-}
-
-impl InodeMetaCache {
-    const fn empty() -> Self {
-        Self {
-            clock: 0,
-            entries: [InodeMetaCacheEntry::empty(); INODE_META_CACHE_ENTRIES],
-        }
-    }
-
-    fn get(&mut self, inode: InodeNo) -> Option<InodeMetaLite> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.valid && entry.inode == inode)?;
-        self.clock = self.clock.wrapping_add(1);
-        self.entries[index].last_used = self.clock;
-        Some(self.entries[index].meta)
-    }
-
-    fn insert(&mut self, inode: InodeNo, meta: InodeMetaLite) {
-        self.clock = self.clock.wrapping_add(1);
-        let victim = self
-            .entries
-            .iter()
-            .position(|entry| !entry.valid || entry.inode == inode)
-            .unwrap_or_else(|| {
-                self.entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(index, _)| index)
-                    .unwrap_or(0)
-            });
-        self.entries[victim] = InodeMetaCacheEntry {
-            valid: true,
-            inode,
-            meta,
-            last_used: self.clock,
-        };
-    }
-
-    fn invalidate(&mut self, inode: InodeNo) {
-        for entry in &mut self.entries {
-            if entry.valid && entry.inode == inode {
-                entry.valid = false;
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct InodeMetaCacheEntry {
-    valid: bool,
-    inode: InodeNo,
-    meta: InodeMetaLite,
-    last_used: u64,
-}
-
-impl InodeMetaCacheEntry {
-    const fn empty() -> Self {
-        Self {
-            valid: false,
-            inode: InodeNo::new(0),
-            meta: InodeMetaLite {
-                generation: 0,
-                mode: 0,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                nlinks: 0,
-                blocks_512: 0,
-                flags: 0,
-                atime: 0,
-                ctime: 0,
-                mtime: 0,
-            },
             last_used: 0,
         }
     }
@@ -698,7 +588,7 @@ impl LookupCache {
     /// `Some(Some(ino))` = cached hit. Negative entries reuse `inode == 0`
     /// (ext4 inode numbers start at 1) and are invalidated by the same
     /// `invalidate_parent` calls that cover create/unlink/rename.
-    fn get(&mut self, parent: InodeNo, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
+    fn get(&mut self, parent: FsObjectId, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
         let index = self
             .entries
             .iter()
@@ -713,7 +603,7 @@ impl LookupCache {
         }
     }
 
-    fn insert(&mut self, parent: InodeNo, name: &[u8], inode: InodeNo, version: u64) {
+    fn insert(&mut self, parent: FsObjectId, name: &[u8], inode: InodeNo, version: u64) {
         if name.len() > LOOKUP_CACHE_NAME_BYTES {
             return;
         }
@@ -733,7 +623,7 @@ impl LookupCache {
         self.entries[victim] = LookupCacheEntry::new(parent, name, inode, version, self.clock);
     }
 
-    fn invalidate_parent(&mut self, parent: InodeNo) {
+    fn invalidate_parent(&mut self, parent: FsObjectId) {
         for entry in &mut self.entries {
             if entry.valid && entry.parent == parent {
                 entry.valid = false;
@@ -745,7 +635,7 @@ impl LookupCache {
 #[derive(Clone, Copy)]
 struct LookupCacheEntry {
     valid: bool,
-    parent: InodeNo,
+    parent: FsObjectId,
     inode: InodeNo,
     version: u64,
     name_len: u8,
@@ -757,7 +647,7 @@ impl LookupCacheEntry {
     const fn empty() -> Self {
         Self {
             valid: false,
-            parent: InodeNo::new(0),
+            parent: FsObjectId::new(0),
             inode: InodeNo::new(0),
             version: 0,
             name_len: 0,
@@ -766,7 +656,7 @@ impl LookupCacheEntry {
         }
     }
 
-    fn new(parent: InodeNo, name: &[u8], inode: InodeNo, version: u64, last_used: u64) -> Self {
+    fn new(parent: FsObjectId, name: &[u8], inode: InodeNo, version: u64, last_used: u64) -> Self {
         let mut entry = Self::empty();
         entry.valid = true;
         entry.parent = parent;
@@ -778,7 +668,7 @@ impl LookupCacheEntry {
         entry
     }
 
-    fn matches(&self, parent: InodeNo, name: &[u8], version: u64) -> bool {
+    fn matches(&self, parent: FsObjectId, name: &[u8], version: u64) -> bool {
         self.valid
             && self.parent == parent
             && self.version == version

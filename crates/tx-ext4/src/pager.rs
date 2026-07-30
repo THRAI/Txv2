@@ -183,10 +183,7 @@ where
         };
         let now_sec = tx_subsystems::wall_clock::current_realtime_sec().min(u32::MAX as u64) as u32;
         match self.with_pager(|pager| pager.set_inode_size_and_times(inode, new_size, now_sec)) {
-            Ok(()) => {
-                self.invalidate_inode_meta(inode);
-                StepOutcome::done(())
-            }
+            Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(err.into()),
         }
     }

@@ -321,6 +321,73 @@ fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
 }
 
 #[test]
+fn ext4_inode_reuse_rejects_old_identity_and_cache_entries() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let root = FsObjectId::new(2);
+
+    let first_id = match <Ext4FsInstance<MemImage> as FsOps>::create_inode(
+        &*fs,
+        root,
+        b"first-generation",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, _)) => id,
+        other => panic!("create first generation: {other:?}"),
+    };
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, root, b"first-generation", &guard,),
+        V3::<_, NoProgress>::done(first_id)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::unlink(
+            &*fs,
+            root,
+            b"first-generation",
+            first_id,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, first_id, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+
+    let second_id = match <Ext4FsInstance<MemImage> as FsOps>::create_inode(
+        &*fs,
+        root,
+        b"second-generation",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, _)) => id,
+        other => panic!("create second generation: {other:?}"),
+    };
+
+    assert_eq!(first_id.inode_number(), second_id.inode_number());
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, first_id, &guard),
+        V3::<_, NoProgress>::err(V3Errno::ESTALE)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, root, b"first-generation", &guard,),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, root, b"second-generation", &guard,),
+        V3::<_, NoProgress>::done(second_id)
+    );
+}
+
+#[test]
 fn ext4_materialise_new_regular_file_has_iozone_growth_capacity() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
