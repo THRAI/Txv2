@@ -10,8 +10,8 @@ use tx_subsystems::vfs::structure::{
 };
 
 use crate::read_backend::{
-    cursor_from_offset, cursor_offset, fs_object_id as inode_fs_object_id, inode_no,
-    map_inode_meta, Ext4FsInstance, READDIR_WINDOW_ENTRIES,
+    Ext4FsInstance, READDIR_WINDOW_ENTRIES, cursor_from_offset, cursor_offset,
+    fs_object_id as inode_fs_object_id, inode_no, map_inode_meta,
 };
 
 // ext4 dir-entry file_type codes (POSIX-shaped). Maps the on-disk byte

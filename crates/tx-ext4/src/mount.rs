@@ -12,8 +12,8 @@ use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 
 use crate::journal::{
     JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool,
@@ -21,7 +21,7 @@ use crate::journal::{
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
 pub use crate::read_backend::FilePageContainerBinder;
 use crate::read_backend::{
-    map_inode_meta, Ext4FsInstance, Ext4PagerMutationPlanSource, EXT4_ROOT_INODE,
+    EXT4_ROOT_INODE, Ext4FsInstance, Ext4PagerMutationPlanSource, map_inode_meta,
 };
 use tx_ext4_format::{clean_replayed_journal, replay_journal};
 

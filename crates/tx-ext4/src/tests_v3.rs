@@ -22,21 +22,21 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
-    self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
+    self as epoch, Errno as V3Errno, NoProgress, StepOutcome as V3, page_allocator,
 };
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
-use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Page4K};
 use tx_subsystems::fs_iface::{
-    BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId,
-    IoDataSource, IoDataTarget, PageFrameRef,
+    BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
+    PageFrameRef,
 };
 use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::io_manager::page::{
     PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
 };
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, InodeMeta};
 
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
 use crate::read_backend::{Ext4FsInstance, Ext4PagerMutationPlanSource};
@@ -313,7 +313,10 @@ fn ext4_mapped_write_mutation_requires_a_mutation_owner() {
         Some(PageGeneration::new(8)),
     );
 
-    assert_eq!(provider.plan_writeback_mutation(&request), Err(V3Errno::EOPNOTSUPP));
+    assert_eq!(
+        provider.plan_writeback_mutation(&request),
+        Err(V3Errno::EOPNOTSUPP)
+    );
 }
 
 // === Tests =============================================================
@@ -407,7 +410,10 @@ fn ext4_v3_mutation_methods_require_a_mutation_owner() {
         &cred,
         &guard,
     );
-    assert_eq!(result, V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP));
+    assert_eq!(
+        result,
+        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP)
+    );
 
     let result = <Ext4FsInstance<MemImage> as FsOps>::mkdir(
         &*fs,
@@ -417,7 +423,10 @@ fn ext4_v3_mutation_methods_require_a_mutation_owner() {
         &cred,
         &guard,
     );
-    assert_eq!(result, V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP));
+    assert_eq!(
+        result,
+        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP)
+    );
 
     // destroy_inode is still unimplemented.
     assert_eq!(
@@ -442,7 +451,10 @@ fn ext4_materialise_new_regular_file_requires_a_mutation_owner() {
         &cred,
         &guard,
     );
-    assert_eq!(result, V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP));
+    assert_eq!(
+        result,
+        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP)
+    );
 }
 
 #[test]
