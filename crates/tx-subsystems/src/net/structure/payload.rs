@@ -761,6 +761,42 @@ impl SocketPayload {
                     sctp_ppid: drain.ppid,
                 }
             }
+            SocketImpl::NetlinkRoute(raw_netlink) => {
+                let response = raw_netlink.pop_response(peek)?;
+                let bytes = core::cmp::min(out.len(), response.len());
+                out[..bytes].copy_from_slice(&response.as_slice()[..bytes]);
+                SocketRecvBytesOutcome {
+                    bytes,
+                    source: None,
+                    unix_source: None,
+                    packet_source: None,
+                    destination: None,
+                    truncated: bytes < response.len(),
+                    became_empty: !peek && raw_netlink.is_empty(),
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
+                }
+            }
+            SocketImpl::NetlinkNetfilter(raw_netlink) => {
+                let response = raw_netlink.pop_response(peek)?;
+                let bytes = core::cmp::min(out.len(), response.len());
+                out[..bytes].copy_from_slice(&response[..bytes]);
+                SocketRecvBytesOutcome {
+                    bytes,
+                    source: None,
+                    unix_source: None,
+                    packet_source: None,
+                    destination: None,
+                    truncated: bytes < response.len(),
+                    became_empty: !peek && raw_netlink.is_empty(),
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
+                }
+            }
             _ => return None,
         };
         Some(outcome)

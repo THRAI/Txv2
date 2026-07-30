@@ -1902,9 +1902,29 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
     }
-    if super::socket::socket_identity_from_file(&file).is_ok() {
-        return super::socket::sys_sendto([args[0], args[1], args[2], 0, 0, 0], ctx).await;
+    // Netlink write(2) needs its message-oriented dispatcher. The generic
+    // socket FileOps byte path has no netlink protocol decoder and would
+    // otherwise wait forever for send readiness that never fires.
+    if let Ok(socket) = super::socket::socket_identity_from_file(&file) {
+        if super::socket::is_netlink_socket_kind(socket.kind) {
+            if !file.flags().write {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let copy_len = core::cmp::min(len, SOCKET_IO_MAX_INLINE);
+            let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; copy_len];
+            if let Err(errno) =
+                bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64)
+            {
+                return SyscallResult::error_from(errno);
+            }
+            return match super::socket::dispatch_netlink_send(ctx, &socket, &bytes) {
+                Ok(sent) => SyscallResult::Return(sent as i64),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            };
+        }
     }
+    // Ordinary sockets deliberately fall through to OpenFileWriteOp and
+    // FileOps::write; sendto/sendmsg keep their socket-specific ABI paths.
     if let Some((_rx, tx)) = file.socketpair_endpoint() {
         if !file.flags().write {
             return SyscallResult::Error(EINVAL_VALUE);
@@ -1934,6 +1954,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Socket datagrams and stream batches use the network staging cap,
+        // not the TTY line-discipline cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
@@ -2262,22 +2286,25 @@ where
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
-    if super::socket::socket_identity_from_file(&file).is_ok() {
-        if ctx.mailbox.is_none() {
-            let guard = crate::adapter::step_engine::guard();
-            if let Some(Ok(mask)) = super::socket::socket_poll_mask_from_file(&file, &guard) {
-                let readable = mask.intersects(
-                    tx_subsystems::net::PollMask::IN
-                        | tx_subsystems::net::PollMask::ERR
-                        | tx_subsystems::net::PollMask::HUP
-                        | tx_subsystems::net::PollMask::RDHUP,
-                );
-                if !readable {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
+    // A bootstrap context has no mailbox and therefore cannot park in
+    // drive(). Keep the readiness gate, but let ready sockets continue
+    // through OpenFileReadOp and FileOps::read.
+    if super::socket::socket_identity_from_file(&file).is_ok() && ctx.mailbox.is_none() {
+        // Match recvfrom/poll/select: give already-queued loopback work one
+        // bounded chance to publish peer readiness before declaring EAGAIN.
+        super::socket::drive_loopback_pending();
+        let guard = crate::adapter::step_engine::guard();
+        if let Some(Ok(mask)) = super::socket::socket_poll_mask_from_file(&file, &guard) {
+            let readable = mask.intersects(
+                tx_subsystems::net::PollMask::IN
+                    | tx_subsystems::net::PollMask::ERR
+                    | tx_subsystems::net::PollMask::HUP
+                    | tx_subsystems::net::PollMask::RDHUP,
+            );
+            if !readable {
+                return SyscallResult::Error(EAGAIN_VALUE);
             }
         }
-        return super::socket::sys_recvfrom::<P>([args[0], args[1], args[2], 0, 0, 0], ctx).await;
     }
 
     sys_read_non_socket::<P>(args, ctx, file).await
@@ -2352,6 +2379,10 @@ where
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Socket datagrams and stream batches use the network staging cap,
+        // not the TTY line-discipline cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
