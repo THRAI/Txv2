@@ -244,6 +244,17 @@ fn build_image() -> MemImage {
     image
 }
 
+fn build_tier1_mount_image() -> MemImage {
+    let mut image = build_image();
+    let mut superblock = Superblock::parse(&image.block_mut(0)[1024..2048]).expect("superblock");
+    superblock.feature_compat = 0x0004;
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .expect("encode Tier 1 superblock");
+    image
+}
+
 fn open_fs() -> Arc<Ext4FsInstance<MemImage>> {
     Ext4FsInstance::open(build_image(), false).expect("open ext4 mem image")
 }
@@ -629,6 +640,18 @@ fn rw_mount_requires_the_pinned_tier1_profile_but_ro_oracles_remain_open() {
         Err(V3Errno::EOPNOTSUPP)
     ));
     assert!(mount_ext4_read_only(build_image()).is_ok());
+}
+
+#[test]
+fn rw_mount_stores_the_accepted_tier1_profile_hash() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let mounted = mount_ext4_read_write(build_tier1_mount_image()).expect("Tier 1 RW mount");
+    assert_eq!(
+        mounted.capability_profile_hash().map(|hash| hash.0),
+        Some(tx_ext4_format::capability::Tier1Capabilities::generated().profile_hash()),
+    );
 }
 
 #[test]
