@@ -2293,17 +2293,10 @@ where
         // Match recvfrom/poll/select: give already-queued loopback work one
         // bounded chance to publish peer readiness before declaring EAGAIN.
         super::socket::drive_loopback_pending();
-        let guard = crate::adapter::step_engine::guard();
-        if let Some(Ok(mask)) = super::socket::socket_poll_mask_from_file(&file, &guard) {
-            let readable = mask.intersects(
-                tx_subsystems::net::PollMask::IN
-                    | tx_subsystems::net::PollMask::ERR
-                    | tx_subsystems::net::PollMask::HUP
-                    | tx_subsystems::net::PollMask::RDHUP,
-            );
-            if !readable {
-                return SyscallResult::Error(EAGAIN_VALUE);
-            }
+        let interest =
+            FdReadyMask::READ | FdReadyMask::ERR | FdReadyMask::HUP | FdReadyMask::RDHUP;
+        if fd_ready_report_for_poll::<P>(&file, interest).ready == FdReadyMask::empty() {
+            return SyscallResult::Error(EAGAIN_VALUE);
         }
     }
 

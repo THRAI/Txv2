@@ -1585,9 +1585,8 @@ impl OpenFile {
         }
     }
 
-    /// P3-S4 (D13): the file's `FileOps` implementation, when its backing
-    /// kind provides one. Sockets today; other rich fd kinds join by
-    /// implementing the trait — call sites then stop naming kinds.
+    /// P3-S2/S5 (D13): byte and lifecycle operations supplied by a rich
+    /// file kind. Readiness remains fd-neutral through `query_fd_ready`.
     pub fn file_ops(&self) -> Option<&dyn crate::device::FileOps> {
         self.socket_identity()
             .map(|identity| identity as &dyn crate::device::FileOps)

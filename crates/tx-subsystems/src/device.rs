@@ -259,16 +259,6 @@ pub trait FileOps: Send + Sync {
         nonblocking: bool,
         guard: &Guard<'_>,
     ) -> StepOutcome<usize, ByteProgress>;
-    /// Current readiness snapshot (P3-S4) — poll/select/epoll sampling.
-    fn poll_mask(&self, guard: &Guard<'_>) -> Result<crate::net::PollMask, Errno>;
-    /// Wait carrier for the blocked interests (P3-S4) — poll/select/epoll
-    /// park on this token; `None` when nothing is blockable.
-    fn poll_wait_token(
-        &self,
-        interests: crate::net::PollMask,
-        guard: &Guard<'_>,
-    ) -> Result<Option<crate::execution::WaitToken>, Errno>;
-
     /// F_SETFL O_NONBLOCK side-effect hook (P3-S5). Sockets re-kick send
     /// readiness so writers parked behind a formerly-blocking fd re-poll.
     fn on_set_fl_nonblock(

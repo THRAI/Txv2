@@ -516,39 +516,6 @@ pub(super) fn open_file_is_path_only(file: &OpenFile) -> bool {
     !flags.read && !flags.write
 }
 
-pub(crate) fn socket_poll_mask_from_file(
-    file: &Cap<OpenFile>,
-    guard: &tx_substrate::epoch::Guard<'_>,
-) -> Option<Result<PollMask, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_ready(&socket, guard) {
-        StepOutcome::Done(mask) => Ok(mask),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(PollMask::empty()),
-    })
-}
-
-pub(crate) fn socket_poll_wait_token_from_file(
-    file: &Cap<OpenFile>,
-    interests: PollMask,
-    guard: &tx_substrate::epoch::Guard<'_>,
-) -> Option<Result<Option<tx_subsystems::execution::WaitToken>, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_wait_token(&socket, interests, guard) {
-        StepOutcome::Done(token) => Ok(token),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(None),
-    })
-}
-
 pub(super) fn read_sockaddr_in<'a>(
     ctx: &SyscallCtx<'a>,
     sockaddr_ptr: u64,
