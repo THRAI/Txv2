@@ -18,6 +18,29 @@
   **Blocker**：本项无；workspace unit 仍是既有 3 个 tx-shims 断言和 tx-ext4
   陈旧 `with_target`，docs lint 仍为既有 23 断链。
 
+- 2026-07-30 (**分支/磁盘盘点与首轮 LTP 运行盘清理完成**).
+  当前 `feature-network-refactor` 工作树盘点前干净，相对本地缓存 upstream
+  ahead 34/behind 0，相对 `main` 多 22 commits；本地 21 分支、37 个实际远端
+  跟踪引用、7 个 worktree。仓库可见实占下限约 **259.17 GiB**，其中
+  `target/` 235.69 GiB、`target/oscomp/` 191.77 GiB；最大单项是
+  `ltp-bin`/`ltp-runtest` 留下的 618 个逐轮磁盘路径（61 个有实占），合计
+  **185.01 GiB**。按用户确认的“runner mode × architecture/libc lane 各保留
+  最新 1 个”策略，已删除 53 个旧非空运行盘、保留 8 个最新盘和 557 个空
+  占位文件，精确释放 **172,082,016,256 bytes（160.26 GiB）**。清理后
+  `target/oscomp` 31.51 GiB、`target/` 75.42 GiB、仓库可见实占下限
+  98.91 GiB；文件系统从 80% 降到 62%，可用空间约 179 GiB → 339 GiB。
+  两个 `testdata` 基盘、1251 份 log/judge、submit 证据均保持不变。四个
+  干净辅助 worktree 另可回收约 17.71 GiB；两个 worktree 含未提交内容，
+  禁止直接移除。`.git` 仅 0.29 GiB，分支删除几乎不省空间。详细边界与
+  8 个保留盘清单见
+  `docs/progress/research/2026-07-30-branch-and-disk-cleanup-inventory.md`。
+  **Verification**：删除前确认无匹配 QEMU，断言候选 `61=8+53` 与目标字节数；
+  删除后复核非空盘 8、空盘 557、log/judge 1251、基盘 stat 摘要不变，并用
+  `du`/`df` 核准释放字节数。
+  **Next**：可选清理 Cargo 缓存或四个干净辅助 worktree。
+  **Blocker**：5 个 `nobody:nogroup`、0700 的 LTP 工作目录无法读，故总占用为
+  下限；远端引用未 fetch，只代表本地缓存快照。
+
 - 2026-07-30 (**feature-network-refactor 合并保真度/结构审计完成，Alpine RV64 curl 已落并真机验收**).
   对当前 `6503312f` 与 07-27 merge `6d41a347` 的 feature parent `90939012`
   做 blob、调用点和当前实现复核：P0/P1/P4 完整保留，P2 外部 TCP/UDP 数据面、
