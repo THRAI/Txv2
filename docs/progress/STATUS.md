@@ -1,3 +1,24 @@
+- 2026-07-30 (**TCP retained close / SO_LINGER 结构调研完成，按额度暂停**).
+  确认当前 last-close 失败根因是 transport 所有权提前终止：路径先撤销
+  connection/bind、`abort()` 并 `take_payload()`，因此 smoltcp 虽有
+  FIN_WAIT/TIME_WAIT 和活时钟，也失去后续 demux/poll/deadline 入口；
+  `SO_LINGER` 目前只有 ABI 存取，close/shutdown 从未消费。另发现 dup3 覆盖与
+  exec CLOEXEC 隐式关闭绕过 FileOps last-close hook。推荐按四阶段落地：
+  先统一所有 OFD 最后释放入口；再用有界网络级 `TcpClosingRegistry` 保留
+  socket/payload/index 并接入 delegate deadline/reaper；随后让 positive
+  linger 的显式 close 变成可等待 StepOp；语义稳定后再抽取 net-owned
+  `TcpFlow`，避免第一步同时重写 demux/readiness/table。不能把 registry
+  直接强挂进 netns，否则形成 namespace→socket→namespace 引用环。
+  **Verification**：只读追踪 close、shutdown、delegate、netns 回收及
+  dup3/CLOEXEC 路径，并复核关键源码；`git diff --check` 通过，未修改或运行
+  网络代码。progress validate 仍被 07-24 plan 的非法 `completed` 阻断，
+  docs lint 仍为既有 23 个断链/6 个退役词汇警告，新文档未新增命中。
+  详细方案见
+  `docs/progress/research/2026-07-30-tcp-retained-close-design.md`。
+  **Next**：从 P0 的统一 OFD release 判决测试开始；实现前补 smoltcp 终态/reap
+  判据与 Linux positive linger/O_NONBLOCK/信号语义 witness。
+  **Blocker**：无代码 blocker；本轮按用户额度要求在设计记录后暂停。
+
 - 2026-07-30 (**TCP connect/lifecycle 单一真相与 loopback 公平性收敛完成**).
   `SocketPayload::control` 现统一持有 TCP 协议状态、活动 connect attempt、
   单调 generation 和 one-shot pending error；异步完成、egress、readiness
