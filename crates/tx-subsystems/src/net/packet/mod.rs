@@ -44,6 +44,13 @@ pub trait PacketTxSink {
         PacketTxReadiness::Ready
     }
 
+    /// Maximum IP-packet size accepted by this egress path.
+    ///
+    /// TCP consumes this before dispatch so segmentation happens in the
+    /// transport engine instead of relying on the device to reject an
+    /// oversized packet after the fact.
+    fn ip_mtu(&self) -> u16;
+
     fn readiness_at(&self, now: Instant, guard: &Guard<'_>) -> PacketTxReadiness {
         let _now = now;
         self.readiness(guard)

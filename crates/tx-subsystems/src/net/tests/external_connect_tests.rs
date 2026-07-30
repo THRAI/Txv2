@@ -415,6 +415,10 @@ fn device_tx_single_pass_drains_multiple_segments() {
         frames: core::sync::atomic::AtomicUsize,
     }
     impl PacketTxSink for CountingSink {
+        fn ip_mtu(&self) -> u16 {
+            1500
+        }
+
         fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
             self.frames
                 .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -530,6 +534,10 @@ fn external_udp_sendto_reaches_device_tx() {
         frames: core::sync::atomic::AtomicUsize,
     }
     impl PacketTxSink for CountingSink {
+        fn ip_mtu(&self) -> u16 {
+            1500
+        }
+
         fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
             self.frames
                 .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -619,6 +627,10 @@ impl ScriptedSink {
 }
 
 impl PacketTxSink for ScriptedSink {
+    fn ip_mtu(&self) -> u16 {
+        1500
+    }
+
     fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
         let left = self.refusals_left.load(core::sync::atomic::Ordering::Acquire);
         if left > 0 {

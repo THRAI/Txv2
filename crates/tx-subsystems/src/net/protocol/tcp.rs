@@ -3,7 +3,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use smoltcp::iface::{Config, Interface};
-use smoltcp::phy::{ChecksumCapabilities, Loopback, Medium};
+use smoltcp::phy::{ChecksumCapabilities, Device as _, Loopback, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Duration;
 use smoltcp::wire::{
@@ -421,9 +421,10 @@ impl RawTcpSocket {
     /// if smoltcp had nothing to send.
     pub fn dispatch_segment_via(
         &self,
+        ip_mtu: usize,
         transmit: impl FnOnce(&SmoltcpTcpSegment) -> bool,
     ) -> Option<bool> {
-        with_context(|cx| {
+        with_context_ip_mtu(ip_mtu, |cx| {
             let inner = &mut *self.inner.lock();
             let socket = &mut inner.socket;
             let mut attempted = None;
@@ -716,20 +717,43 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
 // `Context` provider (checksum caps + `now`). Lock order is CONTEXT_IFACE
 // outer, `self.socket` inner at every call site. Per-netns Interfaces are a
 // later phase (REFACTOR_PLAN_A_v2 P5).
-static CONTEXT_IFACE: SpinMutex<Option<Interface>> = SpinMutex::new(None);
+struct TcpContext {
+    iface: Interface,
+    loopback_ip_mtu: usize,
+}
+
+static CONTEXT_IFACE: SpinMutex<Option<TcpContext>> = SpinMutex::new(None);
 
 pub(crate) fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
+    with_context_maybe_ip_mtu(None, f)
+}
+
+fn with_context_ip_mtu<R>(ip_mtu: usize, f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
+    with_context_maybe_ip_mtu(Some(ip_mtu), f)
+}
+
+fn with_context_maybe_ip_mtu<R>(
+    ip_mtu: Option<usize>,
+    f: impl FnOnce(&mut smoltcp::iface::Context) -> R,
+) -> R {
     let mut slot = CONTEXT_IFACE.lock();
-    let iface = slot.get_or_insert_with(|| {
+    let context = slot.get_or_insert_with(|| {
         let mut device = Loopback::new(Medium::Ip);
-        Interface::new(
+        let loopback_ip_mtu = device.capabilities().ip_mtu();
+        let iface = Interface::new(
             Config::new(HardwareAddress::Ip),
             &mut device,
             smoltcp::time::Instant::ZERO,
-        )
+        );
+        TcpContext {
+            iface,
+            loopback_ip_mtu,
+        }
     });
-    let cx = iface.context();
+    let selected_ip_mtu = ip_mtu.unwrap_or(context.loopback_ip_mtu);
+    let cx = context.iface.context();
     cx.now = net_now_instant();
+    cx.caps.max_transmission_unit = selected_ip_mtu;
     f(cx)
 }
 

@@ -835,6 +835,10 @@ impl PacketTxSink for EtherPacketTxSink<'_> {
         self.iface.netdev.ops.tx_readiness(guard)
     }
 
+    fn ip_mtu(&self) -> u16 {
+        self.iface.netdev.ops.mtu()
+    }
+
     fn readiness_at(&self, now: Instant, guard: &Guard<'_>) -> PacketTxReadiness {
         let _now = now;
         self.readiness(guard)

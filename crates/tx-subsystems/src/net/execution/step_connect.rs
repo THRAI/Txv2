@@ -183,6 +183,14 @@ fn try_tcp_local_namespace_connect(
         return None;
     };
     let target_table = target_namespace.socket_table();
+    let client_table = payload.socket_table();
+    if !core::ptr::eq(client_table, target_table) {
+        // A listener owned by another network namespace is reachable only
+        // through that namespace's link topology. Creating an accept child
+        // here would bypass veth/bridge delivery and leave both smoltcp
+        // engines Closed while the syscall-facing state claimed Connected.
+        return None;
+    }
     let Some(listener) = target_table.lookup_tcp_listener_dual_stack_endpoint(remote, guard) else {
         return Some(StepOutcome::Err(Errno::ECONNREFUSED));
     };
@@ -213,7 +221,6 @@ fn try_tcp_local_namespace_connect(
 
     let client_key = ConnectionKey::new(local, listener_local);
     let server_key = ConnectionKey::new(listener_local, local);
-    let client_table = payload.socket_table();
     if let Err(error) = client_table.insert_tcp_connection(client_key, socket.clone()) {
         return Some(StepOutcome::Err(table_error_to_errno(error)));
     }

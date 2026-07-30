@@ -258,7 +258,7 @@ fn process_tcp_tx_socket(
         let mut busy = false;
         let mut pending = false;
         let mut failed = false;
-        let dispatched = raw_tcp.dispatch_segment_via(|segment| {
+        let dispatched = raw_tcp.dispatch_segment_via(usize::from(sink.ip_mtu()), |segment| {
             let Some(packet) = segment.emit_ipv4_packet() else {
                 // Unbuildable (e.g. no route yet): refuse so it stays
                 // queued — dropping it here would mint a wire hole.

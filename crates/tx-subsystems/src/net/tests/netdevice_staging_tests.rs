@@ -114,6 +114,10 @@ impl PacketTxSink for MockPacketTxSink<'_> {
         }
     }
 
+    fn ip_mtu(&self) -> u16 {
+        self.device.mtu()
+    }
+
     fn transmit(&self, frame: &[u8], guard: &Guard<'_>) -> crate::net::packet::PacketTxResult {
         self.inner.transmit(frame, guard)
     }

@@ -266,6 +266,10 @@ impl PacketTxSink for BootNetRuntime {
         self.ether_iface.netdev.ops.tx_readiness(guard)
     }
 
+    fn ip_mtu(&self) -> u16 {
+        self.ether_iface.netdev.ops.mtu()
+    }
+
     fn readiness_at(
         &self,
         _now: Instant,
