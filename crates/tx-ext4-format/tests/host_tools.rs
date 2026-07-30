@@ -4,8 +4,42 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tx_ext4_format::capability::{sha256, Tier1Capabilities, Tier1Reject, Tier1Request};
 use tx_ext4_format::ondisk::Ext4FormatError;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeNo, BLOCK_SIZE};
+
+#[test]
+fn tier1_rejects_unsupported_shape_before_mutation() {
+    let profile = Tier1Capabilities::generated();
+    for request in [
+        Tier1Request::ExtentDepthGrowth,
+        Tier1Request::HtreeSplit,
+        Tier1Request::OrphanFile,
+        Tier1Request::DirectIo,
+    ] {
+        assert_eq!(profile.admit(request), Err(Tier1Reject::Unsupported));
+    }
+    for request in [
+        Tier1Request::DepthOneExtent,
+        Tier1Request::LinearDirectory,
+        Tier1Request::NonSplittingHtree,
+        Tier1Request::ClassicOrphan,
+    ] {
+        assert_eq!(profile.admit(request), Ok(()));
+    }
+}
+
+#[test]
+fn tier1_generated_capability_profile_matches_authority_ledger() {
+    let ledger = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/ext4/tier1/capability-ledger.json"
+    ));
+    assert_eq!(
+        Tier1Capabilities::generated().profile_hash(),
+        sha256(ledger)
+    );
+}
 
 struct VecImage {
     bytes: Vec<u8>,

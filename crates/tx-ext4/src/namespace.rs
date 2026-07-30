@@ -116,8 +116,8 @@ where
         meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
@@ -141,8 +141,8 @@ where
         cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
@@ -170,8 +170,8 @@ where
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
@@ -194,8 +194,8 @@ where
         new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
         }
         let old_parent_ino = match inode_no(old_parent) {
             Ok(v) => v,
@@ -266,8 +266,8 @@ where
         cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
@@ -300,8 +300,8 @@ where
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,

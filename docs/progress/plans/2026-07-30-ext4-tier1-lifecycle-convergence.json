@@ -88,7 +88,7 @@
     {
       "id": "task-02-admission",
       "title": "Install the Tier 1 capability gate and fail closed",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-01-reconcile"
       ],
@@ -105,7 +105,7 @@
         "cargo test -p tx-ext4 --lib production_namespace_without_mutation_owner -- --test-threads=1",
         "cargo -q xtask unit"
       ],
-      "notes": "Reject unsupported shape before claims, PageSlot transitions, publication, or home-block writes; only the pinned 4 KiB Tier 1 profile is admitted."
+      "notes": "Completed: capability-ledger hash parity and unsupported request rejection are covered by host tests. RW mount admission validates the 4 KiB metadata_csum profile before backend construction, stores the accepted profile hash, and existing direct namespace, writeback-plan, flush, and truncate paths return EOPNOTSUPP before pager/cache mutation until MutationHandle exists. pager.rs was added as the minimal required path because it owns flush_page/truncate. Verified cargo test -p tx-ext4-format --test host_tools tier1_, cargo test -p tx-ext4 --lib --no-default-features, and cargo -q xtask unit."
     },
     {
       "id": "task-03-owned-file-io",

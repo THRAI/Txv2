@@ -4,6 +4,10 @@ use crate::adapter::step_engine::Cap;
 use alloc::sync::Arc;
 use tx_ext4_format::pager::BlockImage;
 use tx_ext4_format::pager::Ext4Pager;
+use tx_ext4_format::{
+    capability::{CapabilityProfileHash, Tier1Capabilities, Tier1MountFacts},
+    ondisk::Superblock,
+};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::io_manager::block::DeviceKey;
@@ -49,6 +53,10 @@ where
 
     pub fn set_file_page_container_binder(&self, binder: Option<Arc<dyn FilePageContainerBinder>>) {
         self.backend.set_file_page_container_binder(binder);
+    }
+
+    pub fn capability_profile_hash(&self) -> Option<CapabilityProfileHash> {
+        self.backend.capability_profile_hash()
     }
 }
 
@@ -187,6 +195,7 @@ pub fn mount_ext4_read_write_with_discovered_journal<I>(
 where
     I: BlockImage + Send + 'static,
 {
+    validate_tier1_rw_profile(&image)?;
     let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
     let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
     let mut image = pager.into_inner();
@@ -244,12 +253,20 @@ fn open_ext4_with_backend_planner_and_mapping<I>(
 where
     I: BlockImage + Send + 'static,
 {
+    let profile_hash = if read_only {
+        None
+    } else {
+        Some(validate_tier1_rw_profile(&image)?)
+    };
     let backend = Ext4FsInstance::open_with_backend_planner_and_mapping(
         image,
         read_only,
         backend_planner,
         extent_mapping,
     )?;
+    if let Some(profile_hash) = profile_hash {
+        backend.set_capability_profile_hash(profile_hash);
+    }
     let root_fs_object_id = FsObjectId::new(EXT4_ROOT_INODE as u64);
     let root_inode_meta = backend
         .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE)))
@@ -260,4 +277,13 @@ where
         root_fs_object_id,
         root_inode_meta,
     })
+}
+
+fn validate_tier1_rw_profile<I: BlockImage>(image: &I) -> Result<CapabilityProfileHash, Errno> {
+    let mut block = [0; tx_ext4_format::pager::BLOCK_SIZE];
+    image.read_block(0, &mut block).map_err(|_| Errno::EIO)?;
+    let superblock = Superblock::parse(&block[1024..2048]).map_err(|_| Errno::EIO)?;
+    Tier1Capabilities::generated()
+        .admit_mount(Tier1MountFacts::from_superblock(&superblock))
+        .map_err(|_| Errno::EOPNOTSUPP)
 }

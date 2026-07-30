@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use tx_ext4_format::capability::CapabilityProfileHash;
 use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
 use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, BLOCK_SIZE,
@@ -74,6 +75,7 @@ where
             .and_then(Weak::upgrade)
             .ok_or(Errno::EIO)?;
         let inode = inode_no(FsObjectId::new(request.object.raw()))?;
+        backend.require_mutation_owner()?;
 
         // The runtime replaces this placeholder with the L4-owned source.
         // The format plan therefore remains metadata-only from L5's view.
@@ -108,6 +110,7 @@ pub(crate) struct Ext4FsInstance<I> {
     /// planner. The compatibility pager would otherwise update home blocks
     /// before the ordered transaction is committed.
     legacy_writeback_enabled: AtomicBool,
+    capability_profile_hash: SpinMutex<Option<CapabilityProfileHash>>,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
@@ -140,6 +143,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             file_page_container_binder: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
             legacy_writeback_enabled: AtomicBool::new(true),
+            capability_profile_hash: SpinMutex::new(None),
         }))
     }
 
@@ -179,6 +183,24 @@ impl<I: BlockImage> Ext4FsInstance<I> {
 
     pub(crate) fn legacy_writeback_enabled(&self) -> bool {
         self.legacy_writeback_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_capability_profile_hash(&self, profile_hash: CapabilityProfileHash) {
+        *self.capability_profile_hash.lock() = Some(profile_hash);
+    }
+
+    pub(crate) fn capability_profile_hash(&self) -> Option<CapabilityProfileHash> {
+        *self.capability_profile_hash.lock()
+    }
+
+    /// MutationHandle is the sole authority allowed to reach persistent pager
+    /// mutation. Until that lifecycle owner exists, every writable surface is
+    /// deliberately fail-closed.
+    pub(crate) fn require_mutation_owner(&self) -> Result<(), Errno> {
+        if self.is_read_only() {
+            return Err(Errno::EROFS);
+        }
+        Err(Errno::EOPNOTSUPP)
     }
 
     pub(crate) fn with_pager<T>(

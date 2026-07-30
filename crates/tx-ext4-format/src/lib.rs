@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod capability;
 pub mod journal;
 mod journal_replay;
 pub mod mapping;

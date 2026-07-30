@@ -132,8 +132,8 @@ where
         frame: &Frame,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if !self.legacy_writeback_enabled() {
-            return StepOutcome::err(Errno::ENOSYS.into());
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
         }
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::err(Errno::EINVAL.into());
@@ -159,6 +159,9 @@ where
         new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        if let Err(err) = self.require_mutation_owner() {
+            return StepOutcome::err(err.into());
+        }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
