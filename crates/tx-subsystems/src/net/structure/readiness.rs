@@ -17,6 +17,10 @@ tx_substrate::bus::bus_readiness! {
     pub struct SendWireSet {
         pub const SPACE = 0x1;
         pub const BROKEN = 0x2;
+        /// One active-open attempt reached a terminal error. Kept separate
+        /// from BROKEN so consuming SO_ERROR cannot erase an established
+        /// connection's close/reset edge.
+        pub const CONNECT_DONE = 0x4;
     }
 }
 

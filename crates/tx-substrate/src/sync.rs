@@ -127,6 +127,25 @@ impl<T, M: LockMetricsMode> SpinMutex<T, M> {
         }
     }
 
+    /// Acquire the mutex without spinning.
+    ///
+    /// This is useful for multi-object transactions that already hold one
+    /// lock: callers can abandon and retry instead of introducing an
+    /// address-dependent nested-lock order.
+    #[inline]
+    pub fn try_lock(&self) -> Option<SpinMutexGuard<'_, T, M>> {
+        let mut timing = M::Timing::start(&self.metrics);
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        timing.acquired(self);
+        Some(SpinMutexGuard {
+            mutex: self,
+            timing,
+            _marker: PhantomData,
+        })
+    }
+
     #[cfg(tx_lock_metrics)]
     #[inline(always)]
     fn emit_metric(&self, metric: tx_observe::EventNameId, value: u64) {
@@ -272,5 +291,19 @@ impl LockTimingOps<LockMetricsOn> for LockTimingOn {
                 release_ts.saturating_sub(self.request_ts),
             );
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpinMutex;
+
+    #[test]
+    fn try_lock_reports_contention_without_spinning() {
+        let mutex = SpinMutex::new(7);
+        let guard = mutex.try_lock().expect("first try_lock");
+        assert!(mutex.try_lock().is_none());
+        drop(guard);
+        assert_eq!(*mutex.try_lock().expect("try_lock after release"), 7);
     }
 }

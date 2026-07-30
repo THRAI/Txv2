@@ -1,3 +1,31 @@
+- 2026-07-30 (**TCP connect/lifecycle 单一真相与 loopback 公平性收敛完成**).
+  `SocketPayload::control` 现统一持有 TCP 协议状态、活动 connect attempt、
+  单调 generation 和 one-shot pending error；异步完成、egress、readiness
+  发布和 `AF_UNSPEC` reset 都按 generation/tuple 拒绝陈旧工作。
+  `CONNECT_DONE` 与普通可写分离，`SO_ERROR` 读取后清除，外部 connect 使用
+  显式网络时钟和 127 s 超时，不再依赖静止的零时钟。连接索引清理改为
+  forward/reverse/bound 的 reservation 事务：owner mismatch、Busy、同 raw
+  重连和 forward-missing 半连接窗口均不会部分删除新连接；为此 substrate
+  新增可回滚的条件撤销 reservation 和非自旋 `SpinMutex::try_lock`。
+  loopback 改为 round-robin，双向 egress 共用每步 64 包上限，零 TCP budget
+  不再自旋，外部连接不再误触发 loopback immediate work；接收入账按整步 ring
+  delta 统计。last-close 路径明确命名为 `peer_detached` 拓扑拆除，并保证排队
+  数据先交付再 EOF；真正的 FIN 仍只由 `shutdown(SHUT_WR)` 驱动。
+  **Verification**：TCP lifecycle **27/27**、external connect **14/14**、
+  veth **4/4**、clock **2/2**、network tick **4/4**、socket fdtable
+  **102/102**、tx-substrate **41/41**，`git diff --check` 通过；最终竞态复核
+  为 no blocker。完整 `loopback_pending_tests` 的首个真实失败仍是既有 raw
+  ICMP 长度断言 `12 != 32`，后续 5 项仅为 epoch 测试锁中毒。
+  `cargo -q xtask unit` 中 tx-kernel **116/116**、tx-scripts **166/166**；
+  仍只有既有 3 个非网络 tx-shims 断言与 tx-ext4 的 8 处陈旧
+  `BackendPageRequest::with_target`。
+  **Next**：实现可保留 payload 的真正 TCP last-close 状态机
+  （FIN_WAIT/TIME_WAIT/linger），再继续收敛剩余动态 buffer/keepalive 参数和
+  外层/smoltcp 状态重复。
+  **Blocker**：本批无；raw ICMP 夹具与 workspace unit 基线另案处理。
+  progress validate 仍被 07-24 plan 的非法旧状态 `completed` 阻断，docs lint
+  仍为既有 23 个断链/6 个退役词汇警告，本次文档未新增命中。
+
 - 2026-07-30 (**Socket/FileOps 生产接线按四步恢复，必要 socket 特判保留**).
   `1ae1a789` 恢复 `OpenFile::step_read/step_write -> FileOps` 的 Socket 委派；
   `8b7bd4ac` 让普通 INET/INET6 `read/write` 回到通用 fd 路径，同时保留

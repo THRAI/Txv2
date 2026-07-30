@@ -15,6 +15,7 @@ use crate::net::clock::net_now_instant;
 use crate::net::packet::LoopbackIpPacket;
 use crate::net::structure::{
     AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address as TxIpv6Address, SocketOptionSet,
+    TcpConnectAttempt,
 };
 use crate::sync::SpinMutex;
 
@@ -30,6 +31,11 @@ pub const TCP_CORK_AUTO_FLUSH_BYTES: usize = 1460;
 /// the TCG/loopback throughput regime (bulk sends 32KB); real-link tuning
 /// is a later concern.
 const TCP_SMOLTCP_BACKING_MAX_BYTES: usize = 65_536;
+
+/// Linux's default active-open retry schedule is nominally
+/// 1+2+4+8+16+32+64 seconds (`tcp_syn_retries=6`). Keep the policy explicit
+/// here until txKernel grows per-netns TCP sysctls.
+pub(crate) const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(127);
 
 fn tcp_backing_bytes(bytes: usize) -> usize {
     bytes.clamp(1, TCP_SMOLTCP_BACKING_MAX_BYTES)
@@ -50,6 +56,7 @@ struct TcpInner {
     socket: Box<tcp::Socket<'static>>,
     protocol_state: RawTcpProtocolState,
     corked_tx: Vec<u8>,
+    connect_attempt: Option<TcpConnectAttempt>,
 }
 
 /// Doc-named owner for the smoltcp TCP socket and its backing buffers.
@@ -62,6 +69,11 @@ pub struct RawTcpSocket {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RawTcpProtocolState {
     pub is_recv_shut: bool,
+    /// The reverse in-kernel endpoint has been destroyed by last-close.
+    ///
+    /// This is topology teardown, not a received TCP FIN: a FIN only closes
+    /// the receive half and must not prevent this endpoint from sending.
+    pub peer_detached: bool,
     pub is_rst_closed: bool,
 }
 
@@ -103,11 +115,20 @@ pub struct SmoltcpTcpRepr {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SmoltcpTcpProcessPublish {
     pub connected: bool,
+    pub connected_attempt: Option<TcpConnectAttempt>,
+    pub recv_bytes_added: usize,
     pub recv_readable: bool,
     pub send_writable: bool,
     pub recv_closed: bool,
     pub send_closed: bool,
     pub broken: bool,
+    pub failed_connect_attempt: Option<TcpConnectAttempt>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawTcpDispatchOutcome {
+    pub emitted: Option<bool>,
+    pub timed_out_connect_attempt: Option<TcpConnectAttempt>,
 }
 
 impl RawTcpSocket {
@@ -121,6 +142,7 @@ impl RawTcpSocket {
                 socket: Box::new(socket),
                 protocol_state: RawTcpProtocolState::default(),
                 corked_tx: Vec::new(),
+                connect_attempt: None,
             }),
             recv_capacity,
             send_capacity,
@@ -204,6 +226,10 @@ impl RawTcpSocket {
         self.inner.lock().socket.send_queue()
     }
 
+    pub fn poll_at(&self, now: smoltcp::time::Instant) -> smoltcp::socket::PollAt {
+        with_context_at(now, None, |cx| self.inner.lock().socket.poll_at(cx))
+    }
+
     pub fn enqueue_tx_len(&self, len: usize) -> Option<RawTcpSendReserve> {
         self.enqueue_tx_bytes(&vec![0; len])
     }
@@ -282,7 +308,8 @@ impl RawTcpSocket {
     }
 
     pub fn can_send(&self) -> bool {
-        self.inner.lock().socket.can_send()
+        let inner = self.inner.lock();
+        !inner.protocol_state.peer_detached && inner.socket.can_send()
     }
 
     pub fn may_recv(&self) -> bool {
@@ -290,7 +317,8 @@ impl RawTcpSocket {
     }
 
     pub fn may_send(&self) -> bool {
-        self.inner.lock().socket.may_send()
+        let inner = self.inner.lock();
+        !inner.protocol_state.peer_detached && inner.socket.may_send()
     }
 
     pub fn is_recv_closed(&self) -> bool {
@@ -298,7 +326,8 @@ impl RawTcpSocket {
     }
 
     pub fn is_send_closed(&self) -> bool {
-        !self.inner.lock().socket.may_send()
+        let inner = self.inner.lock();
+        inner.protocol_state.peer_detached || !inner.socket.may_send()
     }
 
     pub fn close(&self) {
@@ -322,10 +351,13 @@ impl RawTcpSocket {
         ));
         inner.protocol_state = RawTcpProtocolState::default();
         inner.corked_tx.clear();
+        inner.connect_attempt = None;
     }
 
-    pub fn mark_recv_closed_by_peer(&self) {
-        self.inner.lock().protocol_state.is_recv_shut = true;
+    pub fn mark_in_kernel_peer_detached(&self) {
+        let inner = &mut *self.inner.lock();
+        inner.protocol_state.is_recv_shut = true;
+        inner.protocol_state.peer_detached = true;
     }
 
     pub fn listen_endpoint(&self, local: IpEndpoint) -> Result<(), RawTcpSocketError> {
@@ -345,15 +377,42 @@ impl RawTcpSocket {
         local: IpEndpoint,
         remote: IpEndpoint,
     ) -> Result<(), RawTcpSocketError> {
+        self.connect_endpoint_inner(local, remote, None)
+    }
+
+    pub fn connect_endpoint_for_attempt(
+        &self,
+        attempt: TcpConnectAttempt,
+    ) -> Result<(), RawTcpSocketError> {
+        self.connect_endpoint_inner(attempt.local(), attempt.remote(), Some(attempt))
+    }
+
+    fn connect_endpoint_inner(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        attempt: Option<TcpConnectAttempt>,
+    ) -> Result<(), RawTcpSocketError> {
         with_context(|cx| {
-            self.inner
-                .lock()
+            let inner = &mut *self.inner.lock();
+            if let Some(active_attempt) = inner.connect_attempt {
+                return if Some(active_attempt) == attempt {
+                    Ok(())
+                } else {
+                    Err(RawTcpSocketError::InvalidState)
+                };
+            }
+            inner
                 .socket
                 .connect(cx, to_smoltcp_endpoint(remote), to_smoltcp_endpoint(local))
                 .map_err(|error| match error {
                     tcp::ConnectError::InvalidState => RawTcpSocketError::InvalidState,
                     tcp::ConnectError::Unaddressable => RawTcpSocketError::InvalidEndpoint,
-                })
+                })?;
+            inner.socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
+            inner.protocol_state = RawTcpProtocolState::default();
+            inner.connect_attempt = attempt;
+            Ok(())
         })
     }
 
@@ -386,7 +445,11 @@ impl RawTcpSocket {
     }
 
     pub fn dispatch_segment(&self) -> Option<SmoltcpTcpSegment> {
-        with_context(|cx| {
+        self.dispatch_segment_at(net_now_instant())
+    }
+
+    pub fn dispatch_segment_at(&self, now: smoltcp::time::Instant) -> Option<SmoltcpTcpSegment> {
+        with_context_at(now, None, |cx| {
             let inner = &mut *self.inner.lock();
             let socket = &mut inner.socket;
             let mut segment = None;
@@ -416,17 +479,21 @@ impl RawTcpSocket {
     /// the next hole (observed as a self-sustaining ~4KB/s loss loop on
     /// bulk TLS uploads).
     ///
-    /// Returns `Some(true)` if a segment was emitted and accepted,
-    /// `Some(false)` if the sink refused it (still queued), and `None`
-    /// if smoltcp had nothing to send.
+    /// `emitted` is `Some(true)` when a segment was accepted,
+    /// `Some(false)` when the sink refused it (still queued), and `None`
+    /// when smoltcp had nothing to send. `timed_out_connect_attempt` identifies
+    /// the active-open timer edge that otherwise has no ingress packet from
+    /// which the socket layer could derive a wakeup.
     pub fn dispatch_segment_via(
         &self,
+        now: smoltcp::time::Instant,
         ip_mtu: usize,
         transmit: impl FnOnce(&SmoltcpTcpSegment) -> bool,
-    ) -> Option<bool> {
-        with_context_ip_mtu(ip_mtu, |cx| {
+    ) -> RawTcpDispatchOutcome {
+        with_context_at(now, Some(ip_mtu), |cx| {
             let inner = &mut *self.inner.lock();
             let socket = &mut inner.socket;
+            let before = socket.state();
             let mut attempted = None;
             let _ = socket.dispatch(cx, |_, (ip_repr, tcp_repr)| {
                 let segment = SmoltcpTcpSegment::from_reprs(ip_repr, tcp_repr);
@@ -438,7 +505,18 @@ impl RawTcpSocket {
                     Err(())
                 }
             });
-            attempted
+            let timed_out_connect_attempt =
+                if matches!(before, tcp::State::SynSent | tcp::State::SynReceived)
+                    && matches!(socket.state(), tcp::State::Closed)
+                {
+                    inner.connect_attempt.take()
+                } else {
+                    None
+                };
+            RawTcpDispatchOutcome {
+                emitted: attempted,
+                timed_out_connect_attempt,
+            }
         })
     }
 
@@ -446,6 +524,7 @@ impl RawTcpSocket {
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
             let before = observe_socket(&inner.socket);
+            let recv_before = inner.socket.recv_queue();
             let tcp_repr = segment.tcp.as_repr(&segment.payload);
             let _reply = if inner.socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
                 inner.socket.process(cx, &segment.ip_repr, &tcp_repr)
@@ -453,8 +532,15 @@ impl RawTcpSocket {
                 None
             };
             let after = observe_socket(&inner.socket);
-            let protocol_state = &mut inner.protocol_state;
             let mut publish = SmoltcpTcpProcessPublish::default();
+            publish.recv_bytes_added = inner.socket.recv_queue().saturating_sub(recv_before);
+            if after.is_active {
+                inner.socket.set_timeout(None);
+                if !before.is_active {
+                    publish.connected_attempt = inner.connect_attempt.take();
+                }
+            }
+            let protocol_state = &mut inner.protocol_state;
             // Edge-detect "just became connected" from the smoltcp state
             // itself: TCP never re-enters the active set without a reset,
             // so this fires exactly once per connection.
@@ -475,19 +561,21 @@ impl RawTcpSocket {
             if !matches!(before.state, tcp::State::Closed)
                 && matches!(after.state, tcp::State::Closed)
             {
+                if matches!(before.state, tcp::State::SynSent | tcp::State::SynReceived) {
+                    publish.failed_connect_attempt = inner.connect_attempt.take();
+                }
                 protocol_state.is_rst_closed = true;
                 publish.broken = true;
             }
             publish
         })
     }
-
 }
 
 /// Space = smoltcp tx ring headroom minus corked (not-yet-committed)
 /// bytes, which will need ring space when flushed.
 fn send_available_inner(inner: &TcpInner) -> usize {
-    if inner.socket.may_send() {
+    if !inner.protocol_state.peer_detached && inner.socket.may_send() {
         inner
             .socket
             .send_capacity()
@@ -725,14 +813,11 @@ struct TcpContext {
 static CONTEXT_IFACE: SpinMutex<Option<TcpContext>> = SpinMutex::new(None);
 
 pub(crate) fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
-    with_context_maybe_ip_mtu(None, f)
+    with_context_at(net_now_instant(), None, f)
 }
 
-fn with_context_ip_mtu<R>(ip_mtu: usize, f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
-    with_context_maybe_ip_mtu(Some(ip_mtu), f)
-}
-
-fn with_context_maybe_ip_mtu<R>(
+fn with_context_at<R>(
+    now: smoltcp::time::Instant,
     ip_mtu: Option<usize>,
     f: impl FnOnce(&mut smoltcp::iface::Context) -> R,
 ) -> R {
@@ -752,7 +837,7 @@ fn with_context_maybe_ip_mtu<R>(
     });
     let selected_ip_mtu = ip_mtu.unwrap_or(context.loopback_ip_mtu);
     let cx = context.iface.context();
-    cx.now = net_now_instant();
+    cx.now = now;
     cx.caps.max_transmission_unit = selected_ip_mtu;
     f(cx)
 }

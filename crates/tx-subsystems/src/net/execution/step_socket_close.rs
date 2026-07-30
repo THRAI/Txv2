@@ -62,7 +62,7 @@ pub fn step_socket_close(
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
             tcp_flushed_bytes += flush_tcp_tx_before_close(socket, guard);
             if let Some(peer) = lookup_tcp_peer_connection(table, remote, local, guard) {
-                let peer_wakes = mark_tcp_peer_closed(&peer);
+                let peer_wakes = mark_tcp_in_kernel_peer_detached(&peer);
                 peer_recv_woken += peer_wakes.recv_woken;
                 peer_send_woken += peer_wakes.send_woken;
             }
@@ -231,12 +231,17 @@ struct PeerCloseWakes {
     send_woken: usize,
 }
 
-fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
+fn mark_tcp_in_kernel_peer_detached(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     let Some(payload) = peer.acquire_operational() else {
         return PeerCloseWakes::default();
     };
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
-        raw_tcp.mark_recv_closed_by_peer();
+        // last-close currently destroys the local SocketPayload immediately,
+        // unlike shutdown(SHUT_WR), whose raw socket remains alive to drive a
+        // real FIN handshake. Mark this staging topology loss explicitly so
+        // the peer cannot enqueue bytes into a vanished endpoint. A future
+        // retained FIN_WAIT/TIME_WAIT control block can remove this shortcut.
+        raw_tcp.mark_in_kernel_peer_detached();
     }
     let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
     let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);

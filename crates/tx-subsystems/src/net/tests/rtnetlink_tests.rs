@@ -1707,7 +1707,9 @@ fn rtnetlink_ipv6_addr_add_demotes_then_del_promotes_back() {
 
     // Stand in for the V5-2 boot seed.
     let seeded = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15];
-    let configured = [0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15];
+    let configured = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+    ];
     let seed = nlmsg(
         RTM_NEWADDR,
         NLM_F_REQUEST | NLM_F_ACK,

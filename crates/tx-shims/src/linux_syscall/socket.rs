@@ -496,7 +496,7 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
             }
             StepOutcome::Yield { shape, .. } => {
                 let connected = match drive_tcp_loopback_after_connect(&socket) {
-                    Ok(connected) => connected || !socket_is_tcp_connecting(&socket),
+                    Ok(connected) => connected || socket_is_tcp_connected(&socket),
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                 };
                 if nonblocking {
@@ -3135,7 +3135,15 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (SOL_SOCKET, SO_TYPE) => {
             write_sockopt_i32(ctx, optval, optlen_ptr, socket_type_i32(&socket))
         }
-        (SOL_SOCKET, SO_ERROR) => write_sockopt_i32(ctx, optval, optlen_ptr, 0),
+        (SOL_SOCKET, SO_ERROR) => {
+            // Linux atomically fetches and clears sk_err before copyout.
+            // Consequently a bad userspace pointer still consumes SO_ERROR.
+            let value = payload
+                .take_socket_error(&socket.readiness)
+                .map(errno_to_i32)
+                .unwrap_or(0);
+            write_sockopt_i32(ctx, optval, optlen_ptr, value)
+        }
         (SOL_SOCKET, SO_PEERCRED) if socket.kind == SocketKind::UnixStream => {
             match payload.unix_peer_cred() {
                 Some(cred) => write_sockopt_unix_peer_cred(ctx, optval, optlen_ptr, cred),

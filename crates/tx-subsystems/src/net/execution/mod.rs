@@ -115,7 +115,7 @@ pub fn socket_recv_wait_token(socket: &SocketIdentity) -> WaitToken {
 pub fn socket_send_wait_token(socket: &SocketIdentity) -> WaitToken {
     WaitToken::new(
         socket.wait_carriers.send,
-        SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits(),
+        SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits() | SendWireSet::CONNECT_DONE.bits(),
     )
 }
 

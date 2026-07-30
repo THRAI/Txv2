@@ -65,6 +65,7 @@ pub struct NetNamespacePayload {
     /// is the shared `INITIAL_SOCKET_TABLE` static (never freed).
     socket_table_owned: bool,
     loopback_iface: &'static LoopbackIface,
+    loopback_tcp_connected_cursor: AtomicU64,
     loopback_mtu: SpinMutex<u16>,
     loopback_ipv4_override: SpinMutex<Option<(Ipv4Address, u8)>>,
     loopback_ipv6_override: SpinMutex<Option<(Ipv6Address, u8)>>,
@@ -466,6 +467,7 @@ impl NetNamespacePayload {
             socket_table,
             socket_table_owned,
             loopback_iface,
+            loopback_tcp_connected_cursor: AtomicU64::new(0),
             loopback_mtu: SpinMutex::new(loopback_iface.mtu()),
             loopback_ipv4_override: SpinMutex::new(None),
             loopback_ipv6_override: SpinMutex::new(None),
@@ -505,6 +507,11 @@ impl NetNamespacePayload {
 
     pub fn loopback_iface(&self) -> &'static LoopbackIface {
         self.loopback_iface
+    }
+
+    pub(crate) fn reserve_loopback_tcp_connected_window(&self, visits: usize) -> u64 {
+        self.loopback_tcp_connected_cursor
+            .fetch_add(visits as u64, Ordering::Relaxed)
     }
 
     pub(crate) fn netfilter_state(&self) -> &SpinMutex<NetfilterState> {

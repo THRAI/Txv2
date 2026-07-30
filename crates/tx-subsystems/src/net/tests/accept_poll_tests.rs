@@ -115,7 +115,11 @@ fn step_accept_returns_child_socket_and_clears_when_empty() {
     ));
     let payload = listener.acquire_operational().expect("payload");
     assert_eq!(payload.accept_queue_len(), 0, "SYN alone must not accept");
-    assert_eq!(payload.connecting_backlog_len(), 1, "half-open child expected");
+    assert_eq!(
+        payload.connecting_backlog_len(),
+        1,
+        "half-open child expected"
+    );
     let child = payload
         .connecting_child(local, remote)
         .expect("connecting child");
@@ -474,14 +478,24 @@ fn listener_close_breaks_namespace_reference_cycle() {
     assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
 
     let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(tcp_segment_event(
-        remote, local, smoltcp::wire::TcpControl::Syn, client_isn, None,
+        remote,
+        local,
+        smoltcp::wire::TcpControl::Syn,
+        client_isn,
+        None,
     ))]);
     let _ = step_process_network_events(&source, &guard);
     let child_isn = {
         let payload = listener.acquire_operational().expect("payload");
         let child = payload.connecting_child(local, remote).expect("child");
         let cp = child.acquire_operational().expect("cp");
-        cp.raw_tcp_socket().unwrap().dispatch_segment().unwrap().tcp.seq_number.0
+        cp.raw_tcp_socket()
+            .unwrap()
+            .dispatch_segment()
+            .unwrap()
+            .tcp
+            .seq_number
+            .0
     };
     let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(tcp_segment_event(
         remote,
@@ -495,7 +509,9 @@ fn listener_close_breaks_namespace_reference_cycle() {
     // Capture the child Cap and its table-inflated retain count.
     let conn_key = ConnectionKey::new(local, remote);
     let table = crate::net::structure::table::SOCKET_TABLE.as_table();
-    let child = table.lookup_tcp_connection(conn_key, &guard).expect("child in table");
+    let child = table
+        .lookup_tcp_connection(conn_key, &guard)
+        .expect("child in table");
     let retain_with_table = child.retain_count();
 
     let StepOutcome::Done(_) = step_socket_close(&listener, &guard) else {

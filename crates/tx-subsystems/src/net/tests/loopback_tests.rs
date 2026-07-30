@@ -1,6 +1,6 @@
 use super::*;
 use crate::net::step_socket_close;
-use crate::net::structure::SocketIdentity;
+use crate::net::structure::{SocketIdentity, SocketOperationalEvidence, TcpConnectDisposition};
 use crate::net::SocketRecvBytesOutcome;
 use tx_substrate::zone::Cap;
 
@@ -118,6 +118,24 @@ fn prepare_loopback_connect_with_client_send_buf(
         endpoint(client_port),
         endpoint(server_port),
     )
+}
+
+fn start_raw_tcp_connect_for_active_attempt(payload: &SocketOperationalEvidence) {
+    let attempt = payload
+        .active_tcp_connect_attempt()
+        .expect("active TCP connect attempt");
+    payload
+        .transact_tcp_connect_attempt(Some(attempt), attempt.generation(), |_, _| {
+            (
+                payload
+                    .raw_tcp_socket()
+                    .expect("client raw tcp")
+                    .connect_endpoint_for_attempt(attempt),
+                TcpConnectDisposition::KeepConnecting,
+            )
+        })
+        .expect("current TCP connect attempt")
+        .expect("client raw connect");
 }
 
 mod delegate_tick;

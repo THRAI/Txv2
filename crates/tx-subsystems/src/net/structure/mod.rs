@@ -14,8 +14,12 @@ pub use payload::{
     SocketAcceptEntry, SocketAcceptQueue, SocketIoConsume, SocketIoState,
     SocketOperationalEvidence, SocketPayload, SocketProtocol, SocketRecvBytesOutcome,
     SocketSendReserve, Takeable, TcpBacklog, TcpBacklogEntry, TcpBacklogRetransmitOutcome,
-    UnixDatagramState, UnixPeerCred, UnixStreamState, TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS,
-    TCP_BACKLOG_RETRANSMIT_LIMIT_STAGING, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    TcpConnectAttempt, UnixDatagramState, UnixPeerCred, UnixStreamState,
+    TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS, TCP_BACKLOG_RETRANSMIT_LIMIT_STAGING,
+    TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+};
+pub(crate) use payload::{
+    TcpConnectDisposition, TcpConnectProgress, TcpFlowGenerationTry, TcpStateGeneration,
 };
 pub use readiness::{AcceptWireSet, RecvWireSet, SendWireSet, SocketReadiness, UrgentEvent};
 pub use table::{

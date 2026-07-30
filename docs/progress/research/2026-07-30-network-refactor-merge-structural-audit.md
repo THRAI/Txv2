@@ -280,3 +280,74 @@ Alpine branch/源校验记录。
 原审计优先级 1（NET_IRQ）和 2（FileOps 生产入口）至此完成。下一项应是
 TCP 状态与动态 option 单一真相；wait 双载体、L2/L3 所有权、动态对象回收及
 功能缺口仍保持为独立结构工作，不能因 fd readiness facade 已统一而宣称解决。
+
+## TCP 生命周期单一真相：本轮落地与剩余边界
+
+2026-07-30 继续处理原审计的 TCP 状态/时钟项。问题不是一个字段可以删除，
+而是 syscall-facing 状态、smoltcp transport 状态、异步 connect 完成、
+readiness 和连接索引原先缺少共同的“这是同一轮连接”判据。旧事件可能在
+`AF_UNSPEC` 后重新污染新连接，connect 失败也可能被普通 `POLLOUT` 混淆。
+
+本轮建立了以下约束：
+
+1. `SocketPayload::control` 是协议状态、pending error、活动
+   `TcpConnectAttempt` 和 `TcpStateGeneration` 的同一临界区。每次新连接或
+   reset 推进 generation；handshake、device ingress/egress、状态 promotion
+   和 readiness publish 都携带并校验 generation + local/remote tuple。
+2. connect 完成用独立 `CONNECT_DONE` wire bit 表示，成功/失败都能唤醒等待者，
+   但普通 send space 不再冒充 connect 完成。`SO_ERROR` 是 take-and-clear 的
+   one-shot 错误；RST、dispatch timeout 和陈旧完成都有精确测试。
+3. 网络推进显式读取 `net_now_instant()`；外部 TCP connect 的 127 s deadline
+   和 smoltcp RTO 都由同一可推进时钟驱动。丢失数据段在时钟前进后可见重传，
+   不再是依赖 `Instant::ZERO` 的死时钟。
+4. `AF_UNSPEC` 的状态 reset 与 index 清理形成一个可回滚事务。substrate
+   `WithdrawReservation` 先保留 committed entry，全部条件成立后才 withdraw；
+   reverse 槽无论 occupied/vacant 都先被预留。source generation 或 owner
+   改变、任一槽 Busy、peer control lock Busy 都完整回滚并重试。
+5. forward owner 是联动删除 reverse 的授权依据。若 forward 被 replacement
+   owner 占用，reset 返回 `EAGAIN`；若 forward 暂时 Missing，则只清 source
+   可证明拥有的 binding 并保留 reverse，避免把“新 client index 已发布、新
+   accepted child 尚未发布”的半连接误删。peer 的 endpoint 检查在 reverse
+   reservation 和非阻塞 control lock 下完成，避免同 raw/tuple 重连与逆序
+   双锁死锁。
+
+loopback 调度也同时收紧：
+
+- connected flow 使用 round-robin cursor，不再总从表头开始；
+- 每一步双向合计最多发 64 个 egress packet，而不是每个方向各自获得完整预算；
+- receive bytes 按整个 poll step 的 ring delta 入账；
+- `tcp_connected == 0` 或 `tcp_transfer_bytes == 0` 时不发布 immediate work；
+- external/orphan TCP 不再仅因 smoltcp `PollAt::Now` 被当作 loopback 工作；
+- inbound promotion、连接索引发布失败和 backlog 入队失败都回滚已发布索引。
+
+close 语义的当前边界需要明确保留。由于 last fd close 之后当前对象模型会销毁
+`SocketPayload`，该路径不能诚实地保留 smoltcp socket 进入
+FIN_WAIT/TIME_WAIT。本轮把此前容易误解为 FIN 的 raw 标记改名为
+`peer_detached`：它表示 in-kernel topology teardown，并保证已排队字节先送达
+peer、随后观察 EOF/BROKEN。`shutdown(SHUT_WR)` 仍调用 transport `close()`，
+是真正的 FIN 路径。若要实现 Linux 级 last-close/`SO_LINGER`，下一步必须引入
+独立于 fd 生命周期的 retained TCP endpoint/tombstone，不能继续给拓扑拆除换名。
+
+验证：
+
+- `cargo test -p tx-subsystems --lib tcp_lifecycle -- --test-threads=1`：
+  **27 passed**；
+- `external_connect_tests` **14/14**，`veth_tests` **4/4**，
+  `clock_tests` **2/2**，`network_tick_` **4/4**；
+- `loopback_pending_zero_tcp_budget_does_not_reschedule_immediate_work` 单测通过；
+- `cargo test -p tx-substrate --lib -- --test-threads=1`：**41/41**；
+- tx-shims `socket_fdtable`：**102/102**；
+- 完整 `loopback_pending_tests` 的首个实际失败是 raw ICMP 返回长度
+  `12 != 32`，随后五项均由共享 epoch lock poison 级联；
+- `cargo -q xtask unit`：tx-kernel **116/116**、tx-scripts **166/166**；
+  基线仍为 3 个非网络 tx-shims 断言，以及 tx-ext4 测试中 8 处陈旧
+  `BackendPageRequest::with_target`。
+- `cargo xtask progress validate` 仍被
+  `2026-07-24-network-time-integration.json` 的非法旧状态 `completed` 阻断；
+  `cargo xtask lint docs` 仍为既有 23 个断链和 6 个退役词汇警告，本节未新增
+  命中。
+
+因此“TCP 仍用死时钟”和“connect 完成有多份互不关联状态”已在本轮关闭；
+“所有 TCP 生命周期都只有一个状态机”仍不能宣称完成。下一优先项是 retained
+last-close/FIN_WAIT/TIME_WAIT/linger，其后才是剩余动态 buffer/keepalive 参数
+与外层 `TcpState`/smoltcp state 的进一步压缩。

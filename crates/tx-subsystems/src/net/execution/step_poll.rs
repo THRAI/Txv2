@@ -32,11 +32,12 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
     if payload.shutdown_wr() {
         mask |= PollMask::ERR;
     }
+    if payload.socket_error().is_some() {
+        // Linux reports a completed active-open failure as writable and
+        // exceptional; SO_ERROR carries the one-shot errno.
+        mask |= PollMask::OUT | PollMask::ERR;
+    }
 
-    // P3-B S3: io_snapshot is now a live derive that internally locks
-    // `protocol` (for the unix-stream flag) — compute it ONCE here, before
-    // `with_protocol` takes that same lock, to avoid a re-entrant spin
-    // deadlock. Every arm reads the same snapshot anyway.
     // P3-B S3: io_snapshot is a live derive that internally locks
     // `protocol` (unix-stream flag) — compute it ONCE here, before
     // `with_protocol` takes that same lock, to avoid a re-entrant spin
@@ -214,6 +215,16 @@ pub fn step_poll_wait_token(
             if interests.intersects(PollMask::IN) =>
         {
             Some(socket_recv_wait_token(&witness.identity))
+        }
+        // Keep the send wait source available after a connect failure moves
+        // Connecting -> Bound. fd readiness first snapshots `ready` and then
+        // asks for a wait source; returning the same RawQueue for every
+        // active-open-capable TCP state lets persistent CONNECT_DONE close
+        // that observation-to-subscription window.
+        SocketProtocol::Tcp(
+            TcpState::Init | TcpState::Bound { .. } | TcpState::Connecting { .. },
+        ) if interests.intersects(PollMask::OUT | PollMask::ERR) => {
+            Some(socket_send_wait_token(&witness.identity))
         }
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
         | SocketProtocol::UnixDatagram(

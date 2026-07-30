@@ -1290,6 +1290,15 @@ pub(super) fn socket_is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
     })
 }
 
+pub(super) fn socket_is_tcp_connected(socket: &Cap<SocketIdentity>) -> bool {
+    socket.acquire_operational().is_some_and(|payload| {
+        matches!(
+            payload.protocol_snapshot(),
+            SocketProtocol::Tcp(TcpState::Connected { .. })
+        )
+    })
+}
+
 /// True when a recv with no buffered data on this SCTP socket must report
 /// ENOTCONN instead of blocking: the association is not established (never
 /// connected, or locally shut down via SHUT_WR). Mirrors the step_recv check;

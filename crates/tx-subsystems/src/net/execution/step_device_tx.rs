@@ -2,13 +2,15 @@ use alloc::vec::Vec;
 use smoltcp::time::Instant;
 use tx_substrate::zone::{Cap, PayloadCap};
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{PacketTxReadiness, PacketTxResult, PacketTxSink};
 use crate::net::protocol::{build_icmpv4_echo_request, build_icmpv6_echo_request_packet};
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
 };
+
+use super::step_connect::fail_indexed_tcp_connect_attempt;
 
 pub const DEVICE_TX_BUDGET_DEFAULT: DeviceTxBudget = DeviceTxBudget {
     tcp_connecting: 16,
@@ -258,7 +260,7 @@ fn process_tcp_tx_socket(
         let mut busy = false;
         let mut pending = false;
         let mut failed = false;
-        let dispatched = raw_tcp.dispatch_segment_via(usize::from(sink.ip_mtu()), |segment| {
+        let dispatch = raw_tcp.dispatch_segment_via(now, usize::from(sink.ip_mtu()), |segment| {
             let Some(packet) = segment.emit_ipv4_packet() else {
                 // Unbuildable (e.g. no route yet): refuse so it stays
                 // queued — dropping it here would mint a wire hole.
@@ -284,7 +286,14 @@ fn process_tcp_tx_socket(
                 }
             }
         });
-        let Some(emitted) = dispatched else {
+        if let Some(attempt) = dispatch.timed_out_connect_attempt {
+            if let Some(wakes) =
+                fail_indexed_tcp_connect_attempt(socket, &payload, attempt, Errno::ETIMEDOUT)
+            {
+                outcome.wakes_fired += wakes;
+            }
+        }
+        let Some(emitted) = dispatch.emitted else {
             break;
         };
         outcome.tcp_attempted += 1;

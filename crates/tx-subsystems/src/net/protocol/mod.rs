@@ -28,9 +28,12 @@ pub use loopback::{loopback_iface, IfaceCommon, LoopbackIface};
 pub use poll_context::{PollContext, PollContextOutcome};
 pub(crate) use poll_context::{
     is_first_syn, listener_accepts_incoming, promote_connected_stream_and_publish_accept,
+    TcpConnectedPromotion,
 };
 pub use smoltcp_adapter::{
     SmoltcpAdapter, SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink,
 };
+#[cfg(test)]
+pub(crate) use tcp::TCP_CONNECT_TIMEOUT;
 pub use tcp::{RawTcpSocket, SmoltcpTcpSegment, TCP_CORK_AUTO_FLUSH_BYTES};
 pub use udp::{RawUdpSocket, UdpRxDatagram, UdpTxDatagram, UDP_IPV4_MAX_PAYLOAD_BYTES};
