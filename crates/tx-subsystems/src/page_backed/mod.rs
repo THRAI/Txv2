@@ -416,6 +416,12 @@ pub struct PageContainer {
     _object_pin: Option<FsObjectPin>,
     page_count: u64,
     size_bytes: AtomicU64,
+    /// Monotonic generation for logical-size changes.  Writeback snapshots
+    /// this alongside `size_bytes`; completion only acknowledges the exact
+    /// generation it persisted, so a concurrent extending write cannot be
+    /// hidden by an older fsync.
+    size_generation: AtomicU64,
+    persisted_size_generation: AtomicU64,
     state: PageContainerStateCell,
 }
 
@@ -607,6 +613,8 @@ impl PageContainer {
             _object_pin: object_pin,
             page_count,
             size_bytes: AtomicU64::new(capacity),
+            size_generation: AtomicU64::new(0),
+            persisted_size_generation: AtomicU64::new(0),
             state: PageContainerStateCell::new(PageContainerState {
                 pages: PageCacheIndex::new(),
                 in_flight_file_pages: BTreeMap::new(),
@@ -648,7 +656,7 @@ impl PageContainer {
             },
             page_count,
         )?;
-        container.set_size_bytes(size_bytes);
+        container.set_size_bytes_persisted(size_bytes);
         Ok(container)
     }
 
@@ -1291,7 +1299,40 @@ impl PageContainer {
     }
 
     pub fn set_size_bytes(&self, size: u64) {
+        let previous = self.size_bytes.swap(size, Ordering::AcqRel);
+        if previous != size && matches!(self.kind, PageContainerKind::File { .. }) {
+            self.size_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Publish a size that the backing filesystem has already committed.
+    ///
+    /// This is used when materialising an existing inode and after a
+    /// successful truncate/fallocate.  Ordinary writes must use
+    /// `set_size_bytes`/`grow_size_to` so fsync can observe the change.
+    pub fn set_size_bytes_persisted(&self, size: u64) {
         self.size_bytes.store(size, Ordering::Release);
+        let generation = self.size_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.persisted_size_generation
+            .store(generation, Ordering::Release);
+    }
+
+    fn size_writeback_snapshot(&self) -> (u64, u64, bool) {
+        loop {
+            let generation = self.size_generation.load(Ordering::Acquire);
+            let size = self.size_bytes();
+            if self.size_generation.load(Ordering::Acquire) == generation {
+                let persisted = self.persisted_size_generation.load(Ordering::Acquire);
+                return (size, generation, generation != persisted);
+            }
+        }
+    }
+
+    fn acknowledge_size_if_match(&self, generation: u64) {
+        if self.size_generation.load(Ordering::Acquire) == generation {
+            self.persisted_size_generation
+                .store(generation, Ordering::Release);
+        }
     }
 
     fn grow_size_to(&self, new_size: u64) {
@@ -1306,6 +1347,9 @@ impl PageContainer {
                 Ok(_) => break,
                 Err(current) => observed = current,
             }
+        }
+        if new_size > observed && matches!(self.kind, PageContainerKind::File { .. }) {
+            self.size_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
 }

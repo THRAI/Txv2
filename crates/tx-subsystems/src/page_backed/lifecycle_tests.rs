@@ -302,9 +302,62 @@ fn pagebacked_step_fsync_returns_advanced_then_blocked_after_flush_progress() {
         }
     );
 
-    assert!(!pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+    assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
     assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn pagebacked_step_fsync_keeps_snapshot_dirty_when_size_commit_fails() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(LifecycleFs::failing_truncate(Errno::EIO));
+    let pc = file_page_container(fs.clone(), FsObjectId::new(53));
+    {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(PageIndex::new(0), cached_frame_for_test())
+            .expect("seed page");
+        state
+            .pages
+            .mark_dirty(PageIndex::new(0))
+            .expect("mark dirty");
+    }
+    pc.set_size_bytes(17);
+
+    assert_eq!(step_fsync(&pc, &guard), V3Out::Err(step_engine::Errno::EIO));
+    assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+    assert_eq!(fs.flushes.load(Ordering::Acquire), 1);
+    assert_eq!(fs.truncates.load(Ordering::Acquire), 1);
+    assert_eq!(fs.fsyncs.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn pagebacked_step_fsync_persists_a_size_only_change_once() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(LifecycleFs::new());
+    let pc = file_page_container(fs.clone(), FsObjectId::new(54));
+    pc.set_size_bytes(17);
+
+    assert_eq!(step_fsync(&pc, &guard), V3Out::Done(()));
+    assert_eq!(fs.flushes.load(Ordering::Acquire), 0);
+    assert_eq!(fs.truncates.load(Ordering::Acquire), 1);
+    assert_eq!(fs.last_truncate_size.load(Ordering::Acquire), 17);
+
+    assert_eq!(step_fsync(&pc, &guard), V3Out::Done(()));
+    assert_eq!(
+        fs.truncates.load(Ordering::Acquire),
+        1,
+        "acknowledged size must not be rewritten by the next clean fsync"
+    );
 }
 
 #[test]

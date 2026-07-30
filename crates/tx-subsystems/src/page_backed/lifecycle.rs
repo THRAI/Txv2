@@ -113,8 +113,10 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         return V3::done(());
     };
 
+    let dirty_pages = pc.dirty_pages_snapshot();
+    let (size, size_generation, size_dirty) = pc.size_writeback_snapshot();
     let mut pages_so_far: u32 = 0;
-    for (page, ppn, dirty_generation) in pc.dirty_pages_snapshot() {
+    for (page, ppn, _dirty_generation) in dirty_pages.iter().copied() {
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return V3::err(Errno::EINVAL.into());
         };
@@ -125,7 +127,6 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
             guard,
         ) {
             V3::Done(()) => {
-                pc.clear_dirty_if_match(page, ppn, dirty_generation);
                 pages_so_far = pages_so_far.saturating_add(1);
             }
             V3::Continue { progress: _ } => {
@@ -155,12 +156,10 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
     }
 
-    // `flush_page` writes data blocks only, so persist the logical size when
-    // this fsync actually wrote dirty data.  Do not rewrite inode metadata for
-    // a clean/read-only file: close() reaches this path as well, and touching
-    // clean inputs invalidates Cargo fingerprints on the next invocation.
-    if pages_so_far > 0 {
-        let size = pc.size_bytes();
+    // `flush_page` writes data blocks only. Persist the size whenever either
+    // data or EOF changed, but do not rewrite clean inode metadata on close:
+    // that would invalidate Cargo fingerprints on the next invocation.
+    if !dirty_pages.is_empty() || size_dirty {
         match mount
             .payload()
             .fs_page_backing
@@ -184,12 +183,21 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
     }
 
-    match mount
+    let fsync_outcome = mount
         .payload()
         .fs_page_backing
-        .fsync_file(*fs_object_id, guard)
-    {
-        V3::Done(()) => V3::done(()),
+        .fsync_file(*fs_object_id, guard);
+    match fsync_outcome {
+        V3::Done(()) => {
+            // Publish cleanliness only after the data, logical size and
+            // backend barrier all succeeded. Generation checks preserve any
+            // write that raced with this snapshot.
+            for (page, ppn, dirty_generation) in dirty_pages {
+                pc.clear_dirty_if_match(page, ppn, dirty_generation);
+            }
+            pc.acknowledge_size_if_match(size_generation);
+            V3::done(())
+        }
         V3::Continue { progress: _ } => {
             let progress = if pages_so_far == 0 {
                 PageProgress::EMPTY
@@ -288,7 +296,7 @@ pub fn step_truncate(
     };
 
     let old_size = pc.size_bytes();
-    pc.set_size_bytes(new_size);
+    pc.set_size_bytes_persisted(new_size);
 
     if new_size < old_size {
         let Some(first_drop) = first_page_after_size(new_size) else {
@@ -362,7 +370,7 @@ pub fn step_fallocate(
         PageContainerKind::Device { .. } => false,
     };
 
-    pc.set_size_bytes(new_size);
+    pc.set_size_bytes_persisted(new_size);
 
     if fs_advanced {
         V3::continue_with(PageProgress::EMPTY)
@@ -832,8 +840,9 @@ mod v3_tests {
                 },
             }
         );
-        // The first flush did clear-dirty; the second blocked one didn't.
-        assert!(!pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+        // A partial writeback is retryable as one snapshot: neither page is
+        // published clean until data, size and the backend barrier complete.
+        assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
         assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
         assert_eq!(fs.fsyncs.load(Ordering::Acquire), 0);
     }

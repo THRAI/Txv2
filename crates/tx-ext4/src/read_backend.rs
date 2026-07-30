@@ -290,7 +290,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             page_count,
         )
         .map_err(|_| Errno::ENOMEM)?;
-        container.set_size_bytes(meta.size);
+        container.set_size_bytes_persisted(meta.size);
 
         // Publish under the coherence lock, but allocate the candidate before
         // taking it: zone allocation can drain EBR and run a PageContainer
@@ -319,7 +319,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             drop(container);
             return Err(Errno::ENOENT);
         }
-        container.set_size_bytes(latest.size);
+        container.set_size_bytes_persisted(latest.size);
         index.insert(fs_object_id, container.downgrade());
         drop(index);
         drop(orphaned);

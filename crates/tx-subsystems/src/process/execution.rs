@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tx_hal::{PmapIf, UserTrapContext};
 
 use crate::cred::Cred;
+use crate::page_backed::PageContainer;
 use crate::process::adapter::step_engine::{
     self, process_spin_mutex, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt,
     PayloadCap, ProcessSpinMutex, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak,
@@ -46,6 +47,14 @@ pub(crate) const PROCESS_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
     b"debug.lock_service.process.payload.robust.pending.duration_ns",
     b"debug.lock_service.process.payload.robust.entry_count",
 ];
+
+/// Page containers whose close-time writeback could not complete.
+///
+/// The fd is already detached when Linux reports a delayed close error, but
+/// the dirty cache must remain alive.  txKernel has no background flusher yet,
+/// so later close/exit activity retries a bounded batch.  The lock only
+/// protects this rare failure queue and is never held across filesystem I/O.
+static DEFERRED_PAGE_WRITEBACKS: SpinMutex<Vec<Cap<PageContainer>>> = SpinMutex::new(Vec::new());
 
 #[inline(always)]
 pub(crate) fn measure_process_lock_service<R>(name: &'static [u8], f: impl FnOnce() -> R) -> R {
@@ -1117,6 +1126,8 @@ pub fn finalize_detached_open_files<'a>(
     files: impl IntoIterator<Item = &'a Cap<OpenFile>>,
     guard: &step_engine::Guard<'_>,
 ) -> Result<(), step_engine::Errno> {
+    retry_deferred_page_writebacks(guard, 16);
+
     let mut seen_files = Vec::new();
     let mut first_error = None;
     for file in files {
@@ -1161,8 +1172,40 @@ pub fn flush_page_backed_open_file(
     };
     match crate::page_backed::step_fsync(pc, guard) {
         StepOutcome::Done(()) => Ok(()),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(step_engine::Errno::EIO),
+        StepOutcome::Err(errno) => {
+            retain_deferred_page_writeback(pc);
+            Err(errno)
+        }
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            retain_deferred_page_writeback(pc);
+            Err(step_engine::Errno::EIO)
+        }
+    }
+}
+
+fn retain_deferred_page_writeback(pc: &Cap<PageContainer>) {
+    let mut deferred = DEFERRED_PAGE_WRITEBACKS.lock();
+    if deferred.iter().any(|queued| queued == pc) {
+        return;
+    }
+    deferred.push(pc.clone());
+}
+
+fn retry_deferred_page_writebacks(guard: &step_engine::Guard<'_>, budget: usize) {
+    let batch = {
+        let mut deferred = DEFERRED_PAGE_WRITEBACKS.lock();
+        let count = budget.min(deferred.len());
+        let split_at = deferred.len() - count;
+        deferred.split_off(split_at)
+    };
+
+    for pc in batch {
+        match crate::page_backed::step_fsync(&pc, guard) {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                retain_deferred_page_writeback(&pc);
+            }
+        }
     }
 }
 
