@@ -1051,8 +1051,15 @@ session API over those single mapping operations; the board still owns the
 actual PTE walk and mutation. Substrate has an ASID-scoped page shootdown batch
 that holds `MapPin`s until after `PmapIf::shootdown_mapping()`.
 Superpage/multi-frame accounting remains before userspace work; the current
-remote shootdown implementation is RV64 QEMU SBI RFENCE rather than a full
-kernel-managed IPI/ack protocol.
+remote implementations are RV64 QEMU SBI RFENCE and LA64 QEMU's
+kernel-managed per-hart generation mailbox. LA64 uses one full remote INVTLB
+per observed generation and may coalesce concurrent requests. Because its
+board IPI is maskable while Txv2 keeps CRMD.IE clear in syscall/fault paths,
+mailbox service is also exposed as a lock-free progress hook at the pmap and
+vmalloc locks that can participate in a synchronous shootdown cycle. Reactor
+boundaries, prepared interrupt waits, unbounded pmap waits, and CPU shutdown
+drains are also progress points; correctness therefore does not depend on a
+particular lock being contended when the IPI arrives.
 
 RV64 process-root activation and ASID reuse obey two distinct SMP masks.
 The **residency mask** names harts whose `satp` currently carries the ASID and
@@ -1068,6 +1075,27 @@ is released. Root destruction first prevents re-entry and waits for the
 residency mask to become empty, then invalidates the ASID on **all online
 harts**. Only after that global invalidation completes is the TLB-history mask
 cleared and may page-table pages and the numeric ASID be reused.
+
+LA64 QEMU uses a deliberately more conservative switch discipline. Every
+actual PGDL/ASID transition performs a full local INVTLB, so a hart that has
+finished switching away retains no ASID-tagged history and normal shootdowns
+may target the current residency mask. A per-hart odd/even switch sequence
+surrounds incoming-tuple publication, incoming residency, CSR writes, full
+INVTLB, active-tuple publication, and outgoing-residency removal. Teardown
+accepts only a stable even-sequence snapshot; it never clears remote residency
+by inference. Ordinary leaf unmap never prunes committed L0/L1/L2 tables:
+user intermediates remain owned by the process root until ASID quiescence and
+root destruction, while bounded kernel/vmalloc intermediates remain resident.
+This prevents a stale hardware page-table walk from dereferencing a page-table
+page that has already been reused.
+
+LA64 CPU shutdown uses a separate target-acquisition protocol in addition to
+the scheduler online mask. A sender pins an accepting target across mailbox
+publication and completion. An offlining CPU first withdraws acceptance,
+services requests from already-pinned senders until their count reaches zero,
+and only then masks interrupts permanently. Shared kernel PGDH bootstrap
+mapping likewise uses a three-state `UNINIT/BUILDING/READY` once protocol so
+concurrent first users cannot mutate the same page-table tree.
 
 The full planned trait surface is:
 
@@ -2691,7 +2719,39 @@ The platform crate (e.g., `tx-hal-loongarch64-qemu-virt`, `tx-hal-loongarch64-2k
 
 - **Expose DMW activation in H1.** Two DMW windows: one for the kernel direct map (cached), one for MMIO (uncached). DMW activation happens before MMU enable.
 
-- **Implement invtlb in `PmapIf::shootdown`.** Single-hart: `invtlb 0x5, asid, vaddr` (invalidate by VA + ASID). `shootdown_global` uses `invtlb 0x6, x0, vaddr` (invalidate by VA, all ASIDs). Cross-hart deferred to SMP_v1.
+- **Implement invtlb in `PmapIf::shootdown`.** Single-hart:
+  `invtlb 0x5, asid, vaddr` (invalidate by VA + ASID).
+  `shootdown_global` uses `invtlb 0x6, x0, vaddr` (invalidate by VA, all
+  ASIDs). LA64 QEMU implements cross-hart completion with a per-target
+  generation mailbox carried by the board IPI. The receiver retires the
+  interrupt transport before draining the mailbox so an arriving generation
+  cannot be lost by a trailing hardware clear. Concurrent senders service
+  their own inbound mailbox while waiting; pmap/vmalloc lock contention also
+  runs the same lock-free service hook because CRMD.IE may be clear. Reactor
+  boundaries and unbounded pmap/shutdown waits are progress points as well.
+
+- **Publish pmap lifetime transitions explicitly.** Each hart has an
+  odd/even switch sequence. The odd interval begins before incoming root
+  publication and ends only after CSR installation, full local INVTLB, active
+  tuple publication, and outgoing-residency removal. Root teardown waits for
+  stable even snapshots and never edits another hart's residency by
+  inference.
+
+- **Drain synchronous targets before CPU parking.** Sender-side target pins
+  cover request publication through completion. An offlining CPU stops
+  accepting pins, drains existing users and its mailbox, then disables
+  interrupts.
+
+- **Serialize shared PGDH bootstrap.** Concurrent first users participate in
+  an `UNINIT -> BUILDING -> READY` once protocol. Waiters service shootdowns,
+  and a failed idempotent builder returns to `UNINIT` for retry.
+
+- **Keep committed intermediate page tables alive through shootdown.**
+  Ordinary unmap clears only the leaf. User L0/L1/L2 nodes are released only
+  after root residency reaches zero during root destruction; bounded kernel
+  intermediates remain resident. Uncommitted reservation intermediates may
+  still be rolled back immediately because no valid leaf ever referenced
+  them.
 
 - **Use $r21 for percpu.** `$r21` (a.k.a. `tp` in LA64 conventions) holds the per-CPU pointer in kernel mode. Trap entry preserves $r21 via the architecture's trap-frame save discipline.
 

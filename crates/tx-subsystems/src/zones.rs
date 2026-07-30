@@ -488,6 +488,20 @@ pub fn dump_smp_wait_diagnostics<P: TxPlatform>() {
         write_usize::<P>(fds.len());
         console_write_str::<P>(":comm=");
         console_write_str::<P>(proc_comm_bytes(&comm_bytes));
+        if let Some(source) = process.exit_wait_source() {
+            console_write_str::<P>(":exit_source=");
+            write_hex_u64::<P>(source.id().raw());
+            console_write_str::<P>(":exit_subscribers=");
+            write_usize::<P>(source.subscriber_count());
+            console_write_str::<P>(":exit_pending=");
+            write_hex_u64::<P>(source.pending_mask_snapshot());
+            let registry_matches = tx_substrate::wake::lookup_source(source.id())
+                .is_some_and(|registered| alloc::sync::Arc::ptr_eq(&registered, &source));
+            console_write_str::<P>(":exit_registry_matches=");
+            write_usize::<P>(registry_matches as usize);
+        } else {
+            console_write_str::<P>(":exit_source=none");
+        }
         console_write_str::<P>("\n");
 
         for thread in threads {
@@ -504,6 +518,20 @@ pub fn dump_smp_wait_diagnostics<P: TxPlatform>() {
             if let Some(payload) = payload {
                 console_write_str::<P>(":sleeping=");
                 write_usize::<P>(payload.proc_sleeping() as usize);
+                if let Some(mailbox) = payload.mailbox_handle().and_then(|weak| weak.upgrade()) {
+                    console_write_str::<P>(":mailbox_task=");
+                    write_usize::<P>(mailbox.task_id_low() as usize);
+                    console_write_str::<P>(":mailbox_len=");
+                    write_usize::<P>(mailbox.len());
+                    console_write_str::<P>(":mailbox_overflow=");
+                    write_usize::<P>(mailbox.overflow() as usize);
+                    console_write_str::<P>(":mailbox_waker=");
+                    write_usize::<P>(mailbox.has_waker() as usize);
+                    console_write_str::<P>(":mailbox_generation=");
+                    write_usize::<P>(mailbox.current_generation().raw() as usize);
+                } else {
+                    console_write_str::<P>(":mailbox=none");
+                }
                 if let Some(task) = payload.task() {
                     console_write_str::<P>(":task=");
                     write_usize::<P>(task.id().index());

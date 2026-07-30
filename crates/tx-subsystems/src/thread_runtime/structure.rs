@@ -262,6 +262,16 @@ pub struct ThreadPayload {
     active_syscall_nr: AtomicU64,
     active_syscall_arg0: AtomicU64,
     active_syscall_arg1: AtomicU64,
+    /// Last context handed to the platform immediately before entering
+    /// userspace.  These are crash-only diagnostics: on SMP they distinguish
+    /// a context that was already corrupt at the hand-off from one that was
+    /// damaged after userspace started running.
+    last_user_entry_pc: AtomicU64,
+    last_user_entry_ra: AtomicU64,
+    last_user_entry_sp: AtomicU64,
+    last_user_entry_tls: AtomicU64,
+    last_user_entry_syscall: AtomicU64,
+    last_user_entry_hart: AtomicU64,
     /// `clear_child_tid` pointer from `set_tid_address`.  Written
     /// atomically to 0 on thread exit when futex wake is supported.
     pub clear_child_tid: SpinMutex<Option<u64>>,
@@ -297,6 +307,12 @@ impl ThreadPayload {
             active_syscall_nr: AtomicU64::new(u64::MAX),
             active_syscall_arg0: AtomicU64::new(0),
             active_syscall_arg1: AtomicU64::new(0),
+            last_user_entry_pc: AtomicU64::new(0),
+            last_user_entry_ra: AtomicU64::new(0),
+            last_user_entry_sp: AtomicU64::new(0),
+            last_user_entry_tls: AtomicU64::new(0),
+            last_user_entry_syscall: AtomicU64::new(u64::MAX),
+            last_user_entry_hart: AtomicU64::new(u64::MAX),
             clear_child_tid: SpinMutex::new(None),
             robust_list_head: SpinMutex::new(None),
             robust_list_len: SpinMutex::new(0),
@@ -381,6 +397,42 @@ impl ThreadPayload {
             self.active_syscall_arg0.load(Ordering::Relaxed),
             self.active_syscall_arg1.load(Ordering::Relaxed),
         ))
+    }
+
+    /// Publish the exact context about to cross the kernel/userspace boundary.
+    ///
+    /// Store the payload first and the hart last with release ordering, so a
+    /// fault on another hart observes one complete snapshot.
+    pub fn record_user_entry_diagnostic(
+        &self,
+        pc: u64,
+        ra: u64,
+        sp: u64,
+        tls: u64,
+        syscall: u64,
+        hart: u64,
+    ) {
+        self.last_user_entry_pc.store(pc, Ordering::Relaxed);
+        self.last_user_entry_ra.store(ra, Ordering::Relaxed);
+        self.last_user_entry_sp.store(sp, Ordering::Relaxed);
+        self.last_user_entry_tls.store(tls, Ordering::Relaxed);
+        self.last_user_entry_syscall
+            .store(syscall, Ordering::Relaxed);
+        self.last_user_entry_hart.store(hart, Ordering::Release);
+    }
+
+    /// Return the most recently published userspace-entry snapshot as
+    /// `(pc, ra, sp, tls, syscall, hart)`.
+    pub fn user_entry_diagnostic(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let hart = self.last_user_entry_hart.load(Ordering::Acquire);
+        (
+            self.last_user_entry_pc.load(Ordering::Relaxed),
+            self.last_user_entry_ra.load(Ordering::Relaxed),
+            self.last_user_entry_sp.load(Ordering::Relaxed),
+            self.last_user_entry_tls.load(Ordering::Relaxed),
+            self.last_user_entry_syscall.load(Ordering::Relaxed),
+            hart,
+        )
     }
 
     /// Borrow the userspace-run slot owned by this thread. The trap

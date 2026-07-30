@@ -50,6 +50,7 @@ type CommitKernelMappingFn = fn(PmapReservation, PmapPermissions);
 type UnmapKernelMappingFn =
     fn(VirtAddr, PmapReserveKind) -> Result<Option<PmapUnmapResult>, PmapError>;
 type ShootdownKernelMappingsFn = fn(&[PmapInvalidation]);
+type ServicePendingTlbShootdownFn = fn();
 
 /// Slab allocation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -540,11 +541,19 @@ impl SpinLock {
     }
 
     fn lock(&self) -> SpinGuard<'_> {
+        self.lock_with_progress(|| {})
+    }
+
+    fn lock_with_progress<F>(&self, mut progress: F) -> SpinGuard<'_>
+    where
+        F: FnMut(),
+    {
         while self
             .held
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            progress();
             core::hint::spin_loop();
         }
         SpinGuard { lock: self }
@@ -572,6 +581,7 @@ static VMALLOC_RESERVE_MAPPING: AtomicUsize = AtomicUsize::new(0);
 static VMALLOC_COMMIT_NEW_MAPPING: AtomicUsize = AtomicUsize::new(0);
 static VMALLOC_UNMAP_MAPPING: AtomicUsize = AtomicUsize::new(0);
 static VMALLOC_SHOOTDOWN_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
+static VMALLOC_SERVICE_PENDING_TLB_SHOOTDOWN: AtomicUsize = AtomicUsize::new(0);
 static VMALLOC_ALLOC_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 static VMALLOC_ALLOC_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
 static VMALLOC_LIVE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -668,6 +678,8 @@ fn init_vmalloc<P: TxPlatform>() {
     VMALLOC_COMMIT_NEW_MAPPING.store(P::commit_new_kernel_mapping as usize, Ordering::Release);
     VMALLOC_UNMAP_MAPPING.store(P::unmap_kernel_mapping as usize, Ordering::Release);
     VMALLOC_SHOOTDOWN_MAPPINGS.store(P::shootdown_kernel_mappings as usize, Ordering::Release);
+    VMALLOC_SERVICE_PENDING_TLB_SHOOTDOWN
+        .store(P::service_pending_tlb_shootdown as usize, Ordering::Release);
 
     // Keep one leaf permanently mapped in every Sv39 root slot covered by the
     // window. RV64 process roots copy the kernel-half root slots when they are
@@ -675,7 +687,7 @@ fn init_vmalloc<P: TxPlatform>() {
     // shared by every future process root. LA64 uses the same harmless guards
     // below its global PGDH.
     let _va_guard = VMALLOC_VA_LOCK.lock();
-    let _map_guard = VMALLOC_MAP_LOCK.lock();
+    let _map_guard = VMALLOC_MAP_LOCK.lock_with_progress(vmalloc_service_pending_tlb_shootdown);
     let Ok(allocator) = installed_bitmap_allocator() else {
         return;
     };
@@ -785,7 +797,7 @@ fn try_vmalloc(layout: Layout) -> Option<NonNull<u8>> {
     let mut failure_pmap_error = VMALLOC_PMAP_NONE;
 
     {
-        let _guard = VMALLOC_MAP_LOCK.lock();
+        let _guard = VMALLOC_MAP_LOCK.lock_with_progress(vmalloc_service_pending_tlb_shootdown);
         while mapped < page_count {
             let frame = match allocator.reserve_frame(ZeroPolicy::UninitFullOverwrite) {
                 Ok(frame) => frame,
@@ -902,7 +914,7 @@ unsafe fn dealloc_vmalloc(ptr: *mut u8, layout: Layout) {
         return;
     };
     let report = {
-        let _guard = VMALLOC_MAP_LOCK.lock();
+        let _guard = VMALLOC_MAP_LOCK.lock_with_progress(vmalloc_service_pending_tlb_shootdown);
         unmap_vmalloc_pages(start_page, page_count, allocator)
     };
     record_vmalloc_unmap_report(report);
@@ -1180,6 +1192,15 @@ fn vmalloc_shootdown_mappings(invalidations: &[PmapInvalidation]) {
     debug_assert_ne!(raw, 0);
     let callback: ShootdownKernelMappingsFn = unsafe { core::mem::transmute(raw) };
     callback(invalidations);
+}
+
+fn vmalloc_service_pending_tlb_shootdown() {
+    let raw = VMALLOC_SERVICE_PENDING_TLB_SHOOTDOWN.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let callback: ServicePendingTlbShootdownFn = unsafe { core::mem::transmute(raw) };
+    callback();
 }
 
 #[repr(C)]

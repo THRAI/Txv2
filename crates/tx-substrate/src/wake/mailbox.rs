@@ -359,6 +359,13 @@ impl TaskMailbox {
         *self.waker.lock() = None;
     }
 
+    /// Whether a future currently has a wake route installed.
+    ///
+    /// Diagnostic only: semantic readiness remains owned by the source.
+    pub fn has_waker(&self) -> bool {
+        self.waker.lock().is_some()
+    }
+
     /// Claim the next generation for a new active wait. Monotonic.
     pub fn next_generation(&self) -> WaitGeneration {
         let raw = self.generation.fetch_add(1, Ordering::AcqRel);

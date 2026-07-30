@@ -110,6 +110,21 @@ impl<T, M: LockMetricsMode> SpinMutex<T, M> {
 
     #[inline]
     pub fn lock(&self) -> SpinMutexGuard<'_, T, M> {
+        self.lock_with_progress(|| {})
+    }
+
+    /// Acquire the lock while periodically running a non-blocking progress
+    /// hook.
+    ///
+    /// This is intentionally opt-in. Architecture code can use it at locks
+    /// which participate in a synchronous cross-CPU protocol (for example a
+    /// maskable software-IPI TLB shootdown) without imposing HAL work on every
+    /// ordinary kernel spin lock.
+    #[inline]
+    pub fn lock_with_progress<F>(&self, mut progress: F) -> SpinMutexGuard<'_, T, M>
+    where
+        F: FnMut(),
+    {
         let mut timing = M::Timing::start(&self.metrics);
         while self
             .locked
@@ -117,6 +132,7 @@ impl<T, M: LockMetricsMode> SpinMutex<T, M> {
             .is_err()
         {
             timing.spin();
+            progress();
             core::hint::spin_loop();
         }
         timing.acquired(self);

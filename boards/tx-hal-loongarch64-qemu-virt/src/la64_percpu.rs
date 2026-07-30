@@ -7,7 +7,6 @@
 
 use core::sync::atomic::Ordering;
 
-use super::la64_irq_trap::write_la64_csr;
 use super::*;
 
 pub(crate) fn la64_read_stable_counter() -> u64 {
@@ -111,26 +110,16 @@ pub(crate) unsafe fn la64_install_kernel_stack(top: VirtAddr) {
 
 pub(crate) fn la64_wait_for_interrupt_once() {
     #[cfg(target_arch = "loongarch64")]
-    {
-        // CRMD.IE must be set before `idle`: real silicon only leaves
-        // idle when an interrupt can actually be TAKEN, and the
-        // longjmp-like kernel resume path
-        // (`tx_la64_resume_kernel_after_reschedule`) returns to the
-        // reactor loop with the trap entry's IE=0 still in effect —
-        // the LS2K1000 first flights parked here forever (timer armed,
-        // UART routed, nothing ever woke). QEMU's idle emulation wakes
-        // on pending interrupts regardless of IE, which hid this.
-        // RISC-V is immune by spec (WFI resumes on pending interrupts
-        // even when globally masked), which is why the identical loop
-        // works on the VF2. Mirrors Linux loongarch `arch_cpu_idle`
-        // (local_irq_enable before idle).
-        let crmd = super::la64_irq_trap::read_la64_csr(super::LA64_CSR_CRMD);
-        if crmd & super::LA64_CRMD_IE == 0 {
-            write_la64_csr(super::LA64_CSR_CRMD, crmd | super::LA64_CRMD_IE);
+    unsafe {
+        unsafe extern "C" {
+            fn tx_la64_idle_prepared();
         }
-        unsafe {
-            core::arch::asm!("idle 0", options(nomem, nostack));
-        }
+
+        // The helper enables CRMD.IE and executes `idle` inside the rollback
+        // region understood by the trap dispatcher. A plain Rust
+        // "enable; idle" sequence loses a wake when the interrupt lands
+        // between those two operations.
+        tx_la64_idle_prepared();
     }
 
     #[cfg(not(target_arch = "loongarch64"))]

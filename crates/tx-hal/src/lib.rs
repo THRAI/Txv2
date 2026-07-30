@@ -703,6 +703,15 @@ pub trait PmapIf {
         }
     }
 
+    /// Make progress on a remote TLB invalidation addressed to the current CPU.
+    ///
+    /// Most platforms can rely on their architectural interrupt/firmware
+    /// machinery and keep this as a no-op. Platforms whose shootdown transport
+    /// is a maskable supervisor interrupt may override it so lock-contention
+    /// paths can service a pending invalidation while ordinary interrupts are
+    /// masked. The implementation must not acquire VM or heap locks.
+    fn service_pending_tlb_shootdown() {}
+
     // ===== 组3:用户地址空间的创建/销毁/激活(fork/exec/切进程的核心) =====
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
         // 建一个新进程的页表根
@@ -1223,6 +1232,16 @@ pub trait SmpIf {
     }
 
     fn mark_cpu_online(_cpu: CpuId) {}
+
+    /// Withdraw the current CPU from synchronous cross-CPU work before it is
+    /// permanently parked.
+    ///
+    /// Platforms with a maskable-IPI TLB shootdown transport use this hook to
+    /// stop new target acquisitions, drain requests which were already
+    /// acquired by senders, and only then publish the CPU offline. The method
+    /// runs in normal kernel context and must return with no future
+    /// synchronous request able to wait on this CPU.
+    fn prepare_cpu_offline() {}
 
     fn boot_secondary_cpus(_entry: SecondaryEntry) -> usize {
         0

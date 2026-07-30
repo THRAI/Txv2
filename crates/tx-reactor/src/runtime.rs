@@ -1542,6 +1542,22 @@ impl Reactor {
         self.shared.tasks.lock().status_by_id(task)
     }
 
+    pub fn task_wake_requested(&self, task: TaskId) -> Option<bool> {
+        self.shared.tasks.lock().wake_requested_by_id(task)
+    }
+
+    pub fn task_run_owner(&self, task: TaskId) -> Option<TaskRunOwner> {
+        self.shared.scheduler.task_owner(task)
+    }
+
+    pub fn task_is_queued(&self, task: TaskId) -> bool {
+        self.shared.scheduler.is_queued(task)
+    }
+
+    pub fn queued_wake_count(&self) -> usize {
+        self.shared.queued_wakes.load(Ordering::Acquire)
+    }
+
     pub fn task_key_status(&self, task: TaskKey) -> Option<TaskStatus> {
         self.shared.tasks.lock().status(task)
     }

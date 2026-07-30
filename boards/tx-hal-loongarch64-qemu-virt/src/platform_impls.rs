@@ -245,8 +245,9 @@ impl PmapIf for Platform {
     }
 
     fn destroy_pmap_root(root: PmapRoot) {
-        deactivate_la64_user_pmap();
-        wait_for_la64_asid_quiescence(root.asid());
+        deactivate_la64_user_pmap_if_matches(root.asid(), root.phys());
+        wait_for_la64_asid_quiescence(root.asid(), root.phys());
+        invalidate_la64_asid_before_reuse();
         release_la64_user_page_table_tree(root.phys(), 3);
         free_la64_asid(root.asid());
         Self::free_pt_node(root.into_node());
@@ -312,6 +313,10 @@ impl PmapIf for Platform {
         }
     }
 
+    fn service_pending_tlb_shootdown() {
+        service_la64_pending_tlb_shootdown();
+    }
+
     fn shootdown_mapping(asid: Asid, invalidation: PmapInvalidation) {
         la64_invtlb_asid(asid, invalidation.virt());
         la64_remote_tlb_shootdown(la64_asid_residency_mask(asid));
@@ -340,6 +345,11 @@ impl TrapIf for Platform {
 
     fn install_kernel_trap_vector() {
         install_la64_trap_vectors();
+        // The full kernel trap vector is now live, so this hart can safely
+        // accept runtime IPIs.  This must happen here for both the BSP and
+        // APs: the generic AP entry enables IPIs again before publishing
+        // itself online, while the BSP has no later per-CPU enable step.
+        boot_smp::enable_ipi_wakeups();
     }
 
     fn install_user_trap_vector() {
@@ -362,9 +372,6 @@ impl TrapIf for Platform {
             let frame = la64_entry_trap_frame_ptr_for_cpu(cpu);
             (*frame).restore_user_context(ctx);
             let pmap_switch = prepare_la64_pmap_switch(root).expect("LA64 user pmap switch");
-            if pmap_switch.switch_required {
-                record_la64_pmap_switch(&pmap_switch);
-            }
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
             tx_la64_qemu_activate_enter_userspace(
@@ -630,13 +637,9 @@ impl TimeIf for Platform {
         let now = la64_read_stable_counter();
         let target = tx_hal::time::deadline_ns_to_ticks(deadline, frequency_hz);
         let delta = target.saturating_sub(now).max(1);
-        let delta = round_up_to_tcfg_ticks(delta);
 
         write_la64_csr(LA64_CSR_TICLR, LA64_TICLR_CLEAR_TIMER);
-        write_la64_csr(
-            LA64_CSR_TCFG,
-            delta as usize | LA64_TCFG_ENABLE | LA64_TCFG_PERIODIC,
-        );
+        write_la64_csr(LA64_CSR_TCFG, la64_deadline_tcfg(delta));
     }
 
     fn cancel_deadline() {
@@ -743,8 +746,16 @@ impl SmpIf for Platform {
 
     fn mark_cpu_online(cpu: CpuId) {
         if Self::possible_cpus().contains(cpu) {
+            // Accept synchronous work before scheduler-visible online
+            // publication, so no observer can target a CPU that is unable to
+            // acquire a shootdown pin.
+            mark_la64_tlb_cpu_online(cpu);
             LA64_ONLINE_CPUS.fetch_or(CpuMask::single(cpu).bits(), Ordering::AcqRel);
         }
+    }
+
+    fn prepare_cpu_offline() {
+        prepare_la64_tlb_cpu_offline();
     }
 
     fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
@@ -759,12 +770,45 @@ impl SmpIf for Platform {
         la64_wait_for_interrupt_once();
     }
 
+    fn prepare_interrupt_wait() -> InterruptWaitState {
+        let crmd = read_la64_csr(LA64_CSR_CRMD);
+        write_la64_csr(LA64_CSR_CRMD, crmd & !LA64_CRMD_IE);
+        InterruptWaitState::from_raw(crmd)
+    }
+
+    fn cancel_interrupt_wait(state: InterruptWaitState) {
+        let crmd = read_la64_csr(LA64_CSR_CRMD);
+        let restored = if state.raw() & LA64_CRMD_IE != 0 {
+            crmd | LA64_CRMD_IE
+        } else {
+            crmd & !LA64_CRMD_IE
+        };
+        write_la64_csr(LA64_CSR_CRMD, restored);
+    }
+
+    fn wait_for_interrupt_prepared(state: InterruptWaitState) {
+        // `prepare_interrupt_wait` left IE clear while the kernel performed
+        // its final runnable-work check. The assembly helper below enables IE
+        // adjacent to `idle`; the trap dispatcher redirects an interrupt from
+        // that tiny window to the instruction after `idle`, so the just-served
+        // wake cannot be followed by an indefinite sleep.
+        la64_wait_for_interrupt_once();
+        if state.raw() & LA64_CRMD_IE == 0 {
+            let crmd = read_la64_csr(LA64_CSR_CRMD);
+            write_la64_csr(LA64_CSR_CRMD, crmd & !LA64_CRMD_IE);
+        }
+    }
+
     fn pending_ipi(kind: IpiKind) -> bool {
         boot_smp::pending_ipi(kind)
     }
 
     fn quiesce_this_cpu() -> ! {
         Self::cancel_deadline();
+        debug_assert_eq!(
+            LA64_TLB_TARGET_USERS[la64_current_cpu_id().0].load(Ordering::Acquire),
+            0
+        );
         #[cfg(target_arch = "loongarch64")]
         {
             // Disable every local interrupt source before publishing a

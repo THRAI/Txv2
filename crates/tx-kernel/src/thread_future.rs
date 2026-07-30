@@ -681,6 +681,14 @@ pub async fn run_thread<P: TxPlatform>(
                 }
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+                payload.record_user_entry_diagnostic(
+                    ctx.pc as u64,
+                    user_ra_from_context(&ctx) as u64,
+                    user_sp_from_context::<P>(&ctx) as u64,
+                    user_tls_from_context::<P>(&ctx) as u64,
+                    user_syscall_from_context::<P>(&ctx) as u64,
+                    entry_hart as u64,
+                );
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
                 if let Some(sysno) = last_entry_sysno {
                     emit_syscall_roundtrip_marker(sysno, b"debug.thread.enter.before");
@@ -1328,21 +1336,39 @@ fn log_user_segv<P: TxPlatform>(
         tx_hal::console_write_str::<P>(":comm=");
         tx_hal::console_write_str::<P>(comm);
     }
-    // DIAG (board ls-crash): ra/sp/a0/a1/a2 to tell "bad entry PC" from
-    // "ran a few instrs then jumped wild", and to inspect the stack ptr
-    // and first args the loader/_start received.
+    // Crash-only register dump.  Register numbers differ between RV64 and
+    // LA64; using the RV64 numbers here previously made LA's TLS value look
+    // like SP and its syscall number look like a1.
     if let Some(c) = ctx.as_ref() {
         tx_hal::console_write_str::<P>(":ra=0x");
-        write_hex_u64::<P>(c.regs[1] as u64);
+        write_hex_u64::<P>(user_ra_from_context(c) as u64);
         tx_hal::console_write_str::<P>(":sp=0x");
-        write_hex_u64::<P>(c.regs[2] as u64);
+        write_hex_u64::<P>(user_sp_from_context::<P>(c) as u64);
+        tx_hal::console_write_str::<P>(":tls=0x");
+        write_hex_u64::<P>(user_tls_from_context::<P>(c) as u64);
+        tx_hal::console_write_str::<P>(":syscall=0x");
+        write_hex_u64::<P>(user_syscall_from_context::<P>(c) as u64);
         tx_hal::console_write_str::<P>(":a0=0x");
-        write_hex_u64::<P>(c.regs[10] as u64);
+        write_hex_u64::<P>(user_arg_from_context::<P>(c, 0) as u64);
         tx_hal::console_write_str::<P>(":a1=0x");
-        write_hex_u64::<P>(c.regs[11] as u64);
+        write_hex_u64::<P>(user_arg_from_context::<P>(c, 1) as u64);
         tx_hal::console_write_str::<P>(":a2=0x");
-        write_hex_u64::<P>(c.regs[12] as u64);
+        write_hex_u64::<P>(user_arg_from_context::<P>(c, 2) as u64);
     }
+    let (entry_pc, entry_ra, entry_sp, entry_tls, entry_syscall, entry_hart) =
+        payload.user_entry_diagnostic();
+    tx_hal::console_write_str::<P>(":last-entry-pc=0x");
+    write_hex_u64::<P>(entry_pc);
+    tx_hal::console_write_str::<P>(":last-entry-ra=0x");
+    write_hex_u64::<P>(entry_ra);
+    tx_hal::console_write_str::<P>(":last-entry-sp=0x");
+    write_hex_u64::<P>(entry_sp);
+    tx_hal::console_write_str::<P>(":last-entry-tls=0x");
+    write_hex_u64::<P>(entry_tls);
+    tx_hal::console_write_str::<P>(":last-entry-syscall=0x");
+    write_hex_u64::<P>(entry_syscall);
+    tx_hal::console_write_str::<P>(":last-entry-hart=0x");
+    write_hex_u64::<P>(entry_hart);
     tx_hal::console_write_str::<P>("\n");
     pc
 }
@@ -1513,6 +1539,32 @@ fn user_sp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
         tx_hal::Arch::Riscv64 => ctx.regs[2],
         tx_hal::Arch::LoongArch64 => ctx.regs[3],
     }
+}
+
+fn user_ra_from_context(ctx: &tx_hal::UserTrapContext) -> usize {
+    ctx.regs[1]
+}
+
+fn user_tls_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[4],
+        tx_hal::Arch::LoongArch64 => ctx.regs[2],
+    }
+}
+
+fn user_syscall_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[17],
+        tx_hal::Arch::LoongArch64 => ctx.regs[11],
+    }
+}
+
+fn user_arg_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext, index: usize) -> usize {
+    let base = match P::ARCH {
+        tx_hal::Arch::Riscv64 => 10,
+        tx_hal::Arch::LoongArch64 => 4,
+    };
+    ctx.regs[base + index]
 }
 
 fn make_signal_frame_executable(aspace: &AddressSpace, frame_addr: usize, frame_len: usize) {

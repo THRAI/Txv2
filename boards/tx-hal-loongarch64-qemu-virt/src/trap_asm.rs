@@ -3,6 +3,26 @@
 #[cfg(target_arch = "loongarch64")]
 core::arch::global_asm!(
     r#"
+    // LoongArch cannot close the final idle race the same way as RISC-V:
+    // `idle` needs CRMD.IE set, so an interrupt can land after IE is enabled
+    // but before `idle` executes.  The trap dispatcher recognizes this
+    // bounded region and redirects ERA to `tx_la64_idle_irq_region_exit`,
+    // matching Linux's __arch_cpu_idle/handle_vint rollback protocol.
+    .section .text.cpuidle, "ax"
+    .align 5
+    .globl tx_la64_idle_prepared
+    .type tx_la64_idle_prepared, @function
+tx_la64_idle_prepared:
+    .globl tx_la64_idle_irq_region_start
+tx_la64_idle_irq_region_start:
+    li.w    $t0, 4
+    csrxchg $t0, $t0, 0x00
+    idle    0
+    .globl tx_la64_idle_irq_region_exit
+tx_la64_idle_irq_region_exit:
+    jr      $ra
+    .size tx_la64_idle_prepared, . - tx_la64_idle_prepared
+
     .section .text.trap, "ax"
     .align 12
     .equ TX_LA64_TF_R0, 0
@@ -371,9 +391,15 @@ tx_la64_qemu_activate_enter_userspace:
     st.d    $r30, $a0, (TX_LA64_RCTX_R22 + 64)
     st.d    $r31, $a0, (TX_LA64_RCTX_R22 + 72)
 
-    csrwr   $a2, TX_LA64_CSR_KSAVE0_TRAP
-    csrwr   $r21, TX_LA64_CSR_KSAVE1_TRAP
-    csrwr   $r2, TX_LA64_CSR_KSAVE2_TRAP
+    // CSRWR is a swap: it writes the requested value and replaces the source
+    // register with the previous CSR value. Keep the live kernel trap-stack,
+    // CPU/TLS, and thread-pointer registers intact while publishing them.
+    move    $r12, $a2
+    csrwr   $r12, TX_LA64_CSR_KSAVE0_TRAP
+    move    $r12, $r21
+    csrwr   $r12, TX_LA64_CSR_KSAVE1_TRAP
+    move    $r12, $r2
+    csrwr   $r12, TX_LA64_CSR_KSAVE2_TRAP
 
     move    $r31, $a1
     ld.d    $r12, $r31, TX_LA64_TF_ERA
@@ -382,13 +408,51 @@ tx_la64_qemu_activate_enter_userspace:
     csrwr   $r12, TX_LA64_CSR_PRMD_TRAP
     csrwr   $zero, TX_LA64_CSR_TLBRERA_TRAP
 
-    beqz    $a6, .Ltx_la64_activate_done
-    csrwr   $a3, 0x18
-    csrwr   $a4, 0x19
-    csrwr   $a5, 0x1a
+    // Keep the switch tuple in callee-saved registers across the Rust
+    // begin/finish publication helpers. The original kernel values were
+    // already saved in KernelResumeCtx above, and user values are restored
+    // from the trap frame below.
+    move    $r22, $a3
+    move    $r23, $a4
+    move    $r24, $a5
+    move    $r25, $a6
+    beqz    $r25, .Ltx_la64_activate_done
+
+    // CRMD.IE is already clear. Publish the incoming residency first while
+    // retaining the outgoing bit, then switch hardware, and only afterwards
+    // clear the outgoing residency in the finish helper.
+    move    $a0, $r22
+    move    $a1, $r23
+    la.local $r12, tx_la64_begin_pmap_switch
+    li.d    $r13, TX_LA64_PHYS_ADDR_MASK_TRAP
+    and     $r12, $r12, $r13
+    li.d    $r13, TX_LA64_DMW_CACHED_BASE_TRAP
+    or      $r12, $r12, $r13
+    jirl    $r1, $r12, 0
+
+    // CSRWR returns the previous CSR value in its register operand. Never use
+    // r22-r24 directly here: finish needs the incoming tuple, not the old
+    // hardware tuple returned by CSRWR.
+    move    $r12, $r22
+    csrwr   $r12, 0x18
+    move    $r12, $r23
+    csrwr   $r12, 0x19
+    move    $r12, $r24
+    csrwr   $r12, 0x1a
     li.d    $r12, 0x00000000000000b0
     csrwr   $r12, 0x00
     invtlb  0x0, $zero, $zero
+
+    move    $a0, $r22
+    move    $a1, $r23
+    move    $a2, $r24
+    la.local $r12, tx_la64_finish_pmap_switch
+    li.d    $r13, TX_LA64_PHYS_ADDR_MASK_TRAP
+    and     $r12, $r12, $r13
+    li.d    $r13, TX_LA64_DMW_CACHED_BASE_TRAP
+    or      $r12, $r12, $r13
+    jirl    $r1, $r12, 0
+
     la.local $r12, .Ltx_la64_activate_done
     li.d    $r13, TX_LA64_PHYS_ADDR_MASK_TRAP
     and     $r12, $r12, $r13
@@ -449,6 +513,16 @@ tx_la64_resume_kernel_after_reschedule:
     ld.d    $r29, $a0, (TX_LA64_RCTX_R22 + 56)
     ld.d    $r30, $a0, (TX_LA64_RCTX_R22 + 64)
     ld.d    $r31, $a0, (TX_LA64_RCTX_R22 + 72)
+
+    // A user exception clears CRMD.IE and this stackless reschedule path
+    // intentionally bypasses ERTN, so PRMD.PIE is never restored for the
+    // reactor context. At this point the kernel stack/TLS, kernel PGDH and
+    // trap-stack KSAVE registers are all live again; enter the ordinary
+    // interruptible kernel state before returning to Rust. Runtime deadlines
+    // are one-shot, so enabling IE here cannot create the former periodic
+    // timer interrupt storm.
+    li.w    $t0, 4
+    csrxchg $t0, $t0, TX_LA64_CSR_CRMD_TRAP
     ret
     .size tx_la64_resume_kernel_after_reschedule, . - tx_la64_resume_kernel_after_reschedule
 

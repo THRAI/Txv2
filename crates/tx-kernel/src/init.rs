@@ -2184,11 +2184,18 @@ impl<P: TxPlatform> CoreInit<P> {
             // Re-read after every trap/longjmp round-trip; the boot argument is
             // not the authoritative hart identity once the reactor is running.
             let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
+            P::service_pending_tlb_shootdown();
             if AP_REACTOR_STOP_REQUESTED.load(core::sync::atomic::Ordering::Acquire) {
                 P::cancel_deadline();
                 if P::pending_ipi(IpiKind::Stop) {
                     P::ack_ipi(IpiKind::Stop);
                 }
+                // The platform first withdraws this CPU from synchronous
+                // shootdown targeting and drains senders which already pinned
+                // it. Publishing STOPPED before that handshake would let the
+                // BSP free shared pmap/zone state while a sender still waits
+                // on a CPU that is about to disable interrupts forever.
+                P::prepare_cpu_offline();
                 AP_REACTOR_STOPPED_CPUS
                     .fetch_or(Self::cpu_bit(cpu_id), core::sync::atomic::Ordering::Release);
                 P::quiesce_this_cpu();
@@ -2211,6 +2218,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             }
             P::wait_for_interrupt_prepared(wait_state);
+            P::service_pending_tlb_shootdown();
             Self::note_reactor_hart_active(cpu_id);
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
@@ -2232,6 +2240,11 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let deadline = P::read_ns().saturating_add(2_000_000_000);
         loop {
+            // A secondary can be draining a shootdown which was initiated by
+            // this hart while it concurrently observes the stop request.
+            // Progressing our inbound mailbox here prevents a shutdown-only
+            // circular wait.
+            P::service_pending_tlb_shootdown();
             let stopped = AP_REACTOR_STOPPED_CPUS.load(core::sync::atomic::Ordering::Acquire)
                 & targets.bits();
             if stopped == targets.bits() {
@@ -2375,7 +2388,75 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_u64(stalled_ns / 1_000_000);
         tx_hal::console_write_str::<P>("\n");
         tx_subsystems::zones::dump_smp_wait_diagnostics::<P>();
+        Self::dump_reactor_task_diagnostics();
         tx_hal::console_write_str::<P>("txkernel:smp-stall:end\n");
+    }
+
+    fn dump_reactor_task_diagnostics() {
+        let _ = BOOT_REACTOR.with(|reactor| {
+            tx_hal::console_write_str::<P>("txkernel:smp-stall:reactor:queued_wakes=");
+            Self::write_u64(reactor.queued_wake_count() as u64);
+            tx_hal::console_write_str::<P>("\n");
+
+            for (pid, _) in tx_subsystems::process::all_pids() {
+                let Some(process) = tx_subsystems::process::process_by_pid(pid) else {
+                    continue;
+                };
+                for thread in process.threads_snapshot().unwrap_or_default() {
+                    let Some(payload) = thread.payload_cap() else {
+                        continue;
+                    };
+                    let Some(mailbox) = payload.mailbox_handle().and_then(|weak| weak.upgrade())
+                    else {
+                        continue;
+                    };
+                    let task = boot_runtime::TaskId(mailbox.task_id_low() as usize);
+                    tx_hal::console_write_str::<P>("txkernel:smp-stall:reactor-task:pid=");
+                    Self::write_u64(pid.0 as u64);
+                    tx_hal::console_write_str::<P>(":tid=");
+                    Self::write_u64(thread.tid.0 as u64);
+                    tx_hal::console_write_str::<P>(":task=");
+                    Self::write_u64(task.0 as u64);
+                    tx_hal::console_write_str::<P>(":status=");
+                    let status = match reactor.task_status(task) {
+                        Some(boot_runtime::TaskStatus::Runnable) => 1,
+                        Some(boot_runtime::TaskStatus::Polling) => 2,
+                        Some(boot_runtime::TaskStatus::Parked) => 3,
+                        Some(boot_runtime::TaskStatus::Completed) => 4,
+                        Some(boot_runtime::TaskStatus::Cancelled) => 5,
+                        None => 0,
+                    };
+                    Self::write_u64(status);
+                    tx_hal::console_write_str::<P>(":wake=");
+                    Self::write_u64(reactor.task_wake_requested(task).unwrap_or(false) as u64);
+                    tx_hal::console_write_str::<P>(":queued=");
+                    Self::write_u64(reactor.task_is_queued(task) as u64);
+                    tx_hal::console_write_str::<P>(":owner=");
+                    match reactor.task_run_owner(task) {
+                        Some(boot_runtime::TaskRunOwner::Parked) => {
+                            tx_hal::console_write_str::<P>("parked")
+                        }
+                        Some(boot_runtime::TaskRunOwner::Queued { hart, .. }) => {
+                            tx_hal::console_write_str::<P>("queued@");
+                            Self::write_u64(hart.0 as u64);
+                        }
+                        Some(boot_runtime::TaskRunOwner::Polling { hart }) => {
+                            tx_hal::console_write_str::<P>("polling@");
+                            Self::write_u64(hart.0 as u64);
+                        }
+                        Some(boot_runtime::TaskRunOwner::Terminal) => {
+                            tx_hal::console_write_str::<P>("terminal")
+                        }
+                        None => tx_hal::console_write_str::<P>("none"),
+                    }
+                    tx_hal::console_write_str::<P>(":mailbox_len=");
+                    Self::write_u64(mailbox.len() as u64);
+                    tx_hal::console_write_str::<P>(":mailbox_waker=");
+                    Self::write_u64(mailbox.has_waker() as u64);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            }
+        });
     }
 
     fn program_hart_loop_deadline(action: boot_runtime::hart_loop::HartLoopDeadlineAction) {

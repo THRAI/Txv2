@@ -66,6 +66,7 @@ struct VmPmapOps {
     protect_mapping: ProtectMappingFn,
     shootdown_mappings: fn(Asid, &[tx_hal::PmapInvalidation]),
     synchronize_new_mappings: fn(Asid, &[tx_hal::PmapInvalidation]),
+    service_pending_tlb_shootdown: fn(),
 }
 
 impl VmPmapOps {
@@ -79,6 +80,7 @@ impl VmPmapOps {
             protect_mapping: P::protect_mapping,
             shootdown_mappings: P::shootdown_mappings,
             synchronize_new_mappings: P::synchronize_new_mappings,
+            service_pending_tlb_shootdown: P::service_pending_tlb_shootdown,
         }
     }
 }
@@ -192,7 +194,7 @@ impl VmPmap {
 
     pub fn lookup(&self, page: UserPage) -> Option<PmapMappingSnapshot> {
         self.state
-            .lock()
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown)
             .mappings
             .get(&page)
             .map(PmapMapping::snapshot)
@@ -206,13 +208,17 @@ impl VmPmap {
     /// teardown. The lock is held only for the duration of the walk; concurrent
     /// publishes after the call returns are the caller's concern.
     pub fn walk_range(&self, range: UserRange) -> Vec<(UserPage, PmapMappingSnapshot)> {
-        let state = self.state.lock();
+        let state = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown);
         let (start, end) = page_bounds_for_range(range);
         state.mappings.snapshots_in_range(start, end)
     }
 
     pub fn stats(&self) -> PmapStats {
-        let state = self.state.lock();
+        let state = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown);
         PmapStats {
             mapped_pages: state.mappings.len(),
             reservations: state.reservations,
@@ -256,7 +262,9 @@ impl VmPmap {
         let phys = phys_for_ppn(ppn)?;
         let permissions = permissions_for_prot(prot);
         let root = self.root();
-        let mut state = self.state.lock();
+        let mut state = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown);
 
         let mut replaced = false;
         if let Some(existing) = state.mappings.get(&page) {
@@ -352,7 +360,9 @@ impl VmPmap {
         emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.pages", pages.len() as i64);
         emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 0);
         let root = self.root();
-        let mut state = self.state.lock();
+        let mut state = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown);
         let mut invalidations = Vec::new();
         emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.phase", 1);
         state.mappings.reserve_additional(pages.len());
@@ -458,7 +468,9 @@ impl VmPmap {
         // container lock. Keep it across the HAL leaf updates so shadow
         // residency and hardware PTEs cannot be observed or modified as two
         // independent states by another hart.
-        let mut state = self.state.lock();
+        let mut state = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown);
         let drained = state.mappings.drain_range(start, end);
         emit_pmap_map_path_duration(b"debug.vm.map_path.pmap.teardown_drain_ns", drain_start);
         emit_pmap_map_path_count(
@@ -537,7 +549,9 @@ impl VmPmap {
         // Serialize the complete shadow-state/PTE/shootdown transaction with
         // publish, teardown, and gift removal. Different page materialization
         // remains concurrent outside this short pmap commit section.
-        let mut state = self.state.lock();
+        let mut state = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown);
         let pages = mapped_pages_in_range(&state, range);
 
         for page in pages {
@@ -582,7 +596,9 @@ impl VmPmap {
         page: UserPage,
         expected_ppn: Ppn,
     ) -> Result<bool, VmPmapError> {
-        let mut state = self.state.lock();
+        let mut state = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown);
         let Some(mapping) = state.mappings.remove(&page) else {
             return Ok(false);
         };
@@ -658,7 +674,11 @@ impl VmPmap {
 
 impl Drop for VmPmap {
     fn drop(&mut self) {
-        let mapped_pages = self.state.lock().mappings.len();
+        let mapped_pages = self
+            .state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown)
+            .mappings
+            .len();
         let trace_seq = pmap_drop_trace_sample();
         if let Some(seq) = trace_seq {
             emit_pmap_teardown_trace(b"debug.vm.pmap.drop.begin", seq);
@@ -673,7 +693,9 @@ impl Drop for VmPmap {
         }
 
         let released = {
-            let mut state = self.state.lock();
+            let mut state = self
+                .state
+                .lock_with_progress(self.ops.service_pending_tlb_shootdown);
             core::mem::take(&mut state.mappings)
         };
         if let Some(_seq) = trace_seq {

@@ -48,6 +48,6 @@ pub mod boot_runtime {
     pub use tx_reactor::{
         ast, current_delegate_registry, current_task_mailbox, current_timer_wheel, hart_loop,
         userspace, wait, yield_now, HartId, InitialSchedMeta, Phase1QueueKind, Reactor,
-        RescheduleSignal, SharedReactor, SliceClock, TaskKey,
+        RescheduleSignal, SharedReactor, SliceClock, TaskId, TaskKey, TaskRunOwner, TaskStatus,
     };
 }

@@ -162,8 +162,8 @@ tables, trace infrastructure, etc.) can use `Box`, `Vec`, and any
 
 The executable RV64 QEMU path has frame allocation, boot-memory planning,
 direct-map/MMIO pmap extension, typed PT-node allocation, kernel-only
-shootdown accounting, safe in-place kernel leaf protect, committed empty
-intermediate-table teardown for kernel mappings, final high-kernel alias
+shootdown accounting, safe in-place kernel leaf protect, committed
+intermediate-table ownership/lifetime tracking for kernel mappings, final high-kernel alias
 permissions for text/rodata/data/bss/boot-stack pages, `PmapRoot`/ASID
 create-destroy for VM-owned roots, ASID-scoped page shootdown batches,
 no-alloc VM-facing page-range reserve/commit, unmap, and protect wrappers,
@@ -175,7 +175,8 @@ RFENCE for remote pmap shootdown once APs are online. The remaining
 PAGE_SUBSTRATE_v1 exit criteria are:
 
 - superpage/multi-frame shootdown accounting beyond page-sized pins;
-- kernel-managed SMP shootdown protocol if firmware RFENCE is unavailable;
+- kernel-managed SMP shootdown on platforms other than the LA64 QEMU
+  generation-mailbox implementation when firmware RFENCE is unavailable;
 - the full trap shell/user-return path before user/VM faults are enabled.
 
 ### 2.2 Address and pointer boundary

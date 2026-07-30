@@ -968,6 +968,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // userspace trap (which is the only event that resolves the
         // thread future's pending wait).
         loop {
+            // LA64's supervisor IPI is maskable and syscall/fault paths keep
+            // CRMD.IE clear.  Poll the lock-free mailbox at the reactor
+            // boundary so a remote pmap transaction cannot depend solely on
+            // interrupt delivery. Other platforms keep this as a no-op.
+            P::service_pending_tlb_shootdown();
             if init.is_zombie() {
                 break;
             }
@@ -1007,6 +1012,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 Some(step) => step,
                 None => break,
             };
+            P::service_pending_tlb_shootdown();
 
             let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
             let submitted_child_after_poll = Self::drain_pending_child_submits();
@@ -1074,6 +1080,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
                     continue;
                 }
+                P::service_pending_tlb_shootdown();
                 Self::note_reactor_hart_idle(loop_cpu);
                 let wait_state = P::prepare_interrupt_wait();
                 if Self::boot_reactor_has_runnable_work(boot_runtime::HartId(loop_cpu.0)) {
@@ -1082,6 +1089,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     continue;
                 }
                 P::wait_for_interrupt_prepared(wait_state);
+                P::service_pending_tlb_shootdown();
                 Self::note_reactor_hart_active(loop_cpu);
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);

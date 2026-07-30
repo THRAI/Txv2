@@ -232,6 +232,11 @@ impl TaskTable {
         self.task_by_id(id).map(|task| task.status)
     }
 
+    pub(crate) fn wake_requested_by_id(&self, id: TaskId) -> Option<bool> {
+        self.task_by_id(id)
+            .map(|task| task.wake_state.is_wake_requested())
+    }
+
     pub(crate) fn last_stop_reason_by_id(&self, id: TaskId) -> Option<StopReason> {
         self.task_by_id(id).and_then(|task| task.last_stop_reason)
     }

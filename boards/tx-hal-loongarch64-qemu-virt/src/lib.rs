@@ -6,10 +6,10 @@ extern crate std;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
-    CpuPinGuard, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf, IpiKind, IrqDispatchTable,
-    IrqHandled, IrqIf, KernelTrapSink, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion,
-    ObserverIf, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
-    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    CpuPinGuard, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf, InterruptWaitState, IpiKind,
+    IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink, MemoryRegion, MemoryRegionKind, MmioFlags,
+    MmioRegion, ObserverIf, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
     PtNodeAllocator, SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite,
     SignalHandlerRegs, SmpIf, TimeIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
@@ -97,20 +97,67 @@ const LA64_ASID_CAPACITY: usize = LA64_ASID_BITMAP_WORDS * u64::BITS as usize;
 static LA64_ALLOCATED_ASIDS: [AtomicU64; LA64_ASID_BITMAP_WORDS] =
     [const { AtomicU64::new(0) }; LA64_ASID_BITMAP_WORDS];
 static LA64_KERNEL_PGDH_PHYS: AtomicUsize = AtomicUsize::new(0);
-static LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED: AtomicBool = AtomicBool::new(false);
+const LA64_PGDH_BOOTSTRAP_UNINIT: u8 = 0;
+const LA64_PGDH_BOOTSTRAP_BUILDING: u8 = 1;
+const LA64_PGDH_BOOTSTRAP_READY: u8 = 2;
+/// One-time state for the shared high-half kernel mapping.
+///
+/// A boolean "done" flag is insufficient under SMP because two first users
+/// can concurrently mutate the same PGDH tree. BUILDING gives waiters an
+/// explicit lock-free progress state; a failed builder returns to UNINIT so a
+/// later caller can complete the partially materialised, still-valid tree.
+static LA64_KERNEL_PGDH_BOOTSTRAP_STATE: AtomicU8 = AtomicU8::new(LA64_PGDH_BOOTSTRAP_UNINIT);
+/// Sequence protecting each hart's software view of its hardware
+/// ASID/PGDL/PGDH transition. Even values are stable; odd values mean the hart
+/// is between publication and completion of a hardware pmap switch.
+static LA64_PMAP_SWITCH_SEQ: [AtomicU64; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_ACTIVE_PGDL: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
     [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_ACTIVE_PGDH: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
     [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_ACTIVE_ASID: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
     [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+/// Address-space transition published before hardware starts using a new
+/// PGDL.  Root teardown consults both this tuple and the active tuple so it
+/// can distinguish a live in-progress switch from a stale residency bit.
+static LA64_SWITCHING_PGDL: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_SWITCHING_ASID: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_ASID_RESIDENCY: [AtomicU64; LA64_ASID_CAPACITY] =
     [const { AtomicU64::new(0) }; LA64_ASID_CAPACITY];
-static LA64_TLB_SHOOTDOWN_LOCK: AtomicBool = AtomicBool::new(false);
+/// Per-hart full-TLB shootdown mailbox.
+///
+/// LoongArch's board-level IPI is a maskable supervisor interrupt. Txv2 keeps
+/// CRMD.IE clear while executing syscall/fault handlers, so a sender must not
+/// rely exclusively on the interrupt trap to make progress. Request/completion
+/// generations let the target service the same mailbox either from its IPI
+/// handler or from an explicitly safe lock-contention point. Multiple senders
+/// naturally coalesce because every LA64 request currently performs INVTLB-all.
+static LA64_TLB_SHOOTDOWN_REQUESTED: [AtomicU64; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_TLB_SHOOTDOWN_COMPLETED: [AtomicU64; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_TLB_SHOOTDOWN_SERVICING: [AtomicBool; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicBool::new(false) }; LA64_MAX_BOOT_CPUS];
+/// CPUs which still accept new synchronous shootdown acquisitions.
+///
+/// This differs from scheduler online state during the short AP shutdown
+/// drain. A sender pins one target user across request publication and
+/// completion; an offlining CPU clears this mask first and waits for its user
+/// count to reach zero before disabling interrupts permanently.
+static LA64_TLB_ACCEPTING_CPUS: AtomicU64 = AtomicU64::new(1);
+static LA64_TLB_TARGET_USERS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
-const LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS: usize = 4096;
+/// Physical-address ownership registry for committed intermediate page-table
+/// nodes. Keep the capacity and lookup shape aligned with RV64: BuildStorm can
+/// keep thousands of address-space nodes live, and a linear 4096-entry scan
+/// under one global lock becomes both a capacity limit and an SMP bottleneck.
+const LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS: usize = 8192;
 static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry = La64CommittedPtNodeRegistry(
-    UnsafeCell::new([None; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]),
+    UnsafeCell::new([La64CommittedPtNodeEntry::Empty; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]),
 );
 #[cfg(target_arch = "loongarch64")]
 static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] =
@@ -258,10 +305,17 @@ pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFram
 }
 
 struct La64CommittedPtNodeRegistry(
-    UnsafeCell<[Option<PtNode>; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]>,
+    UnsafeCell<[La64CommittedPtNodeEntry; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]>,
 );
 
 unsafe impl Sync for La64CommittedPtNodeRegistry {}
+
+#[derive(Clone, Copy)]
+enum La64CommittedPtNodeEntry {
+    Empty,
+    Tombstone,
+    Occupied(PtNode),
+}
 
 struct La64CommittedPtNodeRegistryGuard;
 

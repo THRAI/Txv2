@@ -1,9 +1,14 @@
 use super::boot_facts::linked_kernel_image;
-use super::la64_irq_trap::{align_up, write_la64_csr};
+use super::la64_irq_trap::{
+    align_up, console_write_hex, console_write_literal, la64_timebase_frequency_hz, read_la64_csr,
+    write_la64_csr,
+};
 #[cfg(feature = "la64-boot-trace")]
 use super::la64_irq_trap::{console_write_hex, console_write_literal};
 use super::la64_percpu::la64_current_cpu_id;
 use super::*;
+
+static LA64_TLB_STALL_DIAG_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn uart_put_byte(byte: u8) {
     let base = la64_uncached_virt(la64_uart_base()) as *mut u8;
@@ -200,32 +205,123 @@ pub(crate) fn prepare_la64_pmap_switch(root: &PmapRoot) -> Result<La64PmapSwitch
     })
 }
 
-pub(crate) fn record_la64_pmap_switch(switch: &La64PmapSwitch) {
-    let cpu = la64_current_cpu_id().0;
-    if cpu >= LA64_MAX_BOOT_CPUS || cpu >= u64::BITS as usize {
-        return;
-    }
-    let previous = LA64_ACTIVE_ASID[cpu].swap(switch.asid, Ordering::AcqRel);
-    LA64_ACTIVE_PGDL[cpu].store(switch.pgdl, Ordering::Release);
-    LA64_ACTIVE_PGDH[cpu].store(switch.pgdh, Ordering::Release);
-    if previous != 0 && previous != switch.asid && previous < LA64_ASID_RESIDENCY.len() {
-        LA64_ASID_RESIDENCY[previous].fetch_and(!(1u64 << cpu), Ordering::AcqRel);
-    }
-    if switch.asid != 0 && switch.asid < LA64_ASID_RESIDENCY.len() {
-        LA64_ASID_RESIDENCY[switch.asid].fetch_or(1u64 << cpu, Ordering::AcqRel);
+fn begin_la64_pmap_transition(cpu: usize, asid: usize, pgdl: usize) {
+    let sequence = LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire);
+    assert_eq!(sequence & 1, 0, "nested LA64 pmap transition on cpu {cpu}");
+    LA64_PMAP_SWITCH_SEQ[cpu]
+        .compare_exchange(
+            sequence,
+            sequence.wrapping_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .expect("concurrent LA64 pmap transition on one hart");
+
+    // Once the sequence is odd, root teardown treats this hart as
+    // non-quiescent even before it can observe which root is incoming. This
+    // closes the tuple -> residency publication gap.
+    LA64_SWITCHING_PGDL[cpu].store(pgdl, Ordering::Relaxed);
+    LA64_SWITCHING_ASID[cpu].store(asid, Ordering::Release);
+    if asid != 0 && asid < LA64_ASID_RESIDENCY.len() {
+        LA64_ASID_RESIDENCY[asid].fetch_or(1u64 << cpu, Ordering::AcqRel);
     }
 }
 
-/// Switch this hart from a user PGDL to the permanent kernel PGDH and only
-/// then publish departure from the user ASID.
-pub(crate) fn deactivate_la64_user_pmap() {
+fn finish_la64_pmap_transition(cpu: usize) {
+    LA64_SWITCHING_ASID[cpu].store(0, Ordering::Relaxed);
+    LA64_SWITCHING_PGDL[cpu].store(0, Ordering::Relaxed);
+    let sequence = LA64_PMAP_SWITCH_SEQ[cpu].fetch_add(1, Ordering::Release);
+    assert_eq!(
+        sequence & 1,
+        1,
+        "LA64 pmap transition completed without begin on cpu {cpu}"
+    );
+}
+
+/// Publish a transition before hardware can start using the incoming PGDL.
+///
+/// The odd sequence is the lifetime barrier: teardown cannot declare any root
+/// quiescent while a hart is between this function and
+/// [`tx_la64_finish_pmap_switch`]. The incoming residency is then installed
+/// before the CSR writes, while the outgoing residency remains until finish.
+#[unsafe(no_mangle)]
+pub extern "C" fn tx_la64_begin_pmap_switch(asid: usize, pgdl: usize) {
     let cpu = la64_current_cpu_id().0;
     if cpu >= LA64_MAX_BOOT_CPUS || cpu >= u64::BITS as usize {
         return;
     }
-    let asid = LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire);
-    if asid == 0 {
+    begin_la64_pmap_transition(cpu, asid, pgdl);
+}
+
+/// Complete an LA64 address-space switch after ASID/PGDL/PGDH and INVTLB are
+/// installed in hardware.
+///
+/// This is called directly by the no-return userspace-entry assembly. Clearing
+/// the outgoing residency any earlier would let another hart free that root
+/// while this hart could still walk it.
+#[unsafe(no_mangle)]
+pub extern "C" fn tx_la64_finish_pmap_switch(asid: usize, pgdl: usize, pgdh: usize) {
+    let cpu = la64_current_cpu_id().0;
+    if cpu >= LA64_MAX_BOOT_CPUS || cpu >= u64::BITS as usize {
         return;
+    }
+    let previous = LA64_ACTIVE_ASID[cpu].load(Ordering::Relaxed);
+    LA64_ACTIVE_PGDL[cpu].store(pgdl, Ordering::Relaxed);
+    LA64_ACTIVE_PGDH[cpu].store(pgdh, Ordering::Relaxed);
+    LA64_ACTIVE_ASID[cpu].store(asid, Ordering::Relaxed);
+    if previous != 0 && previous != asid && previous < LA64_ASID_RESIDENCY.len() {
+        LA64_ASID_RESIDENCY[previous].fetch_and(!(1u64 << cpu), Ordering::AcqRel);
+    }
+    if asid != 0 && asid < LA64_ASID_RESIDENCY.len() {
+        // Keep this idempotent for the standalone activation path and host
+        // tests; begin normally published the bit before the CSR writes.
+        LA64_ASID_RESIDENCY[asid].fetch_or(1u64 << cpu, Ordering::AcqRel);
+    }
+    finish_la64_pmap_transition(cpu);
+}
+
+pub(crate) fn stable_la64_active_root(cpu: usize) -> Option<(usize, usize, usize)> {
+    let before = LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire);
+    if before & 1 != 0 {
+        return None;
+    }
+    let asid = LA64_ACTIVE_ASID[cpu].load(Ordering::Relaxed);
+    let pgdl = LA64_ACTIVE_PGDL[cpu].load(Ordering::Relaxed);
+    let pgdh = LA64_ACTIVE_PGDH[cpu].load(Ordering::Relaxed);
+    let after = LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire);
+    if before == after && after & 1 == 0 {
+        Some((asid, pgdl, pgdh))
+    } else {
+        None
+    }
+}
+
+fn deactivate_la64_user_pmap_matching(expected: Option<(usize, usize)>) -> bool {
+    let cpu = la64_current_cpu_id().0;
+    if cpu >= LA64_MAX_BOOT_CPUS || cpu >= u64::BITS as usize {
+        return false;
+    }
+    let previous_crmd = read_la64_csr(LA64_CSR_CRMD);
+    write_la64_csr(LA64_CSR_CRMD, previous_crmd & !LA64_CRMD_IE);
+
+    let Some((asid, active_pgdl, _)) = stable_la64_active_root(cpu) else {
+        panic!("LA64 current hart is already switching pmaps");
+    };
+    if asid == 0 {
+        if previous_crmd & LA64_CRMD_IE != 0 {
+            let crmd = read_la64_csr(LA64_CSR_CRMD);
+            write_la64_csr(LA64_CSR_CRMD, crmd | LA64_CRMD_IE);
+        }
+        return false;
+    }
+    if expected.is_some_and(|(expected_asid, expected_pgdl)| {
+        asid != expected_asid || active_pgdl != expected_pgdl
+    }) {
+        if previous_crmd & LA64_CRMD_IE != 0 {
+            let crmd = read_la64_csr(LA64_CSR_CRMD);
+            write_la64_csr(LA64_CSR_CRMD, crmd | LA64_CRMD_IE);
+        }
+        return false;
     }
     let pgdh = LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire);
     assert_ne!(
@@ -233,6 +329,7 @@ pub(crate) fn deactivate_la64_user_pmap() {
         "LA64 kernel PGDH must exist before leaving userspace"
     );
 
+    begin_la64_pmap_transition(cpu, 0, 0);
     write_la64_csr(LA64_CSR_ASID, 0);
     write_la64_csr(LA64_CSR_PGDL, 0);
     write_la64_csr(LA64_CSR_PGDH, pgdh);
@@ -240,12 +337,33 @@ pub(crate) fn deactivate_la64_user_pmap() {
     write_la64_csr(LA64_CSR_CRMD, crmd);
     la64_invtlb_all();
 
-    LA64_ACTIVE_PGDL[cpu].store(0, Ordering::Release);
-    LA64_ACTIVE_PGDH[cpu].store(pgdh, Ordering::Release);
-    LA64_ACTIVE_ASID[cpu].store(0, Ordering::Release);
+    LA64_ACTIVE_PGDL[cpu].store(0, Ordering::Relaxed);
+    LA64_ACTIVE_PGDH[cpu].store(pgdh, Ordering::Relaxed);
+    LA64_ACTIVE_ASID[cpu].store(0, Ordering::Relaxed);
     if asid < LA64_ASID_RESIDENCY.len() {
         LA64_ASID_RESIDENCY[asid].fetch_and(!(1u64 << cpu), Ordering::AcqRel);
     }
+    finish_la64_pmap_transition(cpu);
+
+    if previous_crmd & LA64_CRMD_IE != 0 {
+        let crmd = read_la64_csr(LA64_CSR_CRMD);
+        write_la64_csr(LA64_CSR_CRMD, crmd | LA64_CRMD_IE);
+    }
+    true
+}
+
+/// Switch this hart from whichever user PGDL it currently owns to the
+/// permanent kernel PGDH, and publish departure only after hardware is safe.
+pub(crate) fn deactivate_la64_user_pmap() {
+    let _ = deactivate_la64_user_pmap_matching(None);
+}
+
+/// Deactivate only when the current hart is using the root being destroyed.
+///
+/// Destroying root A must never switch an unrelated active root B away from
+/// the CPU.
+pub(crate) fn deactivate_la64_user_pmap_if_matches(asid: Asid, pgdl: PhysAddr) {
+    let _ = deactivate_la64_user_pmap_matching(Some((asid.0 as usize, pgdl.0)));
 }
 
 pub(crate) fn la64_asid_residency_mask(asid: Asid) -> CpuMask {
@@ -256,50 +374,294 @@ pub(crate) fn la64_asid_residency_mask(asid: Asid) -> CpuMask {
     CpuMask::from_bits(LA64_ASID_RESIDENCY[index].load(Ordering::Acquire))
 }
 
-pub(crate) fn wait_for_la64_asid_quiescence(asid: Asid) {
-    while !la64_asid_residency_mask(asid).is_empty() {
+pub(crate) fn wait_for_la64_asid_quiescence(asid: Asid, pgdl: PhysAddr) {
+    let target_asid = asid.0 as usize;
+    let started = super::la64_percpu::la64_read_stable_counter();
+    let diagnostic_after = la64_timebase_frequency_hz().max(1);
+    let mut diagnostic_emitted = false;
+    loop {
+        service_la64_pending_tlb_shootdown();
+        let mut transition_or_owner = false;
+        for cpu in 0..LA64_MAX_BOOT_CPUS {
+            let Some((active_asid, active_pgdl, _)) = stable_la64_active_root(cpu) else {
+                // An odd sequence starts before the incoming root is
+                // published. Conservatively block every root teardown across
+                // this very short hardware-switch interval.
+                transition_or_owner = true;
+                break;
+            };
+            if active_asid == target_asid && active_pgdl == pgdl.0 {
+                transition_or_owner = true;
+                break;
+            }
+        }
+        if !transition_or_owner && la64_asid_residency_mask(asid).is_empty() {
+            break;
+        }
+        if !diagnostic_emitted
+            && super::la64_percpu::la64_read_stable_counter().wrapping_sub(started)
+                >= diagnostic_after
+        {
+            diagnostic_emitted = true;
+            console_write_literal(b"txkernel:la64-pmap-quiesce-stall:target-asid=0x");
+            console_write_hex(target_asid);
+            console_write_literal(b":target-pgdl=0x");
+            console_write_hex(pgdl.0);
+            console_write_literal(b":residency=0x");
+            console_write_hex(la64_asid_residency_mask(asid).bits() as usize);
+            console_write_literal(b"\n");
+            for cpu in 0..LA64_MAX_BOOT_CPUS {
+                let sequence = LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire);
+                let active_asid = LA64_ACTIVE_ASID[cpu].load(Ordering::Relaxed);
+                let active_pgdl = LA64_ACTIVE_PGDL[cpu].load(Ordering::Relaxed);
+                let switching_asid = LA64_SWITCHING_ASID[cpu].load(Ordering::Relaxed);
+                let switching_pgdl = LA64_SWITCHING_PGDL[cpu].load(Ordering::Relaxed);
+                if sequence != 0
+                    || active_asid != 0
+                    || active_pgdl != 0
+                    || switching_asid != 0
+                    || switching_pgdl != 0
+                {
+                    console_write_literal(b"txkernel:la64-pmap-quiesce-stall:cpu=0x");
+                    console_write_hex(cpu);
+                    console_write_literal(b":seq=0x");
+                    console_write_hex(sequence as usize);
+                    console_write_literal(b":active-asid=0x");
+                    console_write_hex(active_asid);
+                    console_write_literal(b":active-pgdl=0x");
+                    console_write_hex(active_pgdl);
+                    console_write_literal(b":switching-asid=0x");
+                    console_write_hex(switching_asid);
+                    console_write_literal(b":switching-pgdl=0x");
+                    console_write_hex(switching_pgdl);
+                    console_write_literal(b"\n");
+                }
+            }
+        }
         core::hint::spin_loop();
     }
 }
 
-fn acquire_la64_tlb_shootdown_lock() {
-    while LA64_TLB_SHOOTDOWN_LOCK
+/// Flush every online hart after residency reaches zero and before the
+/// numeric ASID or any page-table page can be reused.
+pub(crate) fn invalidate_la64_asid_before_reuse() {
+    la64_invtlb_all();
+    let targets = CpuMask::from_bits(
+        <Platform as SmpIf>::online_cpus().bits() & !CpuMask::single(la64_current_cpu_id()).bits(),
+    );
+    la64_remote_tlb_shootdown(targets);
+}
+
+#[inline]
+pub(crate) fn la64_tlb_generation_reached(completed: u64, requested: u64) -> bool {
+    (completed.wrapping_sub(requested) as i64) >= 0
+}
+
+pub(crate) fn try_pin_la64_tlb_target(cpu: usize) -> bool {
+    if cpu >= LA64_MAX_BOOT_CPUS {
+        return false;
+    }
+    let bit = 1u64 << cpu;
+    if LA64_TLB_ACCEPTING_CPUS.load(Ordering::Acquire) & bit == 0 {
+        return false;
+    }
+    LA64_TLB_TARGET_USERS[cpu].fetch_add(1, Ordering::AcqRel);
+    if LA64_TLB_ACCEPTING_CPUS.load(Ordering::Acquire) & bit != 0 {
+        return true;
+    }
+    LA64_TLB_TARGET_USERS[cpu].fetch_sub(1, Ordering::AcqRel);
+    false
+}
+
+pub(crate) fn unpin_la64_tlb_target(cpu: usize) {
+    let previous = LA64_TLB_TARGET_USERS[cpu].fetch_sub(1, Ordering::AcqRel);
+    assert_ne!(previous, 0, "unbalanced LA64 TLB target pin");
+}
+
+pub(crate) fn mark_la64_tlb_cpu_online(cpu: CpuId) {
+    if cpu.0 < LA64_MAX_BOOT_CPUS {
+        debug_assert_eq!(LA64_TLB_TARGET_USERS[cpu.0].load(Ordering::Acquire), 0);
+        LA64_TLB_ACCEPTING_CPUS.fetch_or(CpuMask::single(cpu).bits(), Ordering::AcqRel);
+    }
+}
+
+/// Stop accepting new synchronous requests, then drain every sender which
+/// acquired this hart before the transition.
+pub(crate) fn prepare_la64_tlb_cpu_offline() {
+    let cpu = la64_current_cpu_id();
+    if cpu.0 >= LA64_MAX_BOOT_CPUS {
+        return;
+    }
+
+    // A permanently parked CPU must not retain a root-lifetime reference.
+    deactivate_la64_user_pmap();
+    let bit = CpuMask::single(cpu).bits();
+    LA64_ONLINE_CPUS.fetch_and(!bit, Ordering::AcqRel);
+    LA64_TLB_ACCEPTING_CPUS.fetch_and(!bit, Ordering::AcqRel);
+
+    // A sender which pinned before the accepting-bit clear may publish its
+    // generation afterwards. The pin remains held until completion, so
+    // servicing while users are non-zero closes that race.
+    while LA64_TLB_TARGET_USERS[cpu.0].load(Ordering::Acquire) != 0 {
+        service_la64_pending_tlb_shootdown();
+        core::hint::spin_loop();
+    }
+    service_la64_pending_tlb_shootdown();
+}
+
+/// Service the current hart's full-TLB mailbox without depending on CRMD.IE.
+///
+/// This function deliberately acquires no VM, heap, or IPI locks. It is safe
+/// both from the ordinary IPI trap and from the pmap/vmalloc lock contention
+/// loops that break a sender-holds-lock / target-waits-lock cycle.
+///
+/// The return value reports whether this call serviced, or joined an already
+/// active service of, a pending mailbox generation. A later hardware IPI for
+/// a generation that was already completed by a polling safe point may
+/// conservatively perform one redundant full flush.
+pub(crate) fn service_la64_pending_tlb_shootdown() -> bool {
+    let cpu = la64_current_cpu_id().0;
+    if cpu >= LA64_MAX_BOOT_CPUS {
+        return false;
+    }
+
+    let requested = LA64_TLB_SHOOTDOWN_REQUESTED[cpu].load(Ordering::Acquire);
+    let completed = LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire);
+    if requested == completed {
+        return false;
+    }
+
+    // A nested hardware IPI may arrive while a polling safe point is already
+    // servicing the mailbox. The first context owns INVTLB/completion; the
+    // nested context only needs to clear its hardware interrupt on return.
+    if LA64_TLB_SHOOTDOWN_SERVICING[cpu]
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        core::hint::spin_loop();
+        return true;
     }
+
+    'service: loop {
+        loop {
+            let requested = LA64_TLB_SHOOTDOWN_REQUESTED[cpu].load(Ordering::Acquire);
+            let completed = LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Relaxed);
+            if requested == completed {
+                break;
+            }
+            la64_invtlb_all();
+            LA64_TLB_SHOOTDOWN_COMPLETED[cpu].store(requested, Ordering::Release);
+        }
+
+        // Release ownership before the final recheck. A request can arrive
+        // after the inner loop observed equality while its hardware IPI is
+        // concurrently being acknowledged by a nested context. Rechecking
+        // after this release either lets us reacquire and drain that request,
+        // observes another context doing so, or leaves a later request paired
+        // with its still-pending hardware IPI.
+        LA64_TLB_SHOOTDOWN_SERVICING[cpu].store(false, Ordering::Release);
+        let requested = LA64_TLB_SHOOTDOWN_REQUESTED[cpu].load(Ordering::Acquire);
+        let completed = LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire);
+        if requested == completed {
+            break 'service;
+        }
+        if LA64_TLB_SHOOTDOWN_SERVICING[cpu]
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            break 'service;
+        }
+    }
+    true
 }
 
-fn release_la64_tlb_shootdown_lock() {
-    LA64_TLB_SHOOTDOWN_LOCK.store(false, Ordering::Release);
-}
-
-/// Force remote harts through a full INVTLB and wait for acknowledgement.
+/// Force remote harts through a full INVTLB and wait for their generations.
 ///
-/// LA64 currently has one hardware IPI vector, so requests are serialized.
-/// The receiver performs INVTLB in `boot_smp::ack_ipi(TlbShootdown)` before
-/// publishing its per-kind acknowledgement.
+/// A per-target generation replaces the old global shootdown lock and shared
+/// acknowledgement bit. Concurrent senders can coalesce into one remote full
+/// flush, and every sender services its own inbound mailbox while waiting so
+/// simultaneous shootdowns cannot deadlock each other with interrupts masked.
 pub(crate) fn la64_remote_tlb_shootdown(targets: CpuMask) {
     let current = la64_current_cpu_id();
-    let targets = CpuMask::from_bits(
-        targets.bits()
-            & <Platform as SmpIf>::online_cpus().bits()
-            & !CpuMask::single(current).bits(),
-    );
+    let targets = CpuMask::from_bits(targets.bits() & !CpuMask::single(current).bits());
     if targets.is_empty() {
         return;
     }
 
-    acquire_la64_tlb_shootdown_lock();
-    <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::TlbShootdown, targets);
-    <Platform as SmpIf>::broadcast_ipi(targets, IpiKind::TlbShootdown);
-    while (<Platform as SmpIf>::ipi_ack_cpus(IpiKind::TlbShootdown).bits() & targets.bits())
-        != targets.bits()
-    {
+    let mut generations = [0u64; LA64_MAX_BOOT_CPUS];
+    let mut pinned = 0u64;
+    let mut candidates = targets.bits();
+    while candidates != 0 {
+        let cpu = candidates.trailing_zeros() as usize;
+        let bit = 1u64 << cpu;
+        if !try_pin_la64_tlb_target(cpu) {
+            candidates &= candidates - 1;
+            continue;
+        }
+        pinned |= bit;
+        let generation = LA64_TLB_SHOOTDOWN_REQUESTED[cpu]
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        generations[cpu] = generation;
+        <Platform as SmpIf>::send_ipi(CpuId(cpu), IpiKind::TlbShootdown);
+        candidates &= candidates - 1;
+    }
+
+    let started = super::la64_percpu::la64_read_stable_counter();
+    let diagnostic_after = la64_timebase_frequency_hz().max(1);
+    let mut pending = pinned;
+    while pending != 0 {
+        service_la64_pending_tlb_shootdown();
+        let mut remaining = pending;
+        while remaining != 0 {
+            let cpu = remaining.trailing_zeros() as usize;
+            let bit = 1u64 << cpu;
+            let completed = LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire);
+            if la64_tlb_generation_reached(completed, generations[cpu]) {
+                pending &= !bit;
+                unpin_la64_tlb_target(cpu);
+            }
+            remaining &= remaining - 1;
+        }
+        if super::la64_percpu::la64_read_stable_counter().wrapping_sub(started) >= diagnostic_after
+            && LA64_TLB_STALL_DIAG_EMITTED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            console_write_literal(b"txkernel:la64-tlb-shootdown-stall:sender=0x");
+            console_write_hex(current.0);
+            console_write_literal(b":pending=0x");
+            console_write_hex(pending as usize);
+            console_write_literal(b":online=0x");
+            console_write_hex(<Platform as SmpIf>::online_cpus().bits() as usize);
+            console_write_literal(b":accepting=0x");
+            console_write_hex(LA64_TLB_ACCEPTING_CPUS.load(Ordering::Acquire) as usize);
+            console_write_literal(b"\n");
+            let mut stalled = pending;
+            while stalled != 0 {
+                let cpu = stalled.trailing_zeros() as usize;
+                let bit = 1u64 << cpu;
+                console_write_literal(b"txkernel:la64-tlb-shootdown-stall:target=0x");
+                console_write_hex(cpu);
+                console_write_literal(b":requested=0x");
+                console_write_hex(
+                    LA64_TLB_SHOOTDOWN_REQUESTED[cpu].load(Ordering::Acquire) as usize
+                );
+                console_write_literal(b":completed=0x");
+                console_write_hex(
+                    LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire) as usize
+                );
+                console_write_literal(b":servicing=0x");
+                console_write_hex(
+                    LA64_TLB_SHOOTDOWN_SERVICING[cpu].load(Ordering::Acquire) as usize
+                );
+                console_write_literal(b":users=0x");
+                console_write_hex(LA64_TLB_TARGET_USERS[cpu].load(Ordering::Acquire));
+                console_write_literal(b"\n");
+                stalled &= !bit;
+            }
+        }
         core::hint::spin_loop();
     }
-    release_la64_tlb_shootdown_lock();
 }
 
 pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
@@ -312,6 +674,9 @@ pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
         trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:switch:skip\n");
         return Ok(());
     }
+    let previous_crmd = read_la64_csr(LA64_CSR_CRMD);
+    write_la64_csr(LA64_CSR_CRMD, previous_crmd & !LA64_CRMD_IE);
+    tx_la64_begin_pmap_switch(switch.asid, switch.pgdl);
     trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pwcl:ok\n");
 
     trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:root=0x");
@@ -333,37 +698,80 @@ pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
     la64_invtlb_all();
     trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:invtlb:ok\n");
 
-    record_la64_pmap_switch(&switch);
+    tx_la64_finish_pmap_switch(switch.asid, switch.pgdl, switch.pgdh);
+    if previous_crmd & LA64_CRMD_IE != 0 {
+        let crmd = read_la64_csr(LA64_CSR_CRMD);
+        write_la64_csr(LA64_CSR_CRMD, crmd | LA64_CRMD_IE);
+    }
     Ok(())
 }
 
 pub(crate) fn ensure_la64_kernel_pgdh_bootstrap_mapped() -> Result<PhysAddr, PmapError> {
     let root = ensure_la64_kernel_pgdh_root()?;
-    if LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED.load(Ordering::Acquire) {
-        return Ok(root);
-    }
+    loop {
+        match LA64_KERNEL_PGDH_BOOTSTRAP_STATE.load(Ordering::Acquire) {
+            LA64_PGDH_BOOTSTRAP_READY => return Ok(root),
+            LA64_PGDH_BOOTSTRAP_BUILDING => {
+                // The builder can be waiting on a pmap operation whose
+                // shootdown targets us, so a plain spin is not a valid SMP
+                // once primitive on LA64.
+                service_la64_pending_tlb_shootdown();
+                core::hint::spin_loop();
+            }
+            LA64_PGDH_BOOTSTRAP_UNINIT => {
+                if LA64_KERNEL_PGDH_BOOTSTRAP_STATE
+                    .compare_exchange(
+                        LA64_PGDH_BOOTSTRAP_UNINIT,
+                        LA64_PGDH_BOOTSTRAP_BUILDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
 
-    let image = linked_kernel_image();
-    let start = align_down(image.start.0, <Platform as PlatformConfig>::PAGE_SIZE);
-    let end = align_up(image.end().0, <Platform as PlatformConfig>::PAGE_SIZE);
-    let mut phys = start;
-    while phys < end {
-        let virt = VirtAddr(la64_cached_virt(phys));
-        let reservation =
-            reserve_la64_mapping_in_root(root, virt, PhysAddr(phys), PmapReserveKind::Page4K)?;
-        if let Some(reservation) = reservation {
-            register_la64_committed_intermediates(reservation.intermediates());
-            let permissions = PmapPermissions::KERNEL_RW
-                .union(PmapPermissions::EXECUTE)
-                .union(PmapPermissions::GLOBAL);
-            let leaf = encode_la64_leaf_pte(PhysAddr(phys), permissions);
-            write_la64_leaf(root, virt, PmapReserveKind::Page4K, leaf)?;
+                let result = (|| {
+                    let image = linked_kernel_image();
+                    let start = align_down(image.start.0, <Platform as PlatformConfig>::PAGE_SIZE);
+                    let end = align_up(image.end().0, <Platform as PlatformConfig>::PAGE_SIZE);
+                    let mut phys = start;
+                    while phys < end {
+                        let virt = VirtAddr(la64_cached_virt(phys));
+                        let reservation = reserve_la64_mapping_in_root(
+                            root,
+                            virt,
+                            PhysAddr(phys),
+                            PmapReserveKind::Page4K,
+                        )?;
+                        if let Some(reservation) = reservation {
+                            register_la64_committed_intermediates(reservation.intermediates());
+                            let permissions = PmapPermissions::KERNEL_RW
+                                .union(PmapPermissions::EXECUTE)
+                                .union(PmapPermissions::GLOBAL);
+                            let leaf = encode_la64_leaf_pte(PhysAddr(phys), permissions);
+                            write_la64_leaf(root, virt, PmapReserveKind::Page4K, leaf)?;
+                        }
+                        phys = phys.saturating_add(<Platform as PlatformConfig>::PAGE_SIZE);
+                    }
+                    Ok(root)
+                })();
+
+                LA64_KERNEL_PGDH_BOOTSTRAP_STATE.store(
+                    if result.is_ok() {
+                        LA64_PGDH_BOOTSTRAP_READY
+                    } else {
+                        // Existing leaves and committed intermediates remain
+                        // valid. A later builder may resume the idempotent walk.
+                        LA64_PGDH_BOOTSTRAP_UNINIT
+                    },
+                    Ordering::Release,
+                );
+                return result;
+            }
+            state => panic!("invalid LA64 PGDH bootstrap state {state}"),
         }
-        phys = phys.saturating_add(<Platform as PlatformConfig>::PAGE_SIZE);
     }
-
-    LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED.store(true, Ordering::Release);
-    Ok(root)
 }
 
 pub(crate) fn ensure_la64_kernel_pgdh_root() -> Result<PhysAddr, PmapError> {
@@ -465,11 +873,12 @@ pub(crate) fn unmap_la64_kernel_mapping(
     if root == 0 {
         return Ok(None);
     }
-    let result = unmap_la64_mapping_in_root(PhysAddr(root), virt, kind)?;
-    if result.is_some() {
-        prune_la64_empty_tables(PhysAddr(root), virt, kind);
-    }
-    Ok(result)
+    // Committed kernel intermediate tables remain resident.  The vmalloc
+    // window is bounded, and reclaiming a now-empty branch here would happen
+    // before the caller's cross-hart shootdown.  A remote page-table walk
+    // could therefore dereference a page that had already been returned to
+    // the allocator and reused for unrelated data.
+    unmap_la64_mapping_in_root(PhysAddr(root), virt, kind)
 }
 
 pub(crate) fn protect_la64_kernel_mapping(
@@ -732,7 +1141,10 @@ pub(crate) fn unmap_la64_user_mapping(
     }
     let phys = la64_pte_phys(current);
     *slot = 0;
-    prune_la64_empty_user_tables(root.phys(), virt);
+    // Keep committed L0/L1/L2 tables owned by this root until
+    // destroy_pmap_root() has observed ASID quiescence.  Ordinary unmap only
+    // invalidates the leaf; its shootdown has not completed yet, so pruning
+    // and freeing an intermediate node here would race stale hardware walks.
     Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
 }
 
@@ -933,76 +1345,6 @@ pub(crate) fn protect_la64_mapping_in_root(
     Ok(Some(PmapInvalidation::new(virt, kind.size())))
 }
 
-pub(crate) fn prune_la64_empty_user_tables(root: PhysAddr, virt: VirtAddr) {
-    prune_la64_empty_tables(root, virt, PmapReserveKind::Page4K);
-}
-
-pub(crate) fn prune_la64_empty_tables(root: PhysAddr, virt: VirtAddr, kind: PmapReserveKind) {
-    let root_table = la64_page_table_mut_from_phys(root);
-    let l2_slot = &mut root_table[la64_l3_index(virt.0)];
-    if !la64_pte_is_branch(*l2_slot) {
-        return;
-    }
-    let l2_phys = la64_pte_phys(*l2_slot);
-    let l2 = la64_page_table_mut_from_phys(l2_phys);
-    if kind == PmapReserveKind::Superpage1G {
-        if la64_page_table_is_empty(l2) {
-            *l2_slot = 0;
-            release_la64_committed_pt_node(l2_phys);
-        }
-        return;
-    }
-
-    let l1_slot = &mut l2[la64_l2_index(virt.0)];
-    if !la64_pte_is_branch(*l1_slot) {
-        if la64_page_table_is_empty(l2) {
-            *l2_slot = 0;
-            release_la64_committed_pt_node(l2_phys);
-        }
-        return;
-    }
-    let l1_phys = la64_pte_phys(*l1_slot);
-    let l1 = la64_page_table_mut_from_phys(l1_phys);
-    if kind == PmapReserveKind::Superpage2M {
-        if la64_page_table_is_empty(l1) {
-            *l1_slot = 0;
-            release_la64_committed_pt_node(l1_phys);
-        }
-        if la64_page_table_is_empty(l2) {
-            *l2_slot = 0;
-            release_la64_committed_pt_node(l2_phys);
-        }
-        return;
-    }
-
-    let l0_slot = &mut l1[la64_l1_index(virt.0)];
-    if !la64_pte_is_branch(*l0_slot) {
-        if la64_page_table_is_empty(l1) {
-            *l1_slot = 0;
-            release_la64_committed_pt_node(l1_phys);
-        }
-        if la64_page_table_is_empty(l2) {
-            *l2_slot = 0;
-            release_la64_committed_pt_node(l2_phys);
-        }
-        return;
-    }
-    let l0_phys = la64_pte_phys(*l0_slot);
-    let l0 = la64_page_table_mut_from_phys(l0_phys);
-    if la64_page_table_is_empty(l0) {
-        *l0_slot = 0;
-        release_la64_committed_pt_node(l0_phys);
-    }
-    if la64_page_table_is_empty(l1) {
-        *l1_slot = 0;
-        release_la64_committed_pt_node(l1_phys);
-    }
-    if la64_page_table_is_empty(l2) {
-        *l2_slot = 0;
-        release_la64_committed_pt_node(l2_phys);
-    }
-}
-
 pub(crate) fn release_la64_user_page_table_tree(phys: PhysAddr, level: usize) {
     let table = la64_page_table_mut_from_phys(phys);
     if level > 0 {
@@ -1138,10 +1480,6 @@ pub(crate) fn la64_pte_phys(pte: u64) -> PhysAddr {
     PhysAddr((pte & LA64_PTE_PFN_MASK) as usize)
 }
 
-pub(crate) fn la64_page_table_is_empty(table: &[u64; 512]) -> bool {
-    table.iter().all(|entry| *entry == 0)
-}
-
 pub(crate) fn la64_l3_index(virt: usize) -> usize {
     (virt >> 39) & 0x1ff
 }
@@ -1171,18 +1509,33 @@ pub(crate) fn lock_la64_committed_pt_node_registry() -> La64CommittedPtNodeRegis
 pub(crate) fn register_la64_committed_pt_node(node: PtNode) {
     let _guard = lock_la64_committed_pt_node_registry();
     let nodes = unsafe { &mut *LA64_COMMITTED_PT_NODES.0.get() };
-    for slot in nodes.iter_mut() {
-        if slot.is_some_and(|registered| registered.phys == node.phys) {
-            return;
+    let start = la64_committed_pt_node_slot_index(node.phys);
+    let mut first_tombstone = None;
+    for offset in 0..LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS {
+        let index = (start + offset) & (LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS - 1);
+        match nodes[index] {
+            La64CommittedPtNodeEntry::Empty => {
+                let index = first_tombstone.unwrap_or(index);
+                nodes[index] = La64CommittedPtNodeEntry::Occupied(node);
+                return;
+            }
+            La64CommittedPtNodeEntry::Tombstone => {
+                first_tombstone.get_or_insert(index);
+            }
+            La64CommittedPtNodeEntry::Occupied(registered) if registered.phys == node.phys => {
+                return;
+            }
+            La64CommittedPtNodeEntry::Occupied(_) => {}
         }
     }
-    for slot in nodes.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(node);
-            return;
-        }
+    if let Some(index) = first_tombstone {
+        nodes[index] = La64CommittedPtNodeEntry::Occupied(node);
+        return;
     }
-    panic!("LA64 committed PT-node registry exhausted");
+    panic!(
+        "LA64 committed PT-node registry exhausted: entries={}",
+        LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS
+    );
 }
 
 pub(crate) fn register_la64_committed_intermediates(intermediates: PmapReservationIntermediates) {
@@ -1200,12 +1553,27 @@ pub(crate) fn register_la64_committed_intermediates(intermediates: PmapReservati
 pub(crate) fn take_la64_committed_pt_node(phys: PhysAddr) -> Option<PtNode> {
     let _guard = lock_la64_committed_pt_node_registry();
     let nodes = unsafe { &mut *LA64_COMMITTED_PT_NODES.0.get() };
-    for slot in nodes.iter_mut() {
-        if slot.is_some_and(|registered| registered.phys == phys) {
-            return slot.take();
+    let start = la64_committed_pt_node_slot_index(phys);
+    for offset in 0..LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS {
+        let index = (start + offset) & (LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS - 1);
+        match nodes[index] {
+            La64CommittedPtNodeEntry::Empty => return None,
+            La64CommittedPtNodeEntry::Tombstone => {}
+            La64CommittedPtNodeEntry::Occupied(registered) if registered.phys == phys => {
+                nodes[index] = La64CommittedPtNodeEntry::Tombstone;
+                return Some(registered);
+            }
+            La64CommittedPtNodeEntry::Occupied(_) => {}
         }
     }
     None
+}
+
+#[inline]
+pub(crate) fn la64_committed_pt_node_slot_index(phys: PhysAddr) -> usize {
+    debug_assert!(LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS.is_power_of_two());
+    let page = phys.0 >> 12;
+    page.wrapping_mul(0x9e37_79b9_7f4a_7c15usize) & (LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS - 1)
 }
 
 pub(crate) fn release_la64_committed_pt_node(phys: PhysAddr) {

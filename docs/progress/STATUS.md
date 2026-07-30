@@ -18060,6 +18060,54 @@
   `readelf` confirmed a 6 MiB `.bss.stack`. Next step/blocker: obtain the
   refreshed official images containing `ss`, then run RV with 16 GiB/8 harts
   and LA with 36 GiB/12 harts on a host with sufficient RAM.
+- 2026-07-30 LA64 progress-safe TLB shootdown and pmap lifetime: the LA
+  BuildStorm hang after `BUILDSTORM_TOOLCHAIN ok` was decoded against the
+  submitted kernel as a synchronous shootdown cycle. One hart held
+  `VmPmap.state` while waiting for maskable board-IPIs; target harts had
+  `CRMD.IE=0` and spun for that same lock. The old global shootdown lock and
+  shared ack bit are replaced by per-hart requested/completed generations.
+  Senders service their own inbound mailbox while waiting, and contended
+  pmap/vmalloc locks run the same allocation-free, lock-free progress hook.
+  The shared hardware IPI is cleared before mailbox drain and reasserted from
+  remaining software pending bits, closing the trailing-clear lost-request
+  race. ASID/PGDL switching now uses a per-hart odd/even lifetime sequence
+  around incoming publication, CSR writes, full INVTLB, active publication,
+  and outgoing removal; teardown consumes stable snapshots rather than
+  repairing remote residency by inference. Synchronous targets are pinned
+  across request/completion, and AP shutdown withdraws acceptance then drains
+  existing senders before permanent interrupt masking. Shared kernel PGDH
+  bootstrap uses a retryable `UNINIT/BUILDING/READY` once protocol. Ordinary LA
+  unmap no longer frees empty L0/L1/L2 nodes before shootdown; user nodes live
+  until root destruction and bounded kernel nodes remain resident. The
+  committed-node registry now uses an 8192-entry open-addressed hash table
+  instead of a 4096-entry linear scan. Verification: LA HAL 52/52, RV HAL
+  87/87, tx-kernel/LA HAL checks, RV64+LA64 release builds, and an
+  8-hart/4-GiB local-QEMU-9.2.1 boot passed CPU-online, shootdown, IPI, AP
+  reactor/runqueue, zone, runtime, device, mount, and userspace-submit
+  sentinels. `cargo xtask unit` still reports this branch's pre-existing
+  tx-shims test-scaffold symbol/type failures and `run_thread` future-size
+  budget (2112/2048); unrelated ext4 and tx-scripts suites pass. The docs lint
+  still reports 20 pre-existing broken-link/anchor findings outside the files
+  changed by this decision.
+  Decision:
+  `docs/progress/decisions/2026-07-30-la64-progress-safe-tlb-shootdown.md`.
+  Next: rerun the official writable LA image for end-to-end CAgent and
+  BuildStorm validation. The system QEMU 8.2.2 binary is not a valid substitute
+  for this board test; the project's local QEMU 9.2.1 reaches the sentinels
+  above with the same kernel.
+- 2026-07-30 LA64 SMP idle lost-wakeup fix: the RV64 board already implemented
+  the reactor's two-phase interrupt wait contract, but LA64 inherited empty
+  prepare/cancel hooks and enabled interrupts immediately before `idle`.
+  An interrupt could therefore be handled after the final runnable check but
+  before `idle`, leaving the hart asleep with no pending wakeup. LA64 now masks
+  interrupts during the final check and uses a Linux-style assembly idle
+  rollback region: an interrupt taken in that region redirects ERA to the
+  instruction after `idle`. The existing periodic timer fallback remains
+  enabled because an A/B run with one-shot TCFG stalled before the CAgent
+  server started. Verification: all 45 LA64 HAL tests passed, release and
+  submission kernels rebuilt, and an LA64 8-hart/4-GiB writable-image run
+  completed CAgent 10/10 before entering BuildStorm. Runtime log:
+  `target/cagent-la-idle-final-rerun.log`.
 - Real K210 boot, linker, and hardware path are not implemented yet.
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.

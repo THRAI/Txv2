@@ -36,9 +36,8 @@ _start:
     csrwr   $t0, TX_LA64_CSR_DMW0
     li.d    $t0, TX_LA64_DMW_UNCACHED
     csrwr   $t0, TX_LA64_CSR_DMW1
-    move    $t0, $zero
-    csrwr   $t0, TX_LA64_CSR_DMW2
-    csrwr   $t0, TX_LA64_CSR_DMW3
+    csrwr   $zero, TX_LA64_CSR_DMW2
+    csrwr   $zero, TX_LA64_CSR_DMW3
     invtlb  0x0, $zero, $zero
 
     li.d    $t0, TX_LA64_HIGH_START
@@ -55,9 +54,8 @@ tx_la64_secondary_start:
     csrwr   $t0, TX_LA64_CSR_DMW0
     li.d    $t0, TX_LA64_DMW_UNCACHED
     csrwr   $t0, TX_LA64_CSR_DMW1
-    move    $t0, $zero
-    csrwr   $t0, TX_LA64_CSR_DMW2
-    csrwr   $t0, TX_LA64_CSR_DMW3
+    csrwr   $zero, TX_LA64_CSR_DMW2
+    csrwr   $zero, TX_LA64_CSR_DMW3
     invtlb  0x0, $zero, $zero
     li.d    $s4, 1
     li.d    $t0, TX_LA64_HIGH_START
@@ -110,9 +108,8 @@ tx_la64_high_start:
     csrwr   $t0, TX_LA64_CSR_DMW0
     li.d    $t0, TX_LA64_DMW_UNCACHED
     csrwr   $t0, TX_LA64_CSR_DMW1
-    move    $t0, $zero
-    csrwr   $t0, TX_LA64_CSR_DMW2
-    csrwr   $t0, TX_LA64_CSR_DMW3
+    csrwr   $zero, TX_LA64_CSR_DMW2
+    csrwr   $zero, TX_LA64_CSR_DMW3
     li.w    $t4, -1
     li.d    $t5, TX_LA64_IOCSR_IPI_EN
     iocsrwr.w $t4, $t5
