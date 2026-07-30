@@ -793,6 +793,58 @@ fn dispatch_tcp_read_write_allows_socket_sized_inline_batch() {
         SyscallResult::Return(read_back.len() as i64)
     );
     assert_eq!(read_back, payload);
+
+    let mut empty = [0u8; 1];
+    assert_eq!(
+        socket_req(
+            NR_READ,
+            [
+                accepted_fd as u64,
+                empty.as_mut_ptr() as u64,
+                empty.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(EAGAIN_VALUE),
+        "a mailbox-less bootstrap read must not park after the queue is drained"
+    );
+}
+
+#[test]
+fn dispatch_tcp_read_write_rejects_unconnected_socket() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+    let byte = [0x5au8; 1];
+
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [fd as u64, byte.as_ptr() as u64, byte.len() as u64, 0, 0, 0],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EPIPE))
+    );
+
+    let mut out = [0u8; 1];
+    assert_eq!(
+        socket_req(
+            NR_READ,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENOTCONN))
+    );
 }
 
 #[test]

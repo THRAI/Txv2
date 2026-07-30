@@ -2286,18 +2286,12 @@ where
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
-    // A bootstrap context has no mailbox and therefore cannot park in
-    // drive(). Keep the readiness gate, but let ready sockets continue
-    // through OpenFileReadOp and FileOps::read.
+    // Give queued loopback work one bounded chance before a bootstrap read.
+    // The generic driver below uses Nonblocking mode when there is no mailbox,
+    // so immediate FileOps results (including semantic errors) still win over
+    // EAGAIN while a genuine Yield cannot park forever.
     if super::socket::socket_identity_from_file(&file).is_ok() && ctx.mailbox.is_none() {
-        // Match recvfrom/poll/select: give already-queued loopback work one
-        // bounded chance to publish peer readiness before declaring EAGAIN.
         super::socket::drive_loopback_pending();
-        let interest =
-            FdReadyMask::READ | FdReadyMask::ERR | FdReadyMask::HUP | FdReadyMask::RDHUP;
-        if fd_ready_report_for_poll::<P>(&file, interest).ready == FdReadyMask::empty() {
-            return SyscallResult::Error(EAGAIN_VALUE);
-        }
     }
 
     sys_read_non_socket::<P>(args, ctx, file).await
@@ -2456,12 +2450,12 @@ where
     let mut script_ctx = build_subject_script_ctx(ctx);
     // The op acquires its own epoch guard inside `step()` (STEP_MODEL_v2
     // §1, INVARIANTS_v5 YIELD-5 / EBR-7); no guard crosses `.await`.
-    let mode = if file.flags().nonblocking {
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let mode = if file.flags().nonblocking || mailbox_arc.is_none() {
         DriveMode::Nonblocking
     } else {
         DriveMode::Waiting
     };
-    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 

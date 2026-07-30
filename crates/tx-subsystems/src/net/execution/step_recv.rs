@@ -7,7 +7,7 @@ use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_recv_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::structure::{
     RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
-    SocketRecvBytesOutcome, SocketType, TcpState,
+    SocketRecvBytesOutcome, SocketType, TcpState, UnixStreamState,
 };
 
 pub fn step_recv(
@@ -84,6 +84,9 @@ pub fn step_recv_kernel_bytes(
     if let Some(errno) = recv_flags_error(witness.flags) {
         return StepOutcome::Err(errno);
     }
+    if let Some(errno) = stream_recv_state_error(socket, &payload) {
+        return StepOutcome::Err(errno);
+    }
     if payload.shutdown_rd() || out.is_empty() {
         return StepOutcome::Done(SocketRecvBytesOutcome::default());
     }
@@ -141,6 +144,18 @@ fn sctp_recv_disconnected(payload: &SocketPayload) -> bool {
         // 1-to-1 (Stream): anything other than Connected is ENOTCONN.
         SocketProtocol::Sctp(_) => true,
         _ => false,
+    }
+}
+
+fn stream_recv_state_error(socket: &Cap<SocketIdentity>, payload: &SocketPayload) -> Option<Errno> {
+    match payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+        | SocketProtocol::UnixStream(UnixStreamState::Connected { .. }) => None,
+        SocketProtocol::Tcp(_) | SocketProtocol::UnixStream(_) => Some(Errno::ENOTCONN),
+        _ if matches!(socket.kind, SocketKind::Tcp | SocketKind::UnixStream) => {
+            Some(Errno::ENOTCONN)
+        }
+        _ => None,
     }
 }
 

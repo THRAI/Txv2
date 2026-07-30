@@ -107,6 +107,9 @@ pub fn step_send_kernel_bytes(
     if payload.shutdown_wr() {
         return StepOutcome::Err(Errno::EPIPE);
     }
+    if let Some(errno) = stream_send_state_error(socket, &payload) {
+        return StepOutcome::Err(errno);
+    }
     if let Some(errno) =
         udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + bytes.len())
     {
