@@ -29,6 +29,7 @@ a git submodule for algorithm study; no rsext4 code is used at runtime.
 
 **Companion documents.**
 
+- [`EXT4_LIFECYCLE_v1.md`](EXT4_LIFECYCLE_v1.md) — canonical Tier 1 ownership and terminal-state contract for file-I/O requests, admitted mutations, fsync/sync/unmount settlement, production-path convergence, and crash/e2fsprogs acceptance. Where older phase prose implies caller-managed cleanup, commit-time journal release, multiple active Tier 1 transactions, accumulated uncheckpointed transactions, or concurrent checkpoint publication, this companion's serialized Tier 1 lifecycle wins. Phase-4 T4.5/T4.6 below use the revised serialized form.
 - [`MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — canonical dual-plane file-I/O and global memory-pressure architecture; it supersedes this plan's older global `FrameMeta` CLOCK and dirty-authority prose.
 - [`VFS_CHECKS_V2.1.md`](VFS_CHECKS_V2.1.md) and [`MOUNT_v1.md`](MOUNT_v1.md) — VFS ownership boundary, `FsOps` and `FsPageBacking` consumer side.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — `FsPageBacking` trait, `PageContainer` model.
@@ -132,7 +133,7 @@ and file-page replacement algorithms are owned by
 | RNode zone | Live-node slots | Dies when no edges and no payload-capable holders |
 | Coherence index | `fs_object_id → Weak<RNode>` per mount | Weak references; entries die with their RNodes |
 | Slab (kernel heap) | Kernel allocations backing Box/Vec/etc | Simple free-on-empty; no per-CPU cache in v1 |
-| Journal transactions | Pre-commit buffered metadata mutations | Bounded by journal size; commit releases |
+| Journal transactions | Admitted metadata after-images, revoke records, commit/checkpoint state | Bounded by journal size; checkpoint plus safe tail advancement releases the journal extent |
 
 **Provider policy by phase.**
 
@@ -241,7 +242,7 @@ not a Tier 1 claim.
 | Directories | linear directories plus htree lookup/readdir; insertion is supported while the current leaf has capacity; split/rebalance belongs to Tier 2 |
 | Objects | regular files, directories, fast/block symlinks and hard links; unlinked-open lifetime and classic-orphan recovery are journaled for supported shapes |
 | Mutation | create, mkdir, link, symlink, unlink, rmdir, same/cross-directory rename, chmod/chown/utimens, buffered write, truncate and fsync/fdatasync through immutable mutation admission |
-| Durability | JBD2 ordered mode, replay, revoke and classic-orphan recovery for supported free/truncate shapes, checkpoint, clean unmount, journal wrap/backpressure and remount-RO on integrity error |
+| Durability | JBD2 ordered mode, replay, revoke and classic-orphan recovery for supported free/truncate shapes, regular/directory fsync, fdatasync, syncfs, sync, checkpoint, clean unmount, serialized journal wrap/backpressure and recovery-only mount state on uncertain commit or settlement failure |
 | Integration | VFS/Mount/PageBacked ownership, L5 ext4 plans, L4/L6 I/O-manager execution, mmap/read/write and Alpine/OSComp guest workflows |
 
 Tier 1 may return `EOPNOTSUPP` before mutation for a shape outside the table,
@@ -264,10 +265,10 @@ and transaction protocol. It adds:
 - common xattrs, `security.*`/`user.*` storage needed by Linux userland and
   POSIX ACLs, after the VFS/credential authority seam is documented;
 - common `fallocate` operations (preallocate, punch-hole, zero-range),
-  `statfs`, `syncfs`, `msync`, `O_DIRECT` coherency, `FIEMAP` and the common ext4
+  `statfs`, `msync`, `O_DIRECT` coherency, `FIEMAP` and the common ext4
   ioctl subset selected by actual Linux tests;
-- mount error policy, RO fallback, clean remount/unmount and sustained SMP
-  mutation under journal pressure;
+- full mount error policy, remount-RO/RW transitions, forced-unmount semantics,
+  and sustained SMP mutation under journal pressure;
 - the applicable xfstests generic/ext4 groups, with every exclusion tied to a
   named Tier 3 feature rather than a generic skip.
 
@@ -1016,18 +1017,25 @@ This phase may be absorbed into phases 1–2 depending on reactor maturity. List
 
 **Scope.**
 
-- `JournalState` inside `MountPayload`: current transaction, outstanding committed-but-uncheckpointed transactions, journal PC handles.
+- `JournalState` inside `MountPayload`: one Tier 1 transaction owner, its
+  admitted/committing/committed-needs-settlement phase, journal extent token,
+  and journal PC handles. Multiple simultaneously active or accumulated
+  uncheckpointed transactions are Tier 2 scheduling optimizations.
 - Mount-time replay: scan journal, identify committed transactions (those with valid commit records and matching checksums), replay their metadata writes directly. Use phase 0 JBD2 record parsing and phase 1 PC primitives. Replay is bounded work using only phases 0–2.
 - Transaction API inside tx-ext4: operations that mutate metadata start by attaching to the current transaction. Mutations buffer in the transaction, not directly in the metadata PCs.
 - Commit step machine: one step function per commit phase.
   - `step_data_wait`: wait for all data-page writes of ordered-mode files participating in this transaction to complete. Yields on the owned wait source while I/O is outstanding.
   - `step_metadata_write`: write the transaction's metadata blocks to the journal. Yields on journal I/O.
   - `step_commit_record`: write the commit record with checksum. Yields on journal I/O.
-  - `step_checkpoint`: later, write the metadata from the journal back to the metadata PCs' home locations.
+  - `step_checkpoint`: before admitting the next Tier 1 mutation, write the
+    metadata from the journal back to home locations, flush, advance the safe
+    journal tail, refresh caches, and settle the transaction token.
 - Ordering rules:
   - Data writes (for files in this transaction) must reach disk before the commit record.
   - The commit record must reach disk before metadata is checkpointed to its home location.
-  - Checkpoint can happen arbitrarily later; transactions accumulate in the journal until their home-location writes are confirmed durable.
+  - Tier 1 serializes later mutation admission behind checkpoint, safe tail
+    advancement, cache settlement, and token release. Background checkpoint
+    and accumulated committed transactions are Tier 2 optimizations.
 - Flush and force-commit paths for `fsync`.
 
 **Test milestones.**
@@ -1036,8 +1044,14 @@ This phase may be absorbed into phases 1–2 depending on reactor maturity. List
 - **T4.2 Crash and e2fsck -n.** Random kill during sustained write workload (1000 iterations); remount; `e2fsck -n` reports clean; no silent corruption detected by secondary integrity checks (file-data CRCs).
 - **T4.3 fsync durability.** Process A writes then fsyncs; crash; remount; A's data is present.
 - **T4.4 No fsync means can lose.** Process writes but does not fsync; crash; may or may not see the data but filesystem is consistent.
-- **T4.5 Concurrent transactions.** Two processes mutating different inodes. Both transactions progress; neither blocks the other unnecessarily; commits serialize correctly.
-- **T4.6 Journal wrap.** Fill the journal; transactions block on checkpoint progress; verify forward progress continues.
+- **T4.5 Concurrent callers, serialized owner.** Two processes mutate different
+  inodes. The mount owner serializes their handles without lost wakeups,
+  starvation, leaked tokens, or unnecessary blocking after the earlier handle
+  settles. Tier 1 does not require simultaneously active transactions.
+- **T4.6 Serialized journal wrap.** Drive sequential transactions across the
+  ring boundary. Checkpoint and safe tail advancement reclaim each extent;
+  admission blocks while the current owner has not settled and resumes with
+  forward progress after reclamation.
 - **T4.7 Interop with `e2fsprogs`.** After clean unmount, mount the same image on Linux, run `fsck.ext4 -f`; Linux reports clean; read a file through Linux; content correct.
 
 **Phase-4 exit criterion.** All T4.* pass. Power-cut torture runs for 1000

@@ -98,6 +98,7 @@ How work runs: the step primitive and the runtime that drives it.
 - [`BDEV_FS.md`](05_filesystem/BDEV_FS.md) — block-device pseudo-filesystem; bytes ↔ blocks translation over PAGE_BACKED.
 - [`bringup_fs_specs_v_1 (1).md`](<05_filesystem/bringup_fs_specs_v_1 (1).md>) — bringup filesystem specs for tmpfs, initramfs cpio `newc`, and minimal procfs.
 - [`TX_EXT4_PLAN_v1_2.md`](05_filesystem/TX_EXT4_PLAN_v1_2.md) — Tx-native ext4 backend plan: Linux/e2fsprogs authority, Tier 1 controlled production profile, Tier 2 mainstream compatibility, mutation admission, cache and reclaim policy.
+- [`EXT4_LIFECYCLE_v1.md`](05_filesystem/EXT4_LIFECYCLE_v1.md) — canonical Tier 1 correctness lifecycle: owned file-I/O terminalization, ext4 mutation custody, mount settlement, fail-closed production convergence, and crash/e2fsprogs acceptance.
 
 ## 06 · Devices
 
@@ -116,6 +117,6 @@ How work runs: the step primitive and the runtime that drives it.
 
 **For VM work.** 00 01_CONCEPTS_v5, 02_INVARIANTS_v5, object_model_v2, SUBSYSTEM_ANATOMY_v2_1 → 01 PAGE_SUBSTRATE → 03 MEMORY_IO_ARCHITECTURE → 03 PAGE_BACKED → 03 VM.
 
-**For filesystem / driver work.** 00 (all) → 01 HAL → 01 BUS → 03 MEMORY_IO_ARCHITECTURE → 03 PAGE_BACKED → 05 MOUNT → 05 VFS_CHECKS → 05 IO_MANAGER → 05 BDEV_FS → 05 bringup_fs_specs → 05 TX_EXT4_PLAN; for block drivers add 06 DEVICE; for char devices add 06 DEVICE → 06 TTY.
+**For filesystem / driver work.** 00 (all) → 01 HAL → 01 BUS → 03 MEMORY_IO_ARCHITECTURE → 03 PAGE_BACKED → 05 MOUNT → 05 VFS_CHECKS → 05 IO_MANAGER → 05 BDEV_FS → 05 bringup_fs_specs → 05 TX_EXT4_PLAN → 05 EXT4_LIFECYCLE; for block drivers add 06 DEVICE; for char devices add 06 DEVICE → 06 TTY.
 
 **For process / signal work.** 00 (all) → 02 03_STEP_MODEL_v2 → 02 THREAD_RUNTIME → 02 cred_service / rlimit_service → 04 PROCESS → 04 SIGNAL → 04 SIGNAL_ATTACHMENTS → 02 EXEC.

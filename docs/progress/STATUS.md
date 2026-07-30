@@ -1,3 +1,24 @@
+- 2026-07-30 (ext4 Tier 1 lifecycle architecture convergence).
+  Added the active `docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md` contract
+  and linked it from the design index and ext4 project plan. The approved
+  design narrows correctness ownership to three primitives:
+  `OwnedFileIoRequest`, `MutationHandle`, and `MountSettlementOp`; keeps Tier 1
+  at one active mount mutation with commit plus checkpoint before publication;
+  makes raw request/journal cleanup and direct production home writes private
+  or unreachable; and defines G0-G7 gates through QEMU crash/replay, immutable
+  image collection, offline `e2fsck -fn`, and pinned Tier 1 xfstests. This is a
+  design-only catch-up: no Rust or xtask implementation changed, existing
+  worktree commits have not been merged, and product acceptance remains
+  blocked. Verification passed `cargo xtask lint docs` (the 7 existing
+  retired-vocabulary discussion warnings remain warnings), `cargo xtask
+  progress validate` for 38 records, placeholder and trailing-whitespace scans,
+  scoped `git diff --check`, and an independent design review followed by
+  correction of clean-state, post-commit, abort-drain, lease-custody,
+  cross-yield-token, revoke/deferred-free, syscall, and serialized-journal
+  contracts. Next: user review of the written contract, then replace the
+  overlapping historical ext4 plans with one executable
+  lifecycle-convergence plan.
+
 - 2026-07-25 (memory/I-O ext4 implementation-readiness correction).
   Re-audited the canonical dual-plane plan against the current ext4,
   PageBacked, journal, namespace, and I/O-manager callsites. The architecture
