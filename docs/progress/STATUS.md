@@ -8,11 +8,14 @@
   覆盖当前 size/nlink/mode；路径 stat 与 fd stat 统一以 PageContainer 的当前长度为准。
   验证：tx-ext4-format 26/26、tx-ext4 12/12、五项写回失败/重试定向测试通过，
   `cargo check -p tx-subsystems -p tx-shims --lib` 通过，RV64 release 与 submit 内核
-  已刷新。QEMU 9.2.1、4 GiB、8 hart、可写官方镜像、`tx.profile=final` 完整联合测试
-  通过：CAgent 10/10，BuildStorm minibuild 通过，计时编译
-  `ok=true elapsed_s=1252.93 cores=8 bytes=1681000`，最终
+  已刷新。QEMU 9.2.1、4 GiB、8 hart、可写官方镜像、`tx.profile=final` 连续两次
+  完整联合测试均通过：CAgent 均为 10/10，BuildStorm minibuild 均通过，计时编译分别为
+  `1252.93s` 和 `1183.45s`，两次均为 `ok=true cores=8 bytes=1681000`，最终均为
   `cagent_rc=0 buildstorm_rc=0`；日志为
-  `target/final-rv-fs-cache-20260730-205136.log`。Next：在测评平台的
+  `target/final-rv-fs-cache-20260730-205136.log` 和
+  `target/final-rv-fs-cache-rerun-20260730-215126.log`。确认稳定后已删除只读 stat
+  路径中的 `txkernel:file-size-zero` 临时诊断及其额外元数据读取，不改变文件状态。
+  Next：在测评平台的
   16 GiB/8 hart 参数下复核性能与稳定性。Blocker：无；统一 tx-shims lib-test 仍受
   分支原有旧测试桩缺少 CacheIf/常量等编译错误影响，不影响本次生产构建和 QEMU 验证。
 - 2026-07-30 (BuildStorm socketpair SMP 预检查修复). Cargo/Rust 在启动 rustc 前使用

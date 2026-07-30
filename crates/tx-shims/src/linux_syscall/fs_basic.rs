@@ -2374,59 +2374,6 @@ fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
     meta
 }
 
-/// Emit one failure-focused record when a read-only regular-file descriptor
-/// is reported as empty. Rust's archive builder rejects exactly this state
-/// before mmap, and the record distinguishes a genuinely empty inode from a
-/// split live/disk size publication without tracing ordinary stat traffic.
-fn report_zero_pagebacked_fstat<P: tx_hal::ConsoleIf>(
-    ctx: &SyscallCtx<'_>,
-    fd: i32,
-    file: &Cap<OpenFile>,
-    reported: &InodeMeta,
-    syscall: &str,
-) {
-    if reported.size != 0 || !file.flags().read || file.flags().write {
-        return;
-    }
-    let OpenFileBacking::Rnode { rnode } = file.backing() else {
-        return;
-    };
-    if rnode.meta().kind() != tx_subsystems::vfs::structure::InodeKind::Regular {
-        return;
-    }
-    let RNodeBacking::PageBacked { pc } = rnode.backing() else {
-        return;
-    };
-
-    let guard = step_engine::guard();
-    let disk_size = fs_ops_for_rnode(rnode)
-        .and_then(
-            |ops| match ops.load_inode_meta(rnode.fs_object_id(), &guard) {
-                StepOutcome::Done(meta) => Some(meta.size),
-                _ => None,
-            },
-        )
-        .unwrap_or(u64::MAX);
-    drop(guard);
-    let (resident, dirty, in_flight) = pc.diagnostic_page_counts();
-    let comm_raw = ctx.process.comm();
-    let comm_len = comm_raw
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(comm_raw.len());
-    let comm = core::str::from_utf8(&comm_raw[..comm_len]).unwrap_or("<non-utf8>");
-    tx_hal::console_write_str::<P>(&alloc::format!(
-        "txkernel:file-size-zero:syscall={syscall}:pid={}:tid={}:comm={comm}:fd={fd}:inode={}:pc={:#x}:pc_size={}:disk_size={disk_size}:cached_rnode_size={}:offset={}:resident={resident}:dirty={dirty}:in_flight={in_flight}\n",
-        ctx.process.pid.0,
-        ctx.thread.tid.0,
-        rnode.fs_object_id().as_u64(),
-        pc.raw(),
-        pc.size_bytes(),
-        rnode.meta().size,
-        file.offset(),
-    ));
-}
-
 fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
     match file.backing() {
         OpenFileBacking::Rnode { .. } => None,
@@ -2491,7 +2438,6 @@ pub(super) fn sys_fstat<'a, P: tx_hal::ConsoleIf>(
         }
         _ => (stat_meta_for_open_file(&file), fd as u64),
     };
-    report_zero_pagebacked_fstat::<P>(ctx, fd, &file, &meta, "fstat");
     let stat = inode_meta_to_stat(&meta, ino, stat_rdev_for_open_file(&file));
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
@@ -2590,7 +2536,6 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
                 };
                 let (rmaj, rmin) = rdev_major_minor_for_open_file(&file);
                 let live_meta = stat_meta_for_open_file(&file);
-                report_zero_pagebacked_fstat::<P>(ctx, fd, &file, &live_meta, "statx");
                 match file.backing() {
                     OpenFileBacking::Rnode { rnode } => (
                         StatxResult { meta: live_meta },
