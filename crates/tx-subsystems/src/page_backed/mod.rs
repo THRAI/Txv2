@@ -1964,6 +1964,8 @@ impl PageContainer {
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome))
                             }
                             Err(error) => {
+                                self.abort_file_writeback_submission(&page_request);
+                                self.release_file_io_read_target(&page_request);
                                 work.push(PageServiceDrivenWork::BackendSubmitError(error))
                             }
                         }
