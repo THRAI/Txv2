@@ -14,12 +14,10 @@
 //!   `AtomicSlot` primitive (used for slot-style payload binding),
 //!   and the subsystem/process lock facade. Re-exports `zone::sign`.
 //!
-//! * `wait_routing` — stacked substrate + reactor. The exit-source
-//!   path: each process exposes a `WaitSource` (substrate) that
-//!   wakes parents blocked in `waitpid`, backed by a reactor
-//!   `Channel`/`Mask` legacy coexistence pair. Same verbs as pipe
-//!   and futex: `new_wait_source`, `fire_legacy_channel`,
-//!   `notify_v3_source`.
+//! * `wait_routing` — substrate wake routing. The exit-source path:
+//!   each process exposes a `WaitSource` that wakes parents blocked in
+//!   `waitpid`. Same verbs as pipe and futex: `new_wait_source`,
+//!   `notify_v3_source_with_post`.
 
 use tx_platform_adapter::platform_adapter;
 
@@ -36,14 +34,12 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{borrow_current_guard, drain_with_budget, guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        drive_oneshot, Errno, InterestMask, NoProgress, OneShotStepOp, RestrictionStackHandle,
-        ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId, YieldShape,
+        drive_oneshot, Errno, NoProgress, OneShotStepOp, RestrictionStackHandle, ScriptCtx, StepOp,
+        StepOutcome, SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        register_zone_for, sign, Cap, Dead, Entity, IdentRef, OperationalCapExt, PayloadCap,
+        PayloadPolicy, Weak, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::AtomicSlot;
 }
@@ -54,18 +50,11 @@ pub mod step_engine {
     apis = ["wake", "step"],
     reason = "wrap process exit-source WaitSource registration and v3 mailbox notify"
 )]
-#[platform_adapter(
-    platform = "reactor",
-    domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as process exit-source legacy wake verbs (D2 coexistence)"
-)]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{
-        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
-    };
+    use tx_substrate::wake::MailboxSchedulerHint;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitSource};
 
     /// Delegates to `tx_substrate::wake::new_source`. Also registers
     /// the source in the global registry so the driver can look it up
@@ -81,13 +70,23 @@ pub mod wait_routing {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
-    /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) {
-        tx_reactor::wait::fire_legacy(channel, mask_bits);
-    }
-
-    /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+    /// Notify the v3 `WaitSource` through a caller-provided mailbox post.
+    ///
+    /// This is the process exit-source hook for scheduler-context producers:
+    /// the source still owns readiness, while the caller can route each
+    /// delivered mailbox through the owner-aware reactor path.
+    pub fn notify_v3_source_with_post<F>(
+        source: &Arc<WaitSource>,
+        mask_bits: u64,
+        mut post: F,
+    ) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        source.notify_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            MailboxSchedulerHint::Normal,
+            |mailbox, event, _hint| post(mailbox, event),
+        )
     }
 }

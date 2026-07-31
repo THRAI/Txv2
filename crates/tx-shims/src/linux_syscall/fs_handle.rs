@@ -88,8 +88,7 @@ fn read_handle_payload(
 }
 
 fn payload_for_rnode(rnode: &Cap<RNode>) -> Option<Cap<MountPayload>> {
-    let guard = step_engine::guard();
-    rnode.containing_mount_weak()?.upgrade(&guard)
+    MountedNode::from_rnode_direct(rnode).map(MountedNode::into_payload)
 }
 
 fn mount_payload_from_fd(
@@ -212,19 +211,8 @@ fn resolve_path_target(
     }
 }
 
-fn resolve_cwd_for_path(
-    dirfd: i32,
-    _path: &[u8],
-    ctx: &SyscallCtx<'_>,
-) -> Result<Cap<DEntry>, i32> {
-    if dirfd == AT_FDCWD {
-        return ctx.process.cwd().ok_or(ENOENT_VALUE);
-    }
-    if dirfd < 0 {
-        return Err(EBADF_VALUE);
-    }
-    let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
-    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
+fn resolve_cwd_for_path(dirfd: i32, path: &[u8], ctx: &SyscallCtx<'_>) -> Result<Cap<DEntry>, i32> {
+    dirfd_anchor_errno(dirfd, path, ctx)
 }
 
 pub(super) fn sys_name_to_handle_at<P: PmapIf>(

@@ -88,7 +88,7 @@ fn veth_pair_can_bridge_udp_between_isolated_namespace_socket_tables() {
         device: pair.left,
     };
     assert_eq!(pair.right_device.pending_rx(), 0);
-    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at_with_post(
         &sink_a,
         ns_a.clone(),
         smoltcp::time::Instant::ZERO,
@@ -99,6 +99,7 @@ fn veth_pair_can_bridge_udp_between_isolated_namespace_socket_tables() {
             raw_icmp: 0,
         },
         &guard,
+        |mailbox, event| mailbox.post(event),
     ) else {
         panic!("device tx step should complete");
     };

@@ -56,12 +56,12 @@ where
         let entries = if is_fat_root(parent) {
             match self.with_pager(|p| p.read_root_dir_entries()) {
                 Ok(e) => e,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             }
         } else {
             match self.with_pager(|p| p.read_dir_entries(parent_cluster)) {
                 Ok(e) => e,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             }
         };
 
@@ -119,7 +119,7 @@ where
             return StepOutcome::done(fs_id);
         }
 
-        StepOutcome::err(Errno::ENOENT.into())
+        StepOutcome::err(Errno::ENOENT)
     }
 
     fn load_inode_meta(
@@ -157,7 +157,7 @@ where
             Ok(buf[11] & ATTR_DIRECTORY != 0)
         }) {
             Ok(v) => v,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
 
         StepOutcome::done(InodeMeta {
@@ -192,7 +192,7 @@ where
         // Look up the cached dirent to find the parent directory.
         let cached = match self.dirent_cache.lock().get(fs_object_id) {
             Some(c) => c,
-            None => return StepOutcome::err(Errno::ENOENT.into()),
+            None => return StepOutcome::err(Errno::ENOENT),
         };
 
         let fat_date = unix_to_fat_date(meta.mtime.sec);
@@ -241,7 +241,7 @@ where
                 }
                 StepOutcome::done(())
             }
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -254,7 +254,7 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
 
         let parent_cluster = cluster_from_fs_id(parent);
@@ -269,7 +269,7 @@ where
         // Allocate a cluster.
         let cluster = match self.with_pager(|p| p.alloc_cluster()) {
             Ok(c) => c,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
 
         // For directories, create "." and ".." entries in the new cluster.
@@ -304,7 +304,7 @@ where
                 p.write_cluster(cluster, &buf)
             });
             if let Err(err) = result {
-                return StepOutcome::err(err.into());
+                return StepOutcome::err(err);
             }
         }
 
@@ -317,7 +317,7 @@ where
                 p.append_dirent_in_root(&short_name, attr, cluster, 0, now_date, now_time)
             }) {
                 Ok(idx) => idx,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             }
         } else {
             match self.with_pager(|p| {
@@ -332,7 +332,7 @@ where
                 )
             }) {
                 Ok(idx) => idx,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             }
         };
 
@@ -379,23 +379,23 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
 
         // Look up cached dirent for cluster chain and parent info.
         let cached = match self.dirent_cache.lock().get(target) {
             Some(c) => c,
-            None => return StepOutcome::err(Errno::ENOENT.into()),
+            None => return StepOutcome::err(Errno::ENOENT),
         };
 
         // Directories must go through rmdir.
         if cached.attr & ATTR_DIRECTORY != 0 {
-            return StepOutcome::err(Errno::EISDIR.into());
+            return StepOutcome::err(Errno::EISDIR);
         }
 
         // Free the cluster chain.
         if let Err(err) = self.with_pager(|p| p.free_cluster_chain(cached.first_cluster)) {
-            return StepOutcome::err(err.into());
+            return StepOutcome::err(err);
         }
 
         // Delete the dirent.
@@ -409,7 +409,7 @@ where
 
         match result {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -422,19 +422,19 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
 
         // Look up the old entry.
         let old_entry = match self.lookup(old_parent, old_name, _guard) {
             StepOutcome::Done(fs_id) => fs_id,
             StepOutcome::Err(e) => return StepOutcome::Err(e),
-            _ => return StepOutcome::err(Errno::EIO.into()),
+            _ => return StepOutcome::err(Errno::EIO),
         };
 
         let cached = match self.dirent_cache.lock().get(old_entry) {
             Some(c) => c,
-            None => return StepOutcome::err(Errno::ENOENT.into()),
+            None => return StepOutcome::err(Errno::ENOENT),
         };
 
         let old_parent_cluster = cached.parent_cluster;
@@ -471,7 +471,7 @@ where
                     cache.insert(old_entry, &dummy, old_parent_cluster, old_entry_index);
                     StepOutcome::done(())
                 }
-                Err(err) => StepOutcome::err(err.into()),
+                Err(err) => StepOutcome::err(err),
             }
         } else {
             // Cross-directory rename: create entry in new parent,
@@ -523,7 +523,7 @@ where
 
             match result {
                 Ok(()) => StepOutcome::done(()),
-                Err(err) => StepOutcome::err(err.into()),
+                Err(err) => StepOutcome::err(err),
             }
         }
     }
@@ -536,7 +536,7 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         // FAT does not support hard links.
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn mkdir(
@@ -560,17 +560,17 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
 
         let cached = match self.dirent_cache.lock().get(target) {
             Some(c) => c,
-            None => return StepOutcome::err(Errno::ENOENT.into()),
+            None => return StepOutcome::err(Errno::ENOENT),
         };
 
         // Must be a directory.
         if cached.attr & ATTR_DIRECTORY == 0 {
-            return StepOutcome::err(Errno::ENOTDIR.into());
+            return StepOutcome::err(Errno::ENOTDIR);
         }
 
         // Check that the directory is empty (only "." and "..").
@@ -587,16 +587,16 @@ where
                 == 0)
         }) {
             Ok(v) => v,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
 
         if !is_empty {
-            return StepOutcome::err(Errno::ENOTEMPTY.into());
+            return StepOutcome::err(Errno::ENOTEMPTY);
         }
 
         // Free the cluster chain.
         if let Err(err) = self.with_pager(|p| p.free_cluster_chain(dir_cluster)) {
-            return StepOutcome::err(err.into());
+            return StepOutcome::err(err);
         }
 
         // Delete the dirent.
@@ -610,7 +610,7 @@ where
 
         match result {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -622,7 +622,7 @@ where
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into()) // FAT does not support symlinks
+        StepOutcome::err(Errno::ENOSYS) // FAT does not support symlinks
     }
 
     fn readdir(
@@ -638,12 +638,12 @@ where
         let entries = if is_fat_root(fs_object_id) {
             match self.with_pager(|p| p.read_root_dir_entries()) {
                 Ok(e) => e,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             }
         } else {
             match self.with_pager(|p| p.read_dir_entries(cluster)) {
                 Ok(e) => e,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             }
         };
 
@@ -666,7 +666,7 @@ where
         let entry = visible[index];
         let name = match InlineName::new(entry.display_name()) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
 
         let kind = if entry.attr & ATTR_DIRECTORY != 0 {
@@ -700,7 +700,7 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS.into())
+        StepOutcome::err(Errno::EROFS)
     }
 
     fn materialise_rnode(
@@ -712,7 +712,7 @@ where
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let pin = match self.mount_pin.lock().clone() {
             Some(p) => p,
-            None => return StepOutcome::err(Errno::ENOSYS.into()),
+            None => return StepOutcome::err(Errno::ENOSYS),
         };
 
         const PAGE_SIZE: u64 = 4096;
@@ -725,13 +725,13 @@ where
             page_count,
         ) {
             Ok(pc) => pc,
-            Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
+            Err(_) => return StepOutcome::err(Errno::ENOMEM),
         };
         pc.set_size_bytes_persisted(meta.size);
 
         match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
-            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
         }
     }
 
@@ -740,7 +740,7 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Box<[u8]>, NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into()) // FAT does not support symlinks
+        StepOutcome::err(Errno::ENOSYS) // FAT does not support symlinks
     }
 }
 

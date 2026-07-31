@@ -3,7 +3,7 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard};
 use crate::net::checks::require::require_socket_read_target;
-use crate::net::delegate::net_delegate_kick_poll;
+use crate::net::delegate::net_delegate_kick_poll_with_post;
 use crate::net::execution::{socket_recv_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::structure::{
     RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
@@ -141,7 +141,7 @@ fn kick_tcp_loopback_after_recv(payload: &SocketPayload, bytes: usize) {
         payload.protocol_snapshot(),
         SocketProtocol::Tcp(TcpState::Connected { .. })
     ) {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     }
 }
 

@@ -2,7 +2,7 @@ use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_connect_target;
-use crate::net::delegate::net_delegate_kick_poll;
+use crate::net::delegate::net_delegate_kick_poll_with_post;
 use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::yield_on_token;
 use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
@@ -102,61 +102,20 @@ pub fn step_connect(
 
     if blocked {
         if advanced {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         if let Some(outcome) = try_tcp_local_namespace_connect(socket, &payload, guard) {
             return outcome;
         }
-        // No in-kernel namespace owns the remote: this is an EXTERNAL TCP
-        // connect over the real device. Emit the SYN into smoltcp and
-        // register the client in the connection table so the inbound
-        // SYN-ACK matches in process_tcp_event. Kept after the
-        // local-namespace short-circuit so loopback / intra-namespace
-        // connects are unaffected.
-        try_tcp_external_connect(socket, &payload);
         let wait = WaitToken::new(
             socket.wait_carriers.send,
             SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits(),
         );
         yield_on_token(wait)
     } else {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         StepOutcome::Done(())
     }
-}
-
-/// Emit the SYN for an EXTERNAL TCP connect (no in-kernel namespace owns the
-/// remote) and register the client in the connection table.
-///
-/// Drives smoltcp into SynSent via `connect_endpoint` (mirroring the loopback
-/// path in step_tcp_loopback.rs) so the device-TX scan ships the SYN, and
-/// inserts the client under `ConnectionKey::new(local, remote)` so the inbound
-/// SYN-ACK (src=remote, dst=local) matches `lookup_tcp_connection(dst, src)`
-/// in process_tcp_event. Both the smoltcp connect and the table insert are
-/// best-effort: a smoltcp Err means it is already connecting, and a table
-/// Duplicate means the client is already registered (re-entrant connect/poll)
-/// — neither is fatal, so connect() still parks on its send carrier.
-fn try_tcp_external_connect(socket: &Cap<SocketIdentity>, payload: &SocketOperationalEvidence) {
-    if socket.kind != SocketKind::Tcp {
-        return;
-    }
-    let (local, remote) = match payload.protocol_snapshot() {
-        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
-        _ => return,
-    };
-    if remote.is_loopback() || local.is_unspecified() || local.port == 0 {
-        return;
-    }
-
-    if let Some(raw) = payload.raw_tcp_socket() {
-        // Ignore Err: smoltcp is already in a connecting state.
-        let _ = raw.connect_endpoint(local, remote);
-    }
-    // Ignore a Duplicate: the client is already registered for this 4-tuple.
-    let _ = payload
-        .socket_table()
-        .insert_tcp_connection(ConnectionKey::new(local, remote), socket.clone());
-    net_delegate_kick_poll();
 }
 
 fn try_tcp_local_namespace_connect(
@@ -240,9 +199,15 @@ fn try_tcp_local_namespace_connect(
             remote: listener_local,
         });
     });
-    socket.readiness.fire_send(SendWireSet::SPACE);
+    socket
+        .readiness
+        .fire_send_with_post(SendWireSet::SPACE, |mailbox, event| mailbox.post(event));
     if accept_became_ready {
-        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+        listener
+            .readiness
+            .fire_accept_with_post(AcceptWireSet::HAS_PENDING, |mailbox, event| {
+                mailbox.post(event)
+            });
     }
     Some(StepOutcome::Done(()))
 }
@@ -442,7 +407,11 @@ fn connect_unix_stream(
         unix_peer: local,
     };
     if listener_payload.enqueue_accept_entry(entry).is_some() {
-        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+        listener
+            .readiness
+            .fire_accept_with_post(AcceptWireSet::HAS_PENDING, |mailbox, event| {
+                mailbox.post(event)
+            });
         StepOutcome::Done(())
     } else {
         let _ = table.withdraw_unix_stream_peer(socket.raw());
@@ -534,7 +503,9 @@ fn step_sctp_connect(
             .sctp_ensure_assoc(local)
             .map_or(0, |(id, _)| id);
         enqueue_sctp_comm_up(&listener, Some(local), server_assoc_id);
-        listener.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        listener
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
         enqueue_sctp_comm_up(socket, Some(listener_local), client_assoc_id);
         return StepOutcome::Done(());
     }
@@ -578,7 +549,11 @@ fn step_sctp_connect(
         let _ = table.withdraw_sctp_connection(ConnectionKey::new(listener_local, local));
         return StepOutcome::Err(Errno::ECONNREFUSED);
     }
-    listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+    listener
+        .readiness
+        .fire_accept_with_post(AcceptWireSet::HAS_PENDING, |mailbox, event| {
+            mailbox.post(event)
+        });
 
     payload.with_protocol_mut(|protocol| {
         *protocol = SocketProtocol::Sctp(TcpState::Connected {
@@ -691,9 +666,10 @@ pub(crate) fn enqueue_sctp_comm_up(
         .record_sctp_message(bytes, true, 0, 0, peer)
         .is_some()
     {
-        socket
-            .readiness
-            .fire_recv(crate::net::structure::RecvWireSet::HAS_DATA);
+        socket.readiness.fire_recv_with_post(
+            crate::net::structure::RecvWireSet::HAS_DATA,
+            |mailbox, event| mailbox.post(event),
+        );
     }
 }
 

@@ -2,17 +2,23 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak};
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
+use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
+use tx_ext4_format::pager::{
+    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, BLOCK_SIZE,
+};
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
+use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
-use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
+use tx_subsystems::page_backed::PageContainer;
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
+
+use crate::journal::Ext4MutationPlanSource;
+use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
 pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
@@ -24,8 +30,74 @@ enum OrphanState {
     Reclaiming,
 }
 
+pub trait FilePageContainerBinder: Send + Sync {
+    fn bind_file_page_container(&self, container: Cap<PageContainer>);
+}
+
+/// Mount-local adapter from a backend request to the pure format mutation
+/// planner. It intentionally has no access to page-cache frames; L4 supplies
+/// those separately to `JournalMutationRuntime` during admission.
+pub(crate) struct Ext4PagerMutationPlanSource<I> {
+    backend: Arc<SpinMutex<Option<Weak<Ext4FsInstance<I>>>>>,
+}
+
+impl<I> Clone for Ext4PagerMutationPlanSource<I> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+        }
+    }
+}
+
+impl<I> Ext4PagerMutationPlanSource<I> {
+    pub(crate) fn new() -> Self {
+        Self {
+            backend: Arc::new(SpinMutex::new(None)),
+        }
+    }
+
+    pub(crate) fn bind(&self, backend: &Arc<Ext4FsInstance<I>>) {
+        *self.backend.lock() = Some(Arc::downgrade(backend));
+    }
+}
+
+impl<I> Ext4MutationPlanSource for Ext4PagerMutationPlanSource<I>
+where
+    I: BlockImage + Send + 'static,
+{
+    fn plan_writeback_mutation(
+        &self,
+        request: &BackendPageRequest,
+    ) -> Result<Ext4MutationPlan, Errno> {
+        if request.range.page_count() != 1 {
+            return Err(Errno::EINVAL);
+        }
+        let generation = request.generation_hint.ok_or(Errno::EINVAL)?;
+        let backend = self
+            .backend
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(Errno::EIO)?;
+        let inode = inode_no(FsObjectId::new(request.object.raw()))?;
+
+        // The runtime replaces this placeholder with the L4-owned source.
+        // The format plan therefore remains metadata-only from L5's view.
+        backend.with_pager(|pager| {
+            pager.plan_write_page(
+                inode,
+                request.range.start_page(),
+                &[0; BLOCK_SIZE],
+                FsyncStamp::new(generation.raw()),
+            )
+        })
+    }
+}
+
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
+    extent_mapping: Option<Arc<Ext4MappingTable>>,
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
     /// Lock-free namespace generations used to validate lookup/readdir cache
@@ -48,6 +120,7 @@ pub(crate) struct Ext4FsInstance<I> {
     /// the last-payload callback retries `destroy_inode`.
     orphaned_inodes: SpinMutex<BTreeMap<FsObjectId, OrphanState>>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
+    file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
     /// every page-cache writeback rejects with `EROFS`. The flag is
@@ -55,20 +128,42 @@ pub(crate) struct Ext4FsInstance<I> {
     /// `mount_ext4_read_write` entry point clears it. Matches
     /// Linux's `MS_RDONLY` semantics.
     read_only: AtomicBool,
+    /// Mutation-journal mounts must submit writeback through their bound L5
+    /// planner. The compatibility pager would otherwise update home blocks
+    /// before the ordered transaction is committed.
+    legacy_writeback_enabled: AtomicBool,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
+    #[cfg(test)]
     pub(crate) fn open(image: I, read_only: bool) -> Result<Arc<Self>, Errno> {
+        Self::open_with_backend_planner_and_mapping(image, read_only, None, None)
+    }
+
+    pub(crate) fn open_with_backend_planner_and_mapping(
+        image: I,
+        read_only: bool,
+        backend_planner: Option<Arc<dyn BackendPlanner>>,
+        extent_mapping: Option<Arc<Ext4MappingTable>>,
+    ) -> Result<Arc<Self>, Errno> {
         Ok(Arc::new(Self {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
+            backend_planner,
+            extent_mapping,
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
             dir_versions: core::array::from_fn(|_| AtomicU64::new(0)),
             page_containers: SpinMutex::new(BTreeMap::new()),
             orphaned_inodes: SpinMutex::new(BTreeMap::new()),
             mount_pin: SpinMutex::new(None),
+            file_page_container_binder: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
+            legacy_writeback_enabled: AtomicBool::new(true),
         }))
+    }
+
+    pub(crate) fn backend_planner(&self) -> Option<Arc<dyn BackendPlanner>> {
+        self.backend_planner.clone()
     }
 
     pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
@@ -76,11 +171,33 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         *self.mount_pin.lock() = Some(MountPayloadPin::acquire(&payload));
     }
 
+    pub(crate) fn set_file_page_container_binder(
+        &self,
+        binder: Option<Arc<dyn FilePageContainerBinder>>,
+    ) {
+        *self.file_page_container_binder.lock() = binder;
+    }
+
+    pub(crate) fn bind_file_page_container(&self, container: Cap<PageContainer>) {
+        if let Some(binder) = self.file_page_container_binder.lock().clone() {
+            binder.bind_file_page_container(container);
+        }
+    }
+
     /// Returns `true` when this mount was opened with `MS_RDONLY`
     /// (or via `mount_ext4_read_only`). Mutating `FsOps` methods
     /// consult this and short-circuit with `EROFS`.
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn disable_legacy_writeback(&self) {
+        self.legacy_writeback_enabled
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn legacy_writeback_enabled(&self) -> bool {
+        self.legacy_writeback_enabled.load(Ordering::Acquire)
     }
 
     pub(crate) fn with_pager<T>(
@@ -169,19 +286,24 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(found)
     }
 
-    /// Resolve and validate a persistent object incarnation.
-    ///
-    /// An inode bitmap slot can be reused immediately after reclamation.
-    /// Every backend entry point therefore validates both the low inode
-    /// number and the on-disk generation before touching data or metadata.
-    pub(crate) fn resolve_object(
-        &self,
-        fs_object_id: FsObjectId,
-    ) -> Result<(InodeNo, InodeMetaLite), Errno> {
-        let inode = inode_no(fs_object_id)?;
-        let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
-        if meta.mode == 0 {
-            return Err(Errno::ENOENT);
+    pub(crate) fn inode_meta_cached(&self, inode: InodeNo) -> Result<InodeMetaLite, Errno> {
+        if let Some(meta) = self.inode_meta_cache.lock().get(inode) {
+            return Ok(meta);
+        }
+        let (meta, extent_root) = match self.extent_mapping.as_ref() {
+            Some(_) => self.with_pager(|pager| pager.inode_meta_and_extent_root(inode))?,
+            None => (
+                self.with_pager(|pager| pager.inode_meta(inode))?,
+                Vec::new(),
+            ),
+        };
+        if meta.mode & 0xF000 == 0x8000 {
+            if let Some(mapping) = self.extent_mapping.as_ref() {
+                mapping.insert_extent_root(inode.get() as u64, &extent_root)?;
+            }
+        }
+        if inode_meta_is_dir(meta) {
+            self.inode_meta_cache.lock().insert(inode, meta);
         }
         if meta.generation != fs_object_id.inode_generation() {
             return Err(Errno::ESTALE);

@@ -8,10 +8,9 @@
 //!   `Yield { progress: NoProgress, shape: OnWaitSource { source,
 //!   interests } }` enum constructor in named-domain form.
 //!
-//! * `wait_routing` — stacked substrate + reactor. Wraps WaitSource
-//!   registration (`new_wait_source`) and the legacy/v3 wakeup
-//!   primitives (`fire_legacy_channel`, `notify_v3_source`) used
-//!   by `step_futex_wake` when it fires both D2 paths.
+//! * `wait_routing` — substrate wake routing. Wraps WaitSource registration
+//!   (`new_wait_source`) and mailbox wake publication used by
+//!   `step_futex_wake`.
 
 use tx_platform_adapter::platform_adapter;
 
@@ -29,12 +28,7 @@ pub mod step_engine {
         ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity, WaitSourceId,
         YieldShape,
     };
-    pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
-    };
+    pub use tx_substrate::zone::ZoneError;
 
     /// `futex(uaddr, FUTEX_WAIT, val, ...)` matched the value: park on
     /// the bucket's wait source. Wraps `StepOutcome::Yield { progress
@@ -57,25 +51,16 @@ pub mod step_engine {
     apis = ["wake", "step"],
     reason = "wrap WaitSource registration and v3 mailbox notify in futex-side bucket wakeup verbs (D2 coexistence path)"
 )]
-#[platform_adapter(
-    platform = "reactor",
-    domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as futex-side legacy bucket wakeup verbs (PR-3D-2 D2 coexistence path)"
-)]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{
-        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+        MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitGeneration, WaitRegistrationGuard,
+        WaitSource,
     };
 
-    /// Mint a `WaitSource` for one futex bucket, keyed by the
-    /// bucket's `source_id` so the legacy `Channel` resolver and the
-    /// v3 mailbox path share the id namespace (PR-3D-2 / D2
-    /// coexistence).
-    ///
-    /// Delegates to `tx_substrate::wake::new_source`.
+    /// Mint a `WaitSource` for one futex bucket, keyed by the bucket's
+    /// `source_id`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(source_id);
         tx_substrate::wake::register_source(Arc::clone(&source));
@@ -87,19 +72,26 @@ pub mod wait_routing {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
-    /// Fire the legacy `Channel` for one futex bucket — D2
-    /// coexistence wake path.
+    /// Notify the v3 `WaitSource` through a caller-provided mailbox post.
     ///
-    /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) {
-        tx_reactor::wait::fire_legacy(channel, mask_bits);
-    }
-
-    /// Notify the v3 `WaitSource` for one futex bucket — D2
-    /// coexistence wake path (mailbox).
-    ///
-    /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+    /// This is the futex exact-waiter hook for syscall/reactor contexts that
+    /// can publish `SourceFired` and immediately route the already-upgraded
+    /// mailbox through owner-aware scheduler placement.
+    pub fn notify_v3_source_limit_emit_with_post<F>(
+        source: &Arc<WaitSource>,
+        mask_bits: u64,
+        limit: usize,
+        hint: MailboxSchedulerHint,
+        post: F,
+    ) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        source.notify_limit_emit_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            limit,
+            hint,
+            post,
+        )
     }
 }

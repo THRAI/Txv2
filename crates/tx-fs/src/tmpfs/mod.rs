@@ -154,8 +154,7 @@ struct ReaddirEntrySnapshot {
 fn dir_entry_from_readdir_snapshot(
     snapshot: ReaddirEntrySnapshot,
 ) -> Result<(DirEntry, DirCursor), step_engine::Errno> {
-    let entry = DirEntry::new(snapshot.child_id, snapshot.kind, snapshot.name.as_bytes())
-        .map_err(step_engine::Errno::from)?;
+    let entry = DirEntry::new(snapshot.child_id, snapshot.kind, snapshot.name.as_bytes())?;
     Ok((entry, snapshot.next_cursor))
 }
 
@@ -309,7 +308,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&parent) else {
@@ -393,7 +392,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         // `mknod(2)` file types. Directories and symlinks have their own
         // entry points (`mkdir` / `symlink`); everything else — regular,
@@ -499,7 +498,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -550,11 +549,11 @@ impl FsOps for Tmpfs {
     ) -> StepOutcome<(), NoProgress> {
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let new_key = match InlineName::new(new_name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         if old_parent == new_parent && old_key == new_key {
             return StepOutcome::done(());
@@ -726,7 +725,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mode = (mode & !S_IFMT) | S_IFDIR;
         let mut meta = InodeMeta::new(InodeKind::Directory, mode);
@@ -774,7 +773,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut state = self.state.lock();
         {
@@ -837,7 +836,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
 
         {
@@ -1055,8 +1054,8 @@ impl FsOps for Tmpfs {
     /// in-depth for kernel-internal callers (none today) and the
     /// canonical site if the syscall-arm gate ever changes.
     /// Preserves `S_IFMT` (file kind is immutable through chmod).
-    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
-    fn step_chmod(
+    /// Per the DAC + setuid plan §"FsOps::chmod_inode / chown_inode".
+    fn chmod_inode(
         &self,
         fs_object_id: FsObjectId,
         new_mode: u16,
@@ -1068,7 +1067,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&inode.meta, cred) {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         // Preserve the IFMT bits from the existing meta — kind is
         // immutable through chmod (matches `serialize_inode_meta`).
@@ -1088,8 +1087,8 @@ impl FsOps for Tmpfs {
     /// consumes). Linux's silent-clear rule always drops `S_ISUID`
     /// and drops `S_ISGID` when the file has group-execute set
     /// (matches LTP `chown02`/`chown03`).
-    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
-    fn step_chown(
+    /// Per the DAC + setuid plan §"FsOps::chmod_inode / chown_inode".
+    fn chown_inode(
         &self,
         fs_object_id: FsObjectId,
         new_uid: Option<u32>,
@@ -1104,7 +1103,7 @@ impl FsOps for Tmpfs {
         if let Err(e) =
             tx_subsystems::vfs::predicates::check_chown_perm(&inode.meta, new_uid, new_gid, cred)
         {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         if let Some(u) = new_uid {
             inode.meta.uid = u;

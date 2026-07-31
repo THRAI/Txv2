@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::tty::adapter::step_engine::{
-    guard, reserve_for, sign_for, ByteProgress, Cap, Errno, PayloadCap, StepOutcome,
+    guard, reserve_for, sign_for, ByteProgress, Cap, Errno, NoProgress, PayloadCap, StepOutcome,
 };
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
@@ -19,11 +19,12 @@ use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
 use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 use crate::tty::execution::{
-    register_console_alias, register_hardware, step_hangup, step_ingest, step_ioctl_tcgets,
-    step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz, step_ioctl_tiocnotty,
-    step_ioctl_tiocsctty, step_ioctl_tiocspgrp, step_ioctl_tiocswinsz, step_master_close_last,
-    step_poll_hardware_input, step_read, step_read_for_caller, step_write, step_write_for_caller,
-    IoctlCaller, JobControlSignal, SignalDispatch, SignalTarget, TTY_READABLE,
+    register_console_alias, register_hardware, step_hangup, step_ingest_with_post,
+    step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
+    step_ioctl_tiocnotty, step_ioctl_tiocsctty, step_ioctl_tiocspgrp, step_ioctl_tiocswinsz,
+    step_master_close_last, step_poll_hardware_input, step_read, step_read_for_caller, step_write,
+    step_write_for_caller, IoctlCaller, JobControlSignal, SignalDispatch, SignalTarget,
+    TTY_READABLE,
 };
 use crate::tty::ldisc::state::LdiscState;
 use crate::tty::ldisc::{
@@ -52,6 +53,16 @@ static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
     name: "tty-test",
     ops: &NOOP_OPS,
 };
+
+fn ingest_direct(
+    tty: &crate::tty::adapter::step_engine::Cap<TtyIdentity>,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> StepOutcome<crate::tty::execution::IngestOutcome, NoProgress> {
+    step_ingest_with_post(tty, bytes, guard, |mailbox, event, hint| {
+        mailbox.post_with_scheduler_hint(event, hint)
+    })
+}
 
 struct ScriptedReadOps {
     script: std::sync::Mutex<Vec<u8>>,
@@ -454,7 +465,7 @@ fn step_ingest_commits_cooked_line_and_step_read_drains_it() {
     let mut out = [0u8; 8];
 
     assert_eq!(
-        step_ingest(&tty, b"abc", &guard),
+        ingest_direct(&tty, b"abc", &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 3,
             writable_fired: true,
@@ -466,7 +477,7 @@ fn step_ingest_commits_cooked_line_and_step_read_drains_it() {
         StepOutcome::Yield { .. }
     ));
 
-    let outcome = step_ingest(&tty, b"\n", &guard);
+    let outcome = ingest_direct(&tty, b"\n", &guard);
     assert!(matches!(
         outcome,
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
@@ -493,7 +504,7 @@ fn step_ingest_empty_veof_makes_next_read_return_zero() {
     );
     let mut out = [0u8; 8];
 
-    let outcome = step_ingest(&tty, &[0x04], &guard);
+    let outcome = ingest_direct(&tty, &[0x04], &guard);
     assert!(matches!(
         outcome,
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
@@ -711,7 +722,7 @@ fn ioctl_binding_and_termios_roundtrip_work() {
 
     assert_eq!(
         step_ioctl_tiocgwinsz(&tty, &guard),
-        StepOutcome::Done(Winsize::default())
+        StepOutcome::Done(Winsize::new(24, 80))
     );
     assert_eq!(
         step_ioctl_tiocswinsz(&tty, Winsize::new(24, 80), &guard),
@@ -815,7 +826,7 @@ fn step_ingest_reports_foreground_signal_dispatch_when_bound() {
     tty.bind_session_pgrp(SessionPgrp::from_raw_ids(7, 9, 9));
 
     assert_eq!(
-        step_ingest(&tty, &[0x03], &guard),
+        ingest_direct(&tty, &[0x03], &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 1,
             readable_fired: false,
@@ -848,7 +859,7 @@ fn step_ingest_signal_dispatch_is_none_without_controlling_binding() {
     );
 
     assert_eq!(
-        step_ingest(&tty, &[0x03], &guard),
+        ingest_direct(&tty, &[0x03], &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 1,
             readable_fired: false,
@@ -876,7 +887,7 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
     tty.bind_session_pgrp(SessionPgrp::from_raw_ids(12, 120, 121));
 
     assert_eq!(
-        step_ingest(&tty, &[0x1c], &guard),
+        ingest_direct(&tty, &[0x1c], &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 1,
             readable_fired: false,
@@ -896,7 +907,7 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
     );
 
     assert_eq!(
-        step_ingest(&tty, &[0x1a], &guard),
+        ingest_direct(&tty, &[0x1a], &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 1,
             readable_fired: false,
@@ -994,7 +1005,7 @@ fn tcsets_flushes_pending_cooked_buffer_into_read_queue() {
     );
 
     assert_eq!(
-        step_ingest(&tty, b"flush-me", &guard),
+        ingest_direct(&tty, b"flush-me", &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 8,
             writable_fired: true,

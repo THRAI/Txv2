@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 
 use crate::net::packet::LoopbackIpPacket;
-use crate::net::structure::{Ipv4Address, Ipv6Address};
+use crate::net::structure::Ipv4Address;
 use crate::sync::SpinMutex;
 
 use super::{build_icmpv4_echo_reply, parse_icmpv4_loopback_packet, Icmpv4Event};
@@ -14,11 +14,6 @@ pub struct IfaceCommon {
     netmask: Ipv4Address,
     gateway: Option<Ipv4Address>,
     mtu: u16,
-    // IPv6 V1: on-link v6 config. IPv6 V3b added `ipv6_gateway` so
-    // decide_ipv6_route forwards off-link v6 via the default route's gateway.
-    ipv6_addr: Option<Ipv6Address>,
-    ipv6_prefix_len: Option<u8>,
-    ipv6_gateway: Option<Ipv6Address>,
 }
 
 pub struct LoopbackIface {
@@ -33,9 +28,6 @@ impl IfaceCommon {
             netmask,
             gateway: None,
             mtu,
-            ipv6_addr: None,
-            ipv6_prefix_len: None,
-            ipv6_gateway: None,
         }
     }
 
@@ -50,9 +42,6 @@ impl IfaceCommon {
             netmask,
             gateway,
             mtu,
-            ipv6_addr: None,
-            ipv6_prefix_len: None,
-            ipv6_gateway: None,
         }
     }
 
@@ -78,37 +67,6 @@ impl IfaceCommon {
 
     pub const fn mtu(self) -> u16 {
         self.mtu
-    }
-
-    /// IPv6 V1: attach on-link v6 config (address + prefix). Chained after
-    /// `with_gateway` at the namespace iface-build site.
-    pub fn with_ipv6(self, ipv6_addr: Option<Ipv6Address>, ipv6_prefix_len: Option<u8>) -> Self {
-        Self {
-            ipv6_addr,
-            ipv6_prefix_len,
-            ..self
-        }
-    }
-
-    pub const fn ipv6_addr(self) -> Option<Ipv6Address> {
-        self.ipv6_addr
-    }
-
-    pub const fn ipv6_prefix_len(self) -> Option<u8> {
-        self.ipv6_prefix_len
-    }
-
-    /// IPv6 V3b: attach the off-link v6 next-hop (default route's gateway).
-    /// Chained after `with_ipv6` at the namespace iface-build site.
-    pub fn with_ipv6_gateway(self, ipv6_gateway: Option<Ipv6Address>) -> Self {
-        Self {
-            ipv6_gateway,
-            ..self
-        }
-    }
-
-    pub const fn ipv6_gateway(self) -> Option<Ipv6Address> {
-        self.ipv6_gateway
     }
 }
 

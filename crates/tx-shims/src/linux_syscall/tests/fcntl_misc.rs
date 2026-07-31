@@ -2,17 +2,40 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
+use alloc::sync::{Arc, Weak as ArcWeak};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::linux_syscall::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_FCNTL, NR_GETRANDOM, NR_KILL, NR_PIDFD_OPEN,
-    NR_PIDFD_SEND_SIGNAL, NR_PRLIMIT64, NR_RT_SIGRETURN, NR_TGKILL, NR_TKILL, NR_UNAME, O_NONBLOCK,
-    O_RDWR, RLIMIT_AS, RLIMIT_NOFILE, RLIM_INFINITY,
+    AF_INET, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_CLOSE, NR_FCNTL, NR_GETRANDOM, NR_KILL,
+    NR_PIDFD_GETFD, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PRLIMIT64, NR_READ, NR_RT_SIGRETURN,
+    NR_SOCKET, NR_TGKILL, NR_TKILL, NR_UNAME, O_NONBLOCK, O_RDWR, RLIMIT_AS, RLIMIT_NOFILE,
+    RLIM_INFINITY,
 };
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+use tx_subsystems::signal::{SigDisposition, Signum};
 
 const E_BADF: i32 = 9;
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
 const E_SRCH: i32 = 3;
+const E_AGAIN: i32 = 11;
+const SOCK_DGRAM: u64 = 2;
+
+static SYSCALL_SIGNAL_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FCNTL_SOCKET_REF_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn counting_mailbox_post(mailbox: ArcWeak<TaskMailbox>, event: MailboxEvent) {
+    SYSCALL_SIGNAL_POST_COUNT.fetch_add(1, Ordering::SeqCst);
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
+
+fn counting_fcntl_socket_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    FCNTL_SOCKET_REF_POST_COUNT.fetch_add(1, Ordering::SeqCst);
+    mailbox.post(event)
+}
 
 fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
     let start = index * 65;
@@ -79,6 +102,81 @@ fn dispatch_pidfd_send_signal_zero_probes_pidfd_target() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
+}
+
+/// `pidfd_getfd` must account the duplicated pipe endpoint as a
+/// second fd reference. Closing the target's original writer must
+/// not publish EOF while the caller's duplicated writer is open.
+#[test]
+fn dispatch_pidfd_getfd_pipe_writer_keeps_pipe_alive_until_dup_closes() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child =
+        tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork");
+    let (reader, writer) =
+        tx_subsystems::pipe::step_pipe2(tx_subsystems::pipe::PipeFlags::default()).expect("pipe2");
+    parent.set_fd(3, Some(reader));
+    child.set_fd(4, Some(writer));
+
+    let ctx = make_ctx(parent.clone(), parent_thread);
+    let pidfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_OPEN, [child.pid.0 as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("pidfd_open child: {other:?}"),
+    };
+    let dupfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_GETFD, [pidfd as u64, 4, 0, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("pidfd_getfd child writer: {other:?}"),
+    };
+
+    child.set_fd(4, None);
+    let mut read_buf = [0u8; 1];
+    let read_req = SyscallRequest::new(
+        NR_READ,
+        [
+            3,
+            read_buf.as_mut_ptr() as u64,
+            read_buf.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(read_req, &ctx)),
+        SyscallResult::Error(E_AGAIN),
+        "the duplicated writer fd should keep the empty pipe non-EOF"
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_CLOSE, [dupfd as u64, 0, 0, 0, 0, 0]),
+            &ctx
+        )),
+        SyscallResult::Return(0)
+    );
+    let read_req = SyscallRequest::new(
+        NR_READ,
+        [
+            3,
+            read_buf.as_mut_ptr() as u64,
+            read_buf.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(read_req, &ctx)),
+        SyscallResult::Return(0),
+        "closing the duplicated writer should publish EOF"
+    );
 }
 
 /// `fcntl(fd, F_DUPFD, min)` returns the lowest unused fd ≥ min,
@@ -175,6 +273,46 @@ fn dispatch_fcntl_f_getfl_returns_open_flag_bits() {
 // elsewhere in this file when present, and at the
 // `OpenFile::set_runtime_nonblocking` unit-test level.
 
+#[test]
+fn dispatch_fcntl_setfl_socket_uses_syscall_ctx_mailbox_ref_post_for_send_space() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx =
+        make_ctx(proc_cap.clone(), thread).with_mailbox_ref_post(counting_fcntl_socket_ref_post);
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_SOCKET, [AF_INET as u64, SOCK_DGRAM, 0, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("socket should return fd, got {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("socket fd installed");
+    let identity = file.socket_identity().expect("socket backing").clone();
+    identity
+        .readiness
+        .clear_send(tx_subsystems::net::SendWireSet::SPACE);
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = identity.readiness.send_wq.subscribe(
+        tx_subsystems::net::SendWireSet::SPACE.bits(),
+        Arc::downgrade(&mailbox),
+        generation,
+    );
+    FCNTL_SOCKET_REF_POST_COUNT.store(0, Ordering::SeqCst);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_FCNTL,
+            [fd as u64, F_SETFL as u64, O_NONBLOCK as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(FCNTL_SOCKET_REF_POST_COUNT.load(Ordering::SeqCst), 1);
+}
+
 // -----------------------------------------------------------------
 // kill / tkill / tgkill.
 // -----------------------------------------------------------------
@@ -192,7 +330,7 @@ fn dispatch_kill_self_with_sigterm_succeeds() {
     let pid = proc_cap.pid.0 as u64;
     let ctx = make_ctx(proc_cap, thread);
 
-    // SIGTERM = 15 (catchable; routes through post_signal, no
+    // SIGTERM = 15 (catchable; routes through catchable-signal posting, no
     // zombification side-effect on the calling thread).
     let r = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_KILL, [pid, 15, 0, 0, 0, 0]),
@@ -206,7 +344,7 @@ fn dispatch_kill_self_with_sigterm_succeeds() {
 /// cred-check wiring: `sys_kill` must route through
 /// `script_kill_process` (which runs `cred::require_signal_send`
 /// against the caller's syscall-entry `CredSnapshot`), **not** the
-/// primitive `step_kill_process` that bypasses authorization.
+/// primitive process-directed kill helper that bypasses authorization.
 #[test]
 fn dispatch_kill_different_uid_returns_neg_eperm() {
     use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
@@ -264,23 +402,351 @@ fn dispatch_kill_unknown_pid_returns_neg_esrch() {
     assert_eq!(r, SyscallResult::Error(E_SRCH));
 }
 
-/// `kill(pid, 0)` is the existence probe: returns 0 for live
-/// targets without delivering anything.
 #[test]
-fn dispatch_kill_signal_zero_against_live_returns_zero() {
+fn dispatch_signal_zero_probe_kill_self_returns_zero_without_delivery() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     let pid = proc_cap.pid.0 as u64;
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(proc_cap.clone(), thread.clone()).with_mailbox_post(counting_mailbox_post);
 
     let r = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_KILL, [pid, 0, 0, 0, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
-    // The process must remain live — `sig == 0` is probe-only.
-    assert!(!proc_cap.is_zombie());
+    assert!(!thread
+        .payload_cap()
+        .expect("thread payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_unknown_pid_returns_esrch() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(proc_cap, thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [9999, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_current_pgrp_returns_zero_without_delivery() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(process, thread.clone()).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [0, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!thread
+        .payload_cap()
+        .expect("thread payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_different_uid_returns_eperm() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader");
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [child.pid.0 as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_PERM));
+    assert!(!child_thread
+        .payload_cap()
+        .expect("child payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_negative_pgrp_all_denied_returns_eperm() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    tx_subsystems::process::step_setpgid(&child, tx_subsystems::process::Pgid(child.pid.0))
+        .expect("create child process group");
+
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+    let child_thread = child.nth_thread(0).expect("child leader");
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+    let negative_pgid = (-(child.pid.0 as i64)) as u64;
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [negative_pgid, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_PERM));
+    assert!(!child_thread
+        .payload_cap()
+        .expect("child payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_negative_pgrp_permitted_without_delivery() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader");
+    tx_subsystems::process::step_setpgid(&child, tx_subsystems::process::Pgid(child.pid.0))
+        .expect("create child process group");
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-(child.pid.0 as i64)) as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!child_thread
+        .payload_cap()
+        .expect("child payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_negative_pgrp_no_target_returns_esrch() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-9999i64) as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_kill_negative_pgrp_aggregates_no_target_as_esrch() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let ctx = make_ctx(parent, parent_thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-9999i64) as u64, 15, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+}
+
+#[test]
+fn dispatch_kill_negative_pgrp_aggregates_all_denied_as_eperm() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    tx_subsystems::process::step_setpgid(&child, tx_subsystems::process::Pgid(child.pid.0))
+        .expect("create child process group");
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+    let ctx = make_ctx(parent, parent_thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-(child.pid.0 as i64)) as u64, 15, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_PERM));
+    assert!(!child.is_zombie());
+}
+
+#[test]
+fn dispatch_kill_negative_pgrp_aggregates_all_retry_as_eagain() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader");
+    tx_subsystems::process::step_setpgid(&child, tx_subsystems::process::Pgid(child.pid.0))
+        .expect("create child process group");
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&child, &child_thread)
+        .expect("reserve child exec lifecycle");
+    let ctx = make_ctx(parent, parent_thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_KILL,
+            [
+                (-(child.pid.0 as i64)) as u64,
+                Signum::SIGKILL.raw() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_AGAIN));
+    assert!(!child.is_zombie());
+    drop(exec_prep);
+}
+
+#[test]
+fn dispatch_kill_broadcast_aggregates_partial_success_as_success() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let retrying = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork retrying child");
+    let delivered = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork delivered child");
+    let retrying_thread = retrying.nth_thread(0).expect("retrying child leader");
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&retrying, &retrying_thread)
+        .expect("reserve child exec lifecycle");
+    let ctx = make_ctx(parent, parent_thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_KILL,
+            [(-1i64) as u64, Signum::SIGKILL.raw() as u64, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!retrying.is_zombie());
+    assert!(delivered.is_zombie());
+    drop(exec_prep);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_broadcast_permitted_without_delivery() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader");
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-1i64) as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!child_thread
+        .payload_cap()
+        .expect("child payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_broadcast_all_denied_returns_eperm() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader");
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-1i64) as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_PERM));
+    assert!(!child_thread
+        .payload_cap()
+        .expect("child payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_kill_broadcast_no_target_returns_esrch() {
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_KILL, [(-1i64) as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
 }
 
 /// `kill(pid, sig)` with an out-of-range signum returns `-EINVAL`.
@@ -315,6 +781,312 @@ fn dispatch_tkill_self_returns_success() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
+}
+
+#[test]
+fn dispatch_signal_zero_probe_tkill_different_uid_returns_eperm() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader");
+    tx_subsystems::process::numbers::register_tid(child_thread.tid, child_thread.clone());
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TKILL, [child_thread.tid.0 as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_PERM));
+    assert!(!child_thread
+        .payload_cap()
+        .expect("child payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_tkill_sigcancel_different_uid_returns_eperm_without_exit() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = setup();
+    let parent = bootstrap();
+    let parent_thread = first_thread(&parent);
+    let child = tx_subsystems::process::step_fork::<ShimsTestPmap>(&parent, false, false)
+        .expect("fork child");
+    let child_thread = child.nth_thread(0).expect("child leader");
+    tx_subsystems::process::numbers::register_tid(child_thread.tid, child_thread.clone());
+    clear_caps_for_test(&parent);
+    set_cred_ids_for_test(&parent, 1000, 1000, 1000, 1000, 1000, 1000);
+    clear_caps_for_test(&child);
+    set_cred_ids_for_test(&child, 2000, 2000, 2000, 2000, 2000, 2000);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(parent, parent_thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TKILL, [child_thread.tid.0 as u64, 33, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_PERM));
+    assert!(!child.is_zombie());
+    assert!(!child_thread.is_zombie());
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_tkill_sigcancel_unknown_tid_returns_esrch() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TKILL, [u32::MAX as u64, 33, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+}
+
+#[test]
+fn dispatch_signal_zero_probe_tkill_self_returns_zero_without_delivery() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let tid = thread.tid.0 as u64;
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(process, thread.clone()).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TKILL, [tid, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!thread
+        .payload_cap()
+        .expect("thread payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_tkill_unknown_tid_returns_esrch() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(process, thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TKILL, [u32::MAX as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_tkill_uses_syscall_ctx_mailbox_post() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let mailbox = Arc::new(TaskMailbox::new());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(Arc::downgrade(&mailbox));
+    let _ = tx_subsystems::signal::step_sigaction(
+        &proc_cap,
+        Signum::SIGTERM,
+        SigDisposition::Handler(0xCAFE),
+    );
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let pid = proc_cap.pid.0 as u64;
+    let ctx = make_ctx(proc_cap, thread).with_mailbox_post(counting_mailbox_post);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TKILL, [pid, Signum::SIGTERM.raw() as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(
+        SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "tkill should publish through SyscallCtx mailbox post"
+    );
+}
+
+#[test]
+fn dispatch_tgkill_uses_syscall_ctx_mailbox_post() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let mailbox = Arc::new(TaskMailbox::new());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(Arc::downgrade(&mailbox));
+    let _ = tx_subsystems::signal::step_sigaction(
+        &proc_cap,
+        Signum::SIGTERM,
+        SigDisposition::Handler(0xCAFE),
+    );
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let tgid = proc_cap.pid.0 as u64;
+    let tid = thread.tid.0 as u64;
+    let ctx = make_ctx(proc_cap, thread).with_mailbox_post(counting_mailbox_post);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_TGKILL,
+            [tgid, tid, Signum::SIGTERM.raw() as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(r, SyscallResult::Return(0));
+    assert_eq!(
+        SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "tgkill should publish through SyscallCtx mailbox post"
+    );
+}
+
+#[test]
+fn dispatch_signal_zero_probe_tgkill_unknown_tid_returns_esrch() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let tgid = process.pid.0 as u64;
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(process, thread).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TGKILL, [tgid, u32::MAX as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_signal_zero_probe_tgkill_self_returns_zero_without_delivery() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let tgid = process.pid.0 as u64;
+    let tid = thread.tid.0 as u64;
+    SYSCALL_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(process, thread.clone()).with_mailbox_post(counting_mailbox_post);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TGKILL, [tgid, tid, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!thread
+        .payload_cap()
+        .expect("thread payload")
+        .pending()
+        .is_pending(Signum::SIGTERM));
+    assert_eq!(SYSCALL_SIGNAL_POST_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dispatch_tgkill_sigcancel_foreign_tgid_returns_esrch() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let foreign_tgid = process.pid.0 as u64 + 1;
+    let tid = thread.tid.0 as u64;
+    let ctx = make_ctx(process, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TGKILL, [foreign_tgid, tid, 33, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+}
+
+#[test]
+fn dispatch_tgkill_sigcancel_unknown_tid_returns_esrch() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let tgid = process.pid.0 as u64;
+    let ctx = make_ctx(process, thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_TGKILL, [tgid, u32::MAX as u64, 33, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_SRCH));
+}
+
+#[test]
+fn dispatch_tgkill_sigkill_returns_eagain_while_exec_owns_lifecycle() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&proc_cap, &thread)
+        .expect("reserve exec lifecycle");
+    let tgid = proc_cap.pid.0 as u64;
+    let tid = thread.tid.0 as u64;
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_TGKILL,
+            [tgid, tid, Signum::SIGKILL.raw() as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_AGAIN));
+    assert!(!proc_cap.is_zombie());
+    drop(exec_prep);
+}
+
+#[test]
+fn signal_delivery_result_maps_lifecycle_permission_and_liveness() {
+    use tx_subsystems::execution::Errno;
+    use tx_subsystems::signal::KillOutcome;
+
+    assert_eq!(
+        crate::linux_syscall::signal::signal_delivery_result(Ok(KillOutcome::Delivered)),
+        SyscallResult::Return(0),
+    );
+    assert_eq!(
+        crate::linux_syscall::signal::signal_delivery_result(Ok(KillOutcome::Retry)),
+        SyscallResult::Error(E_AGAIN),
+    );
+    assert_eq!(
+        crate::linux_syscall::signal::signal_delivery_result(Ok(KillOutcome::NoLiveThread)),
+        SyscallResult::Error(E_SRCH),
+    );
+    assert_eq!(
+        crate::linux_syscall::signal::signal_delivery_result(Err(Errno::EPERM)),
+        SyscallResult::Error(E_PERM),
+    );
 }
 
 // Removed: `dispatch_tgkill_aliases_to_kill`. The test passed
@@ -431,11 +1203,17 @@ impl tx_hal::ConsoleIf for LoongArchUnamePmap {
     fn write_bytes(_bytes: &[u8]) {}
 }
 impl SmpIf for LoongArchUnamePmap {}
-impl tx_hal::TimeIf for LoongArchUnamePmap {
+impl tx_hal::MonotonicCounterIf for LoongArchUnamePmap {
     fn read_ns() -> u64 {
         ShimsTestPmap::read_ns()
     }
 
+    fn frequency_hz() -> u64 {
+        ShimsTestPmap::frequency_hz()
+    }
+}
+
+impl tx_hal::DeadlineTimerIf for LoongArchUnamePmap {
     fn set_deadline_ns(deadline_ns: u64) {
         ShimsTestPmap::set_deadline_ns(deadline_ns);
     }
@@ -443,11 +1221,9 @@ impl tx_hal::TimeIf for LoongArchUnamePmap {
     fn cancel_deadline() {
         ShimsTestPmap::cancel_deadline();
     }
-
-    fn frequency_hz() -> u64 {
-        ShimsTestPmap::frequency_hz()
-    }
 }
+
+impl tx_hal::PersistentClockIf for LoongArchUnamePmap {}
 
 #[test]
 fn dispatch_uname_uses_selected_platform_machine() {

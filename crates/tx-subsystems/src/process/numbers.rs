@@ -161,48 +161,17 @@ pub fn with_namespace<T>(f: impl FnOnce(&BTreeMap<(u64, PidNameKind), PidName>) 
 // Allocation
 // ---------------------------------------------------------------------------
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_PID: AtomicU32 = AtomicU32::new(2);
 
-/// One-shot tripwire well below procfs' pid-id window
-/// (`PROCFS_PID_LIMIT` = 0x40_0000): this counter is a monotone
-/// scaffold shared by pids AND tids and never recycles (PROCESS_v1
-/// specifies a bitmap `reserve_pid_name` allocator instead — unbuilt).
-/// A boot that outgrows the window makes `/proc/<pid>` stop resolving,
-/// which wedged the 2026-07-02 ltp-glibc lane at fs_bind_move01. Fire
-/// a loud marker at 3M (75% of the window) so the ceiling announces
-/// itself before it hurts. See ljs/08-pid分配与procfs窗口事故.md.
-const PID_TRIPWIRE: u32 = 0x30_0000;
-static PID_TRIPWIRE_SINK: AtomicUsize = AtomicUsize::new(0);
-
-/// Register the kernel-side console warning hook (this crate is
-/// platform-independent and cannot emit console bytes itself).
-pub fn install_pid_tripwire_sink(sink: fn()) {
-    PID_TRIPWIRE_SINK.store(sink as usize, Ordering::Release);
-}
-
-fn next_number() -> u32 {
-    let number = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    if number == PID_TRIPWIRE {
-        let sink = PID_TRIPWIRE_SINK.load(Ordering::Acquire);
-        if sink != 0 {
-            // SAFETY: only ever stored from `install_pid_tripwire_sink`
-            // with a valid `fn()`.
-            let sink: fn() = unsafe { core::mem::transmute(sink) };
-            sink();
-        }
-    }
-    number
-}
-
 pub fn allocate_pid() -> Pid {
-    Pid(next_number())
+    Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Allocate a unique TID from the shared PID/TID space.
 pub fn allocate_tid() -> Tid {
-    Tid(next_number())
+    Tid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
 }
 
 pub fn reset_pid_counter_for_test() {

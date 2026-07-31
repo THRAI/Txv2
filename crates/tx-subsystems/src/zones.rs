@@ -1,4 +1,7 @@
-use crate::adapter::step_engine::{epoch, page_allocator, zone, Zone, ZoneAllocated, ZoneError};
+use crate::adapter::step_engine::{
+    drain_with_budget, guard, page_allocator, summary as epoch_summary, zone, Zone, ZoneAllocated,
+    ZoneError,
+};
 use tx_hal::{console_write_str, TxPlatform};
 use tx_substrate::slab;
 
@@ -56,7 +59,7 @@ pub fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
     let cap = zone::sign_for(reservation, ZoneSmokeObj { value: 7 });
     let weak = cap.downgrade();
     let upgraded = {
-        let guard = epoch::guard();
+        let guard = guard();
         let ident = weak.observe(&guard).ok_or(ZoneError::SlotNotFound)?;
         if ident.value != 7 {
             return Err(ZoneError::InvalidState);
@@ -69,8 +72,8 @@ pub fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
 
     drop(cap);
     drop(upgraded);
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    let _ = drain_with_budget(usize::MAX);
+    let _ = drain_with_budget(usize::MAX);
 
     console_write_str::<P>("txkernel:zone:smoke:ok\n");
     Ok(())
@@ -88,7 +91,7 @@ pub(crate) fn summary() -> KernelZoneSummary {
     let mut zones = [const { None }; 64];
     let captured_zones = zone::snapshot(&mut zones);
     KernelZoneSummary {
-        epoch: epoch::summary(),
+        epoch: epoch_summary(),
         zone_count: zone::registered_zone_count(),
         captured_zones,
         zones,
@@ -352,14 +355,18 @@ pub fn dump_summary<P: TxPlatform>() {
         console_write_str::<P>("\n");
     }
 
-    let wait_sources = tx_substrate::wake::registry_summary();
+    let wait_sources = crate::wait_source::registry_summary();
     console_write_str::<P>("txkernel:wait_source:registered=");
-    write_usize::<P>(wait_sources.live);
-    console_write_str::<P>(":slots=");
-    write_usize::<P>(wait_sources.slots);
+    write_usize::<P>(wait_sources.total);
+    console_write_str::<P>(":wait=");
+    write_usize::<P>(wait_sources.wait_sources);
+    console_write_str::<P>(":queues=");
+    write_usize::<P>(wait_sources.raw_queues);
+    console_write_str::<P>(":ports=");
+    write_usize::<P>(wait_sources.raw_ports);
     console_write_str::<P>("\n");
 
-    let wake_sources = crate::adapter::step_engine::wake::registry_summary();
+    let wake_sources = crate::adapter::step_engine::wake_registry_summary();
     console_write_str::<P>("txkernel:wake_source:slots=");
     write_usize::<P>(wake_sources.slots);
     console_write_str::<P>(":live=");

@@ -90,22 +90,13 @@ impl PollContext {
         iface: &LoopbackIface,
         _guard: &Guard<'_>,
     ) -> Option<NetworkPublishTarget> {
-        // 同 poll_udp_ingress:检活后再取 payload,防并发 close 竞态。
-        let source_ident = source.downgrade().observe(_guard)?;
-        let source_payload = source_ident.acquire_operational()?;
+        let source_payload = source.acquire_operational()?;
         let (local, connected_remote) = udp_endpoints(&source_payload.protocol_snapshot())?;
         let mut drain = source_payload.take_udp_tx_datagram()?;
         if drain.datagram.dst.port == 0 {
             drain.datagram.dst = connected_remote?;
         }
-        // P2-S6: prefer the dispatch-resolved source (bound address or
-        // enqueue-time hint); fall back to the loopback selection rule for
-        // datagrams that predate the hint.
-        let packet_src = if !drain.src.is_unspecified() && drain.src.port != 0 {
-            drain.src
-        } else {
-            select_udp_packet_source(local, drain.datagram.dst, iface)
-        };
+        let packet_src = select_udp_packet_source(local, drain.datagram.dst, iface);
         let packet = drain.datagram.emit_ipv4_packet(packet_src)?;
         if !iface.dispatch_ip(packet) {
             return None;
@@ -120,6 +111,87 @@ impl PollContext {
                 ..NetworkPublish::none()
             },
         ))
+    }
+
+    pub fn poll_udp_loopback_direct_one(
+        &mut self,
+        source: &Cap<SocketIdentity>,
+        iface: &LoopbackIface,
+        guard: &Guard<'_>,
+    ) -> Option<PollContextOutcome> {
+        let source_payload = source.acquire_operational()?;
+        let (local, connected_remote) = udp_endpoints(&source_payload.protocol_snapshot())?;
+        let mut drain = source_payload.take_udp_tx_datagram()?;
+        if drain.datagram.dst.port == 0 {
+            drain.datagram.dst = connected_remote?;
+        }
+        let src = select_udp_packet_source(local, drain.datagram.dst, iface);
+        if src.port == 0 || drain.datagram.dst.port == 0 || drain.datagram.payload.is_empty() {
+            return None;
+        }
+        if udp_ip_packet_len(drain.datagram.dst, drain.datagram.payload.len())
+            > usize::from(iface.mtu())
+        {
+            return None;
+        }
+
+        self.tx_packets += 1;
+        self.packets_seen += 1;
+        self.sockets_touched += 1;
+
+        let payload_len = drain.datagram.payload.len();
+        let mut publishes = Vec::new();
+        if drain.became_available {
+            publishes.push(NetworkPublishTarget::new(
+                source.clone(),
+                NetworkPublish {
+                    send_has_space: true,
+                    ..NetworkPublish::none()
+                },
+            ));
+        }
+
+        let Some(target) = self
+            .socket_table
+            .lookup_udp_ingress(src, drain.datagram.dst, guard)
+        else {
+            return Some(PollContextOutcome {
+                packets_seen: self.packets_seen,
+                tx_packets: self.tx_packets,
+                sockets_touched: self.sockets_touched,
+                bytes_moved: 0,
+                publishes,
+                created_children: Vec::new(),
+            });
+        };
+        let Some(target_payload) = target.acquire_operational() else {
+            return Some(PollContextOutcome {
+                packets_seen: self.packets_seen,
+                tx_packets: self.tx_packets,
+                sockets_touched: self.sockets_touched,
+                bytes_moved: 0,
+                publishes,
+                created_children: Vec::new(),
+            });
+        };
+
+        let mut peer_publish = NetworkPublish::none();
+        if target_payload.record_recv_payload(src, drain.datagram.dst, drain.datagram.payload) {
+            peer_publish.recv_has_data = true;
+        }
+        self.sockets_touched += 1;
+        if peer_publish.has_any() {
+            publishes.push(NetworkPublishTarget::new(target, peer_publish));
+        }
+
+        Some(PollContextOutcome {
+            packets_seen: self.packets_seen,
+            tx_packets: self.tx_packets,
+            sockets_touched: self.sockets_touched,
+            bytes_moved: payload_len,
+            publishes,
+            created_children: Vec::new(),
+        })
     }
 
     pub fn poll_icmp_egress_one(
@@ -383,7 +455,48 @@ impl PollContext {
         guard: &Guard<'_>,
         budget: usize,
     ) -> PollContextOutcome {
-        self.poll_ingress(iface, guard, budget)
+        let mut publishes = Vec::new();
+        let mut bytes_moved = 0;
+
+        for _ in 0..budget {
+            let Some(packet) = iface.pop_ingress() else {
+                break;
+            };
+            self.packets_seen += 1;
+
+            let Some(datagram) = UdpRxDatagram::parse_ipv4_packet(&packet) else {
+                continue;
+            };
+            let payload_len = datagram.payload.len();
+            let Some(target) =
+                self.socket_table
+                    .lookup_udp_ingress(datagram.src, datagram.dst, guard)
+            else {
+                continue;
+            };
+            let Some(target_payload) = target.acquire_operational() else {
+                continue;
+            };
+
+            let mut publish = NetworkPublish::none();
+            if target_payload.record_recv_payload(datagram.src, datagram.dst, datagram.payload) {
+                publish.recv_has_data = true;
+            }
+            self.sockets_touched += 1;
+            bytes_moved += payload_len;
+            if publish.has_any() {
+                publishes.push(NetworkPublishTarget::new(target, publish));
+            }
+        }
+
+        PollContextOutcome {
+            packets_seen: self.packets_seen,
+            tx_packets: self.tx_packets,
+            sockets_touched: self.sockets_touched,
+            bytes_moved,
+            publishes,
+            created_children: Vec::new(),
+        }
     }
 
     pub fn poll_icmp_ingress(
@@ -476,9 +589,9 @@ impl PollContext {
     ) -> Option<SegmentProcessTarget> {
         let target_raw = target_payload.raw_tcp_socket()?;
 
-        // Data now lands directly in the smoltcp rx ring inside
-        // `process_segment`; readability is derived from the ring below.
         let protocol_publish = target_raw.process_segment(segment);
+        let became_readable = target_raw.drain_protocol_recv_to_staging();
+        target_payload.refresh_io_from_raw();
         self.sockets_touched += 1;
 
         // PollContext is the loopback protocol lane.  Reaching smoltcp's
@@ -490,7 +603,8 @@ impl PollContext {
         let mut publishes = Vec::new();
 
         let publish = NetworkPublish {
-            recv_has_data: protocol_publish.recv_readable
+            recv_has_data: became_readable
+                || protocol_publish.recv_readable
                 || target.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
                     && target_raw.recv_available() > 0,
             send_has_space: protocol_publish.send_writable,
@@ -519,11 +633,11 @@ struct SegmentProcessTarget {
     publishes: Vec<NetworkPublishTarget>,
 }
 
-pub(crate) fn is_first_syn(segment: &SmoltcpTcpSegment) -> bool {
+fn is_first_syn(segment: &SmoltcpTcpSegment) -> bool {
     segment.tcp.control == TcpControl::Syn && segment.tcp.ack_number.is_none()
 }
 
-pub(crate) fn listener_accepts_incoming(
+fn listener_accepts_incoming(
     listener_payload: &crate::net::structure::SocketOperationalEvidence,
     dst: IpEndpoint,
 ) -> bool {
@@ -563,6 +677,17 @@ fn select_udp_packet_source(
     }
 }
 
+fn udp_ip_packet_len(dst: IpEndpoint, payload_len: usize) -> usize {
+    const IPV4_HEADER_LEN: usize = 20;
+    const IPV6_HEADER_LEN: usize = 40;
+    const UDP_HEADER_LEN: usize = 8;
+    if dst.family == crate::net::structure::AddressFamily::Inet6 {
+        IPV6_HEADER_LEN + UDP_HEADER_LEN + payload_len
+    } else {
+        IPV4_HEADER_LEN + UDP_HEADER_LEN + payload_len
+    }
+}
+
 fn accepts_loopback_icmp_destination(iface: &LoopbackIface, dst: Ipv4Address) -> bool {
     dst == iface.local_ipv4() || dst == Ipv4Address::BROADCAST
 }
@@ -574,16 +699,7 @@ fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
     }
 }
 
-fn tcp_endpoints_match_socket(protocol: &SocketProtocol, src: IpEndpoint, dst: IpEndpoint) -> bool {
-    matches!(
-        protocol,
-        SocketProtocol::Tcp(
-            TcpState::Connecting { local, remote } | TcpState::Connected { local, remote }
-        ) if *local == dst && *remote == src
-    )
-}
-
-pub(crate) fn promote_connected_stream_and_publish_accept(
+fn promote_connected_stream_and_publish_accept(
     table: &SocketTable,
     socket: &Cap<SocketIdentity>,
     payload: &crate::net::structure::SocketOperationalEvidence,

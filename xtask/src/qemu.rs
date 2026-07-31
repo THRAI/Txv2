@@ -4,9 +4,14 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::image::{alpine_initramfs_name, busybox_initramfs_name, busybox_root_ext4_name};
+use crate::image::{
+    alpine_initramfs_name, busybox_initramfs_name, busybox_root_ext4_name, test_initramfs_name,
+};
 use crate::target::{Profile, TxTarget};
-use crate::util::{option_value, optional_option_value, shell_join, tail_lines};
+use crate::util::{
+    append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
+    resolve_path, shell_join, tail_lines, validate_boot_mode_value,
+};
 use crate::Result;
 
 const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -14,6 +19,7 @@ const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 struct QemuOptions {
     expect_sentinel: bool,
+    expect_markers: Vec<String>,
     timeout: Duration,
     smp: Option<usize>,
     /// Skip the busybox-profile virtio-blk drive wiring. Used by smoke
@@ -26,6 +32,9 @@ struct QemuOptions {
     /// shell-test driver) sees output directly and types into stdin.
     /// Ctrl-A C to drop into the QEMU monitor, Ctrl-A X to quit.
     interactive: bool,
+    boot_mode: Option<String>,
+    append_cmdline: Option<String>,
+    extra_rv64_ext4: Option<PathBuf>,
     net: QemuNet,
     host_ping: Option<HostPingOptions>,
 }
@@ -71,13 +80,16 @@ pub(crate) fn qemu(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
     let profile = Profile::parse(&option_value(&args, "--profile")?)?;
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
-    let options = qemu_options(&args)?;
+    let options = qemu_options(root, &args)?;
     let command = qemu_command(root, target, profile, &options)?;
 
     println!("{}", shell_join(&command));
     if options.expect_sentinel {
         println!("serial: {}", serial_log_relative(target, profile).display());
         println!("expect: {}", expected_sentinel(target));
+        for marker in &options.expect_markers {
+            println!("expect-marker: {marker}");
+        }
         println!("timeout-ms: {}", options.timeout.as_millis());
     }
     if let Some(host_ping) = &options.host_ping {
@@ -106,7 +118,7 @@ pub(crate) fn qemu(root: &Path, args: Vec<String>) -> Result<()> {
     }
 }
 
-fn qemu_options(args: &[String]) -> Result<QemuOptions> {
+fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
     let timeout = optional_option_value(args, "--timeout-ms")
         .map(|value| {
             value
@@ -132,18 +144,46 @@ fn qemu_options(args: &[String]) -> Result<QemuOptions> {
         .transpose()?;
 
     let expect_sentinel = args.iter().any(|arg| arg == "--expect-sentinel");
+    let expect_markers = option_values(args, "--expect-marker")?;
+    let boot_mode = optional_option_value(args, "--boot-mode")
+        .map(|value| validate_boot_mode_value(&value).map(|()| value))
+        .transpose()?;
+    let append_cmdline = optional_option_value(args, "--append-cmdline");
+    let extra_rv64_ext4 = optional_option_value(args, "--extra-rv64-ext4")
+        .map(|path| resolve_path(root, PathBuf::from(path)));
     let net = qemu_net(args)?;
     let host_ping = host_ping_options(args, expect_sentinel, &net)?;
 
     Ok(QemuOptions {
         expect_sentinel,
+        expect_markers,
         timeout,
         smp,
         no_block: args.iter().any(|arg| arg == "--no-block"),
         interactive: args.iter().any(|arg| arg == "--interactive"),
+        boot_mode,
+        append_cmdline,
+        extra_rv64_ext4,
         net,
         host_ping,
     })
+}
+
+fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        if args[idx] == name {
+            let Some(value) = args.get(idx + 1) else {
+                return Err(format!("option {name} needs a value"));
+            };
+            values.push(value.clone());
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    Ok(values)
 }
 
 pub(crate) fn qemu_net(args: &[String]) -> Result<QemuNet> {
@@ -245,6 +285,13 @@ fn qemu_command(
     profile: Profile,
     options: &QemuOptions,
 ) -> Result<Vec<String>> {
+    if options.extra_rv64_ext4.is_some() && target != TxTarget::Rv64Qemu {
+        return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
+    }
+    if options.extra_rv64_ext4.is_some() && profile == Profile::Busybox && !options.no_block {
+        return Err("--extra-rv64-ext4 conflicts with the busybox default block image; pass --no-block or use --profile alpine".into());
+    }
+
     let kernel = target.kernel_path(root);
     let serial_log = serial_log_relative(target, profile);
     let mut args = vec![
@@ -262,7 +309,7 @@ fn qemu_command(
         "-m".to_string(),
         qemu_memory(target, profile).to_string(),
         "-smp".to_string(),
-        qemu_smp(target, options).to_string(),
+        qemu_smp(target, profile, options).to_string(),
         // Force multi-threaded TCG: vCPUs run on parallel host threads
         // instead of round-robin time-slicing on one host thread. Without
         // this, the boot smoke's BSP busy-spin for AP reactor task
@@ -306,11 +353,6 @@ fn qemu_command(
         args.push("-no-shutdown".into());
     }
 
-    // QEMU's firmware topology is the default source of truth. Keep an
-    // explicit matching cap in xtask-generated command lines so `--smp N`
-    // remains deterministic even when a custom firmware tree exposes more
-    // harts than QEMU was asked to run.
-    let maxcpus_suffix = format!(" tx.maxcpus={}", qemu_smp(target, options));
     if matches!(profile, Profile::Busybox | Profile::Alpine) {
         let initramfs_name = match profile {
             Profile::Busybox => busybox_initramfs_name(target),
@@ -318,25 +360,26 @@ fn qemu_command(
             Profile::Smoke => unreachable!("handled by outer profile match"),
         };
         let initramfs = root.join("target").join("images").join(initramfs_name);
-        let cmdline = match (profile, target) {
+        let boot_mode = options
+            .boot_mode
+            .as_deref()
+            .unwrap_or_else(|| default_boot_mode_for_profile(profile));
+        let cmdline_base = match (profile, target) {
             (Profile::Busybox, TxTarget::Rv64M1DockMock) => {
-                "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+                format!("tx.profile=busybox tx.boot.mode={boot_mode} tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0")
             }
-            (Profile::Busybox, _) => "tx.profile=busybox console=ttyS0",
-            (Profile::Alpine, _) => "tx.profile=alpine init=/bin/sh console=ttyS0",
+            (Profile::Busybox, _) => {
+                format!("tx.profile=busybox tx.boot.mode={boot_mode} console=ttyS0")
+            }
+            (Profile::Alpine, _) => {
+                format!("tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0")
+            }
             (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
-        let cmdline = format!("{cmdline}{maxcpus_suffix}");
-        // LA64 ships the initramfs via fw_cfg only: with the unified
-        // high load base (0x9000_0000, shared with the LS2K1000
-        // board) QEMU 9.2.1's direct-boot loader rejects `-initrd`
-        // for high-RAM kernels ("memory too small for initial ram
-        // disk"); the board HAL copies opt/tx.initrd out of fw_cfg
-        // instead.
-        if target != TxTarget::La64Qemu {
-            args.push("-initrd".into());
-            args.push(initramfs.display().to_string());
-        }
+        let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
+        let cmdline = append_tty_winsize_cmdline(&cmdline_base);
+        args.push("-initrd".into());
+        args.push(initramfs.display().to_string());
         args.push("-append".into());
         args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {
@@ -346,17 +389,30 @@ fn qemu_command(
             args.push(format!("name=opt/tx.initrd,file={}", initramfs.display()));
         }
     } else {
-        let cmdline = if target == TxTarget::Rv64M1DockMock {
-            "tx.profile=smoke tx.board=m1dock-mock console=ttyS0"
+        let boot_mode = options
+            .boot_mode
+            .as_deref()
+            .unwrap_or_else(|| default_boot_mode_for_profile(profile));
+        let cmdline_base = if target == TxTarget::Rv64M1DockMock {
+            format!("tx.profile=smoke tx.boot.mode={boot_mode} tx.board=m1dock-mock init=/tx-test-init tx.test_init=1 console=ttyS0")
         } else {
-            "tx.profile=smoke console=ttyS0"
+            format!("tx.profile=smoke tx.boot.mode={boot_mode} init=/tx-test-init tx.test_init=1 console=ttyS0")
         };
-        let cmdline = format!("{cmdline}{maxcpus_suffix}");
+        let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
+        let cmdline = append_tty_winsize_cmdline(&cmdline_base);
+        let initramfs = root
+            .join("target")
+            .join("images")
+            .join(test_initramfs_name(target));
+        args.push("-initrd".into());
+        args.push(initramfs.display().to_string());
         args.push("-append".into());
         args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {
             args.push("-fw_cfg".into());
             args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.initrd,file={}", initramfs.display()));
         }
     }
 
@@ -370,12 +426,7 @@ fn qemu_command(
                 args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0".into());
             }
             TxTarget::Rv64Qemu => {
-                // Pin the block device to virtio-mmio-bus.0 (-> "virtio0" @
-                // 0x1000_1000, where the block driver probes — see the rv64
-                // board `boot_static.rs`). Net takes bus.1 (-> "virtio1"); an
-                // unpinned block would drift to another slot when net is present
-                // and the block-0 read would hang.
-                args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
+                args.push("virtio-blk-device,drive=txblk0".into());
             }
         }
         args.push("-drive".into());
@@ -393,6 +444,15 @@ fn qemu_command(
             ));
         }
     }
+    if let Some(path) = &options.extra_rv64_ext4 {
+        args.push("-drive".into());
+        args.push(format!(
+            "file={},format=raw,if=none,id=txblk0",
+            path.display()
+        ));
+        args.push("-device".into());
+        args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
+    }
     append_net_args(&mut args, target, &options.net);
     args.push("-d".into());
     args.push("guest_errors".into());
@@ -405,14 +465,22 @@ fn qemu_command(
     Ok(args)
 }
 
-fn qemu_smp(target: TxTarget, options: &QemuOptions) -> usize {
+fn append_extra_cmdline(base: &str, extra: Option<&str>) -> String {
+    match extra {
+        Some(extra) if !extra.trim().is_empty() => format!("{base} {}", extra.trim()),
+        _ => base.to_string(),
+    }
+}
+
+fn qemu_smp(target: TxTarget, profile: Profile, options: &QemuOptions) -> usize {
     if let Some(smp) = options.smp {
         return smp;
     }
 
-    match target {
-        TxTarget::Rv64Qemu | TxTarget::La64Qemu => 4,
-        TxTarget::Rv64M1DockMock => 1,
+    match (target, profile) {
+        (TxTarget::Rv64Qemu, Profile::Alpine) => 1,
+        (TxTarget::Rv64Qemu | TxTarget::La64Qemu, _) => 4,
+        (TxTarget::Rv64M1DockMock, _) => 1,
     }
 }
 
@@ -443,11 +511,7 @@ fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
     args.push("-device".into());
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
-            // Bus.1 (-> "virtio1" @ 0x1000_2000, where the net driver binds —
-            // see the rv64 board `boot_static.rs`). The block device owns bus.0
-            // (-> "virtio0"); putting net on bus.0 lands it where the block
-            // driver probes and hangs the boot-time ext4 superblock read.
-            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1".into());
+            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0".into());
         }
         TxTarget::La64Qemu => {
             args.push("virtio-net-pci,netdev=net0".into());
@@ -464,7 +528,7 @@ fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
 
 fn qemu_memory(target: TxTarget, profile: Profile) -> &'static str {
     match (target, profile) {
-        (TxTarget::Rv64Qemu, Profile::Alpine) => "512M",
+        (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
         (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
         (TxTarget::La64Qemu, _) => "1152M",
     }
@@ -503,7 +567,13 @@ fn run_with_sentinel(
 
     loop {
         let serial = fs::read_to_string(&serial_log).unwrap_or_default();
-        match sentinel_state(&serial, &sentinel, started.elapsed(), options.timeout) {
+        match sentinel_state(
+            &serial,
+            &sentinel,
+            &options.expect_markers,
+            started.elapsed(),
+            options.timeout,
+        ) {
             SentinelState::Found => {
                 if let Some(host_ping) = &options.host_ping {
                     run_host_ping(root, host_ping).inspect_err(|_| {
@@ -513,7 +583,10 @@ fn run_with_sentinel(
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                println!("qemu smoke sentinel observed: {sentinel}");
+                println!(
+                    "qemu smoke sentinel observed: {}",
+                    expected_marker_summary(&sentinel, &options.expect_markers)
+                );
                 return Ok(());
             }
             SentinelState::TimedOut => {
@@ -521,8 +594,9 @@ fn run_with_sentinel(
                 let _ = child.wait();
                 let annotation = fault_decode_annotation(root, target, &serial_log, &serial);
                 return Err(format!(
-                    "qemu timed out after {} ms waiting for {sentinel}\nserial tail:\n{}{}",
+                    "qemu timed out after {} ms waiting for {}\nserial tail:\n{}{}",
                     options.timeout.as_millis(),
+                    expected_marker_summary(&sentinel, &options.expect_markers),
                     tail_lines(&serial, 80),
                     annotation.unwrap_or_default()
                 ));
@@ -532,7 +606,8 @@ fn run_with_sentinel(
                 let _ = child.wait();
                 let annotation = fault_decode_annotation(root, target, &serial_log, &serial);
                 return Err(format!(
-                    "qemu observed trap before sentinel {sentinel}\nserial tail:\n{}{}",
+                    "qemu observed trap before sentinel {}\nserial tail:\n{}{}",
+                    expected_marker_summary(&sentinel, &options.expect_markers),
                     tail_lines(&serial, 80),
                     annotation.unwrap_or_default()
                 ));
@@ -542,18 +617,22 @@ fn run_with_sentinel(
 
         if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
             let serial = fs::read_to_string(&serial_log).unwrap_or_default();
-            if serial_contains_sentinel(&serial, &sentinel) {
+            if serial_contains_expected_markers(&serial, &sentinel, &options.expect_markers) {
                 if options.host_ping.is_some() {
                     return Err(format!(
                         "qemu exited before host ping could run after observing {sentinel}"
                     ));
                 }
-                println!("qemu smoke sentinel observed: {sentinel}");
+                println!(
+                    "qemu smoke sentinel observed: {}",
+                    expected_marker_summary(&sentinel, &options.expect_markers)
+                );
                 return Ok(());
             }
             let annotation = fault_decode_annotation(root, target, &serial_log, &serial);
             return Err(format!(
-                "qemu exited with {status} before sentinel {sentinel}\nserial tail:\n{}{}",
+                "qemu exited with {status} before sentinel {}\nserial tail:\n{}{}",
+                expected_marker_summary(&sentinel, &options.expect_markers),
                 tail_lines(&serial, 80),
                 annotation.unwrap_or_default()
             ));
@@ -621,17 +700,37 @@ fn expected_sentinel(target: TxTarget) -> String {
     format!("txkernel:{}:boot:ok", target.board_name())
 }
 
+pub(crate) fn expected_owner_wake_smp_marker(target: TxTarget) -> String {
+    format!("txkernel:{}:reactor:owner-wake:smp:ok", target.board_name())
+}
+
 fn serial_contains_sentinel(serial: &str, sentinel: &str) -> bool {
     serial.contains(sentinel)
+}
+
+fn serial_contains_expected_markers(serial: &str, sentinel: &str, markers: &[String]) -> bool {
+    serial_contains_sentinel(serial, sentinel)
+        && markers
+            .iter()
+            .all(|marker| serial_contains_sentinel(serial, marker))
+}
+
+fn expected_marker_summary(sentinel: &str, markers: &[String]) -> String {
+    if markers.is_empty() {
+        sentinel.to_string()
+    } else {
+        format!("{sentinel} plus {}", markers.join(", "))
+    }
 }
 
 fn sentinel_state(
     serial: &str,
     sentinel: &str,
+    markers: &[String],
     elapsed: Duration,
     timeout: Duration,
 ) -> SentinelState {
-    if serial_contains_sentinel(serial, sentinel) {
+    if serial_contains_expected_markers(serial, sentinel, markers) {
         SentinelState::Found
     } else if serial_contains_trap_summary(serial) {
         SentinelState::Trapped
@@ -730,7 +829,7 @@ fn fault_decode_args_for_serial(target: TxTarget, serial_log: &Path) -> Option<V
     ])
 }
 
-fn serial_log_relative(target: TxTarget, profile: Profile) -> PathBuf {
+pub(crate) fn serial_log_relative(target: TxTarget, profile: Profile) -> PathBuf {
     PathBuf::from(format!(
         "target/qemu-{}-{}.serial.log",
         target.name(),
@@ -740,10 +839,26 @@ fn serial_log_relative(target: TxTarget, profile: Profile) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::*;
+
+    fn test_options() -> QemuOptions {
+        QemuOptions {
+            expect_sentinel: false,
+            expect_markers: Vec::new(),
+            timeout: Duration::from_secs(10),
+            smp: None,
+            no_block: false,
+            interactive: false,
+            boot_mode: None,
+            append_cmdline: None,
+            extra_rv64_ext4: None,
+            net: QemuNet::None,
+            host_ping: None,
+        }
+    }
 
     #[test]
     fn derives_rv64_qemu_sentinel_from_board_name() {
@@ -771,6 +886,7 @@ mod tests {
             sentinel_state(
                 "OpenSBI\n",
                 "txkernel:qemu-riscv64-virt:boot:ok",
+                &[],
                 Duration::from_millis(1500),
                 Duration::from_millis(1000)
             ),
@@ -784,10 +900,39 @@ mod tests {
             sentinel_state(
                 "txkernel:qemu-riscv64-virt:trap\nscause=0xd sepc=0xffffffff80201234 stval=0x40001000\n",
                 "txkernel:qemu-riscv64-virt:boot:ok",
+                &[],
                 Duration::from_millis(10),
                 Duration::from_secs(10)
             ),
             SentinelState::Trapped
+        );
+    }
+
+    #[test]
+    fn extra_expected_marker_is_required_with_boot_sentinel() {
+        let sentinel = "txkernel:qemu-riscv64-virt:boot:ok";
+        let marker = expected_owner_wake_smp_marker(TxTarget::Rv64Qemu);
+        let markers = vec![marker.clone()];
+
+        assert_eq!(
+            sentinel_state(
+                "OpenSBI\ntxkernel:qemu-riscv64-virt:boot:ok\n",
+                sentinel,
+                &markers,
+                Duration::from_millis(10),
+                Duration::from_secs(10)
+            ),
+            SentinelState::Pending
+        );
+        assert_eq!(
+            sentinel_state(
+                "OpenSBI\ntxkernel:qemu-riscv64-virt:reactor:owner-wake:smp:ok\ntxkernel:qemu-riscv64-virt:boot:ok\n",
+                sentinel,
+                &markers,
+                Duration::from_millis(10),
+                Duration::from_secs(10)
+            ),
+            SentinelState::Found
         );
     }
 
@@ -874,12 +1019,7 @@ mod tests {
     fn qemu_smoke_command_captures_serial_without_block_image() {
         let options = QemuOptions {
             expect_sentinel: true,
-            timeout: Duration::from_secs(10),
-            smp: None,
-            no_block: false,
-            interactive: false,
-            net: QemuNet::None,
-            host_ping: None,
+            ..test_options()
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
@@ -896,6 +1036,12 @@ mod tests {
         assert!(rendered.contains(
             "-kernel /tmp/tx/target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt"
         ));
+        assert!(
+            rendered.contains("-initrd /tmp/tx/target/images/test-init-initramfs-rv64-qemu.cpio")
+        );
+        assert!(rendered.contains(
+            "tx.profile=smoke tx.boot.mode=smoke init=/tx-test-init tx.test_init=1 console=ttyS0"
+        ));
         assert!(!rendered.contains("-drive file=target/images/smoke.ext4"));
     }
 
@@ -903,12 +1049,7 @@ mod tests {
     fn la64_qemu_command_uses_la464_cpu_and_larger_memory() {
         let options = QemuOptions {
             expect_sentinel: true,
-            timeout: Duration::from_secs(10),
-            smp: None,
-            no_block: false,
-            interactive: false,
-            net: QemuNet::None,
-            host_ping: None,
+            ..test_options()
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
@@ -925,9 +1066,14 @@ mod tests {
         assert!(rendered.contains("-m 1152M"));
         assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-la64-qemu-smoke.serial.log"));
-        assert!(
-            rendered.contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=smoke console=ttyS0")
-        );
+        assert!(rendered.contains(
+            "-fw_cfg name=opt/tx.cmdline,string=tx.profile=smoke tx.boot.mode=smoke init=/tx-test-init tx.test_init=1 console=ttyS0"
+        ));
+        assert!(rendered.contains(
+            "-fw_cfg name=opt/tx.initrd,file=/tmp/tx/target/images/test-init-initramfs-la64-qemu.cpio"
+        ));
+        assert!(rendered.contains("tx.tty.rows="));
+        assert!(rendered.contains("tx.tty.cols="));
         assert!(rendered.contains("tx-kernel-loongarch64-qemu-virt"));
     }
 
@@ -935,12 +1081,8 @@ mod tests {
     fn la64_qemu_command_accepts_smp_override() {
         let options = QemuOptions {
             expect_sentinel: true,
-            timeout: Duration::from_secs(10),
             smp: Some(1),
-            no_block: false,
-            interactive: false,
-            net: QemuNet::None,
-            host_ping: None,
+            ..test_options()
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
@@ -955,15 +1097,7 @@ mod tests {
 
     #[test]
     fn la64_busybox_block_device_uses_pci_transport() {
-        let options = QemuOptions {
-            expect_sentinel: false,
-            timeout: Duration::from_secs(10),
-            smp: None,
-            no_block: false,
-            interactive: false,
-            net: QemuNet::None,
-            host_ping: None,
-        };
+        let options = test_options();
         let command = qemu_command(
             Path::new("/tmp/tx"),
             TxTarget::La64Qemu,
@@ -975,9 +1109,14 @@ mod tests {
 
         assert!(rendered.contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0"));
         assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
-        assert!(rendered
-            .contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=busybox console=ttyS0"));
-        assert!(rendered.contains("-fw_cfg name=opt/tx.initrd,file=/tmp/tx/target/images/busybox-initramfs-la64-qemu.cpio"));
+        assert!(rendered.contains(
+            "-fw_cfg name=opt/tx.cmdline,string=tx.profile=busybox tx.boot.mode=busybox console=ttyS0"
+        ));
+        assert!(rendered.contains("tx.tty.rows="));
+        assert!(rendered.contains("tx.tty.cols="));
+        assert!(rendered.contains(
+            "-fw_cfg name=opt/tx.initrd,file=/tmp/tx/target/images/busybox-initramfs-la64-qemu.cpio"
+        ));
         assert!(rendered.contains(
             "-drive driver=raw,file.driver=file,file.filename=target/images/busybox-root-la64-qemu.ext4,file.locking=off,if=none,id=txblk0,read-only=on"
         ));
@@ -991,18 +1130,15 @@ mod tests {
             Profile::Smoke,
             &QemuOptions {
                 expect_sentinel: true,
-                timeout: Duration::from_secs(10),
                 no_block: true,
-                interactive: false,
                 net: QemuNet::User,
-                smp: None,
-                host_ping: None,
+                ..test_options()
             },
         )
         .unwrap()
         .join(" ");
         assert!(rv64.contains("-netdev user,id=net0"));
-        assert!(rv64.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1"));
+        assert!(rv64.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"));
 
         let la64 = qemu_command(
             Path::new("/tmp/tx"),
@@ -1010,12 +1146,9 @@ mod tests {
             Profile::Smoke,
             &QemuOptions {
                 expect_sentinel: true,
-                timeout: Duration::from_secs(10),
                 no_block: true,
-                interactive: false,
                 net: QemuNet::User,
-                smp: None,
-                host_ping: None,
+                ..test_options()
             },
         )
         .unwrap()
@@ -1039,51 +1172,60 @@ mod tests {
 
     #[test]
     fn qemu_host_ping_requires_sentinel_and_tap_or_bridge() {
-        let without_sentinel = qemu_options(&[
-            "--target".into(),
-            "rv64-qemu".into(),
-            "--profile".into(),
-            "smoke".into(),
-            "--net".into(),
-            "tap:txv2tap0".into(),
-            "--host-ping-guest".into(),
-            "10.0.2.15".into(),
-        ])
+        let without_sentinel = qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "smoke".into(),
+                "--net".into(),
+                "tap:txv2tap0".into(),
+                "--host-ping-guest".into(),
+                "10.0.2.15".into(),
+            ],
+        )
         .unwrap_err();
         assert!(without_sentinel.contains("--expect-sentinel"));
 
-        let user_net = qemu_options(&[
-            "--target".into(),
-            "rv64-qemu".into(),
-            "--profile".into(),
-            "smoke".into(),
-            "--expect-sentinel".into(),
-            "--net".into(),
-            "user".into(),
-            "--host-ping-guest".into(),
-            "10.0.2.15".into(),
-        ])
+        let user_net = qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "smoke".into(),
+                "--expect-sentinel".into(),
+                "--net".into(),
+                "user".into(),
+                "--host-ping-guest".into(),
+                "10.0.2.15".into(),
+            ],
+        )
         .unwrap_err();
         assert!(user_net.contains("--net tap:<ifname> or --net bridge:<bridge>"));
     }
 
     #[test]
     fn qemu_host_ping_parses_options_and_command() {
-        let options = qemu_options(&[
-            "--target".into(),
-            "rv64-qemu".into(),
-            "--profile".into(),
-            "smoke".into(),
-            "--expect-sentinel".into(),
-            "--net".into(),
-            "bridge:br0".into(),
-            "--host-ping-guest".into(),
-            "10.0.2.15".into(),
-            "--host-ping-count".into(),
-            "2".into(),
-            "--host-ping-timeout-ms".into(),
-            "2500".into(),
-        ])
+        let options = qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "smoke".into(),
+                "--expect-sentinel".into(),
+                "--net".into(),
+                "bridge:br0".into(),
+                "--host-ping-guest".into(),
+                "10.0.2.15".into(),
+                "--host-ping-count".into(),
+                "2".into(),
+                "--host-ping-timeout-ms".into(),
+                "2500".into(),
+            ],
+        )
         .unwrap();
         let host_ping = options.host_ping.expect("host ping should parse");
 
@@ -1098,21 +1240,127 @@ mod tests {
 
     #[test]
     fn qemu_smp_option_overrides_target_default() {
-        let options = qemu_options(&[
-            "--expect-sentinel".into(),
-            "--target".into(),
-            "rv64-qemu".into(),
-            "--profile".into(),
-            "smoke".into(),
-            "--smp".into(),
-            "1".into(),
-        ])
+        let options = qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--expect-sentinel".into(),
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "smoke".into(),
+                "--smp".into(),
+                "1".into(),
+            ],
+        )
         .unwrap();
 
         let command = qemu_command(
             Path::new("/tmp/tx"),
             TxTarget::Rv64Qemu,
             Profile::Smoke,
+            &options,
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("-smp 1"));
+    }
+
+    #[test]
+    fn qemu_can_append_kernel_cmdline_tokens() {
+        let options = QemuOptions {
+            append_cmdline: Some("tx.mount.sdcard=0".into()),
+            ..test_options()
+        };
+
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            &options,
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("tx.profile=alpine"));
+        assert!(command.contains("tx.boot.mode=alpine"));
+        assert!(command.contains("tx.mount.sdcard=0"));
+        assert!(command.contains("tx.tty.rows="));
+        assert!(command.contains("tx.tty.cols="));
+    }
+
+    #[test]
+    fn qemu_boot_mode_option_overrides_profile_default() {
+        let options = QemuOptions {
+            boot_mode: Some("contest".into()),
+            ..test_options()
+        };
+
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            &options,
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("tx.profile=alpine"));
+        assert!(command.contains("tx.boot.mode=contest"));
+        assert!(!command.contains("tx.boot.mode=alpine"));
+    }
+
+    #[test]
+    fn qemu_boot_mode_option_rejects_unknown_values() {
+        let err = qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "alpine".into(),
+                "--boot-mode".into(),
+                "mystery".into(),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.contains("invalid --boot-mode"));
+    }
+
+    #[test]
+    fn qemu_can_attach_rv64_ext4_drive_on_bus0() {
+        let image = PathBuf::from("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
+        let options = QemuOptions {
+            extra_rv64_ext4: Some(image),
+            ..test_options()
+        };
+
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            &options,
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains(
+            "-drive file=/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4,format=raw,if=none,id=txblk0"
+        ));
+        assert!(command.contains("-device virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0"));
+    }
+
+    #[test]
+    fn alpine_qemu_defaults_to_single_vcpu_for_interactive_stability() {
+        let options = QemuOptions {
+            interactive: true,
+            ..test_options()
+        };
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
             &options,
         )
         .unwrap()

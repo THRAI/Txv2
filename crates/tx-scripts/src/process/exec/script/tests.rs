@@ -24,28 +24,34 @@ use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome,
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOp,
+    StepOutcome,
 };
 use crate::adapter::vfs_exec::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, UserPtr, VirtAddr,
 };
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    MountPayloadPin, SourceLabel,
 };
 use tx_subsystems::page_backed::{
-    AnonSwapPolicy, MaterializeAccess, PageContainer, PageContainerKind, PageIndex,
+    AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess, PageContainer, PageContainerKind,
+    PageIndex,
 };
-use tx_subsystems::process::{bootstrap_init_process, step_chdir, ChdirOutcome, ProcessIdentity};
+use tx_subsystems::process::{
+    bootstrap_init_process, step_chdir, step_chdir_with_mount, step_set_mount_namespace,
+    ChdirOutcome, ProcessIdentity,
+};
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
+use tx_subsystems::vm::{AddressSpace, UserVirtAddr, USER_PAGE_SIZE};
 use tx_subsystems::zones;
 
 use super::{exec_script, ExecError};
@@ -62,23 +68,41 @@ use super::{exec_script, ExecError};
 
 struct ScriptsTestPmap;
 
+struct ScriptsLa64TestPmap;
+
 impl PlatformConfig for ScriptsTestPmap {
     const ARCH: Arch = Arch::Riscv64;
     const BOARD: &'static str = "scripts-test";
+    const USER_TOP: VirtAddr = VirtAddr(0x8000_0000);
+}
+
+impl PlatformConfig for ScriptsLa64TestPmap {
+    const ARCH: Arch = Arch::LoongArch64;
+    const BOARD: &'static str = "scripts-la64-test";
+    const USER_TOP: VirtAddr = VirtAddr(0x8000_0000);
 }
 
 #[derive(Default)]
 struct ScriptsTestPmapState {
     next_root: usize,
     mappings: BTreeMap<(usize, usize), PhysAddr>,
+    fail_next_create_root: bool,
 }
 
 static SCRIPTS_TEST_PMAP_STATE: LazyLock<Mutex<ScriptsTestPmapState>> = LazyLock::new(|| {
     Mutex::new(ScriptsTestPmapState {
         next_root: 1,
         mappings: BTreeMap::new(),
+        fail_next_create_root: false,
     })
 });
+
+fn fail_next_pmap_root_creation() {
+    SCRIPTS_TEST_PMAP_STATE
+        .lock()
+        .expect("scripts pmap lock")
+        .fail_next_create_root = true;
+}
 
 fn root_key(root: &PmapRoot) -> usize {
     root.phys().0
@@ -87,6 +111,9 @@ fn root_key(root: &PmapRoot) -> usize {
 impl PmapIf for ScriptsTestPmap {
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
         let mut state = SCRIPTS_TEST_PMAP_STATE.lock().expect("scripts pmap lock");
+        if core::mem::take(&mut state.fail_next_create_root) {
+            return Err(PmapError::Exhausted);
+        }
         let id = state.next_root;
         state.next_root += 1;
         Ok(PmapRoot::new(
@@ -140,6 +167,41 @@ impl PmapIf for ScriptsTestPmap {
     }
 }
 
+impl PmapIf for ScriptsLa64TestPmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        ScriptsTestPmap::create_pmap_root()
+    }
+
+    fn destroy_pmap_root(root: PmapRoot) {
+        ScriptsTestPmap::destroy_pmap_root(root);
+    }
+
+    fn reserve_mapping(
+        root: &PmapRoot,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        ScriptsTestPmap::reserve_mapping(root, virt, phys, kind)
+    }
+
+    fn rollback_mapping(root: &PmapRoot, reservation: PmapReservation) {
+        ScriptsTestPmap::rollback_mapping(root, reservation);
+    }
+
+    fn commit_mapping(root: &PmapRoot, reservation: PmapReservation, permissions: PmapPermissions) {
+        ScriptsTestPmap::commit_mapping(root, reservation, permissions);
+    }
+
+    fn unmap_mapping(
+        root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError> {
+        ScriptsTestPmap::unmap_mapping(root, virt, kind)
+    }
+}
+
 impl tx_hal::ConsoleIf for ScriptsTestPmap {
     fn write_bytes(_bytes: &[u8]) {}
 }
@@ -151,6 +213,14 @@ impl tx_hal::ConsoleIf for ScriptsTestPmap {
 impl EntropyIf for ScriptsTestPmap {}
 
 impl tx_hal::AuxvIf for ScriptsTestPmap {}
+
+impl tx_hal::ConsoleIf for ScriptsLa64TestPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
+
+impl EntropyIf for ScriptsLa64TestPmap {}
+
+impl tx_hal::AuxvIf for ScriptsLa64TestPmap {}
 
 // ---------------------------------------------------------------------------
 // Minimal in-test FS that knows how to materialise regular files as
@@ -174,6 +244,14 @@ struct ExecTestFsInner {
 
 enum ExecTestInode {
     Directory,
+    Symlink {
+        target: Vec<u8>,
+    },
+    RegularNonPageBacked {
+        mode_bits: u16,
+        uid: u32,
+        gid: u32,
+    },
     Regular {
         container: Cap<PageContainer>,
         size: u64,
@@ -207,6 +285,36 @@ impl ExecTestFs {
         let id = inner.next_id;
         inner.next_id += 1;
         FsObjectId::new(id)
+    }
+
+    fn add_directory(&self, parent: FsObjectId, name: &[u8]) -> FsObjectId {
+        let id = self.alloc_id();
+        let mut inner = self.inner.lock();
+        inner
+            .children
+            .entry(parent)
+            .or_default()
+            .insert(name.to_vec(), id);
+        inner.children.insert(id, BTreeMap::new());
+        inner.inodes.insert(id, ExecTestInode::Directory);
+        id
+    }
+
+    fn add_symlink(&self, parent: FsObjectId, name: &[u8], target: &[u8]) -> FsObjectId {
+        let id = self.alloc_id();
+        let mut inner = self.inner.lock();
+        inner
+            .children
+            .entry(parent)
+            .or_default()
+            .insert(name.to_vec(), id);
+        inner.inodes.insert(
+            id,
+            ExecTestInode::Symlink {
+                target: target.to_vec(),
+            },
+        );
+        id
     }
 
     /// Create a regular-file inode whose page-backed contents are
@@ -283,6 +391,164 @@ impl ExecTestFs {
         );
         id
     }
+
+    fn add_non_page_backed_regular(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode_bits: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsObjectId {
+        let id = self.alloc_id();
+        let mut inner = self.inner.lock();
+        inner
+            .children
+            .entry(parent)
+            .or_default()
+            .insert(name.to_vec(), id);
+        inner.inodes.insert(
+            id,
+            ExecTestInode::RegularNonPageBacked {
+                mode_bits,
+                uid,
+                gid,
+            },
+        );
+        id
+    }
+
+    fn add_regular_with_container(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        container: Cap<PageContainer>,
+        size: u64,
+    ) -> FsObjectId {
+        let id = self.alloc_id();
+        let mut inner = self.inner.lock();
+        inner
+            .children
+            .entry(parent)
+            .or_default()
+            .insert(name.to_vec(), id);
+        inner.inodes.insert(
+            id,
+            ExecTestInode::Regular {
+                container,
+                size,
+                mode_bits: 0o755,
+                uid: 0,
+                gid: 0,
+            },
+        );
+        id
+    }
+}
+
+struct ErrnoPageBacking(tx_subsystems::execution::Errno);
+
+impl FsPageBacking for ErrnoPageBacking {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<Frame, step_engine::NoProgress> {
+        step_engine::StepOutcome::err(self.0.into())
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
+        step_engine::StepOutcome::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
+        step_engine::StepOutcome::done(())
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
+        step_engine::StepOutcome::done(())
+    }
+}
+
+struct OffsetErrnoPageBacking {
+    bytes: Vec<u8>,
+    fail_offset: u64,
+    errno: tx_subsystems::execution::Errno,
+}
+
+impl FsPageBacking for OffsetErrnoPageBacking {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        offset: u64,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<Frame, step_engine::NoProgress> {
+        if offset == self.fail_offset {
+            return step_engine::StepOutcome::err(self.errno.into());
+        }
+        let reservation = match tx_subsystems::page_backed::reserve_frame_with_reclaim(
+            page_allocator::ZeroPolicy::Zeroed,
+        ) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                return step_engine::StepOutcome::err(tx_subsystems::execution::Errno::EBUSY.into())
+            }
+        };
+        let owned = reservation.commit();
+        let start = usize::try_from(offset).expect("test file offset fits usize");
+        if start < self.bytes.len() {
+            let end = core::cmp::min(start + USER_PAGE_SIZE, self.bytes.len());
+            page_allocator::testing::write_frame_bytes_for_test(
+                owned.ppn(),
+                0,
+                &self.bytes[start..end],
+            );
+        }
+        step_engine::StepOutcome::done(Frame::from_owned(owned))
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
+        step_engine::StepOutcome::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
+        step_engine::StepOutcome::done(())
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
+        step_engine::StepOutcome::done(())
+    }
 }
 
 // `FsOps` + `FsPageBacking` impls + tests on `ExecTestFs` live in
@@ -302,9 +568,13 @@ const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
 const ET_EXEC: u16 = 2;
 const EM_RISCV: u16 = 243;
+const EM_LOONGARCH: u16 = 258;
 const PT_LOAD: u32 = 1;
 const PT_PHDR: u32 = 6;
+const PT_GNU_STACK: u32 = 0x6474_e551;
+const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 const PF_R: u32 = 4;
+const PF_W: u32 = 2;
 const PF_X: u32 = 1;
 
 const FIX_PAGE: u64 = 4096;
@@ -403,6 +673,263 @@ fn minimal_elf_bytes() -> Vec<u8> {
     bytes
 }
 
+fn bss_tail_elf_bytes() -> Vec<u8> {
+    let mut bytes = minimal_elf_bytes();
+    let filesz = FIX_PAGE + 128;
+    let memsz = filesz + 128;
+    bytes.resize(filesz as usize, 0x5a);
+    let load_phdr = 64 + 56;
+    bytes[load_phdr + 32..load_phdr + 40].copy_from_slice(&filesz.to_le_bytes());
+    bytes[load_phdr + 40..load_phdr + 48].copy_from_slice(&memsz.to_le_bytes());
+    bytes
+}
+
+/// Emit a minimal RV64 ET_DYN image. `interpreter_path` is encoded as a
+/// NUL-terminated PT_INTERP string when present.
+fn dynamic_elf_bytes(interpreter_path: Option<&[u8]>) -> Vec<u8> {
+    fn write_u16(b: &mut [u8], at: usize, v: u16) {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn write_u32(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn write_u64(b: &mut [u8], at: usize, v: u64) {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn write_phdr(
+        b: &mut [u8],
+        at: usize,
+        p_type: u32,
+        p_flags: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
+        p_align: u64,
+    ) {
+        write_u32(b, at, p_type);
+        write_u32(b, at + 4, p_flags);
+        write_u64(b, at + 8, p_offset);
+        write_u64(b, at + 16, p_vaddr);
+        write_u64(b, at + 24, p_vaddr);
+        write_u64(b, at + 32, p_filesz);
+        write_u64(b, at + 40, p_memsz);
+        write_u64(b, at + 48, p_align);
+    }
+
+    const ET_DYN: u16 = 3;
+    const PT_INTERP: u32 = 3;
+
+    let phoff = 64u64;
+    let phnum = if interpreter_path.is_some() {
+        3u16
+    } else {
+        2u16
+    };
+    let phdr_bytes = u64::from(phnum) * 56;
+    let interp_offset = phoff + phdr_bytes;
+    let interp_len = interpreter_path.map_or(0, |path| path.len() + 1);
+    let file_size = interp_offset as usize + interp_len;
+    let mut bytes = vec![0u8; file_size];
+
+    bytes[..4].copy_from_slice(&ELF_MAGIC);
+    bytes[4] = ELFCLASS64;
+    bytes[5] = ELFDATA2LSB;
+    bytes[6] = EV_CURRENT;
+    write_u16(&mut bytes, 16, ET_DYN);
+    write_u16(&mut bytes, 18, EM_RISCV);
+    write_u32(&mut bytes, 20, 1);
+    write_u64(&mut bytes, 24, ENTRY_OFFSET);
+    write_u64(&mut bytes, 32, phoff);
+    write_u16(&mut bytes, 52, 64);
+    write_u16(&mut bytes, 54, 56);
+    write_u16(&mut bytes, 56, phnum);
+
+    write_phdr(
+        &mut bytes,
+        phoff as usize,
+        PT_PHDR,
+        PF_R,
+        phoff,
+        phoff,
+        phdr_bytes,
+        phdr_bytes,
+        8,
+    );
+    write_phdr(
+        &mut bytes,
+        phoff as usize + 56,
+        PT_LOAD,
+        PF_R | PF_X,
+        0,
+        0,
+        file_size as u64,
+        file_size as u64,
+        FIX_PAGE,
+    );
+    if let Some(path) = interpreter_path {
+        write_phdr(
+            &mut bytes,
+            phoff as usize + 112,
+            PT_INTERP,
+            PF_R,
+            interp_offset,
+            interp_offset,
+            interp_len as u64,
+            interp_len as u64,
+            1,
+        );
+        let start = interp_offset as usize;
+        bytes[start..start + path.len()].copy_from_slice(path);
+        bytes[start + path.len()] = 0;
+    }
+    bytes
+}
+
+fn read_initial_auxv(
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+) -> BTreeMap<u64, u64> {
+    let context = thread
+        .payload_cap()
+        .and_then(|payload| payload.saved_user_context())
+        .expect("saved user context");
+    read_initial_auxv_at_sp(process, context.regs[2] as u64)
+}
+
+fn read_initial_auxv_at_sp(process: &Cap<ProcessIdentity>, sp: u64) -> BTreeMap<u64, u64> {
+    let aspace = process.aspace_cap().expect("post-exec aspace");
+    let stack_entry = aspace
+        .lookup(UserVirtAddr(sp as usize))
+        .expect("initial stack entry");
+    let readable = stack_entry.range.end().as_usize() - sp as usize;
+    let mut bytes = vec![0u8; readable.min(1024)];
+    let guard = guard();
+    match aspace.copy_from_user(&mut bytes, UserPtr::new(sp as usize), &guard) {
+        StepOutcome::Done(copied) => assert!(copied >= 128, "short initial stack: {copied}"),
+        other => panic!("copy initial stack failed: {other:?}"),
+    }
+    drop(guard);
+
+    let word = |offset: usize| {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("stack word"))
+    };
+    let argc = word(0) as usize;
+    let mut offset = 8 + (argc + 1) * 8;
+    while word(offset) != 0 {
+        offset += 8;
+    }
+    offset += 8;
+
+    let mut auxv = BTreeMap::new();
+    loop {
+        let kind = word(offset);
+        let value = word(offset + 8);
+        offset += 16;
+        if kind == 0 {
+            break;
+        }
+        auxv.insert(kind, value);
+    }
+    auxv
+}
+
+fn read_user_cstring(process: &Cap<ProcessIdentity>, ptr: u64) -> Vec<u8> {
+    let aspace = process.aspace_cap().expect("post-exec aspace");
+    let entry = aspace
+        .lookup(UserVirtAddr(ptr as usize))
+        .expect("cstring mapping");
+    let readable = entry.range.end().as_usize() - ptr as usize;
+    let mut bytes = vec![0u8; readable.min(4096)];
+    let guard = guard();
+    let copied = match aspace.copy_from_user(&mut bytes, UserPtr::new(ptr as usize), &guard) {
+        StepOutcome::Done(copied) => copied,
+        other => panic!("copy user cstring failed: {other:?}"),
+    };
+    drop(guard);
+    let nul = bytes[..copied]
+        .iter()
+        .position(|byte| *byte == 0)
+        .expect("NUL-terminated user string");
+    bytes.truncate(nul);
+    bytes
+}
+
+/// Real freestanding RV64 toolchain shape used by the vDSO guest witness:
+/// one RX LOAD, a RISC-V attributes header, and an NX GNU-stack request.
+fn static_toolchain_elf_bytes() -> Vec<u8> {
+    fn write_u16(b: &mut [u8], at: usize, v: u16) {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn write_u32(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn write_u64(b: &mut [u8], at: usize, v: u64) {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn write_phdr(
+        b: &mut [u8],
+        at: usize,
+        p_type: u32,
+        p_flags: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
+        p_align: u64,
+    ) {
+        write_u32(b, at, p_type);
+        write_u32(b, at + 4, p_flags);
+        write_u64(b, at + 8, p_offset);
+        write_u64(b, at + 16, p_vaddr);
+        write_u64(b, at + 24, p_vaddr);
+        write_u64(b, at + 32, p_filesz);
+        write_u64(b, at + 40, p_memsz);
+        write_u64(b, at + 48, p_align);
+    }
+
+    let mut bytes = vec![0u8; 0x102e];
+    bytes[..4].copy_from_slice(&ELF_MAGIC);
+    bytes[4] = ELFCLASS64;
+    bytes[5] = ELFDATA2LSB;
+    bytes[6] = EV_CURRENT;
+    write_u16(&mut bytes, 16, ET_EXEC);
+    write_u16(&mut bytes, 18, EM_RISCV);
+    write_u32(&mut bytes, 20, 1);
+    write_u64(&mut bytes, 24, 0x10bcc);
+    write_u64(&mut bytes, 32, 64);
+    write_u16(&mut bytes, 52, 64);
+    write_u16(&mut bytes, 54, 56);
+    write_u16(&mut bytes, 56, 3);
+
+    write_phdr(
+        &mut bytes,
+        64,
+        PT_RISCV_ATTRIBUTES,
+        PF_R,
+        0xfba,
+        0,
+        0x74,
+        0,
+        1,
+    );
+    write_phdr(
+        &mut bytes,
+        120,
+        PT_LOAD,
+        PF_R | PF_X,
+        0,
+        BASE_LOAD_VADDR,
+        0xfa1,
+        0xfa1,
+        FIX_PAGE,
+    );
+    write_phdr(&mut bytes, 176, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 16);
+    bytes
+}
+
 // ---------------------------------------------------------------------------
 // Test infrastructure: shared lock + bootstrap fixture.
 // ---------------------------------------------------------------------------
@@ -425,11 +952,18 @@ fn setup() -> TestSetup {
     reset_pid_counter();
     reset_tid_counter();
     reset_init_process();
+    tx_subsystems::process::exec_prep::clear_cloexec_plan_allocation_fault_for_test();
+    SCRIPTS_TEST_PMAP_STATE
+        .lock()
+        .expect("scripts pmap lock")
+        .fail_next_create_root = false;
     TestSetup { _lock: lock }
 }
 
 /// Register a fresh `ExecTestFs` rootfs and return (root_dentry, fs).
-fn build_fs_root() -> (Cap<DEntry>, Arc<ExecTestFs>) {
+fn build_fs_root_with_mount(
+    mount_id: MountId,
+) -> (Cap<DEntry>, Arc<ExecTestFs>, Cap<MountIdentity>) {
     let root_id = FsObjectId::new(2);
     let fs = ExecTestFs::new(root_id);
 
@@ -455,22 +989,31 @@ fn build_fs_root() -> (Cap<DEntry>, Arc<ExecTestFs>) {
         sign_for(res, raw)
     };
 
-    let _mount = MountIdentity::new_cap(
-        MountId::new(1),
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    let mount = MountIdentity::new_cap_with_root_dentry(
+        mount_id,
         None,
-        root_rnode.clone(),
+        root_dentry.clone(),
         None,
         payload,
         MountFlags::empty(),
     )
     .expect("mount identity");
 
-    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    (root_dentry, fs, mount)
+}
+
+fn build_fs_root() -> (Cap<DEntry>, Arc<ExecTestFs>) {
+    let (root_dentry, fs, _mount) = build_fs_root_with_mount(MountId::new(1));
     (root_dentry, fs)
 }
 
 fn fresh_aspace() -> Cap<AddressSpace> {
     AddressSpace::new_cap_for_platform::<ScriptsTestPmap>().expect("fresh aspace")
+}
+
+fn fresh_aspace_for<P: PmapIf>() -> Cap<AddressSpace> {
+    AddressSpace::new_cap_for_platform::<P>().expect("fresh aspace")
 }
 
 fn block_on<F: core::future::Future>(future: F) -> F::Output {
@@ -488,6 +1031,308 @@ fn block_on<F: core::future::Future>(future: F) -> F::Output {
     panic!("exec_script tests block_on: future did not resolve in 1024 polls");
 }
 
+#[test]
+fn absent_vdso_mapping_does_not_publish_auxv_address() {
+    assert_eq!(super::vdso_auxv(None), None);
+}
+
+#[test]
+fn image_read_out_of_memory_maps_to_enomem_for_main_and_interpreter() {
+    let error = crate::process::exec::image_reader::ImageReadError::OutOfMemory;
+
+    assert_eq!(
+        ExecError::from_image_read_error(error),
+        ExecError::OutOfMemory
+    );
+    assert_eq!(
+        ExecError::from_interpreter_image_read_error(error),
+        ExecError::OutOfMemory
+    );
+    assert_eq!(
+        ExecError::OutOfMemory.to_step_errno(),
+        step_engine::Errno::ENOMEM
+    );
+}
+
+#[test]
+fn image_read_io_maps_to_eio_for_main_and_interpreter() {
+    let error = crate::process::exec::image_reader::ImageReadError::Io;
+
+    assert_eq!(ExecError::from_image_read_error(error), ExecError::IoError);
+    assert_eq!(
+        ExecError::from_interpreter_image_read_error(error),
+        ExecError::IoError
+    );
+    assert_eq!(ExecError::IoError.to_step_errno(), step_engine::Errno::EIO);
+}
+
+#[test]
+fn exec_step_preserves_wait_source_yield_instead_of_returning_ebusy() {
+    let shape = step_engine::YieldShape::on_wait_source(0x51, 0x3);
+
+    assert_eq!(
+        super::exec_result_to_step_outcome(Some(Err(ExecError::Deferred(shape)))),
+        StepOutcome::Yield {
+            progress: step_engine::NoProgress,
+            shape,
+        }
+    );
+    assert_eq!(
+        super::exec_result_to_step_outcome(Some(Err(ExecError::Retry))),
+        StepOutcome::Continue {
+            progress: step_engine::NoProgress,
+        }
+    );
+}
+
+#[test]
+fn real_page_container_eagain_makes_exec_script_op_continue_but_eio_stays_eio() {
+    for (errno, expected) in [
+        (
+            tx_subsystems::execution::Errno::EAGAIN,
+            StepOutcome::Continue {
+                progress: step_engine::NoProgress,
+            },
+        ),
+        (
+            tx_subsystems::execution::Errno::EIO,
+            StepOutcome::Err(step_engine::Errno::EIO),
+        ),
+    ] {
+        let _setup = setup();
+        let (process, thread) = bootstrap_with_errno_backed_file(b"init", errno);
+        let argv: [&[u8]; 0] = [];
+        let envp: [&[u8]; 0] = [];
+        let cred = Credential::root();
+        let mut op = super::ExecScriptOp::<ScriptsTestPmap>::new(
+            &process, &thread, b"/init", &argv, &envp, &cred,
+        );
+        let mut ctx = step_engine::ScriptCtx::new();
+
+        assert_eq!(op.step(&mut ctx), expected);
+    }
+}
+
+#[test]
+fn bss_tail_page_read_preserves_eagain_and_eio() {
+    for (errno, expected) in [
+        (
+            tx_subsystems::execution::Errno::EAGAIN,
+            StepOutcome::Continue {
+                progress: step_engine::NoProgress,
+            },
+        ),
+        (
+            tx_subsystems::execution::Errno::EIO,
+            StepOutcome::Err(step_engine::Errno::EIO),
+        ),
+    ] {
+        let _setup = setup();
+        let (process, thread) =
+            bootstrap_with_offset_errno_backed_file(b"init", bss_tail_elf_bytes(), FIX_PAGE, errno);
+        let argv: [&[u8]; 0] = [];
+        let envp: [&[u8]; 0] = [];
+        let cred = Credential::root();
+        let mut op = super::ExecScriptOp::<ScriptsTestPmap>::new(
+            &process, &thread, b"/init", &argv, &envp, &cred,
+        );
+        let mut ctx = step_engine::ScriptCtx::new();
+
+        assert_eq!(op.step(&mut ctx), expected);
+    }
+}
+
+#[test]
+fn exec_fallible_buffer_and_layout_oom_map_to_enomem() {
+    assert_eq!(
+        super::try_zeroed_exec_bytes(usize::MAX),
+        Err(ExecError::OutOfMemory)
+    );
+    assert_eq!(
+        ExecError::Layout(crate::process::exec::loader::ElfLayoutError::OutOfMemory)
+            .to_step_errno(),
+        step_engine::Errno::ENOMEM
+    );
+    let mut items = Vec::<u8>::new();
+    assert_eq!(
+        super::try_reserve_exec_items(&mut items, usize::MAX),
+        Err(ExecError::OutOfMemory)
+    );
+}
+
+#[test]
+fn fallible_layout_plan_clone_preserves_all_fields() {
+    let plan = crate::process::exec::loader::parse_image_plan(&dynamic_elf_bytes(Some(b"/ld.so")))
+        .expect("dynamic plan");
+
+    let cloned = super::try_clone_exec_plan(&plan).expect("fallible plan clone");
+
+    assert_eq!(cloned, plan);
+}
+
+#[test]
+fn exec_main_rejects_noexec_child_mount_but_allows_root_mount_image() {
+    let _setup = setup();
+    let (process, thread, _root, root_fs, child_fs, _namespace, _child_mount) =
+        bootstrap_with_child_mount(MountFlags::NOEXEC);
+    let image = minimal_elf_bytes();
+    root_fs.add_regular_with_bytes(FsObjectId::new(2), b"prog", &image);
+    child_fs.add_regular_with_bytes(FsObjectId::new(2), b"prog", &image);
+    let cred = Credential::root();
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/prog",
+            &[],
+            &[],
+            &cred,
+        )),
+        Ok(())
+    );
+    let aspace_before = process.aspace_cap().expect("root exec aspace");
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/mnt/prog",
+            &[],
+            &[],
+            &cred,
+        )),
+        Err(ExecError::PermissionDenied)
+    );
+    assert_eq!(
+        process.aspace_cap().expect("aspace after denial").key(),
+        aspace_before.key()
+    );
+}
+
+#[test]
+fn exec_interpreter_rejects_noexec_child_mount() {
+    let _setup = setup();
+    let (process, thread, _root, root_fs, child_fs, _namespace, _child_mount) =
+        bootstrap_with_child_mount(MountFlags::NOEXEC);
+    root_fs.add_regular_with_bytes(
+        FsObjectId::new(2),
+        b"main",
+        &dynamic_elf_bytes(Some(b"/mnt/ld.so")),
+    );
+    child_fs.add_regular_with_bytes(FsObjectId::new(2), b"ld.so", &dynamic_elf_bytes(None));
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/main",
+            &[],
+            &[],
+            &Credential::root(),
+        )),
+        Err(ExecError::PermissionDenied)
+    );
+}
+
+#[test]
+fn exec_symlink_crossing_to_noexec_mount_rejects_final_mount() {
+    let _setup = setup();
+    let (process, thread, _root, root_fs, child_fs, _namespace, _child_mount) =
+        bootstrap_with_child_mount(MountFlags::NOEXEC);
+    root_fs.add_symlink(FsObjectId::new(2), b"jump", b"/mnt/prog");
+    child_fs.add_regular_with_bytes(FsObjectId::new(2), b"prog", &minimal_elf_bytes());
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/jump",
+            &[],
+            &[],
+            &Credential::root(),
+        )),
+        Err(ExecError::PermissionDenied)
+    );
+}
+
+#[test]
+fn relative_exec_uses_mounted_cwd_origin_across_setns() {
+    let _setup = setup();
+    let (process, thread, root, root_fs, child_fs, namespace, child_mount) =
+        bootstrap_with_child_mount(MountFlags::NOEXEC);
+    let image = minimal_elf_bytes();
+    root_fs.add_regular_with_bytes(FsObjectId::new(2), b"prog", &image);
+    child_fs.add_regular_with_bytes(FsObjectId::new(2), b"prog", &image);
+    match step_chdir_with_mount(
+        &process,
+        child_mount.root_dentry().clone(),
+        child_mount.clone(),
+    ) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("mounted child cwd rejected"),
+    }
+    let replacement = MountNamespace::new_cap(namespace.root().clone()).expect("replacement ns");
+    step_set_mount_namespace(&process, replacement).expect("setns replacement");
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"prog",
+            &[],
+            &[],
+            &Credential::root(),
+        )),
+        Err(ExecError::PermissionDenied)
+    );
+
+    let root_mount = namespace.root().clone();
+    match step_chdir_with_mount(&process, root, root_mount) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("mounted root cwd rejected"),
+    }
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"prog",
+            &[],
+            &[],
+            &Credential::root(),
+        )),
+        Ok(())
+    );
+}
+
+#[test]
+fn relative_exec_rejects_legacy_cwd_without_mount_origin() {
+    let _setup = setup();
+    let (root, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    fs.add_regular_with_bytes(FsObjectId::new(2), b"prog", &minimal_elf_bytes());
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir(&process, root) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("legacy cwd rejected"),
+    }
+    step_set_mount_namespace(
+        &process,
+        MountNamespace::new_cap(mount).expect("mount namespace"),
+    )
+    .expect("install namespace");
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"prog",
+            &[],
+            &[],
+            &Credential::root(),
+        )),
+        Err(ExecError::PathNotFound)
+    );
+}
+
 /// Bootstrap an init process whose cwd is the registered fs root, and
 /// register a regular file at `/<name>` containing `bytes`. Returns
 /// the leader thread, the process Cap, and the fs handle (for further
@@ -496,7 +1341,7 @@ fn bootstrap_with_file(
     name: &[u8],
     bytes: &[u8],
 ) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>, Arc<ExecTestFs>) {
-    let (root_dentry, fs) = build_fs_root();
+    let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
     let _ = fs.add_regular_with_bytes(FsObjectId::new(2), name, bytes);
 
     let aspace = fresh_aspace();
@@ -504,12 +1349,186 @@ fn bootstrap_with_file(
     let thread = process.nth_thread(0).expect("leader thread");
 
     // Bind cwd so the walker has a search root.
-    match step_chdir(&process, root_dentry) {
+    match step_chdir_with_mount(&process, root_dentry, mount.clone()) {
         ChdirOutcome::Replaced { .. } => {}
         ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
     }
+    let namespace = MountNamespace::new_cap(mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
 
     (process, thread, fs)
+}
+
+fn bootstrap_with_file_for<P: PmapIf>(
+    name: &[u8],
+    bytes: &[u8],
+) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>, Arc<ExecTestFs>) {
+    let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), name, bytes);
+
+    let process = bootstrap_init_process(fresh_aspace_for::<P>()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root_dentry, mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+    let namespace = MountNamespace::new_cap(mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
+
+    (process, thread, fs)
+}
+
+fn bootstrap_with_errno_backed_file(
+    name: &[u8],
+    errno: tx_subsystems::execution::Errno,
+) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
+    let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    let backing = Arc::new(ErrnoPageBacking(errno));
+    let payload = MountPayload::new_cap(
+        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        backing as Arc<dyn FsPageBacking>,
+        None,
+        DevId::new(199),
+        MountOptions::default(),
+        "exec-error-backing",
+        SourceLabel::Static("exec-error-backing"),
+    )
+    .expect("error backing mount payload");
+    let pc = PageContainer::new_file_cap(
+        MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(payload)),
+        FsObjectId::new(900),
+        64,
+    )
+    .expect("error-backed page container");
+    fs.add_regular_with_container(FsObjectId::new(2), name, pc, 64);
+
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root_dentry, mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+    let namespace = MountNamespace::new_cap(mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
+    (process, thread)
+}
+
+fn bootstrap_with_offset_errno_backed_file(
+    name: &[u8],
+    bytes: Vec<u8>,
+    fail_offset: u64,
+    errno: tx_subsystems::execution::Errno,
+) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
+    let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    let file_size = bytes.len() as u64;
+    let backing = Arc::new(OffsetErrnoPageBacking {
+        bytes,
+        fail_offset,
+        errno,
+    });
+    let payload = MountPayload::new_cap(
+        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        backing as Arc<dyn FsPageBacking>,
+        None,
+        DevId::new(200),
+        MountOptions::default(),
+        "exec-offset-error-backing",
+        SourceLabel::Static("exec-offset-error-backing"),
+    )
+    .expect("offset error backing mount payload");
+    let pc = PageContainer::new_file_cap(
+        MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(payload)),
+        FsObjectId::new(901),
+        file_size,
+    )
+    .expect("offset error-backed page container");
+    fs.add_regular_with_container(FsObjectId::new(2), name, pc, file_size);
+
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root_dentry, mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+    let namespace = MountNamespace::new_cap(mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
+    (process, thread)
+}
+
+fn bootstrap_with_child_mount(
+    child_flags: MountFlags,
+) -> (
+    Cap<ProcessIdentity>,
+    Cap<ThreadIdentity>,
+    Cap<DEntry>,
+    Arc<ExecTestFs>,
+    Arc<ExecTestFs>,
+    Cap<MountNamespace>,
+    Cap<MountIdentity>,
+) {
+    tx_subsystems::mount::reset_mount_table_for_test();
+    let (root_dentry, root_fs, root_mount) = build_fs_root_with_mount(MountId::new(1));
+    root_fs.add_directory(FsObjectId::new(2), b"mnt");
+    let cred = Credential::root();
+    let guard = guard();
+    let mountpoint =
+        match tx_subsystems::vfs::walker::step_walk(root_dentry.clone(), b"/mnt", &cred, &guard) {
+            StepOutcome::Done(dentry) => dentry,
+            other => panic!("resolve child mountpoint: {other:?}"),
+        };
+    drop(guard);
+
+    let child_root_id = FsObjectId::new(2);
+    let child_fs = ExecTestFs::new(child_root_id);
+    let child_payload = MountPayload::new_cap(
+        child_fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        child_fs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        DevId::new(100),
+        MountOptions::default(),
+        "exec-child-fs",
+        SourceLabel::Static("exec-child"),
+    )
+    .expect("child mount payload");
+    let child_root = {
+        let raw = RNode::new(
+            child_root_id,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&child_payload);
+        let reservation = reserve_for::<RNode>().expect("child root reservation");
+        sign_for(reservation, raw)
+    };
+    let child_mount = MountIdentity::new_cap(
+        MountId::new(2),
+        Some(mountpoint.clone()),
+        child_root,
+        Some(root_mount.clone()),
+        child_payload,
+        child_flags,
+    )
+    .expect("child mount");
+    let namespace = MountNamespace::new_cap(root_mount.clone()).expect("mount namespace");
+    namespace.register_mount(&mountpoint, child_mount.clone());
+
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root_dentry.clone(), root_mount) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+    step_set_mount_namespace(&process, namespace.clone()).expect("install mount namespace");
+
+    (
+        process,
+        thread,
+        root_dentry,
+        root_fs,
+        child_fs,
+        namespace,
+        child_mount,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +1539,7 @@ fn bootstrap_with_file(
 fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
     let _setup = setup();
     let bytes = minimal_elf_bytes();
-    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let (process, thread, fs) = bootstrap_with_file(b"init", &bytes);
 
     let aspace_before = process.aspace_cap().expect("alive aspace");
     let cred = Credential::root();
@@ -557,6 +1576,468 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
     // Other GPRs (besides x2) are zero per System V `_start` contract.
     assert_eq!(ctx.regs[0], 0);
     assert_eq!(ctx.regs[1], 0);
+
+    let exe = process
+        .exe_file()
+        .expect("exec must publish exe_file for /proc/<pid>/exe");
+    assert_eq!(exe.name().as_bytes(), b"init");
+
+    let auxv = read_initial_auxv(&process, &thread);
+    assert_eq!(read_user_cstring(&process, auxv[&15]), b"riscv64");
+    assert_eq!(read_user_cstring(&process, auxv[&31]), b"/init");
+}
+
+#[test]
+fn exec_script_la64_stack_publishes_platform_and_original_execfn() {
+    let _setup = setup();
+    let mut bytes = minimal_elf_bytes();
+    bytes[18..20].copy_from_slice(&EM_LOONGARCH.to_le_bytes());
+    let (process, thread, _fs) = bootstrap_with_file_for::<ScriptsLa64TestPmap>(b"la-init", &bytes);
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsLa64TestPmap>(
+            &process,
+            &thread,
+            b"/la-init",
+            &[b"/la-init"],
+            &[],
+            &Credential::root(),
+        )),
+        Ok(())
+    );
+
+    let context = thread
+        .payload_cap()
+        .and_then(|payload| payload.saved_user_context())
+        .expect("LA64 saved user context");
+    let auxv = read_initial_auxv_at_sp(&process, context.regs[3] as u64);
+    assert_eq!(read_user_cstring(&process, auxv[&15]), b"loongarch64");
+    assert_eq!(read_user_cstring(&process, auxv[&31]), b"/la-init");
+}
+
+#[test]
+fn exec_script_absolute_path_uses_process_mount_namespace() {
+    let _setup = setup();
+    let (cwd_root, _cwd_fs, _cwd_mount) = build_fs_root_with_mount(MountId::new(10));
+    let (_namespace_root, namespace_fs, namespace_mount) =
+        build_fs_root_with_mount(MountId::new(11));
+    let bytes = minimal_elf_bytes();
+    let _ = namespace_fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
+
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir(&process, cwd_root) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+    let namespace = MountNamespace::new_cap(namespace_mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[b"/init"],
+        &[],
+        &Credential::root(),
+    ));
+
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn dynamic_exec_absolute_paths_do_not_require_cwd() {
+    let _setup = setup();
+    let (_namespace_root, namespace_fs, namespace_mount) =
+        build_fs_root_with_mount(MountId::new(12));
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let interpreter = dynamic_elf_bytes(None);
+    let _ = namespace_fs.add_regular_with_bytes(FsObjectId::new(2), b"main", &main);
+    let _ = namespace_fs.add_regular_with_bytes(FsObjectId::new(2), b"ld.so", &interpreter);
+
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    let namespace = MountNamespace::new_cap(namespace_mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn dynamic_exec_interpreter_ignores_same_path_in_other_cwd_root() {
+    let _setup = setup();
+    let (cwd_root, cwd_fs, _cwd_mount) = build_fs_root_with_mount(MountId::new(13));
+    let (_namespace_root, namespace_fs, namespace_mount) =
+        build_fs_root_with_mount(MountId::new(14));
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let interpreter = dynamic_elf_bytes(None);
+    let _ = namespace_fs.add_regular_with_bytes(FsObjectId::new(2), b"main", &main);
+    let _ = namespace_fs.add_regular_with_bytes(FsObjectId::new(2), b"ld.so", &interpreter);
+    let _ = cwd_fs.add_directory(FsObjectId::new(2), b"ld.so");
+
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir(&process, cwd_root) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+    let namespace = MountNamespace::new_cap(namespace_mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn dynamic_exec_layout_pc_auxv_and_ranges_do_not_overlap() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let interpreter = dynamic_elf_bytes(None);
+    let (process, thread, fs) = bootstrap_with_file(b"main", &main);
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"ld.so", &interpreter);
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Ok(()));
+
+    let context = thread
+        .payload_cap()
+        .and_then(|payload| payload.saved_user_context())
+        .expect("dynamic entry context");
+    let auxv = read_initial_auxv(&process, &thread);
+    let at_base = auxv[&7];
+    let at_entry = auxv[&9];
+    let at_phdr = auxv[&3];
+
+    assert_eq!(context.pc as u64, at_base + ENTRY_OFFSET);
+    assert_eq!(at_phdr, at_entry - ENTRY_OFFSET + 64);
+    assert_ne!(at_base, at_entry - ENTRY_OFFSET);
+
+    let aspace = process.aspace_cap().expect("dynamic aspace");
+    assert!(aspace.lookup(UserVirtAddr(context.pc)).is_some());
+    assert!(aspace.lookup(UserVirtAddr(at_entry as usize)).is_some());
+    assert!(aspace.lookup(UserVirtAddr(context.regs[2])).is_some());
+
+    let recipes = aspace.recipes_snapshot();
+    for (index, left) in recipes.iter().enumerate() {
+        assert!(left.range.end().as_usize() <= ScriptsTestPmap::USER_TOP.0);
+        for right in &recipes[index + 1..] {
+            assert!(
+                !left.range.overlaps(right.range),
+                "dynamic main/interpreter/stack/vDSO recipes overlap: {:?} {:?}",
+                left.range,
+                right.range
+            );
+        }
+    }
+}
+
+#[test]
+fn dynamic_exec_layout_reserves_actual_vdso_window_on_large_user_va_platform() {
+    let plan = crate::process::exec::loader::parse_image_plan(&dynamic_elf_bytes(None))
+        .expect("dynamic plan");
+    let layout =
+        super::select_combined_layout(plan, None, 1u64 << 46, || 0).expect("large user VA layout");
+    let vdso_layout = tx_subsystems::vm::VdsoLayout::for_user_top(
+        tx_subsystems::vm::UserVirtAddr::new(1usize << 46),
+    )
+    .expect("large user top has a vDSO layout");
+    assert_eq!(
+        layout.vdso_window.vaddr,
+        vdso_layout.window().start().as_usize() as u64
+    );
+}
+
+#[test]
+fn dynamic_exec_layout_keeps_et_exec_interpreter_at_fixed_addresses() {
+    let main = crate::process::exec::loader::parse_image_plan(&dynamic_elf_bytes(None))
+        .expect("dynamic main plan");
+    let interpreter = crate::process::exec::loader::parse_image_plan(&minimal_elf_bytes())
+        .expect("fixed interpreter plan");
+    let layout = super::select_combined_layout(main, Some(interpreter), 0x8000_0000, || 1)
+        .expect("fixed interpreter layout");
+    let interpreter = layout.interpreter.expect("interpreter");
+
+    assert_eq!(interpreter.load_bias, 0);
+    assert_eq!(interpreter.entry, BASE_LOAD_VADDR + ENTRY_OFFSET);
+    assert_eq!(interpreter.load_segments[0].vaddr, BASE_LOAD_VADDR);
+}
+
+#[test]
+fn dynamic_exec_layout_exhausts_when_fixed_main_and_interpreter_overlap() {
+    let main = crate::process::exec::loader::parse_image_plan(&minimal_elf_bytes())
+        .expect("fixed main plan");
+    let interpreter = crate::process::exec::loader::parse_image_plan(&minimal_elf_bytes())
+        .expect("fixed interpreter plan");
+
+    assert!(matches!(
+        super::select_combined_layout(main, Some(interpreter), 0x8000_0000, || 0),
+        Err(crate::process::exec::loader::ElfLayoutError::Exhausted)
+    ));
+}
+
+fn large_dynamic_layout_plan() -> crate::process::exec::loader::ExecImagePlan {
+    let mut plan = crate::process::exec::loader::parse_image_plan(&dynamic_elf_bytes(None))
+        .expect("dynamic plan");
+    plan.load_segments[0].memsz = 32 * 1024 * 1024;
+    plan
+}
+
+#[test]
+fn dynamic_exec_layout_retries_after_recoverable_candidate_error() {
+    let calls = core::cell::Cell::new(0usize);
+    let layout =
+        super::select_combined_layout(large_dynamic_layout_plan(), None, 64 * 1024 * 1024, || {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                u64::MAX
+            } else {
+                0
+            }
+        })
+        .expect("second layout candidate should fit");
+
+    assert_eq!(
+        calls.get(),
+        4,
+        "selector must advance to a second candidate"
+    );
+    assert!(layout.main.load_segments[0].vaddr < layout.stack_top);
+}
+
+#[test]
+fn dynamic_exec_layout_reports_exhausted_after_all_candidates_fail() {
+    assert!(matches!(
+        super::select_combined_layout(large_dynamic_layout_plan(), None, 64 * 1024 * 1024, || {
+            u64::MAX
+        },),
+        Err(crate::process::exec::loader::ElfLayoutError::Exhausted)
+    ));
+}
+
+#[test]
+fn dynamic_exec_layout_malformed_main_is_enoexec() {
+    let _setup = setup();
+    let mut malformed = vec![0u8; 64];
+    malformed[..4].copy_from_slice(&ELF_MAGIC);
+    let (process, thread, _fs) = bootstrap_with_file(b"main", &malformed);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Err(ExecError::NotExecutable));
+    assert_eq!(
+        result.unwrap_err().to_step_errno(),
+        step_engine::Errno::ENOEXEC
+    );
+}
+
+#[test]
+fn dynamic_exec_layout_malformed_interpreter_is_elibbad() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let mut malformed = vec![0u8; 64];
+    malformed[..4].copy_from_slice(&ELF_MAGIC);
+    let (process, thread, fs) = bootstrap_with_file(b"main", &main);
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"ld.so", &malformed);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Err(ExecError::InterpreterMalformed));
+    assert_eq!(result.unwrap_err().to_errno_i32(), -80);
+    assert_eq!(
+        result.unwrap_err().to_step_errno(),
+        step_engine::Errno::ELIBBAD
+    );
+}
+
+#[test]
+fn dynamic_exec_layout_non_page_backed_interpreter_is_elibbad() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let (process, thread, fs) = bootstrap_with_file(b"main", &main);
+    let _ = fs.add_non_page_backed_regular(FsObjectId::new(2), b"ld.so", 0o755, 0, 0);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Err(ExecError::InterpreterMalformed));
+    assert_eq!(
+        result.unwrap_err().to_step_errno(),
+        step_engine::Errno::ELIBBAD
+    );
+}
+
+#[test]
+fn dynamic_exec_layout_directory_interpreter_is_eacces() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let (process, thread, fs) = bootstrap_with_file(b"main", &main);
+    let _ = fs.add_directory(FsObjectId::new(2), b"ld.so");
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
+    assert_eq!(
+        result.unwrap_err().to_step_errno(),
+        step_engine::Errno::EACCES
+    );
+}
+
+#[test]
+fn dynamic_exec_rejects_non_executable_interpreter_with_eacces() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let interpreter = dynamic_elf_bytes(None);
+    let (process, thread, fs) = bootstrap_with_file_meta(b"main", &main, 0o555, 0, 0);
+    let _ = fs.add_regular_with_bytes_meta(FsObjectId::new(2), b"ld.so", &interpreter, 0o644, 0, 0);
+    set_non_root_cred(&process, 1001);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &walker_cred_for(1001, 1001),
+    ));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
+}
+
+#[test]
+fn dynamic_exec_accepts_execute_only_interpreter() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let interpreter = dynamic_elf_bytes(None);
+    let (process, thread, fs) = bootstrap_with_file_meta(b"main", &main, 0o555, 0, 0);
+    let _ = fs.add_regular_with_bytes_meta(FsObjectId::new(2), b"ld.so", &interpreter, 0o111, 0, 0);
+    set_non_root_cred(&process, 1001);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &walker_cred_for(1001, 1001),
+    ));
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn dynamic_exec_layout_nested_interpreter_is_elibbad() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/ld.so"));
+    let nested = dynamic_elf_bytes(Some(b"/nested.so"));
+    let (process, thread, fs) = bootstrap_with_file(b"main", &main);
+    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"ld.so", &nested);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Err(ExecError::InterpreterNested));
+    assert_eq!(
+        result.unwrap_err().to_step_errno(),
+        step_engine::Errno::ELIBBAD
+    );
+}
+
+#[test]
+fn dynamic_exec_layout_missing_interpreter_is_enoent() {
+    let _setup = setup();
+    let main = dynamic_elf_bytes(Some(b"/missing.so"));
+    let (process, thread, _fs) = bootstrap_with_file(b"main", &main);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/main",
+        &[b"/main"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Err(ExecError::PathNotFound));
+    assert_eq!(
+        result.unwrap_err().to_step_errno(),
+        step_engine::Errno::ENOENT
+    );
+}
+
+#[test]
+fn interpreter_lookup_paths_uses_only_the_declared_path() {
+    assert_eq!(
+        super::interpreter_lookup_paths(b"/lib/ld-linux-riscv64-lp64d.so.1"),
+        vec![b"/lib/ld-linux-riscv64-lp64d.so.1".to_vec()]
+    );
+}
+
+#[test]
+fn exec_script_loads_static_riscv_toolchain_elf_shape() {
+    let _setup = setup();
+    let bytes = static_toolchain_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"probe", &bytes);
+    let cred = Credential::root();
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/probe",
+        &[],
+        &[],
+        &cred,
+    ));
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        thread
+            .payload_cap()
+            .expect("thread payload")
+            .saved_user_context()
+            .expect("exec context")
+            .pc as u64,
+        0x10bcc
+    );
 }
 
 #[test]
@@ -638,12 +2119,9 @@ fn exec_script_resets_brk_base_from_image_plan() {
 }
 
 #[test]
-fn exec_script_invalid_elf_falls_back_to_bin_sh() {
+fn exec_script_invalid_elf_returns_enoexec_without_kernel_shell_fallback() {
     let _setup = setup();
     // 4 KiB of zeroes — fails ELF magic check immediately.
-    // The kernel now falls back to /bin/sh for ENOEXEC; /bin/sh
-    // does not exist in this test fixture, so the result is
-    // PathNotFound.
     let bytes = vec![0u8; 4096];
     let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
 
@@ -657,7 +2135,7 @@ fn exec_script_invalid_elf_falls_back_to_bin_sh() {
         &[],
         &cred,
     ));
-    assert_eq!(result, Err(ExecError::PathNotFound));
+    assert_eq!(result, Err(ExecError::NotExecutable));
 
     // Pre-PoNR error path must leave the process aspace untouched.
     let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
@@ -675,13 +2153,194 @@ fn shebang_busybox_sh_normalization_consumes_applet_arg() {
     let original_argv: [&[u8]; 2] = [b"./test.sh", b"date.lua"];
 
     let (interp_path, argv) =
-        super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv);
+        super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv)
+            .expect("shebang argv");
 
     assert_eq!(interp_path, b"/bin/sh");
     let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
     assert_eq!(
         argv_refs,
         vec![b"/bin/sh".as_slice(), b"./test.sh", b"date.lua"]
+    );
+}
+
+#[test]
+fn shebang_optional_argument_preserves_trimmed_remaining_text() {
+    let header = b"#!/usr/bin/env   -S python -O  \n";
+    let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
+
+    assert_eq!(interp, b"/usr/bin/env");
+    assert_eq!(opt_arg, Some(b"-S python -O".as_slice()));
+}
+
+#[test]
+fn shebang_without_newline_rejects_potentially_truncated_interpreter() {
+    let mut header = vec![b'a'; 256];
+    header[..2].copy_from_slice(b"#!");
+
+    assert!(super::shebang_parse(&header).is_none());
+}
+
+#[test]
+fn shebang_without_newline_accepts_truncated_optional_text() {
+    let mut header = vec![b'x'; 256];
+    let prefix = b"#!/usr/bin/env -S python -O ";
+    header[..prefix.len()].copy_from_slice(prefix);
+
+    let (interp, opt_arg) = super::shebang_parse(&header).expect("complete interpreter path");
+    assert_eq!(interp, b"/usr/bin/env");
+    assert_eq!(opt_arg, Some(&header[b"#!/usr/bin/env ".len()..255]));
+}
+
+#[test]
+fn shebang_newline_at_binprm_buffer_boundary_is_valid() {
+    let mut header = vec![b' '; 256];
+    let prefix = b"#!/bin/sh";
+    header[..prefix.len()].copy_from_slice(prefix);
+    header[255] = b'\n';
+
+    assert_eq!(
+        super::shebang_parse(&header),
+        Some((b"/bin/sh".as_slice(), None))
+    );
+}
+
+#[test]
+fn exec_script_rejects_embedded_nul_in_argv_and_envp() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/init",
+            &[b"init\0tail"],
+            &[],
+            &Credential::root(),
+        )),
+        Err(ExecError::InvalidArgument)
+    );
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/init",
+            &[b"init"],
+            &[b"KEY=value\0tail"],
+            &Credential::root(),
+        )),
+        Err(ExecError::InvalidArgument)
+    );
+}
+
+#[test]
+fn exec_script_resolves_multiple_shebang_layers_iteratively() {
+    let _setup = setup();
+    let (root, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    fs.add_regular_with_bytes(FsObjectId::new(2), b"s1", b"#!/s2\n");
+    fs.add_regular_with_bytes(FsObjectId::new(2), b"s2", b"#!/bin/sh\n");
+    let bin = fs.add_directory(FsObjectId::new(2), b"bin");
+    fs.add_regular_with_bytes(bin, b"sh", &minimal_elf_bytes());
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root, mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("mounted cwd rejected"),
+    }
+    step_set_mount_namespace(
+        &process,
+        MountNamespace::new_cap(mount).expect("mount namespace"),
+    )
+    .expect("install namespace");
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/s1",
+            &[b"/s1"],
+            &[],
+            &Credential::root(),
+        )),
+        Ok(())
+    );
+
+    let auxv = read_initial_auxv(&process, &thread);
+    assert_eq!(read_user_cstring(&process, auxv[&15]), b"riscv64");
+    assert_eq!(read_user_cstring(&process, auxv[&31]), b"/s1");
+}
+
+#[test]
+fn exec_script_fifth_shebang_redirect_returns_eloop() {
+    let _setup = setup();
+    let (root, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    for index in 1..=5 {
+        let name = alloc::format!("s{index}");
+        let next = alloc::format!("#!/s{}\n", index + 1);
+        fs.add_regular_with_bytes(FsObjectId::new(2), name.as_bytes(), next.as_bytes());
+    }
+    fs.add_regular_with_bytes(FsObjectId::new(2), b"s6", &minimal_elf_bytes());
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root, mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("mounted cwd rejected"),
+    }
+    step_set_mount_namespace(
+        &process,
+        MountNamespace::new_cap(mount).expect("mount namespace"),
+    )
+    .expect("install namespace");
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/s1",
+        &[b"/s1"],
+        &[],
+        &Credential::root(),
+    ));
+    assert_eq!(result, Err(ExecError::SymlinkLoop));
+    assert_eq!(
+        result.unwrap_err().to_step_errno(),
+        step_engine::Errno::ELOOP
+    );
+}
+
+#[test]
+fn exec_script_four_shebang_redirects_succeed() {
+    let _setup = setup();
+    let (root, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    for index in 1..=4 {
+        let name = alloc::format!("s{index}");
+        let next = alloc::format!("#!/s{}\n", index + 1);
+        fs.add_regular_with_bytes(FsObjectId::new(2), name.as_bytes(), next.as_bytes());
+    }
+    fs.add_regular_with_bytes(FsObjectId::new(2), b"s5", &minimal_elf_bytes());
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root, mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("mounted cwd rejected"),
+    }
+    step_set_mount_namespace(
+        &process,
+        MountNamespace::new_cap(mount).expect("mount namespace"),
+    )
+    .expect("install namespace");
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/s1",
+            &[b"/s1"],
+            &[],
+            &Credential::root(),
+        )),
+        Ok(())
     );
 }
 
@@ -823,6 +2482,57 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
     assert!(!process.fd_cloexec(4));
 }
 
+#[test]
+fn cloexec_plan_oom_is_pre_ponr_and_preserves_old_aspace_and_fds() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let old_aspace_key = process.aspace_cap().expect("old aspace").key();
+    let cwd = process.cwd().expect("cwd bound");
+    let guard = guard();
+    let marked = match tx_subsystems::vfs::walker::step_open(
+        cwd,
+        b"/init",
+        crate::adapter::vfs_exec::OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+        0,
+        &Credential::root(),
+        &guard,
+    ) {
+        StepOutcome::Done(file) => file,
+        other => panic!("open CLOEXEC fixture: {other:?}"),
+    };
+    drop(guard);
+    let marked_key = marked.key();
+    process.set_fd(3, Some(marked));
+    process.set_fd_cloexec(3, true);
+    tx_subsystems::process::exec_prep::fail_next_cloexec_plan_allocation_for_test();
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/init",
+            &[],
+            &[],
+            &Credential::root(),
+        )),
+        Err(ExecError::OutOfMemory),
+    );
+    assert_eq!(
+        process.aspace_cap().expect("old aspace retained").key(),
+        old_aspace_key
+    );
+    assert_eq!(process.fd(3).expect("marked fd retained").key(), marked_key);
+    assert!(process.fd_cloexec(3));
+}
+
 // ---------------------------------------------------------------------------
 // Wave 4 Part 5: pre-Phase-6 X-bit auth + Phase 3.5 setuid recompute.
 // ---------------------------------------------------------------------------
@@ -837,17 +2547,19 @@ fn bootstrap_with_file_meta(
     uid: u32,
     gid: u32,
 ) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>, Arc<ExecTestFs>) {
-    let (root_dentry, fs) = build_fs_root();
+    let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
     let _ = fs.add_regular_with_bytes_meta(FsObjectId::new(2), name, bytes, mode_bits, uid, gid);
 
     let aspace = fresh_aspace();
     let process = bootstrap_init_process(aspace).expect("bootstrap init");
     let thread = process.nth_thread(0).expect("leader thread");
 
-    match step_chdir(&process, root_dentry) {
+    match step_chdir_with_mount(&process, root_dentry, mount.clone()) {
         ChdirOutcome::Replaced { .. } => {}
         ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
     }
+    let namespace = MountNamespace::new_cap(mount).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install process mount namespace");
 
     (process, thread, fs)
 }
@@ -905,6 +2617,24 @@ fn exec_script_eacces_for_non_executable_binary() {
 }
 
 #[test]
+fn exec_script_accepts_execute_only_main_candidate() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o111, 0, 0);
+    set_non_root_cred(&process, 1001);
+
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &walker_cred_for(1001, 1001),
+    ));
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
 fn exec_script_eacces_for_other_user_when_no_other_x_bit() {
     let _setup = setup();
     let bytes = minimal_elf_bytes();
@@ -948,13 +2678,11 @@ fn exec_script_dac_override_bypasses_with_x_bit_set() {
 }
 
 #[test]
-fn exec_script_dac_override_bypasses_with_no_x_bit() {
+fn exec_script_dac_override_still_requires_some_x_bit() {
     let _setup = setup();
     let bytes = minimal_elf_bytes();
-    // mode 0o600 — no X bits. CAP_DAC_OVERRIDE bypasses the x-bit
-    // requirement entirely so the kernel can attempt exec and return
-    // ENOEXEC for non-ELF content, letting shells fall back to script
-    // interpretation (oscomp compatibility).
+    // mode 0o600 has no execute bits. Linux still rejects exec under
+    // CAP_DAC_OVERRIDE unless at least one execute bit is present.
     let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o600, 0, 0);
 
     let cred = Credential::root();
@@ -966,7 +2694,7 @@ fn exec_script_dac_override_bypasses_with_no_x_bit() {
         &[],
         &cred,
     ));
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
 }
 
 #[test]
@@ -979,6 +2707,7 @@ fn exec_script_setuid_binary_changes_euid() {
     let mode_bits = 0o4755; // S_ISUID | rwxr-xr-x
     let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, mode_bits, 1000, 0);
     set_non_root_cred(&process, 1001);
+    let before_cred_cap = process.cred_cap().expect("pre-exec cred cap");
 
     let cred = walker_cred_for(1001, 1001);
     let result = block_on(exec_script::<ScriptsTestPmap>(
@@ -995,6 +2724,175 @@ fn exec_script_setuid_binary_changes_euid() {
     assert_eq!(post.uid.raw(), 1001, "real uid preserved by exec");
     assert_eq!(post.euid.raw(), 1000, "S_ISUID applied");
     assert_eq!(post.suid.raw(), 1000, "saved-set tracks new euid");
+    assert_ne!(
+        process.cred_cap().expect("post-exec cred cap").key(),
+        before_cred_cap.key(),
+        "successful exec publishes the prepared cred"
+    );
+    assert_eq!(read_initial_auxv(&process, &thread)[&23], 1);
+}
+
+#[test]
+fn exec_setid_prepare_rolls_back_when_aspace_build_fails() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o6755, 1000, 2000);
+    set_non_root_cred(&process, 1001);
+    tx_subsystems::cross_crate_test_support::set_cred_ids_for_test(
+        &process, 1001, 1001, 1001, 1001, 1001, 1001,
+    );
+    let before = process.cred().expect("pre-exec cred");
+
+    fail_next_pmap_root_creation();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &walker_cred_for(1001, 1001),
+    ));
+
+    assert_eq!(result, Err(ExecError::OutOfMemory));
+    assert_eq!(
+        process.cred().expect("failed exec keeps process alive"),
+        before
+    );
+}
+
+#[test]
+fn exec_setuid_cred_allocation_oom_is_pre_ponr_and_returns_enomem() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o4755, 1000, 2000);
+    set_non_root_cred(&process, 1001);
+    let before_cred_cap = process.cred_cap().expect("pre-exec cred cap");
+    let before_cred = *before_cred_cap;
+    let before_aspace = process.aspace_cap().expect("pre-exec aspace");
+    let before_context = thread
+        .payload_cap()
+        .and_then(|payload| payload.saved_user_context());
+
+    tx_subsystems::cred::fail_next_cred_sign_for_test();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &walker_cred_for(1001, 1001),
+    ));
+
+    assert_eq!(result, Err(ExecError::OutOfMemory));
+    assert_eq!(
+        process.cred_cap().expect("post-error cred cap").key(),
+        before_cred_cap.key()
+    );
+    assert_eq!(process.cred().expect("post-error cred"), before_cred);
+    assert_eq!(
+        process.aspace_cap().expect("post-error aspace").key(),
+        before_aspace.key()
+    );
+    assert_eq!(
+        thread
+            .payload_cap()
+            .and_then(|payload| payload.saved_user_context()),
+        before_context
+    );
+}
+
+#[test]
+fn exec_setid_uses_final_alias_mount_nosuid_flag() {
+    let _setup = setup();
+    tx_subsystems::mount::reset_mount_table_for_test();
+    let (root, fs, root_mount) = build_fs_root_with_mount(MountId::new(1));
+    fs.add_directory(FsObjectId::new(2), b"alias");
+    fs.add_regular_with_bytes_meta(
+        FsObjectId::new(2),
+        b"setid",
+        &minimal_elf_bytes(),
+        0o4755,
+        1000,
+        0,
+    );
+    let guard = guard();
+    let mountpoint = match tx_subsystems::vfs::walker::step_walk(
+        root.clone(),
+        b"/alias",
+        &Credential::root(),
+        &guard,
+    ) {
+        StepOutcome::Done(dentry) => dentry,
+        other => panic!("resolve alias mountpoint: {other:?}"),
+    };
+    drop(guard);
+    let payload = root_mount
+        .payload_cap()
+        .expect("root mount payload")
+        .into_cap();
+    let alias_mount = MountIdentity::new_cap_with_root_dentry(
+        MountId::new(2),
+        Some(mountpoint.clone()),
+        root.clone(),
+        Some(root_mount.clone()),
+        payload,
+        MountFlags::NOSUID,
+    )
+    .expect("nosuid alias mount");
+    let namespace = MountNamespace::new_cap(root_mount.clone()).expect("namespace");
+    namespace.register_mount(&mountpoint, alias_mount);
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root, root_mount) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("mounted cwd rejected"),
+    }
+    step_set_mount_namespace(&process, namespace).expect("install namespace");
+    set_non_root_cred(&process, 1001);
+    let cred = walker_cred_for(1001, 1001);
+
+    tx_subsystems::cred::fail_next_cred_sign_for_test();
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/alias/setid",
+            &[],
+            &[],
+            &cred,
+        )),
+        Ok(())
+    );
+    assert_eq!(process.cred().expect("post-nosuid cred").euid.raw(), 1001);
+    assert_eq!(read_initial_auxv(&process, &thread)[&23], 0);
+
+    assert!(matches!(
+        tx_subsystems::cred::prepare_setid_for_exec(
+            &process,
+            tx_subsystems::cred::Uid(1000),
+            tx_subsystems::cred::Gid(0),
+            0o4755,
+        ),
+        Err(tx_subsystems::execution::Errno::ENOMEM)
+    ));
+    assert_eq!(
+        process.cred().expect("post-prepare-oom cred").euid.raw(),
+        1001
+    );
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/setid",
+            &[],
+            &[],
+            &cred,
+        )),
+        Ok(())
+    );
+    assert_eq!(process.cred().expect("post-normal cred").euid.raw(), 1000);
+    assert_eq!(read_initial_auxv(&process, &thread)[&23], 1);
 }
 
 #[test]

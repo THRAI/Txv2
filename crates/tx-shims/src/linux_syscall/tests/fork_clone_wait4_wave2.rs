@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
+use crate::linux_syscall::EAGAIN_VALUE;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tx_hal::UserTrapContext;
 use tx_subsystems::process::{Pgid, Pid};
@@ -124,6 +125,34 @@ fn dispatch_clone_with_clone_vm_flag_returns_child_pid() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     // CLONE_VM is now accepted — child shares parent's aspace.
     assert!(expect_clone_return_value(result) > 0);
+}
+
+#[test]
+fn dispatch_clone_thread_returns_eagain_while_exec_owns_lifecycle() {
+    let _setup = setup();
+    install_capturing_seam_and_reset();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let _ = seed_parent_trap_context(&thread);
+    let exec_prep = tx_subsystems::process::ProcessExecPrep::begin(&proc_cap, &thread)
+        .expect("reserve exec lifecycle");
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLONE,
+            [CLONE_VM | CLONE_SIGHAND | CLONE_THREAD, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(EAGAIN_VALUE));
+    assert_eq!(proc_cap.live_thread_count(), 1);
+    drop(exec_prep);
 }
 
 /// flags = `SIGCHLD | CLONE_NEWIPC` creates a child process in a
@@ -421,19 +450,19 @@ fn dispatch_setpgid_self_zero_returns_zero() {
     );
 }
 
-/// Cross-process `setpgid(target, 0)` returns `-EPERM` — day-1 only
-/// supports self-pid.
+/// Cross-process `setpgid(target, 0)` for an unknown pid returns
+/// `-ESRCH`; permission checks only apply after the target process is found.
 #[test]
-fn dispatch_setpgid_cross_process_returns_neg_eperm() {
+fn dispatch_setpgid_unknown_process_returns_neg_esrch() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap, thread);
 
-    // pid = 999 (non-self). EPERM.
+    // pid = 999 (non-self, unknown). ESRCH.
     let req = SyscallRequest::new(NR_SETPGID, [999, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(1));
+    assert_eq!(result, SyscallResult::Error(3));
 }
 
 /// `getpgid(0)` returns the caller's pgid.

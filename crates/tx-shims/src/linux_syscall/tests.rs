@@ -17,6 +17,7 @@
 //! - `txdoc:PROCESS-STEP-EXIT-GROUP-1` (PROCESS_v1 §7.3.2).
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -26,12 +27,17 @@ use std::sync::Mutex;
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
 use crate::linux_syscall::reset_uts_nodename_for_test;
+use tx_substrate::step::InterestMask;
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
-use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
+use tx_subsystems::process::{
+    bootstrap_init_process, step_fork, ExitStatus, Pid, ProcessIdentity,
+    EXIT_SOURCE_CHILD_ZOMBIFIED,
+};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::{
@@ -69,6 +75,7 @@ use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
     PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, SmpIf, VirtAddr,
 };
+use tx_services::time::{platform::HalRtcDevice, RtcDeviceOps as TimeRtcDeviceOps, TimeError};
 use tx_subsystems::vm::USER_PAGE_SIZE;
 
 struct ShimsTestPmap;
@@ -76,6 +83,7 @@ struct ShimsTestPmap;
 impl PlatformConfig for ShimsTestPmap {
     const ARCH: Arch = Arch::Riscv64;
     const BOARD: &'static str = "shims-test";
+    const USER_TOP: VirtAddr = VirtAddr(tx_subsystems::vm::FULL_USER_V1_TOP);
 }
 
 #[derive(Default)]
@@ -170,30 +178,111 @@ impl tx_hal::CacheIf for ShimsTestPmap {}
 impl tx_hal::TrapIf for ShimsTestPmap {}
 impl tx_hal::SignalFrameIf for ShimsTestPmap {}
 
-// Slice 4 of the shell-prompt roadmap (2026-05-07) added a `TimeIf`
-// bound to `dispatch::<P>` so the time-syscall arms can read the
-// platform monotonic clock through `<P as TimeIf>::read_ns()`. The
-// test platform exposes a monotonically-increasing nanosecond
-// counter — each call returns 1ns more than the last — so tests can
-// observe both the nanosecond-to-`(tv_sec, tv_nsec)` decomposition
-// (`SHIMS_TEST_NS_BASE` is large enough to span a full tv_sec) and
-// the strict-monotonicity contract `TimeIf` requires. The
-// deadline / cancel hooks are no-ops; the test harness never drives
+// Slice 4 of the shell-prompt roadmap (2026-05-07) added time capability
+// bounds to `dispatch::<P>` so time-syscall arms can read the platform
+// monotonic clock and, for realtime setters, attempt best-effort persistent
+// writeback. The test platform exposes a monotonically-increasing nanosecond
+// counter — each call returns 1ns more than the last — so tests can observe
+// both the nanosecond-to-`(tv_sec, tv_nsec)` decomposition (`SHIMS_TEST_NS_BASE`
+// is large enough to span a full tv_sec) and the strict-monotonicity contract
+// `MonotonicCounterIf` requires. The deadline / cancel hooks are no-ops; the
+// test harness never drives
 // the reactor's timer queue and Slice 4 has no real-duration
 // `nanosleep` path.
 static SHIMS_TEST_NS_COUNTER: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(SHIMS_TEST_NS_BASE);
 const SHIMS_TEST_NS_BASE: u64 = 5_000_000_000;
+static EXIT_GROUP_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
-impl tx_hal::TimeIf for ShimsTestPmap {
+fn counting_mailbox_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    EXIT_GROUP_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post(event)
+}
+
+impl tx_hal::MonotonicCounterIf for ShimsTestPmap {
     fn read_ns() -> u64 {
         SHIMS_TEST_NS_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
+}
+
+impl tx_hal::DeadlineTimerIf for ShimsTestPmap {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+pub(super) static SHIMS_TEST_RTC_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS);
+pub(super) static SHIMS_TEST_RTC_SET_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(super) static SHIMS_TEST_RTC_SET_FAIL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(super) static SHIMS_TEST_RTC_ALARM_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(super) static SHIMS_TEST_RTC_ALARM_UNSUPPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(super) static SHIMS_TEST_RTC_ALARM_CLEAR_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+impl tx_hal::PersistentClockIf for ShimsTestPmap {
+    fn read_realtime_ns() -> Result<u64, tx_hal::PersistentClockError> {
+        Ok(SHIMS_TEST_RTC_NS.load(core::sync::atomic::Ordering::Acquire))
+    }
+
+    fn set_realtime_ns(ns: u64) -> Result<(), tx_hal::PersistentClockError> {
+        if SHIMS_TEST_RTC_SET_FAIL.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(tx_hal::PersistentClockError::Hardware);
+        }
+        SHIMS_TEST_RTC_SET_NS.store(ns, core::sync::atomic::Ordering::Release);
+        SHIMS_TEST_RTC_NS.store(ns, core::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), tx_hal::PersistentClockError> {
+        if SHIMS_TEST_RTC_ALARM_UNSUPPORTED.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(tx_hal::PersistentClockError::Unsupported);
+        }
+        SHIMS_TEST_RTC_ALARM_NS.store(ns, core::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn clear_wake_alarm() -> Result<(), tx_hal::PersistentClockError> {
+        if SHIMS_TEST_RTC_ALARM_UNSUPPORTED.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(tx_hal::PersistentClockError::Unsupported);
+        }
+        SHIMS_TEST_RTC_ALARM_CLEAR_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+fn shims_test_rtc_read_time_ns() -> Result<u64, TimeError> {
+    HalRtcDevice::<ShimsTestPmap>::new().read_time_ns()
+}
+
+fn shims_test_rtc_set_time_ns(ns: u64) -> Result<(), TimeError> {
+    HalRtcDevice::<ShimsTestPmap>::new().set_time_ns(ns)
+}
+
+fn shims_test_rtc_set_alarm_ns(ns: u64) -> Result<(), TimeError> {
+    HalRtcDevice::<ShimsTestPmap>::new().set_alarm_ns(ns)
+}
+
+fn shims_test_rtc_clear_alarm() -> Result<(), TimeError> {
+    HalRtcDevice::<ShimsTestPmap>::new().clear_alarm()
+}
+
+fn install_shims_test_rtc_backend() {
+    tx_fs::devfs::install_rtc_backend(
+        shims_test_rtc_read_time_ns,
+        shims_test_rtc_set_time_ns,
+        shims_test_rtc_set_alarm_ns,
+        shims_test_rtc_clear_alarm,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -219,13 +308,24 @@ fn setup() -> TestSetup {
     reset_tid_counter();
     reset_init_process();
     reset_reactor_affinity_seam();
-    tx_subsystems::wall_clock::reset_for_test();
+    tx_services::time::reset_for_test();
+    tx_subsystems::time_hooks::ensure_hooks_installed();
     reset_uts_nodename_for_test();
     tx_subsystems::net::reset_initial_net_namespace_for_test();
     tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
     tx_subsystems::net::device::reset_net_registry_for_test();
     tx_subsystems::net::reset_netfilter_for_test();
     super::reset_itimer_registry_for_test();
+    tx_fs::devfs::reset_rtc_backend_for_test();
+    SHIMS_TEST_RTC_NS.store(
+        tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS,
+        core::sync::atomic::Ordering::Release,
+    );
+    SHIMS_TEST_RTC_SET_NS.store(0, core::sync::atomic::Ordering::Release);
+    SHIMS_TEST_RTC_SET_FAIL.store(false, core::sync::atomic::Ordering::Release);
+    SHIMS_TEST_RTC_ALARM_NS.store(0, core::sync::atomic::Ordering::Release);
+    SHIMS_TEST_RTC_ALARM_UNSUPPORTED.store(false, core::sync::atomic::Ordering::Release);
+    SHIMS_TEST_RTC_ALARM_CLEAR_COUNT.store(0, core::sync::atomic::Ordering::Release);
     TestSetup { _lock: lock }
 }
 
@@ -579,6 +679,53 @@ fn dispatch_exit_group_marks_process_zombie() {
     assert_eq!(proc_cap.live_thread_count(), 0);
 }
 
+#[test]
+fn dispatch_exit_group_uses_syscall_ctx_mailbox_ref_post_for_parent_exit_source() {
+    let _setup = setup();
+    EXIT_GROUP_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+
+    let parent = bootstrap();
+    let child = step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork child");
+    let parent_source = parent
+        .exit_endpoint()
+        .expect("live parent has exit endpoint");
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _guard = parent_source
+        .prepare(
+            Arc::downgrade(&mailbox),
+            generation,
+            InterestMask::new(EXIT_SOURCE_CHILD_ZOMBIFIED),
+        )
+        .install_if(|| true)
+        .expect("registered parent exit wait-source subscriber");
+
+    let thread = first_thread(&child);
+    let ctx = make_ctx(child.clone(), thread).with_mailbox_ref_post(counting_mailbox_ref_post);
+    let req = SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::NoReturn);
+    assert!(child.is_zombie());
+    assert_eq!(
+        EXIT_GROUP_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "parent exit wait-source should publish through SyscallCtx mailbox-ref post",
+    );
+    match mailbox.poll().expect("parent exit source should post") {
+        MailboxEvent::SourceFired {
+            generation: got_generation,
+            source,
+            interests,
+        } => {
+            assert_eq!(got_generation, generation);
+            assert_eq!(source, parent_source.id());
+            assert_ne!(interests.raw() & EXIT_SOURCE_CHILD_ZOMBIFIED, 0);
+        }
+        other => panic!("expected SourceFired, got {other:?}"),
+    }
+}
+
 /// For a single-threaded process, `exit(7)` chains internally inside
 /// `step_thread_exit` to `step_process_exit` (per `PROCESS_v1` §7.3.1
 /// step 3: "If `thread_count == 0`: trigger step_process_exit"). The
@@ -760,7 +907,7 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
 
     // Manually drive the future: first poll should observe an empty
     // TTY input queue and return Pending after registering a waker
-    // on the wait-carrier `Channel`.
+    // on the registered wait source.
     let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let fut = dispatch::<ShimsTestPmap>(req, &ctx);
@@ -781,7 +928,12 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     {
         use step_engine::StepOutcome as V3Out;
         let guard = guard();
-        let outcome = tx_subsystems::tty::execution::step_ingest(&console_tty, b"X\n", &guard);
+        let outcome = tx_subsystems::tty::execution::step_ingest_with_post(
+            &console_tty,
+            b"X\n",
+            &guard,
+            |mailbox, event, hint| mailbox.post_with_scheduler_hint(event, hint),
+        );
         assert!(
             matches!(outcome, V3Out::Done(_)),
             "step_ingest should accept the bytes; got {outcome:?}"
@@ -808,6 +960,77 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
         }
     }
     panic!("dispatch did not resolve after step_ingest woke the carrier; last poll = {result:?}");
+}
+
+#[test]
+fn dispatch_read_rtc_blocks_until_event_then_returns_record() {
+    let _setup = setup();
+    tx_fs::devfs::reset_rtc_backend_for_test();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let rtc_file = static_char_file(&tx_fs::devfs::RTC_CHAR_BINDING, true, false);
+    proc_cap.set_fd(3, Some(rtc_file));
+    let ctx = make_ctx(proc_cap, thread);
+    let mut buf = [0u8; 8];
+    let req = SyscallRequest::new(NR_READ, [3, buf.as_mut_ptr() as u64, 8, 0, 0, 0]);
+
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    let first = pinned.as_mut().poll(&mut cx);
+    assert!(
+        matches!(first, Poll::Pending),
+        "blocking RTC read without pending events should park; got {first:?}"
+    );
+
+    tx_fs::devfs::publish_rtc_event_with_post(
+        tx_subsystems::device::RtcEventMask::ALARM,
+        |mailbox, event| mailbox.post(event),
+    );
+
+    let mut result = Poll::Pending;
+    for _ in 0..256 {
+        result = pinned.as_mut().poll(&mut cx);
+        if let Poll::Ready(value) = result {
+            assert_eq!(value, SyscallResult::Return(8));
+            let record = u64::from_ne_bytes(buf);
+            assert_eq!(
+                record & 0xff,
+                0x80 | 0x20,
+                "RTC read record should carry RTC_IRQF | RTC_AF"
+            );
+            assert_eq!(record >> 8, 1, "one event publication should be counted");
+            tx_fs::devfs::reset_rtc_backend_for_test();
+            return;
+        }
+    }
+    tx_fs::devfs::reset_rtc_backend_for_test();
+    panic!("RTC read did not resolve after event publication; last poll = {result:?}");
+}
+
+#[test]
+fn dispatch_read_rtc_nonblocking_without_event_returns_eagain() {
+    let _setup = setup();
+    tx_fs::devfs::reset_rtc_backend_for_test();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let rtc_file = static_char_file(&tx_fs::devfs::RTC_CHAR_BINDING, true, false);
+    rtc_file.set_nonblocking(true);
+    proc_cap.set_fd(3, Some(rtc_file));
+    let ctx = make_ctx(proc_cap, thread);
+    let mut buf = [0u8; 8];
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_READ, [3, buf.as_mut_ptr() as u64, 8, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(11));
+    tx_fs::devfs::reset_rtc_backend_for_test();
 }
 
 /// `brk(0)` reports the current break, then `brk(>current)` grows,
@@ -1107,7 +1330,7 @@ fn dispatch_direct_trap_payload_oneshot_routes_sigprocmask_through_payload_lane(
     const SIGUSR1_BIT: u64 = 1u64 << 9;
 
     let set: u64 = SIGUSR1_BIT;
-    let set_result = dispatch_direct_trap_payload_oneshot(
+    let set_result = dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
         &SyscallRequest::new(
             NR_RT_SIGPROCMASK,
             [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
@@ -1120,7 +1343,7 @@ fn dispatch_direct_trap_payload_oneshot_routes_sigprocmask_through_payload_lane(
     assert_eq!(set_result, Some(SyscallResult::Return(0)));
 
     let mut oldset: u64 = 0;
-    let query_result = dispatch_direct_trap_payload_oneshot(
+    let query_result = dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
         &SyscallRequest::new(
             NR_RT_SIGPROCMASK,
             [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],
@@ -1636,7 +1859,7 @@ mod dac_setuid_wave2;
 //   - `faccessat2` AT_EACCESS effective-id branch
 //
 // Mount setup mirrors the `execve` module's `build_fs_root` shape but
-// uses the shipping `Tmpfs` backend so `step_chmod` / `step_chown`
+// uses the shipping `Tmpfs` backend so `chmod_inode` / `chown_inode`
 // reach the real implementation.
 // ===========================================================================
 
@@ -1764,7 +1987,7 @@ mod futex_dispatch;
 //
 // Coverage:
 //   - `clock_gettime(CLOCK_MONOTONIC, ts)` writes a tv_sec / tv_nsec
-//     pair derived from `<P as TimeIf>::read_ns()`. Tests the
+//     pair derived from `<P as MonotonicCounterIf>::read_ns()`. Tests the
 //     nanosecond → `(tv_sec, tv_nsec)` decomposition.
 //   - `clock_gettime` with an unrecognised clock id returns
 //     `-EINVAL`.
@@ -1799,6 +2022,18 @@ mod time_syscalls;
 //     `-EINVAL`.
 // ===========================================================================
 mod timerfd_dispatch;
+
+// ===========================================================================
+// POSIX timer syscall ABI.
+//
+// Coverage:
+//   - `timer_create` writes a timer id through the caller pointer.
+//   - `timer_settime` and `timer_gettime` use the LP64 `struct itimerspec`
+//     layout and report relative remaining time.
+//   - `timer_getoverrun` reports the stored overrun value.
+//   - `timer_delete` removes the id and subsequent lookup returns `-EINVAL`.
+// ===========================================================================
+mod posix_timer_dispatch;
 
 // ===========================================================================
 // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY routing.

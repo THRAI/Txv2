@@ -16,7 +16,7 @@ use crate::thread_runtime::adapter::reactor_entry::{
     TaskKey, UserspaceRunRequest, UserspaceRunSlot,
 };
 use crate::thread_runtime::adapter::step_engine::{
-    Dead, Entity, PayloadCap, PayloadPolicy, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
+    Cap, Dead, Entity, PayloadCap, PayloadPolicy, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
 };
 
 use crate::process::ProcessIdentity;
@@ -151,7 +151,7 @@ pub struct ThreadPayload {
     /// authoritative `ProcessPayload.group_pending`.
     pub(crate) group_pending_summary: AtomicU64,
     /// `InterruptSummary` packed into 8 bits, kept current by
-    /// `post_signal`, `step_sigprocmask`, `step_thread_exit`, and the
+    /// catchable-signal posting, `step_sigprocmask`, `step_thread_exit`, and the
     /// SIGKILL routing path. Read by `select_next_signal` /
     /// `ast_check`. Per `THREAD_RUNTIME_v1` §5.2.
     pub(crate) signal_summary: AtomicU8,
@@ -188,8 +188,8 @@ pub struct ThreadPayload {
     /// Wake mailbox bound to the reactor task that drives this
     /// thread's future, used by D9-A's signal-wake plumbing.
     ///
-    /// **D9-A (lost-wake fix for signals).** `post_signal`,
-    /// `route_gewalt`, and `set_thread_zombie` post a
+    /// **D9-A (lost-wake fix for signals).** Catchable-signal posting,
+    /// Gewalt routing, and `set_thread_zombie` post a
     /// [`MailboxEvent::SignalDelivered`] event to this mailbox after
     /// updating the per-thread `signal_summary`. The mailbox post
     /// wakes the registered `core::task::Waker`, forcing the parked
@@ -211,20 +211,9 @@ pub struct ThreadPayload {
     /// `Arc`-managed at the substrate layer; the eventual zone
     /// migration (PR-3D+) flips this to `zone::Weak<TaskMailbox>`.
     pub(crate) mailbox: SpinMutex<Option<ArcWeak<TaskMailbox>>>,
-    /// Scheduler wake route reserved for thread lifecycle events.
-    ///
-    /// Ordinary futex/I/O/timer waits share `TaskMailbox::waker` and clear it
-    /// when their local wait completes.  Process-wide exec/exit must not rely
-    /// on that replaceable slot: otherwise a sibling can remain parked after
-    /// its nested wait clears the mailbox waker, leaving exec's participant
-    /// countdown permanently non-zero.
-    ///
-    /// `PerHartSlotted` refreshes this with the reactor task's current waker
-    /// at every poll.  Only payload teardown drops it.
-    pub(crate) lifecycle_waker: SpinMutex<Option<Waker>>,
-    /// Thread stop flag.  Set by `route_gewalt(SIGSTOP)` /
+    /// Thread stop flag.  Set by Gewalt routing for SIGSTOP /
     /// `DefaultStop` AST materialisation; cleared by
-    /// `route_gewalt(SIGCONT)`.  When `true`, the thread must not
+    /// Gewalt routing for SIGCONT.  When `true`, the thread must not
     /// enter userspace — it is parked until `stopped` becomes
     /// `false`.
     ///
@@ -236,11 +225,11 @@ pub struct ThreadPayload {
     ///
     /// Phase E (first pass): busy-wait placeholder.  The thread
     /// future spins on `stopped` until cleared.  TODO: replace with
-    /// a wait-source parked by the reactor, woken by SIGCONT's
-    /// `route_gewalt` clearing the flag + posting to the thread's
+    /// a wait-source parked by the reactor, woken by SIGCONT
+    /// clearing the flag + posting to the thread's
     /// mailbox.
     ///
-    /// Atomic because `route_gewalt` sets/clears it under the
+    /// Atomic because Gewalt routing sets/clears it under the
     /// thread-list lock, and the AST checkpoint reads it from the
     /// thread future without acquiring the payload lock.
     /// See: `txdoc:SIGNAL-V1-S12-3-ROUTE-GEWALT-STOP`.
@@ -502,7 +491,7 @@ impl ThreadPayload {
     }
 
     /// Set or clear the stopped flag. Used by
-    /// `route_gewalt(SIGSTOP)` (set) and `route_gewalt(SIGCONT)`
+    /// Gewalt routing for SIGSTOP (set) and SIGCONT
     /// (clear).
     pub(crate) fn set_stopped(&self, val: bool) {
         self.stopped
@@ -541,7 +530,7 @@ impl ThreadPayload {
     }
 
     /// Atomic read-modify-write on the packed summary bits. Used by
-    /// `post_signal`, `step_sigprocmask`, etc., to keep the summary
+    /// catchable-signal posting, `step_sigprocmask`, etc., to keep the summary
     /// in sync with the underlying state. The mutator is `Fn` because
     /// the CAS loop may retry on contention.
     pub(crate) fn update_summary(&self, f: impl Fn(&mut InterruptSummary)) {
@@ -567,7 +556,7 @@ impl ThreadPayload {
 // D9-A bridge: ThreadPayload → reactor InterruptSource
 // ------------------------------------------------------------------
 
-use crate::signal::adapter::wait_routing::InterruptSource;
+use tx_reactor::interrupt::InterruptSource;
 
 impl InterruptSource for ThreadPayload {
     fn deliverable_signal_pending(&self) -> bool {
@@ -624,7 +613,7 @@ pub fn prewarm_thread_payload_slots(count: usize) -> usize {
     let mut quiet = 0u8;
     while quiet < 2 {
         let stats = crate::thread_runtime::adapter::step_engine::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
+        if stats.bag_reclaimed == 0 && stats.publication_dropped == 0 {
             quiet += 1;
         } else {
             quiet = 0;
@@ -673,16 +662,13 @@ static CURRENT_THREAD_PAYLOAD: ThreadPayloadSlots = ThreadPayloadSlots::new();
 static CURRENT_USERSPACE_PAYLOAD: ThreadPayloadSlots = ThreadPayloadSlots::new();
 
 struct ThreadIdentitySlots {
-    slots: [SpinMutex<Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>>>;
-        MAX_THREAD_PAYLOAD_HARTS],
+    slots: [SpinMutex<Option<Cap<ThreadIdentity>>>; MAX_THREAD_PAYLOAD_HARTS],
 }
 
 impl ThreadIdentitySlots {
     const fn new() -> Self {
         #[allow(clippy::declare_interior_mutable_const)]
-        const NIL: SpinMutex<
-            Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>>,
-        > = SpinMutex::new(None);
+        const NIL: SpinMutex<Option<Cap<ThreadIdentity>>> = SpinMutex::new(None);
         Self {
             slots: [NIL; MAX_THREAD_PAYLOAD_HARTS],
         }
@@ -707,9 +693,7 @@ pub fn current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> 
     CURRENT_THREAD_PAYLOAD.slots[hart].lock().clone()
 }
 
-pub fn current_thread_identity(
-    hart: usize,
-) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+pub fn current_thread_identity(hart: usize) -> Option<Cap<ThreadIdentity>> {
     if hart >= MAX_THREAD_PAYLOAD_HARTS {
         return None;
     }
@@ -732,6 +716,13 @@ pub fn current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload
         return None;
     }
     CURRENT_USERSPACE_PAYLOAD.slots[hart].lock().clone()
+}
+
+pub fn current_userspace_thread_identity(hart: usize) -> Option<Cap<ThreadIdentity>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock().clone()
 }
 
 pub fn current_thread_payload_mask() -> u64 {
@@ -766,8 +757,8 @@ pub fn set_current_thread_payload(
 
 pub fn set_current_thread_identity(
     hart: usize,
-    thread: crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>,
-) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+    thread: Cap<ThreadIdentity>,
+) -> Option<Cap<ThreadIdentity>> {
     assert!(
         hart < MAX_THREAD_PAYLOAD_HARTS,
         "hart {hart} exceeds MAX_THREAD_PAYLOAD_HARTS",
@@ -790,9 +781,7 @@ pub fn clear_current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayl
     CURRENT_THREAD_PAYLOAD.slots[hart].lock().take()
 }
 
-pub fn clear_current_thread_identity(
-    hart: usize,
-) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+pub fn clear_current_thread_identity(hart: usize) -> Option<Cap<ThreadIdentity>> {
     if hart >= MAX_THREAD_PAYLOAD_HARTS {
         return None;
     }
@@ -816,6 +805,20 @@ pub fn set_current_userspace_payload(
     prev
 }
 
+pub fn set_current_userspace_thread_identity(
+    hart: usize,
+    thread: Cap<ThreadIdentity>,
+) -> Option<Cap<ThreadIdentity>> {
+    assert!(
+        hart < MAX_THREAD_PAYLOAD_HARTS,
+        "hart {hart} exceeds MAX_THREAD_PAYLOAD_HARTS",
+    );
+    let mut slot = CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock();
+    let prev = slot.clone();
+    *slot = Some(thread);
+    prev
+}
+
 /// Clear the userspace-running payload on `hart`.
 pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> {
     if hart >= MAX_THREAD_PAYLOAD_HARTS {
@@ -825,6 +828,33 @@ pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadP
     LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
     USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
     cleared
+}
+
+pub fn clear_current_userspace_thread_identity(hart: usize) -> Option<Cap<ThreadIdentity>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock().take()
+}
+
+pub(crate) fn clear_thread_slots_for(
+    thread: &Cap<ThreadIdentity>,
+    payload: &PayloadCap<ThreadPayload>,
+) {
+    let thread_key = thread.key();
+    let payload_key = payload.key();
+
+    let mut hart = 0;
+    while hart < MAX_THREAD_PAYLOAD_HARTS {
+        clear_payload_slot_if_matches(&CURRENT_THREAD_PAYLOAD, hart, payload_key);
+        clear_identity_slot_if_matches(&CURRENT_THREAD_IDENTITY, hart, thread_key);
+        if clear_payload_slot_if_matches(&CURRENT_USERSPACE_PAYLOAD, hart, payload_key) {
+            LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
+            USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        clear_identity_slot_if_matches(&CURRENT_USERSPACE_THREAD_IDENTITY, hart, thread_key);
+        hart += 1;
+    }
 }
 
 pub fn userspace_payload_trace_counters() -> (u64, u64, u64, u64) {
@@ -846,6 +876,34 @@ fn payload_slot_mask(slots: &ThreadPayloadSlots) -> u64 {
         hart += 1;
     }
     mask
+}
+
+fn clear_payload_slot_if_matches(
+    slots: &ThreadPayloadSlots,
+    hart: usize,
+    key: crate::thread_runtime::adapter::step_engine::SlotKey,
+) -> bool {
+    let mut slot = slots.slots[hart].lock();
+    if slot.as_ref().map(PayloadCap::key) == Some(key) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn clear_identity_slot_if_matches(
+    slots: &ThreadIdentitySlots,
+    hart: usize,
+    key: crate::thread_runtime::adapter::step_engine::SlotKey,
+) -> bool {
+    let mut slot = slots.slots[hart].lock();
+    if slot.as_ref().map(Cap::key) == Some(key) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
 }
 
 static THREAD_IDENTITY_ZONE: Zone<ThreadIdentity> = Zone::const_new();

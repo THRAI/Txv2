@@ -73,7 +73,10 @@ fn boot_net_runtime_delivers_virtio_rx_udp_to_socket() {
 
     let injected = VIRTIO_NET0_DEVICE.inject_rx_for_test_or_irq(RxFrame::new(frame));
     assert!(injected.accepted);
-    let irq = VIRTIO_NET0_DEVICE.handle_irq(VirtioNetIrqEvent::RxAvailable);
+    let irq = VIRTIO_NET0_DEVICE
+        .handle_irq_with_post(VirtioNetIrqEvent::RxAvailable, |mailbox, event| {
+            mailbox.post(event)
+        });
     assert!(irq.rx_ready);
     assert!(irq.poll_wakes >= 1, "parked delegate should be woken");
 

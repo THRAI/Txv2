@@ -449,7 +449,7 @@ fn tcp_loopback_first_syn_uses_listener_connecting_backlog() {
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
     let ack = ctx.poll_ingress(&iface, &guard, 1);
     for publish in ack.publishes {
-        publish.publish();
+        publish.publish_with_post(|mailbox, event| mailbox.post(event));
     }
 
     assert_eq!(listener_payload.connecting_backlog_len(), 0);

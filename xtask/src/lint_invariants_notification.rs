@@ -46,7 +46,7 @@ pub(crate) fn lint_invariants_notification_boundary(root: &Path) -> Result<()> {
             continue;
         }
 
-        let text = fs::read_to_string(&file).map_err(|err| format!("{}: {err}", rel))?;
+        let text = fs::read_to_string(&file).map_err(|err| format!("{rel}: {err}"))?;
         if is_convergence_home(&rel) {
             continue;
         }

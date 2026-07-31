@@ -193,12 +193,16 @@ pub trait TxPlatform:
     + TrapIf
     + SignalFrameIf
     + IrqIf
-    + TimeIf
+    + MonotonicCounterIf
+    + DeadlineTimerIf
+    + PersistentClockIf
     + PercpuIf
     + CacheIf
     + DmaIf
     + SmpIf
     + PowerIf
+    + EntropyIf
+    + ObserverIf
     + 'static
 {
 }
@@ -222,7 +226,10 @@ impl TxPlatform for Platform {}
 // trait impls follow for each *If
 ```
 
-This means kernel code can write `<P as TimeIf>::read_ns()` without holding any `Platform` instance. The methods are all "associated function" form; there is no `&self`.
+This means kernel code can call platform methods without holding any `Platform`
+instance. Time consumers use associated functions as well: for example
+`<P as MonotonicCounterIf>::read_ns()` or
+`<P as DeadlineTimerIf>::set_deadline_ns(deadline)`. There is no `&self`.
 
 ### 3.2 The kernel mainline bound
 <!-- txdoc:HAL-THE-TXPLATFORM-SUPERTRAIT-THE-KERNEL-MAINLINE-BOUND-1 -->
@@ -867,7 +874,11 @@ impl MmioFlags {
 
 A driver (UART, virtio-blk, PLIC) does not import `tx_hal_riscv64_qemu_virt::UART_BASE`. It receives its MMIO base through device init, which read `P::platform_info().mmio_regions` and looks up by name. This keeps device code portable across boards even when the same driver runs on different boards with different bases.
 
-The exception is tier-1 HAL devices (PLIC, CLINT, early UART). These live *inside* the platform crate itself; their bases are platform-private. For these, the platform crate's `IrqIf`, `TimeIf`, and `ConsoleIf` impls reach for the constants directly — but no other crate sees those constants.
+The exception is tier-1 HAL devices (PLIC, CLINT, early UART). These live
+*inside* the platform crate itself; their bases are platform-private. For these,
+the platform crate's `IrqIf`, `MonotonicCounterIf`, `DeadlineTimerIf`, and
+`ConsoleIf` impls reach for the constants directly — but no other crate sees
+those constants.
 
 ### 8.2 PlatformInfo and substrate phase 3
 <!-- txdoc:HAL-PLATFORMINFOIF-PLATFORMINFO-AND-SUBSTRATE-PHASE-3-1 -->
@@ -2074,13 +2085,17 @@ only the impl swaps.
 
 ---
 
-## 14. TimeIf
-<!-- txdoc:HAL-TIMEIF-1 -->
+## 14. Time Capability Traits
+<!-- txdoc:HAL-TIME-CAPABILITIES-1 -->
 
-`TimeIf` is the platform's monotonic clock and the deadline source for the scheduler/reactor. It is small but performance-critical: `read_ns` is called from the scheduler's hot path.
+The platform exposes time hardware as separate capabilities:
+`MonotonicCounterIf` for clocksource-like reads, `DeadlineTimerIf` for
+clockevent-like deadline interrupts, and `PersistentClockIf` for optional
+RTC/firmware realtime seed, persistent set-time, and wake alarm support. The
+retired mixed `TimeIf` name should not be used by new active docs or code.
 
 ```rust
-pub trait TimeIf {
+pub trait MonotonicCounterIf {
     /// Read the current monotonic time in nanoseconds since boot.
     /// Must be:
     /// - monotonically non-decreasing on a single hart;
@@ -2088,6 +2103,12 @@ pub trait TimeIf {
     /// - cheap (typically: read a single CSR, multiply by a constant).
     fn read_ns() -> u64;
 
+    /// Read the timer-interrupt frequency, used for converting
+    /// between cycles and nanoseconds during early init.
+    fn frequency_hz() -> u64;
+}
+
+pub trait DeadlineTimerIf {
     /// Program the per-hart timer to fire at the given absolute
     /// monotonic deadline. If the deadline is in the past, fire ASAP.
     fn set_deadline_ns(deadline: u64);
@@ -2098,25 +2119,78 @@ pub trait TimeIf {
     /// Prepare the current hart so a programmed timer deadline can wake or
     /// trap out of the platform idle path.
     fn enable_timer_wakeups();
+}
 
-    /// Read the timer-interrupt frequency, used for converting
-    /// between cycles and nanoseconds during early init.
-    fn frequency_hz() -> u64;
+pub trait PersistentClockIf {
+    fn read_realtime_ns() -> Result<u64, PersistentClockError>;
+    fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError>;
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError>;
+    fn clear_wake_alarm() -> Result<(), PersistentClockError>;
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError>;
 }
 ```
 
+`MonotonicCounterIf::read_ns` is performance-critical because scheduler,
+reactor, tracing, and timekeeping hot paths read it frequently.
+`DeadlineTimerIf` is intentionally narrower: it arms or cancels the current
+hart's timer and knows nothing about tasks, futures, mailboxes, realtime
+offsets, or software timer lists. `PersistentClockIf` is intentionally fallible
+and outside the hot path: platforms without RTC or firmware wall-clock support
+return `Unsupported`, and the generic timekeeper falls back to its default
+realtime epoch.
+
 ### 14.1 RV64 vs LA64 implementation
-<!-- txdoc:HAL-TIMEIF-RV64-VS-LA64-IMPLEMENTATION-1 -->
+<!-- txdoc:HAL-TIME-CAPABILITIES-RV64-VS-LA64-IMPLEMENTATION-1 -->
 
-| Platform | Time CSR | Timer set | Comment |
-|---|---|---|---|
-| RV64 | `time` (rdtime) | SBI `set_timer` (M-mode) | qemu-virt CLINT is virtualized by SBI |
-| LA64 | `stable_counter` | `tcfg` CSR | Direct supervisor access to stable timer |
+| Platform | Monotonic counter | Deadline timer | Persistent clock | Comment |
+|---|---|---|---|---|
+| RV64 | `time` (rdtime) | SBI `set_timer` (M-mode) | board RTC or unsupported default | qemu-virt CLINT is virtualized by SBI |
+| LA64 | `stable_counter` | `tcfg` CSR | board RTC or unsupported default | Direct supervisor access to stable timer |
 
-The platform crate handles these differences. Subsystem code calls `P::read_ns()` regardless.
+The platform crate handles these differences. Subsystem code asks for the
+narrow capability it needs: read-side consumers use
+`MonotonicCounterIf`; reactor deadline programming uses `DeadlineTimerIf`;
+boot realtime seed and `/dev/rtc` adapters use `PersistentClockIf`.
 
-### 14.2 The timer-interrupt path
-<!-- txdoc:HAL-TIMEIF-THE-TIMER-INTERRUPT-PATH-1 -->
+### 14.2 Persistent-clock backend contract
+<!-- txdoc:HAL-TIME-CAPABILITIES-PERSISTENT-CLOCK-BACKEND-1 -->
+
+Real-board RTC support is a board-local backend, not a generic devfs or
+timekeeper special case. A board that has a battery-backed RTC, PMIC RTC, SoC
+TOY register block, or firmware wall-clock service implements
+`PersistentClockIf` on its platform type. A board without a reliable persistent
+clock keeps the default `Unsupported` results.
+
+The backend interface is intentionally Unix-nanosecond shaped:
+
+- `read_realtime_ns` returns a validated Unix realtime value or a typed error;
+- `set_realtime_ns` writes the persistent clock when the hardware permits it;
+- `set_wake_alarm_ns` and `clear_wake_alarm` program only the hardware or
+  firmware wake source;
+- `acknowledge_wake_alarm_irq` clears or acknowledges the board-local RTC alarm
+  source after `IrqIf` dispatch has identified the IRQ.
+
+If the board exposes an RTC alarm interrupt, it also overrides
+`IrqIf::RTC_IRQ` with the platform IRQ number. The generic kernel may register
+an RTC IRQ handler for that number, call the typed RTC adapter to acknowledge
+the hardware source, and then publish a device event. HAL must not publish
+`RtcEventMask`, touch `RNode`, inspect open files, or route scheduler wakes.
+
+Real-board profile tests should prove the following before the backend is
+treated as usable:
+
+- the MMIO or firmware source is described in the board crate and, for MMIO
+  devices, covered by `PlatformInfo::mmio_regions`;
+- calendar or BCD register conversion is range-checked before returning Unix
+  nanoseconds;
+- unsupported set-time or alarm operations return
+  `PersistentClockError::Unsupported` rather than silently succeeding;
+- `IrqIf::RTC_IRQ` is zero when no hardware alarm IRQ exists, or names the real
+  interrupt line when one exists;
+- `acknowledge_wake_alarm_irq` is hardware-only and can run from IRQ context.
+
+### 14.3 The timer-interrupt path
+<!-- txdoc:HAL-TIME-CAPABILITIES-THE-TIMER-INTERRUPT-PATH-1 -->
 
 When the timer fires, the trap shell classifies it as `TrapClass::TimerInterrupt` and calls `KernelTrapSink::on_timer_interrupt(cpu)`. The kernel's impl is in the scheduler:
 
@@ -2126,14 +2200,24 @@ fn on_timer_interrupt(cpu: CpuId) -> TrapAction {
 }
 ```
 
-The scheduler's timer tick handler walks the per-hart timer wheel (or whatever data structure the scheduler/reactor uses), wakes any threads whose deadlines have passed, and returns `TrapAction::Reschedule` if the wake set is non-empty.
+The timer tick handler enters reactor-owned timer-driver code. That code reads
+the monotonic counter, fires due software timer registrations, routes resulting
+wake events through the scheduler-aware wake path, and then arms the next
+hardware deadline through `DeadlineTimerIf`.
 
-### 14.3 What `TimeIf` does *not* provide
-<!-- txdoc:HAL-TIMEIF-WHAT-TIMEIF-DOES-NOT-PROVIDE-1 -->
+### 14.4 What HAL time capabilities do *not* provide
+<!-- txdoc:HAL-TIME-CAPABILITIES-WHAT-HAL-TIME-DOES-NOT-PROVIDE-1 -->
 
-- Wall-clock time. That's a higher-level concept (CLOCK_REALTIME) implemented above HAL using `read_ns` plus a stored offset.
+- Wall-clock time. That's a higher-level concept (CLOCK_REALTIME) implemented
+  above HAL using monotonic time plus a stored offset.
 - Per-process / per-thread CPU time. That's the signal subsystem's responsibility; HAL provides the raw monotonic clock.
-- High-precision timestamping for tracing. Tracing reads `read_ns` like any other consumer; it does not have a separate fast path.
+- Software timer ownership. Timer wheels, timerfd state, futex waits, and
+  nanosleep state live above HAL.
+- Scheduler placement. Timer expiry produces wake events; scheduler-owned SMP
+  wake routing decides the target hart.
+- High-precision timestamping for tracing. Tracing reads
+  `MonotonicCounterIf::read_ns` like any other consumer; it does not have a
+  separate fast path.
 
 ---
 
@@ -2706,7 +2790,9 @@ The platform crate (e.g., `tx-hal-riscv64-qemu-virt`, `tx-hal-riscv64-visionfive
 
 - **Implement IrqIf via PLIC.** PLIC base is platform-private. Claim/complete cycle uses PLIC's claim register.
 
-- **Implement TimeIf via SBI / CLINT.** `read_ns` reads the `time` CSR; `set_deadline_ns` calls SBI `set_timer`.
+- **Implement time capabilities via SBI / CLINT.** `MonotonicCounterIf::read_ns`
+  reads the `time` CSR; `DeadlineTimerIf::set_deadline_ns` calls SBI
+  `set_timer`.
 
 - **Implement PowerIf via SBI.** SBI shutdown for `system_off`; SBI reset for `reboot`.
 
@@ -2757,7 +2843,9 @@ The platform crate (e.g., `tx-hal-loongarch64-qemu-virt`, `tx-hal-loongarch64-2k
 
 - **Implement IrqIf via ExtIOI** (or LIOINTC on simpler platforms). Claim/complete cycle uses ExtIOI's claim register.
 
-- **Implement TimeIf via stable timer.** `read_ns` reads `stable_counter`; `set_deadline_ns` writes the `tcfg` CSR.
+- **Implement time capabilities via stable timer.**
+  `MonotonicCounterIf::read_ns` reads `stable_counter`;
+  `DeadlineTimerIf::set_deadline_ns` writes the `tcfg` CSR.
 
 - **Implement PowerIf via UEFI / firmware-specific port.** On 2K1000LA, this may be a board-specific shutdown register; on qemu-virt, the QEMU exit device.
 
@@ -2782,7 +2870,8 @@ What this document does *not* specify:
 
 - **PCIe / PCI bus.** PCIe ECAM ranges are listed in `PlatformInfo.mmio_regions` but PCI configuration access is the device subsystem's responsibility, not HAL's. v1 boards have no PCIe; tier-2 device init handles virtio-mmio directly.
 
-- **High-precision tracing clocks.** Tracing uses `TimeIf::read_ns`. There is no separate fast-path tracing clock.
+- **High-precision tracing clocks.** Tracing uses
+  `MonotonicCounterIf::read_ns`. There is no separate fast-path tracing clock.
 
 - **Crash-dump infrastructure.** Out of scope for v1.
 

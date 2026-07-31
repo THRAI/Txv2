@@ -23,7 +23,7 @@ What landed before this plan:
 - **v3 substrate scaffold present.** `WaitProtocol` (88 hits),
   `EndpointKind` (41), `SubjectContext` (26), `WakeHint` (24) all
   defined under [`crates/tx-substrate/src/step/`](../../../crates/tx-substrate/src/step/)
-  and [`crates/tx-reactor/src/scheduler.rs`](../../../crates/tx-reactor/src/scheduler.rs).
+  and [`crates/tx-reactor/src/scheduler/mod.rs`](../../../crates/tx-reactor/src/scheduler/mod.rs).
   Files exist for `agent.rs`, `subject_context.rs`,
   `execution_scope.rs`, `wait_protocol.rs`, `endpoint_kind.rs`,
   `binding_obligations.rs`, `restriction_stack.rs`, plus four

@@ -4,18 +4,29 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
+use tx_reactor::adapter::step_engine::{
+    AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest,
+    DelegateTokenId, TokenDropPolicy, TransitionOutcome,
+};
 use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{
-    yield_now, HartId, InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, Reactor,
-    RescheduleSignal, RunStats, SharedReactor, SliceClock, SliceConfig, StopReason, TaskHandle,
-    TaskId, TaskStatus, WakeDispatchReport, WakeHint,
+    current_deadline_registrar, current_task_mailbox, yield_now, HartId, InitialSchedMeta,
+    Phase1QueueKind, Phase1Scheduler, Reactor, RescheduleSignal, RunStats, SharedReactor,
+    SignalRouting, SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus,
+    WakeDispatchReport, WakeHint,
 };
+use tx_services::time::{
+    CurrentHartDeadlineTimer, DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle,
+    DeviceTimerCallback, TimerGuard, TimerRole, TimerTarget,
+};
+use tx_substrate::bus::{RawQueue, RawQueueSubscription};
 use tx_substrate::step::{InterestMask, WaitSourceId};
 use tx_substrate::wake::mailbox::{
-    MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitGeneration,
+    MailboxEvent, MailboxPollAction, MailboxSchedulerHint, TaskMailbox, WaitGeneration,
 };
+use tx_substrate::wake::{register_source, unregister_source, SubscriberId, WaitSource};
 
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -126,6 +137,472 @@ impl Future for CurrentTaskMailboxPark {
     }
 }
 
+struct SignalDeliveredPark {
+    polls: Arc<AtomicUsize>,
+    expected_signum: u32,
+}
+
+impl Future for SignalDeliveredPark {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let mailbox = tx_reactor::current_task_mailbox(0).expect("current task mailbox");
+        mailbox.register_waker(cx.waker().clone());
+        while let Some(event) = mailbox.poll() {
+            if let MailboxEvent::SignalDelivered { signum, routing } = event {
+                assert_eq!(signum, self.expected_signum);
+                assert_eq!(routing, SignalRouting::ProcessDirected);
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    }
+}
+
+struct DelegateTimeoutPark {
+    hart: usize,
+    deadline_ns: u64,
+    polls: Arc<AtomicUsize>,
+    token: Option<DelegateTokenId>,
+    registry: Option<Arc<DelegateRegistry>>,
+    registrar: Option<DeadlineRegistrarHandle>,
+    mailbox: Option<Arc<Mutex<Option<Arc<TaskMailbox>>>>>,
+    timer: Option<TimerGuard>,
+}
+
+#[derive(Clone, Copy)]
+enum DelegateTerminalEvent {
+    Replied,
+    Aborted(AbortReason),
+}
+
+struct DelegateOwnerAwarePark {
+    hart: usize,
+    polls: Arc<AtomicUsize>,
+    token_slot: Arc<Mutex<Option<DelegateTokenId>>>,
+    registry_slot: Arc<Mutex<Option<Arc<DelegateRegistry>>>>,
+    expected: DelegateTerminalEvent,
+}
+
+impl Future for DelegateOwnerAwarePark {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let mailbox = tx_reactor::current_task_mailbox(self.hart).expect("current task mailbox");
+
+        if self
+            .token_slot
+            .lock()
+            .expect("token slot poisoned")
+            .is_none()
+        {
+            let registry =
+                tx_reactor::current_delegate_registry(self.hart).expect("delegate registry");
+            let guard = registry.install_request(
+                DelegateRequest::Placeholder,
+                0,
+                AgentCancelPolicy::BestEffort,
+                TokenDropPolicy::Abandon,
+                Arc::downgrade(&mailbox),
+            );
+            let token = guard.forget();
+            *self.token_slot.lock().expect("token slot poisoned") = Some(token);
+            *self.registry_slot.lock().expect("registry slot poisoned") = Some(registry);
+            return Poll::Pending;
+        }
+
+        let token = self
+            .token_slot
+            .lock()
+            .expect("token slot poisoned")
+            .expect("token installed");
+        while let Some(event) = mailbox.poll() {
+            match (self.expected, event) {
+                (DelegateTerminalEvent::Replied, MailboxEvent::AgentReplied { token_id })
+                    if token_id == token =>
+                {
+                    let registry = self
+                        .registry_slot
+                        .lock()
+                        .expect("registry slot poisoned")
+                        .as_ref()
+                        .expect("registry installed")
+                        .clone();
+                    assert!(
+                        registry.take_reply(token).is_some(),
+                        "AgentReplied must publish after installing reply payload",
+                    );
+                    return Poll::Ready(());
+                }
+                (
+                    DelegateTerminalEvent::Aborted(expected),
+                    MailboxEvent::Abort { token_id, reason },
+                ) if token_id == token && reason == expected => {
+                    return Poll::Ready(());
+                }
+                _ => {}
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+fn count_device_timer_fire(counter: u64) {
+    // The submitting test and its parked future retain the Arc until this callback fires.
+    unsafe {
+        (&*(counter as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct DeviceWaitSourceTimerPark {
+    hart: usize,
+    source: Arc<WaitSource>,
+    interests: InterestMask,
+    deadline_ns: u64,
+    polls: Arc<AtomicUsize>,
+    callback_fires: Arc<AtomicUsize>,
+    registrar: Option<DeadlineRegistrarHandle>,
+    mailbox: Option<Arc<Mutex<Option<Arc<TaskMailbox>>>>>,
+    subscriber: Option<SubscriberId>,
+    timer: Option<TimerGuard>,
+}
+
+struct DeviceRawQueueTimerPark {
+    hart: usize,
+    queue: RawQueue,
+    interests: u64,
+    deadline_ns: u64,
+    polls: Arc<AtomicUsize>,
+    callback_fires: Arc<AtomicUsize>,
+    registrar: Option<DeadlineRegistrarHandle>,
+    mailbox: Option<Arc<Mutex<Option<Arc<TaskMailbox>>>>>,
+    subscriber: Option<RawQueueSubscription>,
+    timer: Option<TimerGuard>,
+}
+
+struct MixedProducerOwnerAwarePark {
+    hart: usize,
+    source: Arc<WaitSource>,
+    interests: InterestMask,
+    deadline_ns: u64,
+    polls: Arc<AtomicUsize>,
+    observed_stage: Arc<AtomicUsize>,
+    token_slot: Arc<Mutex<Option<DelegateTokenId>>>,
+    registry_slot: Arc<Mutex<Option<Arc<DelegateRegistry>>>>,
+    initialized: bool,
+    stage: usize,
+    subscriber: Option<SubscriberId>,
+    timer: Option<TimerGuard>,
+    delegate_token: Option<DelegateTokenId>,
+}
+
+impl Future for MixedProducerOwnerAwarePark {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let mailbox = tx_reactor::current_task_mailbox(self.hart).expect("current task mailbox");
+
+        if !self.initialized {
+            let generation = mailbox.next_generation();
+            self.subscriber = Some(self.source.register(
+                Arc::downgrade(&mailbox),
+                generation,
+                self.interests,
+            ));
+
+            let registrar =
+                tx_reactor::current_deadline_registrar(self.hart).expect("deadline registrar");
+            self.timer = Some(
+                registrar
+                    .register_deadline(
+                        DeadlineNs::new(self.deadline_ns),
+                        TimerRole::DeadlineAbort,
+                        TimerTarget::TaskMailbox(Arc::downgrade(&mailbox)),
+                    )
+                    .expect("deadline registration"),
+            );
+
+            let registry =
+                tx_reactor::current_delegate_registry(self.hart).expect("delegate registry");
+            let guard = registry.install_request(
+                DelegateRequest::Placeholder,
+                0,
+                AgentCancelPolicy::BestEffort,
+                TokenDropPolicy::Abandon,
+                Arc::downgrade(&mailbox),
+            );
+            let token = guard.forget();
+            self.delegate_token = Some(token);
+            *self.token_slot.lock().expect("token slot poisoned") = Some(token);
+            *self.registry_slot.lock().expect("registry slot poisoned") = Some(registry);
+            self.initialized = true;
+            return Poll::Pending;
+        }
+
+        match self.stage {
+            0 => {
+                let source_id = self.source.id();
+                let interests = self.interests;
+                if mailbox
+                    .poll_select(|event| match event {
+                        MailboxEvent::SourceFired {
+                            source,
+                            interests: event_interests,
+                            ..
+                        } if *source == source_id
+                            && event_interests.raw() & interests.raw() == interests.raw() =>
+                        {
+                            MailboxPollAction::Take
+                        }
+                        _ => MailboxPollAction::Keep,
+                    })
+                    .is_some()
+                {
+                    if let Some(subscriber) = self.subscriber.take() {
+                        self.source.unregister(subscriber);
+                    }
+                    self.stage = 1;
+                    self.observed_stage.store(1, Ordering::SeqCst);
+                    return Poll::Pending;
+                }
+            }
+            1 => {
+                if mailbox
+                    .poll_select(|event| match event {
+                        MailboxEvent::TimerFired { .. } => MailboxPollAction::Take,
+                        _ => MailboxPollAction::Keep,
+                    })
+                    .is_some()
+                {
+                    self.timer = None;
+                    self.stage = 2;
+                    self.observed_stage.store(2, Ordering::SeqCst);
+                    return Poll::Pending;
+                }
+            }
+            2 => {
+                let expected = self.delegate_token;
+                if let Some(MailboxEvent::AgentReplied { token_id }) =
+                    mailbox.poll_select(|event| match event {
+                        MailboxEvent::AgentReplied { token_id } if Some(*token_id) == expected => {
+                            MailboxPollAction::Take
+                        }
+                        _ => MailboxPollAction::Keep,
+                    })
+                {
+                    let registry = self
+                        .registry_slot
+                        .lock()
+                        .expect("registry slot poisoned")
+                        .as_ref()
+                        .expect("registry installed")
+                        .clone();
+                    assert!(
+                        registry.take_reply(token_id).is_some(),
+                        "AgentReplied must publish after installing reply payload",
+                    );
+                    self.stage = 3;
+                    self.observed_stage.store(3, Ordering::SeqCst);
+                    return Poll::Ready(());
+                }
+            }
+            _ => {}
+        }
+
+        Poll::Pending
+    }
+}
+
+impl Future for DeviceRawQueueTimerPark {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let mailbox = match &self.mailbox {
+            Some(slot) => slot
+                .lock()
+                .expect("mailbox slot poisoned")
+                .clone()
+                .expect("task mailbox installed before polling"),
+            None => tx_reactor::current_task_mailbox(self.hart).expect("current task mailbox"),
+        };
+
+        if self.subscriber.is_none() {
+            let generation = mailbox.next_generation();
+            self.subscriber = Some(self.queue.subscribe(
+                self.interests,
+                Arc::downgrade(&mailbox),
+                generation,
+            ));
+            let registrar = self
+                .registrar
+                .clone()
+                .or_else(|| tx_reactor::current_deadline_registrar(self.hart))
+                .expect("deadline registrar");
+            self.timer = Some(
+                registrar
+                    .register_deadline(
+                        DeadlineNs::new(self.deadline_ns),
+                        TimerRole::DeviceEvent,
+                        TimerTarget::DeviceCallback(
+                            DeviceTimerCallback::new(
+                                count_device_timer_fire,
+                                Arc::as_ptr(&self.callback_fires) as usize as u64,
+                            )
+                            .with_raw_queue_wake(self.queue.clone(), self.interests),
+                        ),
+                    )
+                    .expect("device timer registration"),
+            );
+            return Poll::Pending;
+        }
+
+        while let Some(event) = mailbox.poll() {
+            if let MailboxEvent::SourceFired { interests, .. } = event {
+                if interests.raw() & self.interests == self.interests {
+                    if let Some(mut subscriber) = self.subscriber.take() {
+                        subscriber.unsubscribe();
+                    }
+                    self.timer = None;
+                    return Poll::Ready(());
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl Future for DeviceWaitSourceTimerPark {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let mailbox = match &self.mailbox {
+            Some(slot) => slot
+                .lock()
+                .expect("mailbox slot poisoned")
+                .clone()
+                .expect("task mailbox installed before polling"),
+            None => tx_reactor::current_task_mailbox(self.hart).expect("current task mailbox"),
+        };
+
+        if self.subscriber.is_none() {
+            let generation = mailbox.next_generation();
+            self.subscriber = Some(self.source.register(
+                Arc::downgrade(&mailbox),
+                generation,
+                self.interests,
+            ));
+            let registrar = self
+                .registrar
+                .clone()
+                .or_else(|| tx_reactor::current_deadline_registrar(self.hart))
+                .expect("deadline registrar");
+            self.timer = Some(
+                registrar
+                    .register_deadline(
+                        DeadlineNs::new(self.deadline_ns),
+                        TimerRole::DeviceEvent,
+                        TimerTarget::DeviceCallback(
+                            DeviceTimerCallback::new(
+                                count_device_timer_fire,
+                                Arc::as_ptr(&self.callback_fires) as usize as u64,
+                            )
+                            .with_wait_source_wake(self.source.id(), self.interests),
+                        ),
+                    )
+                    .expect("device timer registration"),
+            );
+            return Poll::Pending;
+        }
+
+        while let Some(event) = mailbox.poll() {
+            if let MailboxEvent::SourceFired {
+                source, interests, ..
+            } = event
+            {
+                if source == self.source.id()
+                    && interests.raw() & self.interests.raw() == self.interests.raw()
+                {
+                    if let Some(subscriber) = self.subscriber.take() {
+                        self.source.unregister(subscriber);
+                    }
+                    self.timer = None;
+                    return Poll::Ready(());
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl Future for DelegateTimeoutPark {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let mailbox = match &self.mailbox {
+            Some(slot) => slot
+                .lock()
+                .expect("mailbox slot poisoned")
+                .clone()
+                .expect("task mailbox installed before polling"),
+            None => tx_reactor::current_task_mailbox(self.hart).expect("current task mailbox"),
+        };
+        mailbox.register_waker(cx.waker().clone());
+
+        if self.token.is_none() {
+            let registry = self
+                .registry
+                .clone()
+                .or_else(|| tx_reactor::current_delegate_registry(self.hart))
+                .expect("delegate registry");
+            let registrar = self
+                .registrar
+                .clone()
+                .or_else(|| tx_reactor::current_deadline_registrar(self.hart))
+                .expect("deadline registrar");
+            let guard = registry.install_request(
+                DelegateRequest::Placeholder,
+                0,
+                AgentCancelPolicy::BestEffort,
+                TokenDropPolicy::Abandon,
+                Arc::downgrade(&mailbox),
+            );
+            let token = guard.forget();
+            self.timer = Some(
+                registrar
+                    .register_deadline(
+                        DeadlineNs::new(self.deadline_ns),
+                        TimerRole::DelegateTimeout,
+                        TimerTarget::DelegateToken(token),
+                    )
+                    .expect("delegate timeout registration"),
+            );
+            self.token = Some(token);
+            return Poll::Pending;
+        }
+
+        while let Some(event) = mailbox.poll() {
+            if let MailboxEvent::Abort { token_id, reason } = event {
+                if Some(token_id) == self.token {
+                    assert_eq!(reason, AbortReason::TimedOut);
+                    self.timer = None;
+                    return Poll::Ready(());
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
 struct RecordReadyOrder {
     first_ready: Arc<AtomicUsize>,
 }
@@ -162,7 +639,7 @@ impl Future for ExternallyWoken {
 }
 
 const SAW_MAILBOX: usize = 1 << 0;
-const SAW_TIMER_WHEEL: usize = 1 << 1;
+const SAW_DEADLINE_REGISTRAR: usize = 1 << 1;
 const SAW_DELEGATE_REGISTRY: usize = 1 << 2;
 const SAW_OTHER_HART_CLEAR: usize = 1 << 3;
 
@@ -180,14 +657,14 @@ impl Future for HartContextProbe {
         if tx_reactor::current_task_mailbox(self.hart).is_some() {
             observed |= SAW_MAILBOX;
         }
-        if tx_reactor::current_timer_wheel(self.hart).is_some() {
-            observed |= SAW_TIMER_WHEEL;
+        if tx_reactor::current_deadline_registrar(self.hart).is_some() {
+            observed |= SAW_DEADLINE_REGISTRAR;
         }
         if tx_reactor::current_delegate_registry(self.hart).is_some() {
             observed |= SAW_DELEGATE_REGISTRY;
         }
         if tx_reactor::current_task_mailbox(self.other_hart).is_none()
-            && tx_reactor::current_timer_wheel(self.other_hart).is_none()
+            && tx_reactor::current_deadline_registrar(self.other_hart).is_none()
             && tx_reactor::current_delegate_registry(self.other_hart).is_none()
         {
             observed |= SAW_OTHER_HART_CLEAR;
@@ -236,19 +713,77 @@ impl SliceClock for ScriptedSliceClock {
         self.idx = self.idx.saturating_add(1);
         sample
     }
+}
 
-    fn set_deadline_ns(&mut self, deadline_ns: u64) {
+impl CurrentHartDeadlineTimer for ScriptedSliceClock {
+    fn set_current_hart_deadline_ns(&mut self, deadline_ns: u64) {
         self.deadlines
             .lock()
             .expect("deadline log poisoned")
             .push(Some(deadline_ns));
     }
 
-    fn cancel_deadline(&mut self) {
+    fn cancel_current_hart_deadline(&mut self) {
         self.deadlines
             .lock()
             .expect("deadline log poisoned")
             .push(None);
+    }
+}
+
+struct BarrierSliceClock {
+    samples: Vec<u64>,
+    idx: usize,
+    deadlines: Arc<Mutex<Vec<Option<u64>>>>,
+    update_started: Arc<Barrier>,
+    update_registered: Arc<Barrier>,
+}
+
+impl BarrierSliceClock {
+    fn new(
+        samples: Vec<u64>,
+        deadlines: Arc<Mutex<Vec<Option<u64>>>>,
+        update_started: Arc<Barrier>,
+        update_registered: Arc<Barrier>,
+    ) -> Self {
+        Self {
+            samples,
+            idx: 0,
+            deadlines,
+            update_started,
+            update_registered,
+        }
+    }
+}
+
+impl SliceClock for BarrierSliceClock {
+    fn now_ns(&mut self) -> u64 {
+        let sample = self
+            .samples
+            .get(self.idx)
+            .copied()
+            .or_else(|| self.samples.last().copied())
+            .unwrap_or(0);
+        self.idx = self.idx.saturating_add(1);
+        sample
+    }
+}
+
+impl CurrentHartDeadlineTimer for BarrierSliceClock {
+    fn set_current_hart_deadline_ns(&mut self, deadline_ns: u64) {
+        self.deadlines
+            .lock()
+            .expect("deadline log poisoned")
+            .push(Some(deadline_ns));
+    }
+
+    fn cancel_current_hart_deadline(&mut self) {
+        self.deadlines
+            .lock()
+            .expect("deadline log poisoned")
+            .push(None);
+        self.update_started.wait();
+        self.update_registered.wait();
     }
 }
 
@@ -941,6 +1476,861 @@ fn remote_wake_routes_through_target_hart_inbox() {
 }
 
 #[test]
+fn owner_aware_post_routes_source_fired_without_captured_waker_drain() {
+    let reactor = Reactor::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task = reactor.submit_task_with_meta(
+        CurrentTaskMailboxPark {
+            polls: Arc::clone(&polls),
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+
+    let mailbox = reactor.task_mailbox(task).expect("task mailbox");
+    let mut signal = RecordingRescheduleSignal::default();
+    let report = reactor.post_mailbox_event_from_hart(
+        Arc::downgrade(&mailbox),
+        MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: WaitSourceId::new(1),
+            interests: InterestMask::new(0b1),
+        },
+        HartId(1),
+        &mut signal,
+    );
+
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert!(reactor.dispatch_markers(HartId(0)).need_resched());
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+}
+
+#[test]
+fn signal_delivered_routes_through_owner_aware_post() {
+    let reactor = Reactor::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task = reactor.submit_task_with_meta(
+        SignalDeliveredPark {
+            polls: Arc::clone(&polls),
+            expected_signum: 15,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+
+    let mailbox = reactor.task_mailbox(task).expect("task mailbox");
+    let mut signal = RecordingRescheduleSignal::default();
+    let report = reactor.post_signal_delivered_from_hart(
+        Arc::downgrade(&mailbox),
+        15,
+        SignalRouting::ProcessDirected,
+        HartId(1),
+        &mut signal,
+    );
+
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn signal_delivery_promotes_already_runnable_userspace_task() {
+    let reactor = Reactor::new();
+    let aux = reactor.submit_task_with_meta(
+        CountOnce,
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .preempted_on_submit(),
+    );
+    let worker = reactor.submit_task_with_meta(
+        CountOnce,
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .preempted_on_submit(),
+    );
+    let mailbox = reactor.task_mailbox(worker).expect("worker mailbox");
+    let mut signal = RecordingRescheduleSignal::default();
+
+    let report = reactor.post_signal_delivered_from_hart(
+        Arc::downgrade(&mailbox),
+        15,
+        SignalRouting::ThreadDirected { tid: 75 },
+        HartId(0),
+        &mut signal,
+    );
+
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 1,
+            remote_ipis: 0,
+        }
+    );
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(worker.id())
+    );
+    assert_eq!(reactor.task_key_status(aux), Some(TaskStatus::Runnable));
+    assert_eq!(reactor.task_key_status(worker), Some(TaskStatus::Runnable));
+}
+
+#[test]
+fn wait_channel_fire_routes_through_owner_aware_post() {
+    let reactor = Reactor::new();
+    let channel = Channel::new();
+    let mask = Mask::from_bits(0x1);
+    let completed = Arc::new(AtomicUsize::new(0));
+    let task = reactor.submit_task_with_meta(
+        {
+            let channel = channel.clone();
+            let completed = Arc::clone(&completed);
+            async move {
+                assert_eq!(channel.wait(mask).await, WaitOutcome::Ready);
+                completed.store(1, Ordering::SeqCst);
+            }
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let mut report = WakeDispatchReport::empty();
+    let woke = channel.fire_with_post(mask, |mailbox, event| {
+        let (posted, next) =
+            reactor.post_mailbox_ref_event_from_hart(mailbox, event, HartId(1), &mut signal);
+        report.merge(next);
+        posted
+    });
+
+    assert_eq!(woke, 1);
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn delegate_timeout_routes_through_owner_aware_timer_tick() {
+    let reactor = Reactor::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mailbox = Arc::new(Mutex::new(None));
+    let task = reactor.submit_task_with_meta(
+        DelegateTimeoutPark {
+            hart: 0,
+            deadline_ns: 50,
+            polls: Arc::clone(&polls),
+            token: None,
+            registry: Some(reactor.delegate_registry_handle()),
+            registrar: Some(reactor.deadline_registrar_handle()),
+            mailbox: Some(Arc::clone(&mailbox)),
+            timer: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    *mailbox.lock().expect("mailbox slot poisoned") =
+        Some(reactor.task_mailbox(task).expect("task mailbox"));
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let (fired, report) =
+        reactor.advance_time_to_from_hart_with_reschedule(50, HartId(1), &mut signal);
+
+    assert_eq!(fired, 1);
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+}
+
+fn run_delegate_owner_aware_transition(
+    expected: DelegateTerminalEvent,
+    trigger: impl FnOnce(
+        &Reactor,
+        &DelegateRegistry,
+        DelegateTokenId,
+        &mut RecordingRescheduleSignal,
+    ) -> (TransitionOutcome, WakeDispatchReport),
+) {
+    let reactor = Reactor::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let token_slot = Arc::new(Mutex::new(None));
+    let registry_slot = Arc::new(Mutex::new(None));
+    let task = reactor.submit_task_with_meta(
+        DelegateOwnerAwarePark {
+            hart: 0,
+            polls: Arc::clone(&polls),
+            token_slot: Arc::clone(&token_slot),
+            registry_slot: Arc::clone(&registry_slot),
+            expected,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    let token = token_slot
+        .lock()
+        .expect("token slot poisoned")
+        .expect("token installed");
+    let registry = registry_slot
+        .lock()
+        .expect("registry slot poisoned")
+        .as_ref()
+        .expect("registry installed")
+        .clone();
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let (outcome, report) = trigger(&reactor, &registry, token, &mut signal);
+
+    assert_eq!(outcome, TransitionOutcome::Applied);
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn delegate_reply_routes_through_owner_aware_post() {
+    run_delegate_owner_aware_transition(
+        DelegateTerminalEvent::Replied,
+        |reactor, registry, token, signal| {
+            reactor.mark_delegate_replied_from_hart_with_reschedule(
+                registry,
+                token,
+                DelegateReply::placeholder(),
+                HartId(1),
+                signal,
+            )
+        },
+    );
+}
+
+#[test]
+fn delegate_cancel_routes_through_owner_aware_post() {
+    run_delegate_owner_aware_transition(
+        DelegateTerminalEvent::Aborted(AbortReason::Canceled),
+        |reactor, registry, token, signal| {
+            reactor.mark_delegate_canceled_from_hart_with_reschedule(
+                registry,
+                token,
+                HartId(1),
+                signal,
+            )
+        },
+    );
+}
+
+#[test]
+fn delegate_agent_died_routes_through_owner_aware_post() {
+    run_delegate_owner_aware_transition(
+        DelegateTerminalEvent::Aborted(AbortReason::AgentDied),
+        |reactor, registry, token, signal| {
+            reactor.mark_delegate_agent_died_from_hart_with_reschedule(
+                registry,
+                token,
+                HartId(1),
+                signal,
+            )
+        },
+    );
+}
+
+#[test]
+fn device_callback_wait_source_routes_through_owner_aware_timer_tick() {
+    let reactor = Reactor::new();
+    let source = Arc::new(WaitSource::new(WaitSourceId::new(0xD0E0)));
+    register_source(Arc::clone(&source));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let callback_fires = Arc::new(AtomicUsize::new(0));
+    let mailbox = Arc::new(Mutex::new(None));
+    let task = reactor.submit_task_with_meta(
+        DeviceWaitSourceTimerPark {
+            hart: 0,
+            source: Arc::clone(&source),
+            interests: InterestMask::new(0b1000),
+            deadline_ns: 70,
+            polls: Arc::clone(&polls),
+            callback_fires: Arc::clone(&callback_fires),
+            registrar: Some(reactor.deadline_registrar_handle()),
+            mailbox: Some(Arc::clone(&mailbox)),
+            subscriber: None,
+            timer: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    *mailbox.lock().expect("mailbox slot poisoned") =
+        Some(reactor.task_mailbox(task).expect("task mailbox"));
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    assert_eq!(reactor.next_deadline_ns(), Some(70));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let (fired, report) =
+        reactor.advance_time_to_from_hart_with_reschedule(70, HartId(1), &mut signal);
+
+    assert_eq!(fired, 1);
+    assert_eq!(callback_fires.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
+
+    unregister_source(source.id());
+}
+
+#[test]
+fn device_callback_raw_queue_routes_through_owner_aware_timer_tick() {
+    let reactor = Reactor::new();
+    let queue = RawQueue::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let callback_fires = Arc::new(AtomicUsize::new(0));
+    let mailbox = Arc::new(Mutex::new(None));
+    let task = reactor.submit_task_with_meta(
+        DeviceRawQueueTimerPark {
+            hart: 0,
+            queue,
+            interests: 0b1000,
+            deadline_ns: 75,
+            polls: Arc::clone(&polls),
+            callback_fires: Arc::clone(&callback_fires),
+            registrar: Some(reactor.deadline_registrar_handle()),
+            mailbox: Some(Arc::clone(&mailbox)),
+            subscriber: None,
+            timer: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    *mailbox.lock().expect("mailbox slot poisoned") =
+        Some(reactor.task_mailbox(task).expect("task mailbox"));
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    assert_eq!(reactor.next_deadline_ns(), Some(75));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let (fired, report) =
+        reactor.advance_time_to_from_hart_with_reschedule(75, HartId(1), &mut signal);
+
+    assert_eq!(fired, 1);
+    assert_eq!(callback_fires.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn mixed_producer_wakes_repeatedly_route_current_owner() {
+    let reactor = Reactor::new();
+    let source = Arc::new(WaitSource::new(WaitSourceId::new(0xA11CE)));
+    let interests = InterestMask::new(0b0010);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed_stage = Arc::new(AtomicUsize::new(0));
+    let token_slot = Arc::new(Mutex::new(None));
+    let registry_slot = Arc::new(Mutex::new(None));
+
+    let task = reactor.submit_task_with_meta(
+        MixedProducerOwnerAwarePark {
+            hart: 0,
+            source: Arc::clone(&source),
+            interests,
+            deadline_ns: 90,
+            polls: Arc::clone(&polls),
+            observed_stage: Arc::clone(&observed_stage),
+            token_slot: Arc::clone(&token_slot),
+            registry_slot: Arc::clone(&registry_slot),
+            initialized: false,
+            stage: 0,
+            subscriber: None,
+            timer: None,
+            delegate_token: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(source.subscriber_count(), 1);
+    assert_eq!(reactor.next_deadline_ns(), Some(90));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let mut source_report = WakeDispatchReport::empty();
+    let source_wakes = source.notify_with_owner_post(
+        interests,
+        MailboxSchedulerHint::Normal,
+        |mailbox, event, hint| {
+            let (posted, report) = reactor.post_mailbox_ref_event_with_hint_from_hart(
+                mailbox,
+                event,
+                hint,
+                HartId(1),
+                &mut signal,
+            );
+            source_report.merge(report);
+            posted
+        },
+    );
+    assert_eq!(source_wakes, 1);
+    assert_eq!(
+        source_report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 0,
+        }
+    );
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    assert_eq!(source.subscriber_count(), 0);
+    assert_eq!(observed_stage.load(Ordering::SeqCst), 1);
+
+    signal.sent.clear();
+    let (timer_fired, timer_report) =
+        reactor.advance_time_to_from_hart_with_reschedule(90, HartId(1), &mut signal);
+    assert_eq!(timer_fired, 1);
+    assert_eq!(
+        timer_report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 0,
+        }
+    );
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    assert_eq!(observed_stage.load(Ordering::SeqCst), 2);
+
+    let token = token_slot
+        .lock()
+        .expect("token slot poisoned")
+        .expect("delegate token installed");
+    let registry = registry_slot
+        .lock()
+        .expect("registry slot poisoned")
+        .as_ref()
+        .expect("registry installed")
+        .clone();
+
+    signal.sent.clear();
+    let (outcome, delegate_report) = reactor.mark_delegate_replied_from_hart_with_reschedule(
+        &registry,
+        token,
+        DelegateReply::placeholder(),
+        HartId(1),
+        &mut signal,
+    );
+    assert_eq!(outcome, TransitionOutcome::Applied);
+    assert_eq!(
+        delegate_report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
+    assert_eq!(polls.load(Ordering::SeqCst), 4);
+    assert_eq!(observed_stage.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn broad_owner_aware_producer_stress_routes_remote_wakes() {
+    let reactor = Reactor::new();
+    let channel = Channel::new();
+    let channel_completed = Arc::new(AtomicUsize::new(0));
+    let source_polls = Arc::new(AtomicUsize::new(0));
+    let signal_polls = Arc::new(AtomicUsize::new(0));
+    let delegate_polls = Arc::new(AtomicUsize::new(0));
+    let device_source_polls = Arc::new(AtomicUsize::new(0));
+    let device_raw_polls = Arc::new(AtomicUsize::new(0));
+    let callback_fires = Arc::new(AtomicUsize::new(0));
+    let device_source = Arc::new(WaitSource::new(WaitSourceId::new(0xD0E1)));
+    register_source(Arc::clone(&device_source));
+
+    let source_task = reactor.submit_task_with_meta(
+        CurrentTaskMailboxPark {
+            polls: Arc::clone(&source_polls),
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    let signal_task = reactor.submit_task_with_meta(
+        SignalDeliveredPark {
+            polls: Arc::clone(&signal_polls),
+            expected_signum: 12,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    let channel_task = reactor.submit_task_with_meta(
+        {
+            let channel = channel.clone();
+            let channel_completed = Arc::clone(&channel_completed);
+            async move {
+                assert_eq!(
+                    channel.wait(Mask::from_bits(0x20)).await,
+                    WaitOutcome::Ready
+                );
+                channel_completed.store(1, Ordering::SeqCst);
+            }
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    let delegate_task = reactor.submit_task_with_meta(
+        DelegateTimeoutPark {
+            hart: 0,
+            deadline_ns: 100,
+            polls: Arc::clone(&delegate_polls),
+            token: None,
+            registry: None,
+            registrar: None,
+            mailbox: None,
+            timer: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    let device_source_task = reactor.submit_task_with_meta(
+        DeviceWaitSourceTimerPark {
+            hart: 0,
+            source: Arc::clone(&device_source),
+            interests: InterestMask::new(0b1000),
+            deadline_ns: 110,
+            polls: Arc::clone(&device_source_polls),
+            callback_fires: Arc::clone(&callback_fires),
+            registrar: None,
+            mailbox: None,
+            subscriber: None,
+            timer: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+    let device_raw_task = reactor.submit_task_with_meta(
+        DeviceRawQueueTimerPark {
+            hart: 0,
+            queue: RawQueue::new(),
+            interests: 0b1000,
+            deadline_ns: 120,
+            polls: Arc::clone(&device_raw_polls),
+            callback_fires: Arc::clone(&callback_fires),
+            registrar: None,
+            mailbox: None,
+            subscriber: None,
+            timer: None,
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 6,
+            completed: 0,
+        }
+    );
+    for task in [
+        source_task,
+        signal_task,
+        channel_task,
+        delegate_task,
+        device_source_task,
+        device_raw_task,
+    ] {
+        assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    }
+    assert_eq!(reactor.next_deadline_ns(), Some(100));
+
+    let mut signal = RecordingRescheduleSignal::default();
+
+    let source_mailbox = reactor.task_mailbox(source_task).expect("source mailbox");
+    let source_report = reactor.post_mailbox_event_from_hart(
+        Arc::downgrade(&source_mailbox),
+        MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: WaitSourceId::new(0xA001),
+            interests: InterestMask::new(0b1),
+        },
+        HartId(1),
+        &mut signal,
+    );
+    assert_remote_wake(&reactor, source_task, &mut signal, source_report);
+
+    let signal_mailbox = reactor.task_mailbox(signal_task).expect("signal mailbox");
+    let signal_report = reactor.post_signal_delivered_from_hart(
+        Arc::downgrade(&signal_mailbox),
+        12,
+        SignalRouting::ProcessDirected,
+        HartId(1),
+        &mut signal,
+    );
+    assert_remote_wake(&reactor, signal_task, &mut signal, signal_report);
+
+    let mut channel_report = WakeDispatchReport::empty();
+    let channel_wakes = channel.fire_with_post(Mask::from_bits(0x20), |mailbox, event| {
+        let (posted, report) =
+            reactor.post_mailbox_ref_event_from_hart(mailbox, event, HartId(1), &mut signal);
+        channel_report.merge(report);
+        posted
+    });
+    assert_eq!(channel_wakes, 1);
+    assert_remote_wake(&reactor, channel_task, &mut signal, channel_report);
+    assert_eq!(channel_completed.load(Ordering::SeqCst), 1);
+
+    let (delegate_fired, delegate_report) =
+        reactor.advance_time_to_from_hart_with_reschedule(100, HartId(1), &mut signal);
+    assert_eq!(delegate_fired, 1);
+    assert_remote_wake(&reactor, delegate_task, &mut signal, delegate_report);
+
+    let (device_source_fired, device_source_report) =
+        reactor.advance_time_to_from_hart_with_reschedule(110, HartId(1), &mut signal);
+    assert_eq!(device_source_fired, 1);
+    assert_remote_wake(
+        &reactor,
+        device_source_task,
+        &mut signal,
+        device_source_report,
+    );
+
+    let (device_raw_fired, device_raw_report) =
+        reactor.advance_time_to_from_hart_with_reschedule(120, HartId(1), &mut signal);
+    assert_eq!(device_raw_fired, 1);
+    assert_remote_wake(&reactor, device_raw_task, &mut signal, device_raw_report);
+
+    assert_eq!(callback_fires.load(Ordering::SeqCst), 2);
+    assert_eq!(source_polls.load(Ordering::SeqCst), 2);
+    assert_eq!(signal_polls.load(Ordering::SeqCst), 2);
+    assert_eq!(delegate_polls.load(Ordering::SeqCst), 2);
+    assert_eq!(device_source_polls.load(Ordering::SeqCst), 2);
+    assert_eq!(device_raw_polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.next_deadline_ns(), None);
+
+    unregister_source(device_source.id());
+}
+
+fn assert_remote_wake(
+    reactor: &Reactor,
+    task: tx_reactor::TaskKey,
+    signal: &mut RecordingRescheduleSignal,
+    report: WakeDispatchReport,
+) {
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
+    signal.sent.clear();
+}
+
+#[test]
 fn rescheduled_hart_consumes_marker_before_draining_runqueue() {
     let polls = Arc::new(AtomicUsize::new(0));
     let ready = Arc::new(AtomicUsize::new(0));
@@ -1075,6 +2465,157 @@ fn userspace_preempt_marker_requeues_pending_poll() {
 }
 
 #[test]
+fn slice_clock_restores_unchanged_domain_deadline_before_polling_idle() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+    let domain_deadline_ns = 1_000_000;
+    let _domain_deadline = shared
+        .with(|reactor| {
+            reactor
+                .deadline_registrar_handle()
+                .register_deadline(
+                    DeadlineNs::new(domain_deadline_ns),
+                    TimerRole::DelegateTimeout,
+                    TimerTarget::DelegateToken(DelegateTokenId::new(1)),
+                )
+                .expect("domain deadline registration")
+        })
+        .expect("initialized reactor");
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let mut clock = ScriptedSliceClock::new(vec![1_000, 1_001, 1_001], Arc::clone(&deadlines));
+
+    shared
+        .with(|reactor| reactor.program_current_hart_deadline(&mut clock))
+        .expect("initialized reactor");
+    assert_eq!(
+        deadlines.lock().expect("deadline log poisoned").as_slice(),
+        &[Some(domain_deadline_ns)],
+    );
+
+    let task = shared
+        .with(|reactor| {
+            reactor
+                .submit_task_with_meta(ParkForever, InitialSchedMeta::fair().with_affinity(0b0001))
+        })
+        .expect("initialized reactor");
+    let mut signal = RecordingRescheduleSignal::default();
+    let step =
+        shared.run_hart_loop_concurrent_with_slice_clock(HartId(0), 1_000, &mut signal, &mut clock);
+
+    assert_eq!(
+        step.expect("initialized reactor").stats,
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    shared
+        .with(|reactor| {
+            assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+            assert!(reactor.is_idle());
+            reactor.begin_polling_idle(HartId(0));
+            assert!(reactor.is_polling_idle(HartId(0)));
+            assert!(!reactor.should_leave_polling_idle(HartId(0)));
+            reactor.end_polling_idle(HartId(0));
+        })
+        .expect("initialized reactor");
+    assert_eq!(
+        deadlines.lock().expect("deadline log poisoned").as_slice(),
+        &[
+            Some(domain_deadline_ns),
+            Some(1_000 + Phase1Scheduler::NEW_QUEUE_SLICE_NS),
+            None,
+            Some(domain_deadline_ns),
+        ],
+        "an unchanged domain deadline must replace the cancelled poll-slice arm before idle",
+    );
+}
+
+#[test]
+fn slice_clock_restore_keeps_concurrently_registered_earlier_domain_deadline() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+    let old_deadline_ns = 1_000_000;
+    let new_deadline_ns = 500_000;
+    let registrar = shared
+        .with(|reactor| reactor.deadline_registrar_handle())
+        .expect("initialized reactor");
+    let _old_deadline = registrar
+        .register_deadline(
+            DeadlineNs::new(old_deadline_ns),
+            TimerRole::DelegateTimeout,
+            TimerTarget::DelegateToken(DelegateTokenId::new(1)),
+        )
+        .expect("old domain deadline registration");
+    let update_started = Arc::new(Barrier::new(2));
+    let update_registered = Arc::new(Barrier::new(2));
+    let updater = {
+        let registrar = registrar.clone();
+        let update_started = Arc::clone(&update_started);
+        let update_registered = Arc::clone(&update_registered);
+        std::thread::spawn(move || {
+            update_started.wait();
+            let _ = registrar
+                .register_deadline(
+                    DeadlineNs::new(new_deadline_ns),
+                    TimerRole::DelegateTimeout,
+                    TimerTarget::DelegateToken(DelegateTokenId::new(2)),
+                )
+                .expect("new domain deadline registration")
+                .forget();
+            update_registered.wait();
+        })
+    };
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let mut clock = BarrierSliceClock::new(
+        vec![1_000, 1_001, 1_001],
+        Arc::clone(&deadlines),
+        update_started,
+        update_registered,
+    );
+
+    shared
+        .with(|reactor| reactor.program_current_hart_deadline(&mut clock))
+        .expect("initialized reactor");
+    let task = shared
+        .with(|reactor| {
+            reactor
+                .submit_task_with_meta(ParkForever, InitialSchedMeta::fair().with_affinity(0b0001))
+        })
+        .expect("initialized reactor");
+    let mut signal = RecordingRescheduleSignal::default();
+
+    let step = shared
+        .run_hart_loop_concurrent_with_slice_clock(HartId(0), 1_000, &mut signal, &mut clock)
+        .expect("initialized reactor");
+    updater.join().expect("deadline updater panicked");
+
+    assert_eq!(
+        step.stats,
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    shared
+        .with(|reactor| {
+            assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+            assert_eq!(reactor.next_deadline_ns(), Some(new_deadline_ns));
+        })
+        .expect("initialized reactor");
+    assert_eq!(
+        deadlines.lock().expect("deadline log poisoned").as_slice(),
+        &[
+            Some(old_deadline_ns),
+            Some(1_000 + Phase1Scheduler::NEW_QUEUE_SLICE_NS),
+            None,
+            Some(new_deadline_ns),
+        ],
+        "the restore must arm the deadline registered during slice cancellation",
+    );
+}
+
+#[test]
 fn slice_clock_accounts_consumed_time_and_requeues_expired_slice() {
     let polls = Arc::new(AtomicUsize::new(0));
     let deadlines = Arc::new(Mutex::new(Vec::new()));
@@ -1141,9 +2682,15 @@ fn concurrent_hart_loop_advances_timer_during_self_yield_storm() {
             reactor.submit_task_with_meta(
                 {
                     let timer_done = Arc::clone(&timer_done);
-                    let sleep = reactor.sleep_until(10);
+                    let channel = reactor.channel();
                     async move {
-                        sleep.await;
+                        let _ = channel
+                            .wait_event(
+                                Mask::from_bits(0),
+                                WaitProtocol::InterruptibleTimeout(10),
+                                || false,
+                            )
+                            .await;
                         timer_done.store(1, Ordering::SeqCst);
                     }
                 },
@@ -1315,11 +2862,11 @@ fn per_hart_runtime_context_is_visible_only_on_polling_hart() {
     assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
     assert_eq!(
         seen.load(Ordering::SeqCst),
-        SAW_MAILBOX | SAW_TIMER_WHEEL | SAW_DELEGATE_REGISTRY | SAW_OTHER_HART_CLEAR
+        SAW_MAILBOX | SAW_DEADLINE_REGISTRAR | SAW_DELEGATE_REGISTRY | SAW_OTHER_HART_CLEAR
     );
-    assert!(tx_reactor::current_task_mailbox(11).is_none());
-    assert!(tx_reactor::current_timer_wheel(11).is_none());
-    assert!(tx_reactor::current_delegate_registry(11).is_none());
+    assert!(tx_reactor::current_task_mailbox(2).is_none());
+    assert!(tx_reactor::current_deadline_registrar(2).is_none());
+    assert!(tx_reactor::current_delegate_registry(2).is_none());
     assert!(tx_reactor::current_task_mailbox(usize::MAX).is_none());
 }
 
@@ -1362,10 +2909,10 @@ fn shared_concurrent_poll_path_sets_per_hart_runtime_context() {
     );
     assert_eq!(
         seen.load(Ordering::SeqCst),
-        SAW_MAILBOX | SAW_TIMER_WHEEL | SAW_DELEGATE_REGISTRY | SAW_OTHER_HART_CLEAR
+        SAW_MAILBOX | SAW_DEADLINE_REGISTRAR | SAW_DELEGATE_REGISTRY | SAW_OTHER_HART_CLEAR
     );
     assert!(tx_reactor::current_task_mailbox(1).is_none());
-    assert!(tx_reactor::current_timer_wheel(1).is_none());
+    assert!(tx_reactor::current_deadline_registrar(1).is_none());
     assert!(tx_reactor::current_delegate_registry(1).is_none());
 }
 
@@ -1734,6 +3281,46 @@ struct MailboxParkFuture {
     completed: Arc<AtomicUsize>,
 }
 
+struct DeadlineDomainParkWithoutMailboxWaker {
+    hart: usize,
+    deadline_ns: u64,
+    polls: Arc<AtomicUsize>,
+    guard: Option<TimerGuard>,
+}
+
+impl Future for DeadlineDomainParkWithoutMailboxWaker {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.polls.fetch_add(1, Ordering::SeqCst);
+
+        let mailbox = current_task_mailbox(this.hart).expect("current task mailbox");
+        if this.guard.is_none() {
+            let registrar = current_deadline_registrar(this.hart).expect("deadline registrar");
+            this.guard = Some(
+                registrar
+                    .register_deadline(
+                        DeadlineNs::new(this.deadline_ns),
+                        TimerRole::PrimarySleep,
+                        TimerTarget::TaskMailbox(Arc::downgrade(&mailbox)),
+                    )
+                    .expect("primary sleep registration"),
+            );
+            return Poll::Pending;
+        }
+
+        while let Some(event) = mailbox.poll() {
+            if matches!(event, MailboxEvent::TimerFired { .. }) {
+                this.guard.take();
+                return Poll::Ready(());
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
 impl Future for MailboxParkFuture {
     type Output = ();
 
@@ -1790,4 +3377,76 @@ fn mailbox_post_wakes_parked_reactor_task() {
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert_eq!(completed.load(Ordering::SeqCst), 1);
     assert!(reactor.is_idle());
+}
+
+#[test]
+fn deadline_domain_expiry_routes_parked_task_through_scheduler_without_mailbox_waker() {
+    const TIMER_HART: usize = 7;
+    let reactor = Reactor::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task = reactor.submit_task_with_meta(
+        DeadlineDomainParkWithoutMailboxWaker {
+            hart: TIMER_HART,
+            deadline_ns: 10,
+            polls: Arc::clone(&polls),
+            guard: None,
+        },
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .with_affinity(1 << TIMER_HART),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(TIMER_HART)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    assert_eq!(reactor.next_deadline_ns(), Some(10));
+
+    assert_eq!(reactor.advance_time_to(10), 1);
+    let stats = reactor.run_until_idle_on_hart(HartId(TIMER_HART));
+
+    assert_eq!(stats.completed, 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn deadline_domain_expiry_from_remote_hart_requests_remote_ipi_and_requeues_owner() {
+    const TIMER_HART: usize = 6;
+    const CURRENT_HART: usize = 1;
+    let reactor = Reactor::new();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task = reactor.submit_task_with_meta(
+        DeadlineDomainParkWithoutMailboxWaker {
+            hart: TIMER_HART,
+            deadline_ns: 10,
+            polls: Arc::clone(&polls),
+            guard: None,
+        },
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .with_affinity(1 << TIMER_HART),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(TIMER_HART)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+    assert_eq!(reactor.next_deadline_ns(), Some(10));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let (_wakes, report) =
+        reactor.advance_time_to_from_hart_with_reschedule(10, HartId(CURRENT_HART), &mut signal);
+
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(TIMER_HART)]);
+    assert!(reactor.dispatch_markers(HartId(TIMER_HART)).need_resched());
+
+    let stats = reactor.run_until_idle_on_hart(HartId(TIMER_HART));
+    assert_eq!(stats.completed, 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
 }

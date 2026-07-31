@@ -57,8 +57,7 @@ pub(crate) fn lint_invariants_script_boundary(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "script→structure imports: {:>4}  (ceiling {})  {}",
-        count, MAX_SCRIPT_STRUCTURE_IMPORTS, status
+        "script→structure imports: {count:>4}  (ceiling {MAX_SCRIPT_STRUCTURE_IMPORTS})  {status}"
     );
 
     for v in &violations {

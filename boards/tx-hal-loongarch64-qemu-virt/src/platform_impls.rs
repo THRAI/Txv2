@@ -1,6 +1,5 @@
 use super::boot_smp;
 use super::la64_irq_trap::*;
-use super::la64_percpu::*;
 use super::la64_pmap::*;
 use super::*;
 
@@ -23,7 +22,7 @@ unsafe extern "C" {
 #[cfg(target_arch = "loongarch64")]
 fn enable_uart_rx_irq() {
     unsafe {
-        let base = la64_uncached_virt(la64_uart_base()) as *mut u8;
+        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
         core::ptr::write_volatile(base.add(UART_IER), UART_IER_ERBFI);
     }
 
@@ -42,6 +41,10 @@ fn enable_uart_rx_irq() {
 
 #[cfg(all(not(target_arch = "loongarch64"), test))]
 static LA64_HOST_UART_IER: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_arch = "loongarch64")]
+static LA64_USER_ENTRY_PROBE_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(all(not(target_arch = "loongarch64"), test))]
 pub(crate) fn la64_reset_host_uart_ier_for_test() {
@@ -357,7 +360,7 @@ impl TrapIf for Platform {
     }
 
     fn classify_trap(snapshot: TrapFrameSnapshot) -> TrapClass {
-        classify_la64_trap(snapshot.cause)
+        classify_la64_trap(snapshot.scause)
     }
 
     fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
@@ -374,6 +377,7 @@ impl TrapIf for Platform {
             let pmap_switch = prepare_la64_pmap_switch(root).expect("LA64 user pmap switch");
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
+            trace_la64_user_entry_probe(cpu, ctx, &*frame, &pmap_switch, stack_top);
             tx_la64_qemu_activate_enter_userspace(
                 resume_ctx,
                 frame,
@@ -399,7 +403,103 @@ impl TrapIf for Platform {
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn trace_la64_user_entry_probe(
+    cpu: CpuId,
+    ctx: &UserTrapContext,
+    frame: &La64TrapFrame,
+    pmap_switch: &La64PmapSwitch,
+    stack_top: usize,
+) {
+    let pc_is_user = (ctx.pc < LA64_USER_TOP) as usize;
+    let frame_pc_is_user = (frame.era < LA64_USER_TOP) as usize;
+    let probe_index =
+        LA64_USER_ENTRY_PROBE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    if probe_index >= 8 && pc_is_user != 0 && frame_pc_is_user != 0 {
+        return;
+    }
+
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:probe:user-entry");
+    console_write_literal(b":idx=0x");
+    console_write_hex(probe_index);
+    console_write_literal(b":cpu=0x");
+    console_write_hex(cpu.0);
+    console_write_literal(b":ctx_pc=0x");
+    console_write_hex(ctx.pc);
+    console_write_literal(b":ctx_sp=0x");
+    console_write_hex(ctx.regs[LA64_R_SP]);
+    console_write_literal(b":ctx_ra=0x");
+    console_write_hex(ctx.regs[LA64_R_RA]);
+    console_write_literal(b":ctx_prmd=0x");
+    console_write_hex(ctx.status);
+    console_write_literal(b":ctx_user=0x");
+    console_write_hex(pc_is_user);
+    console_write_literal(b":frame_pc=0x");
+    console_write_hex(frame.era);
+    console_write_literal(b":frame_sp=0x");
+    console_write_hex(frame.r[LA64_R_SP]);
+    console_write_literal(b":frame_ra=0x");
+    console_write_hex(frame.r[LA64_R_RA]);
+    console_write_literal(b":frame_prmd=0x");
+    console_write_hex(frame.prmd);
+    console_write_literal(b":frame_user=0x");
+    console_write_hex(frame_pc_is_user);
+    console_write_literal(b":asid=0x");
+    console_write_hex(pmap_switch.asid);
+    console_write_literal(b":pgdl=0x");
+    console_write_hex(pmap_switch.pgdl);
+    console_write_literal(b":pgdh=0x");
+    console_write_hex(pmap_switch.pgdh);
+    console_write_literal(b":switch=0x");
+    console_write_hex(pmap_switch.switch_required as usize);
+    console_write_literal(b":trap_stack=0x");
+    console_write_hex(stack_top);
+    console_write_literal(b"\n");
+}
 impl SignalFrameIf for Platform {
+    fn write_signal_frame(
+        mut tf: TrapFrameMut<'_>,
+        setup: SignalFrameWrite,
+    ) -> Result<SignalFramePlacement, FaultInfo> {
+        let frame_size = core::mem::size_of::<La64SignalFrame>();
+        let Some(unrounded_frame_addr) = setup.stack_top.addr().checked_sub(frame_size) else {
+            return Err(FaultInfo {
+                address: VirtAddr(setup.stack_top.addr()),
+                write: true,
+                instruction: false,
+                from_user: false,
+            });
+        };
+        let frame_addr = align_down(unrounded_frame_addr, LA64_SIGFRAME_ALIGN);
+        let frame = La64SignalFrame::new(&tf, &setup);
+
+        unsafe {
+            la64_write_user(UserPtr::<La64SignalFrame>::new(frame_addr), frame)?;
+        }
+
+        let siginfo_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, siginfo);
+        let ucontext_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, user_context);
+        let trampoline_pc = frame_addr + core::mem::offset_of!(La64SignalFrame, trampoline);
+
+        tf.set_pc(VirtAddr(setup.handler_pc.addr()));
+        tf.set_sp(VirtAddr(frame_addr));
+        tf.set_signal_handler_regs(SignalHandlerRegs {
+            return_pc: VirtAddr(trampoline_pc),
+            args: [setup.sig_no as usize, siginfo_addr, ucontext_addr],
+        });
+
+        Ok(SignalFramePlacement {
+            frame_addr: UserPtr::new(frame_addr),
+            trampoline_pc: UserPtr::new(trampoline_pc),
+        })
+    }
+
+    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
+        let frame = unsafe { la64_read_user(UserPtr::<La64SignalFrame>::new(user_sp.addr()))? };
+        decode_la64_signal_frame(user_sp, frame)
+    }
+
     fn signal_frame_size() -> usize {
         core::mem::size_of::<La64SignalFrame>()
     }
@@ -467,6 +567,10 @@ impl SignalFrameIf for Platform {
             tx_hal::SignalFrameBytes::from_slice(frame_bytes),
         ))
     }
+
+    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
+        tf.rewind_pc(4);
+    }
 }
 
 fn decode_la64_signal_frame(
@@ -510,6 +614,7 @@ impl FpSimdIf for Platform {
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = QEMU_LA64_GSI_BASE + QEMU_LA64_PCH_PIC_IRQS;
     const UART_IRQ: u32 = QEMU_LA64_UART0_IRQ;
+    const RTC_IRQ: u32 = QEMU_LA64_RTC_IRQ;
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0
@@ -521,6 +626,10 @@ impl IrqIf for Platform {
 
     fn interrupts_enabled() -> bool {
         read_la64_csr(LA64_CSR_CRMD) & LA64_CRMD_IE != 0
+    }
+
+    fn exclude_local_execution() -> LocalExecutionGuard {
+        exclude_la64_interrupts()
     }
 
     fn claim() -> u32 {
@@ -559,75 +668,56 @@ impl IrqIf for Platform {
         handler(irq)
     }
 }
-/// Read the QEMU virt loongson ls7a-rtc (`rtc@100d0100`) as Unix-epoch
-/// nanoseconds. The "toy" (time-of-year) read registers hold the current
-/// broken-down time; TOY_READ0 packs month/day/hour/min/sec and TOY_READ1 the
-/// year. Reachable through the DMW uncached window — no page-table entry, so
-/// (unlike RV64's goldfish-rtc) no boot mapping is required.
-#[cfg(target_arch = "loongarch64")]
-fn read_ls7a_rtc_epoch_ns() -> Option<u64> {
-    const LS7A_RTC_PHYS: usize = 0x100d_0100;
-    const TOY_READ0: usize = 0x2c;
-    const TOY_READ1: usize = 0x30;
-    const RTC_CTRL: usize = 0x40;
-    // QEMU gates the toy read registers on the enable bits; firmware normally
-    // sets them, but we boot bare `-kernel`, so enable the toy oscillator +
-    // counter ourselves before reading.
-    const TOY_ENABLE: u32 = 1 << 11;
-    const OSC_ENABLE: u32 = 1 << 8;
-    // SAFETY: the DMW uncached window maps every physical address; this only
-    // touches the ls7a-rtc MMIO registers.
-    let (toy0, year_reg) = unsafe {
-        let ctrl = (la64_uncached_virt(LS7A_RTC_PHYS) + RTC_CTRL) as *mut u32;
-        ctrl.write_volatile(ctrl.read_volatile() | TOY_ENABLE | OSC_ENABLE);
-        let toy0 = ((la64_uncached_virt(LS7A_RTC_PHYS) + TOY_READ0) as *const u32).read_volatile();
-        let year_reg =
-            ((la64_uncached_virt(LS7A_RTC_PHYS) + TOY_READ1) as *const u32).read_volatile();
-        (toy0, year_reg)
-    };
-    // TOY_READ0: mon[31:26] day[25:21] hour[20:16] min[15:10] sec[9:4] 0.1s[3:0].
-    let mon = ((toy0 >> 26) & 0x3f) as i64;
-    let day = ((toy0 >> 21) & 0x1f) as i64;
-    let hour = ((toy0 >> 16) & 0x1f) as i64;
-    let min = ((toy0 >> 10) & 0x3f) as i64;
-    let sec = ((toy0 >> 4) & 0x3f) as i64;
-    // TOY_READ1 is years-since-1900 on some QEMU builds, a full year on others;
-    // disambiguate by magnitude.
-    let year = if year_reg >= 1970 {
-        year_reg as i64
-    } else {
-        year_reg as i64 + 1900
-    };
-    if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || year < 1970 {
-        return None; // toy clock not populated
+
+fn exclude_la64_interrupts() -> LocalExecutionGuard {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let mut saved = 0usize;
+        let mask = LA64_CRMD_IE;
+        unsafe {
+            core::arch::asm!(
+                "csrxchg {saved}, {mask}, 0x00",
+                saved = inout(reg) saved,
+                mask = in(reg) mask,
+                options(nostack)
+            );
+            LocalExecutionGuard::new(saved & LA64_CRMD_IE, restore_la64_interrupts)
+        }
     }
-    let secs = civil_to_epoch_secs(year, mon, day, hour, min, sec);
-    (secs > 0).then(|| secs as u64 * 1_000_000_000)
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    unsafe {
+        LocalExecutionGuard::new(0, restore_la64_interrupts)
+    }
 }
 
-#[cfg(not(target_arch = "loongarch64"))]
-fn read_ls7a_rtc_epoch_ns() -> Option<u64> {
-    None
-}
+unsafe fn restore_la64_interrupts(saved: usize) {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        let restored = saved & LA64_CRMD_IE;
+        let mask = LA64_CRMD_IE;
+        core::arch::asm!(
+            "csrxchg {restored}, {mask}, 0x00",
+            restored = inout(reg) restored => _,
+            mask = in(reg) mask,
+            options(nostack)
+        );
+    }
 
-/// Civil (proleptic Gregorian) date to Unix-epoch seconds — Howard Hinnant's
-/// `days_from_civil` algorithm plus the intra-day seconds.
-#[cfg(target_arch = "loongarch64")]
-fn civil_to_epoch_secs(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    days * 86400 + hh * 3600 + mm * 60 + ss
+    #[cfg(not(target_arch = "loongarch64"))]
+    let _ = saved;
 }
-
-impl TimeIf for Platform {
+impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
         tx_hal::time::ticks_to_ns(la64_read_stable_counter(), Self::frequency_hz())
     }
 
+    fn frequency_hz() -> u64 {
+        la64_timebase_frequency_hz()
+    }
+}
+
+impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
         let frequency_hz = Self::frequency_hz();
         if frequency_hz == 0 {
@@ -654,15 +744,86 @@ impl TimeIf for Platform {
         let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
         write_la64_csr(LA64_CSR_CRMD, crmd);
     }
+}
 
-    fn frequency_hz() -> u64 {
-        la64_timebase_frequency_hz()
-    }
-
-    fn read_rtc_epoch_ns() -> Option<u64> {
-        read_ls7a_rtc_epoch_ns()
+fn ls7a_rtc_ensure_toy_enabled() {
+    let ctrl = ls7a_rtc_read_u32(LS7A_RTC_CTRL);
+    let required = LS7A_RTC_CTRL_EO | LS7A_RTC_CTRL_TOYEN;
+    if ctrl & required != required {
+        ls7a_rtc_write_u32(LS7A_RTC_CTRL, ctrl | required);
     }
 }
+
+#[cfg(target_arch = "loongarch64")]
+fn ls7a_rtc_read_u32(offset: usize) -> u32 {
+    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *const u32).read_volatile() }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn ls7a_rtc_write_u32(offset: usize, value: u32) {
+    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *mut u32).write_volatile(value) }
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
+fn ls7a_rtc_read_u32(_offset: usize) -> u32 {
+    0
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
+fn ls7a_rtc_write_u32(_offset: usize, _value: u32) {}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+fn ls7a_rtc_read_u32(offset: usize) -> u32 {
+    LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state")
+        .read_u32(offset)
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+fn ls7a_rtc_write_u32(offset: usize, value: u32) {
+    LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state")
+        .write_u32(offset, value);
+}
+
+impl PersistentClockIf for Platform {
+    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        ls7a_rtc_ensure_toy_enabled();
+        let toy0 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD0);
+        let toy1 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD1);
+        ls7a_unix_ns_from_toy_registers(toy0, toy1)
+    }
+
+    fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError> {
+        let (toy0, toy1) = ls7a_toy_registers_from_unix_ns(ns)?;
+        ls7a_rtc_ensure_toy_enabled();
+        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE1, toy1);
+        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE0, toy0);
+        Ok(())
+    }
+
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError> {
+        let toymatch = ls7a_toymatch_from_unix_ns(ns)?;
+        ls7a_rtc_ensure_toy_enabled();
+        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, toymatch);
+        Self::set_priority(QEMU_LA64_RTC_IRQ, 1);
+        Self::unmask(QEMU_LA64_RTC_IRQ);
+        Ok(())
+    }
+
+    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, 0);
+        Self::mask(QEMU_LA64_RTC_IRQ);
+        Ok(())
+    }
+
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        Ok(())
+    }
+}
+
 impl PercpuIf for Platform {
     fn current_cpu_id() -> CpuId {
         la64_current_cpu_id()
@@ -714,9 +875,6 @@ impl CacheIf for Platform {
     }
 
     fn flush_icache_range(_start: VirtAddr, _len: usize) {
-        // LA64 has no range-scoped icache maintenance: `ibar 0` is a full
-        // instruction-fetch barrier, so `start`/`len` are intentionally
-        // ignored (identical to `fence_i_local`/`fence_i_all`).
         la64_ibar();
     }
 }
@@ -727,17 +885,10 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        // QEMU publishes its `-smp` count through the firmware FDT. Use that
-        // topology by default and treat `tx.maxcpus=N` as an explicit upper
-        // bound. Missing firmware topology falls back to one CPU in
-        // `LA64_DEFAULT_POSSIBLE_CPUS`.
-        let discovered = LA64_POSSIBLE_CPU_COUNT
+        let possible = LA64_POSSIBLE_CPU_COUNT
             .load(Ordering::Acquire)
             .clamp(1, LA64_MAX_BOOT_CPUS);
-        let requested = crate::boot_facts::max_cpus_from_cmdline()
-            .unwrap_or(discovered)
-            .clamp(1, LA64_MAX_BOOT_CPUS);
-        CpuMask::first(discovered.min(requested))
+        CpuMask::first(possible)
     }
 
     fn online_cpus() -> CpuMask {
@@ -754,12 +905,8 @@ impl SmpIf for Platform {
         }
     }
 
-    fn prepare_cpu_offline() {
-        prepare_la64_tlb_cpu_offline();
-    }
-
-    fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
-        boot_smp::boot_secondary_cpus(Self::possible_cpus(), entry)
+    fn boot_secondary_cpus(_entry: SecondaryEntry) -> usize {
+        boot_smp::boot_secondary_cpus(_entry)
     }
 
     fn enable_ipi_wakeups() {
@@ -770,61 +917,8 @@ impl SmpIf for Platform {
         la64_wait_for_interrupt_once();
     }
 
-    fn prepare_interrupt_wait() -> InterruptWaitState {
-        let crmd = read_la64_csr(LA64_CSR_CRMD);
-        write_la64_csr(LA64_CSR_CRMD, crmd & !LA64_CRMD_IE);
-        InterruptWaitState::from_raw(crmd)
-    }
-
-    fn cancel_interrupt_wait(state: InterruptWaitState) {
-        let crmd = read_la64_csr(LA64_CSR_CRMD);
-        let restored = if state.raw() & LA64_CRMD_IE != 0 {
-            crmd | LA64_CRMD_IE
-        } else {
-            crmd & !LA64_CRMD_IE
-        };
-        write_la64_csr(LA64_CSR_CRMD, restored);
-    }
-
-    fn wait_for_interrupt_prepared(state: InterruptWaitState) {
-        // `prepare_interrupt_wait` left IE clear while the kernel performed
-        // its final runnable-work check. The assembly helper below enables IE
-        // adjacent to `idle`; the trap dispatcher redirects an interrupt from
-        // that tiny window to the instruction after `idle`, so the just-served
-        // wake cannot be followed by an indefinite sleep.
-        la64_wait_for_interrupt_once();
-        if state.raw() & LA64_CRMD_IE == 0 {
-            let crmd = read_la64_csr(LA64_CSR_CRMD);
-            write_la64_csr(LA64_CSR_CRMD, crmd & !LA64_CRMD_IE);
-        }
-    }
-
     fn pending_ipi(kind: IpiKind) -> bool {
         boot_smp::pending_ipi(kind)
-    }
-
-    fn quiesce_this_cpu() -> ! {
-        Self::cancel_deadline();
-        debug_assert_eq!(
-            LA64_TLB_TARGET_USERS[la64_current_cpu_id().0].load(Ordering::Acquire),
-            0
-        );
-        #[cfg(target_arch = "loongarch64")]
-        {
-            // Disable every local interrupt source before publishing a
-            // permanently parked AP to the shutdown coordinator.
-            write_la64_csr(LA64_CSR_ECFG, 0);
-            let crmd = read_la64_csr(LA64_CSR_CRMD) & !LA64_CRMD_IE;
-            write_la64_csr(LA64_CSR_CRMD, crmd);
-        }
-        loop {
-            #[cfg(target_arch = "loongarch64")]
-            unsafe {
-                core::arch::asm!("idle 0", options(nomem, nostack));
-            }
-            #[cfg(not(target_arch = "loongarch64"))]
-            core::hint::spin_loop();
-        }
     }
 
     fn send_ipi(target: CpuId, kind: IpiKind) {
@@ -832,13 +926,7 @@ impl SmpIf for Platform {
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-        let current = la64_current_cpu_id();
-        let mut bits = mask.bits() & !CpuMask::single(current).bits();
-        while bits != 0 {
-            let cpu = bits.trailing_zeros() as usize;
-            Self::send_ipi(CpuId(cpu), kind);
-            bits &= bits - 1;
-        }
+        boot_smp::broadcast_ipi(mask, kind);
     }
 
     fn ack_ipi(kind: IpiKind) {

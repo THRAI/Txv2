@@ -32,8 +32,7 @@ pub enum LdiscInputEffect {
     /// the controlling tty's foreground process group.
     ///
     /// The line discipline does not post the signal itself; it returns the
-    /// signal kind and leaves `deliver_posix_signal` to the caller
-    /// (`step_ingest` in Phase C).
+    /// signal kind and leaves POSIX signal delivery to the caller.
     SignalFgPgrp(SignalKind),
 
     /// Flow-control transition (`IXON` matched VSTOP or VSTART).

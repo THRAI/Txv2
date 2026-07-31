@@ -5,8 +5,9 @@
 
 use tx_platform_adapter::notification_adapter;
 
+pub use readiness::CQE_AVAILABLE;
 pub(crate) use readiness::{
-    new_wait_points, notify_cqe_available, notify_sqe_arrived, release_wait_points,
+    new_wait_points, notify_cqe_available_with_post, notify_sqe_arrived, release_wait_points,
 };
 
 #[notification_adapter(
@@ -18,18 +19,37 @@ mod readiness {
     use alloc::sync::Arc;
 
     use crate::io_uring::adapter::step_engine::{InterestMask, WaitSource};
-    use crate::io_uring::adapter::wait_routing;
+    use crate::io_uring::adapter::wait_routing::{self, MailboxEvent, TaskMailbox};
 
     /// An SQE is queued and ready for the SQPOLL worker.
     const SQE_ARRIVED: u64 = 0x1;
     /// A CQE is queued and available for completion consumers.
-    const CQE_AVAILABLE: u64 = 0x1;
+    pub const CQE_AVAILABLE: u64 = 0x1;
 
     pub(crate) struct IoUringWaitPoints {
-        pub(crate) sqe_arrived_id: u64,
-        pub(crate) sqe_arrived: Arc<WaitSource>,
-        pub(crate) cqe_available_id: u64,
-        pub(crate) cqe_available: Arc<WaitSource>,
+        sqe_arrived_id: u64,
+        sqe_arrived: Arc<WaitSource>,
+        cqe_available_id: u64,
+        cqe_available: Arc<WaitSource>,
+    }
+
+    impl IoUringWaitPoints {
+        pub(crate) fn sqe_arrived_endpoint(&self) -> &Arc<WaitSource> {
+            &self.sqe_arrived
+        }
+
+        pub(crate) fn cqe_available_endpoint(&self) -> &Arc<WaitSource> {
+            &self.cqe_available
+        }
+
+        pub(crate) fn into_parts(self) -> (u64, Arc<WaitSource>, u64, Arc<WaitSource>) {
+            (
+                self.sqe_arrived_id,
+                self.sqe_arrived,
+                self.cqe_available_id,
+                self.cqe_available,
+            )
+        }
     }
 
     pub(crate) fn new_wait_points() -> IoUringWaitPoints {
@@ -49,8 +69,11 @@ mod readiness {
         source.notify_emit(InterestMask::new(SQE_ARRIVED));
     }
 
-    pub(crate) fn notify_cqe_available(source: &Arc<WaitSource>) {
-        source.notify_emit(InterestMask::new(CQE_AVAILABLE));
+    pub(crate) fn notify_cqe_available_with_post<F>(source: &Arc<WaitSource>, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        wait_routing::notify_v3_source_with_post(source, CQE_AVAILABLE, post);
     }
 
     pub(crate) fn release_wait_points(sqe_arrived_id: u64, cqe_available_id: u64) {

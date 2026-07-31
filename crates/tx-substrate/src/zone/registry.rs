@@ -109,6 +109,17 @@ pub struct EmptySlabTrimStats {
     pub retired_slabs: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SlotLookupDebug {
+    pub reason: &'static str,
+    pub requested_type: &'static str,
+    pub registered_type: Option<&'static str>,
+    pub key: SlotKey,
+    pub allocated_slots: Option<usize>,
+    pub slab_count: Option<usize>,
+    pub empty_slab_count: Option<usize>,
+}
+
 #[derive(Clone, Copy)]
 struct RegisteredZone {
     /// Stable ID used as the registry table index.
@@ -127,6 +138,8 @@ struct RegisteredZone {
     trim_empty_slabs: fn(*const (), usize) -> usize,
     /// Resolve a logical key to a typed slot pointer, erased for storage.
     slot_from_key: fn(*const (), SlotKey) -> Option<*mut ()>,
+    /// Reclaim one typed slot selected from a mixed Zone retirement bag.
+    reclaim_slot: unsafe fn(*const (), SlotKey),
 }
 
 static NEXT_ZONE_ID: AtomicUsize = AtomicUsize::new(1);
@@ -149,6 +162,7 @@ pub fn register_static_zone<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneIn
         flush_current_cpu_bucket: flush_current_cpu_bucket::<T>,
         trim_empty_slabs: trim_empty_slabs_for::<T>,
         slot_from_key: slot_from_key::<T>,
+        reclaim_slot: reclaim_slot_for::<T>,
     };
     REGISTRY.register(entry)?;
     Ok(info)
@@ -180,6 +194,18 @@ pub(crate) fn init_cpu_buckets(cpu: CpuId) -> Result<(), ZoneError> {
 
 pub(crate) fn slot_for<T: 'static>(key: SlotKey) -> Option<NonNull<Slot<T>>> {
     REGISTRY.slot_for::<T>(key)
+}
+
+pub(crate) fn slot_meta(key: SlotKey) -> Option<NonNull<super::meta::SlotMeta>> {
+    REGISTRY.slot_meta(key)
+}
+
+pub(crate) unsafe fn reclaim_slot(key: SlotKey) {
+    unsafe { REGISTRY.reclaim_slot(key) }
+}
+
+pub(crate) fn slot_lookup_debug<T: 'static>(key: SlotKey) -> SlotLookupDebug {
+    REGISTRY.slot_lookup_debug::<T>(key)
 }
 
 pub(crate) fn init_registry() {
@@ -214,6 +240,14 @@ fn trim_empty_slabs_for<T: 'static>(erased: *const (), limit: usize) -> usize {
 fn slot_from_key<T: 'static>(erased: *const (), key: SlotKey) -> Option<*mut ()> {
     let zone = unsafe { &*(erased as *const Zone<T>) };
     zone.slot_from_key(key).map(|slot| slot.as_ptr() as *mut ())
+}
+
+unsafe fn reclaim_slot_for<T: 'static>(erased: *const (), key: SlotKey) {
+    let zone = unsafe { &*(erased as *const Zone<T>) };
+    let slot = zone
+        .slot_from_key(key)
+        .expect("retired Zone slot must remain directory-resolvable");
+    unsafe { super::slot::reclaim_slot(slot) };
 }
 
 struct ZoneRegistry {
@@ -353,6 +387,99 @@ impl ZoneRegistry {
 
         let ptr = (entry.slot_from_key)(entry.erased, key)?;
         NonNull::new(ptr.cast::<Slot<T>>())
+    }
+
+    fn slot_meta(&self, key: SlotKey) -> Option<NonNull<super::meta::SlotMeta>> {
+        let zone_id = key.zone_id();
+        if zone_id.0 == 0 || zone_id.0 > MAX_REGISTERED_ZONES {
+            return None;
+        }
+        let entry = self.entry_at(zone_id.0 - 1)?;
+        if entry.zone_id != zone_id {
+            return None;
+        }
+        let ptr = (entry.slot_from_key)(entry.erased, key)?;
+        NonNull::new(ptr.cast::<super::meta::SlotMeta>())
+    }
+
+    unsafe fn reclaim_slot(&self, key: SlotKey) {
+        let zone_id = key.zone_id();
+        let entry = self
+            .entry_at(
+                zone_id
+                    .0
+                    .checked_sub(1)
+                    .expect("retired key has nonzero zone id"),
+            )
+            .expect("retired key has registered zone");
+        unsafe { (entry.reclaim_slot)(entry.erased, key) };
+    }
+
+    fn slot_lookup_debug<T: 'static>(&self, key: SlotKey) -> SlotLookupDebug {
+        let requested_type = core::any::type_name::<T>();
+        let zone_id = key.zone_id();
+        if zone_id.0 == 0 || zone_id.0 > MAX_REGISTERED_ZONES {
+            return SlotLookupDebug {
+                reason: "zone-id-out-of-range",
+                requested_type,
+                registered_type: None,
+                key,
+                allocated_slots: None,
+                slab_count: None,
+                empty_slab_count: None,
+            };
+        }
+
+        let Some(entry) = self.entry_at(zone_id.0 - 1) else {
+            return SlotLookupDebug {
+                reason: "registry-entry-unpublished",
+                requested_type,
+                registered_type: None,
+                key,
+                allocated_slots: None,
+                slab_count: None,
+                empty_slab_count: None,
+            };
+        };
+
+        let info = (entry.refresh_info)(entry.erased);
+        if entry.zone_id != zone_id {
+            return SlotLookupDebug {
+                reason: "registry-zone-id-mismatch",
+                requested_type,
+                registered_type: Some(info.type_name),
+                key,
+                allocated_slots: Some(info.allocated_slots),
+                slab_count: Some(info.slab_count),
+                empty_slab_count: Some(info.empty_slab_count),
+            };
+        }
+        if entry.type_id != TypeId::of::<T>() {
+            return SlotLookupDebug {
+                reason: "registry-type-mismatch",
+                requested_type,
+                registered_type: Some(info.type_name),
+                key,
+                allocated_slots: Some(info.allocated_slots),
+                slab_count: Some(info.slab_count),
+                empty_slab_count: Some(info.empty_slab_count),
+            };
+        }
+
+        let reason = if (entry.slot_from_key)(entry.erased, key).is_some() {
+            "slot-resolved-on-debug-retry"
+        } else {
+            "keg-slab-or-slot-miss"
+        };
+        SlotLookupDebug {
+            reason,
+            requested_type,
+            registered_type: Some(info.type_name),
+            key,
+            allocated_slots: Some(info.allocated_slots),
+            slab_count: Some(info.slab_count),
+            empty_slab_count: Some(info.empty_slab_count),
+        }
     }
 
     fn entry_at(&self, index: usize) -> Option<RegisteredZone> {

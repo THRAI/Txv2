@@ -9,7 +9,7 @@ use crate::tty::adapter::step_engine::{
     ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::tty::checks::{background_write_signal, require_fg_pgrp, require_live_tty};
-use crate::tty::execution::{step_ingest, TTY_WRITABLE};
+use crate::tty::execution::{step_ingest_with_post, TTY_WRITABLE};
 use crate::tty::ldisc::process_output;
 use crate::tty::structure::{termios::TOSTOP, TtyIdentity, TtyTransport};
 
@@ -53,121 +53,6 @@ pub fn step_write_for_process(
     }
 
     step_write(tty, bytes, guard)
-}
-
-/// Scan one raw output burst for a Device Status Report cursor-position
-/// query (`ESC[6n`) and synthesize the reply an xterm would send
-/// (`ESC[<row>;<col>R`). Returns `None` when the burst carries no query.
-///
-/// The cursor position is derived from the last absolute cursor move
-/// (`ESC[<r>;<c>H` / `...f`, or `ESC[H` = 1;1) in the same burst, plus
-/// the printable columns emitted after it (each UTF-8 lead byte counts
-/// as one column; escape sequences and continuation bytes do not). vim
-/// emits the whole `position + glyph + query` in a single write, so a
-/// per-burst scan is sufficient and needs no cross-write state.
-pub(crate) fn synthesize_dsr_cpr_reply(out: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-    const DSR: &[u8] = b"\x1b[6n";
-    let q = find_subslice(out, DSR)?;
-
-    let (mut row, mut col): (u32, u32) = (1, 1);
-    let mut last_move_end = 0usize;
-    let mut i = 0usize;
-    while i + 1 < q {
-        if out[i] == 0x1b && out[i + 1] == b'[' {
-            let mut j = i + 2;
-            let (mut first, mut cur, mut seen_semi) = (0u32, 0u32, false);
-            while j < q {
-                let b = out[j];
-                if b.is_ascii_digit() {
-                    cur = cur.saturating_mul(10).saturating_add((b - b'0') as u32);
-                    j += 1;
-                } else if b == b';' {
-                    first = cur;
-                    cur = 0;
-                    seen_semi = true;
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            if j < q && (out[j] == b'H' || out[j] == b'f') {
-                if seen_semi {
-                    row = first.max(1);
-                    col = cur.max(1);
-                } else {
-                    // `ESC[H` (or `ESC[<n>H`) → home / row n, col 1.
-                    row = cur.max(1);
-                    col = 1;
-                }
-                last_move_end = j + 1;
-            }
-            i = j.saturating_add(1);
-        } else {
-            i += 1;
-        }
-    }
-
-    // Advance `col` by the printable columns written after the last move.
-    let mut k = last_move_end;
-    while k < q {
-        let b = out[k];
-        if b == 0x1b {
-            k += 1;
-            if k < q && out[k] == b'[' {
-                k += 1;
-                while k < q && !out[k].is_ascii_alphabetic() {
-                    k += 1;
-                }
-                if k < q {
-                    k += 1;
-                }
-            } else {
-                k += 1;
-            }
-        } else if b == b'\r' {
-            col = 1;
-            k += 1;
-        } else if b >= 0x20 && (b & 0xc0) != 0x80 {
-            col = col.saturating_add(1);
-            k += 1;
-        } else {
-            k += 1;
-        }
-    }
-
-    let mut reply = alloc::vec::Vec::with_capacity(12);
-    reply.push(0x1b);
-    reply.push(b'[');
-    push_u32_decimal(&mut reply, row);
-    reply.push(b';');
-    push_u32_decimal(&mut reply, col);
-    reply.push(b'R');
-    Some(reply)
-}
-
-fn push_u32_decimal(buf: &mut alloc::vec::Vec<u8>, mut v: u32) {
-    if v == 0 {
-        buf.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut n = 0;
-    while v > 0 {
-        tmp[n] = b'0' + (v % 10) as u8;
-        v /= 10;
-        n += 1;
-    }
-    while n > 0 {
-        n -= 1;
-        buf.push(tmp[n]);
-    }
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
 fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
@@ -256,23 +141,27 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
             },
             TtyTransport::Pty { .. } => V3Out::Err(Errno::EIO.into()),
         },
-        Kick::Pty(peer) => match step_ingest(&peer, &chunk, guard) {
-            V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
-            V3Out::Err(e) => V3Out::Err(e),
-            V3Out::Yield { shape, .. } => {
-                if let Some((carrier, interests)) =
-                    crate::tty::notification::wait_source_parts(&shape)
-                {
-                    crate::tty::notification::yield_on_wait_source(
-                        ByteProgress::new(chunk.len()),
-                        carrier,
-                        interests,
-                    )
-                } else {
-                    V3Out::Err(step_engine::Errno::EIO)
+        Kick::Pty(peer) => {
+            match step_ingest_with_post(&peer, &chunk, guard, |mailbox, event, hint| {
+                mailbox.post_with_scheduler_hint(event, hint)
+            }) {
+                V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
+                V3Out::Err(e) => V3Out::Err(e),
+                V3Out::Yield { shape, .. } => {
+                    if let Some((carrier, interests)) =
+                        crate::tty::notification::wait_source_parts(&shape)
+                    {
+                        crate::tty::notification::yield_on_wait_source(
+                            ByteProgress::new(chunk.len()),
+                            carrier,
+                            interests,
+                        )
+                    } else {
+                        V3Out::Err(step_engine::Errno::EIO)
+                    }
                 }
             }
-        },
+        }
     }
 }
 
@@ -377,7 +266,7 @@ pub fn step_write(
     }
 
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out};
-    let outcome = match kick_transport(tty, guard) {
+    match kick_transport(tty, guard) {
         V3Out::Err(err) => V3Out::err(err),
         V3Out::Yield { shape, .. } => {
             if let Some((carrier, interests)) = crate::tty::notification::wait_source_parts(&shape)
@@ -392,15 +281,7 @@ pub fn step_write(
             }
         }
         V3Out::Done(_) | V3Out::Continue { .. } => V3Out::done(consumed),
-    };
-
-    // NOTE(vim/[6n]): an earlier revision injected a synthesized
-    // cursor-position report (see `synthesize_dsr_cpr_reply`) through
-    // `step_ingest` right here. Calling ingest from inside the write
-    // path wedged the TTY under load (echo/ingest re-entry), so the
-    // hook is withdrawn until the injection can run from a safe
-    // context (syscall layer, after the write op completes).
-    outcome
+    }
 }
 
 /// `step_write_for_caller`-shaped TTY step — step_v3 outcome shape.
@@ -496,52 +377,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WriteForProcessOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let __guard = step_engine::guard();
         step_write_for_process(self.tty, self.bytes, self.caller, &__guard)
-    }
-}
-
-#[cfg(test)]
-mod dsr_reply_tests {
-    use super::synthesize_dsr_cpr_reply;
-
-    #[test]
-    fn no_query_returns_none() {
-        assert!(synthesize_dsr_cpr_reply(b"hello world\r\n").is_none());
-        assert!(synthesize_dsr_cpr_reply(b"\x1b[2J\x1b[H~~~").is_none());
-    }
-
-    #[test]
-    fn vim_ambiwidth_probe_reports_column_after_glyph() {
-        // vim: position at row 2 col 1, write ▽ (U+25BD = 3 UTF-8
-        // bytes, 1 column), then query. Cursor is now at col 2.
-        let mut out = alloc::vec::Vec::new();
-        out.extend_from_slice(b"\x1b[2;1H");
-        out.extend_from_slice("▽".as_bytes());
-        out.extend_from_slice(b"\x1b[6n");
-        assert_eq!(synthesize_dsr_cpr_reply(&out).unwrap(), b"\x1b[2;2R");
-    }
-
-    #[test]
-    fn plain_ascii_after_move_counts_each_column() {
-        assert_eq!(
-            synthesize_dsr_cpr_reply(b"\x1b[5;10Habc\x1b[6n").unwrap(),
-            b"\x1b[5;13R"
-        );
-    }
-
-    #[test]
-    fn home_move_without_coords_is_row1_col1() {
-        assert_eq!(
-            synthesize_dsr_cpr_reply(b"\x1b[H\x1b[6n").unwrap(),
-            b"\x1b[1;1R"
-        );
-    }
-
-    #[test]
-    fn query_without_preceding_move_defaults_to_origin_plus_glyphs() {
-        assert_eq!(
-            synthesize_dsr_cpr_reply(b"XY\x1b[6n").unwrap(),
-            b"\x1b[1;3R"
-        );
     }
 }
 

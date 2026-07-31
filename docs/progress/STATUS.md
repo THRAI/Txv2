@@ -18168,3 +18168,13 @@
 - `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
 - `docs/progress/research/2026-04-30-reactor-third-wave-scout.md`
 - `docs/progress/research/2026-04-30-reactor-third-wave-audit.md`
+- 2026-07-24 (network/time integration publication blocked).
+  A clean worktree on `codex/network-time-integration` carries the time facade
+  and the candidate owner-aware reactor/network-delegate sequence, but the
+  first closure check is blocked before publication: current `origin/main`
+  lacks the source branch's `tx-observe` `l2_producer` API and the uncommitted
+  `tx-substrate::publication` module that the selected reactor code imports.
+  `cargo check -p tx-time -p tx-services -p tx-reactor -p tx-substrate` stops
+  on those missing APIs. No push was performed; the original dirty source
+  worktree was not changed. Next: explicitly approve either a broader
+  observation/publication baseline migration or a reduced time-only publish.

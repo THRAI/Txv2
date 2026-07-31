@@ -15,15 +15,15 @@ use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use crate::page_backed::FsPageBacking;
-use crate::vfs::adapter::step_engine::{guard, reserve_for, sign_for, Cap};
+use crate::vfs::FsOps;
+use crate::vfs::adapter::step_engine::{Cap, guard, reserve_for, sign_for};
 use crate::vfs::structure::{
-    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
-    RNodeBacking, S_IFDIR,
+    Credential, DEntry, FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
+    S_IFDIR,
 };
 use crate::vfs::walker::{step_open, step_walk};
-use crate::vfs::FsOps;
 
-use super::{init_zones, TestFs};
+use super::{TestFs, init_zones};
 
 // === fixture: rootfs over TestFs ===================================
 
@@ -58,17 +58,17 @@ fn build_rootfs_v3() -> V3Topology {
         sign_for(res, raw)
     };
 
-    let _mount = MountIdentity::new_cap(
+    let mount = MountIdentity::new_cap(
         MountId::new(1),
         None,
-        root_rnode.clone(),
+        root_rnode,
         None,
         payload,
         MountFlags::empty(),
     )
     .expect("rootfs mount identity reservation");
 
-    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("rootfs root dentry");
+    let root_dentry = mount.root_dentry().clone();
 
     V3Topology {
         root_dentry,
@@ -145,14 +145,14 @@ fn step_walk_caches_regular_file_positive_lookup() {
     let cred = Credential::root();
     let guard = guard();
 
-    let first = step_walk(topo.root_dentry.clone(), b"/file", &cred, &guard);
-    match first {
+    let first_dentry = match step_walk(topo.root_dentry.clone(), b"/file", &cred, &guard) {
         V3::Done(dentry) => {
             assert_eq!(dentry.name().as_bytes(), b"file");
             assert_eq!(dentry.rnode().fs_object_id(), file_id);
+            dentry
         }
         other => panic!("expected first walk to materialise file, got {other:?}"),
-    }
+    };
     let first_counts = topo.rootfs.lookup_counts();
     assert_eq!(first_counts, (1, 1, 1));
 
@@ -169,6 +169,7 @@ fn step_walk_caches_regular_file_positive_lookup() {
         first_counts,
         "positive dcache hits for regular files must avoid backend lookup/meta/materialise"
     );
+    drop(first_dentry);
     drop(guard);
 }
 

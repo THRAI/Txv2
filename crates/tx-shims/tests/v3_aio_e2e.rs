@@ -12,8 +12,8 @@
 //!      leaked user-VA buffer, nbytes = N, offset = 0); call
 //!      `sys_io_submit(ctx_fd, 1, &iocb_ptr)` and assert it returns 1.
 //!   3. **Worker drives.** The spawned worker (from W-CC's
-//!      `spawn_worker_for_context` + W-FF's real dispatcher) pumps
-//!      iocbs under the `OnBehalfOf<P>` borrow. The real dispatch path
+//!      `spawn_worker_for_context_with_completion_post` + W-FF's real
+//!      dispatcher) pumps iocbs under the `OnBehalfOf<P>` borrow. The real dispatch path
 //!      resolves `aio_fildes` against P's fd table, seeks the file to
 //!      `aio_offset`, and dispatches the read through `OpenFileReadOp`
 //!      (which routes `RNodeBacking::PageBacked` through
@@ -67,8 +67,9 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, UserPtr, VirtAddr,
+    Arch, Asid, DeadlineTimerIf, EntropyIf, MonotonicCounterIf, PhysAddr, PlatformConfig,
+    PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, PtNode, UserPtr, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
 use tx_shims::adapter::step_engine::{
@@ -156,16 +157,23 @@ impl tx_hal::ConsoleIf for StubPmap {
 }
 impl tx_hal::SmpIf for StubPmap {}
 
-impl TimeIf for StubPmap {
+impl MonotonicCounterIf for StubPmap {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+impl DeadlineTimerIf for StubPmap {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for StubPmap {}
 
 // -------- Setup ----------------------------------------------------
 

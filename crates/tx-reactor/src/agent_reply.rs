@@ -87,7 +87,7 @@ pub type AgentReplyOutcome = Result<DelegateReply, AbortReason>;
 /// on next post, and the parked event remains in the queue for a
 /// future consumer. Phase 4 callers in `fault_script` couple the
 /// drop with the `AgentTokenGuard`'s drop policy
-/// (`CancelOnDrop` → registry `mark_canceled` fires the `Abort`).
+/// (`CancelOnDrop` → registry `delegate cancel transition` fires the `Abort`).
 pub fn await_agent_reply<'a>(
     token_id: DelegateTokenId,
     mailbox: &'a TaskMailbox,
@@ -154,7 +154,8 @@ impl<'a> Future for AwaitAgentReply<'a> {
                     // honest if a new variant lands later.
                     MailboxEvent::SourceFired { .. }
                     | MailboxEvent::SignalDelivered { .. }
-                    | MailboxEvent::TimerFired { .. } => {
+                    | MailboxEvent::TimerFired { .. }
+                    | MailboxEvent::SignalTimerFired { .. } => {
                         unreachable!(
                             "agent_event_matches must not return true for non-agent events"
                         )

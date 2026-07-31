@@ -138,10 +138,7 @@ pub(crate) fn lint_invariants_v4_vocabulary(root: &Path) -> Result<()> {
     } else {
         "ok"
     };
-    println!(
-        "total v4 identifiers: {:>4}  (ceiling {})  {}",
-        total, MAX_V4_VOCABULARY, status
-    );
+    println!("total v4 identifiers: {total:>4}  (ceiling {MAX_V4_VOCABULARY})  {status}");
 
     // Show first 20 hits for triage
     if !hits.is_empty() {
@@ -261,10 +258,7 @@ pub(crate) fn lint_invariants_step_no_await(root: &Path) -> Result<()> {
     } else {
         "ok"
     };
-    println!(
-        ".await in step fn bodies: {:>4}  (ceiling {})  {}",
-        count, MAX_AWAIT_IN_STEP, status
-    );
+    println!(".await in step fn bodies: {count:>4}  (ceiling {MAX_AWAIT_IN_STEP})  {status}");
 
     for v in &violations {
         println!("  {v}");
@@ -352,10 +346,7 @@ pub(crate) fn lint_invariants_step_sync_signature(root: &Path) -> Result<()> {
     } else {
         "ok"
     };
-    println!(
-        "async step fn signatures: {:>4}  (ceiling {})  {}",
-        count, MAX_ASYNC_STEP_SIG, status
-    );
+    println!("async step fn signatures: {count:>4}  (ceiling {MAX_ASYNC_STEP_SIG})  {status}");
 
     for v in &violations {
         println!("  {v}");

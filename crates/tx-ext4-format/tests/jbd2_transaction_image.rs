@@ -1,0 +1,38 @@
+use tx_ext4_format::journal::{
+    Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
+    JBD2_MAGIC,
+};
+
+#[test]
+fn transaction_image_encodes_descriptor_metadata_and_commit() {
+    let mut escaped = [0u8; JBD2_BLOCK_SIZE];
+    escaped[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    escaped[4] = 0xA5;
+    let ordinary = [0x5A; JBD2_BLOCK_SIZE];
+    let image = Jbd2TransactionImage::encode_legacy(
+        77,
+        [0x44; 16],
+        vec![
+            Jbd2MetadataUpdate::new(9, escaped),
+            Jbd2MetadataUpdate::new(13, ordinary),
+        ],
+    )
+    .unwrap();
+
+    let descriptor = Jbd2Descriptor::parse_legacy(&image.descriptor).unwrap();
+    assert_eq!(descriptor.header.sequence, 77);
+    assert_eq!(descriptor.tags.len(), 2);
+    assert_eq!(descriptor.tags[0].target_block, 9);
+    assert!(descriptor.tags[0].escaped);
+    assert_eq!(descriptor.tags[0].uuid, Some([0x44; 16]));
+    assert_eq!(descriptor.tags[1].target_block, 13);
+    assert!(descriptor.tags[1].same_uuid);
+    assert!(descriptor.tags[1].last);
+    assert_eq!(image.metadata_blocks[0][..4], [0; 4]);
+    assert_eq!(image.metadata_blocks[0][4], 0xA5);
+    assert_eq!(image.metadata_blocks[1], ordinary);
+    assert_eq!(
+        Jbd2Commit::parse(&image.commit).unwrap().header.sequence,
+        77
+    );
+}

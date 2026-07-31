@@ -17,25 +17,93 @@ use crate::adapter::reactor_entry::{
     lookup_source, ActiveWait, MailboxEvent, SubscriberId, TaskMailbox, WaitSource,
 };
 use crate::adapter::step_engine::{InterestMask, WaitSourceId};
+use tx_services::time::{
+    DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle, TimerGuard, TimerRole, TimerTarget,
+    TimerToken,
+};
 
 use super::SyscallCtx;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum WaitSourceDeadline {
-    Source,
-    Deadline,
-    NotInstalled,
+pub(super) fn deadline_timer(
+    ctx: &SyscallCtx<'_>,
+    deadline_ns: u64,
+) -> Option<DeadlineTimerFuture> {
+    ctx.timer_registrar
+        .as_ref()
+        .map(|registrar| DeadlineTimerFuture::new(registrar.clone(), deadline_ns))
 }
 
-pub(super) async fn await_wait_source(
+pub(super) struct DeadlineTimerFuture {
+    registrar: DeadlineRegistrarHandle,
+    deadline_ns: u64,
+    mailbox: Arc<TaskMailbox>,
+    guard: Option<TimerGuard>,
+    token: Option<TimerToken>,
+}
+
+impl DeadlineTimerFuture {
+    fn new(registrar: DeadlineRegistrarHandle, deadline_ns: u64) -> Self {
+        Self {
+            registrar,
+            deadline_ns,
+            mailbox: Arc::new(TaskMailbox::new()),
+            guard: None,
+            token: None,
+        }
+    }
+}
+
+impl Unpin for DeadlineTimerFuture {}
+
+impl Future for DeadlineTimerFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        this.mailbox.register_waker(cx.waker().clone());
+        if this.guard.is_none() {
+            let guard = this
+                .registrar
+                .register_deadline(
+                    DeadlineNs::new(this.deadline_ns),
+                    TimerRole::DeadlineAbort,
+                    TimerTarget::TaskMailbox(Arc::downgrade(&this.mailbox)),
+                )
+                .expect("deadline registrar should accept task-mailbox deadline");
+            this.token = Some(guard.token());
+            this.guard = Some(guard);
+        }
+
+        while let Some(event) = this.mailbox.poll() {
+            if let MailboxEvent::TimerFired { token } = event {
+                if Some(token) == this.token {
+                    this.guard = None;
+                    this.token = None;
+                    this.mailbox.clear_waker();
+                    return Poll::Ready(());
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+pub(super) async fn await_wait_endpoint(
     ctx: &SyscallCtx<'_>,
-    source: WaitSourceId,
+    endpoint: &(impl tx_substrate::wake::WaitEndpoint + ?Sized),
     interests: InterestMask,
 ) {
     let Some(mailbox) = ctx.mailbox.as_ref() else {
         return;
     };
-    await_wait_source_on_mailbox(mailbox, source, interests).await;
+    await_wait_source_handle_on_mailbox(
+        mailbox,
+        endpoint.source(),
+        endpoint.source_id(),
+        interests,
+    )
+    .await;
 }
 
 /// Atomically install a wait-source subscription while rechecking the
@@ -126,7 +194,8 @@ where
 
 pub(super) async fn await_any_wait_source(
     ctx: &SyscallCtx<'_>,
-    sources: &[(WaitSourceId, InterestMask)],
+    sources: &[(WaitSourceId, InterestMask, Option<Arc<WaitSource>>)],
+    deadline_ns: Option<u64>,
 ) -> bool {
     let Some(mailbox) = ctx.mailbox.as_ref() else {
         return false;
@@ -135,11 +204,17 @@ pub(super) async fn await_any_wait_source(
     let generation = mailbox.next_generation();
     let mut registrations = Vec::new();
     let mut active = Vec::new();
-    for (source, interests) in sources.iter().copied() {
+    for (source, interests, endpoint) in sources {
+        let source = *source;
+        let interests = *interests;
         if source.raw() == 0 || interests.raw() == 0 {
             continue;
         }
-        let Some(wait_source) = lookup_source(source) else {
+        let wait_source = if let Some(endpoint) = endpoint {
+            Arc::clone(endpoint)
+        } else if let Some(wait_source) = lookup_source(source) {
+            wait_source
+        } else {
             continue;
         };
         let subscriber = wait_source.register(Arc::downgrade(mailbox), generation, interests);
@@ -154,26 +229,44 @@ pub(super) async fn await_any_wait_source(
         return false;
     }
 
-    MailboxAnySourceFuture {
+    let (timer_guard, deadline_token) = match deadline_ns {
+        Some(deadline_ns) => {
+            let Some(registrar) = ctx.timer_registrar.as_ref() else {
+                return false;
+            };
+            let guard = registrar
+                .register_deadline(
+                    DeadlineNs::new(deadline_ns),
+                    TimerRole::DeadlineAbort,
+                    TimerTarget::TaskMailbox(Arc::downgrade(mailbox)),
+                )
+                .expect("deadline registrar should accept task-mailbox deadline");
+            let token = guard.token();
+            (Some(guard), Some(token))
+        }
+        None => (None, None),
+    };
+
+    let woke = MailboxAnySourceFuture {
         mailbox,
         generation,
         active: &active,
+        _timer_guard: timer_guard,
+        deadline_token,
     }
     .await;
     drop(registrations);
-    true
+    woke
 }
 
-async fn await_wait_source_on_mailbox(
+async fn await_wait_source_handle_on_mailbox(
     mailbox: &Arc<TaskMailbox>,
+    wait_source: Arc<WaitSource>,
     source: WaitSourceId,
     interests: InterestMask,
 ) {
     let generation = mailbox.next_generation();
     let active = ActiveWait::new(generation, source, interests);
-    let Some(wait_source) = lookup_source(source) else {
-        return;
-    };
     let subscriber = wait_source.register(Arc::downgrade(mailbox), generation, interests);
     MailboxSourceFuture { mailbox, active }.await;
     wait_source.unregister(subscriber);
@@ -201,11 +294,12 @@ impl Future for MailboxSourceFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.mailbox.register_waker(cx.waker().clone());
         while let Some(event) = self.mailbox.poll() {
-            if self.active.matches(&event) {
-                self.mailbox.clear_waker();
-                return Poll::Ready(());
-            }
-            if matches!(event, MailboxEvent::SignalDelivered { .. }) {
+            if self.active.matches(&event)
+                || matches!(
+                    event,
+                    MailboxEvent::SignalDelivered { .. } | MailboxEvent::SignalTimerFired { .. }
+                )
+            {
                 self.mailbox.clear_waker();
                 return Poll::Ready(());
             }
@@ -228,19 +322,30 @@ struct MailboxAnySourceFuture<'a> {
     mailbox: &'a TaskMailbox,
     generation: crate::adapter::reactor_entry::WaitGeneration,
     active: &'a [(WaitSourceId, InterestMask)],
+    _timer_guard: Option<TimerGuard>,
+    deadline_token: Option<TimerToken>,
 }
 
 impl Future for MailboxAnySourceFuture<'_> {
-    type Output = ();
+    type Output = bool;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
         self.mailbox.register_waker(cx.waker().clone());
         while let Some(event) = self.mailbox.poll() {
+            if let MailboxEvent::TimerFired { token } = event {
+                if self.deadline_token == Some(token) {
+                    self.mailbox.clear_waker();
+                    return Poll::Ready(false);
+                }
+            }
             if matches_any_wait(self.generation, self.active, &event)
-                || matches!(event, MailboxEvent::SignalDelivered { .. })
+                || matches!(
+                    event,
+                    MailboxEvent::SignalDelivered { .. } | MailboxEvent::SignalTimerFired { .. }
+                )
             {
                 self.mailbox.clear_waker();
-                return Poll::Ready(());
+                return Poll::Ready(true);
             }
         }
         if self.mailbox.take_overflow() {

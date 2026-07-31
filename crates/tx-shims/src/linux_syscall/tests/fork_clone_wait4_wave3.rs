@@ -2,9 +2,25 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
+use alloc::sync::Arc;
 use tx_hal::UserTrapContext;
-use tx_subsystems::process::{step_exit_group, ExitStatus};
+use tx_subsystems::process::{step_exit_group_with_posts, ExitStatus};
 use tx_subsystems::reactor_submit::{self, SubmitChildThreadStatus};
+use tx_subsystems::signal::adapter::step_engine::TaskMailbox;
+
+fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    step_exit_group_with_posts(
+        process,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
+}
 
 /// No-op reactor-submit seam for tests that fork via `sys_clone`.
 /// The blocking-wait tests just need the seam to not panic; they
@@ -57,7 +73,7 @@ fn dispatch_wait4_wnohang_no_zombies_returns_zero() {
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     seed_parent_trap_context(&thread);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(Arc::new(TaskMailbox::new()));
 
     // Fork once.
     let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
@@ -86,15 +102,15 @@ fn dispatch_wait4_wnohang_zombie_ready_reaps_and_returns_pid() {
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     seed_parent_trap_context(&thread);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(Arc::new(TaskMailbox::new()));
 
     let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
     let child = proc_cap.children()[0].clone();
     let child_pid = child.pid.0 as i64;
 
-    // Zombify the child via step_exit_group.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    // Zombify the child via explicit no-context group exit.
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     assert!(child.is_zombie());
 
     let req = SyscallRequest::new(NR_WAIT4, [(-1i64) as u64, 0, WNOHANG as u64, 0, 0, 0]);
@@ -125,7 +141,7 @@ fn dispatch_wait4_wnohang_writes_status_word_for_exited() {
     let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
     let child = proc_cap.children()[0].clone();
 
-    step_exit_group(&child, ExitStatus::Exited(42));
+    finish_process_group_for_test(&child, ExitStatus::Exited(42));
 
     let mut wstatus: i32 = -1;
     let wstatus_addr = &mut wstatus as *mut i32 as u64;
@@ -178,7 +194,7 @@ fn dispatch_wait4_specific_pid_skips_other_zombies() {
         .clone();
 
     // Zombify B; A still alive.
-    step_exit_group(&child_b, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child_b, ExitStatus::Exited(0));
     assert!(child_b.is_zombie());
     assert!(!child_a.is_zombie());
 
@@ -194,7 +210,7 @@ fn dispatch_wait4_specific_pid_skips_other_zombies() {
     );
 
     // Now zombify A; call wait4(A.pid, ...) again → Return(A.pid).
-    step_exit_group(&child_a, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child_a, ExitStatus::Exited(0));
     let req = SyscallRequest::new(NR_WAIT4, [child_a_pid as u64, 0, WNOHANG as u64, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(child_a_pid));
@@ -202,7 +218,7 @@ fn dispatch_wait4_specific_pid_skips_other_zombies() {
 
 /// Blocking wait4 — load-bearing test. Fork a child; spawn a host
 /// driver future that polls `sys_wait4(-1, NULL, 0, NULL)`. First
-/// poll → Pending (no zombie). Manually call `step_exit_group` on
+/// poll → Pending (no zombie). Manually call group exit on
 /// the child (which routes through `post_sigchld_to_parent` and
 /// fires the parent's `exit_source` channel). Subsequent polls →
 /// Ready with the child's pid.
@@ -213,7 +229,7 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     seed_parent_trap_context(&thread);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(Arc::new(TaskMailbox::new()));
 
     let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
@@ -232,19 +248,18 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     let fut = dispatch::<ShimsTestPmap>(req, &ctx);
     let mut pinned = Box::pin(fut);
 
-    // First poll: no zombie ready, parks on exit_source via
-    // wait_source::wait_on_token.
+    // First poll: no zombie ready, parks on the registered exit_source.
     let first = pinned.as_mut().poll(&mut cx);
     assert!(
         matches!(first, Poll::Pending),
         "blocking wait4 with no ready zombie should park; got {first:?}"
     );
 
-    // Now zombify the child. step_exit_group →
-    // post_sigchld_to_parent → parent.fire_exit_source(...) — fires
-    // the EXIT_SOURCE_CHILD_ZOMBIFIED bit on the parent's channel,
-    // which wakes the WaitFuture.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    // Now zombify the child. group exit →
+    // post_sigchld_to_parent → parent.fire_exit_source_with_post(...) — fires
+    // the EXIT_SOURCE_CHILD_ZOMBIFIED bit on the parent's wait source,
+    // which wakes the registered-source future.
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     assert!(child.is_zombie());
 
     // Spin-poll a bounded number of times so a stuck future fails
@@ -282,7 +297,7 @@ fn dispatch_wait4_rusage_nonzero_writes_zeroed_rusage() {
     let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
     let child = proc_cap.children()[0].clone();
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     let mut rusage = [0xa5u8; 256];
     let req = SyscallRequest::new(
@@ -372,7 +387,7 @@ fn dispatch_wait4_pgid_selector_picks_grouped_zombie() {
     let child_pid_i64 = child.pid.0 as i64;
     let child_pgid = child.pgrp_cap().pgid.0 as i64;
 
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     assert!(child.is_zombie());
 
     // pid = -(pgid). The selector becomes Pgrp(child_pgid). Since

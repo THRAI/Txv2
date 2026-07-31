@@ -95,10 +95,7 @@ impl UserPageGiftSlot {
             }
         };
         if matches!(outcome, StepOutcome::Done(_)) {
-            notification::notify_readable(
-                &self.payload.reader_wait_channel,
-                &self.payload.reader_wait_source,
-            );
+            notification::notify_readable(&self.payload.reader_wait_source);
         }
         outcome
     }
@@ -112,10 +109,7 @@ impl UserPageGiftSlot {
             let mut ring = self.payload.ring.lock();
             ring.release_user_page_gift_slot();
         }
-        notification::notify_writable(
-            &self.payload.writer_wait_channel,
-            &self.payload.writer_wait_source,
-        );
+        notification::notify_writable(&self.payload.writer_wait_source);
     }
 }
 
@@ -146,7 +140,7 @@ pub fn step_reserve_user_page_gift_slot(
     if nonblocking {
         return StepOutcome::Err(step_engine::Errno::EAGAIN);
     }
-    notification::yield_until_writable(payload.writer_wait_source_id)
+    notification::yield_until_writable(payload.writer_endpoint())
 }
 
 pub fn step_push_user_page_gift(
@@ -167,14 +161,11 @@ pub fn step_push_user_page_gift(
     match ring.push_user_page_gift(gift, packet_mode) {
         Ok(()) => {
             drop(ring);
-            notification::notify_readable(
-                &payload.reader_wait_channel,
-                &payload.reader_wait_source,
-            );
+            notification::notify_readable(&payload.reader_wait_source);
             step_engine::done_bytes(len)
         }
         Err(_gift) if nonblocking => step_engine::eagain(),
-        Err(_gift) => notification::wait_until_writable(payload.writer_wait_source_id),
+        Err(_gift) => notification::wait_until_writable(payload.writer_endpoint()),
     }
 }
 
@@ -186,7 +177,7 @@ pub fn step_pop_user_page_gift(
     let mut ring = payload.ring.lock();
     if let Some(buf) = ring.pop_front_user_page_gift() {
         drop(ring);
-        notification::notify_writable(&payload.writer_wait_channel, &payload.writer_wait_source);
+        notification::notify_writable(&payload.writer_wait_source);
         return match buf.storage {
             PipeStorage::UserPageGift(gift) => StepOutcome::Done(Some(gift)),
             PipeStorage::AnonPage(_) | PipeStorage::PageBackedLease(_) => StepOutcome::Done(None),
@@ -202,5 +193,5 @@ pub fn step_pop_user_page_gift(
     if nonblocking {
         return StepOutcome::Err(step_engine::Errno::EAGAIN);
     }
-    notification::yield_until_readable(payload.reader_wait_source_id)
+    notification::yield_until_readable(payload.reader_endpoint())
 }

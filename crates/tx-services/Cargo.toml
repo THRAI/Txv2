@@ -5,7 +5,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+tx-hal = { path = "../tx-hal" }
+tx-substrate = { path = "../tx-substrate" }
+tx-time = { path = "../tx-time" }
+
+[features]
+default = []
+test-support = ["tx-time/test-support"]
+
 [lib]
 path = "src/lib.rs"
-test = false
+test = true
 doctest = false
+
+[lints]
+workspace = true

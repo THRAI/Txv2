@@ -217,7 +217,7 @@ tx-observe-types  (no deps; defines Pod-marked POD structs)
        ↑
        ├── tx-hal  (defines Pod, ObserverIf; depends only on core types)
        │   ↑
-       │   tx-observe  (depends on tx-hal for Pod/ObserverIf/PercpuIf/HartLocal/TimeIf
+       │   tx-observe  (depends on tx-hal for Pod/ObserverIf/PercpuIf/HartLocal/MonotonicCounterIf
        │              + tx-observe-types for record shapes)
        │   ↑
        │   ├── tx-substrate  (calls tx_observe::emit_* at substrate convergence points)

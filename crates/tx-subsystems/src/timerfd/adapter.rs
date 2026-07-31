@@ -1,9 +1,7 @@
 //! Substrate / reactor adapter for timerfd.
 //!
-//! Two `#[platform_adapter]`-marked modules: step_engine (zone
-//! allocation, step outcomes, WaitSource) and wait_routing (Channel
-//! for legacy coexistence).  Mirrors the pipe / signalfd / eventfd
-//! adapters.
+//! Two `#[platform_adapter]`-marked modules: step_engine (zone allocation,
+//! step outcomes, WaitSource) and wait_routing (mailbox notify helpers).
 
 use tx_platform_adapter::platform_adapter;
 
@@ -22,11 +20,7 @@ pub mod step_engine {
         WaitSourceId, YieldShape,
     };
     pub use tx_substrate::wake::WaitSource;
-    pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, CoLocatedEntity, Dead, Entity, IdentRef,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, Weak, Zone,
-        ZoneAllocated, ZoneError,
-    };
+    pub use tx_substrate::zone::{sign, Cap, Weak, Zone, ZoneAllocated, ZoneError};
 
     pub type ByteOutcome = StepOutcome<usize, ByteProgress>;
 
@@ -57,16 +51,10 @@ pub mod step_engine {
     apis = ["wake"],
     reason = "wrap WaitSource registration and v3 mailbox notify for timerfd"
 )]
-#[platform_adapter(
-    platform = "reactor",
-    domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as timerfd legacy wakeup verbs (D2 coexistence)"
-)]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource};
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(source_id);
@@ -78,11 +66,14 @@ pub mod wait_routing {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
-        tx_reactor::wait::fire_legacy(channel, mask_bits)
-    }
-
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+    pub fn notify_source_with_post<F>(source: &Arc<WaitSource>, mask_bits: u64, mut post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        source.notify_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            MailboxSchedulerHint::Normal,
+            |mailbox, event, _hint| post(mailbox, event),
+        );
     }
 }

@@ -9,10 +9,13 @@ use core::marker::PhantomData;
 
 use smoltcp::time::Instant;
 use tx_hal::TxPlatform;
+use tx_services::time::{timekeeper_clock, ClockRead};
+use tx_substrate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_substrate::SpinMutex;
 use tx_subsystems::net::delegate::{
-    net_delegate_kick_tick, net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver,
-    NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
+    net_delegate_kick_tick_with_post, net_delegate_task_loop_owned_with_deadline_hook,
+    NetDelegateDriver, NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm,
+    NetDelegateTimerWake,
 };
 #[cfg(test)]
 use tx_subsystems::net::device::VIRTIO_NET0_DEVICE;
@@ -159,34 +162,14 @@ fn publish_boot_net_device_to_namespace(
     let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
 }
 
-impl BootNetRuntime {
-    /// Cross-feed NDP learning to the namespace's iface for the SAME netdev.
-    ///
-    /// The boot lane drains the shared RX queue into its own v4-only iface,
-    /// but external v6 TX/pending live on the namespace's
-    /// `ensure_ether_iface_for_link` iface — without this, an NA lands in the
-    /// boot iface's table and the namespace iface re-solicits forever.
-    /// `learn_ndisc_from_dispatch` learns without replying (no guard), so the
-    /// boot iface remains the only NS responder.
-    fn cross_feed_ndisc(&self, dispatch: &PacketDispatch, now: Instant) {
-        for iface in initial_net_namespace_payload().ether_ifaces_snapshot() {
-            if iface.netdev.devt == self.ether_iface.netdev.devt {
-                iface.learn_ndisc_from_dispatch(dispatch, now);
-            }
-        }
-    }
-}
-
 impl PacketSource for BootNetRuntime {
     fn next_packet(&self) -> Option<PacketDispatch> {
         let frame = self.ether_iface.netdev.ops.receive()?;
-        let dispatch = self.ether_iface.process_frame_at(
+        Some(self.ether_iface.process_frame_at(
             frame,
             Instant::ZERO,
             Option::<&tx_subsystems::execution::Guard<'_>>::None,
-        );
-        self.cross_feed_ndisc(&dispatch, Instant::ZERO);
-        Some(dispatch)
+        ))
     }
 
     fn next_packet_at(
@@ -195,9 +178,7 @@ impl PacketSource for BootNetRuntime {
         guard: &tx_subsystems::execution::Guard<'_>,
     ) -> Option<PacketDispatch> {
         let frame = self.ether_iface.netdev.ops.receive()?;
-        let dispatch = self.ether_iface.process_frame_at(frame, now, Some(guard));
-        self.cross_feed_ndisc(&dispatch, now);
-        Some(dispatch)
+        Some(self.ether_iface.process_frame_at(frame, now, Some(guard)))
     }
 }
 
@@ -247,7 +228,7 @@ impl<P: TxPlatform> BootNetDelegateDriver<P> {
 
 impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
     fn now(&self) -> Instant {
-        let micros = P::read_ns() / 1_000;
+        let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
         Instant::from_micros(micros.min(i64::MAX as u64) as i64)
     }
 
@@ -273,6 +254,15 @@ impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
 
     fn loopback_budget(&self) -> LoopbackPollBudget {
         LoopbackPollBudget::default()
+    }
+
+    fn post_net_mailbox_ref_event(
+        &self,
+        mailbox: &TaskMailbox,
+        event: MailboxEvent,
+        hint: MailboxSchedulerHint,
+    ) -> bool {
+        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(mailbox, event, hint)
     }
 }
 
@@ -349,7 +339,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
-                boot_net_deadline_task(runtime),
+                boot_net_deadline_task::<P>(runtime),
                 tx_reactor::InitialSchedMeta::kernel()
                     .pinned()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
@@ -362,7 +352,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return Some(runtime);
         }
 
-        let now_ns = P::read_ns();
+        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
         let smoltcp_now = instant_from_ns(now_ns);
         let runtime = BOOT_REACTOR.with(|reactor| {
             let runtime: &'static BootNetRuntime = Box::leak(Box::new(BootNetRuntime::new(
@@ -372,22 +362,6 @@ impl<P: TxPlatform> CoreInit<P> {
             )));
             runtime
         })?;
-
-        // Static ARP for the SLIRP gateway (10.0.2.2 -> 52:55:0a:00:02:02):
-        // dynamic ARP replies are learned by the per-namespace device iface,
-        // not this one, so without this the SYN is dropped pending resolution
-        // and re-ARPs forever. Harmless for loopback-only boots (never routed).
-        runtime.ether_iface.install_static_arp(
-            BOOT_ETH_GATEWAY,
-            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]),
-        );
-        // P2-S6: SLIRP's DNS server (10.0.2.3) uses the same synthetic-MAC
-        // convention as the gateway; the static entry unblocks the first
-        // query (ARP learning hardening is P4/D10).
-        runtime.ether_iface.install_static_arp(
-            Ipv4Address::new([10, 0, 2, 3]),
-            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x03]),
-        );
 
         let mut slot = BOOT_NET_RUNTIME.lock();
         if let Some(existing) = *slot {
@@ -410,7 +384,7 @@ fn instant_from_ns(ns: u64) -> Instant {
     Instant::from_micros(micros.min(i64::MAX as u64) as i64)
 }
 
-async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
+async fn boot_net_deadline_task<P: TxPlatform>(runtime: &'static BootNetRuntime) {
     loop {
         let Some(arm) = runtime.current_deadline_arm() else {
             let _ = runtime.deadline_channel.wait(DEADLINE_UPDATED).await;
@@ -434,7 +408,13 @@ async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
                     tick_fired: true,
                 };
                 if runtime.consume_timer_wake(wake) {
-                    net_delegate_kick_tick();
+                    net_delegate_kick_tick_with_post(|mailbox, event| {
+                        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(
+                            mailbox,
+                            event,
+                            MailboxSchedulerHint::Normal,
+                        )
+                    });
                 }
             }
             tx_reactor::wait::WaitOutcome::Ready

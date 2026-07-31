@@ -1,6 +1,6 @@
 //! AddressSpace identity and read accessors.
 
-use crate::vm::adapter::step_engine::{epoch_mod as epoch, Cap, Zone, ZoneAllocated};
+use crate::vm::adapter::step_engine::{borrow_current_guard, guard, Cap, Zone, ZoneAllocated};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tx_hal::PmapIf;
@@ -57,7 +57,7 @@ pub struct AddressSpace {
 
 impl AddressSpace {
     fn recipe_guard() -> step_engine::Guard<'static> {
-        epoch::borrow_current_guard().unwrap_or_else(epoch::guard)
+        borrow_current_guard().unwrap_or_else(guard)
     }
 
     pub fn new_for_platform<P: PmapIf>() -> Result<Self, VmPmapError> {

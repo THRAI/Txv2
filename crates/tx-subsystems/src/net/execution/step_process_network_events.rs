@@ -1,26 +1,21 @@
-use alloc::vec::Vec;
-use smoltcp::time::{Duration, Instant};
+use smoltcp::time::Instant;
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{
-    NetworkPublish, NetworkPublishTarget, PacketDispatch, PacketSource, TcpPacketEvent,
-    UdpPacketEvent,
+    NetworkPublish, PacketDispatch, PacketSource, TcpPacketEvent, UdpPacketEvent,
 };
-use crate::net::protocol::{
-    is_first_syn, listener_accepts_incoming, promote_connected_stream_and_publish_accept,
-    Icmpv4Event, LoopbackIface, SmoltcpTcpSegment,
-};
+use crate::net::protocol::{Icmpv4Event, LoopbackIface};
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    ConnectionKey, Ipv4Address, RecvWireSet, SocketIdentity, SocketKind, SocketProtocol,
-    TcpBacklogEntry, TcpBacklogRetransmitOutcome, TcpState, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    ConnectionKey, Ipv4Address, SocketAcceptEntry, SocketIdentity, SocketProtocol,
+    TcpBacklogRetransmitOutcome,
 };
 use tx_substrate::zone::Cap;
 
-use super::step_send::deliver_raw_ipv6_packet_to_table;
 use super::step_tcp_backlog_cleanup::{cleanup_tcp_backlog_for_listener, TcpBacklogCleanupOutcome};
 use super::step_tcp_backlog_poll::poll_tcp_backlog_for_listener_loopback;
 
@@ -56,11 +51,12 @@ pub fn step_process_network_events(
     // reserve
     // commit
     // publish
-    step_process_network_events_in_namespace_at(
+    step_process_network_events_in_namespace_at_with_post(
         source,
         initial_net_namespace_payload(),
         Instant::ZERO,
         guard,
+        |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
     )
 }
 
@@ -74,7 +70,13 @@ pub fn step_process_network_events_at(
     // reserve
     // commit
     // publish
-    step_process_network_events_in_namespace_at(source, initial_net_namespace_payload(), now, guard)
+    step_process_network_events_in_namespace_at_with_post(
+        source,
+        initial_net_namespace_payload(),
+        now,
+        guard,
+        |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
+    )
 }
 
 pub fn step_process_network_events_in_namespace_at(
@@ -83,6 +85,25 @@ pub fn step_process_network_events_in_namespace_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkStepOutcome> {
+    step_process_network_events_in_namespace_at_with_post(
+        source,
+        net_namespace,
+        now,
+        guard,
+        |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
+    )
+}
+
+pub fn step_process_network_events_in_namespace_at_with_post<F>(
+    source: &dyn PacketSource,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    now: Instant,
+    guard: &Guard<'_>,
+    mut post: F,
+) -> StepOutcome<NetworkStepOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -99,33 +120,27 @@ pub fn step_process_network_events_in_namespace_at(
 
         match packet {
             PacketDispatch::Tcp(event) => {
-                if let Some(targets) = process_tcp_event(table, &net_namespace, event, now, guard) {
+                if let Some((socket, publish)) =
+                    process_tcp_event(table, &net_namespace, event, guard)
+                {
                     outcome.sockets_touched += 1;
-                    for target in targets {
-                        outcome.wakes_fired += target.publish();
-                    }
+                    outcome.wakes_fired += publish
+                        .publish_to_with_post(&socket, |mailbox, event| post(mailbox, event));
                 }
             }
             PacketDispatch::Udp(event) => {
                 if let Some((socket, publish)) = process_udp_event(table, event, guard) {
                     outcome.sockets_touched += 1;
-                    outcome.wakes_fired += publish.publish_to(&socket);
+                    outcome.wakes_fired += publish
+                        .publish_to_with_post(&socket, |mailbox, event| post(mailbox, event));
                 }
             }
             PacketDispatch::Icmp(event) => {
                 if let Some((socket, publish)) = process_icmp_event(table, event, guard) {
                     outcome.sockets_touched += 1;
-                    outcome.wakes_fired += publish.publish_to(&socket);
+                    outcome.wakes_fired += publish
+                        .publish_to_with_post(&socket, |mailbox, event| post(mailbox, event));
                 }
-            }
-            // IPv6 V1b: raw ICMPv6 (ping6 echo replies) fans out to matching
-            // raw-icmp6 sockets. `deliver_raw_ipv6_packet_to_table` publishes
-            // readiness to each target internally (shared with the send path).
-            PacketDispatch::Icmp6(packet) => {
-                let packet_type = packet.payload.first().copied();
-                let protocol = packet.next_header;
-                let dst = packet.dst;
-                deliver_raw_ipv6_packet_to_table(table, protocol, dst, packet_type, packet, guard);
             }
             PacketDispatch::Unsupported | PacketDispatch::Malformed => {}
         }
@@ -289,159 +304,53 @@ fn earliest_deadline(current: Option<Instant>, candidate: Instant) -> Option<Ins
 
 fn process_tcp_event(
     table: &SocketTable,
-    _net_namespace: &PayloadCap<NetNamespacePayload>,
+    net_namespace: &PayloadCap<NetNamespacePayload>,
     event: TcpPacketEvent,
-    now: Instant,
     guard: &Guard<'_>,
-) -> Option<Vec<NetworkPublishTarget>> {
+) -> Option<(Cap<SocketIdentity>, NetworkPublish)> {
     let key = ConnectionKey::new(event.dst, event.src);
     if let Some(socket) = table.lookup_tcp_connection(key, guard) {
-        // P2-S7 hardening (P1-S4 race family): observe(guard) before any
-        // payload access — the socket may be concurrently close-retired.
-        let ident = socket.downgrade().observe(guard)?;
-        let payload = ident.acquire_operational()?;
-        // Established-connection RX feeds smoltcp: seq/ack/checksum are the
-        // state machine's verdict, not hand bookkeeping. Events without a
-        // parsed segment (hand-built) cannot enter an established
-        // connection and are dropped.
-        let segment = event.segment.as_ref()?;
-        return Some(feed_tcp_segment(
-            table,
-            &socket,
-            &payload,
-            segment,
-            event.urgent,
-            guard,
-        ));
-    }
-
-    // No connection matched: only checksum-verified parsed segments may
-    // participate in handshakes (hand-built events cannot).
-    let segment = event.segment.as_ref()?;
-
-    // P2-S3: real inbound handshake (mirror of the loopback
-    // `process_first_syn_for_listener` flow). The child is NOT inserted
-    // into the connections table here — it lives in the listener's
-    // connecting backlog until the final ACK promotes it (loopback
-    // parity); mid-handshake segments route via the backlog below.
-    let listener = table.lookup_tcp_listener_dual_stack_endpoint(event.dst, guard)?;
-    let listener_ident = listener.downgrade().observe(guard)?;
-    let listener_payload = listener_ident.acquire_operational()?;
-    if !listener_accepts_incoming(&listener_payload, event.dst) {
-        return None;
-    }
-
-    if let Some(child) = listener_payload.connecting_child(event.dst, event.src) {
-        // Half-open child exists: the final ACK completes the handshake
-        // (feed → connected edge → accept promotion); a retransmitted SYN
-        // re-queues the SYN-ACK inside smoltcp. Either way, feed it.
-        let child_ident = child.downgrade().observe(guard)?;
-        let child_payload = child_ident.acquire_operational()?;
-        return Some(feed_tcp_segment(
-            table,
-            &child,
-            &child_payload,
-            segment,
-            event.urgent,
-            guard,
-        ));
-    }
-
-    if !is_first_syn(segment) {
-        return None;
-    }
-
-    let options = listener_payload.with_options(Clone::clone);
-    let child = registry::create_socket_in_namespace_with_family(
-        SocketKind::Tcp,
-        listener_payload.family(),
-        options,
-        listener_payload.net_namespace(),
-    )
-    .ok()?;
-    let child_payload = child.acquire_operational()?;
-    child_payload.with_protocol_mut(|protocol| {
-        *protocol = SocketProtocol::Tcp(TcpState::Connecting {
-            local: event.dst,
-            remote: event.src,
-        });
-    });
-    child_payload
-        .raw_tcp_socket()?
-        .listen_endpoint(event.dst)
-        .ok()?;
-    // Backlog full ⇒ enqueue fails ⇒ drop the SYN (Linux semantics: the
-    // client retries; the just-created child is reclaimed with its Cap).
-    listener_payload.enqueue_connecting_entry(TcpBacklogEntry {
-        child: child.clone(),
-        local: event.dst,
-        peer: event.src,
-        created_at: now,
-        deadline: now + Duration::from_millis(TCP_BACKLOG_TIMEOUT_STAGING_MILLIS as u64),
-        attempts: 1,
-    })?;
-    // Feed the SYN: smoltcp moves to SynReceived and queues the SYN-ACK.
-    // The device-TX half-open lane emits it (and its RTO retransmits).
-    Some(feed_tcp_segment(
-        table,
-        &child,
-        &child_payload,
-        segment,
-        event.urgent,
-        guard,
-    ))
-}
-
-/// Feed one checksum-verified segment into a socket's smoltcp state
-/// machine and derive the publish set. Shared by the established branch,
-/// the half-open backlog branch, and the first-SYN feed.
-fn feed_tcp_segment(
-    table: &SocketTable,
-    socket: &Cap<SocketIdentity>,
-    payload: &crate::net::structure::SocketOperationalEvidence,
-    segment: &SmoltcpTcpSegment,
-    urgent: bool,
-    guard: &Guard<'_>,
-) -> Vec<NetworkPublishTarget> {
-    let Some(raw) = payload.raw_tcp_socket() else {
-        return Vec::new();
-    };
-    let bits = raw.process_segment(segment);
-
-    let mut publishes = Vec::new();
-    if bits.connected {
-        // Inbound child: flip Connecting→Connected, register the
-        // connection in the table, move the backlog entry to the accept
-        // queue, and publish accept-readiness to the listener. Outbound
-        // client: the enum flip still happens inside, but no listener
-        // matches its ephemeral local port, so this returns None and the
-        // SPACE publish below resumes the parked connect().
-        if let Some(accept_publish) =
-            promote_connected_stream_and_publish_accept(table, socket, payload, guard)
-        {
-            publishes.push(accept_publish);
+        let payload = socket.acquire_operational()?;
+        let mut publish = NetworkPublish::none();
+        let flags = event.flags;
+        let urgent = event.urgent;
+        let ack_bytes = core::cmp::max(1, event.payload_len());
+        if payload.record_recv_payload(event.src, event.dst, event.payload) {
+            publish.recv_has_data = true;
         }
+        if flags.ack && payload.record_send_space(ack_bytes) {
+            publish.send_has_space = true;
+        }
+        publish.urgent = urgent;
+        return Some((socket, publish));
     }
 
-    // P2-S7 hardening: readiness is a field on the identity — read it via
-    // an observed IdentRef, not a bare Cap deref (panics on retired slots).
-    let Some(ident) = socket.downgrade().observe(guard) else {
-        return publishes;
-    };
-    let publish = NetworkPublish {
-        recv_has_data: bits.recv_readable
-            || ident.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
-                && raw.recv_available() > 0,
-        send_has_space: bits.connected || bits.send_writable,
-        recv_broken: bits.broken || bits.recv_closed,
-        send_broken: bits.broken || bits.send_closed,
-        urgent,
-        ..NetworkPublish::none()
-    };
-    if publish.has_any() {
-        publishes.push(NetworkPublishTarget::new(socket.clone(), publish));
+    if event.flags.syn && !event.flags.ack {
+        let socket = table.lookup_tcp_listener_endpoint(event.dst, guard)?;
+        let payload = socket.acquire_operational()?;
+        let options = payload.with_options(Clone::clone);
+        let child = registry::create_connected_stream_for_accept_in_namespace(
+            event.dst,
+            event.src,
+            options,
+            net_namespace.clone(),
+        )
+        .ok()?;
+        table.insert_tcp_connection(key, child.clone()).ok()?;
+        let entry = SocketAcceptEntry {
+            child,
+            local: event.dst,
+            peer: event.src,
+            unix_peer: None,
+        };
+        let mut publish = NetworkPublish::none();
+        if payload.enqueue_accept_entry(entry)? {
+            publish.accept_has_pending = true;
+        }
+        return Some((socket, publish));
     }
-    publishes
+
+    None
 }
 
 fn process_icmp_event(

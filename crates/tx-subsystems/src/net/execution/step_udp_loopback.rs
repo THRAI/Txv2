@@ -4,7 +4,10 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_write_target;
 use crate::net::namespace::initial_loopback_iface;
 use crate::net::protocol::{LoopbackIface, PollContext, UDP_IPV4_MAX_PAYLOAD_BYTES};
-use crate::net::structure::{IpEndpoint, SendRecvFlags, SocketIdentity, SocketProtocol, UdpInner};
+use crate::net::structure::{
+    IpEndpoint, SendRecvFlags, SendWireSet, SocketIdentity, SocketProtocol, UdpInner,
+};
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 use super::step_send::send_flags_error;
 use super::{
@@ -22,25 +25,39 @@ pub struct LoopbackUdpTransferOutcome {
     pub peer_wake_fired: bool,
 }
 
-pub fn step_process_loopback_udp(
+pub fn step_process_loopback_udp_with_post<F>(
     source: &Cap<SocketIdentity>,
     budget: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackUdpTransferOutcome> {
+    post: F,
+) -> StepOutcome<LoopbackUdpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_loopback_udp_on_iface(source, budget, initial_loopback_iface(), guard)
+    step_process_loopback_udp_on_iface_with_post::<F>(
+        source,
+        budget,
+        initial_loopback_iface(),
+        guard,
+        post,
+    )
 }
 
-pub fn step_process_loopback_udp_on_iface(
+pub fn step_process_loopback_udp_on_iface_with_post<F>(
     source: &Cap<SocketIdentity>,
     budget: usize,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackUdpTransferOutcome> {
+    mut post: F,
+) -> StepOutcome<LoopbackUdpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -50,24 +67,43 @@ pub fn step_process_loopback_udp_on_iface(
         return StepOutcome::Done(LoopbackUdpTransferOutcome::default());
     };
 
-    // P1-S4: 单通路——loopback UDP 一律经 lo 队列真包转运（egress 编包
-    // → 队列 → ingress 解析投递），直拷捷径已删除。
-    let mut ctx = PollContext::new_with_table(
-        crate::net::clock::net_now_instant(),
-        source_payload.socket_table(),
-    );
+    if budget > 0 {
+        let mut ctx = PollContext::new_with_table(
+            smoltcp::time::Instant::ZERO,
+            source_payload.socket_table(),
+        );
+        if let Some(outcome) = ctx.poll_udp_loopback_direct_one(source, iface, guard) {
+            let mut source_wake_fired = false;
+            let mut peer_wake_fired = false;
+            for publish in outcome.publishes {
+                source_wake_fired |= publish.publish.send_has_space;
+                peer_wake_fired |= publish.publish.recv_has_data;
+                publish.publish_with_post(&mut post);
+            }
+            return StepOutcome::Done(LoopbackUdpTransferOutcome {
+                tx_packets: outcome.tx_packets,
+                packets_seen: outcome.packets_seen,
+                sockets_touched: outcome.sockets_touched,
+                bytes_moved: outcome.bytes_moved,
+                source_wake_fired,
+                peer_wake_fired,
+            });
+        }
+    }
+    let mut ctx =
+        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
     let mut source_wake_fired = false;
 
     if let Some(publish) = ctx.poll_udp_egress_one(source, iface, guard) {
         source_wake_fired = publish.publish.send_has_space;
-        publish.publish();
+        publish.publish_with_post(&mut post);
     }
 
     let ingress = ctx.poll_udp_ingress(iface, guard, budget);
     let mut peer_wake_fired = false;
     for publish in ingress.publishes {
         peer_wake_fired |= publish.publish.recv_has_data;
-        publish.publish();
+        publish.publish_with_post(&mut post);
     }
 
     StepOutcome::Done(LoopbackUdpTransferOutcome {
@@ -80,36 +116,45 @@ pub fn step_process_loopback_udp_on_iface(
     })
 }
 
-pub fn step_send_udp_loopback_kernel_bytes(
+pub fn step_send_udp_loopback_kernel_bytes_with_post<F>(
     socket: &Cap<SocketIdentity>,
     dst: Option<IpEndpoint>,
     bytes: &[u8],
     flags: SendRecvFlags,
     guard: &Guard<'_>,
-) -> ByteStepOutcome<usize> {
+    post: F,
+) -> ByteStepOutcome<usize>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_send_udp_loopback_kernel_bytes_on_iface(
+    step_send_udp_loopback_kernel_bytes_on_iface_with_post::<F>(
         socket,
         dst,
         bytes,
         flags,
         initial_loopback_iface(),
         guard,
+        post,
     )
 }
 
-pub fn step_send_udp_loopback_kernel_bytes_on_iface(
+pub fn step_send_udp_loopback_kernel_bytes_on_iface_with_post<F>(
     socket: &Cap<SocketIdentity>,
     dst: Option<IpEndpoint>,
     bytes: &[u8],
     flags: SendRecvFlags,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> ByteStepOutcome<usize> {
+    mut post: F,
+) -> ByteStepOutcome<usize>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -175,18 +220,29 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
         return tx_substrate::step::StepOutcome::Err(Errno::EINVAL);
     }
 
-    // P1-S4: 数据报经 lo 队列真包转运（不再查表直塞对端）。同步驱动
-    // 一轮 egress+ingress，保持发送路径的内联时延特性。
-    let mut ctx = PollContext::new_with_table(
-        crate::net::clock::net_now_instant(),
-        source_payload.socket_table(),
-    );
-    if let Some(publish) = ctx.poll_udp_egress_one(socket, iface, guard) {
-        publish.publish();
+    let Some(drain) = source_payload.commit_udp_tx_datagram_sent() else {
+        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
+    };
+    let Some(target) =
+        source_payload
+            .socket_table()
+            .lookup_udp_ingress(source, drain.datagram.dst, guard)
+    else {
+        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
+    };
+    let Some(target_payload) = target.acquire_operational() else {
+        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
+    };
+
+    if target_payload.record_recv_payload(source, drain.datagram.dst, drain.datagram.payload) {
+        target
+            .readiness
+            .fire_recv_with_post(crate::net::structure::RecvWireSet::HAS_DATA, &mut post);
     }
-    let ingress = ctx.poll_udp_ingress(iface, guard, 1);
-    for publish in ingress.publishes {
-        publish.publish();
+    if drain.became_available {
+        socket
+            .readiness
+            .fire_send_with_post(SendWireSet::SPACE, &mut post);
     }
     tx_substrate::step::StepOutcome::Done(reserve.bytes)
 }

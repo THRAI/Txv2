@@ -258,10 +258,7 @@ fn emit_syscall_roundtrip_marker(sysno: u64, name: &[u8]) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            sysno as i64,
-        );
+        observer.debug_counter(name, sysno as i64);
         tx_observe::dump_registered_if_requested();
     }
 }

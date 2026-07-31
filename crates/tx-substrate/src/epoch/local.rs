@@ -6,144 +6,272 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use super::retired::LocalBag;
-
-const PINNINGS_BETWEEN_COLLECT: usize = 128;
+use super::bag::{LocalRetireState, EPOCH_BAG_COUNT};
 
 /// Per-CPU EBR state.
 #[repr(align(64))]
 pub(crate) struct CpuLocalEpochState {
-    /// Set once the CPU has joined the epoch domain.
-    initialized: AtomicBool,
+    membership_and_pins: AtomicUsize,
     /// Zero means quiescent; non-zero means the CPU is inside a guard.
     local_epoch: AtomicU64,
-    /// Number of live guards on this CPU. Only the outermost guard publishes
-    /// `local_epoch`; only the last guard to leave clears it.
-    pin_depth: AtomicUsize,
-    /// Current CPU's Crossbeam-style local deferred-callback bag.
-    bag: UnsafeCell<LocalBag>,
-    /// Number of callbacks owned by this CPU across its local and sealed bags.
-    pending: AtomicUsize,
-    /// Periodic collector trigger, matching Crossbeam's 128 pinnings cadence.
-    pin_count: AtomicUsize,
+    /// True while this CPU mutates its local retirement storage with local
+    /// interrupt admission disabled.
+    retire_active: AtomicBool,
+    /// Debug-only reader accounting stays on the current CPU's cacheline.
+    active_guards: AtomicUsize,
+    /// Set remotely and consumed only by the owning CPU in normal context.
+    drain_requested: AtomicBool,
+    /// True only while an existing pinned reclaim callback runs with local
+    /// execution reopened. It permits callback-owned nested retirement while
+    /// an offline coordinator waits for the outer pin to quiesce.
+    callback_depth: AtomicUsize,
+    /// Current CPU's intrusive retirement bags.
+    retire_state: UnsafeCell<LocalRetireState>,
+    /// Remotely readable occupied epoch for each bag; zero means empty.
+    bag_epochs: [AtomicU64; EPOCH_BAG_COUNT],
+    /// Remotely readable bag node count. Only the owning CPU writes it.
+    bag_retired: AtomicUsize,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum CpuMembership {
+    Offline = 0,
+    Admitting = 1,
+    Online = 2,
+    Draining = 3,
+}
+
+const MEMBERSHIP_BITS: usize = 2;
+const MEMBERSHIP_MASK: usize = (1 << MEMBERSHIP_BITS) - 1;
+const PIN_ONE: usize = 1 << MEMBERSHIP_BITS;
 
 unsafe impl Sync for CpuLocalEpochState {}
 
 impl CpuLocalEpochState {
     pub(crate) const fn new() -> Self {
         Self {
-            initialized: AtomicBool::new(false),
+            membership_and_pins: AtomicUsize::new(CpuMembership::Offline as usize),
             local_epoch: AtomicU64::new(0),
-            pin_depth: AtomicUsize::new(0),
-            bag: UnsafeCell::new(LocalBag::new()),
-            pending: AtomicUsize::new(0),
-            pin_count: AtomicUsize::new(0),
+            retire_active: AtomicBool::new(false),
+            active_guards: AtomicUsize::new(0),
+            drain_requested: AtomicBool::new(false),
+            callback_depth: AtomicUsize::new(0),
+            retire_state: UnsafeCell::new(LocalRetireState::new()),
+            bag_epochs: [const { AtomicU64::new(0) }; EPOCH_BAG_COUNT],
+            bag_retired: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn init(&self) {
+    pub(crate) fn prepare_admission(&self) {
         self.local_epoch.store(0, Ordering::Release);
-        self.pin_depth.store(0, Ordering::Release);
+        self.retire_active.store(false, Ordering::Release);
+        self.active_guards.store(0, Ordering::Release);
+        debug_assert_eq!(self.pin_count(), 0);
+        self.drain_requested.store(false, Ordering::Release);
+        self.callback_depth.store(0, Ordering::Release);
+        self.clear_retire_summary();
         unsafe {
-            *self.bag.get() = LocalBag::new();
+            (*self.retire_state.get()).reset();
         }
-        self.pending.store(0, Ordering::Release);
-        self.pin_count.store(0, Ordering::Release);
-        self.initialized.store(true, Ordering::Release);
     }
 
     pub(crate) fn reset(&self) {
-        self.initialized.store(false, Ordering::Release);
+        self.membership_and_pins
+            .store(CpuMembership::Offline as usize, Ordering::Release);
         self.local_epoch.store(0, Ordering::Release);
-        self.pin_depth.store(0, Ordering::Release);
+        self.retire_active.store(false, Ordering::Release);
+        self.active_guards.store(0, Ordering::Release);
+        self.drain_requested.store(false, Ordering::Release);
+        self.callback_depth.store(0, Ordering::Release);
+        self.clear_retire_summary();
         unsafe {
-            *self.bag.get() = LocalBag::new();
+            (*self.retire_state.get()).reset();
         }
-        self.pending.store(0, Ordering::Release);
-        self.pin_count.store(0, Ordering::Release);
     }
 
     pub(crate) fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
+        self.membership() != CpuMembership::Offline
     }
 
-    /// Pin this CPU-local participant and return `(entered_epoch, outermost)`.
-    ///
-    /// Like Crossbeam's `guard_count`, nested guards only increase the depth.
-    /// The 0 -> 1 transition is the sole publication point for `local_epoch`.
-    pub(crate) fn pin(&self, epoch: u64) -> (u64, bool) {
-        let previous_depth = self
-            .pin_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
-                depth.checked_add(1)
-            })
-            .expect("epoch guard nesting depth overflowed");
-
-        if previous_depth == 0 {
-            debug_assert_eq!(self.local_epoch.load(Ordering::Relaxed), 0);
-            // SeqCst pairs with the domain's guard acquisition fence and keeps
-            // the published epoch visible before protected reads proceed.
-            self.local_epoch.store(epoch, Ordering::SeqCst);
-            (epoch, true)
-        } else {
-            let entered_epoch = self.local_epoch.load(Ordering::Acquire);
-            assert_ne!(
-                entered_epoch, 0,
-                "nested epoch guard found a quiescent CPU-local participant"
-            );
-            (entered_epoch, false)
+    pub(crate) fn membership(&self) -> CpuMembership {
+        match self.membership_and_pins.load(Ordering::Acquire) & MEMBERSHIP_MASK {
+            x if x == CpuMembership::Admitting as usize => CpuMembership::Admitting,
+            x if x == CpuMembership::Online as usize => CpuMembership::Online,
+            x if x == CpuMembership::Draining as usize => CpuMembership::Draining,
+            _ => CpuMembership::Offline,
         }
     }
 
-    /// Unpin one guard. Returns true only for the final 1 -> 0 transition.
-    pub(crate) fn unpin(&self) -> bool {
-        let previous_depth = self
-            .pin_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
-                depth.checked_sub(1)
-            })
-            .expect("epoch guard nesting depth underflowed");
+    pub(crate) fn set_membership(&self, membership: CpuMembership) {
+        debug_assert_eq!(self.pin_count(), 0);
+        self.membership_and_pins
+            .store(membership as usize, Ordering::Release);
+    }
 
-        if previous_depth == 1 {
-            // Release keeps every protected access before the participant is
-            // advertised as quiescent to a concurrent collector.
-            self.local_epoch.store(0, Ordering::Release);
-            true
-        } else {
-            false
+    pub(crate) fn transition_membership(&self, from: CpuMembership, to: CpuMembership) -> bool {
+        let mut current = self.membership_and_pins.load(Ordering::Acquire);
+        loop {
+            if current & MEMBERSHIP_MASK != from as usize {
+                return false;
+            }
+            let next = (current & !MEMBERSHIP_MASK) | to as usize;
+            match self.membership_and_pins.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
         }
     }
 
-    pub(crate) fn is_pinned(&self) -> bool {
-        self.pin_depth.load(Ordering::Relaxed) != 0
+    pub(crate) fn try_pin_online(&self) -> bool {
+        self.try_pin_matching(|membership| membership == CpuMembership::Online)
+    }
+
+    pub(crate) fn try_pin_for_retire(&self) -> bool {
+        self.try_pin_matching(|membership| {
+            membership == CpuMembership::Online
+                || (membership == CpuMembership::Draining && self.callback_active())
+        })
+    }
+
+    fn try_pin_matching(&self, allowed: impl Fn(CpuMembership) -> bool) -> bool {
+        let mut current = self.membership_and_pins.load(Ordering::Acquire);
+        loop {
+            let membership = membership_from_word(current);
+            if !allowed(membership) {
+                return false;
+            }
+            let Some(next) = current.checked_add(PIN_ONE) else {
+                return false;
+            };
+            match self.membership_and_pins.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn unpin(&self) {
+        let previous = self
+            .membership_and_pins
+            .fetch_sub(PIN_ONE, Ordering::AcqRel);
+        debug_assert!(previous >> MEMBERSHIP_BITS > 0, "epoch pin count underflow");
+    }
+
+    pub(crate) fn pin_count(&self) -> usize {
+        self.membership_and_pins.load(Ordering::Acquire) >> MEMBERSHIP_BITS
+    }
+
+    pub(crate) fn request_drain(&self) -> bool {
+        !self.drain_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_drain_request(&self) -> bool {
+        self.drain_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn drain_requested(&self) -> bool {
+        self.drain_requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_callback(&self) {
+        self.callback_depth.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn end_callback(&self) {
+        let previous = self.callback_depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "epoch callback depth underflow");
+    }
+
+    fn callback_active(&self) -> bool {
+        self.callback_depth.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn enter(&self, epoch: u64) {
+        debug_assert_eq!(
+            self.local_epoch.load(Ordering::Relaxed),
+            0,
+            "epoch guards cannot be nested on the same CPU"
+        );
+        // SeqCst pairs with the domain's guard acquisition fence and keeps the
+        // published epoch visible before protected reads proceed.
+        self.local_epoch.store(epoch, Ordering::SeqCst);
+        self.active_guards.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn leave(&self) {
+        self.local_epoch.store(0, Ordering::Release);
+        self.active_guards.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub(crate) fn current(&self) -> u64 {
         self.local_epoch.load(Ordering::Acquire)
     }
 
-    pub(crate) fn note_pin_and_should_collect(&self) -> bool {
-        self.pin_count
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1)
-            % PINNINGS_BETWEEN_COLLECT
-            == 0
+    pub(crate) fn try_begin_retire(&self) -> bool {
+        self.retire_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
-    pub(crate) fn note_retired(&self) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn end_retire(&self) {
+        self.retire_active.store(false, Ordering::Release);
     }
 
-    pub(crate) fn note_reclaimed(&self, count: usize) {
-        self.pending.fetch_sub(count, Ordering::AcqRel);
+    pub(crate) fn retire_active(&self) -> bool {
+        self.retire_active.load(Ordering::Acquire)
     }
 
-    pub(crate) fn retired_count(&self) -> usize {
-        self.pending.load(Ordering::Acquire)
+    pub(crate) fn bag_retired_count(&self) -> usize {
+        self.bag_retired.load(Ordering::Acquire)
     }
 
-    pub(crate) fn bag_ptr(&self) -> *mut LocalBag {
-        self.bag.get()
+    pub(crate) fn can_advance_to(&self, epoch: u64) -> bool {
+        let occupied_epoch =
+            self.bag_epochs[epoch as usize % EPOCH_BAG_COUNT].load(Ordering::Acquire);
+        occupied_epoch == 0 || occupied_epoch == epoch
+    }
+
+    pub(crate) fn publish_retire_summary(&self, state: &LocalRetireState) {
+        for (index, bag) in state.bags.iter().enumerate() {
+            let occupied_epoch = if bag.is_empty() { 0 } else { bag.epoch };
+            self.bag_epochs[index].store(occupied_epoch, Ordering::Release);
+        }
+        self.bag_retired
+            .store(state.retired_count(), Ordering::Release);
+    }
+
+    fn clear_retire_summary(&self) {
+        for epoch in &self.bag_epochs {
+            epoch.store(0, Ordering::Release);
+        }
+        self.bag_retired.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn active_guard_count(&self) -> usize {
+        self.active_guards.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn retire_state_ptr(&self) -> *mut LocalRetireState {
+        self.retire_state.get()
+    }
+}
+
+fn membership_from_word(word: usize) -> CpuMembership {
+    match word & MEMBERSHIP_MASK {
+        x if x == CpuMembership::Admitting as usize => CpuMembership::Admitting,
+        x if x == CpuMembership::Online as usize => CpuMembership::Online,
+        x if x == CpuMembership::Draining as usize => CpuMembership::Draining,
+        _ => CpuMembership::Offline,
     }
 }

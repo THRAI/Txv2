@@ -21,7 +21,7 @@ use crate::process::adapter::step_engine::{
     self, process_spin_mutex, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy,
     ProcessSpinMutex, RawPort, RawQueue, Weak, Zone, ZoneAllocated,
 };
-use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
+use crate::process::adapter::wait_routing::{self, MailboxEvent, TaskMailbox, WaitSource};
 
 use crate::cred::{Cred, CredSnapshot, Gid, Uid};
 use crate::execution::WaitToken;
@@ -55,8 +55,8 @@ pub const EXIT_SOURCE_CHILD_ZOMBIFIED: u64 = 0x1;
 /// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-1`.
 pub const SIGNAL_GENERATED: u64 = 0x1;
 
-/// Per-process exit disposition, populated by `step_exit_group` /
-/// `step_exit_group_with_signal` / the last-thread cascade. Spec
+/// Per-process exit disposition, populated by the group-exit transition,
+/// fatal signal group-exit transition, or the last-thread cascade. Spec
 /// counterpart in `PROCESS_v1` §6.2 ("priority of process exit
 /// status"): both shapes feed into the future `wait(2)` status word.
 ///
@@ -64,7 +64,7 @@ pub const SIGNAL_GENERATED: u64 = 0x1;
 /// only the signum until the fatal-Core action lands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExitStatus {
-    /// Explicit `step_exit_group(int)` exit.
+    /// Explicit group-exit status.
     Exited(i32),
     /// Terminated by a fatal signal (default `Term` action or SIGKILL).
     Signaled(crate::signal::Signum),
@@ -162,7 +162,7 @@ pub struct ProcessIdentity {
     pub(crate) children: ProcessChildren,
     pub(crate) pgrp: ProcessSpinMutex<Cap<ProcessGroup>>,
     /// Process-visible exit disposition. `Some` once the process has
-    /// run `step_exit_group` / `step_exit_group_with_signal` (or the
+    /// run the group-exit / fatal signal group-exit transition (or the
     /// last-thread cascade has fired); otherwise `None`. Discriminates
     /// explicit-int exits from signal-driven termination per
     /// `PROCESS_v1` §6.2.
@@ -238,7 +238,7 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
     }
 
     fn thread_deliverable_signal_pending(thread: &Cap<Self::ThreadIdentity>) -> bool {
-        crate::signal::select_next_signal(thread).is_some()
+        crate::signal::thread_pending_signal_interrupts(thread)
     }
 
     fn thread_signal_interrupts_wait(thread: &Cap<Self::ThreadIdentity>) -> bool {
@@ -349,7 +349,7 @@ impl ProcessIdentity {
         self.children.snapshot()
     }
 
-    /// Read the recorded exit status. `Some` once `step_exit_group`
+    /// Read the recorded exit status. `Some` once group exit
     /// (or last-thread `step_thread_exit`) has run; otherwise `None`.
     pub fn exit_status(&self) -> Option<ExitStatus> {
         *self.exit_status.lock()
@@ -414,56 +414,6 @@ impl ProcessIdentity {
     /// Returns `None` for zombies.
     pub fn threads_snapshot(&self) -> Option<alloc::vec::Vec<Cap<ThreadIdentity>>> {
         self.payload.lock().as_ref().map(|p| p.threads.snapshot())
-    }
-
-    /// Collapse all sibling threads for exec, leaving `initiator`
-    /// as the sole live thread. Returns the number of siblings
-    /// removed, or `None` for zombies.
-    pub async fn collapse_threads_for_exec(
-        &self,
-        initiator: &Cap<ThreadIdentity>,
-    ) -> Option<usize> {
-        let exec = self.begin_exec_transaction()?;
-        let collapsed = self.collapse_threads_for_exec_in(initiator, &exec).await;
-        if collapsed.is_some() {
-            self.clear_exec_group_exit_in(&exec);
-        }
-        collapsed
-    }
-
-    pub async fn collapse_threads_for_exec_in(
-        &self,
-        initiator: &Cap<ThreadIdentity>,
-        exec: &ProcessExecGuard<'_>,
-    ) -> Option<usize> {
-        if !core::ptr::eq(self, exec.process) || *self.lifecycle.lock() != ProcessLifecycle::Execing
-        {
-            return None;
-        }
-        let payload = {
-            let payload_guard = self.payload.lock();
-            match payload_guard.as_ref().cloned() {
-                Some(payload) => payload,
-                None => return None,
-            }
-        };
-        payload.collapse_threads_for_exec(initiator).await
-    }
-
-    /// Clear a completed exec-only GroupExit episode after the new image has
-    /// committed. Ordinary exit-group state is never cleared here; it remains
-    /// authoritative until the last thread publishes process exit.
-    pub fn clear_exec_group_exit_in(&self, exec: &ProcessExecGuard<'_>) {
-        if !core::ptr::eq(self, exec.process) {
-            return;
-        }
-        let Some(payload) = self.payload.lock().as_ref().cloned() else {
-            return;
-        };
-        let mut slot = payload.group_exit.lock();
-        if slot.as_ref().is_some_and(|state| state.is_exec()) {
-            *slot = None;
-        }
     }
 
     /// Snapshot the current address space `Cap`, if the process is
@@ -640,6 +590,13 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().and_then(|p| p.cwd())
     }
 
+    pub fn cwd_binding(&self) -> Option<CwdBinding> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|payload| payload.cwd_binding())
+    }
+
     /// Install `file` at fd `idx` on this process's payload, returning
     /// the previously installed `Cap<OpenFile>` if any. No-op (returns
     /// `None`) for zombies. Passing `file = None` removes the fd from
@@ -661,6 +618,46 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .and_then(|p| p.set_fd(idx, file))
+    }
+
+    /// Atomically remove an fd and its close-on-exec bit, returning the
+    /// detached file capability. This is the close syscall's fd-reuse fence.
+    pub fn take_fd_for_close(&self, idx: u32) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|p| p.take_fd_for_close(idx))
+    }
+
+    /// Atomically detach every currently open fd in an inclusive range and
+    /// clear all close-on-exec state in that range.
+    pub fn take_fds_for_close_range(
+        &self,
+        first: u32,
+        last: u32,
+    ) -> Vec<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.take_fds_for_close_range(first, last))
+            .unwrap_or_default()
+    }
+
+    /// Install a duplicated fd reference. Pipe and socketpair endpoints
+    /// carry fd-table-visible reader/writer counts, so callers that
+    /// bind an already-open `OpenFile` into another fd slot must account
+    /// the new slot before installation.
+    pub fn install_fd_dup_ref(
+        &self,
+        idx: u32,
+        file: Cap<crate::vfs::OpenFile>,
+    ) -> Option<Cap<crate::vfs::OpenFile>> {
+        let payload = self.payload.lock();
+        let Some(payload) = payload.as_ref() else {
+            return None;
+        };
+        incr_pipe_fd_ref(&file);
+        payload.set_fd(idx, Some(file))
     }
 
     /// Allocate the lowest unused fd ≥ 0 without installing anything.
@@ -812,10 +809,10 @@ impl ProcessIdentity {
         }
     }
 
-    /// Internal: snapshot the full close-on-exec set as an owned
-    /// `BTreeSet<u32>`. Returns an empty set for zombies. Used by
-    /// [`crate::process::execution::step_close_cloexec_fds`] during
-    /// exec phase 7 to walk every marked fd.
+    /// Snapshot the full close-on-exec set as an owned `BTreeSet<u32>`.
+    /// Returns an empty set for zombies. Exec uses
+    /// `ProcessExecPrep::prepare_cloexec_close` so this allocation-bearing
+    /// observation helper is never called after PoNR.
     pub fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
         self.payload
             .lock()
@@ -843,16 +840,6 @@ impl ProcessIdentity {
             .as_ref()
             .map(|p| p.open_fds())
             .unwrap_or_default()
-    }
-
-    /// Internal: clear the entire close-on-exec set. Used by
-    /// [`crate::process::execution::step_close_cloexec_fds`] after the
-    /// sweep so future `fcntl(F_SETFD)` calls start from a clean
-    /// state.
-    pub(crate) fn clear_fd_cloexec(&self) {
-        if let Some(payload) = self.payload.lock().as_ref() {
-            payload.clear_fd_cloexec();
-        }
     }
 
     /// Snapshot the current `SigActionEntry` for `sig` from this
@@ -992,14 +979,14 @@ impl ProcessIdentity {
         payload.threads.nth(idx)
     }
 
-    /// Carrier id under which this process's `exit_source` channel is
+    /// Carrier id under which this process's `exit_source` wait source is
     /// registered with the global wait-source resolver. Returns
     /// `None` for zombies (no payload — the channel is unreachable
     /// once the payload has been dropped).
     ///
     /// Wave 2's `sys_wait4` blocking arm pairs this with
     /// [`EXIT_SOURCE_CHILD_ZOMBIFIED`] to build the `WaitToken` it
-    /// awaits via [`crate::wait_source::wait_on_token`].
+    /// resolves through the registered wait-source API.
     pub fn exit_source_id(&self) -> Option<u64> {
         self.payload.lock().as_ref().map(|p| p.exit_source_id())
     }
@@ -1036,45 +1023,24 @@ impl ProcessIdentity {
             .map(|id| WaitToken::new(id, EXIT_SOURCE_CHILD_ZOMBIFIED))
     }
 
-    /// Fire the `exit_source` channel with `mask`, returning the number
-    /// of awaiters released by [`Channel::fire`]. No-op (returns `0`)
-    /// for zombies.
-    ///
-    /// PR-3D-3 (D2/D4 coexistence): also fires the parallel
-    /// [`Self::exit_wait_source`] (the new `Arc<WaitSource>` mailbox
-    /// path) with the same mask reinterpreted as
-    /// [`InterestMask`]. Both fires happen under the same
-    /// payload-lock observation, so the zombie/live edge is
-    /// idempotent on both paths — once the payload drops, neither
-    /// fires (returns 0 / posts 0 events). Double-call on a
-    /// still-live payload re-fires both: that's a property of
-    /// `Channel::fire` (subsequent callers see the latch) and of
-    /// `WaitSource::notify` (re-posts to any subscribers still
-    /// registered). Production callers only invoke this once per
-    /// transition (`post_sigchld_to_parent` runs once per zombify),
-    /// so re-fire is not a concern in practice.
-    pub fn fire_exit_source(&self, mask: Mask) -> usize {
+    /// Fire the exit-source through a caller-provided mailbox post operation.
+    pub fn fire_exit_source_with_post<F>(&self, mask_bits: u64, mut post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         self.payload
             .lock()
             .as_ref()
             .map(|p| {
-                let released = p.exit_source().fire(mask);
-                // PR-3D-3 new path: post `MailboxEvent::SourceFired`
-                // to any v3 caller that registered a `TaskMailbox`
-                // against this process's exit_wait_source. Same
-                // mask bits — the legacy Channel and the new
-                // WaitSource share the bit-namespace
-                // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
-                // bits land in both).
-                wait_routing::notify_v3_source(p.exit_wait_source(), mask.bits());
-                // Phase A (bus wire alignment): set the same mask on
-                // the RawQueue readiness wire so native bus subscribers
-                // (future signalfd, pidfd) wake without going through
-                // the legacy Channel. Level-triggered semantics
-                // (`set` is idempotent); consumers re-read the queue
-                // state via `subscribe` + `try_take_ready`.
+                let released = wait_routing::notify_v3_source_with_post(
+                    p.exit_wait_source(),
+                    mask_bits,
+                    &mut post,
+                );
+                // Phase A (bus wire alignment): set the same mask on the RawQueue
+                // readiness wire so native bus subscribers can re-read level state.
                 // See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-2`.
-                p.exit_source_bus.fire(mask.bits());
+                p.exit_source_bus.fire_with_post(mask_bits, post);
                 released
             })
             .unwrap_or(0)
@@ -1090,6 +1056,18 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.exit_wait_source().clone())
+    }
+
+    /// Endpoint-facing alias for the process exit wait source.
+    ///
+    /// `Arc<WaitSource>` implements `WaitEndpoint`, so callers that only need to
+    /// subscribe should use this name instead of importing process-specific
+    /// `exit_source_id` vocabulary.
+    pub fn exit_endpoint(&self) -> Option<Arc<WaitSource>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.exit_endpoint().clone())
     }
 
     /// Build the process-exported value type that `cred::require_signal_send`
@@ -1155,70 +1133,35 @@ pub struct TargetProcCred {
 /// the existing surface.
 /// Group-exit coordination state (PROCESS_v1 §5).
 pub(crate) struct GroupExitState {
-    status: ProcessSpinMutex<ExitStatus>,
-    /// `true` while this episode is an exec sibling-collapse. A fatal
-    /// process-wide termination can convert it to an ordinary group exit.
-    is_exec: AtomicBool,
-    /// The exec caller survives the collapse and therefore does not arrive at
-    /// the sibling countdown. `None` for an ordinary exit-group episode.
-    exec_initiator_tid: Option<u32>,
-    /// Present only for exec, where the surviving caller must asynchronously
-    /// wait for every sibling to run its own `step_thread_exit`.
-    completion: Option<CountdownCompletion>,
+    pub status: ExitStatus,
+    pub owner: GroupExitOwner,
+    pub generation: u64,
+    pub initiator_tid: u32,
+    pub remaining_threads: AtomicU32,
+    /// Tids that already own an exit permit in this lifecycle episode.
+    claimed_thread_exits: BTreeSet<u32>,
 }
 
-impl GroupExitState {
-    pub(crate) fn for_exit(status: ExitStatus) -> Self {
-        Self {
-            status: process_spin_mutex(status, b"debug.lock.process.group_exit.status"),
-            is_exec: AtomicBool::new(false),
-            exec_initiator_tid: None,
-            completion: None,
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GroupExitOwner {
+    Exit,
+    ThreadExit,
+    ExecReserved,
+    ExecCollapsing,
+    ExecAborting,
+}
 
-    pub(crate) fn for_exec(initiator_tid: u32, sibling_count: NonZeroU32) -> Self {
-        Self {
-            status: process_spin_mutex(
-                ExitStatus::Exited(0),
-                b"debug.lock.process.group_exit.status",
-            ),
-            is_exec: AtomicBool::new(true),
-            exec_initiator_tid: Some(initiator_tid),
-            completion: Some(CountdownCompletion::new(sibling_count)),
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecCollapseHandoff {
+    Completed,
+    Aborting,
+    Stale,
+}
 
-    pub(crate) fn status(&self) -> ExitStatus {
-        *self.status.lock()
-    }
-
-    pub(crate) fn is_exec(&self) -> bool {
-        self.is_exec.load(Ordering::Acquire)
-    }
-
-    /// Convert an in-flight exec collapse into process termination. The
-    /// sibling countdown remains alive so an already-waiting exec future is
-    /// woken and can abort before replacing the address space.
-    pub(crate) fn convert_to_exit(&self, status: ExitStatus) {
-        *self.status.lock() = status;
-        self.is_exec.store(false, Ordering::Release);
-    }
-
-    pub(crate) fn participant_exited(&self, tid: u32) {
-        let Some(completion) = self.completion.as_ref() else {
-            return;
-        };
-        if self.exec_initiator_tid != Some(tid) {
-            completion.arrive();
-        }
-    }
-
-    pub(crate) async fn wait_for_exec_siblings(&self) {
-        if let Some(completion) = self.completion.as_ref() {
-            let _ = completion.wait(WaitProtocol::Uninterruptible).await;
-        }
-    }
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ThreadExitPermit {
+    generation: u64,
+    owner: GroupExitOwner,
 }
 
 /// Per-process resource frame — the set of resources governed by
@@ -1236,6 +1179,36 @@ pub struct Frame {
     /// shared ownership across processes; the inner `SpinMutex`
     /// on `SigActionTable` handles per-entry concurrency.
     pub sig_actions: Arc<SigActionTable>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CwdBinding {
+    pub dentry: Cap<DEntry>,
+    pub mount: Cap<crate::mount::MountIdentity>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProcessCwdState {
+    Mounted(CwdBinding),
+    /// Compatibility for host scaffolds created before a mount namespace is
+    /// installed. Production relative resolution must reject this state.
+    Legacy(Cap<DEntry>),
+}
+
+impl ProcessCwdState {
+    pub(crate) fn dentry(&self) -> Cap<DEntry> {
+        match self {
+            Self::Mounted(binding) => binding.dentry.clone(),
+            Self::Legacy(dentry) => dentry.clone(),
+        }
+    }
+
+    fn binding(&self) -> Option<CwdBinding> {
+        match self {
+            Self::Mounted(binding) => Some(binding.clone()),
+            Self::Legacy(_) => None,
+        }
+    }
 }
 
 pub struct ProcessPayload {
@@ -1266,7 +1239,7 @@ pub struct ProcessPayload {
     /// delivery point.
     pub(crate) group_pending: PendingSignalQueue,
     /// Per-signum siginfo slots. Written by signal producers
-    /// (post_signal via step_kill_process), read by signalfd
+    /// (catchable-signal post via the process-directed kill helper), read by signalfd
     /// and the future handler-delivery path. Phase I.
     pub(crate) siginfo_slots: crate::signal::SigInfoSlots,
     /// Per-process bus wire for signal-generated lifecycle events.
@@ -1278,7 +1251,7 @@ pub struct ProcessPayload {
     /// this wire internally for handler-vs-default routing.
     ///
     /// Phase A (bus wire alignment): declared on ProcessPayload per
-    /// spec; fired in `step_kill_process` after thread-eligibility
+    /// spec; fired in the process-directed kill helper after thread-eligibility
     /// post and signalfd notification. Signalfd migration from
     /// private subscription table to bus-subscriber is TODO.
     ///
@@ -1306,6 +1279,9 @@ pub struct ProcessPayload {
     /// Field shape mirrors the existing
     /// `aspace: AtomicSlot<Cap<AddressSpace>>` precedent above.
     pub(crate) cred: AtomicSlot<Cap<Cred>>,
+    /// Serializes credential writers and records an exec reservation without
+    /// keeping a lock guard alive across exec's reversible phases.
+    pub(crate) cred_mutation: ProcessSpinMutex<CredMutationState>,
     /// Per-process namespace proxy. Immutable-after-publication bundle
     /// of namespace references per `NAMESPACE_VIEW_v1.md` §1.
     /// `AtomicSlot` allows clone/unshare/setns to publish a replacement
@@ -1331,7 +1307,7 @@ pub struct ProcessPayload {
     /// initial cwd. Day-1 `bootstrap_init_process` leaves this slot
     /// empty; `step_getcwd` returns `None` for a process with no
     /// cwd installed.
-    pub(crate) cwd: ProcessSpinMutex<Option<Cap<DEntry>>>,
+    pub(crate) cwd: ProcessSpinMutex<Option<ProcessCwdState>>,
     /// Sparse fd table keyed by `u32` fd value.
     ///
     /// **fd-ops Wave 1 (2026-05-07):** flipped from a fixed
@@ -1352,8 +1328,8 @@ pub struct ProcessPayload {
     pub(crate) fds: ProcessSpinMutex<BTreeMap<u32, Cap<OpenFile>>>,
     /// Per-fd close-on-exec set. fd `i` is marked CLOEXEC iff
     /// `fd_cloexec.contains(&i)`; marked fds are closed by
-    /// [`crate::process::execution::step_close_cloexec_fds`] during
-    /// exec phase 7 (per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC`).
+    /// [`crate::process::ProcessExecPrep`] during the checked PoNR commit
+    /// (per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC`).
     ///
     /// **fd-ops Wave 1 (2026-05-07):** flipped from `AtomicU32` (which
     /// capped CLOEXEC tracking at fd 31) to `BTreeSet<u32>`. Now any
@@ -1423,68 +1399,17 @@ pub struct ProcessPayload {
     /// Per `docs/Txv3/08_SYSV_IPC_v1.md` §4.4 / IPC-3, `SEM_UNDO`
     /// state is process-local and process exit drains only this list.
     pub(crate) sem_undos: ProcessSpinMutex<BTreeMap<u32, SemUndo>>,
-    /// Reactor wait source that fires when **any** child of this
-    /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
-    /// `children_state_channel` notion). Created at payload-sign time
-    /// and registered with [`crate::wait_source::register_wait_channel`]
-    /// so async script wrappers can `wait_on_token` against the
-    /// returned id without holding a `Cap<ProcessIdentity>`.
-    ///
-    /// Pattern mirrors `TtyIdentity.wait_channel` /
-    /// `wait_source_id` (see
-    /// `crates/tx-subsystems/src/tty/structure/identity.rs`'s
-    /// `TtyIdentity::new`) — the only other in-tree wait source
-    /// today.
-    ///
-    /// Fire site: [`crate::process::execution::post_sigchld_to_parent`]
-    /// fires this immediately after the SIGCHLD post once a child
-    /// zombifies. Wave 1 of the fork/clone/wait4 slice wires the
-    /// fire; the matching `sys_wait4` blocking-wait await arrives in
-    /// Wave 2.
-    ///
-    /// Bit allocation: see [`EXIT_SOURCE_CHILD_ZOMBIFIED`].
-    pub(crate) exit_source: Channel,
-    /// Carrier id under which `exit_source` is registered with the
-    /// global [`crate::wait_source`] resolver. Embedded in the
-    /// `WaitToken` returned by
-    /// [`ProcessIdentity::exit_source_wait_token`] so the syscall arm
-    /// can park on the carrier without reaching the channel directly.
-    ///
-    /// Released from the global wait-source registry when the payload
-    /// drops; otherwise long-running fork/exit workloads retain a
-    /// stale channel clone per process.
+    /// Carrier id under which this process's exit wait source is registered.
     pub(crate) exit_source_id: u64,
-    /// PR-3D-3 (D2/D4 coexistence). Per-process `WaitSource` minted at
-    /// `sign_process_payload` time alongside the legacy
-    /// `exit_source` Channel. Shares the same `WaitSourceId` (raw
-    /// `u64` matches `exit_source_id`) so a v3 caller's
-    /// `YieldShape::OnWaitSource { source: WaitSourceId(exit_source_id),
-    /// .. }` round-trips cleanly to this source. Fired in parallel
-    /// with the legacy Channel by `post_sigchld_to_parent` (the sole
-    /// fire site). `notify` is idempotent in the "no subscribers,
-    /// already-zombie process" sense — once the payload drops the
-    /// `Arc<WaitSource>` is unreachable through this slot and any
-    /// last fire was already issued under the live-payload guard
-    /// inside `fire_exit_source`.
+    /// Per-process `WaitSource` fired when any child zombifies.
     pub(crate) exit_wait_source: Arc<WaitSource>,
     /// Bus-aligned readiness wire for process lifecycle events.
     ///
     /// `RawQueue` (level-triggered) per `SIGNAL_ATTACHMENTS_v1`:
     /// sets bits for zombie-children (`EXIT_SOURCE_CHILD_ZOMBIFIED`),
     /// future thread-stop events, and group-continue events. Native
-    /// consumers (future signalfd, pidfd) subscribe to this wire;
-    /// `wait4`/`waitid` consume the legacy `exit_source` Channel
-    /// until the Channel → RawQueue migration completes.
-    ///
-    /// Phase A: declared alongside the legacy `exit_source` Channel.
-    /// `fire_exit_source` sets bits on both mechanisms; native
-    /// subscribers poll this wire, while the wait4 path still drains
-    /// the Channel. Once all consumers migrate, the Channel is
-    /// removed.
-    ///
-    /// Event bits use the same constants as the Channel
-    /// (`EXIT_SOURCE_CHILD_ZOMBIFIED`).  See the top-level
-    /// constant doc for how the wait4 arm builds its `WaitToken`.
+    /// consumers subscribe to this wire. Event bits use the same constants as
+    /// the process wait source (`EXIT_SOURCE_CHILD_ZOMBIFIED`).
     /// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-2`.
     pub(crate) exit_source_bus: RawQueue,
     /// Process command-line snapshot. Populated by `execve` at the
@@ -1501,7 +1426,8 @@ pub struct ProcessPayload {
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
     pub _comm: ProcessSpinMutex<[u8; 16]>,
     pub(crate) thread_count: AtomicU32,
-    pub(crate) group_exit: ProcessSpinMutex<Option<Arc<GroupExitState>>>,
+    pub(crate) group_exit: ProcessSpinMutex<Option<GroupExitState>>,
+    pub(crate) next_group_exit_generation: AtomicU64,
     pub vfork_done: AtomicBool,
     /// Waker for a vfork-parent that is parked in `sys_clone` waiting
     /// for this process to exec or exit.  Set by the parent before
@@ -1509,9 +1435,26 @@ pub struct ProcessPayload {
     pub(crate) vfork_waiter: ProcessSpinMutex<Option<core::task::Waker>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExecCredReservationToken(u64);
+
+pub(crate) struct CredMutationState {
+    next_generation: u64,
+    exec_reservation: Option<ExecCredReservationToken>,
+}
+
+impl CredMutationState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next_generation: 0,
+            exec_reservation: None,
+        }
+    }
+}
+
 impl Drop for ProcessPayload {
     fn drop(&mut self) {
-        crate::wait_source::release_wait_channel(self.exit_source_id);
+        crate::wait_source::release_wait_source(self.exit_source_id);
         wait_routing::unregister_source(self.exit_source_id);
     }
 }
@@ -1609,6 +1552,54 @@ impl ProcessPayload {
             .expect("ProcessPayload.cred slot is always populated")
     }
 
+    pub(crate) fn reserve_exec_cred(&self) -> Option<(ExecCredReservationToken, Cred)> {
+        let mut state = self.cred_mutation.lock();
+        if state.exec_reservation.is_some() {
+            return None;
+        }
+        state.next_generation = state.next_generation.wrapping_add(1);
+        let token = ExecCredReservationToken(state.next_generation);
+        state.exec_reservation = Some(token);
+        Some((token, self.cred()))
+    }
+
+    pub(crate) fn with_unreserved_cred_mutation<R>(
+        &self,
+        mutation: impl FnOnce() -> R,
+    ) -> Result<R, ()> {
+        let state = self.cred_mutation.lock();
+        if state.exec_reservation.is_some() {
+            return Err(());
+        }
+        let result = mutation();
+        drop(state);
+        Ok(result)
+    }
+
+    pub(crate) fn release_exec_cred_reservation(&self, token: ExecCredReservationToken) {
+        let mut state = self.cred_mutation.lock();
+        if state.exec_reservation == Some(token) {
+            state.exec_reservation = None;
+        }
+    }
+
+    pub(crate) fn commit_exec_cred_reservation(
+        &self,
+        token: ExecCredReservationToken,
+        replacement: Option<Cap<Cred>>,
+    ) -> Result<Cap<Cred>, ()> {
+        let mut state = self.cred_mutation.lock();
+        if state.exec_reservation != Some(token) {
+            return Err(());
+        }
+        state.exec_reservation = None;
+        let previous = match replacement {
+            Some(replacement) => self.replace_cred(replacement),
+            None => self.cred_cap(),
+        };
+        Ok(previous)
+    }
+
     /// Snapshot the per-process namespace proxy. The returned `Cap`
     /// shares the same `NsProxy` bundle; clone/unshare/setns publish
     /// a replacement via `replace_nsproxy`.
@@ -1668,6 +1659,14 @@ impl ProcessPayload {
     /// is installed. `None` for processes that haven't had a cwd
     /// set (init pre-rootfs).
     pub fn cwd(&self) -> Option<Cap<DEntry>> {
+        self.cwd.lock().as_ref().map(ProcessCwdState::dentry)
+    }
+
+    pub fn cwd_binding(&self) -> Option<CwdBinding> {
+        self.cwd.lock().as_ref().and_then(ProcessCwdState::binding)
+    }
+
+    pub(crate) fn cwd_state(&self) -> Option<ProcessCwdState> {
         self.cwd.lock().clone()
     }
 
@@ -1709,59 +1708,48 @@ impl ProcessPayload {
         previous
     }
 
-    pub fn install_new_fd_at_least(
-        &self,
-        min: u32,
-        file: Cap<OpenFile>,
-        want_cloexec: bool,
-    ) -> Option<u32> {
-        let mut files = self.fds.lock();
-        let limit = self.rlimit_nofile_cur.load(Ordering::Acquire);
-        let mut fd = min;
-        for &existing in files.keys() {
-            if existing < fd {
-                continue;
-            }
-            if existing == fd {
-                fd = fd.checked_add(1)?;
-            } else {
-                break;
-            }
-        }
-        if fd >= limit {
-            return None;
-        }
+    /// Atomically detach one fd and clear its close-on-exec state.
+    ///
+    /// The returned capability identifies the exact file that was removed;
+    /// callers must not re-read the fd after this transition because another
+    /// thread may reuse the number immediately.
+    pub fn take_fd_for_close(&self, idx: u32) -> Option<Cap<OpenFile>> {
+        let mut fds = self.fds.lock();
         let mut cloexec = self.fd_cloexec.lock();
-        debug_assert!(!files.contains_key(&fd));
-        files.insert(fd, file);
-        if want_cloexec {
-            cloexec.insert(fd);
-        } else {
-            cloexec.remove(&fd);
+        let file = fds.remove(&idx);
+        cloexec.remove(&idx);
+        drop(cloexec);
+        drop(fds);
+        if let Some(file) = &file {
+            decr_pipe_fd_ref(file);
         }
-        Some(fd)
+        file
     }
 
-    pub fn install_fd_with_cloexec(
-        &self,
-        fd: u32,
-        file: Cap<OpenFile>,
-        want_cloexec: bool,
-    ) -> Option<Cap<OpenFile>> {
-        let mut files = self.fds.lock();
+    /// Atomically detach every currently open fd in an inclusive range and
+    /// clear all close-on-exec state in that range.
+    pub fn take_fds_for_close_range(&self, first: u32, last: u32) -> Vec<Cap<OpenFile>> {
+        if first > last {
+            return Vec::new();
+        }
+
+        let mut fds = self.fds.lock();
         let mut cloexec = self.fd_cloexec.lock();
-        let previous = files.insert(fd, file);
-        if want_cloexec {
-            cloexec.insert(fd);
-        } else {
+        let closing: Vec<u32> = fds.range(first..=last).map(|(&fd, _)| fd).collect();
+        let files: Vec<Cap<OpenFile>> = closing
+            .into_iter()
+            .filter_map(|fd| fds.remove(&fd))
+            .collect();
+        let cloexec_to_clear: Vec<u32> = cloexec.range(first..=last).copied().collect();
+        for fd in cloexec_to_clear {
             cloexec.remove(&fd);
         }
         drop(cloexec);
-        drop(files);
-        if let Some(previous) = &previous {
-            decr_pipe_fd_ref(previous);
+        drop(fds);
+        for file in &files {
+            decr_pipe_fd_ref(file);
         }
-        previous
+        files
     }
 
     /// Remove every fd from this payload and return the detached table.
@@ -1838,59 +1826,219 @@ impl ProcessPayload {
         self._exe_file.lock().clone()
     }
 
-    /// Collapse the thread group for exec. Marks all non-initiator
-    /// threads for termination and asynchronously waits until every sibling
-    /// has executed its own thread-exit path.
-    ///
-    /// Returns the number of threads removed from the live roster.
-    /// No-op for zombies; returns `0` if the process is already
-    /// single-threaded.
-    pub async fn collapse_threads_for_exec(
-        &self,
-        initiator: &Cap<ThreadIdentity>,
-    ) -> Option<usize> {
-        let (state, siblings) = {
-            // This lock is also taken by CLONE_THREAD's commit path. Holding it
-            // across the roster snapshot makes "install collapse vs attach a
-            // new thread" a single serialized decision.
-            let mut slot = self.group_exit.lock();
-            if slot.is_some() {
-                return None;
-            }
-            let siblings: Vec<Cap<ThreadIdentity>> = self
-                .threads
-                .snapshot()
-                .into_iter()
-                .filter(|thread| thread.key() != initiator.key() && thread.payload_cap().is_some())
-                .collect();
-            let Some(count) = NonZeroU32::new(siblings.len() as u32) else {
-                return Some(0);
-            };
-            let state = Arc::new(GroupExitState::for_exec(initiator.tid.0, count));
-            *slot = Some(Arc::clone(&state));
-            (state, siblings)
+    /// EXEC Phase 5 — install the group-exit state that collapses every
+    /// sibling thread of the calling process. Returns `true` if more
+    /// than one thread was live and the group_exit slot was populated;
+    /// `false` if the process was single-threaded and no collapse is
+    /// needed. `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`.
+    pub(crate) fn reserve_exec_lifecycle(&self, initiator_tid: u32) -> Option<u64> {
+        let mut episode = self.group_exit.lock();
+        if episode.is_some() {
+            return None;
+        }
+        let generation = self
+            .next_group_exit_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        *episode = Some(GroupExitState {
+            status: ExitStatus::Exited(0),
+            owner: GroupExitOwner::ExecReserved,
+            generation,
+            initiator_tid,
+            remaining_threads: AtomicU32::new(0),
+            claimed_thread_exits: BTreeSet::new(),
+        });
+        Some(generation)
+    }
+
+    /// Attach a freshly signed thread only while no process lifecycle episode
+    /// owns the shared lane. Holding `group_exit` across the idle check and
+    /// roster insertion prevents exec from snapshotting the old roster and a
+    /// concurrent `CLONE_THREAD` from attaching immediately afterwards.
+    pub(crate) fn attach_thread_if_lifecycle_idle(&self, thread: Cap<ThreadIdentity>) -> bool {
+        let episode = self.group_exit.lock();
+        if episode.is_some() {
+            return false;
+        }
+        self.threads.attach(thread);
+        self.thread_count.fetch_add(1, Ordering::AcqRel);
+        drop(episode);
+        true
+    }
+
+    pub(crate) fn exec_lifecycle_matches(&self, generation: u64) -> bool {
+        self.group_exit.lock().as_ref().is_some_and(|episode| {
+            episode.generation == generation
+                && matches!(
+                    episode.owner,
+                    GroupExitOwner::ExecReserved | GroupExitOwner::ExecCollapsing
+                )
+        })
+    }
+
+    pub(crate) fn begin_exec_collapse(&self, generation: u64, remaining_threads: u32) -> bool {
+        let mut episode = self.group_exit.lock();
+        let Some(current) = episode.as_mut() else {
+            return false;
         };
+        if current.generation != generation || current.owner != GroupExitOwner::ExecReserved {
+            return false;
+        }
+        current.owner = GroupExitOwner::ExecCollapsing;
+        current
+            .remaining_threads
+            .store(remaining_threads, Ordering::Release);
+        current.claimed_thread_exits.clear();
+        true
+    }
 
-        // Publish after releasing group_exit/threads locks. Mailbox wakeups can
-        // immediately poll the target on another hart and must never run into
-        // the initiator holding the coordination locks.
-        for sibling in &siblings {
-            if let Some(payload) = sibling.payload_cap() {
-                payload.update_summary(|summary| summary.termination = true);
-                crate::thread_runtime::execution::post_termination_wake(&payload);
+    pub(crate) fn finish_exec_collapse(&self, generation: u64) -> bool {
+        let mut episode = self.group_exit.lock();
+        let Some(current) = episode.as_mut() else {
+            return false;
+        };
+        if current.generation != generation
+            || current.owner != GroupExitOwner::ExecCollapsing
+            || current.remaining_threads.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        current.owner = GroupExitOwner::ExecReserved;
+        true
+    }
+
+    pub(crate) fn handoff_exec_collapse_abort(&self, generation: u64) -> ExecCollapseHandoff {
+        let mut episode = self.group_exit.lock();
+        let Some(current) = episode.as_mut() else {
+            return ExecCollapseHandoff::Stale;
+        };
+        if current.generation != generation || current.owner != GroupExitOwner::ExecCollapsing {
+            return ExecCollapseHandoff::Stale;
+        }
+        if current.remaining_threads.load(Ordering::Acquire) == 0 {
+            current.owner = GroupExitOwner::ExecReserved;
+            ExecCollapseHandoff::Completed
+        } else {
+            current.owner = GroupExitOwner::ExecAborting;
+            ExecCollapseHandoff::Aborting
+        }
+    }
+
+    pub(crate) fn release_exec_lifecycle(&self, generation: u64) -> bool {
+        let mut episode = self.group_exit.lock();
+        if episode.as_ref().is_some_and(|current| {
+            current.generation == generation
+                && matches!(
+                    current.owner,
+                    GroupExitOwner::ExecReserved | GroupExitOwner::ExecCollapsing
+                )
+        }) {
+            *episode = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn reserve_group_exit(&self, status: ExitStatus) -> bool {
+        let mut episode = self.group_exit.lock();
+        if episode.is_some() {
+            return false;
+        }
+        *episode = Some(GroupExitState {
+            status,
+            owner: GroupExitOwner::Exit,
+            generation: 0,
+            initiator_tid: 0,
+            remaining_threads: AtomicU32::new(self.thread_count.load(Ordering::Acquire)),
+            claimed_thread_exits: BTreeSet::new(),
+        });
+        true
+    }
+
+    pub(crate) fn prepare_thread_exit(&self, tid: u32) -> Option<ThreadExitPermit> {
+        let mut episode = self.group_exit.lock();
+        match episode.as_mut() {
+            Some(current) if current.owner == GroupExitOwner::ExecReserved => None,
+            Some(current) if current.owner == GroupExitOwner::ExecCollapsing => {
+                if current.initiator_tid == tid || !current.claimed_thread_exits.insert(tid) {
+                    None
+                } else {
+                    Some(ThreadExitPermit {
+                        generation: current.generation,
+                        owner: GroupExitOwner::ExecCollapsing,
+                    })
+                }
+            }
+            Some(_) => None,
+            None => {
+                let generation = self
+                    .next_group_exit_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1);
+                *episode = Some(GroupExitState {
+                    status: ExitStatus::Exited(0),
+                    owner: GroupExitOwner::ThreadExit,
+                    generation,
+                    initiator_tid: tid,
+                    remaining_threads: AtomicU32::new(0),
+                    claimed_thread_exits: BTreeSet::new(),
+                });
+                Some(ThreadExitPermit {
+                    generation,
+                    owner: GroupExitOwner::ThreadExit,
+                })
             }
         }
+    }
 
-        #[cfg(any(test, feature = "test-support"))]
-        for sibling in &siblings {
-            crate::thread_runtime::execution::step_thread_exit_with_status(
-                sibling.clone(),
-                ExitStatus::Exited(0),
-            );
+    pub(crate) fn finish_thread_exit(
+        &self,
+        permit: ThreadExitPermit,
+        was_last: bool,
+        status: ExitStatus,
+    ) -> bool {
+        let mut episode = self.group_exit.lock();
+        let clear_episode = {
+            let Some(current) = episode.as_mut() else {
+                return false;
+            };
+            let owner_matches = current.owner == permit.owner
+                || (permit.owner == GroupExitOwner::ExecCollapsing
+                    && current.owner == GroupExitOwner::ExecAborting);
+            if current.generation != permit.generation || !owner_matches {
+                return false;
+            }
+            match permit.owner {
+                GroupExitOwner::ThreadExit if was_last => {
+                    current.owner = GroupExitOwner::Exit;
+                    current.status = status;
+                    current.remaining_threads.store(0, Ordering::Release);
+                    false
+                }
+                GroupExitOwner::ThreadExit => true,
+                GroupExitOwner::ExecCollapsing => {
+                    if current
+                        .remaining_threads
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    current.owner == GroupExitOwner::ExecAborting
+                        && current.remaining_threads.load(Ordering::Acquire) == 0
+                }
+                GroupExitOwner::Exit
+                | GroupExitOwner::ExecReserved
+                | GroupExitOwner::ExecAborting => return false,
+            }
+        };
+        if clear_episode {
+            *episode = None;
         }
-
-        state.wait_for_exec_siblings().await;
-        state.is_exec().then_some(siblings.len())
+        true
     }
 
     /// Process short name comm (for `/proc/<pid>/stat`).
@@ -1968,20 +2116,10 @@ impl ProcessPayload {
         }
     }
 
-    /// Snapshot the entire close-on-exec set as an owned
-    /// `BTreeSet<u32>`. Used by
-    /// [`crate::process::execution::step_close_cloexec_fds`] to walk
-    /// every marked fd during exec phase 7.
+    /// Snapshot the entire close-on-exec set as an owned `BTreeSet<u32>`.
+    /// Exec does not call this allocation-bearing observation helper.
     pub(crate) fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
         self.fd_cloexec.lock().clone()
-    }
-
-    /// Clear the entire close-on-exec set. Used by
-    /// [`crate::process::execution::step_close_cloexec_fds`] to clear
-    /// the set after the close sweep so future `fcntl(F_SETFD)` calls
-    /// start from a clean state.
-    pub(crate) fn clear_fd_cloexec(&self) {
-        self.fd_cloexec.lock().clear();
     }
 
     /// Read the program-break base address for this process. Returns
@@ -2032,37 +2170,68 @@ impl ProcessPayload {
 
     /// Borrow the per-process `exit_source` wait channel.
     ///
-    /// Fired by [`crate::process::execution::post_sigchld_to_parent`]
-    /// after the SIGCHLD producer post when a child zombifies. The
-    /// matching syscall-side awaiter (Wave 2's `sys_wait4` blocking
-    /// arm) parks on
-    /// [`ProcessIdentity::exit_source_wait_token`] via
-    /// [`crate::wait_source::wait_on_token`] rather than borrowing
-    /// the channel directly.
-    pub fn exit_source(&self) -> &Channel {
-        &self.exit_source
-    }
-
-    /// Carrier id under which [`Self::exit_source`] is registered with
-    /// the global wait-source resolver. Embedded in the
-    /// `WaitToken` callers use to park.
+    /// Carrier id under which [`Self::exit_wait_source`] is registered.
     pub fn exit_source_id(&self) -> u64 {
         self.exit_source_id
     }
 
-    /// PR-3D-3: per-process `WaitSource` for the new mailbox-based
-    /// wake path. Returned as `&Arc<WaitSource>` so callers can clone
-    /// the strong reference, register a `TaskMailbox` via
-    /// `WaitSource::prepare(..).install_if(..)`, and hold the source
-    /// alive across the wait window independent of payload lifetime.
-    ///
-    /// `WaitSource::id()` matches [`Self::exit_source_id`]: a v3
-    /// caller's `YieldShape::OnWaitSource { source: WaitSourceId(id),
-    /// .. }` where `id == exit_source_id()` resolves to this same
-    /// source without going through the legacy `wait_source`
-    /// resolver.
+    /// Per-process wait source for child lifecycle events.
     pub fn exit_wait_source(&self) -> &Arc<WaitSource> {
         &self.exit_wait_source
+    }
+
+    /// Endpoint-facing alias for child lifecycle waits.
+    pub fn exit_endpoint(&self) -> &Arc<WaitSource> {
+        self.exit_wait_source()
+    }
+}
+
+#[cfg(test)]
+mod exec_cred_reservation_tests {
+    use super::*;
+    use crate::cred::{sign_cred, Uid};
+    use crate::process::execution::reset_init_process_for_test;
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::thread_runtime::structure::reset_tid_counter_for_test;
+    use crate::vm::{AddressSpace, TestPmap};
+    use crate::{process::bootstrap_init_process, zones};
+
+    #[test]
+    fn stale_exec_cred_token_cannot_mutate_or_consume_new_reservation() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_test_support::init_host();
+        let _ = zones::register_all();
+        tx_test_support::drain_to_quiescence();
+        reset_pid_counter_for_test();
+        reset_tid_counter_for_test();
+        reset_init_process_for_test();
+        let aspace = AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace");
+        let process = bootstrap_init_process(aspace).expect("bootstrap init");
+        let payload = process
+            .payload
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("live payload");
+
+        let (stale, _) = payload.reserve_exec_cred().expect("first reservation");
+        payload.release_exec_cred_reservation(stale);
+        let (_active, _) = payload.reserve_exec_cred().expect("second reservation");
+
+        let mut replacement = payload.cred();
+        replacement.euid = Uid(1234);
+        let replacement = sign_cred(replacement).expect("replacement cred");
+        let _ = payload.commit_exec_cred_reservation(stale, Some(replacement));
+
+        assert_eq!(
+            payload.cred().euid,
+            Uid(0),
+            "stale token must not mutate cred"
+        );
+        assert!(
+            payload.with_unreserved_cred_mutation(|| ()).is_err(),
+            "stale token must not clear the active reservation"
+        );
     }
 }
 
@@ -2192,30 +2361,7 @@ pub(crate) fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
 }
 
 fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) {
-    if let Some(socket) = file.socket_identity() {
-        if increment {
-            socket.incr_fd_ref();
-        } else {
-            socket.decr_fd_ref();
-        }
-    }
-    if let Some((payload, side)) = file.pipe_endpoint() {
-        match (side, increment) {
-            (crate::pipe::PipeSide::Reader, true) => payload.incr_reader(),
-            (crate::pipe::PipeSide::Writer, true) => payload.incr_writer(),
-            (crate::pipe::PipeSide::Reader, false) => payload.decr_reader(),
-            (crate::pipe::PipeSide::Writer, false) => payload.decr_writer(),
-        }
-    }
-    if let Some((rx, tx)) = file.socketpair_endpoint() {
-        if increment {
-            rx.incr_reader();
-            tx.incr_writer();
-        } else {
-            rx.decr_reader();
-            tx.decr_writer();
-        }
-    }
+    file.adjust_process_fd_reference(increment);
 }
 
 unsafe impl ZoneAllocated for ProcessGroup {

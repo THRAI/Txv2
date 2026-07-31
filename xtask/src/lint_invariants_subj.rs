@@ -64,8 +64,7 @@ pub(crate) fn lint_invariants_subject_context(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "_ctx: &mut ScriptCtx occurrences: {:>4}  (ceiling {})  {}",
-        count, MAX_IGNORED_SCRIPTCTX, status
+        "_ctx: &mut ScriptCtx occurrences: {count:>4}  (ceiling {MAX_IGNORED_SCRIPTCTX})  {status}"
     );
 
     for entry in &ignored {

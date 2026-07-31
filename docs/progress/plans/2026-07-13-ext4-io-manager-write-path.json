@@ -1,0 +1,274 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-13-ext4-io-manager-write-path",
+  "title": "Ext4 I/O-manager write-path migration",
+  "status": "active",
+  "created": "2026-07-13",
+  "updated": "2026-07-21",
+  "owner": "codex",
+  "summary": "Move ext4 from the direct page-pager compatibility path to a write-capable neutral planner while preserving page-cache ownership and durable journal ordering.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/io_manager",
+      "crates/tx-subsystems/src/fs_iface",
+      "crates/tx-subsystems/src/page_backed",
+      "crates/tx-ext4/src",
+      "crates/tx-ext4-format/src",
+      "docs/design/05_filesystem",
+      "docs/design/03_memory-vm"
+    ],
+    "out": [
+      "txarray-ebr-index",
+      "virtio-completion-rewrite",
+      "multi-queue-driver-sharding",
+      "fs-page-backing-removal"
+    ],
+    "write_sets": [
+      {
+        "owner": "phase-6-coordinator",
+        "paths": [
+          "docs/superpowers/specs/2026-07-13-ext4-io-manager-write-design.md",
+          "docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json"
+        ],
+        "notes": "This proposed master plan owns only its specification and record. Each implementation slice claims its code write set after prior plans release it."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/superpowers/specs/2026-07-13-ext4-io-manager-write-design.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": [
+      "Linux iomap and blk-mq layering",
+      "JBD2 ordered-mode durability model"
+    ]
+  },
+  "steps": [
+    {
+      "id": "6a-neutral-write-ir",
+      "title": "Add neutral I/O data-source leases and dependency graph",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager",
+        "crates/tx-subsystems/src/fs_iface"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib io_manager",
+        "cargo check -p tx-subsystems"
+      ],
+      "notes": "Completed with leased IoDataSource values, validated BackendBioGraph, default planner resume rejection, and BlockGraph transport. Existing variants remain compatibility adapters. The 6E runtime now executes BlockGraph through its graph scheduler; the PageContainer external compatibility facade still rejects graphs because it cannot route tagged completion into the private L4 registry."
+    },
+    {
+      "id": "6b-page-slot-writeback",
+      "title": "Make PageSlot writeback generation-safe under concurrent redirty",
+      "status": "complete",
+      "depends_on": [
+        "6a-neutral-write-ir"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed",
+        "crates/tx-subsystems/src/io_manager/page"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib page_backed",
+        "cargo test -p tx-subsystems --lib io_manager"
+      ],
+      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. PageContainer now admits dirty pages to L4 writeback, retains PageCache leases through planning/execution, routes terminal WritebackFinished completion into the generation-checked slot FSM, and rolls back leases/marks/slots on unplanned or queue-rejected submission. FileFsyncSession captures the page-generation frontier once, submits only the captured generations, waits without duplicate admission, resubmits a captured redirty after its earlier writeback, and surfaces terminal backend errors. Compatibility FsPageBacking::flush_page remains until 6G hot-path cutover; this slice makes no durable fsync claim before 6E ordered JBD2 fencing."
+    },
+    {
+      "id": "6c-ext4-read-planner",
+      "title": "Implement ext4 read planner parity",
+      "status": "pending",
+      "depends_on": [
+        "6a-neutral-write-ir"
+      ],
+      "paths": [
+        "crates/tx-ext4/src"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --lib",
+        "cargo check -p tx-ext4 -p tx-subsystems"
+      ],
+      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback. BackendPageRequest carries an L4-owned IoDataTarget for page-cache read DMA, MountPayload transports source plus target into BackendPlanner, and PageContainer leases a CachedFrame target across planning until matching completion installs the same pin into the page index. Ext4BlockGeometry and plan_read_request emit complete hole plans, mapped-extent L6 bios, or metadata-first continuations; BlockDeviceImage exposes geometry only when the caller supplies its registered DeviceKey. MetadataFirst preserves the original BackendPageRequest, L4 waits for every metadata bio, terminalizes metadata errors with the original generation, deduplicates merged request IDs, and wakes the page service when the final continuation is ready. Ext4MappingTable caches inline extent roots and child nodes: an uncached child produces an L6 metadata bio into the already leased target frame, resume parses that frame through the direct map, validates and caches the child, then replans the original data bio without synchronous pager I/O. Ext4PlannerBinding now pairs the planner with the shared mapping table; `Ext4FsInstance::inode_meta_cached` atomically reads and seeds each regular inode's inline root during its existing metadata lookup. New explicit I/O-manager mount helpers construct the binding. 6C remains pending: the concrete device bridge must pass its registered DeviceKey to these helpers and run old/new ext4 read parity before compatibility fetch can be cut over."
+    },
+    {
+      "id": "6d-ext4-buffered-writeback",
+      "title": "Plan buffered ext4 writeback from PC frame sources",
+      "status": "pending",
+      "depends_on": [
+        "6b-page-slot-writeback",
+        "6c-ext4-read-planner"
+      ],
+      "paths": [
+        "crates/tx-ext4/src",
+        "crates/tx-ext4-format/src"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --lib",
+        "cargo test -p tx-subsystems --lib page_backed"
+      ],
+      "notes": "Mapped data pages now plan `BlockOp::Write` bios directly from the L4-owned PageCache source lease; L5 neither copies nor releases that frame. Hole allocation, extent-child metadata miss, inode/bitmap mutation, and journal ordering remain explicitly ENOSYS until the write metadata graph and 6E ordered JBD2 fence exist. This is not a durable fsync claim."
+    },
+    {
+      "id": "6e-jbd2-durability",
+      "title": "Add ordered JBD2 transaction graph, replay, and fsync fence",
+      "status": "pending",
+      "depends_on": [
+        "6d-ext4-buffered-writeback"
+      ],
+      "paths": [
+        "crates/tx-ext4/src",
+        "crates/tx-ext4-format/src",
+        "crates/tx-subsystems/src/io_manager"
+      ],
+      "verification": [
+        "QEMU fault-injection remount witness",
+        "e2fsck -n",
+        "Linux ext4 interoperability witness"
+      ],
+      "notes": "Data precedes journal commit; commit record is durable before fsync completes; checkpoint remains asynchronous. The first 6E sub-slice added a standalone BackendGraphScheduler that admits only dependency-ready bios, releases joins only after all predecessors complete, and suppresses dependent admission after an error. The second sub-slice wires it through PageService and the owned PageContainer block runtime: a terminal tag advances every graph sharing its merged L6 request ID, queues generation-preserving terminal page completion, and kicks L6 when successors become ready. No ext4 allocation or JBD2 transaction graph is emitted yet, so this remains pending and makes no durable fsync claim."
+    },
+    {
+      "id": "6f-direct-io-coherency",
+      "title": "Add direct-I/O, msync, and syncfs coherence",
+      "status": "pending",
+      "depends_on": [
+        "6e-jbd2-durability"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed",
+        "crates/tx-subsystems/src/io_manager",
+        "crates/tx-ext4/src",
+        "crates/tx-shims/src"
+      ],
+      "verification": [
+        "overlap reservation tests",
+        "direct-I/O pinned-buffer tests",
+        "msync and syncfs coherence tests"
+      ],
+      "notes": "O_DIRECT bypasses the PC data cache but not range coherency, ext4 planning, or L6 scheduling. The first 6F sub-slice binds RangeReservationTable into PageContainer: direct reads and writes can reserve only clean, non-fetching ranges; reservations reject overlapping buffered page materialization; every completion releases its reservation; direct-write success invalidates clean overlapping cache entries while direct-read success preserves them. The neutral IoDataTarget::Direct contract now retains an L4 user-page lease plus BioVecs. Mapped ext4 reads and writes now preserve validated multi-segment direct BioVecs in their L6 bios without owning or copying user pages; empty, zero-length, overflowing, and partial-block vectors are rejected. `DirectIoBuffer` now turns a fully published, access-checked user range into cross-page BioVecs backed by one real DmaPin per page, with a stable lease id and rollback on partial pin failure; the buffer retains every pin while exporting neutral direct source/target descriptors. Ext4 still rejects hole direct reads and writes until L4 zero-fill/allocation adapters exist. Direct completion registry ownership, syscall submission, msync, and syncfs remain pending; this planner slice makes no JBD2 durability claim."
+    },
+    {
+      "id": "6g-hot-path-cutover",
+      "title": "Cut over hot paths callsite by callsite",
+      "status": "pending",
+      "depends_on": [
+        "6f-direct-io-coherency"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed",
+        "crates/tx-ext4/src",
+        "crates/tx-fs/src",
+        "crates/tx-shims/src"
+      ],
+      "verification": [
+        "old/new ext4 path parity tests",
+        "FsPageBacking fetch/flush callsite removal audit",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Replace compatibility fetch and flush one production callsite at a time only after its planner path has parity and durable-ordering evidence. FsPageBacking remains the regression oracle until each corresponding hot path is removed."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed for all 34 progress records after repairing the stale progress reference and restoring the active IO_MANAGER_v1.md contract."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed with the workspace's existing 7 stale-vocabulary warnings."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 64 I/O-manager tests after BlockGraph transport and L4 rejection landed."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib fs_iface::plan::tests -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 4 neutral IR tests covering source retention, graph ordering/cycle rejection, and default resume rejection."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing unused guard warning in net step_connect."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 126 PageBacked tests after the persistent fsync-session frontier coverage. The serial harness is required because the default parallel host harness can nest same-CPU epoch guards in unrelated tests."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib planner::tests --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5 planner tests covering hole/data plans, metadata-child L6 planning, and direct-map node parse plus replan from the retained L4 target lease."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager::page::service --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 34 page-service tests covering all-bio metadata continuation, metadata error terminalization, merged request deduplication, and final-continuation wake propagation."
+    },
+    {
+      "command": "cargo check -p tx-subsystems --lib --no-default-features; cargo check -p tx-ext4 --lib --no-default-features",
+      "status": "passed",
+      "notes": "Both focused no-default-feature library checks passed; existing unrelated warnings remain in net step_connect and unused Ext4FsInstance::open."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 15 ext4 library tests, including the Ext4FsInstance metadata lookup to shared L5 extent-root seed and data-bio planning witness."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager::backend::graph --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed root/join dependency admission and terminal failure short-circuit tests for the graph scheduler foundation."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager::page::service --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 38 tests, including planner SubmitGraph root admission, graph join release, dependent-failure terminalization, merged L6 request fanout to every graph consumer, and generation-preserving terminal completion."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 128 tests, including the owned PageContainer runtime graph regression that kicks L6 for a dependency successor and L4 for its terminal completion."
+    },
+    {
+      "command": "cargo check -p tx-subsystems --lib --no-default-features",
+      "status": "passed",
+      "notes": "Passed; the existing unrelated net step_connect unused-guard warning remains."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 131 tests after direct read/write range reservation and cache-coherency coverage; the serial harness is required because unrelated parallel host tests can nest same-CPU epoch guards."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib fs_iface::plan::tests --no-default-features -- --nocapture --test-threads=1; cargo check -p tx-ext4 --lib --no-default-features",
+      "status": "passed",
+      "notes": "The neutral direct-read target contract and ext4's explicit hole-read ENOSYS guard passed; existing net unused-guard and Ext4FsInstance dead-code warnings remain."
+    }
+  ],
+  "risks": [
+    "Treating a completed data bio as durable fsync before ordered JBD2 exists would violate the power-loss contract.",
+    "A writeback completion that clears a page redirtied after submission loses data.",
+    "A plan that holds PC, inode, journal, or range locks across I/O will preserve the current serialization bottleneck.",
+    "Direct I/O without reservation and invalidation creates stale PC data."
+  ],
+  "blockers": [
+    "Active I/O-manager and ext4 design files are already modified in the current worktree; reconcile this plan into those files in their owning change rather than overwriting them."
+  ],
+  "handoff": {
+    "needed": true,
+    "path": null
+  }
+}

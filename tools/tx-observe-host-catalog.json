@@ -1,0 +1,782 @@
+{
+  "cfgs": [
+    {
+      "name": "tx_demo_boot"
+    },
+    {
+      "name": "tx_lock_metrics"
+    },
+    {
+      "name": "tx_lock_metrics_vm"
+    },
+    {
+      "name": "tx_lock_metrics_process"
+    },
+    {
+      "name": "tx_lock_metrics_kernel"
+    },
+    {
+      "name": "tx_lock_metrics_fs"
+    },
+    {
+      "name": "tx_sigprocmask_phase_metrics"
+    },
+    {
+      "name": "tx_sigprocmask_detail_metrics"
+    },
+    {
+      "name": "tx_signal_select_metrics"
+    },
+    {
+      "name": "tx_cap_upgrade_metrics"
+    },
+    {
+      "name": "tx_ds_metrics"
+    },
+    {
+      "name": "tx_ds_metrics_page_allocator"
+    },
+    {
+      "name": "tx_ds_metrics_zone"
+    },
+    {
+      "name": "tx_ds_metrics_process"
+    },
+    {
+      "name": "tx_vm_recipe_bplus"
+    },
+    {
+      "name": "tx_vm_recipe_bplus_arc_metrics"
+    },
+    {
+      "name": "tx_vm_recipe_bplus_shape_metrics"
+    },
+    {
+      "name": "tx_vm_recipe_node_alloc_metrics"
+    },
+    {
+      "name": "tx_vm_recipe_publish_shape_metrics"
+    },
+    {
+      "name": "tx_vm_recipe_reclaim_shape_metrics"
+    },
+    {
+      "name": "tx_vm_recipe_phase_metrics"
+    },
+    {
+      "name": "tx_vm_user_access_metrics"
+    },
+    {
+      "name": "tx_vm_phase_metrics"
+    },
+    {
+      "name": "tx_vm_map_path_metrics"
+    },
+    {
+      "name": "tx_vm_pmap_metrics"
+    },
+    {
+      "name": "tx_vm_pmap_chunked_resident"
+    },
+    {
+      "name": "tx_vm_private_page_metrics"
+    },
+    {
+      "name": "tx_clone_path_metrics"
+    },
+    {
+      "name": "tx_thread_roundtrip_metrics"
+    },
+    {
+      "name": "tx_thread_lifecycle_metrics"
+    },
+    {
+      "name": "tx_sched_metrics"
+    },
+    {
+      "name": "tx_reactor_poll_metrics"
+    },
+    {
+      "name": "tx_futex_debug_metrics"
+    },
+    {
+      "name": "tx_pmap_debug"
+    }
+  ],
+  "control_groups": [
+    {
+      "default": false,
+      "events": [
+        "lock_metric"
+      ],
+      "id": "lock_metrics",
+      "local_cfgs": [
+        "tx_lock_metrics_vm",
+        "tx_lock_metrics_process",
+        "tx_lock_metrics_kernel",
+        "tx_lock_metrics_fs"
+      ],
+      "requires_cfg": [
+        "tx_lock_metrics"
+      ],
+      "title": "Lock metrics"
+    },
+    {
+      "default": false,
+      "events": [
+        "ds_method_metric"
+      ],
+      "id": "ds_metrics",
+      "local_cfgs": [
+        "tx_ds_metrics_page_allocator",
+        "tx_ds_metrics_zone",
+        "tx_ds_metrics_process"
+      ],
+      "requires_cfg": [
+        "tx_ds_metrics"
+      ],
+      "title": "Data-structure method metrics"
+    },
+    {
+      "default": false,
+      "events": [
+        "debug.vm.*",
+        "debug.pagebacked.*"
+      ],
+      "id": "vm_metrics",
+      "local_cfgs": [],
+      "requires_cfg": [
+        "tx_vm_recipe_bplus_arc_metrics",
+        "tx_vm_recipe_bplus_shape_metrics",
+        "tx_vm_recipe_node_alloc_metrics",
+        "tx_vm_recipe_publish_shape_metrics",
+        "tx_vm_recipe_reclaim_shape_metrics",
+        "tx_vm_recipe_phase_metrics",
+        "tx_vm_user_access_metrics",
+        "tx_vm_phase_metrics",
+        "tx_vm_map_path_metrics",
+        "tx_vm_pmap_metrics",
+        "tx_vm_private_page_metrics"
+      ],
+      "title": "VM path metrics"
+    },
+    {
+      "default": false,
+      "events": [
+        "debug.clone_path.*",
+        "debug.thread.*"
+      ],
+      "id": "process_clone_metrics",
+      "local_cfgs": [],
+      "requires_cfg": [
+        "tx_clone_path_metrics",
+        "tx_thread_roundtrip_metrics",
+        "tx_thread_lifecycle_metrics"
+      ],
+      "title": "Process and clone path metrics"
+    },
+    {
+      "default": false,
+      "events": [
+        "sched_switch",
+        "debug.sched.*",
+        "debug.reactor.*"
+      ],
+      "id": "scheduler_reactor_metrics",
+      "local_cfgs": [],
+      "requires_cfg": [
+        "tx_sched_metrics",
+        "tx_reactor_poll_metrics"
+      ],
+      "title": "Scheduler and reactor metrics"
+    },
+    {
+      "default": false,
+      "events": [
+        "debug.signal.*",
+        "debug.futex.*"
+      ],
+      "id": "signal_futex_metrics",
+      "local_cfgs": [],
+      "requires_cfg": [
+        "tx_sigprocmask_phase_metrics",
+        "tx_sigprocmask_detail_metrics",
+        "tx_signal_select_metrics",
+        "tx_futex_debug_metrics"
+      ],
+      "title": "Signal and futex debug metrics"
+    },
+    {
+      "default": false,
+      "events": [
+        "debug.cap.*",
+        "debug.vm.pmap.*"
+      ],
+      "id": "capability_and_pmap_debug",
+      "local_cfgs": [],
+      "requires_cfg": [
+        "tx_cap_upgrade_metrics",
+        "tx_pmap_debug"
+      ],
+      "title": "Capability and pmap debug metrics"
+    },
+    {
+      "default": false,
+      "events": [
+        "debug.observe.*"
+      ],
+      "id": "demo_boot",
+      "local_cfgs": [],
+      "requires_cfg": [
+        "tx_demo_boot"
+      ],
+      "title": "Demo boot probes"
+    }
+  ],
+  "event_families": [
+    {
+      "control_group": "always_on_when_observe_enabled",
+      "id": "syscall",
+      "levels": [
+        "boundary"
+      ],
+      "payloads": [
+        "syscall_enter",
+        "syscall_exit",
+        "arg_value"
+      ],
+      "projection": [
+        "spans",
+        "records",
+        "ndjson",
+        "perfetto",
+        "text_report"
+      ]
+    },
+    {
+      "control_group": "always_on_when_observe_enabled",
+      "id": "drive",
+      "levels": [
+        "drive",
+        "step"
+      ],
+      "payloads": [
+        "drive_begin",
+        "drive_end",
+        "step_outcome"
+      ],
+      "projection": [
+        "spans",
+        "records",
+        "ndjson",
+        "perfetto",
+        "text_report"
+      ]
+    },
+    {
+      "control_group": "always_on_when_observe_enabled",
+      "id": "yield",
+      "levels": [
+        "yield"
+      ],
+      "payloads": [
+        "yield_begin",
+        "resume",
+        "wait_source_notify"
+      ],
+      "projection": [
+        "spans",
+        "records",
+        "ndjson",
+        "perfetto",
+        "text_report"
+      ]
+    },
+    {
+      "control_group": "scheduler_reactor_metrics",
+      "id": "scheduler",
+      "levels": [
+        "sched"
+      ],
+      "payloads": [
+        "sched_switch",
+        "process_label",
+        "process_group",
+        "process_fork"
+      ],
+      "projection": [
+        "sched_intervals",
+        "records",
+        "ndjson",
+        "perfetto",
+        "text_report"
+      ]
+    },
+    {
+      "control_group": "always_on_when_callsite_enabled",
+      "id": "allocation",
+      "levels": [
+        "mutation",
+        "phase"
+      ],
+      "payloads": [
+        "arg_value",
+        "counter_value"
+      ],
+      "projection": [
+        "allocation_rows",
+        "records",
+        "perfetto",
+        "text_report"
+      ]
+    },
+    {
+      "control_group": "lock_metrics",
+      "id": "lock",
+      "levels": [
+        "boundary"
+      ],
+      "payloads": [
+        "counter_value"
+      ],
+      "projection": [
+        "lock_rows",
+        "records",
+        "perfetto",
+        "text_report"
+      ]
+    },
+    {
+      "control_group": "ds_metrics",
+      "id": "ds_method",
+      "levels": [
+        "boundary"
+      ],
+      "payloads": [
+        "counter_value"
+      ],
+      "projection": [
+        "ds_method_rows",
+        "records",
+        "perfetto",
+        "text_report"
+      ]
+    },
+    {
+      "control_group": "always_on_when_observe_enabled",
+      "id": "phase",
+      "levels": [
+        "phase"
+      ],
+      "payloads": [
+        "phase_transition"
+      ],
+      "projection": [
+        "spans",
+        "records",
+        "ndjson",
+        "perfetto"
+      ]
+    },
+    {
+      "control_group": "always_on_when_callsite_enabled",
+      "id": "mutation",
+      "levels": [
+        "mutation"
+      ],
+      "payloads": [
+        "mutation_zone_sign",
+        "mutation_index_commit"
+      ],
+      "projection": [
+        "records",
+        "ndjson",
+        "perfetto"
+      ]
+    },
+    {
+      "control_group": "always_on_when_observe_enabled",
+      "id": "panic",
+      "levels": [
+        "boundary"
+      ],
+      "payloads": [
+        "panic"
+      ],
+      "projection": [
+        "records",
+        "repairs",
+        "ndjson",
+        "perfetto",
+        "text_report"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "extension": ".txtrace",
+      "id": "txtrace",
+      "reader_target": "TraceReader::TxtraceRegion"
+    },
+    {
+      "extension": ".rawrecords",
+      "id": "rawrecords",
+      "reader_target": "TraceReader::RawRecords"
+    },
+    {
+      "extension": ".rawrecords.gz",
+      "id": "rawrecords_gzip",
+      "reader_target": "TraceReader::RawRecordsGzip"
+    },
+    {
+      "extension": null,
+      "id": "live_guest_mem",
+      "reader_target": "TraceReader::LiveGuestMem"
+    }
+  ],
+  "projections": [
+    {
+      "columns": [],
+      "coverage_default": "emit",
+      "current_source": "tools/tx-trace-daemon/src/l6_views/emit_json.rs",
+      "file": null,
+      "id": "ndjson",
+      "kind": "transcoder",
+      "target_type": "NdjsonTranscoder"
+    },
+    {
+      "columns": [],
+      "coverage_default": "event_specific",
+      "current_source": "tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs",
+      "file": null,
+      "id": "perfetto",
+      "kind": "transcoder",
+      "target_type": "PerfettoTranscoder"
+    },
+    {
+      "columns": [],
+      "coverage_default": "event_specific",
+      "current_source": "tools/tx-observe-analyze.py analyze_* report functions",
+      "file": null,
+      "id": "text_report",
+      "kind": "report",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "ts",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "hart",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "seq",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "kind",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "level",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "span",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "parent",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "name_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "payload_tag",
+          "type": "UINTEGER"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections.records; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": null,
+      "id": "records",
+      "kind": "sql_view",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "hart",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "seq_around",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "category",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "details",
+          "type": "VARCHAR"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections.repairs; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": null,
+      "id": "repairs",
+      "kind": "sql_view",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "span",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "name_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "sysno",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "begin",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "end",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "dur",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "begin_hart",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "end_hart",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "task_id",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "process_id",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "ret",
+          "type": "BIGINT"
+        },
+        {
+          "name": "errno",
+          "type": "BIGINT"
+        },
+        {
+          "name": "dangling",
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "sched_harts",
+          "type": "UINTEGER[]"
+        },
+        {
+          "name": "sched_segments",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "sched_coverage",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "sched_migrated",
+          "type": "BOOLEAN"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": "spans.parquet",
+      "id": "spans",
+      "kind": "derived_table",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "ts",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "counter_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "value",
+          "type": "UBIGINT"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": "counters.parquet",
+      "id": "counters",
+      "kind": "derived_table",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "ts",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "track",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "name_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "value",
+          "type": "UBIGINT"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": "allocation_rows.parquet",
+      "id": "allocation_rows",
+      "kind": "derived_table",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "task",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "pid",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "hart",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "begin",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "end",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "dur",
+          "type": "UBIGINT"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": "sched_intervals.parquet",
+      "id": "sched_intervals",
+      "kind": "derived_table",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "ts",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "hart",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "lock_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "metric_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "value",
+          "type": "UBIGINT"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": "lock_rows.parquet",
+      "id": "lock_rows",
+      "kind": "derived_table",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "ts",
+          "type": "UBIGINT"
+        },
+        {
+          "name": "hart",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "method_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "zone_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "metric_id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "value",
+          "type": "UBIGINT"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog",
+      "file": "ds_method_rows.parquet",
+      "id": "ds_method_rows",
+      "kind": "derived_table",
+      "target_type": null
+    },
+    {
+      "columns": [
+        {
+          "name": "id",
+          "type": "UINTEGER"
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR"
+        }
+      ],
+      "coverage_default": null,
+      "current_source": "schema/txobserve.toml host.projections.names; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog; xtask/src/observe.rs names",
+      "file": null,
+      "id": "names",
+      "kind": "sql_view",
+      "target_type": null
+    }
+  ],
+  "schema": "tx-observe-host-catalog-v0",
+  "source": "schema/txobserve.toml"
+}

@@ -35,7 +35,7 @@
 //! - **VM fault path is untouched** (phase 4 territory).
 
 use tx_subsystems::execution::Errno;
-use tx_subsystems::userfaultfd::{UfdRange, UserfaultFd};
+use tx_subsystems::userfaultfd::{UfdRange, UffdReadOp, UserfaultFd};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::{UfdRegistration, UserRange, UserVirtAddr, VmMapError, USER_PAGE_SIZE};
@@ -412,7 +412,7 @@ pub(super) fn step_uffdio_register(
 //    fault address is the natural identifier, and Linux's userfaultfd
 //    delivers one fault at a time per ufd (no overlap on the same
 //    address before reply). Mismatch → -EINVAL.
-// 5. Calls `ufd.delegate_registry().mark_replied(token_id,
+// 5. Calls the ufd registry delegate reply transition for `token_id`
 //    DelegateReply::Ufd(...))` with the per-ioctl reply payload.
 // 6. Pops the front message off the pending queue (the agent has
 //    consumed it).
@@ -422,7 +422,7 @@ pub(super) fn step_uffdio_register(
 //
 // **Page copy stub (per W-Y's phase-4 stub semantics).** The actual
 // `src` → `dst` byte move for UFFDIO_COPY is deferred to a follow-up;
-// the wiring (validation, token resolution, mark_replied, queue pop)
+// the wiring (validation, token resolution, delegate reply transition, queue pop)
 // is what phase 5 pins. The same applies to UFFDIO_CONTINUE's
 // page-cache mapping work.
 
@@ -494,7 +494,7 @@ pub struct UffdioContinue {
 /// range is fully inside a registered range, and that the ufd's
 /// pending-fault queue front carries a `fault_addr == dst`. On
 /// success returns the matched `DelegateTokenId` so the caller can
-/// run `mark_replied` and pop the message.
+/// run `delegate reply transition` and pop the message.
 fn validate_and_match_pending(
     ufd: &UserfaultFd,
     dst: u64,
@@ -536,7 +536,7 @@ fn validate_and_match_pending(
     Ok(front.token_id)
 }
 
-/// Map a `TransitionOutcome` from `mark_replied` to a syscall result.
+/// Map a `TransitionOutcome` from `delegate reply transition` to a syscall result.
 /// `Applied` → success; `LateNoOp` → `-EINVAL` (the token was already
 /// terminal — agent's reply came in too late, e.g. fault was cancelled
 /// by the script side); `UnknownToken` → `-EINVAL` (programmer error,
@@ -562,7 +562,7 @@ fn map_transition(outcome: TransitionOutcome) -> Result<(), i32> {
 /// 3. Validate `dst` page-alignment, `len > 0` + page-multiple, range
 ///    fully covered by a registered range, and front pending fault
 ///    matches.
-/// 4. `mark_replied(token_id, DelegateReply::Ufd(UfdReply::Copy { ...
+/// 4. the delegate reply transition for `token_id` DelegateReply::Ufd(UfdReply::Copy { ...
 ///    }))`.
 /// 5. Pop the matched pending message off the queue.
 /// 6. Write back `copy = len` (whole-range success — phase 5 reply
@@ -590,11 +590,17 @@ pub(super) fn step_uffdio_copy(file: &OpenFile, argp: u64, ctx: &SyscallCtx<'_>)
         dst_uaddr: req.dst,
         len: req.len,
     });
-    if let Err(code) = map_transition(ufd_cap.delegate_registry().mark_replied(token_id, reply)) {
+    if let Err(code) = map_transition(ufd_cap.delegate_registry().mark_replied_with_post(
+        token_id,
+        reply,
+        |mailbox, event| {
+            ctx.post_mailbox_event(mailbox, event);
+        },
+    )) {
         return SyscallResult::Error(code);
     }
 
-    // Drain the matched fault from the queue. After `mark_replied`
+    // Drain the matched fault from the queue. After `delegate reply transition`
     // returned `Applied` the agent has officially handled the fault;
     // the front message is no longer pending.
     let _ = ufd_cap.pop_fault_msg();
@@ -635,7 +641,13 @@ pub(super) fn step_uffdio_zeropage(
         dst_uaddr: req.range.start,
         len: req.range.len,
     });
-    if let Err(code) = map_transition(ufd_cap.delegate_registry().mark_replied(token_id, reply)) {
+    if let Err(code) = map_transition(ufd_cap.delegate_registry().mark_replied_with_post(
+        token_id,
+        reply,
+        |mailbox, event| {
+            ctx.post_mailbox_event(mailbox, event);
+        },
+    )) {
         return SyscallResult::Error(code);
     }
     let _ = ufd_cap.pop_fault_msg();
@@ -675,7 +687,13 @@ pub(super) fn step_uffdio_continue(
         dst_uaddr: req.range.start,
         len: req.range.len,
     });
-    if let Err(code) = map_transition(ufd_cap.delegate_registry().mark_replied(token_id, reply)) {
+    if let Err(code) = map_transition(ufd_cap.delegate_registry().mark_replied_with_post(
+        token_id,
+        reply,
+        |mailbox, event| {
+            ctx.post_mailbox_event(mailbox, event);
+        },
+    )) {
         return SyscallResult::Error(code);
     }
     let _ = ufd_cap.pop_fault_msg();
@@ -719,51 +737,41 @@ pub(super) async fn sys_ufd_read(
 
     let nonblocking = file.flags().nonblocking;
     let wire_size = tx_subsystems::userfaultfd::UFFD_MSG_WIRE_SIZE;
-    loop {
-        let outcome = {
-            let mut staging = [0u8; 32];
-            let result = tx_subsystems::userfaultfd::step_ufd_read(
-                ufd_cap,
-                &mut staging[..wire_size],
-                nonblocking,
-            );
-            (result, staging)
-        };
-        use step_engine::{StepOutcome as V3Out, YieldShape};
-        match outcome.0 {
-            V3Out::Done(read) => {
-                if read == 0 {
-                    return SyscallResult::Return(0);
-                }
-                if let Err(errno) =
-                    super::bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &outcome.1[..read])
-                {
-                    return SyscallResult::error_from(errno);
-                }
-                return SyscallResult::Return(read as i64);
-            }
-            V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
-                if errno == Errno::EAGAIN {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
+    let mut staging = [0u8; 32];
+    let mut script_ctx = super::build_subject_script_ctx(ctx);
+    let mailbox = script_ctx
+        .mailbox()
+        .cloned()
+        .unwrap_or_else(|| alloc::sync::Arc::new(tx_substrate::wake::TaskMailbox::new()));
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
+    let op = UffdReadOp {
+        ufd: &ufd_cap,
+        out: &mut staging[..wire_size],
+        nonblocking,
+    };
+    match tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        if nonblocking {
+            step_engine::DriveMode::Nonblocking
+        } else {
+            step_engine::DriveMode::Waiting
+        },
+        Some(&mailbox),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    )
+    .await
+    {
+        Ok(read) => {
+            if let Err(errno) =
+                super::bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..read])
+            {
                 return SyscallResult::error_from(errno);
             }
-            V3Out::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                super::await_wait_source(ctx, carrier, interests).await;
-                // Re-poll on next loop iteration.
-            }
-            // Other shapes are unreachable for the ufd read path.
-            V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::error_from(Errno::EIO);
-            }
+            SyscallResult::Return(read as i64)
         }
+        Err(errno) => SyscallResult::error_from(errno.into()),
     }
 }

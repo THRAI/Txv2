@@ -6,8 +6,9 @@
 //! (`script.rs::exec_script`, Phase 5) that wires them with the
 //! kernel-side VM / process / VFS / signal seams.
 
+mod image_reader;
 pub mod loader;
 pub mod script;
 pub mod stack;
 
-pub use script::{exec_script, ExecError, ExecIoStage, EXEC_LAST_OPEN_ERRNO};
+pub use script::{exec_script, ExecError, ExecScriptOp};

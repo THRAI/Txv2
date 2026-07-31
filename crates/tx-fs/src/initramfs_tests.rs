@@ -211,6 +211,97 @@ fn unpack_creates_parent_dirs_implicitly() {
 }
 
 #[test]
+fn unpack_keeps_regular_sibling_after_absolute_symlink_fanout() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let archive = build_test_cpio(&[
+        (b"bin/cat", 0o120777, b"/bin/busybox"),
+        (b"usr/bin/vi", 0o120777, b"/bin/busybox"),
+        (b"bin/sh", 0o100755, b"bootstrap-shell"),
+        (b"bin/busybox", 0o100755, b"alpine-busybox"),
+        (b"bin/tx-bootstrap-busybox", 0o100755, b"bootstrap-shell"),
+    ]);
+    let mount = fresh_rootfs_mount();
+    let stats = unpack_into_root_mount(&archive, &mount).expect("unpack");
+    assert_eq!(stats.files, 3);
+    assert_eq!(stats.symlinks, 2);
+
+    let bin_id = match lookup_in_root(&mount, b"bin") {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup bin: {other:?}"),
+    };
+    let busybox_id = match lookup_in(&mount, bin_id, b"busybox") {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup bin/busybox: {other:?}"),
+    };
+    let fs_ops = fs_ops_of(&mount);
+    let guard = guard();
+    let meta = match fs_ops.load_inode_meta(busybox_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta busybox: {other:?}"),
+    };
+    assert_eq!(meta.kind(), InodeKind::Regular);
+    assert_eq!(meta.size, b"alpine-busybox".len() as u64);
+}
+
+#[test]
+fn unpack_preserves_alpine_busybox_when_bootstrap_sh_preexists() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let mount = fresh_rootfs_mount();
+    let fs_ops = fs_ops_of(&mount);
+    let root_id = mount.root().fs_object_id();
+    let bin_id = match fs_ops.mkdir(
+        root_id,
+        b"bin",
+        0o040755,
+        &tx_subsystems::vfs::Credential::root(),
+        &guard(),
+    ) {
+        StepOutcome::Done((id, _)) => id,
+        other => panic!("mkdir /bin: {other:?}"),
+    };
+    match fs_ops.create_inode(
+        bin_id,
+        b"sh",
+        0o100755,
+        &tx_subsystems::vfs::Credential::root(),
+        &guard(),
+    ) {
+        StepOutcome::Done(_) => {}
+        other => panic!("precreate /bin/sh: {other:?}"),
+    }
+
+    let archive = build_test_cpio(&[
+        (b"./usr/bin/vi", 0o120755, b"/bin/busybox"),
+        (b"./bin/cat", 0o120755, b"/bin/busybox"),
+        (b"./bin/sh", 0o100755, b"alpine-sh-should-skip"),
+        (b"./bin/busybox", 0o100755, b"alpine-busybox"),
+        (b"./bin/tx-bootstrap-busybox", 0o100755, b"bootstrap-shell"),
+    ]);
+    let stats = unpack_into_root_mount(&archive, &mount).expect("unpack");
+    assert_eq!(stats.files, 3);
+    assert_eq!(stats.symlinks, 2);
+
+    let busybox_id = match lookup_in(&mount, bin_id, b"busybox") {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup /bin/busybox: {other:?}"),
+    };
+    let meta = match fs_ops.load_inode_meta(busybox_id, &guard()) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta /bin/busybox: {other:?}"),
+    };
+    assert_eq!(meta.kind(), InodeKind::Regular);
+    assert_eq!(meta.size, b"alpine-busybox".len() as u64);
+}
+
+#[test]
 fn unpack_writes_directory_entry() {
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()

@@ -95,10 +95,7 @@ fn emit_clone_marker(name: &[u8]) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            NR_CLONE as i64,
-        );
+        observer.debug_counter(name, NR_CLONE as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -130,10 +127,7 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value as i64,
-        );
+        observer.debug_counter(name, value as i64);
     }
 }
 
@@ -146,7 +140,7 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
 /// Per the trio plan's open question #6 and the doc citation in
 /// `PROCESS_v1` §7.3.1 step 3 ("If `thread_count == 0`: trigger
 /// step_process_exit"), the dispatcher therefore calls **only**
-/// `step_thread_exit`. Calling `step_exit_group` here would
+/// `step_thread_exit`. Calling the group-exit transition here would
 /// double-zombify the payload and corrupt the recorded exit status.
 /// PR-3 migration: `ThreadExitOp` is a `OneShotStepOp` — dispatched
 /// via `drive_oneshot` (no reactor, no yield).
@@ -163,9 +157,8 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     }
 }
 
-/// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
-/// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
-/// via `drive_oneshot` (no reactor, no yield).
+/// `exit_group(status)` — per `PROCESS_v1` §7.3.2. This path injects
+/// both task-mailbox and wait-source posts from `SyscallCtx`.
 /// `gettid()` — return the callers thread id.
 pub(super) fn sys_gettid(ctx: &SyscallCtx) -> SyscallResult {
     SyscallResult::Return(ctx.thread.tid.0 as i64)
@@ -271,7 +264,9 @@ pub(super) fn sys_pidfd_getfd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     };
     let Some(newfd) = ctx.process.install_new_fd(target_file, true) else {
         return SyscallResult::Error(EMFILE_VALUE);
-    };
+    }
+    let _ = ctx.process.install_fd_dup_ref(newfd, target_file);
+    ctx.process.set_fd_cloexec(newfd, true);
     SyscallResult::Return(newfd as i64)
 }
 
@@ -283,14 +278,15 @@ pub(super) fn sys_getpgrp(ctx: &SyscallCtx<'_>) -> SyscallResult {
 
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = ExitGroupOp {
-        process: &ctx.process,
-        status: ExitStatus::Exited(status),
-    };
-    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(()) => SyscallResult::NoReturn,
-        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+    let outcome = tx_subsystems::process::execution::step_exit_group_with_posts(
+        &ctx.process,
+        ExitStatus::Exited(status),
+        |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+    );
+    match outcome {
+        tx_subsystems::process::ProcessExitOutcome::Completed => SyscallResult::NoReturn,
+        tx_subsystems::process::ProcessExitOutcome::Retry => SyscallResult::Error(EAGAIN_VALUE),
     }
 }
 
@@ -499,22 +495,21 @@ pub(super) fn sys_setns(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
 ///    are bounded by `EXECVE_ARG_MAX_INLINE = 8192`. Overflow →
 ///    `-E2BIG`.
 ///
-/// On `Ok(())` from `exec_script`, return `SyscallResult::ExecCommitted`.
+/// On `Ok(())` from the exec StepOp, return `SyscallResult::ExecCommitted`.
 /// The thread future MUST NOT drain `pending_syscall_return` for this
 /// iteration — the new image's `_start` reads from a fresh
 /// `saved_user_context` (entry pc / initial sp) and zero-initialised
 /// gprs (System V psABI). On `Err(_)` map to a Linux negative errno
-/// via `ExecError::to_errno_i32`.
+/// via the standard step `Errno` table.
 ///
 /// User-buffer reads (`path_uaddr`, `argv_uaddr`, `envp_uaddr`) flow
 /// through `read_user_cstr` / `read_user_cstr_vec`, which bridge via
 /// the canonical `aspace.read_user` / `aspace.read_user_cstr` lane
 /// (with a kernel-pointer fallback for test scaffolding).
 //
-// PR-9 phase 3b: StepOp-driven via ExecOp (10-phase state
-// machine).  Async operations yield; the drive loop parks on I/O.
-// Remaining synchronous phases return Continue.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::ConsoleIf>(
+// Exec is a waiting StepOp: PageBacked/VFS waits retain their source and the
+// central driver resumes reversible preparation before EXEC-PONR.
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -526,13 +521,25 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::Cons
     let path_buf = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
+    if path_buf.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
 
     if is_identity_noop_helper(&path_buf) {
         ctx.process.notify_vfork_done();
-        tx_subsystems::process::execution::step_exit_group(&ctx.process, ExitStatus::Exited(0));
-        return SyscallResult::NoReturn;
+        let outcome = tx_subsystems::process::execution::step_exit_group_with_posts(
+            &ctx.process,
+            ExitStatus::Exited(0),
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        );
+        return match outcome {
+            tx_subsystems::process::ProcessExitOutcome::Completed => SyscallResult::NoReturn,
+            tx_subsystems::process::ProcessExitOutcome::Retry => SyscallResult::Error(EAGAIN_VALUE),
+        };
     }
 
     // (Debug execve-marker observe-reset hook removed once
@@ -551,11 +558,15 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::Cons
     {
         Ok(v) => v,
         Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
+        Err(ReadVecError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
+        Err(ReadVecError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     let envp_buf = match read_user_cstr_vec(&ctx.aspace, envp_uaddr, EXECVE_VEC_MAX, &mut remaining)
     {
         Ok(v) => v,
         Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
+        Err(ReadVecError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
+        Err(ReadVecError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     // ----- Build kernel-side `&[&[u8]]` slices for `exec_script`. -----
@@ -564,8 +575,16 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::Cons
     // — both are local to this function so the lifetimes are
     // straightforward. `exec_script` only reads from the slices
     // during the stack-image build, well before any aspace swap.
-    let argv_slices: Vec<&[u8]> = argv_buf.iter().map(|s| s.as_slice()).collect();
-    let envp_slices: Vec<&[u8]> = envp_buf.iter().map(|s| s.as_slice()).collect();
+    let mut argv_slices: Vec<&[u8]> = Vec::new();
+    if try_reserve_user_copy_items(&mut argv_slices, argv_buf.len()).is_err() {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
+    argv_slices.extend(argv_buf.iter().map(|s| s.as_slice()));
+    let mut envp_slices: Vec<&[u8]> = Vec::new();
+    if try_reserve_user_copy_items(&mut envp_slices, envp_buf.len()).is_err() {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
+    envp_slices.extend(envp_buf.iter().map(|s| s.as_slice()));
 
     // Wave 2 (cred-on-ctx): consume the caller's cred through
     // `ctx.walker_cred()`. The walker projection uses euid/egid +
@@ -575,49 +594,34 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::Cons
     // `SyscallCtx` (kernel-side bootstrap path).
     let cred = ctx.walker_cred();
 
-    // `exec_script` is the canonical multi-phase async free fn that
-    // realises the EXEC_v1 protocol. The StepOp-shaped `ExecOp` wrap
-    // in `super::exec_op` is an unfinished refactor; the syscall arm
-    // drives `exec_script` directly until that lands.
-    let outcome = exec_script::<P>(
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let op = ExecScriptOp::<P>::new(
         &ctx.process,
         &ctx.thread,
         &path_buf,
         &argv_slices,
         &envp_slices,
         &cred,
+    );
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
     )
-    .await;
-
-    match outcome {
+    .await
+    {
         Ok(()) => {
             ctx.process.notify_vfork_done();
             SyscallResult::ExecCommitted
         }
-        Err(e) => {
-            if matches!(e, ExecError::IoError | ExecError::IoAt(_)) {
-                let path = core::str::from_utf8(&path_buf).unwrap_or("<non-utf8>");
-                tx_hal::console_write_str::<P>(&alloc::format!(
-                    "txkernel:execdiag:path={path}:error={e:?}:open_errno={}\n",
-                    tx_scripts::process::exec::EXEC_LAST_OPEN_ERRNO
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                ));
-            }
-            SyscallResult::Error(execve_errno_magnitude(e))
-        }
+        Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     }
-}
-
-/// Translate `ExecError` to the dispatched `-errno` magnitude the
-/// Phase 6 syscall arm hands back through `SyscallResult::Error`.
-///
-/// `ExecError::to_errno_i32` returns the *signed* `-errno`
-/// (`-2` for `ENOENT`); `SyscallResult::Error` carries the *positive*
-/// magnitude (the userspace-entry shim negates before writing). We
-/// flip the sign here so the existing `Error(i32)` discipline is
-/// unchanged.
-pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
-    -e.to_errno_i32()
 }
 
 fn is_identity_noop_helper(path: &[u8]) -> bool {
@@ -834,7 +838,21 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
         emit_clone_marker(b"debug.clone.step_thread.after");
         let child_thread = match child_thread {
             Ok(t) => t,
-            Err(_) => return Some(SyscallResult::Error(ENOMEM_VALUE)),
+            Err(tx_subsystems::process::ForkError::ParentZombie) => {
+                return Some(SyscallResult::Error(ESRCH_VALUE));
+            }
+            Err(tx_subsystems::process::ForkError::Vm(_)) => {
+                return Some(SyscallResult::Error(EAGAIN_VALUE));
+            }
+            Err(tx_subsystems::process::ForkError::Zone(_)) => {
+                return Some(SyscallResult::Error(ENOMEM_VALUE));
+            }
+            Err(tx_subsystems::process::ForkError::Busy) => {
+                return Some(SyscallResult::Error(EAGAIN_VALUE));
+            }
+            Err(tx_subsystems::process::ForkError::PidNamespace) => {
+                return Some(SyscallResult::Error(ENOMEM_VALUE));
+            }
         };
 
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
@@ -1271,112 +1289,48 @@ pub(super) async fn sys_wait4<'a, P: tx_hal::TimeIf>(
         }
     }
 
-    // Blocking wait: drive WaitpidNohangOp through the v3 StepOp loop.
-    // The op yields on NoneReady via YieldShape::OnWaitSource; the
-    // drive loop parks the parent task, child exit fires the source,
-    // and step() is re-called on wake.
-    use step_engine::{StepOp, StepOutcome as WaitOutcome, YieldShape};
+    // Blocking wait: the common driver owns registration, signal-aware
+    // parking, and re-polling after the parent exit source fires.
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
     use tx_subsystems::process::execution::WaitpidNohangOp;
-    let mut op = WaitpidNohangOp {
+    let op = WaitpidNohangOp {
         parent: &ctx.process,
         target,
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    loop {
-        match op.step(&mut script_ctx) {
-            WaitOutcome::Done(Ok((child_pid, status))) => {
-                if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
-                    return result;
-                }
-                if wstatus_uaddr != 0 {
-                    let word = status.wait_status_word();
-                    if let Err(errno) =
-                        bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
-                    {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                yield_after_reap().await;
-                return SyscallResult::Return(child_pid.0 as i64);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(Ok((child_pid, status))) => {
+            if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
+                return result;
             }
-            WaitOutcome::Done(Err(WaitError::NoChildren)) => {
-                return SyscallResult::Error(ECHILD_VALUE);
-            }
-            WaitOutcome::Done(Err(WaitError::NoneReady)) => {
-                // Should not reach here — op yields on NoneReady.
-                // Fall through to the exit_source wait.
-            }
-            WaitOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source, interests },
-                ..
-            } => {
-                // A process-directed POSIX/interval timer must be able to
-                // interrupt wait4 even though this task is parked on the
-                // child-exit source. Poll once before sleeping both to deliver
-                // an already-due signal and to obtain the next deadline.
-                let posix_deadline = poll_due_posix_timers::<P>(&ctx.process);
-                let itimer_deadline = poll_due_itimers::<P>(&ctx.process);
-                // Make the blocking wait signal-interruptible. The loop re-runs
-                // `op.step()` at the top, so any reapable child is collected
-                // *before* this check — that keeps a child-exit SIGCHLD from
-                // spuriously returning EINTR. Only when no child is ready does a
-                // pending deliverable signal interrupt the wait. Without this,
-                // a parent blocked in wait4 (e.g. hackbench waiting on its
-                // workers) could not be killed by SIGTERM, so its whole tree
-                // leaked — fatal on LA64 where the leaked page tables exhaust
-                // the fixed PT-node registry and panic.
-                if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
-                    return SyscallResult::Error(EINTR_VALUE);
-                }
-                // Commit the subscription and recheck the child state under
-                // the exit source's notification lock. This closes the SMP
-                // window between the no-zombie observation in op.step() and
-                // publishing the parent as an exit-source subscriber.
-                let deadline = match (posix_deadline, itimer_deadline) {
-                    (Some(left), Some(right)) => Some(left.min(right)),
-                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-                    (None, None) => None,
-                };
-                if let Some(deadline_ns) = deadline {
-                    match super::await_wait_source_if_until(
-                        ctx,
-                        source,
-                        interests,
-                        deadline_ns,
-                        || {
-                            tx_subsystems::process::execution::waitpid_would_block(
-                                &ctx.process,
-                                target,
-                            )
-                        },
-                    )
-                    .await
-                    {
-                        super::WaitSourceDeadline::Deadline => {
-                            // This call posts the due signal. The top of the
-                            // loop rechecks children first; if none is ready,
-                            // the signal-interrupt check above returns EINTR.
-                            let _ = poll_due_posix_timers::<P>(&ctx.process);
-                            let _ = poll_due_itimers::<P>(&ctx.process);
-                        }
-                        super::WaitSourceDeadline::Source => {}
-                        super::WaitSourceDeadline::NotInstalled => {
-                            tx_reactor::yield_now().await;
-                        }
-                    }
-                } else {
-                    let parked = super::await_wait_source_if(ctx, source, interests, || {
-                        tx_subsystems::process::execution::waitpid_would_block(&ctx.process, target)
-                    })
-                    .await;
-                    if !parked {
-                        continue;
-                    }
+            if wstatus_uaddr != 0 {
+                let word = status.wait_status_word();
+                if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
+                {
+                    return SyscallResult::error_from(errno);
                 }
             }
-            WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
-            _ => {}
+            yield_after_reap().await;
+            SyscallResult::Return(child_pid.0 as i64)
         }
+        Ok(Err(WaitError::NoChildren)) => SyscallResult::Error(ECHILD_VALUE),
+        Ok(Err(WaitError::NoneReady)) => {
+            unreachable!("WaitpidNohangOp must yield when a child is not ready")
+        }
+        Err(errno) => SyscallResult::error_from(errno),
     }
 }
 
@@ -1410,34 +1364,43 @@ pub(super) fn sys_getppid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 
 /// `setpgid(pid, pgid)`.
 ///
-/// Wraps `step_setpgid` (`process/execution.rs:721`). Day-1 only
-/// supports `pid == 0` / `pid == self.pid` (setpgid on self) and
-/// `pgid == 0` / `pgid == self.pid` (create a fresh process group
-/// rooted at the caller's pid inside the caller's session). Anything
-/// else returns `-EPERM` (matches Linux's errno for cross-pgrp
-/// setpgid). Cross-process setpgid needs a pid → `Cap<ProcessIdentity>`
-/// resolver that day-1 doesn't ship.
+/// Wraps `step_setpgid` (`process/execution.rs:721`). Supports self
+/// setpgid and the shell job-control subset where a parent moves its
+/// direct child into a fresh child-led process group before `exec`.
 pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let pid = args[0] as i32;
     let pgid = args[1] as i32;
 
-    // Day-1: only "self" target supported (cross-process setpgid is
-    // deferred). pid == 0 means "self" per Linux convention.
-    if pid != 0 && (pid as u32) != ctx.process.pid.0 {
+    if pid < 0 || pgid < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let target = if pid == 0 || (pid as u32) == ctx.process.pid.0 {
+        ctx.process.clone()
+    } else {
+        let Some(target) = process_by_pid(Pid(pid as u32)) else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        if target.parent_pid() != ctx.process.pid {
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+        if target.pgrp_cap().session_cap().key() != ctx.process.pgrp_cap().session_cap().key() {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
+        target
+    };
+
+    // pgid == 0 means "use target pid". The process subsystem step still
+    // only creates a fresh target-led pgrp; joining existing pgrps remains
+    // deferred until the process topology step grows that operation.
+    let new_pgid_raw = if pgid == 0 { target.pid.0 } else { pgid as u32 };
+    if new_pgid_raw != target.pid.0 {
         return SyscallResult::Error(EPERM_VALUE);
     }
 
-    // pgid == 0 means "use the caller's pid" — exactly what the trio's
-    // step_setpgid supports.
-    let new_pgid_raw = if pgid == 0 {
-        ctx.process.pid.0
-    } else {
-        pgid as u32
-    };
-
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = SetpgidOp {
-        target: &ctx.process,
+        target: &target,
         new_pgid: Pgid(new_pgid_raw),
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {

@@ -7,16 +7,46 @@
 //! and copying between the frame and the caller's `[u8; 4096]` buffer.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use crate::devfs::adapter::step_engine::{
     epoch, page_allocator, SpinMutex, StepOutcome, ZeroPolicy,
 };
+use tx_ext4::planner::Ext4BlockGeometry;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
-use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
-use tx_subsystems::page_backed::Frame;
+use tx_subsystems::device::{self, BlockDevice, BlockDeviceHandle, PhysicalBlockNumber};
+use tx_subsystems::io_manager::block::DeviceKey;
+use tx_subsystems::page_backed::{Frame, PageContainer};
+
+/// Concrete L5-to-L6 binder for one mounted ext4 block device.
+///
+/// Mount code supplies the registered handle explicitly.  The bridge never
+/// derives a device identity from the image's `dyn BlockDevice`, because that
+/// would make a partition or layered device indistinguishable from its parent.
+#[derive(Clone, Copy, Debug)]
+pub struct Ext4FileIoRuntimeBinder {
+    handle: BlockDeviceHandle,
+}
+
+impl Ext4FileIoRuntimeBinder {
+    pub const fn new(handle: BlockDeviceHandle) -> Self {
+        Self { handle }
+    }
+
+    pub const fn handle(self) -> BlockDeviceHandle {
+        self.handle
+    }
+}
+
+impl tx_ext4::mount::FilePageContainerBinder for Ext4FileIoRuntimeBinder {
+    fn bind_file_page_container(
+        &self,
+        container: tx_subsystems::adapter::step_engine::Cap<PageContainer>,
+    ) {
+        let _runtime = device::register_page_container_file_io_service(container, self.handle);
+    }
+}
 
 /// A `BlockImage` that reads through a kernel block device.
 ///
@@ -42,6 +72,14 @@ impl BlockDeviceImage {
             return None;
         }
         Some(BLOCK_SIZE as u64 / sector)
+    }
+
+    /// Bind this image's 4 KiB ext4 blocks to its registered L6 device key.
+    /// The caller owns the key because `BlockDevice` deliberately exposes no
+    /// registry identity and guessing one would misroute I/O.
+    pub fn block_geometry(&self, device: DeviceKey) -> Option<Ext4BlockGeometry> {
+        self.sectors_per_ext4_block()
+            .map(|sectors_per_block| Ext4BlockGeometry::new(device, sectors_per_block))
     }
 
     fn read_block_uncached(&self, block: u64, out: &mut Page4K) -> Result<()> {
@@ -277,8 +315,9 @@ impl ReadBlockCache {
 mod tests {
     use super::*;
     use crate::devfs::adapter::step_engine::{page_allocator, NoProgress};
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use tx_subsystems::device::{BlockDeviceOps, PhysicalBlockNumber};
+    use tx_subsystems::device::{
+        BlockDeviceHandle, BlockDeviceOps, BlockDeviceRegistration, DevT, PhysicalBlockNumber,
+    };
     use tx_subsystems::execution::Guard;
 
     #[test]
@@ -357,6 +396,11 @@ mod tests {
 
     static CONTINUE_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Continue);
     static YIELD_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Yield);
+    static FILE_IO_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 65),
+        name: "ext4-test",
+        ops: &CONTINUE_DEVICE,
+    };
 
     struct RecordingBlockDevice {
         reads: AtomicUsize,
@@ -474,29 +518,31 @@ mod tests {
     }
 
     #[test]
-    fn regular_data_read_populates_bounded_read_ahead_window() {
+    fn ext4_file_io_runtime_binder_registers_supplied_block_handle() {
         let _serial = crate::test_support::FS_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         init_bridge_test();
-        RECORDING_DEVICE.reset();
-        let image = BlockDeviceImage::new(&RECORDING_DEVICE);
-        let mut out = [0u8; BLOCK_SIZE];
+        tx_subsystems::zones::register_all().expect("tx-subsystems zones");
+        tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
 
-        image.read_data_block(4, &mut out).unwrap();
-        assert_eq!(out, [4u8; BLOCK_SIZE]);
-        assert_eq!(RECORDING_DEVICE.reads.load(Ordering::Acquire), 1);
-        assert_eq!(
-            RECORDING_DEVICE.last_frames.load(Ordering::Acquire),
-            DATA_READ_AHEAD_BLOCKS
-        );
-
-        image.read_data_block(5, &mut out).unwrap();
-        assert_eq!(out, [5u8; BLOCK_SIZE]);
-        assert_eq!(
-            RECORDING_DEVICE.reads.load(Ordering::Acquire),
+        let container = tx_subsystems::page_backed::PageContainer::new_cap(
+            tx_subsystems::page_backed::PageContainerKind::Anon {
+                swap_policy: tx_subsystems::page_backed::AnonSwapPolicy::Reclaimable,
+            },
             1,
-            "the adjacent block should be served from read-ahead cache"
+        )
+        .expect("page container cap");
+        let binder = Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(&FILE_IO_REGISTRATION));
+
+        tx_ext4::mount::FilePageContainerBinder::bind_file_page_container(&binder, container);
+
+        let runtimes = tx_subsystems::device::page_container_file_io_service_runtimes_snapshot();
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(
+            runtimes[0].handle().registration().devt,
+            FILE_IO_REGISTRATION.devt
         );
+        tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     }
 }

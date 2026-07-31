@@ -15,3 +15,7 @@ path = "src/lib.rs"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(vdso_stub)'] }
 
 [build-dependencies]
+tx-time = { path = "../tx-time" }
+
+[dev-dependencies]
+tx-time = { path = "../tx-time" }

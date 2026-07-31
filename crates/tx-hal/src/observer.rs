@@ -55,6 +55,10 @@ pub trait ObserverIf {
         None
     }
 
+    /// Optional flush hint after a batch of emits.  Default no-op.
+    /// ivshmem: nothing (host polls).  JTAG-TPIU: flush.  Hosted-file: fsync.
+    fn observation_flush(_hart: CpuId) {}
+
     /// True if the platform's trace clock is shared across harts
     /// (so cross-hart ordering is trustworthy without calibration).
     /// QEMU `time` CSR → true.  Real RV64 silicon with per-hart timers → false.

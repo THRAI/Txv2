@@ -142,14 +142,6 @@ pub fn step_bind(
             // address set (sctp_bindx appends the rest); reported via getpaddrs.
             payload.sctp_add_local_addr(witness.local);
         }
-        if socket.kind == SocketKind::Udp {
-            // P2-S6: the smoltcp UDP socket is the data path now; without
-            // this bind its `accepts`/`process` drop every inbound datagram
-            // and `send` is unaddressable.
-            if let Some(raw_udp) = payload.raw_udp_socket() {
-                let _ = raw_udp.bind_endpoint(witness.local);
-            }
-        }
         StepOutcome::Done(())
     } else {
         StepOutcome::Err(Errno::EINVAL)

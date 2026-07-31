@@ -25,19 +25,18 @@ const ANSI_GREEN: &str = "\x1b[32m";
 fn color_enabled() -> bool {
     COLOR_ENABLED.load(Ordering::Relaxed)
 }
-fn col(code: &'static str) -> &'static str {
-    if color_enabled() {
+fn col_if(enabled: bool, code: &'static str) -> &'static str {
+    if enabled {
         code
     } else {
         ""
     }
 }
+fn col(code: &'static str) -> &'static str {
+    col_if(color_enabled(), code)
+}
 fn col_reset() -> &'static str {
-    if color_enabled() {
-        ANSI_RESET
-    } else {
-        ""
-    }
+    col_if(color_enabled(), ANSI_RESET)
 }
 
 const RV64_KERNEL_WINDOW_SIZE: u64 = 512 * 1024 * 1024;
@@ -1916,7 +1915,7 @@ fn print_address_details(
         println!("  section: {section}");
     }
     if let Some((name, offset)) = &analysis.nearest {
-        println!("  symbol: {name} + {:#x}", offset);
+        println!("  symbol: {name} + {offset:#x}");
     }
     if analysis.frames.is_empty() {
         println!("  source: <unavailable>");
@@ -2129,14 +2128,12 @@ fn decode_rv64_insn(b: [u8; 4]) -> String {
                     } else {
                         format!("compressed (op={op} f3={f3} bits={w:#018b})")
                     }
+                } else if rs2_5 == 0 && rd5 == 0 {
+                    "c.ebreak".to_string()
+                } else if rs2_5 == 0 && rd5 != 0 {
+                    format!("c.jalr {}", RV64_REG_NAMES[rd5])
                 } else {
-                    if rs2_5 == 0 && rd5 == 0 {
-                        "c.ebreak".to_string()
-                    } else if rs2_5 == 0 && rd5 != 0 {
-                        format!("c.jalr {}", RV64_REG_NAMES[rd5])
-                    } else {
-                        format!("c.add {}, {}", RV64_REG_NAMES[rd5], RV64_REG_NAMES[rs2_5])
-                    }
+                    format!("c.add {}, {}", RV64_REG_NAMES[rd5], RV64_REG_NAMES[rs2_5])
                 }
             }
             (2, 6) => {
@@ -3348,16 +3345,13 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
 
     #[test]
     fn color_codes_absent_when_disabled() {
-        COLOR_ENABLED.store(false, Ordering::Relaxed);
-        assert_eq!(col(ANSI_RED), "");
-        assert_eq!(col_reset(), "");
+        assert_eq!(col_if(false, ANSI_RED), "");
+        assert_eq!(col_if(false, ANSI_RESET), "");
     }
 
     #[test]
     fn color_codes_present_when_enabled() {
-        COLOR_ENABLED.store(true, Ordering::Relaxed);
-        assert_eq!(col(ANSI_RED), "\x1b[31m");
-        assert_eq!(col_reset(), "\x1b[0m");
-        COLOR_ENABLED.store(false, Ordering::Relaxed);
+        assert_eq!(col_if(true, ANSI_RED), "\x1b[31m");
+        assert_eq!(col_if(true, ANSI_RESET), "\x1b[0m");
     }
 }

@@ -233,7 +233,17 @@ fn deliver_tty_dispatch_zombie_source_returns_esrch() {
         signal: JobControlSignal::Cont,
     };
 
-    crate::process::step_exit_group(&parent, ExitStatus::Exited(0));
+    crate::process::step_exit_group_with_posts(
+        &parent,
+        ExitStatus::Exited(0),
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
 
     assert_eq!(deliver_tty_dispatch(&parent, dispatch), Err(Errno::ESRCH));
 }

@@ -1,7 +1,8 @@
 use tx_hal::{
-    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, TrapAction, TrapFrameMut,
-    TxPlatform, VirtAddr,
+    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, SmpIf, TrapAction,
+    TrapFrameMut, TxPlatform, VirtAddr,
 };
+use tx_services::time::platform::HalDeadlineTimer;
 use tx_shims::linux_syscall::numbers::{NR_RT_SIGPROCMASK, NR_SET_TID_ADDRESS};
 use tx_shims::linux_syscall::SyscallResult;
 
@@ -50,7 +51,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     }
 
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
-        P::cancel_deadline();
+        HalDeadlineTimer::<P>::new().cancel_deadline();
         if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
             emit_debug_counter(b"debug.trap.timer_user", view.view().pc.0 as i64);
             let hart = <P as PercpuIf>::current_cpu_id().0;
@@ -64,7 +65,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Resume
     }
 
-    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId) -> TrapAction {
         let irq = P::claim();
         if irq == 0 {
             return TrapAction::Resume;
@@ -74,64 +75,13 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         P::complete(irq);
 
         match handled {
-            IrqHandled::Wake => {
-                // An external interrupt that lands while USER code is
-                // running must park the interrupted thread exactly like
-                // a timer preempt: save the user context and resolve
-                // the thread's userspace wait so the reactor can resume
-                // it later. Returning a bare `Reschedule` here (the
-                // pre-2026-07-06 behaviour) longjmps to the reactor
-                // with the user context unsaved and the wait
-                // unresolved — the thread is parked forever and the
-                // session appears to freeze. Trigger: serial RX
-                // arriving in the window where the process is
-                // executing userspace (vim startup racing the
-                // terminal's query responses; bursty paste input);
-                // also the P2 external-connect resume hang (2026-07-03).
-                // Kernel-mode interrupts (WFI wake) keep the plain
-                // Reschedule path.
-                if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
-                    let hart = <P as PercpuIf>::current_cpu_id().0;
-                    let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
-                    if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
-                        crate::init::mark_boot_reactor_userspace_preempt(cpu);
-                    }
-                    return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
-                }
-                TrapAction::Reschedule
-            }
+            IrqHandled::Wake => TrapAction::Reschedule,
             IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
         }
     }
 
-    fn on_ipi(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
-        let reschedule = P::pending_ipi(IpiKind::Reschedule);
-        if P::pending_ipi(IpiKind::Membarrier) {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            P::ack_ipi(IpiKind::Membarrier);
-        }
-        if reschedule {
-            P::ack_ipi(IpiKind::Reschedule);
-        }
-        if P::pending_ipi(IpiKind::TlbShootdown) {
-            P::ack_ipi(IpiKind::TlbShootdown);
-        }
-
-        // A remote runnable task has already been published before the
-        // reschedule IPI. If the interrupt landed in userspace, complete the
-        // same context handoff used by timer preemption; returning a bare
-        // Reschedule without it would strand UserspaceRunWait, while returning
-        // Resume would postpone the queued task until an unrelated timer or
-        // syscall.
-        if reschedule && view.view().previous_mode == tx_hal::TrapPreviousMode::User {
-            let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
-            if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
-                crate::init::mark_boot_reactor_userspace_preempt(cpu);
-            }
-            return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
-        }
-
-        TrapAction::Resume
+    fn on_ipi(_cpu: CpuId) -> TrapAction {
+        dispatch_pending_ipis::<P>()
     }
 
     fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
@@ -156,6 +106,62 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
             log_page_fault_handoff_failure::<P>(hart, &outcome);
         }
         action
+    }
+}
+
+fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
+    let mut action = TrapAction::Resume;
+    if P::pending_ipi(IpiKind::Maintenance) {
+        P::ack_ipi(IpiKind::Maintenance);
+        action = TrapAction::Reschedule;
+    }
+    if P::pending_ipi(IpiKind::Membarrier) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        P::ack_ipi(IpiKind::Membarrier);
+    }
+    if P::pending_ipi(IpiKind::Reschedule) {
+        P::ack_ipi(IpiKind::Reschedule);
+    }
+    if P::pending_ipi(IpiKind::TlbShootdown) {
+        P::ack_ipi(IpiKind::TlbShootdown);
+    }
+    action
+}
+
+#[cfg(test)]
+mod ipi_tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    static MAINTENANCE_PENDING: AtomicBool = AtomicBool::new(false);
+    static MAINTENANCE_ACKED: AtomicBool = AtomicBool::new(false);
+
+    struct TestSmp;
+
+    impl SmpIf for TestSmp {
+        fn pending_ipi(kind: IpiKind) -> bool {
+            kind == IpiKind::Maintenance && MAINTENANCE_PENDING.load(Ordering::Acquire)
+        }
+
+        fn ack_ipi(kind: IpiKind) {
+            if kind == IpiKind::Maintenance {
+                MAINTENANCE_PENDING.store(false, Ordering::Release);
+                MAINTENANCE_ACKED.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_ipi_only_acknowledges_and_reschedules() {
+        MAINTENANCE_ACKED.store(false, Ordering::Release);
+        MAINTENANCE_PENDING.store(true, Ordering::Release);
+
+        let action = dispatch_pending_ipis::<TestSmp>();
+
+        assert_eq!(action, TrapAction::Reschedule);
+        assert!(MAINTENANCE_ACKED.load(Ordering::Acquire));
+        assert!(!MAINTENANCE_PENDING.load(Ordering::Acquire));
     }
 }
 
@@ -365,10 +371,7 @@ fn emit_debug_counter(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -394,10 +397,7 @@ fn emit_direct_sigprocmask_detail_duration(nr: u64, name: &[u8], start_ns: u64) 
     }
     if let Some(observer) = tx_observe::current() {
         let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            dur.min(i64::MAX as u64) as i64,
-        );
+        observer.debug_counter(name, dur.min(i64::MAX as u64) as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -411,10 +411,7 @@ fn emit_direct_sigprocmask_detail_value(nr: u64, name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }

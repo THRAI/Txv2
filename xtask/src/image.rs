@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::{self as unix_fs, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -26,6 +26,11 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let profile = Profile::parse(&option_value(&args[1..], "--profile")?)?;
     let target = image_target(&args[1..])?;
     match (kind.as_str(), profile) {
+        ("test-init" | "test-initramfs", _) => {
+            let out = ensure_test_initramfs(root, target)?;
+            println!("wrote {}", out.display());
+            Ok(())
+        }
         ("cpio" | "initramfs", Profile::Busybox) => image_cpio_busybox(root, target),
         ("cpio" | "initramfs", Profile::Alpine) => image_cpio_alpine(root, &args[1..], target),
         ("ext4", Profile::Busybox) => {
@@ -307,6 +312,10 @@ pub(crate) fn busybox_root_ext4_name(target: TxTarget) -> String {
     format!("busybox-root-{}.ext4", target.name())
 }
 
+pub(crate) fn test_initramfs_name(target: TxTarget) -> String {
+    format!("test-init-initramfs-{}.cpio", target.name())
+}
+
 fn image_target(args: &[String]) -> Result<TxTarget> {
     optional_option_value(args, "--target")
         .map(|target| TxTarget::parse(&target))
@@ -361,6 +370,89 @@ fn image_cpio_alpine(root: &Path, args: &[String], target: TxTarget) -> Result<(
     run_shell(root, &script)?;
     println!("wrote {}", out.display());
     Ok(())
+}
+
+pub(crate) fn ensure_test_initramfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
+    if !command_exists("cpio") {
+        return Err("cpio is required to create the test-init initramfs".into());
+    }
+    let layout = prepare_test_init_rootfs(root, target)?;
+    let out = root
+        .join("target")
+        .join("images")
+        .join(test_initramfs_name(target));
+    fs::create_dir_all(out.parent().expect("image path has parent"))
+        .map_err(|err| err.to_string())?;
+    remove_existing_image(&out)?;
+
+    let script = format!(
+        "cd '{}' && find . -print | cpio -o -H newc > '{}'",
+        shell_escape(&layout.display().to_string()),
+        shell_escape(&out.display().to_string())
+    );
+    run_shell(root, &script)?;
+    Ok(out)
+}
+
+/// Append one executable guest helper to the test-init CPIO image.
+///
+/// Linux accepts concatenated `newc` archives as an initramfs. Keeping this
+/// overlay separate lets focused witnesses add a private helper without
+/// broadening the generic test-init image contract.
+pub(crate) fn append_test_init_overlay(
+    root: &Path,
+    target: TxTarget,
+    source: &Path,
+    guest_name: &str,
+) -> Result<PathBuf> {
+    if !source.is_file() {
+        return Err(format!(
+            "missing test-init overlay source {}",
+            source.display()
+        ));
+    }
+    if guest_name.is_empty() || guest_name.contains('/') || guest_name.contains("..") {
+        return Err(format!("invalid test-init overlay name {guest_name:?}"));
+    }
+
+    let initramfs = root
+        .join("target")
+        .join("images")
+        .join(test_initramfs_name(target));
+    if !initramfs.is_file() {
+        return Err(format!(
+            "missing test-init image {}; build it before adding an overlay",
+            initramfs.display()
+        ));
+    }
+
+    let stage = root
+        .join("target")
+        .join("rootfs")
+        .join(format!("test-init-overlay-{}-{guest_name}", target.name()));
+    if stage.exists() {
+        fs::remove_dir_all(&stage).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(&stage).map_err(|err| err.to_string())?;
+    let guest_path = stage.join(guest_name);
+    fs::copy(source, &guest_path).map_err(|err| err.to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&guest_path, fs::Permissions::from_mode(0o755))
+        .map_err(|err| err.to_string())?;
+
+    let script = format!(
+        "cd '{}' && find . -print | cpio -o -H newc >> '{}'",
+        shell_escape(&stage.display().to_string()),
+        shell_escape(&initramfs.display().to_string())
+    );
+    run_shell(root, &script)?;
+    println!(
+        "test-init: appended {} as /{} to {}",
+        source.display(),
+        guest_name,
+        initramfs.display()
+    );
+    Ok(initramfs)
 }
 
 fn image_ext4_busybox(
@@ -549,6 +641,43 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     Ok(layout)
 }
 
+fn prepare_test_init_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
+    let busybox = resolve_busybox(root, target)?;
+    let layout = root
+        .join("target")
+        .join("rootfs")
+        .join(format!("test-init-{}", target.name()));
+    if layout.exists() {
+        fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(layout.join("bin")).map_err(|err| err.to_string())?;
+
+    fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
+    let init_src = root.join("tools").join("test-init").join("tx-test-init.sh");
+    if !init_src.is_file() {
+        return Err(format!("missing {}", init_src.display()));
+    }
+    fs::copy(&init_src, layout.join("tx-test-init")).map_err(|err| err.to_string())?;
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(
+            layout.join("bin").join("busybox"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .map_err(|err| err.to_string())?;
+        fs::set_permissions(
+            layout.join("tx-test-init"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .map_err(|err| err.to_string())?;
+        unix_fs::symlink("busybox", layout.join("bin").join("sh"))
+            .map_err(|err| err.to_string())?;
+    }
+
+    Ok(layout)
+}
+
 fn prepare_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Result<PathBuf> {
     let source = resolve_alpine_rootfs(root, args, target)?;
     if !source.is_dir() {
@@ -575,11 +704,23 @@ fn prepare_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Resu
     run_shell(root, &script)?;
 
     for dir in ["dev", "proc", "sys", "tmp", "run", "var/run"] {
-        fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
+        ensure_dir_or_symlink(layout.join(dir))?;
     }
     install_alpine_bootstrap_busybox(root, target, args, &layout)?;
     install_optional_user_smokes(root, target, &layout)?;
     Ok(layout)
+}
+
+fn ensure_dir_or_symlink(path: PathBuf) -> Result<()> {
+    match fs::create_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(_) if path_or_symlink_exists(&path) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn path_or_symlink_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
 }
 
 fn resolve_alpine_rootfs(root: &Path, args: &[String], target: TxTarget) -> Result<PathBuf> {
@@ -628,14 +769,14 @@ fn install_alpine_bootstrap_busybox(
     #[cfg(unix)]
     {
         let sh = bin.join("sh");
-        if sh.exists() {
+        if path_or_symlink_exists(&sh) {
             fs::remove_file(&sh).map_err(|err| err.to_string())?;
         }
-        unix_fs::symlink(bootstrap_name, sh).map_err(|err| err.to_string())?;
+        fs::copy(bin.join(bootstrap_name), sh).map_err(|err| err.to_string())?;
     }
 
     println!(
-        "alpine: installed static bootstrap shell from {} as /bin/{}",
+        "alpine: installed static bootstrap shell from {} as /bin/{} and /bin/sh",
         busybox.display(),
         bootstrap_name
     );
@@ -739,10 +880,13 @@ fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) ->
     if target != TxTarget::Rv64Qemu {
         return Ok(());
     }
-    if !command_exists("riscv64-linux-gnu-gcc") {
-        println!("warn: riscv64-linux-gnu-gcc not found; skipping optional user smokes");
+    let Some(cc) = user_smoke_compiler() else {
+        println!(
+            "warn: no RISC-V GCC found; skipping optional user smokes (tried {})",
+            user_smoke_compiler_candidates().join(", ")
+        );
         return Ok(());
-    }
+    };
 
     for name in [
         "udp-loopback-smoke",
@@ -769,7 +913,7 @@ fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) ->
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
-        let status = Command::new("riscv64-linux-gnu-gcc")
+        let status = Command::new(cc)
             .args([
                 "-nostdlib",
                 "-static",
@@ -784,11 +928,79 @@ fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) ->
             .arg("-o")
             .arg(&out)
             .status()
-            .map_err(|err| format!("failed to run riscv64-linux-gnu-gcc: {err}"))?;
+            .map_err(|err| format!("failed to run {cc}: {err}"))?;
         if !status.success() {
-            return Err(format!("riscv64-linux-gnu-gcc exited with {status}"));
+            return Err(format!("{cc} exited with {status}"));
         }
         fs::copy(&out, layout.join("bin").join(name)).map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+fn user_smoke_compiler() -> Option<&'static str> {
+    user_smoke_compiler_candidates()
+        .into_iter()
+        .find(|candidate| command_exists(candidate))
+}
+
+fn user_smoke_compiler_candidates() -> Vec<&'static str> {
+    vec!["riscv64-linux-gnu-gcc", "riscv64-unknown-elf-gcc"]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn ensure_dir_or_symlink_accepts_existing_symlink() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "tx-xtask-image-symlink-{}-{stamp}",
+            std::process::id()
+        ));
+        let run = root.join("run");
+        let var = root.join("var");
+        fs::create_dir_all(&run).expect("create run");
+        fs::create_dir_all(&var).expect("create var");
+        #[cfg(unix)]
+        unix_fs::symlink("../run", var.join("run")).expect("symlink var/run");
+
+        let result = ensure_dir_or_symlink(var.join("run"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn path_or_symlink_exists_accepts_dangling_symlink() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "tx-xtask-image-dangling-symlink-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create root");
+        let link = root.join("sh");
+        #[cfg(unix)]
+        unix_fs::symlink("/bin/busybox", &link).expect("symlink sh");
+
+        let exists = path_or_symlink_exists(&link);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert!(exists);
+    }
+
+    #[test]
+    fn user_smoke_compiler_candidates_include_bare_metal_freestanding_toolchain() {
+        assert!(
+            user_smoke_compiler_candidates().contains(&"riscv64-unknown-elf-gcc"),
+            "freestanding helper sources should build with the local bare-metal RISC-V GCC"
+        );
+    }
 }

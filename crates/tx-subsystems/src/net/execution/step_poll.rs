@@ -33,17 +33,9 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
         mask |= PollMask::ERR;
     }
 
-    // P3-B S3: io_snapshot is now a live derive that internally locks
-    // `protocol` (for the unix-stream flag) — compute it ONCE here, before
-    // `with_protocol` takes that same lock, to avoid a re-entrant spin
-    // deadlock. Every arm reads the same snapshot anyway.
-    // P3-B S3: io_snapshot is a live derive that internally locks
-    // `protocol` (unix-stream flag) — compute it ONCE here, before
-    // `with_protocol` takes that same lock, to avoid a re-entrant spin
-    // deadlock. Every arm reads the same snapshot anyway.
-    let io = payload.io_snapshot();
     payload.with_protocol(|protocol| match protocol {
         SocketProtocol::Tcp(TcpState::Listening { .. }) => {
+            let io = payload.io_snapshot();
             if io.accept_pending > 0
                 || witness.identity.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits()
                     != 0
@@ -52,6 +44,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Sctp(TcpState::Listening { .. }) => {
+            let io = payload.io_snapshot();
             if io.accept_pending > 0
                 || witness.identity.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits()
                     != 0
@@ -60,6 +53,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::UnixStream(UnixStreamState::Listening { .. }) => {
+            let io = payload.io_snapshot();
             if io.accept_pending > 0
                 || witness.identity.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits()
                     != 0
@@ -68,6 +62,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Tcp(TcpState::Connected { .. }) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
@@ -83,6 +78,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::UnixStream(UnixStreamState::Connected { .. }) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
@@ -96,6 +92,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Sctp(TcpState::Connected { .. }) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
@@ -109,6 +106,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. }) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
@@ -123,6 +121,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             | UnixDatagramState::Connected { .. }
             | UnixDatagramState::ConnectedPair { .. },
         ) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
@@ -133,6 +132,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::RawIcmp(_) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
@@ -143,6 +143,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Rds(RdsState::Bound { .. }) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
@@ -155,6 +156,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
         SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
         | SocketProtocol::Packet(_) => {
+            let io = payload.io_snapshot();
             if io.recv_len > 0
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {

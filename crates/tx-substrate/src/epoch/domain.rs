@@ -6,40 +6,42 @@
 //! left its guard or advanced past the retire epoch.
 
 use core::cell::UnsafeCell;
+use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::guard::Guard;
-use super::local::CpuLocalEpochState;
-use super::retired::{allocate_bag_page, BagQueue, RetiredEntry, SealedBag, RETIRED_BAG_CAPACITY};
-use tx_hal::{CpuId, CpuPinGuard, IrqIf, PercpuIf, SmpIf};
+use super::local::{CpuLocalEpochState, CpuMembership};
+use super::RcuHead;
+use tx_hal::{CpuId, CpuPinGuard, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
 
 const INITIAL_EPOCH: u64 = 1;
-const COLLECT_STEPS: usize = 8;
-const PERIODIC_COLLECT_BUDGET: usize = RETIRED_BAG_CAPACITY * COLLECT_STEPS;
-const MAX_EPOCH_CPUS: usize = 64;
+pub(crate) const MAX_EPOCH_CPUS: usize = 64;
 
 static GLOBAL_DOMAIN: EpochDomain = EpochDomain::new();
-static RETIRE_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static DRAIN_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
-static RECLAIM_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EpochError {
     AlreadyInitialized,
     NotInitialized,
-    RetiredBagAllocationFailed,
-    NullPointer,
     TooManyCpus,
     InvalidCpu,
     CpuNotInitialized,
+    CpuAlreadyOnline,
+    CpuNotOnline,
+    LocalRetireReentered,
+    RetireBagOccupied,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrainStats {
     pub advanced_epochs: usize,
-    pub reclaimed: usize,
-    pub remaining: usize,
+    pub bag_reclaimed: usize,
+    pub bag_remaining: usize,
     pub active_guards: usize,
+    pub examined: usize,
+    pub publication_dropped: usize,
+    pub publication_remaining: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,7 +49,8 @@ pub struct CpuEpochSummary {
     pub cpu_id: CpuId,
     pub initialized: bool,
     pub local_epoch: u64,
-    pub retired_count: usize,
+    pub bag_retired: usize,
+    pub publication_pending: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -56,8 +59,15 @@ pub struct EpochSummary {
     pub global_epoch: u64,
     pub active_guards: usize,
     pub possible_cpus: usize,
-    pub retired_count: usize,
-    pub collection_requested: bool,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdvanceAttempt {
+    pub advanced: bool,
+    pub scan_attempts: usize,
+    pub version_before: u64,
+    pub version_after: u64,
 }
 
 #[repr(align(64))]
@@ -74,49 +84,181 @@ pub(crate) struct EpochDomain {
     initialized: AtomicBool,
     /// Monotonic epoch used to decide when retired nodes become reclaimable.
     global_epoch: CachePadded<AtomicU64>,
-    /// Debug/accounting counter for currently pinned CPU participants.
-    active_guards: CachePadded<AtomicUsize>,
     /// Number of CPUs the platform says may participate in EBR.
     possible_cpus: CachePadded<AtomicUsize>,
-    /// Set by retirement/pin hot paths and consumed at a normal-stack drain
-    /// point. Trap/IRQ paths may request collection but never execute
-    /// destructor callbacks themselves.
-    collection_requested: AtomicBool,
+    /// Changes whenever a CPU enters or leaves the participating set.
+    membership_version: CachePadded<AtomicU64>,
     /// Platform callbacks are installed once at BSP init and then read lock-free.
     hooks: UnsafeCell<PlatformHooks>,
     /// Per-CPU guard state and retired-node list heads.
     cpu_states: [CpuLocalEpochState; MAX_EPOCH_CPUS],
-    /// Protects initialization and hook replacement.
+    /// Protects initialization and hook replacement; hot retire/drain paths use
+    /// CPU pinning and per-CPU node ranges instead of this lock.
     lock: SpinLock,
-    /// Serializes short shared sealed-bag queue operations.
-    queue_lock: SpinLock,
-    /// Allows one collector to execute callbacks at a time without holding the
-    /// queue lock across arbitrary destructors.
-    collect_lock: SpinLock,
-    /// Shared sealed-bag queue and recycled page-backed bag cache.
-    state: UnsafeCell<DomainState>,
 }
 
 unsafe impl Sync for EpochDomain {}
+
+pub(crate) struct LocalRetireGuard {
+    domain: &'static EpochDomain,
+    local: &'static CpuLocalEpochState,
+    cpu_id: CpuId,
+    local_execution: Option<LocalExecutionGuard>,
+    _cpu_pin: CpuPinGuard,
+}
+
+struct CallbackActiveGuard(&'static CpuLocalEpochState);
+
+impl Drop for CallbackActiveGuard {
+    fn drop(&mut self) {
+        self.0.end_callback();
+    }
+}
+
+impl LocalRetireGuard {
+    pub(crate) fn cpu_id(&self) -> CpuId {
+        self.cpu_id
+    }
+
+    fn local(&self) -> &'static CpuLocalEpochState {
+        self.local
+    }
+
+    pub(crate) fn sample_epoch_after_barrier(&self) -> u64 {
+        // The caller establishes its no-new-reader barrier before sampling.
+        // AcqRel RMW observes the immediately preceding modification-order
+        // value and prevents a stale ordinary load from tagging the bag.
+        self.domain.global_epoch.0.fetch_add(0, Ordering::AcqRel)
+    }
+
+    fn try_enqueue_head_after_barrier(
+        &mut self,
+        head: NonNull<RcuHead>,
+        epoch: u64,
+    ) -> Result<(), EpochError> {
+        let state = unsafe { &mut *self.local.retire_state_ptr() };
+        unsafe { state.try_enqueue_rcu(epoch, head) }?;
+        self.local.publish_retire_summary(state);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_head_bags_after_barrier(&mut self, epoch: u64) -> Result<(), EpochError> {
+        let state = unsafe { &mut *self.local.retire_state_ptr() };
+        let next = epoch.saturating_add(1);
+        for candidate in [epoch, next] {
+            let bag = &state.bags[candidate as usize % super::bag::EPOCH_BAG_COUNT];
+            if !bag.is_empty() && bag.epoch != candidate {
+                return Err(EpochError::RetireBagOccupied);
+            }
+        }
+        for candidate in [epoch, next] {
+            let bag = &mut state.bags[candidate as usize % super::bag::EPOCH_BAG_COUNT];
+            debug_assert!(bag.reset_if_empty(candidate));
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn enqueue_prepared_head_after_barrier(
+        &mut self,
+        mut head: NonNull<RcuHead>,
+        epoch: u64,
+    ) {
+        let state = unsafe { &mut *self.local.retire_state_ptr() };
+        let bag = &mut state.bags[epoch as usize % super::bag::EPOCH_BAG_COUNT];
+        debug_assert_eq!(bag.epoch, epoch);
+        debug_assert!(unsafe { !head.as_ref().is_queued() });
+        let previous = bag.rcu_head;
+        unsafe {
+            head.as_mut().next = if previous.is_null() {
+                head.as_ptr()
+            } else {
+                previous
+            };
+        }
+        bag.rcu_head = head.as_ptr();
+        bag.rcu_count += 1;
+        self.local.publish_retire_summary(state);
+    }
+
+    pub(crate) unsafe fn enqueue_head_after_barrier(&mut self, head: NonNull<RcuHead>, epoch: u64) {
+        self.try_enqueue_head_after_barrier(head, epoch)
+            .expect("post-barrier RCU head enqueue must be infallible");
+    }
+
+    pub(crate) unsafe fn enqueue_slot_after_barrier(
+        &mut self,
+        key: crate::zone::SlotKey,
+        epoch: u64,
+        link: impl FnOnce(Option<crate::zone::SlotKey>),
+    ) {
+        let state = unsafe { &mut *self.local.retire_state_ptr() };
+        let bag = state
+            .bag_for_epoch_mut(epoch)
+            .expect("post-barrier Zone slot enqueue must be infallible");
+        let previous_head = bag.zone_head;
+        link(previous_head);
+        bag.zone_head = Some(key);
+        bag.zone_count += 1;
+        self.local.publish_retire_summary(state);
+    }
+
+    pub(crate) fn with_local_execution_open<R>(
+        &mut self,
+        action: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.local.end_retire();
+        self.local.begin_callback();
+        let callback_active = CallbackActiveGuard(self.local);
+        drop(self.local_execution.take());
+
+        let result = action(self);
+
+        let hooks = self.domain.hooks();
+        assert_eq!(
+            (hooks.pin_current_cpu)().cpu_id(),
+            self.cpu_id,
+            "epoch reclaim callback crossed a CPU migration point"
+        );
+        let local_execution = (hooks.exclude_local_execution)();
+        drop(callback_active);
+        assert!(
+            self.local.try_begin_retire(),
+            "local retire state re-entered while reopening exclusion"
+        );
+        self.local_execution = Some(local_execution);
+        result
+    }
+}
+
+impl Drop for LocalRetireGuard {
+    fn drop(&mut self) {
+        self.local.end_retire();
+        drop(self.local_execution.take());
+        self.local.unpin();
+    }
+}
 
 impl EpochDomain {
     const fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
             global_epoch: CachePadded::new(AtomicU64::new(INITIAL_EPOCH)),
-            active_guards: CachePadded::new(AtomicUsize::new(0)),
             possible_cpus: CachePadded::new(AtomicUsize::new(1)),
-            collection_requested: AtomicBool::new(false),
+            membership_version: CachePadded::new(AtomicU64::new(0)),
             hooks: UnsafeCell::new(PlatformHooks::default()),
             cpu_states: [const { CpuLocalEpochState::new() }; MAX_EPOCH_CPUS],
             lock: SpinLock::new(),
-            queue_lock: SpinLock::new(),
-            collect_lock: SpinLock::new(),
-            state: UnsafeCell::new(DomainState::new()),
         }
     }
 
     fn init_on_bsp<P>(&'static self) -> Result<(), EpochError>
+    where
+        P: PercpuIf + SmpIf + IrqIf,
+    {
+        self.init_on_bsp_with::<P>(|| {})
+    }
+
+    fn init_on_bsp_with<P>(&'static self, admission_hook: impl FnOnce()) -> Result<(), EpochError>
     where
         P: PercpuIf + SmpIf + IrqIf,
     {
@@ -125,60 +267,101 @@ impl EpochDomain {
             return Err(EpochError::TooManyCpus);
         }
 
-        self.initialized
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| EpochError::AlreadyInitialized)?;
-
-        self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
-        self.active_guards.0.store(0, Ordering::Release);
-        self.possible_cpus.0.store(possible_cpus, Ordering::Release);
-        self.collection_requested.store(false, Ordering::Release);
-
         let _guard = self.lock.lock();
+        if self.initialized.load(Ordering::Acquire) {
+            return Err(EpochError::AlreadyInitialized);
+        }
+        admission_hook();
+        self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
+        self.possible_cpus.0.store(possible_cpus, Ordering::Release);
+        self.membership_version.0.store(0, Ordering::Release);
         unsafe {
             *self.hooks.get() = PlatformHooks::for_platform::<P>();
-            (*self.state.get()).reset();
         }
 
         for cpu in 0..MAX_EPOCH_CPUS {
             self.cpu_states[cpu].reset();
         }
 
-        self.init_cpu(<P as PercpuIf>::current_cpu_id())
+        self.admit_cpu_locked(<P as PercpuIf>::current_cpu_id())?;
+        self.initialized.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn init_for_test(&'static self) {
-        self.initialized.store(true, Ordering::Release);
-        self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
-        self.active_guards.0.store(0, Ordering::Release);
-        self.possible_cpus.0.store(1, Ordering::Release);
-        self.collection_requested.store(false, Ordering::Release);
-
         let _guard = self.lock.lock();
+        self.initialized.store(false, Ordering::Release);
+        self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
+        self.possible_cpus.0.store(1, Ordering::Release);
+        self.membership_version.0.store(0, Ordering::Release);
         unsafe {
             *self.hooks.get() = PlatformHooks::default();
-            (*self.state.get()).reset();
         }
 
         for cpu in 0..MAX_EPOCH_CPUS {
             self.cpu_states[cpu].reset();
         }
-        self.cpu_states[0].init();
+        self.admit_cpu_locked(CpuId(0))
+            .expect("test BSP CPU admission");
+        self.initialized.store(true, Ordering::Release);
     }
 
     fn init_on_ap(&'static self, cpu: CpuId) -> Result<(), EpochError> {
+        let _guard = self.lock.lock();
         if !self.initialized.load(Ordering::Acquire) {
             return Err(EpochError::NotInitialized);
         }
-        self.init_cpu(cpu)
+        self.admit_cpu_locked(cpu)
     }
 
-    fn init_cpu(&'static self, cpu: CpuId) -> Result<(), EpochError> {
+    fn admit_cpu_locked(&'static self, cpu: CpuId) -> Result<(), EpochError> {
         if cpu.0 >= self.possible_cpus.0.load(Ordering::Acquire) {
             return Err(EpochError::InvalidCpu);
         }
-        self.cpu_states[cpu.0].init();
+        let local = &self.cpu_states[cpu.0];
+        if local.membership() != CpuMembership::Offline {
+            return Err(EpochError::CpuAlreadyOnline);
+        }
+        local.set_membership(CpuMembership::Admitting);
+        local.prepare_admission();
+        local.set_membership(CpuMembership::Online);
+        self.membership_version.0.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    fn local_retire_guard(&'static self) -> Result<LocalRetireGuard, EpochError> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(EpochError::NotInitialized);
+        }
+
+        let hooks = self.hooks();
+        if (hooks.in_irq_context)() {
+            return Err(EpochError::CpuNotOnline);
+        }
+        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_id = cpu_pin.cpu_id();
+        let local_execution = (hooks.exclude_local_execution)();
+        let Some(local) = self.cpu_state(cpu_id) else {
+            drop(local_execution);
+            return Err(EpochError::InvalidCpu);
+        };
+        if !local.try_pin_for_retire() {
+            drop(local_execution);
+            return Err(EpochError::CpuNotOnline);
+        }
+        if !local.try_begin_retire() {
+            drop(local_execution);
+            local.unpin();
+            return Err(EpochError::LocalRetireReentered);
+        }
+
+        Ok(LocalRetireGuard {
+            domain: self,
+            local,
+            cpu_id,
+            local_execution: Some(local_execution),
+            _cpu_pin: cpu_pin,
+        })
     }
 
     #[track_caller]
@@ -200,41 +383,30 @@ impl EpochDomain {
             .cpu_state(cpu_id)
             .expect("epoch::guard current CPU is outside initialized epoch range");
         assert!(
-            local.is_initialized(),
-            "epoch::guard current CPU has not called epoch::init_on_ap/init_on_bsp"
+            local.try_pin_online(),
+            "epoch::guard current CPU is not online in the epoch domain"
         );
 
         let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
-        let (entered_epoch, outermost) = local.pin(current_epoch);
-        let should_collect = if outermost {
-            self.active_guards.0.fetch_add(1, Ordering::AcqRel);
-            // Publish the local epoch before any protected load can float above
-            // the guard acquisition. Nested guards reuse this published window.
-            fence(Ordering::SeqCst);
-            local.note_pin_and_should_collect()
-        } else {
-            false
-        };
-        let guard = Guard::new(self, local, cpu_id, entered_epoch, cpu_pin);
-        if should_collect {
-            // Crossbeam performs this cold-path collection on an ordinary
-            // userspace thread stack. Txv2 can enter guard() from a syscall
-            // trap stack, so only publish a maintenance request here. The
-            // reactor consumes it after the trap longjmp returns to its normal
-            // kernel stack.
-            self.request_collection();
+        let active_epoch = local.current();
+        if active_epoch != 0 {
+            local.unpin();
+            panic!(
+                "epoch::guard nested on CPU {} with active epoch {}; use borrow_current_guard()",
+                cpu_id.0, active_epoch
+            );
         }
-        guard
+        local.enter(current_epoch);
+        // Publish the local epoch before any protected load can float above the
+        // guard acquisition. This is the core EBR reader-side ordering rule.
+        fence(Ordering::SeqCst);
+        Guard::new(local, cpu_id, current_epoch, cpu_pin)
     }
 
-    pub(crate) fn leave_guard(&'static self) {
-        self.active_guards.0.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    /// Return a real nested guard for the current CPU if one is already active.
-    /// The nested guard increments/decrements the CPU-local pin depth but does
-    /// not republish the epoch, increment `active_guards`, or trigger periodic
-    /// collection. Returns `None` when no guard is held.
+    /// Return a borrow-mode guard for the current CPU if one is already active
+    /// (local_epoch != 0).  The returned guard does not call `local.enter()` or
+    /// increment `active_guards`; its Drop is a no-op.  Returns `None` when no
+    /// guard is held.
     fn borrow_guard(&'static self) -> Option<Guard<'static>> {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
@@ -243,125 +415,30 @@ impl EpochDomain {
         let cpu_pin = (hooks.pin_current_cpu)();
         let cpu_id = cpu_pin.cpu_id();
         let local = self.cpu_state(cpu_id)?;
-        if !local.is_pinned() {
+        if local.membership() != CpuMembership::Online {
             return None;
         }
-        let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
-        let (entered_epoch, outermost) = local.pin(current_epoch);
-        assert!(
-            !outermost,
-            "active epoch participant became quiescent while CPU-pinned"
-        );
-        Some(Guard::new(self, local, cpu_id, entered_epoch, cpu_pin))
+        let local_epoch = local.current();
+        if local_epoch == 0 {
+            return None;
+        }
+        Some(Guard::new_borrowed(local, cpu_id, local_epoch, cpu_pin))
     }
 
-    unsafe fn retire_raw(
-        &'static self,
-        ptr: *mut u8,
-        reclaim_fn: unsafe fn(*mut u8),
-    ) -> Result<(), EpochError> {
-        let trace_seq = epoch_trace_sample(&RETIRE_TRACE_SAMPLE);
-        if let Some(seq) = trace_seq {
-            emit_epoch_trace(b"debug.epoch.retire.enter", seq);
-            emit_epoch_trace(b"debug.epoch.retire.reclaim_fn", reclaim_fn as usize as i64);
-        }
-        if ptr.is_null() {
-            if let Some(seq) = trace_seq {
-                emit_epoch_trace(b"debug.epoch.retire.null", seq);
+    unsafe fn retire_intrusive(&'static self, head: NonNull<RcuHead>) -> Result<(), EpochError> {
+        super::with_local_retire_guard(|local_guard| {
+            if unsafe { head.as_ref().is_queued() } {
+                return Err(EpochError::RetireBagOccupied);
             }
-            return Err(EpochError::NullPointer);
-        }
-        if !self.initialized.load(Ordering::Acquire) {
-            if let Some(seq) = trace_seq {
-                emit_epoch_trace(b"debug.epoch.retire.not_initialized", seq);
+            let retired_at_epoch = local_guard.sample_epoch_after_barrier();
+            unsafe {
+                local_guard.enqueue_head_after_barrier(head, retired_at_epoch);
             }
-            return Err(EpochError::NotInitialized);
-        }
-
-        let hooks = self.hooks();
-        let mut retried_after_drain = false;
-        loop {
-            let cpu_pin = (hooks.pin_current_cpu)();
-            let cpu_id = cpu_pin.cpu_id();
-            let local = self.cpu_state(cpu_id).ok_or(EpochError::InvalidCpu)?;
-            if !local.is_initialized() {
-                return Err(EpochError::CpuNotInitialized);
-            }
-
-            let local_bag = unsafe { &mut *local.bag_ptr() };
-            if local_bag.is_full() {
-                let seal_result = self.seal_local_bag(cpu_id, local_bag);
-                if seal_result.is_err() && !retried_after_drain {
-                    drop(cpu_pin);
-                    if let Some(seq) = trace_seq {
-                        emit_epoch_trace(b"debug.epoch.retire.alloc_miss", seq);
-                    }
-                    let _ = self.try_drain_inner(PERIODIC_COLLECT_BUDGET, false);
-                    retried_after_drain = true;
-                    continue;
-                }
-                seal_result?;
-            }
-
-            local_bag.push(RetiredEntry { ptr, reclaim_fn });
-            local.note_retired();
-            let retired_count = local.retired_count();
-            if let Some(seq) = trace_seq {
-                emit_epoch_trace(b"debug.epoch.retire.queued", seq);
-                emit_epoch_trace(b"debug.epoch.retire.local_count", retired_count as i64);
-            }
-            return Ok(());
-        }
-    }
-
-    fn seal_local_bag(
-        &'static self,
-        cpu_id: CpuId,
-        local_bag: &mut super::retired::LocalBag,
-    ) -> Result<(), EpochError> {
-        if local_bag.is_empty() {
-            return Ok(());
-        }
-
-        let cached = {
-            let _guard = self.queue_lock.lock();
-            unsafe { &mut *self.state.get() }.queue.take_cached()
-        };
-        let bag = match cached {
-            Some(bag) => bag,
-            None => allocate_bag_page().map_err(|_| EpochError::RetiredBagAllocationFailed)?,
-        };
-
-        // Crossbeam seals a local bag only after a SeqCst publication fence,
-        // then stamps it with the current global epoch.
-        fence(Ordering::SeqCst);
-        let epoch = self.global_epoch.0.load(Ordering::Relaxed);
-        unsafe {
-            SealedBag::fill_from_local(bag, local_bag, epoch, cpu_id.0);
-        }
-        let _guard = self.queue_lock.lock();
-        unsafe { &mut *self.state.get() }.queue.push_back(bag);
-        self.request_collection();
-        Ok(())
+            Ok(())
+        })?
     }
 
     fn try_drain(&'static self, budget: usize) -> DrainStats {
-        self.try_drain_inner(budget, true)
-    }
-
-    fn drain_requested(&'static self, budget: usize) -> DrainStats {
-        if !self.collection_requested.swap(false, Ordering::AcqRel) {
-            return DrainStats::default();
-        }
-
-        let stats = self.try_drain_inner(budget, true);
-        if stats.remaining > 0 {
-            self.request_collection();
-        }
-        stats
-    }
-
-    fn try_drain_inner(&'static self, budget: usize, flush_local: bool) -> DrainStats {
         let trace_seq = epoch_trace_sample(&DRAIN_TRACE_SAMPLE);
         if let Some(seq) = trace_seq {
             emit_epoch_trace(b"debug.epoch.drain.enter", seq);
@@ -371,35 +448,14 @@ impl EpochDomain {
             return DrainStats::default();
         }
 
+        let publication = crate::publication::drain_deferred_drops(budget);
+
         let mut stats = DrainStats {
-            active_guards: self.active_guards.0.load(Ordering::Acquire),
+            active_guards: self.active_guard_count(),
+            publication_dropped: publication.dropped,
+            publication_remaining: publication.remaining,
             ..DrainStats::default()
         };
-
-        let hooks = self.hooks();
-        if (hooks.in_irq_context)() || (hooks.in_trap_context)() {
-            // Never run arbitrary Rust destructors on a bounded IRQ/trap
-            // stack. Preserve the request for the reactor's normal-stack
-            // maintenance point.
-            self.request_collection();
-            stats.remaining = self.total_retired_count();
-            return stats;
-        }
-
-        let cpu_pin = (hooks.pin_current_cpu)();
-        let cpu_id = cpu_pin.cpu_id();
-        if cpu_id.0 >= self.possible_cpus.0.load(Ordering::Acquire)
-            || !(hooks.is_cpu_online)(cpu_id)
-            || !self.cpu_states[cpu_id.0].is_initialized()
-        {
-            return stats;
-        }
-
-        let local = &self.cpu_states[cpu_id.0];
-        let flush_failed = flush_local
-            && self
-                .seal_local_bag(cpu_id, unsafe { &mut *local.bag_ptr() })
-                .is_err();
 
         if self.try_advance_epoch() {
             stats.advanced_epochs += 1;
@@ -408,78 +464,73 @@ impl EpochDomain {
         // Nodes retired in epoch E are reclaimable only once the global epoch
         // reaches at least E + 2.
         let safe_epoch = self.global_epoch.0.load(Ordering::Acquire);
-        if let Some(_seq) = trace_seq {
+        let mut zone_reclaim_head = None;
+        let mut intrusive_reclaim_head: *mut RcuHead = core::ptr::null_mut();
+        let mut detach_count = 0usize;
+
+        let mut local_guard = match self.local_retire_guard() {
+            Ok(guard) => guard,
+            Err(_) => return stats,
+        };
+        let cpu_id = local_guard.cpu_id();
+
+        {
+            let state = unsafe { &mut *local_guard.local().retire_state_ptr() };
+            for bag in &mut state.bags {
+                stats.examined += 1;
+                if bag.is_empty() || safe_epoch < bag.epoch.saturating_add(2) {
+                    continue;
+                }
+                while detach_count < budget {
+                    if let Some(key) = bag.zone_head {
+                        bag.zone_head = crate::zone::retiring_next(key);
+                        crate::zone::set_retiring_next(key, zone_reclaim_head);
+                        zone_reclaim_head = Some(key);
+                        bag.zone_count -= 1;
+                    } else if !bag.rcu_head.is_null() {
+                        let head = bag.rcu_head;
+                        let next = unsafe { (*head).next };
+                        debug_assert!(!next.is_null());
+                        bag.rcu_head = if next == head {
+                            core::ptr::null_mut()
+                        } else {
+                            next
+                        };
+                        unsafe {
+                            (*head).next = if intrusive_reclaim_head.is_null() {
+                                head
+                            } else {
+                                intrusive_reclaim_head
+                            };
+                        }
+                        intrusive_reclaim_head = head;
+                        bag.rcu_count -= 1;
+                    } else {
+                        break;
+                    }
+                    detach_count += 1;
+                    stats.examined += 1;
+                }
+                if bag.is_empty() {
+                    bag.epoch = 0;
+                }
+            }
+            local_guard.local().publish_retire_summary(state);
+        }
+
+        stats.bag_reclaimed = self.reclaim_zone_list(&mut local_guard, zone_reclaim_head);
+        stats.bag_reclaimed = stats.bag_reclaimed
+            + self.reclaim_intrusive_list(&mut local_guard, intrusive_reclaim_head);
+        stats.bag_remaining = local_guard.local().bag_retired_count();
+        stats.publication_remaining = crate::publication::deferred_drop_count(cpu_id);
+        drop(local_guard);
+        if let Some(seq) = trace_seq {
             emit_epoch_trace(b"debug.epoch.drain.cpu", cpu_id.0 as i64);
             emit_epoch_trace(b"debug.epoch.drain.safe_epoch", safe_epoch as i64);
-        }
-
-        let Some(_collector) = self.collect_lock.try_lock() else {
-            stats.remaining = self.total_retired_count();
-            return stats;
-        };
-
-        let mut collected_bags = 0usize;
-        while stats.reclaimed < budget && collected_bags < COLLECT_STEPS {
-            let bag = {
-                let _guard = self.queue_lock.lock();
-                unsafe { &mut *self.state.get() }
-                    .queue
-                    .pop_expired(safe_epoch)
-            };
-            let Some(mut bag) = bag else {
-                break;
-            };
-            collected_bags += 1;
-
-            while stats.reclaimed < budget {
-                let next = unsafe {
-                    let bag_ref = bag.as_mut();
-                    if bag_ref.cursor == bag_ref.len {
-                        None
-                    } else {
-                        let entry = bag_ref.entries[bag_ref.cursor];
-                        bag_ref.cursor += 1;
-                        Some((entry, bag_ref.owner_cpu, bag_ref.cursor == bag_ref.len))
-                    }
-                };
-                let Some((entry, owner_cpu, complete)) = next else {
-                    break;
-                };
-                let reclaim_seq = epoch_trace_sample(&RECLAIM_TRACE_SAMPLE);
-                if let Some(seq) = reclaim_seq {
-                    emit_epoch_trace(b"debug.epoch.reclaim.begin", seq);
-                    emit_epoch_trace(b"debug.epoch.reclaim.fn", entry.reclaim_fn as usize as i64);
-                }
-                unsafe { (entry.reclaim_fn)(entry.ptr) };
-                if let Some(seq) = reclaim_seq {
-                    emit_epoch_trace(b"debug.epoch.reclaim.end", seq);
-                }
-                self.cpu_states[owner_cpu].note_reclaimed(1);
-                stats.reclaimed += 1;
-                if complete {
-                    break;
-                }
-            }
-
-            if unsafe { bag.as_ref().remaining() } == 0 {
-                let _guard = self.queue_lock.lock();
-                unsafe { &mut *self.state.get() }.queue.recycle(bag);
-            } else {
-                let _guard = self.queue_lock.lock();
-                unsafe { &mut *self.state.get() }.queue.push_front(bag);
-                break;
-            }
-        }
-
-        if flush_failed {
-            let _ = self.seal_local_bag(cpu_id, unsafe { &mut *local.bag_ptr() });
-        }
-        stats.remaining = self.total_retired_count();
-        if let Some(seq) = trace_seq {
             emit_epoch_trace(b"debug.epoch.drain.exit", seq);
             emit_epoch_trace(b"debug.epoch.drain.advanced", stats.advanced_epochs as i64);
-            emit_epoch_trace(b"debug.epoch.drain.reclaimed", stats.reclaimed as i64);
-            emit_epoch_trace(b"debug.epoch.drain.remaining", stats.remaining as i64);
+            emit_epoch_trace(b"debug.epoch.drain.reclaimed", stats.bag_reclaimed as i64);
+            emit_epoch_trace(b"debug.epoch.drain.remaining", stats.bag_remaining as i64);
             emit_epoch_trace(
                 b"debug.epoch.drain.active_guards",
                 stats.active_guards as i64,
@@ -488,48 +539,217 @@ impl EpochDomain {
         stats
     }
 
-    #[inline]
-    fn request_collection(&self) {
-        self.collection_requested.store(true, Ordering::Release);
+    fn try_advance_epoch(&'static self) -> bool {
+        self.try_advance_epoch_with(|| {}).advanced
     }
 
-    fn try_advance_epoch(&'static self) -> bool {
-        let current = self.global_epoch.0.load(Ordering::Acquire);
+    fn try_advance_epoch_with(&'static self, membership_change: impl FnOnce()) -> AdvanceAttempt {
+        let version_before = self.membership_version.0.load(Ordering::Acquire);
+        let mut membership_change = Some(membership_change);
+        let mut scan_attempts = 0usize;
         let hooks = self.hooks();
+        let current_cpu = (hooks.pin_current_cpu)().cpu_id();
+        loop {
+            scan_attempts += 1;
+            let version = self.membership_version.0.load(Ordering::Acquire);
+            let current = self.global_epoch.0.load(Ordering::Acquire);
+            let next = current.saturating_add(1);
+            let mut blocked = false;
 
-        // Pairs with guard publication and bag sealing. This is the same
-        // synchronization point Crossbeam places before scanning participants.
-        fence(Ordering::SeqCst);
+            for cpu in 0..self.possible_cpus.0.load(Ordering::Acquire) {
+                let state = &self.cpu_states[cpu];
+                if !matches!(
+                    state.membership(),
+                    CpuMembership::Online | CpuMembership::Draining
+                ) {
+                    continue;
+                }
 
-        // Epoch advance is allowed only if every online initialized CPU is
-        // either outside a guard (`local == 0`) or already in the current epoch.
-        for cpu in 0..self.possible_cpus.0.load(Ordering::Acquire) {
-            let cpu_id = CpuId(cpu);
-            if !(hooks.is_cpu_online)(cpu_id) || !self.cpu_states[cpu].is_initialized() {
+                let local = state.current();
+                if state.retire_active() || (local != 0 && local < current) {
+                    blocked = true;
+                }
+                if !state.can_advance_to(next) {
+                    if cpu != current_cpu.0 && state.request_drain() {
+                        (hooks.request_maintenance)(CpuId(cpu));
+                    }
+                    blocked = true;
+                }
+            }
+
+            if let Some(change) = membership_change.take() {
+                change();
+            }
+            // Admission/offline also takes this lock. The scan stays lock-free,
+            // while the final version check and epoch CAS form one membership
+            // snapshot with no change window between them.
+            let _membership = self.lock.lock();
+            let version_after = self.membership_version.0.load(Ordering::Acquire);
+            if version_after != version {
                 continue;
             }
-
-            let local = self.cpu_states[cpu].current();
-            if local != 0 && local < current {
-                return false;
-            }
+            let advanced = !blocked
+                && self
+                    .global_epoch
+                    .0
+                    .compare_exchange(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok();
+            return AdvanceAttempt {
+                advanced,
+                scan_attempts,
+                version_before,
+                version_after,
+            };
         }
-
-        self.global_epoch
-            .0
-            .compare_exchange(
-                current,
-                current.saturating_add(1),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .is_ok()
     }
 
-    fn total_retired_count(&self) -> usize {
-        (0..self.possible_cpus.0.load(Ordering::Acquire))
-            .map(|cpu| self.cpu_states[cpu].retired_count())
-            .sum()
+    fn service_local_drain_request(&'static self, budget: usize) -> Option<DrainStats> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return None;
+        }
+        let hooks = self.hooks();
+        let cpu_pin = (hooks.pin_current_cpu)();
+        let local = self.cpu_state(cpu_pin.cpu_id())?;
+        if local.membership() != CpuMembership::Online || !local.take_drain_request() {
+            return None;
+        }
+        let stats = self.try_drain(budget);
+        drop(cpu_pin);
+        Some(stats)
+    }
+
+    fn offline_cpu(&'static self, target: CpuId) -> Result<(), EpochError> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(EpochError::NotInitialized);
+        }
+        let hooks = self.hooks();
+        let coordinator_pin = (hooks.pin_current_cpu)();
+        let coordinator_cpu = coordinator_pin.cpu_id();
+        if coordinator_cpu == target {
+            return Err(EpochError::InvalidCpu);
+        }
+        let coordinator = self
+            .cpu_state(coordinator_cpu)
+            .ok_or(EpochError::InvalidCpu)?;
+        let target_state = self.cpu_state(target).ok_or(EpochError::InvalidCpu)?;
+        if !coordinator.try_pin_online() {
+            return Err(EpochError::CpuNotOnline);
+        }
+
+        {
+            let _membership = self.lock.lock();
+            if !target_state.transition_membership(CpuMembership::Online, CpuMembership::Draining) {
+                coordinator.unpin();
+                return Err(EpochError::CpuNotOnline);
+            }
+            self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+        }
+
+        while target_state.pin_count() != 0
+            || target_state.current() != 0
+            || target_state.retire_active()
+        {
+            core::hint::spin_loop();
+        }
+
+        let local_execution = (hooks.exclude_local_execution)();
+        if !coordinator.try_begin_retire() {
+            let _membership = self.lock.lock();
+            if target_state.membership() == CpuMembership::Draining {
+                assert!(target_state
+                    .transition_membership(CpuMembership::Draining, CpuMembership::Online));
+                self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+            }
+            drop(local_execution);
+            coordinator.unpin();
+            return Err(EpochError::LocalRetireReentered);
+        }
+
+        let transfer_result = {
+            let _membership = self.lock.lock();
+            if target_state.membership() != CpuMembership::Draining
+                || target_state.pin_count() != 0
+                || target_state.current() != 0
+                || target_state.retire_active()
+            {
+                Err(EpochError::CpuNotOnline)
+            } else {
+                let coordinator_retire = unsafe { &mut *coordinator.retire_state_ptr() };
+                let target_retire = unsafe { &mut *target_state.retire_state_ptr() };
+                match unsafe { coordinator_retire.merge_from(target_retire) } {
+                    Ok(()) => {
+                        unsafe {
+                            crate::publication::transfer_deferred_drops(target, coordinator_cpu);
+                        }
+                        coordinator.publish_retire_summary(coordinator_retire);
+                        target_state.publish_retire_summary(target_retire);
+                        assert!(target_state.transition_membership(
+                            CpuMembership::Draining,
+                            CpuMembership::Offline,
+                        ));
+                        self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        assert!(target_state
+                            .transition_membership(CpuMembership::Draining, CpuMembership::Online));
+                        self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+                        Err(error)
+                    }
+                }
+            }
+        };
+
+        coordinator.end_retire();
+        drop(local_execution);
+        coordinator.unpin();
+        drop(coordinator_pin);
+        transfer_result
+    }
+
+    fn reclaim_intrusive_list(
+        &'static self,
+        local_guard: &mut LocalRetireGuard,
+        mut head: *mut RcuHead,
+    ) -> usize {
+        let mut reclaimed = 0usize;
+        while !head.is_null() {
+            let current = head;
+            let next = unsafe { (*current).next };
+            head = if next == current {
+                core::ptr::null_mut()
+            } else {
+                next
+            };
+            unsafe {
+                // Reclaim is one-shot. Keep the node marked queued while its
+                // callback runs so a recursive retire cannot reinsert it.
+                (*current).next = current;
+            }
+            let reclaim = unsafe { (*current).reclaim };
+            local_guard.with_local_execution_open(|local_guard| unsafe {
+                reclaim(current, local_guard);
+            });
+            reclaimed += 1;
+        }
+        reclaimed
+    }
+
+    fn reclaim_zone_list(
+        &'static self,
+        local_guard: &mut LocalRetireGuard,
+        mut head: Option<crate::zone::SlotKey>,
+    ) -> usize {
+        let mut reclaimed = 0usize;
+        while let Some(current) = head {
+            head = crate::zone::retiring_next(current);
+            crate::zone::set_retiring_next(current, Some(current));
+            local_guard.with_local_execution_open(|_| unsafe {
+                crate::zone::reclaim_retired_slot(current);
+            });
+            reclaimed += 1;
+        }
+        reclaimed
     }
 
     fn cpu_state(&'static self, cpu: CpuId) -> Option<&'static CpuLocalEpochState> {
@@ -547,12 +767,10 @@ impl EpochDomain {
     unsafe fn reset_for_test(&'static self) {
         self.initialized.store(false, Ordering::Release);
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
-        self.active_guards.0.store(0, Ordering::Release);
         self.possible_cpus.0.store(1, Ordering::Release);
-        self.collection_requested.store(false, Ordering::Release);
+        self.membership_version.0.store(0, Ordering::Release);
         let _guard = self.lock.lock();
         *self.hooks.get() = PlatformHooks::default();
-        (*self.state.get()).reset();
         for cpu in 0..MAX_EPOCH_CPUS {
             self.cpu_states[cpu].reset();
         }
@@ -562,10 +780,8 @@ impl EpochDomain {
         EpochSummary {
             initialized: self.initialized.load(Ordering::Acquire),
             global_epoch: self.global_epoch.0.load(Ordering::Acquire),
-            active_guards: self.active_guards.0.load(Ordering::Acquire),
+            active_guards: self.active_guard_count(),
             possible_cpus: self.possible_cpus.0.load(Ordering::Acquire),
-            retired_count: self.total_retired_count(),
-            collection_requested: self.collection_requested.load(Ordering::Acquire),
         }
     }
 
@@ -575,8 +791,29 @@ impl EpochDomain {
             cpu_id: cpu,
             initialized: state.is_initialized(),
             local_epoch: state.current(),
-            retired_count: state.retired_count(),
+            bag_retired: state.bag_retired_count(),
+            publication_pending: crate::publication::deferred_drop_count(cpu),
         })
+    }
+
+    fn local_retire_active_for_current_cpu(&'static self) -> bool {
+        if !self.initialized.load(Ordering::Acquire) {
+            return false;
+        }
+        let hooks = self.hooks();
+        let cpu_pin = (hooks.pin_current_cpu)();
+        self.cpu_state(cpu_pin.cpu_id())
+            .is_some_and(CpuLocalEpochState::retire_active)
+    }
+
+    fn active_guard_count(&'static self) -> usize {
+        (0..self.possible_cpus.0.load(Ordering::Acquire))
+            .map(|cpu| self.cpu_states[cpu].active_guard_count())
+            .sum()
+    }
+
+    fn membership_version(&'static self) -> u64 {
+        self.membership_version.0.load(Ordering::Acquire)
     }
 }
 
@@ -587,28 +824,25 @@ fn epoch_trace_sample(counter: &AtomicU64) -> Option<i64> {
 
 fn emit_epoch_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
 #[derive(Clone, Copy)]
 struct PlatformHooks {
     pin_current_cpu: fn() -> CpuPinGuard,
+    exclude_local_execution: fn() -> LocalExecutionGuard,
     in_irq_context: fn() -> bool,
-    in_trap_context: fn() -> bool,
-    is_cpu_online: fn(CpuId) -> bool,
+    request_maintenance: fn(CpuId),
 }
 
 impl PlatformHooks {
     const fn default() -> Self {
         Self {
             pin_current_cpu: default_pin_current_cpu,
+            exclude_local_execution: default_exclude_local_execution,
             in_irq_context: default_in_irq_context,
-            in_trap_context: default_in_trap_context,
-            is_cpu_online: default_is_cpu_online,
+            request_maintenance: default_request_maintenance,
         }
     }
 
@@ -618,9 +852,9 @@ impl PlatformHooks {
     {
         Self {
             pin_current_cpu: P::pin_current_cpu,
+            exclude_local_execution: P::exclude_local_execution,
             in_irq_context: P::in_irq_context,
-            in_trap_context: P::in_trap_context,
-            is_cpu_online: P::is_cpu_online,
+            request_maintenance: |cpu| P::send_ipi(cpu, tx_hal::IpiKind::Maintenance),
         }
     }
 }
@@ -629,33 +863,17 @@ fn default_pin_current_cpu() -> CpuPinGuard {
     CpuPinGuard::new(CpuId(0))
 }
 
+fn default_exclude_local_execution() -> LocalExecutionGuard {
+    unsafe { LocalExecutionGuard::new(0, default_restore_local_execution) }
+}
+
+unsafe fn default_restore_local_execution(_saved_state: usize) {}
+
 fn default_in_irq_context() -> bool {
     false
 }
 
-fn default_in_trap_context() -> bool {
-    false
-}
-
-fn default_is_cpu_online(cpu: CpuId) -> bool {
-    cpu.0 == 0
-}
-
-struct DomainState {
-    queue: BagQueue,
-}
-
-impl DomainState {
-    const fn new() -> Self {
-        Self {
-            queue: BagQueue::new(),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.queue.reset();
-    }
-}
+fn default_request_maintenance(_cpu: CpuId) {}
 
 struct SpinLock {
     held: AtomicBool,
@@ -678,13 +896,6 @@ impl SpinLock {
         }
         SpinGuard { lock: self }
     }
-
-    fn try_lock(&self) -> Option<SpinGuard<'_>> {
-        self.held
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| SpinGuard { lock: self })
-    }
 }
 
 struct SpinGuard<'a> {
@@ -704,6 +915,16 @@ where
     GLOBAL_DOMAIN.init_on_bsp::<P>()
 }
 
+#[doc(hidden)]
+pub fn init_on_bsp_with_admission_hook_for_test<P>(
+    admission_hook: impl FnOnce(),
+) -> Result<(), EpochError>
+where
+    P: PercpuIf + SmpIf + IrqIf,
+{
+    GLOBAL_DOMAIN.init_on_bsp_with::<P>(admission_hook)
+}
+
 pub fn init_on_ap(cpu: CpuId) -> Result<(), EpochError> {
     GLOBAL_DOMAIN.init_on_ap(cpu)
 }
@@ -717,19 +938,27 @@ pub(crate) fn borrow_guard() -> Option<Guard<'static>> {
     GLOBAL_DOMAIN.borrow_guard()
 }
 
-pub(crate) unsafe fn retire_raw(
-    ptr: *mut u8,
-    reclaim_fn: unsafe fn(*mut u8),
-) -> Result<(), EpochError> {
-    GLOBAL_DOMAIN.retire_raw(ptr, reclaim_fn)
+pub(crate) unsafe fn retire_intrusive(head: NonNull<RcuHead>) -> Result<(), EpochError> {
+    unsafe { GLOBAL_DOMAIN.retire_intrusive(head) }
+}
+
+pub(crate) fn with_local_retire_guard<R>(
+    action: impl FnOnce(&mut LocalRetireGuard) -> R,
+) -> Result<R, EpochError> {
+    let mut guard = GLOBAL_DOMAIN.local_retire_guard()?;
+    Ok(action(&mut guard))
 }
 
 pub fn try_drain(budget: usize) -> DrainStats {
     GLOBAL_DOMAIN.try_drain(budget)
 }
 
-pub fn drain_requested(budget: usize) -> DrainStats {
-    GLOBAL_DOMAIN.drain_requested(budget)
+pub fn service_local_drain_request(budget: usize) -> Option<DrainStats> {
+    GLOBAL_DOMAIN.service_local_drain_request(budget)
+}
+
+pub fn offline_cpu(cpu: CpuId) -> Result<(), EpochError> {
+    GLOBAL_DOMAIN.offline_cpu(cpu)
 }
 
 pub fn summary() -> EpochSummary {
@@ -738,6 +967,45 @@ pub fn summary() -> EpochSummary {
 
 pub fn cpu_summary(cpu: CpuId) -> Option<CpuEpochSummary> {
     GLOBAL_DOMAIN.cpu_summary(cpu)
+}
+
+#[doc(hidden)]
+pub fn with_local_retire_guard_for_test<R>(action: impl FnOnce() -> R) -> Result<R, EpochError> {
+    let guard = GLOBAL_DOMAIN.local_retire_guard()?;
+    let result = action();
+    drop(guard);
+    Ok(result)
+}
+
+#[doc(hidden)]
+pub fn local_retire_active_for_test() -> bool {
+    GLOBAL_DOMAIN.local_retire_active_for_current_cpu()
+}
+
+#[doc(hidden)]
+pub fn try_advance_with_membership_change_for_test(
+    membership_change: impl FnOnce(),
+) -> AdvanceAttempt {
+    GLOBAL_DOMAIN.try_advance_epoch_with(membership_change)
+}
+
+#[doc(hidden)]
+pub fn drain_requested_for_test(cpu: CpuId) -> bool {
+    GLOBAL_DOMAIN
+        .cpu_state(cpu)
+        .is_some_and(CpuLocalEpochState::drain_requested)
+}
+
+#[doc(hidden)]
+pub fn membership_for_test(cpu: CpuId) -> Option<CpuMembership> {
+    GLOBAL_DOMAIN
+        .cpu_state(cpu)
+        .map(CpuLocalEpochState::membership)
+}
+
+#[doc(hidden)]
+pub fn membership_version_for_test() -> u64 {
+    GLOBAL_DOMAIN.membership_version()
 }
 
 #[doc(hidden)]

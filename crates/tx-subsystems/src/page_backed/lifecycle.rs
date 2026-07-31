@@ -6,28 +6,26 @@ use alloc::vec::Vec;
 
 impl PageCacheIndex {
     fn withdraw_from(&mut self, first: PageIndex) {
-        drop(self.pages.split_off(&first));
+        self.erase_from(first);
     }
 
-    fn dirty_pages(&self) -> Vec<(PageIndex, Ppn, u64)> {
-        self.pages
-            .iter()
-            .filter_map(|(page, entry)| {
-                entry
-                    .marks
-                    .dirty
-                    .then_some((*page, entry.ppn, entry.dirty_generation))
-            })
+    fn dirty_pages(&self) -> Vec<(PageIndex, Ppn)> {
+        if !self.marked(PageCacheMark::Dirty) {
+            return Vec::new();
+        }
+        self.collect_marked(PageCacheMark::Dirty)
+            .into_iter()
+            .map(|(page, entry)| (page, entry.ppn))
             .collect()
     }
 
-    fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn, dirty_generation: u64) {
-        let Some(entry) = self.pages.get_mut(&page) else {
+    fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn) {
+        let Some(entry) = self.load(page) else {
             return;
         };
-        if entry.ppn == ppn && entry.dirty_generation == dirty_generation {
-            entry.marks.dirty = false;
-            entry.marks.writeback = false;
+        if entry.ppn == ppn {
+            let _ = self.clear_mark(page, PageCacheMark::Dirty);
+            let _ = self.clear_mark(page, PageCacheMark::Writeback);
         }
     }
 }
@@ -47,7 +45,9 @@ impl PageContainer {
                 .collect()
         };
         for notifier in notify_ready {
-            notification::notify_page_ready(&notifier);
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
         }
     }
 
@@ -393,14 +393,39 @@ pub fn step_fallocate(
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FsyncOp<'a> {
     pub pc: &'a PageContainer,
+    state: FileFsyncState,
+}
+
+impl<'a> FsyncOp<'a> {
+    #[allow(dead_code)] // constructed by syscall-side StepOp migration next
+    pub const fn new(pc: &'a PageContainer) -> Self {
+        Self {
+            pc,
+            state: FileFsyncState::new(),
+        }
+    }
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
     type Output = ();
     type Progress = PageProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let __guard = step_engine::guard();
-        step_fsync(self.pc, &__guard)
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
+        let PageContainerKind::File { mount, .. } = self.pc.kind() else {
+            return V3::done(());
+        };
+        if mount.payload().backend_planner().is_none() {
+            let guard = step_engine::guard();
+            return step_fsync(self.pc, &guard);
+        }
+
+        match self.state.advance(self.pc) {
+            Err(errno) => V3::err(errno.into()),
+            Ok(None) => V3::continue_with(PageProgress::EMPTY),
+            Ok(Some(Ok(()))) => V3::done(()),
+            Ok(Some(Err(errno))) => V3::err(errno.into()),
+        }
     }
 }
 
@@ -1002,7 +1027,7 @@ mod step_op_wraps {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
         let pc = anon_pc(1);
-        let mut op = FsyncOp { pc: &pc };
+        let mut op = FsyncOp::new(&pc);
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }

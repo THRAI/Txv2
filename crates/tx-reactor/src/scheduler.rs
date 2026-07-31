@@ -312,6 +312,22 @@ pub struct LocalEnqueueRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LocalQueueMove {
+    pub(crate) task: TaskId,
+    pub(crate) from_hart: HartId,
+    pub(crate) from_queue: Phase1QueueKind,
+    pub(crate) to_hart: HartId,
+    pub(crate) to_queue: Phase1QueueKind,
+    pub(crate) front: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalRunnableAction {
+    Enqueue(LocalEnqueueRequest),
+    Move(LocalQueueMove),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueuedTaskReport {
     pub task: TaskId,
     pub hart: HartId,
@@ -565,10 +581,10 @@ impl Phase1Scheduler {
     }
 
     pub fn task_runnable(&mut self, task: TaskId, hint: WakeHint) {
-        if let Some((_placement, request)) =
+        if let Some((_placement, action)) =
             self.task_runnable_from_for_locals(task, hint, HartId(0))
         {
-            self.apply_compat_enqueue(request);
+            self.apply_compat_runnable_action(action);
         }
     }
 
@@ -646,6 +662,38 @@ impl Phase1Scheduler {
         self.ensure_compat_hart(request.hart);
         if let Some(local) = self.compat_local(request.hart) {
             Self::push_to_local_queue(local, request.task, request.queue, request.front);
+        }
+    }
+
+    fn apply_compat_runnable_action(&mut self, action: LocalRunnableAction) {
+        match action {
+            LocalRunnableAction::Enqueue(request) => self.apply_compat_enqueue(request),
+            LocalRunnableAction::Move(movement) => {
+                self.ensure_compat_hart(movement.from_hart);
+                self.ensure_compat_hart(movement.to_hart);
+                if let Some(from_local) = self.compat_local(movement.from_hart) {
+                    Self::remove_from_local_queue(movement.task, from_local, movement.from_queue);
+                }
+                if let Some(to_local) = self.compat_local(movement.to_hart) {
+                    Self::push_to_local_queue(
+                        to_local,
+                        movement.task,
+                        movement.to_queue,
+                        movement.front,
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_compat_affinity_move(&mut self, movement: LocalAffinityMove) {
+        self.ensure_compat_hart(movement.from_hart);
+        self.ensure_compat_hart(movement.to_hart);
+        if let Some(from_local) = self.compat_local(movement.from_hart) {
+            Self::remove_from_local_queue(movement.task, from_local, movement.queue);
+        }
+        if let Some(to_local) = self.compat_local(movement.to_hart) {
+            Self::push_to_local_queue(to_local, movement.task, movement.queue, false);
         }
     }
 
@@ -901,17 +949,17 @@ impl Phase1Scheduler {
         hint: WakeHint,
         current_hart: HartId,
     ) -> Option<RunnablePlacement> {
-        let (placement, request) = self.task_runnable_inner_for_locals(task, hint, current_hart)?;
-        self.apply_compat_enqueue(request);
+        let (placement, action) = self.task_runnable_inner_for_locals(task, hint, current_hart)?;
+        self.apply_compat_runnable_action(action);
         Some(placement)
     }
 
-    pub fn task_runnable_from_for_locals(
+    pub(crate) fn task_runnable_from_for_locals(
         &self,
         task: TaskId,
         hint: WakeHint,
         current_hart: HartId,
-    ) -> Option<(RunnablePlacement, LocalEnqueueRequest)> {
+    ) -> Option<(RunnablePlacement, LocalRunnableAction)> {
         self.task_runnable_inner_for_locals(task, hint, current_hart)
     }
 
@@ -1671,7 +1719,77 @@ impl Phase1Scheduler {
         task: TaskId,
         hint: WakeHint,
         current_hart: HartId,
-    ) -> Option<(RunnablePlacement, LocalEnqueueRequest)> {
+    ) -> Option<(RunnablePlacement, LocalRunnableAction)> {
+        let meta = self.shared.meta_for(task)?;
+        let hart = self.wake_target_hart_for_meta(&meta, hint, current_hart);
+        let (queue, front) = if meta.kernel_only {
+            (Phase1QueueKind::Kernel, false)
+        } else {
+            match meta.class {
+                SchedClass::Fair => {
+                    if hint.is_boosted() {
+                        (Phase1QueueKind::Boosted, false)
+                    } else if meta.remaining_budget_ns > 0 {
+                        (
+                            Phase1QueueKind::Preempted,
+                            !meta.userspace_thread || hint == WakeHint::WakeHandoff,
+                        )
+                    } else {
+                        (Phase1QueueKind::New, false)
+                    }
+                }
+                SchedClass::RtFifo
+                | SchedClass::RtRoundRobin
+                | SchedClass::Deadline
+                | SchedClass::Idle => (Phase1QueueKind::New, false),
+            }
+        };
+
+        if meta.owner == TaskRunOwner::Terminal {
+            return None;
+        }
+
+        if let TaskRunOwner::Queued {
+            hart: from_hart,
+            queue: from_queue,
+        } = meta.owner
+        {
+            if !meta.userspace_thread
+                || hint != WakeHint::SignalDelivery
+                || from_queue == Phase1QueueKind::Boosted
+            {
+                return None;
+            }
+
+            self.shared.with_meta_mut(task, |meta| {
+                meta.latency_wake = false;
+                meta.owner = TaskRunOwner::Queued {
+                    hart: from_hart,
+                    queue,
+                };
+            });
+            emit_sched_debug(b"debug.sched.runnable.queue", pack_task_queue(task, queue));
+            emit_sched_debug(
+                b"debug.sched.runnable.hint",
+                ((task.0 as i64) << 8) | wake_hint_code(hint),
+            );
+
+            return Some((
+                RunnablePlacement {
+                    target_hart: from_hart,
+                    wake_remote: from_hart != current_hart,
+                },
+                LocalRunnableAction::Move(LocalQueueMove {
+                    task,
+                    from_hart,
+                    from_queue,
+                    to_hart: from_hart,
+                    to_queue: queue,
+                    front,
+                }),
+            ));
+        }
+
         let queued_turn = self.shared.current_turn();
         let (hart, queue, front) = self.shared.with_meta_mut(task, |meta| {
             if meta.is_queued() || meta.owner == TaskRunOwner::Terminal {
@@ -1704,12 +1822,12 @@ impl Phase1Scheduler {
                 target_hart: hart,
                 wake_remote: hart != current_hart,
             },
-            LocalEnqueueRequest {
+            LocalRunnableAction::Enqueue(LocalEnqueueRequest {
                 task,
                 hart,
                 queue,
                 front,
-            },
+            }),
         ))
     }
 
@@ -1906,10 +2024,7 @@ fn emit_sched_debug(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }

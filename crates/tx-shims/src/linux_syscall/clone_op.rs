@@ -2,15 +2,14 @@
 //
 // CloneOp unifies fork and clone_thread under a single StepOp,
 // replacing the ad-hoc synchronous dispatch in sys_clone.
-// CLONE_VFORK uses YieldShape::OnWaitSource for proper reactor
-// parking instead of manual wait_source::wait_on_token.
+// CLONE_VFORK uses YieldShape::OnWaitSource for registered-source parking.
 
 use super::*;
-use step_engine::{StepOp, StepOutcome, YieldShape, NoProgress};
+use step_engine::{NoProgress, StepOp, StepOutcome, YieldShape};
+use tx_hal::UserTrapContext;
 use tx_subsystems::process::execution::{step_clone_thread, step_fork};
 use tx_subsystems::process::{ForkError, ProcessIdentity};
 use tx_subsystems::thread_runtime::structure::ThreadIdentity;
-use tx_hal::UserTrapContext;
 
 #[cfg(target_arch = "loongarch64")]
 const TLS_REG_INDEX: usize = 2;
@@ -33,8 +32,13 @@ enum ClonePhase {
 /// Output of the clone operation — either a new process pid or
 /// a thread tid.
 pub enum CloneOutput {
-    NewProcess { child: Cap<ProcessIdentity>, pid: u64 },
-    NewThread { tid: u64 },
+    NewProcess {
+        child: Cap<ProcessIdentity>,
+        pid: u64,
+    },
+    NewThread {
+        tid: u64,
+    },
 }
 
 /// StepOp wrapping the clone syscall logic.
@@ -89,7 +93,10 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
     type Output = CloneOutput;
     type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut step_engine::ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(
+        &mut self,
+        _ctx: &mut step_engine::ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         match self.phase {
             ClonePhase::Exec => {
                 let clone_thread = (self.flags & CLONE_THREAD) != 0;
@@ -127,9 +134,13 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
                     }
 
                     reactor_submit::submit_child_thread(self.parent.clone(), child_thread.clone());
-                    self.result = Some(CloneOutput::NewThread { tid: child_thread.tid.0 });
+                    self.result = Some(CloneOutput::NewThread {
+                        tid: child_thread.tid.0,
+                    });
                     self.phase = ClonePhase::Done;
-                    return StepOutcome::Done(CloneOutput::NewThread { tid: child_thread.tid.0 });
+                    return StepOutcome::Done(CloneOutput::NewThread {
+                        tid: child_thread.tid.0,
+                    });
                 }
 
                 // ---- Process path ----
@@ -138,9 +149,7 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
                     Err(e) => return StepOutcome::Err(map_fork_err_to_v3(e)),
                 };
 
-                let child_thread = child
-                    .nth_thread(0)
-                    .expect(":clone:no-leader");
+                let child_thread = child.nth_thread(0).expect(":clone:no-leader");
 
                 seed_child_leader_context(
                     &child_thread,
@@ -154,15 +163,24 @@ impl<'a, P: tx_hal::PmapIf, I: step_engine::SubjectIdentity> StepOp<I> for Clone
 
                 if clone_vfork {
                     // Transition to VforkWait — parent blocks until child exits/execs.
-                    if let Some(exit_id) = child.exit_source_id() {
-                        self.phase = ClonePhase::VforkWait { exit_source_id: exit_id };
+                    if let Some(endpoint) = child.exit_endpoint() {
+                        let exit_id = tx_substrate::wake::WaitEndpoint::source_id(&endpoint).raw();
+                        self.phase = ClonePhase::VforkWait {
+                            exit_source_id: exit_id,
+                        };
                         return StepOutcome::Yield(YieldShape::on_wait_source(exit_id, 1));
                     }
                 }
 
-                self.result = Some(CloneOutput::NewProcess { child, pid: child_pid });
+                self.result = Some(CloneOutput::NewProcess {
+                    child,
+                    pid: child_pid,
+                });
                 self.phase = ClonePhase::Done;
-                StepOutcome::Done(CloneOutput::NewProcess { child, pid: child_pid })
+                StepOutcome::Done(CloneOutput::NewProcess {
+                    child,
+                    pid: child_pid,
+                })
             }
 
             ClonePhase::VforkWait { exit_source_id } => {

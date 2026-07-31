@@ -1,0 +1,175 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-14-elf-exec-loader",
+  "title": "Replaceable elf 0.8 exec loader",
+  "status": "active",
+  "created": "2026-07-14",
+  "updated": "2026-07-21",
+  "owner": "codex",
+  "summary": "Replace production goblin parsing with a tx-owned ElfFileParser backed by elf 0.8.0, staged metadata reads, platform policy, and validated dynamic interpreter layout. Non-goals are dynamic tag/symbol/hash/relocation processing, vDSO implementation owned by the vDSO plan, and uncoordinated PageBacked executable-lease edits.",
+  "scope": {
+    "in": [
+      "crates/tx-scripts/src/process/exec/loader.rs",
+      "crates/tx-scripts/src/process/exec/loader",
+      "crates/tx-scripts/Cargo.toml",
+      "Cargo.lock"
+    ],
+    "out": [],
+    "write_sets": [
+      {
+        "owner": "elf-loader-core",
+        "paths": [
+          "crates/tx-scripts/src/process/exec/loader.rs",
+          "crates/tx-scripts/src/process/exec/loader",
+          "crates/tx-scripts/Cargo.toml"
+        ],
+        "notes": "Parser trait, elf 0.8 backend, tx-owned facts, policy and loader tests. Staged exec integration is coordinated separately with the active vDSO plan."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/superpowers/specs/2026-07-14-elf-exec-loader-design.md",
+      "docs/design/02_execution/EXEC_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": [
+      "https://docs.rs/elf/0.8.0/elf/"
+    ]
+  },
+  "steps": [
+    {
+      "id": "parser-contract",
+      "title": "Add tx-owned ELF values and replaceable parser trait",
+      "status": "in-progress",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/loader.rs",
+        "crates/tx-scripts/src/process/exec/loader/model.rs",
+        "crates/tx-scripts/src/process/exec/loader/parser.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-scripts parser_trait_exposes_only_tx_owned_values --lib"
+      ],
+      "notes": "TDD starts with the trait contract test."
+    },
+    {
+      "id": "elf08-backend",
+      "title": "Implement elf 0.8 syntax decoder",
+      "status": "pending",
+      "depends_on": ["parser-contract"],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/loader/elf08.rs",
+        "crates/tx-scripts/Cargo.toml",
+        "Cargo.lock"
+      ],
+      "verification": [
+        "cargo test -p tx-scripts elf08_parser_ --lib",
+        "cargo check -p tx-scripts --lib"
+      ],
+      "notes": "Use elf low-level header and ParsingTable APIs; no elf type escapes."
+    },
+    {
+      "id": "platform-policy",
+      "title": "Build image plans from parser-independent platform policy",
+      "status": "pending",
+      "depends_on": ["elf08-backend"],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/loader/policy.rs",
+        "crates/tx-scripts/src/process/exec/loader.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-scripts process::exec::loader::tests --lib"
+      ],
+      "notes": "Covers target ISA, checked file/final VA ranges, entry and PHDR validation."
+    },
+    {
+      "id": "runtime-metadata",
+      "title": "Retain TLS, dynamic, RELRO and GNU stack facts",
+      "status": "pending",
+      "depends_on": ["platform-policy"],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/loader/model.rs",
+        "crates/tx-scripts/src/process/exec/loader.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-scripts process::exec::loader::tests --lib"
+      ],
+      "notes": "No kernel dynamic linker is introduced."
+    },
+    {
+      "id": "staged-reader",
+      "title": "Integrate bounded header, phdr and interpreter reads",
+      "status": "pending",
+      "depends_on": ["runtime-metadata"],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/image_reader.rs",
+        "crates/tx-scripts/src/process/exec/script.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-scripts staged_elf_read_ --lib",
+        "cargo test -p tx-scripts process::exec --lib"
+      ],
+      "notes": "Coordinate line ownership with vdso-migration before editing script.rs."
+    },
+    {
+      "id": "layout-and-auxv",
+      "title": "Validate combined main/interpreter layout and auxv",
+      "status": "pending",
+      "depends_on": ["staged-reader"],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/script.rs",
+        "crates/tx-scripts/src/process/exec/stack.rs",
+        "crates/tx-subsystems/src/vm/scripts.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-scripts dynamic_exec_layout_ --lib",
+        "cargo check -p tx-subsystems --lib --no-default-features"
+      ],
+      "notes": "Preserve any vDSO mappings and AT_SYSINFO_EHDR work that lands first."
+    },
+    {
+      "id": "goblin-retirement",
+      "title": "Remove goblin and close core guest verification",
+      "status": "pending",
+      "depends_on": ["layout-and-auxv"],
+      "paths": [
+        "crates/tx-scripts/Cargo.toml",
+        "Cargo.lock",
+        "docs/design/02_execution/EXEC_v1.md",
+        "docs/progress"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate",
+        "RV64 and LA64 static, PIE, musl and glibc exec witnesses"
+      ],
+      "notes": "Complete-program status remains open for executable lease, yielding StepOp, and vDSO GNU-stack closure."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-scripts process::exec::loader::tests --lib",
+      "status": "passed",
+      "notes": "Baseline before implementation: 23 passed, 0 failed."
+    }
+  ],
+  "risks": [
+    "Current exec files contain unrelated uncommitted StepOp migration changes that must be preserved.",
+    "The active vDSO plan owns overlapping future exec and VM paths.",
+    "Changing strict alignment/WX behavior can invalidate hand-built fixtures while improving Linux compatibility.",
+    "Production parser replacement does not by itself provide ETXTBSY generation stability or a yielding exec continuation."
+  ],
+  "blockers": [
+    "Final NX GNU-stack enforcement depends on vDSO migration phase 6.",
+    "Progress validation is currently blocked by the pre-existing vdso-migration status value 'in_progress'."
+  ],
+  "handoff": {
+    "needed": true,
+    "path": null
+  }
+}

@@ -328,8 +328,9 @@ impl AddressSpace {
     /// "NULL is EFAULT" rule should reject the NULL pointer before
     /// invoking.
     ///
-    /// `Errno::ENAMETOOLONG` if `max_len` bytes are walked without
-    /// finding a NUL.
+    /// Returns `Errno::ENAMETOOLONG` if `max_len` bytes are walked
+    /// without finding a NUL, or `Errno::ENOMEM` if the kernel-owned
+    /// result buffer cannot grow.
     pub fn read_user_cstr(
         &self,
         src: UserPtr<u8>,
@@ -340,7 +341,10 @@ impl AddressSpace {
         if src.addr() == 0 || max_len == 0 {
             return V3::Done(Vec::new());
         }
-        let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
+        let mut out: Vec<u8> = Vec::new();
+        if out.try_reserve_exact(core::cmp::min(max_len, 256)).is_err() {
+            return V3::Err(Errno::ENOMEM.into());
+        }
         let mut consumed = 0usize;
         while consumed < max_len {
             let Some(user_addr) = src.addr().checked_add(consumed) else {
@@ -370,6 +374,13 @@ impl AddressSpace {
                 let byte = unsafe { core::ptr::read(frame_base.add(within + i)) };
                 if byte == 0 {
                     return V3::Done(out);
+                }
+                if out.len() == out.capacity() {
+                    let additional =
+                        core::cmp::min(out.capacity().max(1), max_len.saturating_sub(out.len()));
+                    if out.try_reserve(additional).is_err() {
+                        return V3::Err(Errno::ENOMEM.into());
+                    }
                 }
                 out.push(byte);
             }
@@ -681,10 +692,7 @@ fn emit_vm_user_trace(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -704,6 +712,9 @@ fn resolve_user_page(
         b"debug.vm.user.resolve_page.backing",
         vm_backing_trace_id(entry.backing_kind()),
     );
+    if entry.special_backing().is_some() {
+        return ResolvePageOutcome::Err(Errno::EFAULT);
+    }
     match entry.backing_kind() {
         VmEntryBacking::None => {
             emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 1);

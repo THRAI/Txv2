@@ -2,9 +2,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use tx_hal::{
     Arch, AuxvIf, BootInfo, BootInfoIf, BootPlatformIf, BootProtocol, CacheIf, ConsoleIf, CpuId,
-    CpuMask, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, ObserverIf, PercpuIf, PhysRange,
-    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TimeIf,
-    TrapIf, VirtAddr,
+    CpuMask, DeadlineTimerIf, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockIf, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TrapIf, VirtAddr,
 };
 use tx_substrate::{epoch, zone};
 
@@ -72,19 +72,23 @@ impl SignalFrameIf for TestPlatform {}
 impl IrqIf for TestPlatform {}
 impl EntropyIf for TestPlatform {}
 
-impl TimeIf for TestPlatform {
+impl MonotonicCounterIf for TestPlatform {
     fn read_ns() -> u64 {
         0
     }
-
-    fn set_deadline_ns(_deadline: u64) {}
-
-    fn cancel_deadline() {}
 
     fn frequency_hz() -> u64 {
         PLATFORM_INFO.timebase_frequency_hz
     }
 }
+
+impl DeadlineTimerIf for TestPlatform {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl PersistentClockIf for TestPlatform {}
 
 impl PercpuIf for TestPlatform {
     fn current_cpu_id() -> CpuId {

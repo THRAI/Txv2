@@ -1,3 +1,4 @@
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::Cap;
 use tx_substrate::{index::IndexError, step::NoProgress};
 
@@ -45,23 +46,43 @@ pub struct LoopbackTcpTransferOutcome {
     pub peer_wake_fired: bool,
 }
 
-pub fn step_tcp_loopback_handshake(
+pub fn step_tcp_loopback_handshake_with_post<F>(
     client: &Cap<SocketIdentity>,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    post: F,
+) -> StepOutcome<LoopbackTcpConnectOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_tcp_loopback_handshake_on_iface(client, initial_loopback_iface(), guard)
+    step_tcp_loopback_handshake_on_iface_with_post::<F>(
+        client,
+        initial_loopback_iface(),
+        guard,
+        post,
+    )
 }
 
-pub fn step_tcp_loopback_handshake_on_iface(
+pub fn step_tcp_loopback_handshake(
+    client: &Cap<SocketIdentity>,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    step_tcp_loopback_handshake_with_post(client, guard, |mailbox, event| mailbox.post(event))
+}
+
+pub fn step_tcp_loopback_handshake_on_iface_with_post<F>(
     client: &Cap<SocketIdentity>,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    mut post: F,
+) -> StepOutcome<LoopbackTcpConnectOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -161,6 +182,10 @@ pub fn step_tcp_loopback_handshake_on_iface(
         };
     }
 
+    client_payload.refresh_io_from_raw();
+    if let Some(child_payload) = child.acquire_operational() {
+        child_payload.refresh_io_from_raw();
+    }
     publish_targets.push(NetworkPublishTarget::new(
         client.clone(),
         NetworkPublish {
@@ -171,7 +196,7 @@ pub fn step_tcp_loopback_handshake_on_iface(
 
     let wakes_fired = publish_targets
         .into_iter()
-        .map(|target| target.publish())
+        .map(|target| target.publish_with_post(&mut post))
         .sum();
 
     StepOutcome::Done(LoopbackTcpConnectOutcome {
@@ -181,25 +206,59 @@ pub fn step_tcp_loopback_handshake_on_iface(
     })
 }
 
-pub fn step_tcp_loopback_transfer(
+pub fn step_tcp_loopback_handshake_on_iface(
+    client: &Cap<SocketIdentity>,
+    iface: &LoopbackIface,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    step_tcp_loopback_handshake_on_iface_with_post(client, iface, guard, |mailbox, event| {
+        mailbox.post(event)
+    })
+}
+
+pub fn step_tcp_loopback_transfer_with_post<F>(
     source: &Cap<SocketIdentity>,
     max_bytes: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    post: F,
+) -> StepOutcome<LoopbackTcpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_loopback_tcp(source, max_bytes, initial_loopback_iface(), guard)
+    step_process_loopback_tcp_with_post::<F>(
+        source,
+        max_bytes,
+        initial_loopback_iface(),
+        guard,
+        post,
+    )
 }
 
-pub fn step_process_loopback_tcp(
+pub fn step_tcp_loopback_transfer(
+    source: &Cap<SocketIdentity>,
+    max_bytes: usize,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    step_tcp_loopback_transfer_with_post(source, max_bytes, guard, |mailbox, event| {
+        mailbox.post(event)
+    })
+}
+
+pub fn step_process_loopback_tcp_with_post<F>(
     source: &Cap<SocketIdentity>,
     max_bytes: usize,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    mut post: F,
+) -> StepOutcome<LoopbackTcpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -236,20 +295,20 @@ pub fn step_process_loopback_tcp(
         return StepOutcome::Err(Errno::ENOTCONN);
     }
 
-    if peer_payload.raw_tcp_socket().is_none() {
+    let Some(peer_raw) = peer_payload.raw_tcp_socket() else {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
-    }
-    // Flow control is smoltcp's job now: the peer's advertised window
-    // derives from its rx ring, so dispatch stops by itself when full.
-    let transfer_limit = max_bytes;
-    let source_had_no_send_space = source_payload
-        .raw_tcp_socket()
-        .is_some_and(|raw| raw.send_available() == 0);
+    };
 
-    let mut ctx = PollContext::new_with_table(
-        crate::net::clock::net_now_instant(),
-        source_payload.socket_table(),
-    );
+    let peer_space = peer_raw
+        .recv_capacity()
+        .saturating_sub(peer_raw.recv_available());
+    let transfer_limit = core::cmp::min(max_bytes, peer_space);
+    if transfer_limit == 0 {
+        return StepOutcome::Done(LoopbackTcpTransferOutcome::default());
+    }
+
+    let mut ctx =
+        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
     let mut publish_targets = alloc::vec::Vec::new();
     let mut bytes_moved = 0;
     let mut source_bytes_moved = 0;
@@ -317,15 +376,16 @@ pub fn step_process_loopback_tcp(
         return StepOutcome::Done(LoopbackTcpTransferOutcome::default());
     }
 
-    // Send space opens when the transfer's ACKs release smoltcp tx ring
-    // bytes — derive the wake from the ring, no shadow drain to account.
-    let source_wake_fired = source_had_no_send_space
-        && source_payload
-            .raw_tcp_socket()
-            .is_some_and(|raw| raw.send_available() > 0);
+    let drain = source_payload.take_tcp_tx_bytes(bytes_moved);
+    source_payload.refresh_io_from_raw();
+    peer_payload.refresh_io_from_raw();
+    let source_wake_fired = drain
+        .as_ref()
+        .map(|drain| drain.became_available)
+        .unwrap_or(false);
     publish_targets.extend(send_space_publish_for_drain(source, source_wake_fired));
     for target in publish_targets {
-        target.publish();
+        target.publish_with_post(&mut post);
     }
     StepOutcome::Done(LoopbackTcpTransferOutcome {
         bytes_moved,
@@ -339,6 +399,17 @@ pub fn step_process_loopback_tcp(
         peer_send_broken,
         source_wake_fired,
         peer_wake_fired,
+    })
+}
+
+pub fn step_process_loopback_tcp(
+    source: &Cap<SocketIdentity>,
+    max_bytes: usize,
+    iface: &LoopbackIface,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    step_process_loopback_tcp_with_post(source, max_bytes, iface, guard, |mailbox, event| {
+        mailbox.post(event)
     })
 }
 
@@ -416,10 +487,8 @@ fn establish_smoltcp_loopback_on_iface(
         _ => return LoopbackHandshakeDrive::Failed,
     }
 
-    let mut ctx = PollContext::new_with_table(
-        crate::net::clock::net_now_instant(),
-        client_payload.socket_table(),
-    );
+    let mut ctx =
+        PollContext::new_with_table(smoltcp::time::Instant::ZERO, client_payload.socket_table());
     let mut publishes = alloc::vec::Vec::new();
     let table = client_payload.socket_table();
     let listener = table.lookup_tcp_listener_dual_stack_endpoint(remote, guard);

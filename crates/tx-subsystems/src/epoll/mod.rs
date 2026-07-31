@@ -19,6 +19,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
@@ -33,7 +34,7 @@ use adapter::step_engine::{
 // ---------------------------------------------------------------------------
 
 /// Monitored fd entry.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EpollEntry {
     /// Userspace fd number.
     pub fd: u32,
@@ -46,6 +47,9 @@ pub struct EpollEntry {
     /// is a sentinel meaning "source not yet known" — the entry is
     /// tracked but does not contribute to readiness.
     pub source: WaitSourceId,
+    /// Object-owned endpoint for the monitored fd when the fd facade can
+    /// expose one. Raw/legacy sources keep this as `None` and use `source`.
+    pub endpoint: Option<Arc<WaitSource>>,
     /// Target epoll, when the monitored fd is itself an epoll fd.
     pub target_epoll: Option<Cap<Epoll>>,
     /// Last readiness mask observed by `epoll_wait`.
@@ -53,6 +57,21 @@ pub struct EpollEntry {
     /// `EPOLLONESHOT` disables the entry after one delivered event
     /// until userspace re-enables it with `EPOLL_CTL_MOD`.
     pub disabled: bool,
+}
+
+impl fmt::Debug for EpollEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EpollEntry")
+            .field("fd", &self.fd)
+            .field("interests", &self.interests)
+            .field("data", &self.data)
+            .field("source", &self.source)
+            .field("has_endpoint", &self.endpoint.is_some())
+            .field("target_epoll", &self.target_epoll.is_some())
+            .field("last_ready", &self.last_ready)
+            .field("disabled", &self.disabled)
+            .finish()
+    }
 }
 
 /// Per-instance epoll state.
@@ -122,6 +141,11 @@ impl Epoll {
         self.wait_source.id()
     }
 
+    /// Readiness endpoint fired when any monitored fd becomes ready.
+    pub fn ready_endpoint(&self) -> &Arc<WaitSource> {
+        &self.wait_source
+    }
+
     pub fn entries_snapshot(&self) -> alloc::vec::Vec<EpollEntry> {
         self.fds.lock().values().cloned().collect()
     }
@@ -148,6 +172,7 @@ pub fn step_epoll_ctl_add(
     interests: u32,
     data: u64,
     source: WaitSourceId,
+    endpoint: Option<Arc<WaitSource>>,
     target_epoll: Option<Cap<Epoll>>,
 ) -> StepOutcome<(), NoProgress> {
     // observe — N/A: ep is &Epoll (always alive)
@@ -178,6 +203,7 @@ pub fn step_epoll_ctl_add(
             interests,
             data,
             source,
+            endpoint,
             target_epoll,
             last_ready: 0,
             disabled: false,
@@ -193,6 +219,7 @@ pub fn step_epoll_ctl_mod(
     interests: u32,
     data: u64,
     source: WaitSourceId,
+    endpoint: Option<Arc<WaitSource>>,
     target_epoll: Option<Cap<Epoll>>,
 ) -> StepOutcome<(), NoProgress> {
     {
@@ -220,6 +247,7 @@ pub fn step_epoll_ctl_mod(
         interests,
         data,
         source,
+        endpoint,
         target_epoll,
         last_ready: 0,
         disabled: false,
@@ -329,10 +357,11 @@ pub fn step_epoll_wait(
     let fds = ep.fds.lock();
     if fds.is_empty() {
         // Park until a monitored fd is added and fires.
+        let source = tx_substrate::wake::WaitEndpoint::source_id(ep.ready_endpoint());
         return StepOutcome::Yield {
             progress: ByteProgress::new(0),
             shape: YieldShape::OnEdge {
-                source: ep.wait_source_id(),
+                source,
                 interests: InterestMask::new(1), // "readable" epoll fd
             },
         };
@@ -348,10 +377,11 @@ pub fn step_epoll_wait(
     } else {
         // Fds are monitored but none have a wired source yet.
         // Yield to park until a source is connected.
+        let source = tx_substrate::wake::WaitEndpoint::source_id(ep.ready_endpoint());
         StepOutcome::Yield {
             progress: ByteProgress::new(0),
             shape: YieldShape::OnEdge {
-                source: ep.wait_source_id(),
+                source,
                 interests: InterestMask::new(1),
             },
         }
@@ -365,4 +395,18 @@ pub fn step_epoll_wait(
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_epoll_id_counter_for_test() {
     NEXT_EPOLL_ID.store(1, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_endpoint_matches_wait_source_id() {
+        let ep = Epoll::new();
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(ep.ready_endpoint()),
+            ep.wait_source_id(),
+        );
+    }
 }

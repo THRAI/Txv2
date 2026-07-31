@@ -10,6 +10,16 @@ use tx_subsystems::ipc::{sysv_msg, sysv_sem, sysv_shm};
 use tx_subsystems::vm::{Prot, VmEntryBacking, USER_PAGE_SIZE};
 
 const E2BIG: i32 = 7;
+static SYSV_SEM_DISPATCH_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_sysv_sem_dispatch_ref_post(
+    mailbox: &tx_substrate::wake::TaskMailbox,
+    event: tx_substrate::wake::MailboxEvent,
+) -> bool {
+    SYSV_SEM_DISPATCH_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    mailbox.post(event)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -323,6 +333,110 @@ fn dispatch_sysv_semop_and_semctl_stat_use_musl_layout() {
     assert_eq!(ds.sem_perm.key, 0x53454d31);
     assert_eq!(ds.sem_perm.mode, 0o660);
     assert_eq!(ds.sem_nsems, 1);
+}
+
+#[test]
+fn dispatch_sysv_semop_uses_syscall_ctx_mailbox_ref_post_for_changed_wake() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process.clone(), thread)
+        .with_mailbox_ref_post(counting_sysv_sem_dispatch_ref_post);
+
+    let semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMGET,
+            [
+                0x53455053,
+                1,
+                (sysv_shm::execution::IPC_CREAT | 0o660) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u32,
+        other => panic!("semget failed: {other:?}"),
+    };
+
+    let cred = ctx.cred_cap();
+    let wait_sop = sysv_sem::structure::SemBuf {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
+    let wait_source_id = match sysv_sem::execution::step_semop_v3_with_post(
+        semid,
+        &[wait_sop],
+        &cred,
+        &process,
+        |mailbox, event| mailbox.post(event),
+    ) {
+        StepOutcome::Yield {
+            shape:
+                tx_substrate::step::YieldShape::OnWaitSource {
+                    source, interests, ..
+                },
+            ..
+        } => {
+            assert_eq!(interests.raw(), 1);
+            source.raw()
+        }
+        other => panic!("expected blocking semop to yield, got {other:?}"),
+    };
+    let source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(wait_source_id))
+            .expect("sem wait source should be registered");
+    let mailbox = alloc::sync::Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let subscriber = source.register(
+        alloc::sync::Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(1),
+    );
+    SYSV_SEM_DISPATCH_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+
+    let post_sop = SembufLayout {
+        sem_num: 0,
+        sem_op: 1,
+        sem_flg: 0,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMOP,
+                [
+                    semid as u64,
+                    (&post_sop as *const SembufLayout) as u64,
+                    1,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
+    );
+
+    assert_eq!(
+        SYSV_SEM_DISPATCH_REF_POST_COUNT.load(core::sync::atomic::Ordering::SeqCst),
+        1,
+        "dispatch sys_semop must use SyscallCtx mailbox-ref post"
+    );
+    assert!(
+        matches!(
+            mailbox.poll(),
+            Some(tx_substrate::wake::MailboxEvent::SourceFired {
+                generation: fired,
+                ..
+            }) if fired == generation
+        ),
+        "dispatch sys_semop must wake sem waiters"
+    );
+    source.unregister(subscriber);
 }
 
 #[test]

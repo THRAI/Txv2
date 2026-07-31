@@ -44,7 +44,7 @@ impl LockMetricsOn {
         let _ = name;
         Self {
             #[cfg(tx_lock_metrics)]
-            name: tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            name: tx_observe::EventNameId::from_name(name),
         }
     }
 }
@@ -157,19 +157,19 @@ impl<T, M: LockMetricsMode> SpinMutex<T, M> {
 
 #[cfg(tx_lock_metrics)]
 const LOCK_METRIC_WAIT_NS: tx_observe::EventNameId =
-    tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.lock.wait_ns"));
+    tx_observe::EventNameId::from_name(b"debug.lock.wait_ns");
 #[cfg(tx_lock_metrics)]
 const LOCK_METRIC_SERVICE_NS: tx_observe::EventNameId =
-    tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.lock.service_ns"));
+    tx_observe::EventNameId::from_name(b"debug.lock.service_ns");
 #[cfg(tx_lock_metrics)]
 const LOCK_METRIC_RESPONSE_NS: tx_observe::EventNameId =
-    tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.lock.response_ns"));
+    tx_observe::EventNameId::from_name(b"debug.lock.response_ns");
 #[cfg(tx_lock_metrics)]
 const LOCK_METRIC_SPINS: tx_observe::EventNameId =
-    tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.lock.spins"));
+    tx_observe::EventNameId::from_name(b"debug.lock.spins");
 #[cfg(tx_lock_metrics)]
 const LOCK_METRIC_CONTENDED: tx_observe::EventNameId =
-    tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.lock.contended"));
+    tx_observe::EventNameId::from_name(b"debug.lock.contended");
 
 impl<T: core::fmt::Debug, M: LockMetricsMode> core::fmt::Debug for SpinMutex<T, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

@@ -2,8 +2,14 @@
 
 extern crate alloc;
 
+pub mod journal;
+mod journal_replay;
+pub mod mapping;
+pub mod mutation;
 pub mod ondisk;
 pub mod pager;
+
+pub use journal_replay::{clean_replayed_journal, replay_journal, JournalReplayReport};
 
 pub type Result<T> = core::result::Result<T, Ext4FormatError>;
 

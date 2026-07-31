@@ -1,6 +1,6 @@
 # RISC-V 64 vDSO — high-resolution clock implementation.
 #
-# Reads the VVAR page at 0x3F_FFFE_F000 using a seqlock.
+# Reads the VVAR page using the image-relative VVAR delta and a seqlock.
 #
 # Supported clock ids:
 #   CLOCK_REALTIME / CLOCK_MONOTONIC (high-res via rdtime + mult/shift)
@@ -9,14 +9,59 @@
 #
 # VVAR layout (offsets from base):
 #   0x00  seq            (u64)
-#   0x08  realtime_sec   (u64)
-#   0x10  realtime_nsec  (u64, shifted by shift for high-res)
-#   0x18  monotonic_sec  (u64)
-#   0x20  monotonic_nsec (u64, shifted by shift for high-res)
-#   0x28  cycle_last     (u64)
-#   0x30  mult           (u64)
-#   0x38  shift          (u64)
-#   0x40  mask           (u64)
+#   0x08  abi_version    (u32)
+#   0x0c  clock_mode     (u32; RiscvTime permits rdtime)
+#   0x10  realtime_sec   (u64)
+#   0x18  realtime_nsec  (u64, shifted by shift for high-res)
+#   0x20  monotonic_sec  (u64)
+#   0x28  monotonic_nsec (u64, shifted by shift for high-res)
+#   0x30  cycle_last     (u64)
+#   0x38  mult           (u64)
+#   0x40  shift          (u64)
+#   0x48  mask           (u64)
+
+# The build script derives this from VVAR_DELTA, the ELF text vaddr, and the
+# actual `auipc` offset in .text. The entry-point then reaches vvar_base from
+# its own PC without a runtime virtual address or dynamic relocation.
+.ifndef VVAR_PC_DELTA
+.set VVAR_PC_DELTA, -4096
+.endif
+
+# `build.rs` supplies every VVAR fact from tx-time's exported VvarData ABI.
+# Defaults keep direct assembly usable for local inspection only.
+.ifndef VVAR_SEQ_OFFSET
+.set VVAR_SEQ_OFFSET, 0
+.endif
+.ifndef VVAR_CLOCK_MODE_OFFSET
+.set VVAR_CLOCK_MODE_OFFSET, 12
+.endif
+.ifndef VVAR_REALTIME_SEC_OFFSET
+.set VVAR_REALTIME_SEC_OFFSET, 16
+.endif
+.ifndef VVAR_REALTIME_NSEC_SHIFTED_OFFSET
+.set VVAR_REALTIME_NSEC_SHIFTED_OFFSET, 24
+.endif
+.ifndef VVAR_MONOTONIC_SEC_OFFSET
+.set VVAR_MONOTONIC_SEC_OFFSET, 32
+.endif
+.ifndef VVAR_MONOTONIC_NSEC_SHIFTED_OFFSET
+.set VVAR_MONOTONIC_NSEC_SHIFTED_OFFSET, 40
+.endif
+.ifndef VVAR_CYCLE_LAST_OFFSET
+.set VVAR_CYCLE_LAST_OFFSET, 48
+.endif
+.ifndef VVAR_MULT_OFFSET
+.set VVAR_MULT_OFFSET, 56
+.endif
+.ifndef VVAR_SHIFT_OFFSET
+.set VVAR_SHIFT_OFFSET, 64
+.endif
+.ifndef VVAR_MASK_OFFSET
+.set VVAR_MASK_OFFSET, 72
+.endif
+.ifndef VDSO_CLOCK_MODE_RISCV_TIME
+.set VDSO_CLOCK_MODE_RISCV_TIME, 1
+.endif
 
 .section .text, "ax", @progbits
 .align 3
@@ -38,11 +83,10 @@ __vdso_clock_gettime:
     sd      s5, 8(sp)
     sd      s6, 0(sp)
 
-    # Load VVAR base (0x3F_FFFE_F000) into s0.
-    lui     s0, 0xFFFEF
-    addi    t0, zero, 64
-    slli    t0, t0, 32
-    add     s0, s0, t0            # s0 = 0x3F_FFFE_F000
+    # Load VVAR base from the clock_gettime PC and image-relative delta.
+    auipc   s0, 0
+    li      t0, VVAR_PC_DELTA
+    add     s0, s0, t0
 
     # Dispatch on clk_id.
     beqz    a0, .Lgt_highres_realtime    # CLOCK_REALTIME = 0
@@ -57,32 +101,36 @@ __vdso_clock_gettime:
 
 # ---- high-resolution realtime ----
 .Lgt_highres_realtime:
-    addi    s5, s0, 0x08           # realtime_sec
-    addi    s6, s0, 0x10           # realtime_nsec
+    addi    s5, s0, VVAR_REALTIME_SEC_OFFSET
+    addi    s6, s0, VVAR_REALTIME_NSEC_SHIFTED_OFFSET
     j       .Lgt_seqlock_highres
 
 # ---- high-resolution monotonic ----
 .Lgt_highres_monotonic:
-    addi    s5, s0, 0x18           # monotonic_sec
-    addi    s6, s0, 0x20           # monotonic_nsec
+    addi    s5, s0, VVAR_MONOTONIC_SEC_OFFSET
+    addi    s6, s0, VVAR_MONOTONIC_NSEC_SHIFTED_OFFSET
     j       .Lgt_seqlock_highres
 
 .Lgt_seqlock_highres:
     # s5 = &sec, s6 = &shifted_nsec. Read the full conversion tuple
     # under one seqlock sample, matching Linux vDSO datapage rules.
-1:  ld      t1, 0(s0)              # t1 = seq
+1:  ld      t1, VVAR_SEQ_OFFSET(s0) # t1 = seq
     andi    t2, t1, 1
     bnez    t2, 1b
     fence   r, rw
+    lwu     t5, VVAR_CLOCK_MODE_OFFSET(s0)
+    li      t0, VDSO_CLOCK_MODE_RISCV_TIME
+    bne     t5, t0, .Lgt_enosys
     ld      s3, 0(s5)              # s3 = base seconds
     ld      s4, 0(s6)              # s4 = shifted base nanoseconds
-    ld      t6, 0x28(s0)           # t6 = cycle_last
-    ld      t2, 0x40(s0)           # t2 = mask
-    ld      t3, 0x30(s0)           # t3 = mult
-    ld      t4, 0x38(s0)           # t4 = shift
+    ld      t6, VVAR_CYCLE_LAST_OFFSET(s0)
+    ld      t2, VVAR_MASK_OFFSET(s0)
+    ld      t3, VVAR_MULT_OFFSET(s0)
+    beqz    t3, .Lgt_enosys
+    ld      t4, VVAR_SHIFT_OFFSET(s0)
     rdtime  t0                     # t0 = current cycle counter
     fence   r, rw
-    ld      t5, 0(s0)              # t5 = seq (re-read)
+    ld      t5, VVAR_SEQ_OFFSET(s0) # t5 = seq (re-read)
     bne     t1, t5, 1b
 
     # Linux-style high-res math:
@@ -121,30 +169,36 @@ __vdso_clock_gettime:
 
 # ---- coarse realtime ----
 .Lgt_coarse_realtime:
-    addi    s1, s0, 8              # &realtime_sec
-    addi    s2, s0, 16             # &realtime_nsec
+    addi    s1, s0, VVAR_REALTIME_SEC_OFFSET
+    addi    s2, s0, VVAR_REALTIME_NSEC_SHIFTED_OFFSET
     j       .Lgt_seqlock_coarse
 
 # ---- coarse monotonic ----
 .Lgt_coarse_monotonic:
-    addi    s1, s0, 24             # &monotonic_sec
-    addi    s2, s0, 32             # &monotonic_nsec
+    addi    s1, s0, VVAR_MONOTONIC_SEC_OFFSET
+    addi    s2, s0, VVAR_MONOTONIC_NSEC_SHIFTED_OFFSET
 
 .Lgt_seqlock_coarse:
-1:  ld      t0, 0(s0)              # seq
+1:  ld      t0, VVAR_SEQ_OFFSET(s0) # seq
     andi    t1, t0, 1
     bnez    t1, 1b
     fence   r, rw
+    lwu     t5, VVAR_CLOCK_MODE_OFFSET(s0)
+    li      t1, VDSO_CLOCK_MODE_RISCV_TIME
+    bne     t5, t1, .Lgt_enosys
     ld      s3, 0(s1)              # seconds
     ld      s4, 0(s2)              # nanoseconds
     fence   r, rw
-    ld      t1, 0(s0)              # seq (re-read)
+    ld      t1, VVAR_SEQ_OFFSET(s0) # seq (re-read)
     bne     t0, t1, 1b
-    ld      t2, 0x38(s0)           # nsec is stored shifted
+    ld      t2, VVAR_SHIFT_OFFSET(s0) # nsec is stored shifted
     srl     s4, s4, t2
     sd      s3, 0(a1)              # ts->tv_sec
     sd      s4, 8(a1)              # ts->tv_nsec
     li      a0, 0
+
+.Lgt_enosys:
+    li      a0, -38                # -ENOSYS
 
 .Lgt_done:
     ld      ra, 56(sp)
@@ -228,3 +282,13 @@ __vdso_clock_getres:
     li      a0, 0
     ret
 .size __vdso_clock_getres, .-__vdso_clock_getres
+
+# ---------------------------------------------------------------------------
+# __vdso_rt_sigreturn() -> never returns
+# ---------------------------------------------------------------------------
+.globl __vdso_rt_sigreturn
+.type  __vdso_rt_sigreturn, @function
+__vdso_rt_sigreturn:
+    li      a7, 139               # __NR_rt_sigreturn
+    ecall
+.size __vdso_rt_sigreturn, .-__vdso_rt_sigreturn

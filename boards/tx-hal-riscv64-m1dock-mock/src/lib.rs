@@ -7,11 +7,12 @@ mod pmap;
 
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootHandoff, BootInfo, BootInfoIf,
-    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DmaIf, EntropyIf, InitIf,
-    IrqIf, MmioFlags, MmioRegion, ObserverIf, PercpuIf, PhysAddr, PhysRange, PlatformConfig,
-    PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator,
-    SignalFrameIf, SmpIf, SpiSdInfo, TimeIf, TrapIf, VirtAddr, VirtRange,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DeadlineTimerIf, DmaIf,
+    EntropyIf, InitIf, IrqIf, LocalExecutionGuard, MmioFlags, MmioRegion, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr, PhysRange,
+    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
+    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode,
+    PtNodeAllocator, SignalFrameIf, SmpIf, SpiSdInfo, TrapIf, VirtAddr, VirtRange,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -346,20 +347,79 @@ impl PmapIf for Platform {
 
 impl TrapIf for Platform {}
 impl SignalFrameIf for Platform {}
-impl IrqIf for Platform {}
-impl TimeIf for Platform {
+impl IrqIf for Platform {
+    fn interrupts_enabled() -> bool {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let sstatus: usize;
+            unsafe {
+                core::arch::asm!("csrr {sstatus}, sstatus", sstatus = out(reg) sstatus, options(nomem, nostack));
+            }
+            sstatus & (1 << 1) != 0
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            true
+        }
+    }
+
+    fn exclude_local_execution() -> LocalExecutionGuard {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let saved: usize;
+            unsafe {
+                core::arch::asm!(
+                    "csrrci {saved}, sstatus, 2",
+                    saved = out(reg) saved,
+                    options(nostack)
+                );
+                LocalExecutionGuard::new(saved & (1 << 1), restore_m1_interrupts)
+            }
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        unsafe {
+            LocalExecutionGuard::new(0, restore_m1_interrupts)
+        }
+    }
+}
+
+unsafe fn restore_m1_interrupts(saved: usize) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        if saved & (1 << 1) != 0 {
+            core::arch::asm!("csrsi sstatus, 2", options(nostack));
+        } else {
+            core::arch::asm!("csrci sstatus, 2", options(nostack));
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = saved;
+}
+impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
         0
     }
-
-    fn set_deadline_ns(_deadline: u64) {}
-
-    fn cancel_deadline() {}
 
     fn frequency_hz() -> u64 {
         PLATFORM_INFO.timebase_frequency_hz
     }
 }
+
+impl DeadlineTimerIf for Platform {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl PersistentClockIf for Platform {
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+}
+
 impl PercpuIf for Platform {}
 impl CacheIf for Platform {}
 impl DmaIf for Platform {}
@@ -435,5 +495,39 @@ fn sbi_console_getchar() -> Option<u8> {
 fn sbi_shutdown() {
     unsafe {
         core::arch::asm!("ecall", in("a7") 8usize, options(nostack));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_clock_absent_returns_typed_unsupported() {
+        assert_eq!(
+            <Platform as PersistentClockIf>::read_realtime_ns(),
+            Err(PersistentClockError::Unsupported)
+        );
+        assert_eq!(
+            <Platform as PersistentClockIf>::set_realtime_ns(1),
+            Err(PersistentClockError::Unsupported)
+        );
+        assert_eq!(
+            <Platform as PersistentClockIf>::set_wake_alarm_ns(1),
+            Err(PersistentClockError::Unsupported)
+        );
+        assert_eq!(
+            <Platform as PersistentClockIf>::clear_wake_alarm(),
+            Err(PersistentClockError::Unsupported)
+        );
+        assert_eq!(
+            <Platform as PersistentClockIf>::acknowledge_wake_alarm_irq(),
+            Err(PersistentClockError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn rtc_irq_absent_uses_zero_sentinel() {
+        assert_eq!(<Platform as IrqIf>::RTC_IRQ, 0);
     }
 }

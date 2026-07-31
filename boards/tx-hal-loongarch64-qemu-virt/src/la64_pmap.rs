@@ -11,7 +11,7 @@ use super::*;
 static LA64_TLB_STALL_DIAG_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn uart_put_byte(byte: u8) {
-    let base = la64_uncached_virt(la64_uart_base()) as *mut u8;
+    let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
 
     unsafe {
         while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
@@ -24,7 +24,7 @@ pub(crate) fn uart_put_byte(byte: u8) {
 pub(crate) fn uart_try_get_byte() -> Option<u8> {
     #[cfg(target_arch = "loongarch64")]
     unsafe {
-        let base = la64_uncached_virt(la64_uart_base()) as *const u8;
+        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *const u8;
         if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_DR == 0 {
             return None;
         }
@@ -113,9 +113,13 @@ pub(crate) fn la64_kernel_addr_to_phys(addr: usize) -> usize {
 }
 
 pub(crate) fn alloc_la64_asid() -> Result<Asid, PmapError> {
-    for word_index in 0..LA64_ASID_BITMAP_WORDS {
+    for (word_index, word) in LA64_ALLOCATED_ASIDS
+        .iter()
+        .enumerate()
+        .take(LA64_ASID_BITMAP_WORDS)
+    {
         loop {
-            let allocated = LA64_ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
+            let allocated = word.load(Ordering::Acquire);
             // ASID 0 is reserved (word 0, bit 0).
             let reserved = if word_index == 0 { 1 } else { 0 };
             if allocated | reserved == u64::MAX {
@@ -130,7 +134,7 @@ pub(crate) fn alloc_la64_asid() -> Result<Asid, PmapError> {
                 if allocated & bit != 0 {
                     continue;
                 }
-                if LA64_ALLOCATED_ASIDS[word_index]
+                if word
                     .compare_exchange(
                         allocated,
                         allocated | bit,
@@ -1235,7 +1239,17 @@ pub(crate) fn rollback_la64_intermediates(
 }
 
 pub(crate) fn la64_l0_table_mut(root: PhysAddr, virt: VirtAddr) -> Option<&'static mut [u64; 512]> {
-    let l1 = la64_l1_table_mut_from_root(root, virt)?;
+    let root = la64_page_table_mut_from_phys(root);
+    let l2_pte = root[la64_l3_index(virt.0)];
+    if !la64_pte_is_branch(l2_pte) {
+        return None;
+    }
+    let l2 = la64_page_table_mut_from_phys(la64_pte_phys(l2_pte));
+    let l1_pte = l2[la64_l2_index(virt.0)];
+    if !la64_pte_is_branch(l1_pte) {
+        return None;
+    }
+    let l1 = la64_page_table_mut_from_phys(la64_pte_phys(l1_pte));
     let l0_pte = l1[la64_l1_index(virt.0)];
     if !la64_pte_is_branch(l0_pte) {
         return None;
@@ -1623,4 +1637,113 @@ pub(crate) fn la64_invtlb_all() {
     unsafe {
         core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
     }
+}
+
+pub(crate) fn la64_read_stable_counter() -> u64 {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let ticks: u64;
+        unsafe {
+            core::arch::asm!(
+                "rdtime.d {ticks}, $zero",
+                ticks = out(reg) ticks,
+                options(nomem, nostack)
+            );
+        }
+        ticks
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        0
+    }
+}
+
+pub(crate) fn la64_current_cpu_id() -> CpuId {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let kernel_tls = la64_read_kernel_tls();
+        let csr_cpu: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrd {cpu}, 0x20",
+                cpu = out(reg) csr_cpu,
+                options(nomem, nostack)
+            );
+        }
+        let csr_cpu = csr_cpu.min(LA64_MAX_BOOT_CPUS - 1);
+        if LA64_KERNEL_TLS_VALID[csr_cpu].load(Ordering::Acquire) && kernel_tls < LA64_MAX_BOOT_CPUS
+        {
+            return CpuId(kernel_tls);
+        }
+        return CpuId(csr_cpu);
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        let kernel_tls = la64_read_kernel_tls();
+        if kernel_tls < LA64_MAX_BOOT_CPUS {
+            return CpuId(kernel_tls);
+        }
+        CpuId(0)
+    }
+}
+
+pub(crate) fn la64_read_kernel_tls() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let value: usize;
+        unsafe {
+            core::arch::asm!(
+                "move {value}, $r21",
+                value = out(reg) value,
+                options(nomem, nostack)
+            );
+        }
+        value
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        LA64_HOST_KERNEL_TLS.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) fn la64_write_kernel_tls(value: usize) {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("move $r21, {value}", value = in(reg) value, options(nomem, nostack));
+        let csr_cpu: usize;
+        core::arch::asm!(
+            "csrrd {cpu}, 0x20",
+            cpu = out(reg) csr_cpu,
+            options(nomem, nostack)
+        );
+        LA64_KERNEL_TLS_VALID[csr_cpu.min(LA64_MAX_BOOT_CPUS - 1)].store(true, Ordering::Release);
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        LA64_HOST_KERNEL_TLS.store(value, Ordering::Release);
+    }
+}
+
+pub(crate) unsafe fn la64_install_kernel_stack(top: VirtAddr) {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("move $sp, {top}", top = in(reg) top.0, options(nomem, nostack));
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    let _ = top;
+}
+
+pub(crate) fn la64_wait_for_interrupt_once() {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("idle 0", options(nomem, nostack));
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    core::hint::spin_loop();
 }

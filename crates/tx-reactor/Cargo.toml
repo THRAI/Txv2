@@ -12,7 +12,9 @@ doctest = false
 
 [dependencies]
 tx-platform-adapter = { path = "../tx-platform-adapter" }
+tx-services = { path = "../tx-services" }
 tx-substrate = { path = "../tx-substrate" }
+tx-time = { path = "../tx-time" }
 # OBS-9 reactor scheduler track (`08_OBSERVATION_v1.md` §15.6):
 # `Reactor::run_until_idle_on_hart_with_reschedule` wraps each
 # `Future::poll` call in `SpanBegin/SpanEnd(Sched)` so the daemon can

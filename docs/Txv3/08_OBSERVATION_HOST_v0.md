@@ -91,9 +91,11 @@ OBS-HOST-V0-TRANSPORT-GUEST-MEM-LIVE: the OSComp live-drain path uses QEMU
 and `-machine virt,memory-backend=txram`. This is not a separate trace device:
 it maps the guest's normal RAM into a host file, then treats the board's
 exported `TX_OBSERVE_RINGS` static as the live trace region. The daemon writes
-all runtime products under `--output-dir`: `replay.ndjson`, `trace.pftrace`,
-`runtime.json`, and optional support files such as `daemon.log` and the
-guest-RAM backing file when the OSComp wrapper created it there.
+capture evidence under `--output-dir`: by default `trace.rawrecords.gz` and
+`runtime.json`, plus optional support files such as `daemon.log` and the
+guest-RAM backing file when the OSComp wrapper created it there. `replay.ndjson`
+and `trace.pftrace` are explicit compatibility outputs, not default live-capture
+products.
 
 OBS-HOST-V0-TRANSPORT-GUEST-MEM-PROTOCOL: the MVP guest-memory drain reads and
 writes the ring's `producer` and `consumer` fields through a host mmap using
@@ -201,10 +203,13 @@ framing errors. A syntactically valid trace with `complete=false` is still a
 usable tail sample, not a lossless full-window trace.
 
 OBS-HOST-V0-LIVE-RUNTIME: the `live-guest-mem` command writes records from a
-running guest-RAM file into `trace.rawrecords` on the hot path, advancing each
-ring consumer as soon as the fixed-size slot bytes are copied. After the stop
-file appears or the duration limit expires, the daemon decodes that raw stream
-into `replay.ndjson` and `trace.pftrace`, then writes `runtime.json`.
+running guest-RAM file into a temporary raw stream on the hot path, advancing
+each ring consumer as soon as the fixed-size slot bytes are copied. After the
+stop file appears or the duration limit expires, it atomically stores
+`trace.rawrecords.gz`, removes the temporary stream, and writes `runtime.json`
+with the raw SHA-256 plus compressed and uncompressed byte counts. The optional
+`--finalize` compatibility path may additionally produce `replay.ndjson` and
+`trace.pftrace`; it is not part of the default retention contract.
 `runtime.json` carries a `drained` section for the records actually streamed
 during the run and a final `stats` section for the post-stop ring state. In a
 successful live drain, `drained.records` is the full-stream count;

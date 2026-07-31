@@ -1,6 +1,5 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::vm::adapter::wait_routing::Channel;
 use crate::vm::RANGE_LOCK_RELEASE_MASK;
 use alloc::boxed::Box;
 use core::future::Future;
@@ -40,6 +39,10 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
 
     let token = blocked.wait_token();
     assert_eq!(token.source_id(), aspace.range_lock().wait_source_id());
+    assert_eq!(
+        tx_substrate::wake::WaitEndpoint::source_id(aspace.range_lock().release_endpoint()).raw(),
+        token.source_id()
+    );
     assert_eq!(token.interest(), RANGE_LOCK_RELEASE_MASK);
 }
 
@@ -1212,7 +1215,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
 }
 
 #[test]
-fn range_lock_release_fires_registered_channel_for_external_subscribers() {
+fn range_lock_release_fires_registered_wait_source_for_external_subscribers() {
     let aspace = AddressSpace::new();
     let range = range(0x4000, 1);
     let holder = match aspace
@@ -1223,11 +1226,9 @@ fn range_lock_release_fires_registered_channel_for_external_subscribers() {
         _ => panic!("acquire should succeed"),
     };
 
-    let channel: Channel =
-        crate::wait_source::lookup_wait_channel(aspace.range_lock().wait_source_id())
-            .expect("RangeLock channel registered");
-    let mut wait_future = Box::pin(channel.wait(
-        crate::vm::adapter::wait_routing::Mask::from_bits(RANGE_LOCK_RELEASE_MASK),
+    let mut wait_future = Box::pin(crate::wait_source::wait_on_endpoint(
+        aspace.range_lock().release_endpoint(),
+        RANGE_LOCK_RELEASE_MASK,
     ));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);

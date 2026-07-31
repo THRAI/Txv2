@@ -14,6 +14,7 @@ std = []
 
 [dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
+tx-hal = { path = "../tx-hal" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
 tx-test-support = { path = "../tx-test-support" }

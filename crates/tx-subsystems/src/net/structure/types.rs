@@ -203,11 +203,6 @@ impl Ipv6Address {
         self.octets
     }
 
-    /// IPv6 multicast is `ff00::/8` (first octet `0xff`).
-    pub const fn is_multicast(self) -> bool {
-        self.octets[0] == 0xff
-    }
-
     pub fn is_unspecified(self) -> bool {
         let mut idx = 0;
         while idx < self.octets.len() {

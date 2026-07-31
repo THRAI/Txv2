@@ -1,6 +1,10 @@
 //! Cooperative host reactor runtime.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     future::Future,
     ptr,
@@ -9,27 +13,31 @@ use core::{
 };
 
 use crate::adapter::bus_wire::{
-    DeclaredPort, DeclaredQueue, DelegateRegistry, TaskMailbox, TimerWheel, WireDeclaration,
-    WireDeclarationError, WireEventSet,
+    DeclaredPort, DeclaredQueue, DelegateRegistry, MailboxEvent, SignalRouting, TaskMailbox,
+    WireDeclaration, WireDeclarationError, WireEventSet,
 };
+use crate::adapter::step_engine::{DelegateReply, DelegateTokenId, TransitionOutcome};
+use tx_services::time::{CurrentHartDeadlineTimer, DeadlineRegistrarHandle, TimerToken};
+use tx_substrate::step::{InterestMask, WaitSourceId};
 use tx_substrate::wake::mailbox::MailboxSchedulerHint;
 
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
+    deadline_registry::{ExpiredTimer, ReactorTimerDomain, TimerRoute},
     dispatch::{NoopRescheduleSignal, RescheduleSignal, WakeDispatchAction, WakeDispatchReport},
     hart_loop::HartLoopStep,
     preempt::PreemptMarkers,
     scheduler::{
-        HartId, HartSchedulerLocal, InitialSchedMeta, LocalEnqueueRequest, Phase1Scheduler,
-        QueuedTaskReport, RunnablePlacement, SchedulerAffinityError, SchedulerStats, SliceConfig,
-        StopReason, TaskHandle, TaskRunOwner, WakeHint,
+        HartId, HartSchedulerLocal, InitialSchedMeta, LocalAffinityMove, LocalEnqueueRequest,
+        LocalRunnableAction, Phase1Scheduler, QueuedTaskReport, RunnablePlacement,
+        SchedulerAffinityError, SchedulerStats, SliceConfig, StopReason, TaskHandle, TaskRunOwner,
+        WakeHint,
     },
     spin_lock::SpinLock,
     task::{
-        PendingPollCommit, TakeRunnableError, TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError,
-        TaskStatus, TaskTable,
+        PendingPollCommit, TakeRunnableError, TaskDrainRecord, TaskGeneration, TaskId, TaskKey,
+        TaskLifecycleError, TaskStatus, TaskTable,
     },
-    timer::{DeadlineFuture, TimerQueue},
     userspace::{
         UserspaceEntryCheckpoint, UserspaceEntryDecision, UserspaceEntryOutcome,
         UserspaceEntryTaskError, UserspaceRunError, UserspaceRunRequest, UserspaceRunSlot,
@@ -87,19 +95,8 @@ impl RunIdleReport {
     }
 }
 
-fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-pub(crate) trait ClockSource {
+pub(crate) trait ClockSource: CurrentHartDeadlineTimer {
     fn now_ns(&mut self) -> u64;
-    fn set_deadline_ns(&mut self, deadline_ns: u64);
-    fn cancel_deadline(&mut self);
 }
 
 struct CallbackClock<N, D> {
@@ -115,12 +112,18 @@ where
     fn now_ns(&mut self) -> u64 {
         (self.now_ns)()
     }
+}
 
-    fn set_deadline_ns(&mut self, deadline_ns: u64) {
+impl<N, D> CurrentHartDeadlineTimer for CallbackClock<N, D>
+where
+    N: FnMut() -> u64,
+    D: FnMut(Option<u64>),
+{
+    fn set_current_hart_deadline_ns(&mut self, deadline_ns: u64) {
         (self.program_deadline)(Some(deadline_ns));
     }
 
-    fn cancel_deadline(&mut self) {
+    fn cancel_current_hart_deadline(&mut self) {
         (self.program_deadline)(None);
     }
 }
@@ -131,16 +134,16 @@ impl SliceClock for NoopSliceClock {
     fn now_ns(&mut self) -> u64 {
         0
     }
-
-    fn set_deadline_ns(&mut self, _deadline_ns: u64) {}
-
-    fn cancel_deadline(&mut self) {}
 }
 
-pub trait SliceClock {
+impl CurrentHartDeadlineTimer for NoopSliceClock {
+    fn set_current_hart_deadline_ns(&mut self, _deadline_ns: u64) {}
+
+    fn cancel_current_hart_deadline(&mut self) {}
+}
+
+pub trait SliceClock: CurrentHartDeadlineTimer {
     fn now_ns(&mut self) -> u64;
-    fn set_deadline_ns(&mut self, deadline_ns: u64);
-    fn cancel_deadline(&mut self);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -153,15 +156,16 @@ impl PollTiming {
     fn start<C: SliceClock>(slice: SliceConfig, clock: &mut C) -> Self {
         let start_ns = clock.now_ns();
         if let SliceConfig::Preemptive { slice_ns } = slice {
-            clock.set_deadline_ns(start_ns.saturating_add(slice_ns));
+            clock.set_current_hart_deadline_ns(start_ns.saturating_add(slice_ns));
         }
         Self { slice, start_ns }
     }
 
     fn finish<C: SliceClock>(self, clock: &mut C) -> PollAccounting {
         let end_ns = clock.now_ns();
-        clock.cancel_deadline();
+        clock.cancel_current_hart_deadline();
         let consumed_ns = end_ns.saturating_sub(self.start_ns);
+        let cancelled_slice_deadline = matches!(self.slice, SliceConfig::Preemptive { .. });
         let slice_expired = matches!(
             self.slice,
             SliceConfig::Preemptive { slice_ns } if consumed_ns >= slice_ns
@@ -169,6 +173,7 @@ impl PollTiming {
         PollAccounting {
             consumed_ns,
             slice_expired,
+            cancelled_slice_deadline,
         }
     }
 }
@@ -177,6 +182,16 @@ impl PollTiming {
 struct PollAccounting {
     consumed_ns: u64,
     slice_expired: bool,
+    cancelled_slice_deadline: bool,
+}
+
+fn restore_current_hart_deadline_after_slice<T>(next_deadline_ns: Option<u64>, timer: &mut T)
+where
+    T: CurrentHartDeadlineTimer,
+{
+    if let Some(deadline_ns) = next_deadline_ns {
+        timer.set_current_hart_deadline_ns(deadline_ns);
+    }
 }
 
 pub struct Reactor {
@@ -209,10 +224,7 @@ fn emit_wake_debug(name: &[u8], task: TaskId, value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            ((task.0 as i64) << 8) | value,
-        );
+        observer.debug_counter(name, ((task.0 as i64) << 8) | value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -222,10 +234,7 @@ fn emit_submit_debug(name: &[u8], task: TaskId) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            task.0 as i64,
-        );
+        observer.debug_counter(name, task.0 as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -235,10 +244,7 @@ fn emit_poll_task_debug(name: &[u8], task: TaskId) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            task.0 as i64,
-        );
+        observer.debug_counter(name, task.0 as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -249,10 +255,8 @@ fn emit_poll_duration_debug(task: TaskId, consumed_ns: u64) {
     }
     if let Some(observer) = tx_observe::current() {
         let consumed_us = (consumed_ns / 1_000).min(u32::MAX as u64) as i64;
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(
-                b"debug.reactor.poll.consumed_us",
-            )),
+        observer.debug_counter(
+            b"debug.reactor.poll.consumed_us",
             ((task.0 as i64) << 32) | consumed_us,
         );
         tx_observe::dump_registered_if_requested();
@@ -264,8 +268,7 @@ pub struct ReactorShared {
     queued_wakes: Arc<AtomicUsize>,
     scheduler: Phase1Scheduler,
     observability: SpinLock<ReactorObservability>,
-    timers: SpinLock<TimerQueue>,
-    timer_wheel: TimerWheel,
+    deadlines: Arc<ReactorTimerDomain>,
     delegate_registry: Arc<DelegateRegistry>,
     userspace: SpinLock<UserspaceRunSlot>,
 }
@@ -494,12 +497,16 @@ impl SharedReactor {
         let mut stats = RunStats::empty();
         let mut timer_wakes: usize;
         let wake_report: WakeDispatchReport;
+        let mut cancelled_slice_deadline = false;
 
         // Phase 1: advance time & drain wakes through shared/local locks.
         {
             let mut view = reactor.hart_runtime_view(hart);
-            timer_wakes = view.advance_time_to(now_ns);
-            wake_report = view.drain_wakes_for_hart(hart, signal);
+            let (wakes, mut report) = view.advance_time_to_with_reschedule(now_ns, hart, signal);
+            timer_wakes = wakes;
+            report.merge(view.drain_wakes_for_hart(hart, signal));
+            wake_report = report;
+            view.rebalance_local_at(hart, now_ns);
         }
 
         // Phase 2: poll loop — take a task future, then poll outside reactor locks.
@@ -518,9 +525,9 @@ impl SharedReactor {
                 {
                     Ok((key, future, wake_state, mailbox)) => {
                         crate::task::set_current_mailbox(hart.0, Some(mailbox));
-                        crate::task::set_current_timer_wheel(
+                        crate::task::set_current_deadline_registrar(
                             hart.0,
-                            Some(view.shared.timer_wheel.clone()),
+                            Some(view.shared.deadlines.registrar_handle()),
                         );
                         crate::task::set_current_delegate_registry(
                             hart.0,
@@ -558,11 +565,12 @@ impl SharedReactor {
             emit_poll_task_debug(b"debug.reactor.poll.begin", key.id());
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            cancelled_slice_deadline |= accounting.cancelled_slice_deadline;
             emit_poll_duration_debug(key.id(), accounting.consumed_ns);
             emit_poll_task_debug(b"debug.reactor.poll.end", key.id());
 
             crate::task::set_current_mailbox(hart.0, None);
-            crate::task::set_current_timer_wheel(hart.0, None);
+            crate::task::set_current_deadline_registrar(hart.0, None);
             crate::task::set_current_delegate_registry(hart.0, None);
 
             // Phase 3: commit state through task/scheduler/local locks.
@@ -660,10 +668,15 @@ impl SharedReactor {
                         }
                     }
                 }
-                timer_wakes =
-                    timer_wakes.saturating_add(view.advance_time_to(slice_clock.now_ns()));
-                view.drain_wakes_for_hart(hart, signal);
+                let (wakes, mut report) =
+                    view.advance_time_to_with_reschedule(slice_clock.now_ns(), hart, signal);
+                timer_wakes = timer_wakes.saturating_add(wakes);
+                report.merge(view.drain_wakes_for_hart(hart, signal));
             }
+        }
+
+        if cancelled_slice_deadline {
+            restore_current_hart_deadline_after_slice(reactor.next_deadline_ns(), slice_clock);
         }
 
         let (consumed_markers, next_deadline_ns) = {
@@ -679,6 +692,7 @@ impl SharedReactor {
             wake_report,
             consumed_markers,
             timer_wakes,
+            false,
             next_deadline_ns,
         ))
     }
@@ -689,18 +703,291 @@ pub struct HartRuntimeView<'a> {
     locals: &'a ReactorLocals,
 }
 
+struct ReactorOwnerWakePost<'a, 's, S>
+where
+    S: RescheduleSignal,
+{
+    shared: &'a ReactorShared,
+    locals: &'a ReactorLocals,
+    current_hart: HartId,
+    signal: &'s mut S,
+    report: WakeDispatchReport,
+}
+
+impl<'a, 's, S> ReactorOwnerWakePost<'a, 's, S>
+where
+    S: RescheduleSignal,
+{
+    fn new(
+        shared: &'a ReactorShared,
+        locals: &'a ReactorLocals,
+        current_hart: HartId,
+        signal: &'s mut S,
+    ) -> Self {
+        Self {
+            shared,
+            locals,
+            current_hart,
+            signal,
+            report: WakeDispatchReport::empty(),
+        }
+    }
+
+    fn finish(self) -> WakeDispatchReport {
+        self.report
+    }
+
+    fn post_mailbox_event(&mut self, mailbox: Weak<TaskMailbox>, event: MailboxEvent) {
+        let Some(mailbox) = mailbox.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+        self.route_mailbox_owner(&mailbox);
+    }
+
+    fn post_mailbox_ref_event_with_hint(
+        &mut self,
+        mailbox: &TaskMailbox,
+        event: MailboxEvent,
+        hint: MailboxSchedulerHint,
+    ) -> bool {
+        let posted = mailbox.post_with_scheduler_hint(event, hint);
+        self.route_mailbox_owner(mailbox);
+        posted
+    }
+
+    fn route_mailbox_owner(&mut self, mailbox: &TaskMailbox) {
+        let Some(owner) = mailbox.scheduler_owner() else {
+            return;
+        };
+        let owner_key = TaskKey::new(
+            TaskId(owner.task_index()),
+            TaskGeneration::from_raw(owner.task_generation()),
+        );
+        let Some((key, hint)) = self
+            .shared
+            .tasks
+            .lock()
+            .make_owner_runnable_with_hint(owner_key.id(), owner_key.generation())
+        else {
+            return;
+        };
+        let hint = mailbox_scheduler_hint_to_reactor(hint);
+        if let Some((placement, action)) =
+            self.shared
+                .scheduler
+                .task_runnable_from_for_locals(key.id(), hint, self.current_hart)
+        {
+            self.apply_local_runnable_action(action);
+            let action = self.apply_runnable_placement(placement);
+            self.mark_userspace_preempt_for_wake(placement, hint);
+            self.report.record(action);
+        }
+    }
+
+    fn route_wake_id(&mut self, id: TaskId) {
+        let Some((key, hint)) = self
+            .shared
+            .tasks
+            .lock()
+            .take_wake_if_parked_by_id_with_hint(id)
+        else {
+            return;
+        };
+        emit_wake_debug(
+            b"debug.wake.drain_hint",
+            key.id(),
+            mailbox_scheduler_hint_code(hint),
+        );
+        self.route_task_with_hint(key, hint);
+    }
+
+    fn route_task_with_hint(&mut self, key: TaskKey, hint: MailboxSchedulerHint) {
+        let hint = mailbox_scheduler_hint_to_reactor(hint);
+        if let Some((placement, action)) =
+            self.shared
+                .scheduler
+                .task_runnable_from_for_locals(key.id(), hint, self.current_hart)
+        {
+            self.apply_local_runnable_action(action);
+            let action = self.apply_runnable_placement(placement);
+            self.mark_userspace_preempt_for_wake(placement, hint);
+            self.report.record(action);
+        }
+    }
+
+    fn apply_local_enqueue(&self, request: LocalEnqueueRequest) {
+        self.locals.ensure_hart(request.hart);
+        if let Some(local) = self.locals.get(request.hart) {
+            Phase1Scheduler::push_to_local_queue(
+                local.scheduler(),
+                request.task,
+                request.queue,
+                request.front,
+            );
+        }
+    }
+
+    fn apply_local_runnable_action(&self, action: LocalRunnableAction) {
+        match action {
+            LocalRunnableAction::Enqueue(request) => self.apply_local_enqueue(request),
+            LocalRunnableAction::Move(movement) => {
+                self.locals.ensure_hart(movement.from_hart);
+                self.locals.ensure_hart(movement.to_hart);
+                if let Some(from_local) = self.locals.get(movement.from_hart) {
+                    Phase1Scheduler::remove_from_local_queue(
+                        movement.task,
+                        from_local.scheduler(),
+                        movement.from_queue,
+                    );
+                }
+                if let Some(to_local) = self.locals.get(movement.to_hart) {
+                    Phase1Scheduler::push_to_local_queue(
+                        to_local.scheduler(),
+                        movement.task,
+                        movement.to_queue,
+                        movement.front,
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_runnable_placement(&mut self, placement: RunnablePlacement) -> WakeDispatchAction {
+        self.locals.ensure_hart(placement.target_hart);
+        if let Some(local) = self.locals.get(placement.target_hart) {
+            Phase1Scheduler::mark_need_resched_local(local.scheduler());
+        }
+        let wake_remote =
+            placement.wake_remote && self.signal.send_reschedule_ipi(placement.target_hart);
+
+        WakeDispatchAction {
+            target_hart: placement.target_hart,
+            wake_remote,
+        }
+    }
+
+    fn mark_userspace_preempt_for_wake(&self, placement: RunnablePlacement, hint: WakeHint) {
+        if placement.target_hart == self.current_hart && hint.requests_userspace_preempt() {
+            self.locals.ensure_hart(self.current_hart);
+            if let Some(local) = self.locals.get(self.current_hart) {
+                Phase1Scheduler::mark_userspace_preempt_local(local.scheduler());
+            }
+        }
+    }
+}
+
+impl<S> ReactorOwnerWakePost<'_, '_, S>
+where
+    S: RescheduleSignal,
+{
+    fn route_expired_timer(&mut self, expired: ExpiredTimer) {
+        let ExpiredTimer { key, route } = expired;
+        let token = TimerToken::new(key.raw());
+        match route {
+            TimerRoute::Task { mailbox } => {
+                self.post_mailbox_event(mailbox, MailboxEvent::TimerFired { token });
+            }
+            TimerRoute::Signal { mailbox } => self.post_signal_timer_fired(mailbox, token),
+            TimerRoute::Delegate(delegate_token) => self.post_delegate_timeout(delegate_token),
+            TimerRoute::WaitSource { source, interests } => {
+                let _ = self.post_source_fired(source, interests);
+            }
+            TimerRoute::Device(callback) => {
+                callback.fire();
+                if let Some((queue, interests)) = callback.raw_queue_wake() {
+                    let _ = queue.fire_with_post(interests, |mailbox, event| {
+                        self.post_mailbox_ref_event(mailbox, event)
+                    });
+                }
+                if let Some((source, interests)) = callback.wait_source_wake() {
+                    let _ = self.post_source_fired(source, interests);
+                }
+            }
+        }
+    }
+
+    fn post_signal_timer_fired(&mut self, mailbox: Weak<TaskMailbox>, token: TimerToken) {
+        let Some(mailbox) = mailbox.upgrade() else {
+            return;
+        };
+        let posted = mailbox.post_with_scheduler_hint(
+            MailboxEvent::SignalTimerFired { token },
+            MailboxSchedulerHint::SignalDelivery,
+        );
+        if posted {
+            self.route_mailbox_owner(&mailbox);
+        }
+    }
+
+    fn post_delegate_timeout(&mut self, delegate_token: DelegateTokenId) {
+        let registry = Arc::clone(&self.shared.delegate_registry);
+        let _ = registry.mark_timed_out_with_post(delegate_token, |mailbox, event| {
+            self.post_mailbox_event(mailbox, event);
+        });
+    }
+
+    fn post_source_fired(&mut self, source: WaitSourceId, interests: InterestMask) -> usize {
+        let Some(source) = tx_substrate::wake::lookup_source(source) else {
+            return 0;
+        };
+        source.notify_with_owner_post(
+            interests,
+            MailboxSchedulerHint::Normal,
+            |mailbox, event, hint| {
+                let posted = mailbox.post_with_scheduler_hint(event, hint);
+                if posted {
+                    self.route_mailbox_owner(mailbox);
+                }
+                posted
+            },
+        )
+    }
+
+    fn post_mailbox_ref_event(&mut self, mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+        let posted = mailbox.post_with_scheduler_hint(event, MailboxSchedulerHint::Normal);
+        if posted {
+            self.route_mailbox_owner(mailbox);
+        }
+        posted
+    }
+}
+
 impl HartRuntimeView<'_> {
+    pub fn advance_time_to_with_reschedule<S>(
+        &self,
+        now_ns: u64,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (usize, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        let mut router = ReactorOwnerWakePost::new(self.shared, self.locals, current_hart, signal);
+        let due = self
+            .shared
+            .deadlines
+            .drain_due_for_owner(current_hart.0, now_ns);
+        let timer_wakes = due.len();
+        for expired in due {
+            router.route_expired_timer(expired);
+        }
+        let report = router.finish();
+        (timer_wakes, report)
+    }
+
     pub fn advance_time_to(&self, now_ns: u64) -> usize {
-        let wheel_wakes = self.shared.timer_wheel.fire_due(now_ns);
-        let queue_wakes = self.shared.timers.lock().advance_time_to(now_ns);
-        wheel_wakes + queue_wakes
+        let mut signal = NoopRescheduleSignal::new();
+        self.advance_time_to_with_reschedule(now_ns, HartId(0), &mut signal)
+            .0
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
-        earliest_deadline(
-            self.shared.timers.lock().next_deadline_ns(),
-            self.shared.timer_wheel.next_deadline_ns(),
-        )
+        self.shared.deadlines.next_deadline_ns()
+    }
+
+    pub(crate) fn deadline_change_pending(&self) -> bool {
+        self.shared.deadlines.deadline_change_pending()
     }
 
     pub fn drain_wakes_for_hart<S>(
@@ -711,7 +998,6 @@ impl HartRuntimeView<'_> {
     where
         S: RescheduleSignal,
     {
-        let mut report = WakeDispatchReport::empty();
         self.locals.ensure_hart(current_hart);
         let mut drained = self.shared.tasks.lock().drain_wake_ids();
         if let Some(local) = self.locals.get(current_hart) {
@@ -721,34 +1007,11 @@ impl HartRuntimeView<'_> {
             ));
         }
 
+        let mut post = ReactorOwnerWakePost::new(self.shared, self.locals, current_hart, signal);
         for id in drained {
-            let Some((key, hint)) = self
-                .shared
-                .tasks
-                .lock()
-                .take_wake_if_parked_by_id_with_hint(id)
-            else {
-                continue;
-            };
-            emit_wake_debug(
-                b"debug.wake.drain_hint",
-                key.id(),
-                mailbox_scheduler_hint_code(hint),
-            );
-            let hint = mailbox_scheduler_hint_to_reactor(hint);
-            if let Some(placement) = self.commit_woken_task(key.id(), hint, current_hart) {
-                if placement.target_hart != current_hart {
-                    report.record(self.apply_runnable_placement(placement, signal));
-                } else {
-                    self.mark_userspace_preempt_for_wake(placement, current_hart, hint);
-                    report.record(WakeDispatchAction {
-                        target_hart: placement.target_hart,
-                        wake_remote: false,
-                    });
-                }
-            }
+            post.route_wake_id(id);
         }
-        report
+        post.finish()
     }
 
     /// Commit a wake into its destination run queue.
@@ -826,6 +1089,7 @@ impl HartRuntimeView<'_> {
             polled: 0,
             completed: 0,
         };
+        let mut cancelled_slice_deadline = false;
         loop {
             let Some((key, mut future, wake_state, slice)) = ({
                 self.drain_wakes_for_hart(hart, signal);
@@ -840,9 +1104,9 @@ impl HartRuntimeView<'_> {
                 {
                     Ok((key, future, wake_state, mailbox)) => {
                         crate::task::set_current_mailbox(hart.0, Some(mailbox));
-                        crate::task::set_current_timer_wheel(
+                        crate::task::set_current_deadline_registrar(
                             hart.0,
-                            Some(self.shared.timer_wheel.clone()),
+                            Some(self.shared.deadlines.registrar_handle()),
                         );
                         crate::task::set_current_delegate_registry(
                             hart.0,
@@ -877,10 +1141,11 @@ impl HartRuntimeView<'_> {
             emit_poll_task_debug(b"debug.reactor.poll.begin", key.id());
             let result = future.as_mut().poll(&mut cx);
             let accounting = timing.finish(slice_clock);
+            cancelled_slice_deadline |= accounting.cancelled_slice_deadline;
             emit_poll_duration_debug(key.id(), accounting.consumed_ns);
             emit_poll_task_debug(b"debug.reactor.poll.end", key.id());
             crate::task::set_current_mailbox(hart.0, None);
-            crate::task::set_current_timer_wheel(hart.0, None);
+            crate::task::set_current_deadline_registrar(hart.0, None);
             crate::task::set_current_delegate_registry(hart.0, None);
 
             match result {
@@ -973,6 +1238,9 @@ impl HartRuntimeView<'_> {
             }
         }
 
+        if cancelled_slice_deadline {
+            restore_current_hart_deadline_after_slice(self.next_deadline_ns(), slice_clock);
+        }
         self.record_run_stats(hart, stats);
         stats
     }
@@ -982,6 +1250,43 @@ impl HartRuntimeView<'_> {
             .observability
             .lock()
             .record_run_stats(hart, stats);
+    }
+
+    fn apply_local_enqueue(&mut self, request: LocalEnqueueRequest) {
+        self.locals.ensure_hart(request.hart);
+        if let Some(local) = self.locals.get(request.hart) {
+            Phase1Scheduler::push_to_local_queue(
+                local.scheduler(),
+                request.task,
+                request.queue,
+                request.front,
+            );
+        }
+    }
+
+    fn apply_local_runnable_action(&mut self, action: LocalRunnableAction) {
+        match action {
+            LocalRunnableAction::Enqueue(request) => self.apply_local_enqueue(request),
+            LocalRunnableAction::Move(movement) => {
+                self.locals.ensure_hart(movement.from_hart);
+                self.locals.ensure_hart(movement.to_hart);
+                if let Some(from_local) = self.locals.get(movement.from_hart) {
+                    Phase1Scheduler::remove_from_local_queue(
+                        movement.task,
+                        from_local.scheduler(),
+                        movement.from_queue,
+                    );
+                }
+                if let Some(to_local) = self.locals.get(movement.to_hart) {
+                    Phase1Scheduler::push_to_local_queue(
+                        to_local.scheduler(),
+                        movement.task,
+                        movement.to_queue,
+                        movement.front,
+                    );
+                }
+            }
+        }
     }
 
     fn task_stopped_local(
@@ -1040,7 +1345,12 @@ impl HartRuntimeView<'_> {
     {
         let mut report = WakeDispatchReport::empty();
         if self.shared.tasks.lock().mark_runnable(key).is_ok() {
-            if let Some(placement) = self.commit_woken_task(key.id(), hint, current_hart) {
+            if let Some((placement, action)) =
+                self.shared
+                    .scheduler
+                    .task_runnable_from_for_locals(key.id(), hint, current_hart)
+            {
+                self.apply_local_runnable_action(action);
                 let action = self.apply_runnable_placement(placement, signal);
                 self.mark_userspace_preempt_for_wake(placement, current_hart, hint);
                 report.record(action);
@@ -1119,8 +1429,7 @@ impl Reactor {
                 queued_wakes,
                 scheduler: Phase1Scheduler::new(),
                 observability: SpinLock::new(ReactorObservability::default()),
-                timers: SpinLock::new(TimerQueue::new()),
-                timer_wheel: TimerWheel::new(),
+                deadlines: Arc::new(ReactorTimerDomain::new()),
                 delegate_registry: Arc::new(DelegateRegistry::new()),
                 userspace: SpinLock::new(UserspaceRunSlot::new()),
             },
@@ -1136,12 +1445,24 @@ impl Reactor {
         }
     }
 
-    /// Creates a wait channel attached to this reactor's timer queue.
-    pub fn channel(&self) -> wait::Channel {
-        wait::Channel::with_timer_queue(self.shared.timers.lock().clone())
+    /// Return a handle to this reactor's deadline registrar.
+    ///
+    /// Subsystems that only need task-bound deadline registration should take
+    /// this handle instead of manufacturing a wait channel.
+    pub fn deadline_registrar_handle(&self) -> DeadlineRegistrarHandle {
+        self.shared.deadlines.registrar_handle()
     }
 
-    /// Creates a typed declared wait channel attached to this reactor's timer queue.
+    pub fn delegate_registry_handle(&self) -> Arc<DelegateRegistry> {
+        Arc::clone(&self.shared.delegate_registry)
+    }
+
+    /// Creates a wait channel attached to this reactor's timer registry.
+    pub fn channel(&self) -> wait::Channel {
+        wait::Channel::with_deadline_registrar(self.deadline_registrar_handle())
+    }
+
+    /// Creates a typed declared wait channel attached to this reactor's timer registry.
     pub fn declared_channel<E>(
         &self,
         declaration: WireDeclaration<E>,
@@ -1149,18 +1470,24 @@ impl Reactor {
     where
         E: WireEventSet + Send + Sync + 'static,
     {
-        wait::DeclaredChannel::with_timer_queue(declaration, self.shared.timers.lock().clone())
+        wait::DeclaredChannel::with_deadline_registrar(
+            declaration,
+            self.deadline_registrar_handle(),
+        )
     }
 
-    /// Attaches an existing typed declared bus port to this reactor's timer queue.
+    /// Attaches an existing typed declared bus port to this reactor's timer registry.
     pub fn declared_channel_from_port<E>(&self, port: DeclaredPort<E>) -> wait::DeclaredChannel<E>
     where
         E: WireEventSet + Send + Sync + 'static,
     {
-        wait::DeclaredChannel::from_port_with_timer_queue(port, self.shared.timers.lock().clone())
+        wait::DeclaredChannel::from_port_with_deadline_registrar(
+            port,
+            self.deadline_registrar_handle(),
+        )
     }
 
-    /// Creates a typed declared readiness channel attached to this reactor's timer queue.
+    /// Creates a typed declared readiness channel attached to this reactor's timer registry.
     pub fn declared_readiness_channel<E>(
         &self,
         declaration: WireDeclaration<E>,
@@ -1168,13 +1495,13 @@ impl Reactor {
     where
         E: WireEventSet + Send + Sync + 'static,
     {
-        wait::DeclaredReadinessChannel::with_timer_queue(
+        wait::DeclaredReadinessChannel::with_deadline_registrar(
             declaration,
-            self.shared.timers.lock().clone(),
+            self.deadline_registrar_handle(),
         )
     }
 
-    /// Attaches an existing typed declared bus queue to this reactor's timer queue.
+    /// Attaches an existing typed declared bus queue to this reactor's timer registry.
     pub fn declared_readiness_channel_from_queue<E>(
         &self,
         queue: DeclaredQueue<E>,
@@ -1182,42 +1509,67 @@ impl Reactor {
     where
         E: WireEventSet + Send + Sync + 'static,
     {
-        wait::DeclaredReadinessChannel::from_queue_with_timer_queue(
+        wait::DeclaredReadinessChannel::from_queue_with_deadline_registrar(
             queue,
-            self.shared.timers.lock().clone(),
+            self.deadline_registrar_handle(),
         )
     }
 
     /// Advances the reactor-owned absolute nanosecond clock and wakes expired timers.
     pub fn advance_time_to(&self, now_ns: u64) -> usize {
-        let wheel_wakes = self.shared.timer_wheel.fire_due(now_ns);
-        let queue_wakes = self.shared.timers.lock().advance_time_to(now_ns);
-        wheel_wakes + queue_wakes
+        let mut signal = NoopRescheduleSignal::new();
+        self.advance_time_to_from_hart_with_reschedule(now_ns, HartId(0), &mut signal)
+            .0
+    }
+
+    pub fn advance_time_to_from_hart_with_reschedule<S>(
+        &self,
+        now_ns: u64,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (usize, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        let mut router =
+            ReactorOwnerWakePost::new(&self.shared, &self.locals, current_hart, signal);
+        let due = self
+            .shared
+            .deadlines
+            .drain_due_for_owner(current_hart.0, now_ns);
+        let timer_wakes = due.len();
+        for expired in due {
+            router.route_expired_timer(expired);
+        }
+        let report = router.finish();
+        (timer_wakes, report)
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
-        earliest_deadline(
-            self.shared.timers.lock().next_deadline_ns(),
-            self.shared.timer_wheel.next_deadline_ns(),
-        )
+        self.shared.deadlines.next_deadline_ns()
     }
 
-    /// Create a future that resolves once the reactor's clock advances past `deadline_ns`.
-    pub fn sleep_until(&self, deadline_ns: u64) -> DeadlineFuture {
-        self.shared.timers.lock().wait_until(deadline_ns)
+    pub(crate) fn deadline_change_pending(&self) -> bool {
+        self.shared.deadlines.deadline_change_pending()
     }
 
-    /// Clone the reactor's timer queue so callers can schedule deadline
-    /// futures without holding the reactor lock.
-    pub fn timer_queue(&self) -> TimerQueue {
-        self.shared.timers.lock().clone()
+    pub fn program_current_hart_deadline<T>(&self, timer: &mut T)
+    where
+        T: CurrentHartDeadlineTimer,
+    {
+        if self.shared.deadlines.consume_deadline_change() {
+            match self.next_deadline_ns() {
+                Some(deadline_ns) => timer.set_current_hart_deadline_ns(deadline_ns),
+                None => timer.cancel_current_hart_deadline(),
+            }
+        }
     }
 
     /// Drive expired timers from a monotonic clock, run ready work, then
     /// program the next absolute timer deadline.
     ///
     /// `program_deadline` receives `Some(deadline_ns)` to arm the current
-    /// clock source, or `None` to cancel it. This mirrors the HAL `TimeIf`
+    /// clock source, or `None` to cancel it. This mirrors the HAL deadline-timer
     /// shape without making host tests depend on a platform.
     pub fn run_until_idle_with_clock<N, D>(&self, now_ns: N, program_deadline: D) -> RunIdleReport
     where
@@ -1380,6 +1732,153 @@ impl Reactor {
             .ok_or(SchedulerAffinityError::UnknownTask)
     }
 
+    /// Post a mailbox event and route the owning task through scheduler
+    /// placement immediately.
+    ///
+    /// This is the reactor-owned owner-aware post primitive for wake producers
+    /// that already have scheduler context. The mailbox records the wake
+    /// payload; the reactor resolves the current task owner and decides local
+    /// queue insertion or remote reschedule IPI. Producers without reactor
+    /// context should keep publishing to their wait source and let the reactor
+    /// drain the task wake inbox later.
+    pub fn post_mailbox_event_from_hart<S>(
+        &self,
+        mailbox: Weak<TaskMailbox>,
+        event: MailboxEvent,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> WakeDispatchReport
+    where
+        S: RescheduleSignal,
+    {
+        let mut post = ReactorOwnerWakePost::new(&self.shared, &self.locals, current_hart, signal);
+        post.post_mailbox_event(mailbox, event);
+        post.finish()
+    }
+
+    /// Post through an already-upgraded task mailbox and route its owner
+    /// through scheduler placement immediately.
+    ///
+    /// This is the bridge used by bus/wait-source producer paths whose
+    /// delivery loop already upgraded the subscriber mailbox before invoking
+    /// an injected post closure.
+    pub fn post_mailbox_ref_event_from_hart<S>(
+        &self,
+        mailbox: &TaskMailbox,
+        event: MailboxEvent,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (bool, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        self.post_mailbox_ref_event_with_hint_from_hart(
+            mailbox,
+            event,
+            MailboxSchedulerHint::Normal,
+            current_hart,
+            signal,
+        )
+    }
+
+    /// Post through an already-upgraded task mailbox with an explicit scheduler
+    /// hint and route its owner through scheduler placement immediately.
+    pub fn post_mailbox_ref_event_with_hint_from_hart<S>(
+        &self,
+        mailbox: &TaskMailbox,
+        event: MailboxEvent,
+        hint: MailboxSchedulerHint,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (bool, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        let mut post = ReactorOwnerWakePost::new(&self.shared, &self.locals, current_hart, signal);
+        let posted = post.post_mailbox_ref_event_with_hint(mailbox, event, hint);
+        (posted, post.finish())
+    }
+
+    /// Post a signal-delivery mailbox event and route the owning task
+    /// through scheduler placement immediately.
+    ///
+    /// Signal subsystem code owns target selection and signal-state
+    /// mutation. This wrapper is only the reactor-side owner-aware
+    /// publication boundary once that target mailbox has been resolved.
+    pub fn post_signal_delivered_from_hart<S>(
+        &self,
+        mailbox: Weak<TaskMailbox>,
+        signum: u32,
+        routing: SignalRouting,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> WakeDispatchReport
+    where
+        S: RescheduleSignal,
+    {
+        self.post_mailbox_event_from_hart(
+            mailbox,
+            MailboxEvent::SignalDelivered { signum, routing },
+            current_hart,
+            signal,
+        )
+    }
+
+    pub fn mark_delegate_replied_from_hart_with_reschedule<S>(
+        &self,
+        registry: &DelegateRegistry,
+        token: DelegateTokenId,
+        reply: DelegateReply,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (TransitionOutcome, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        let mut post = ReactorOwnerWakePost::new(&self.shared, &self.locals, current_hart, signal);
+        let outcome = registry.mark_replied_with_post(token, reply, |mailbox, event| {
+            post.post_mailbox_event(mailbox, event);
+        });
+        let report = post.finish();
+        (outcome, report)
+    }
+
+    pub fn mark_delegate_canceled_from_hart_with_reschedule<S>(
+        &self,
+        registry: &DelegateRegistry,
+        token: DelegateTokenId,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (TransitionOutcome, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        let mut post = ReactorOwnerWakePost::new(&self.shared, &self.locals, current_hart, signal);
+        let outcome = registry.mark_canceled_with_post(token, |mailbox, event| {
+            post.post_mailbox_event(mailbox, event);
+        });
+        let report = post.finish();
+        (outcome, report)
+    }
+
+    pub fn mark_delegate_agent_died_from_hart_with_reschedule<S>(
+        &self,
+        registry: &DelegateRegistry,
+        token: DelegateTokenId,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> (TransitionOutcome, WakeDispatchReport)
+    where
+        S: RescheduleSignal,
+    {
+        let mut post = ReactorOwnerWakePost::new(&self.shared, &self.locals, current_hart, signal);
+        let outcome = registry.mark_agent_died_with_post(token, |mailbox, event| {
+            post.post_mailbox_event(mailbox, event);
+        });
+        let report = post.finish();
+        (outcome, report)
+    }
+
     pub fn queue_ast_marker(
         &self,
         task: TaskKey,
@@ -1520,11 +2019,8 @@ impl Reactor {
     {
         let timer_wakes = self.advance_time_to(clock.now_ns());
         let stats = self.run_until_idle();
+        self.program_current_hart_deadline(clock);
         let next_deadline_ns = self.next_deadline_ns();
-        match next_deadline_ns {
-            Some(deadline_ns) => clock.set_deadline_ns(deadline_ns),
-            None => clock.cancel_deadline(),
-        }
 
         RunIdleReport {
             stats,

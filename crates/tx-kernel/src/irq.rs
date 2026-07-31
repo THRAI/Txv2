@@ -29,11 +29,14 @@
 //! that draining runs with irq_depth=0 and is free to create epoch
 //! guards and call `step_ingest`.
 
-use crate::adapter::step_engine::{self as step_engine, spin_mutex, SpinMutex, StepOutcome};
+use crate::adapter::step_engine::{spin_mutex, SpinMutex};
 use tx_hal::{
-    ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
+    ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, TxPlatform,
+    IRQ_DISPATCH_TABLE_SIZE,
 };
-use tx_subsystems::tty::execution::step_ingest;
+use tx_services::time::{platform::HalRtcDevice, RtcDeviceOps as TimeRtcDeviceOps};
+use tx_substrate::wake::MailboxSchedulerHint;
+use tx_subsystems::device::RtcEventMask;
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -76,13 +79,6 @@ impl UartRxPending {
 
 static UART_RX_PENDING: SpinMutex<UartRxPending> =
     spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
-
-/// Set by `net_rx_irq_handler` (IRQ context) and consumed by
-/// `drain_net_rx_pending` (reactor loop, task context). The virtio-net
-/// interrupt line stays PLIC-masked between the two, so a level-triggered
-/// line cannot storm while the bottom half is pending.
-static NET_RX_IRQ_PENDING: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 /// Register `handler` as the dispatch entry for IRQ number `irq`.
 ///
@@ -163,50 +159,39 @@ fn dispatch_table_static() -> &'static IrqDispatchTable {
 /// Install all kernel IRQ handlers and publish the dispatch table to
 /// the platform. One-shot; called from `init.rs` after
 /// `register_console_hardware` has populated the `CONSOLE_TTY` slot.
-pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
-    let irq = <P as IrqIf>::uart_irq();
-    register_irq_handler(irq, uart_rx_irq_handler::<P>);
-    let net_irq = <P as IrqIf>::NET_IRQ;
-    if net_irq != 0 {
-        register_irq_handler(net_irq, net_rx_irq_handler::<P>);
+pub(crate) fn install_irq_handlers<P: TxPlatform>() {
+    let uart_irq = <P as IrqIf>::UART_IRQ;
+    register_irq_handler(uart_irq, uart_rx_irq_handler::<P>);
+    let rtc_irq = <P as IrqIf>::RTC_IRQ;
+    if rtc_irq != 0 {
+        tx_fs::devfs::rtc_event_source_id();
+        register_irq_handler(rtc_irq, rtc_alarm_irq_handler::<P>);
     }
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
-    <P as IrqIf>::set_priority(irq, 1);
-    <P as IrqIf>::unmask(irq);
-    if net_irq != 0 {
-        <P as IrqIf>::set_priority(net_irq, 1);
-        <P as IrqIf>::unmask(net_irq);
+    <P as IrqIf>::set_priority(uart_irq, 1);
+    <P as IrqIf>::unmask(uart_irq);
+    if rtc_irq != 0 {
+        <P as IrqIf>::set_priority(rtc_irq, 1);
+        <P as IrqIf>::unmask(rtc_irq);
     }
 }
 
-/// virtio-net IRQ handler (top half).
+/// RTC alarm IRQ handler.
 ///
-/// **IRQ-context safety**: takes no locks and no epoch guards — the delegate
-/// task may hold the driver's state lock when this interrupt lands, so even
-/// touching the device here could deadlock a single hart. The virtio line is
-/// level-triggered, so the handler masks it at the PLIC (otherwise it
-/// re-fires the instant the trap path `complete()`s) and defers everything
-/// to `drain_net_rx_pending` in the reactor loop.
-pub fn net_rx_irq_handler<P: IrqIf>(irq: u32) -> IrqHandled {
-    <P as IrqIf>::mask(irq);
-    NET_RX_IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
+/// The RTC wait queue is initialized during [`install_irq_handlers`], before
+/// the IRQ is unmasked, so this path only publishes pending device bits and
+/// fires the existing wait source. It must not inspect `/dev` paths, open
+/// RNodes, or run ioctl policy.
+pub fn rtc_alarm_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
+    let _ = HalRtcDevice::<P>::new().acknowledge_alarm_irq();
+    tx_fs::devfs::publish_rtc_event_with_post(RtcEventMask::ALARM, |mailbox, event| {
+        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(
+            mailbox,
+            event,
+            MailboxSchedulerHint::Normal,
+        )
+    });
     IrqHandled::Wake
-}
-
-/// Bottom half for the net RX IRQ (task context, epoch guard legal).
-///
-/// Acks the virtio interrupt status, polls the device once (which kicks the
-/// net delegate when frames or TX completions are pending), and unmasks the
-/// line for the next interrupt. Returns true when an IRQ was consumed.
-pub(crate) fn drain_net_rx_pending<P: IrqIf>() -> bool {
-    if !NET_RX_IRQ_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
-        return false;
-    }
-    if let Some(registration) = tx_subsystems::net::net_device_by_name(b"eth0") {
-        let _ = registration.ops.ack_interrupt_and_fire();
-    }
-    <P as IrqIf>::unmask(<P as IrqIf>::NET_IRQ);
-    true
 }
 
 /// UART RX IRQ handler. Drains pending bytes from the platform
@@ -264,7 +249,7 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
 /// wake, this returns 0 — the IRQ-deferred path is only exercised when
 /// the SBI poll buffer fills first. See the 2026-05-13 sizing note on
 /// `drain_sbi_console_into_tty` for why we keep both paths.
-pub(crate) fn drain_uart_rx_pending() -> usize {
+pub(crate) fn drain_uart_rx_pending<P: tx_hal::TxPlatform>() -> usize {
     // Snapshot and clear the pending buffer under the lock, then
     // release before calling step_ingest (which takes its own locks).
     let (bytes, n) = {
@@ -279,15 +264,7 @@ pub(crate) fn drain_uart_rx_pending() -> usize {
         (snapshot, n)
     };
 
-    let Some(tty) = crate::init::console_tty() else {
-        return 0;
-    };
-    let guard = step_engine::guard();
-    use StepOutcome as V3Out;
-    match step_ingest(&tty, &bytes[..n], &guard) {
-        V3Out::Done(_) => n,
-        _ => 0,
-    }
+    crate::init::ingest_console_tty_bytes::<P>(&bytes[..n])
 }
 
 #[cfg(test)]

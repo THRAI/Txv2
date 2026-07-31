@@ -13,7 +13,6 @@ tx-kernel = { path = "../../crates/tx-kernel" }
 [features]
 default = []
 la64-boot-trace = ["tx-hal-loongarch64-qemu-virt/la64-boot-trace"]
-la-board-ls2k1000 = ["tx-hal-loongarch64-qemu-virt/la-board-ls2k1000"]
 
 [[bin]]
 name = "tx-kernel-loongarch64-qemu-virt"

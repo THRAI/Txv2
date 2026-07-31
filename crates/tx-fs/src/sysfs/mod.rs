@@ -388,7 +388,7 @@ impl FsOps for Sysfs {
         }
     }
 
-    fn step_read_projected(
+    fn read_projected(
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
@@ -416,7 +416,7 @@ impl FsOps for Sysfs {
         StepOutcome::done(len as u64)
     }
 
-    fn step_write_projected(
+    fn write_projected(
         &self,
         _fs_object_id: FsObjectId,
         _offset: u64,
@@ -426,7 +426,7 @@ impl FsOps for Sysfs {
         StepOutcome::err(Errno::EROFS)
     }
 
-    fn step_chmod(
+    fn chmod_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_mode: u16,
@@ -436,7 +436,7 @@ impl FsOps for Sysfs {
         StepOutcome::err(Errno::EROFS)
     }
 
-    fn step_chown(
+    fn chown_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_uid: Option<u32>,
@@ -763,7 +763,7 @@ mod tests {
         };
 
         let mut out = [0u8; 32];
-        let read = match sysfs.step_read_projected(mtu, 0, &mut out, &guard) {
+        let read = match sysfs.read_projected(mtu, 0, &mut out, &guard) {
             StepOutcome::Done(read) => read as usize,
             other => panic!("read lo/mtu failed: {other:?}"),
         };
@@ -807,7 +807,7 @@ mod tests {
         };
 
         let mut out = [0u8; 64];
-        let read = match sysfs.step_read_projected(address, 0, &mut out, &guard) {
+        let read = match sysfs.read_projected(address, 0, &mut out, &guard) {
             StepOutcome::Done(read) => read as usize,
             other => panic!("read sys-veth0/address failed: {other:?}"),
         };
@@ -858,7 +858,7 @@ mod tests {
         };
 
         let mut out = [0u8; 64];
-        let read = match sysfs.step_read_projected(address, 0, &mut out, &guard) {
+        let read = match sysfs.read_projected(address, 0, &mut out, &guard) {
             StepOutcome::Done(read) => read as usize,
             other => panic!("read sys-remote0/address failed: {other:?}"),
         };

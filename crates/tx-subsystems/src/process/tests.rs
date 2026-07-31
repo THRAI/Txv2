@@ -2,7 +2,7 @@
 //!
 //! These exercise the entity graph (Process / Thread / ProcessGroup /
 //! Session) and the lifecycle steps (`bootstrap_init_process`,
-//! `step_fork`, `step_exit_group`, `step_setpgid`, `step_setsid`) without
+//! `step_fork`, group exit, `step_setpgid`, `step_setsid`) without
 //! signal state, credentials, rlimits, or fd-table coupling. The
 //! identity/payload split is the primary subject under test: zombies
 //! retain identity but drop payload.
@@ -20,9 +20,10 @@ use crate::page_backed::{Frame as PageFrame, FsPageBacking};
 use crate::process::adapter::step_engine::{
     guard as ebr_guard, sign, Cap, ScriptCtx, StepOp, StepOutcome,
 };
+use crate::process::adapter::wait_routing::{MailboxEvent, TaskMailbox};
 use crate::process::execution::{
-    init_process, initiate_group_exit, reset_init_process_for_test, spawn_sibling_thread_for_test,
-    step_exit_group_with_signal, BootstrapError, DupOp,
+    init_process, reset_init_process_for_test, step_exit_group_with_signal_with_posts,
+    BootstrapError, DupOp,
 };
 use crate::process::nsproxy::{PosixMqName, SysvKey};
 use crate::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
@@ -30,9 +31,10 @@ use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
 };
 use crate::process::{
-    bootstrap_init_process, fork_with_options_wait, step_chdir, step_exit_group, step_fork,
-    step_fork_with_options, step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang,
-    ChdirOutcome, ForkError, ForkOptions, SetpgidError, WaitError, WaitTarget,
+    bootstrap_init_process, step_chdir, step_chdir_with_mount, step_exit_group_with_posts,
+    step_fork, step_fork_with_options, step_getcwd, step_set_mount_namespace, step_setpgid,
+    step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError, ForkOptions, SetpgidError,
+    WaitError, WaitTarget,
 };
 use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
@@ -48,6 +50,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::ptr::null;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::time::Duration;
 
 const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |_| RawWaker::new(null(), &NOOP_WAKER_VTABLE),
@@ -55,6 +59,105 @@ const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |_| {},
     |_| {},
 );
+
+const TEST_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct TestPauseController {
+    reached: Receiver<()>,
+    release: Option<SyncSender<()>>,
+}
+
+struct TestPauseWorker {
+    reached: SyncSender<()>,
+    release: Receiver<()>,
+}
+
+fn bounded_test_pause() -> (TestPauseController, TestPauseWorker) {
+    let (reached_tx, reached_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    (
+        TestPauseController {
+            reached: reached_rx,
+            release: Some(release_tx),
+        },
+        TestPauseWorker {
+            reached: reached_tx,
+            release: release_rx,
+        },
+    )
+}
+
+impl TestPauseController {
+    fn wait_until_paused(&self) {
+        self.reached
+            .recv_timeout(TEST_COORDINATION_TIMEOUT)
+            .expect("worker reaches bounded test pause");
+    }
+
+    fn release(mut self) {
+        let release = self.release.take().expect("test pause release is one-shot");
+        let _ = release.try_send(());
+    }
+}
+
+impl Drop for TestPauseController {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.try_send(());
+        }
+    }
+}
+
+impl TestPauseWorker {
+    fn pause(self) {
+        self.reached
+            .send(())
+            .expect("test controller receives pause notification");
+        self.release
+            .recv_timeout(TEST_COORDINATION_TIMEOUT)
+            .expect("test controller releases paused worker");
+    }
+}
+
+#[test]
+fn bounded_test_pause_release_tolerates_worker_disconnect() {
+    let (controller, worker) = bounded_test_pause();
+    let TestPauseWorker { reached, release } = worker;
+    reached.send(()).expect("controller observes worker");
+    drop(release);
+
+    controller.wait_until_paused();
+    controller.release();
+}
+
+fn direct_process_sem_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    mailbox.post(event)
+}
+
+fn direct_process_task_post(weak: alloc::sync::Weak<TaskMailbox>, event: MailboxEvent) {
+    let Some(mailbox) = weak.upgrade() else {
+        return;
+    };
+    let _ = mailbox.post(event);
+}
+
+fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    step_exit_group_with_posts(
+        process,
+        status,
+        direct_process_task_post,
+        direct_process_sem_ref_post,
+    );
+}
+
+fn finish_process_group_with_signal_for_test(process: &Cap<ProcessIdentity>, sig: Signum) {
+    step_exit_group_with_signal_with_posts(
+        process,
+        sig,
+        direct_process_task_post,
+        direct_process_sem_ref_post,
+    );
+}
 
 fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(null(), &NOOP_WAKER_VTABLE)) }
@@ -155,6 +258,81 @@ fn process_lock_service_declares_high_stake_payload_phase_names() {
     assert!(names
         .contains(&b"debug.lock_service.process.payload.robust.pending.duration_ns".as_slice()));
     assert!(names.contains(&b"debug.lock_service.process.payload.robust.entry_count".as_slice()));
+}
+
+fn source_function_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let start = src.find(name).expect("function name present");
+    let open = src[start..]
+        .find('{')
+        .map(|idx| start + idx)
+        .expect("function body opens");
+    let mut depth = 0usize;
+    for (offset, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("function body closes");
+}
+
+fn source_between<'a>(src: &'a str, start_pat: &str, end_pat: &str) -> &'a str {
+    let start = src.find(start_pat).expect("start pattern present");
+    let end = src[start..]
+        .find(end_pat)
+        .map(|idx| start + idx)
+        .expect("end pattern present");
+    &src[start..end]
+}
+
+#[test]
+fn exit_group_payload_slot_guard_only_detaches_state() {
+    let body = source_function_body(
+        include_str!("execution.rs"),
+        "pub fn step_exit_group_with_posts",
+    );
+    let guard_region = source_between(
+        body,
+        "let payload_guard = process.payload.lock();",
+        "if let Some(aspace) = exit_aspace",
+    );
+
+    for forbidden in [
+        "close_socket_files_for_process_exit",
+        "notify_thread_exit_userspace_in_aspace",
+        "set_thread_zombie_with_post",
+        "unregister_tid_number",
+        "drop(closed_fds)",
+        "drop(drained)",
+    ] {
+        assert!(
+            !guard_region.contains(forbidden),
+            "{forbidden} must run after dropping process.payload guard"
+        );
+    }
+}
+
+#[test]
+fn process_exit_payload_slot_guard_only_detaches_state() {
+    let body = source_function_body(include_str!("execution.rs"), "fn step_process_exit_inner");
+    let guard_region = source_between(
+        body,
+        "let payload_guard = process.payload.lock();",
+        "if let Some(aspace) = exit_aspace",
+    );
+
+    for forbidden in ["close_socket_files_for_process_exit", "drop(closed_fds)"] {
+        assert!(
+            !guard_region.contains(forbidden),
+            "{forbidden} must run after dropping process.payload guard"
+        );
+    }
 }
 
 struct NullMountFs;
@@ -364,11 +542,17 @@ fn subject_identity_signal_pending_checks_authoritative_pending_state() {
     let proc = bootstrap();
     let leader = first_thread(&proc);
 
-    crate::thread_runtime::execution::post_signal(
+    crate::thread_runtime::execution::post_signal_with_post(
         &leader,
-        Signum::SIGCHLD,
+        Signum::SIGTERM,
         tx_substrate::wake::SignalRouting::ProcessDirected,
         None,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
     );
     assert!(
         <ProcessIdentity as crate::process::adapter::step_engine::SubjectIdentity>::
@@ -380,7 +564,7 @@ fn subject_identity_signal_pending_checks_authoritative_pending_state() {
         .payload_cap()
         .expect("leader payload")
         .pending()
-        .clear(Signum::SIGCHLD);
+        .clear(Signum::SIGTERM);
 
     assert!(
         !<ProcessIdentity as crate::process::adapter::step_engine::SubjectIdentity>::
@@ -573,6 +757,35 @@ fn fork_inherits_mount_namespace_from_nsproxy_bundle() {
 }
 
 #[test]
+fn mounted_cwd_binding_is_atomic_across_fork_and_survives_setns() {
+    let _g = setup();
+    let process = bootstrap();
+    let namespace = fresh_mount_namespace();
+    step_set_mount_namespace(&process, namespace.clone()).expect("install mount namespace");
+    let root_mount = namespace.root().clone();
+    let root_dentry = namespace.root_dentry();
+
+    match step_chdir_with_mount(&process, root_dentry.clone(), root_mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("live process rejected mounted cwd"),
+    }
+    let parent_cwd = process.cwd_binding().expect("mounted parent cwd");
+    assert_eq!(parent_cwd.dentry.key(), root_dentry.key());
+    assert_eq!(parent_cwd.mount.key(), root_mount.key());
+
+    let child = step_fork::<TestPmap>(&process, false, false).expect("fork child");
+    let child_cwd = child.cwd_binding().expect("forked mounted cwd");
+    assert_eq!(child_cwd.dentry.key(), parent_cwd.dentry.key());
+    assert_eq!(child_cwd.mount.key(), parent_cwd.mount.key());
+
+    let replacement_namespace = fresh_mount_namespace();
+    step_set_mount_namespace(&process, replacement_namespace).expect("setns replacement");
+    let origin_held = process.cwd_binding().expect("origin-held cwd after setns");
+    assert_eq!(origin_held.dentry.key(), parent_cwd.dentry.key());
+    assert_eq!(origin_held.mount.key(), parent_cwd.mount.key());
+}
+
+#[test]
 fn fork_clones_address_space_into_distinct_cap() {
     let _g = setup();
     let parent = bootstrap();
@@ -637,7 +850,7 @@ fn fork_registers_child_in_parent_pgrp_member_list() {
 fn fork_on_zombie_parent_returns_parent_zombie() {
     let _g = setup();
     let parent = bootstrap();
-    step_exit_group(&parent, ExitStatus::Exited(0));
+    finish_process_group_for_test(&parent, ExitStatus::Exited(0));
     assert!(parent.is_zombie());
 
     let result = step_fork::<TestPmap>(&parent, false, false);
@@ -700,7 +913,7 @@ fn exit_group_zombifies_process_at_once_and_records_status() {
     let _g = setup();
     let proc_cap = bootstrap();
 
-    step_exit_group(&proc_cap, ExitStatus::Exited(42));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(42));
 
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(42)));
@@ -772,7 +985,7 @@ fn exit_group_detaches_live_sysv_shm_mappings() {
     .expect("shmat");
     assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_some());
 
-    step_exit_group(&proc_cap, ExitStatus::Exited(42));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(42));
 
     assert!(proc_cap.is_zombie());
     assert!(aspace.lookup(crate::vm::UserVirtAddr(addr)).is_none());
@@ -802,16 +1015,17 @@ fn last_thread_exit_applies_sysv_sem_undo_adjustments() {
         &ns,
     )
     .expect("semget private");
-    sysv_sem::execution::step_semctl(
+    sysv_sem::execution::step_semctl_with_post(
         semid,
         0,
         sysv_sem::execution::SETVAL,
         sysv_sem::execution::SemCtlArg::Val(2),
         &cred,
         None,
+        direct_process_sem_ref_post,
     )
     .expect("SETVAL");
-    sysv_sem::execution::step_semop(
+    sysv_sem::execution::step_semop_with_post(
         semid,
         &[sysv_sem::structure::SemBuf {
             sem_num: 0,
@@ -820,6 +1034,7 @@ fn last_thread_exit_applies_sysv_sem_undo_adjustments() {
         }],
         &cred,
         &proc_cap,
+        direct_process_sem_ref_post,
     )
     .expect("semop SEM_UNDO");
 
@@ -827,13 +1042,14 @@ fn last_thread_exit_applies_sysv_sem_undo_adjustments() {
     step_thread_exit(leader, 7);
 
     assert!(proc_cap.is_zombie());
-    match sysv_sem::execution::step_semctl(
+    match sysv_sem::execution::step_semctl_with_post(
         semid,
         0,
         sysv_sem::execution::GETVAL,
         sysv_sem::execution::SemCtlArg::None,
         &cred,
         None,
+        direct_process_sem_ref_post,
     )
     .expect("GETVAL after exit")
     {
@@ -856,16 +1072,17 @@ fn exit_group_applies_sysv_sem_undo_adjustments() {
         &ns,
     )
     .expect("semget private");
-    sysv_sem::execution::step_semctl(
+    sysv_sem::execution::step_semctl_with_post(
         semid,
         0,
         sysv_sem::execution::SETVAL,
         sysv_sem::execution::SemCtlArg::Val(2),
         &cred,
         None,
+        direct_process_sem_ref_post,
     )
     .expect("SETVAL");
-    sysv_sem::execution::step_semop(
+    sysv_sem::execution::step_semop_with_post(
         semid,
         &[sysv_sem::structure::SemBuf {
             sem_num: 0,
@@ -874,19 +1091,21 @@ fn exit_group_applies_sysv_sem_undo_adjustments() {
         }],
         &cred,
         &proc_cap,
+        direct_process_sem_ref_post,
     )
     .expect("semop SEM_UNDO");
 
-    step_exit_group(&proc_cap, ExitStatus::Exited(42));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(42));
 
     assert!(proc_cap.is_zombie());
-    match sysv_sem::execution::step_semctl(
+    match sysv_sem::execution::step_semctl_with_post(
         semid,
         0,
         sysv_sem::execution::GETVAL,
         sysv_sem::execution::SemCtlArg::None,
         &cred,
         None,
+        direct_process_sem_ref_post,
     )
     .expect("GETVAL after exit_group")
     {
@@ -909,16 +1128,17 @@ fn fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments() {
         &ns,
     )
     .expect("semget private");
-    sysv_sem::execution::step_semctl(
+    sysv_sem::execution::step_semctl_with_post(
         semid,
         0,
         sysv_sem::execution::SETVAL,
         sysv_sem::execution::SemCtlArg::Val(2),
         &cred,
         None,
+        direct_process_sem_ref_post,
     )
     .expect("SETVAL");
-    sysv_sem::execution::step_semop(
+    sysv_sem::execution::step_semop_with_post(
         semid,
         &[sysv_sem::structure::SemBuf {
             sem_num: 0,
@@ -927,19 +1147,21 @@ fn fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments() {
         }],
         &cred,
         &parent,
+        direct_process_sem_ref_post,
     )
     .expect("parent semop SEM_UNDO");
 
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
-    match sysv_sem::execution::step_semctl(
+    match sysv_sem::execution::step_semctl_with_post(
         semid,
         0,
         sysv_sem::execution::GETVAL,
         sysv_sem::execution::SemCtlArg::None,
         &cred,
         None,
+        direct_process_sem_ref_post,
     )
     .expect("GETVAL after child exit")
     {
@@ -947,14 +1169,15 @@ fn fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments() {
         other => panic!("expected Val, got {other:?}"),
     }
 
-    step_exit_group(&parent, ExitStatus::Exited(0));
-    match sysv_sem::execution::step_semctl(
+    finish_process_group_for_test(&parent, ExitStatus::Exited(0));
+    match sysv_sem::execution::step_semctl_with_post(
         semid,
         0,
         sysv_sem::execution::GETVAL,
         sysv_sem::execution::SemCtlArg::None,
         &cred,
         None,
+        direct_process_sem_ref_post,
     )
     .expect("GETVAL after parent exit")
     {
@@ -1060,13 +1283,13 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
     // retainer: the test's `child` Cap *and* the parent.children
     // retainer (per §8.5 the parent's children list pins zombies
     // until reap). Reap path:
-    //   1. zombify via step_exit_group
+    //   1. zombify via group exit
     //   2. drop the test's `child` Cap
     //   3. waitpid reap → parent.children removes its Cap
     //   4. epoch drain → identity reclaims
     // After step 4, pgrp.members's Weak is stale.
     let child_pid = child.pid;
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     drop(child);
     let _ = step_waitpid_nohang(&parent, WaitTarget::Pid(child_pid)).expect("reap");
     tx_test_support::drain_to_quiescence();
@@ -1087,11 +1310,11 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
 }
 
 #[test]
-fn step_exit_group_with_signal_records_signum_and_status_encoding() {
+fn fatal_group_exit_records_signum_and_status_encoding() {
     let _g = setup();
     let proc_cap = bootstrap();
 
-    step_exit_group_with_signal(&proc_cap, Signum::SIGTERM);
+    finish_process_group_with_signal_for_test(&proc_cap, Signum::SIGTERM);
 
     assert!(proc_cap.is_zombie());
     assert_eq!(
@@ -1110,19 +1333,19 @@ fn step_exit_group_with_signal_records_signum_and_status_encoding() {
 }
 
 #[test]
-fn step_exit_group_with_signal_overrides_terminating_signal_on_double_call() {
+fn fatal_group_exit_overrides_terminating_signal_on_double_call() {
     let _g = setup();
     let proc_cap = bootstrap();
 
     // First call sets terminating_signal=SIGTERM and zombifies.
-    step_exit_group_with_signal(&proc_cap, Signum::SIGTERM);
+    finish_process_group_with_signal_for_test(&proc_cap, Signum::SIGTERM);
     assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGTERM));
 
     // Second call on the same identity should be a no-op for the
     // payload (already None) but still updates the recorded signal —
     // demonstrates idempotent slot semantics. Defensive coverage of
     // the double-zombify path.
-    step_exit_group_with_signal(&proc_cap, Signum::SIGKILL);
+    finish_process_group_with_signal_for_test(&proc_cap, Signum::SIGKILL);
     assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGKILL));
 }
 
@@ -1164,7 +1387,7 @@ fn waitpid_any_reaps_zombie_child_and_returns_status() {
     let live = parent.children();
     assert_eq!(live.len(), 1);
     let child = live.into_iter().next().unwrap();
-    step_exit_group(&child, ExitStatus::Exited(42));
+    finish_process_group_for_test(&child, ExitStatus::Exited(42));
     assert!(payload_was_dropped(&child));
 
     let result = step_waitpid_nohang(&parent, WaitTarget::Any);
@@ -1178,8 +1401,8 @@ fn waitpid_specific_pid_reaps_only_that_child() {
     let c1 = step_fork::<TestPmap>(&parent, false, false).expect("c1");
     let c2 = step_fork::<TestPmap>(&parent, false, false).expect("c2");
 
-    step_exit_group(&c1, ExitStatus::Exited(1));
-    step_exit_group(&c2, ExitStatus::Exited(2));
+    finish_process_group_for_test(&c1, ExitStatus::Exited(1));
+    finish_process_group_for_test(&c2, ExitStatus::Exited(2));
 
     // Reap c2 specifically.
     let result = step_waitpid_nohang(&parent, WaitTarget::Pid(c2.pid));
@@ -1222,7 +1445,7 @@ fn waitpid_reap_withdraws_from_parent_children_list() {
 
     assert_eq!(parent.child_count(), 1);
 
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     drop(child);
     let _ = step_waitpid_nohang(&parent, WaitTarget::Pid(child_pid)).expect("reap succeeds");
 
@@ -1240,7 +1463,7 @@ fn waitpid_reap_withdraws_from_pgrp_members_list() {
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     assert_eq!(pgrp.member_slot_count(), 2); // parent + child
 
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     // Per PROCESS_v1 §8.5: zombies stay in pgrp.members until reap.
     // The Weak still upgrades because child Cap is still held by the
@@ -1262,7 +1485,7 @@ fn zombie_process_pid_remains_resolvable_until_reap() {
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     let child_pid = child.pid;
 
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     assert!(
         crate::process::process_by_pid(child_pid).is_some(),
@@ -1329,7 +1552,7 @@ fn waitpid_reap_returns_signaled_status() {
     let child_pid = child.pid;
 
     // Child exits via signal — recorded as ExitStatus::Signaled.
-    step_exit_group_with_signal(&child, crate::signal::Signum::SIGTERM);
+    finish_process_group_with_signal_for_test(&child, crate::signal::Signum::SIGTERM);
     drop(child);
 
     let result = step_waitpid_nohang(&parent, WaitTarget::Pid(child_pid));
@@ -1347,7 +1570,7 @@ fn waitpid_after_reaping_all_children_returns_no_children() {
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     let child_pid = child.pid;
     drop(child);
 
@@ -1473,7 +1696,7 @@ fn chdir_on_zombie_returns_zombie_ignored() {
     let init = bootstrap();
     let root = fresh_root_dentry();
 
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
     assert!(init.is_zombie());
 
     let outcome = step_chdir(&init, root);
@@ -1525,7 +1748,7 @@ fn waitpid_caller_pgrp_reaps_zombie_in_callers_pgroup() {
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     // Child inherits parent's pgrp at fork. Both share parent.pgrp.
 
-    step_exit_group(&child, ExitStatus::Exited(5));
+    finish_process_group_for_test(&child, ExitStatus::Exited(5));
     let child_pid = child.pid;
     drop(child);
 
@@ -1543,7 +1766,7 @@ fn waitpid_caller_pgrp_skips_child_in_other_pgroup() {
     step_setpgid(&child, Pgid(child.pid.0)).expect("setpgid");
     assert_ne!(child.pgrp_cap().pgid, parent.pgrp_cap().pgid);
 
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     // CallerPgrp matches only children in caller's pgrp; child is no
     // longer there, so NoChildren — no matching children at all.
@@ -1562,8 +1785,8 @@ fn waitpid_pgrp_selector_matches_specific_pgid() {
     step_setpgid(&c2, Pgid(c2.pid.0)).expect("setpgid");
     let c2_pgid = c2.pgrp_cap().pgid;
 
-    step_exit_group(&c1, ExitStatus::Exited(1));
-    step_exit_group(&c2, ExitStatus::Exited(2));
+    finish_process_group_for_test(&c1, ExitStatus::Exited(1));
+    finish_process_group_for_test(&c2, ExitStatus::Exited(2));
     let c2_pid = c2.pid;
     drop(c1);
     drop(c2);
@@ -1615,14 +1838,14 @@ fn leader_has_sigchld_pending(proc_cap: &Cap<ProcessIdentity>) -> bool {
 }
 
 #[test]
-fn child_exit_via_step_exit_group_posts_sigchld_to_parent() {
+fn child_group_exit_posts_sigchld_to_parent() {
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
 
     assert!(!leader_has_sigchld_pending(&parent));
 
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     assert!(
         leader_has_sigchld_pending(&parent),
@@ -1651,7 +1874,7 @@ fn bootstrap_init_exit_does_not_panic_with_no_parent() {
     // Init has no parent. SIGCHLD post must short-circuit cleanly.
     let _g = setup();
     let init = bootstrap();
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
     // Just exercising the code path; assertion is "didn't panic".
     assert!(init.is_zombie());
 }
@@ -1664,12 +1887,12 @@ fn orphaned_child_exit_does_not_post_sigchld() {
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
 
-    step_exit_group(&parent, ExitStatus::Exited(0));
+    finish_process_group_for_test(&parent, ExitStatus::Exited(0));
     assert!(child.parent_cap().is_none(), "severed by parent's exit");
 
     // Now child exits. No parent to receive SIGCHLD; should not
     // panic or error.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     assert!(child.is_zombie());
 }
 
@@ -1678,7 +1901,7 @@ fn zombie_parent_does_not_receive_sigchld() {
     // If the parent has somehow zombified before the child does
     // (without severing — pathological in spec terms but a defensive
     // shape worth covering), the SIGCHLD producer's underlying
-    // step_kill_process returns NoLiveThread and we discard.
+    // process-directed kill returns NoLiveThread and we discard.
     //
     // Note: real flows always sever children at parent exit, so this
     // test simulates the pathological window by manually clearing
@@ -1691,15 +1914,15 @@ fn zombie_parent_does_not_receive_sigchld() {
 
     // Manually clear parent.children so sever doesn't run on the child.
     parent.children.clear();
-    step_exit_group(&parent, ExitStatus::Exited(0));
+    finish_process_group_for_test(&parent, ExitStatus::Exited(0));
     assert!(parent.is_zombie());
     // child still has parent slot pointing at the (now zombie) parent.
     assert!(child.parent_cap().is_some());
 
-    // Child exit invokes post_sigchld_to_parent which calls
-    // step_kill_process on a zombie target: NoLiveThread, discarded.
+    // Child exit invokes post_sigchld_to_parent, whose process-directed
+    // kill sees a zombie target: NoLiveThread, discarded.
     // No panic.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     assert!(child.is_zombie());
 }
 
@@ -1745,7 +1968,7 @@ fn non_init_parent_exit_reparents_children_to_init() {
     assert_eq!(leaf.parent_pid(), middle.pid);
     let init_children_before = init.child_count();
 
-    step_exit_group(&middle, ExitStatus::Exited(0));
+    finish_process_group_for_test(&middle, ExitStatus::Exited(0));
 
     // leaf's parent now points at init.
     assert_eq!(leaf.parent_pid(), init.pid);
@@ -1765,11 +1988,11 @@ fn adopted_live_child_auto_reaps_when_it_exits() {
     let leaf_pid = leaf.pid;
     let init_children_before = init.child_count();
 
-    step_exit_group(&middle, ExitStatus::Exited(0));
+    finish_process_group_for_test(&middle, ExitStatus::Exited(0));
     assert_eq!(leaf.parent_pid(), init.pid);
     assert_eq!(init.child_count(), init_children_before + 1);
 
-    step_exit_group(&leaf, ExitStatus::Exited(0));
+    finish_process_group_for_test(&leaf, ExitStatus::Exited(0));
 
     assert_eq!(
         init.child_count(),
@@ -1791,10 +2014,10 @@ fn adopted_zombie_child_reaped_during_reparent_to_init() {
     let leaf_pid = leaf.pid;
     let init_children_before = init.child_count();
 
-    step_exit_group(&leaf, ExitStatus::Exited(0));
+    finish_process_group_for_test(&leaf, ExitStatus::Exited(0));
     assert!(leaf.is_zombie());
 
-    step_exit_group(&middle, ExitStatus::Exited(0));
+    finish_process_group_for_test(&middle, ExitStatus::Exited(0));
 
     assert_eq!(
         init.child_count(),
@@ -1816,7 +2039,7 @@ fn init_exit_severs_children_without_reparent_target() {
     let init = bootstrap();
     let child = step_fork::<TestPmap>(&init, false, false).expect("fork");
 
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
 
     assert_eq!(child.parent_pid(), Pid::RESERVED);
     assert!(child.parent_cap().is_none());
@@ -1892,13 +2115,13 @@ fn dropping_test_child_cap_leaves_parent_children_list_intact() {
 }
 
 #[test]
-fn parent_exit_via_step_exit_group_severs_children_parent_slot() {
+fn parent_group_exit_severs_children_parent_slot() {
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
     assert_eq!(child.parent_pid(), parent.pid);
 
-    step_exit_group(&parent, ExitStatus::Exited(0));
+    finish_process_group_for_test(&parent, ExitStatus::Exited(0));
 
     // Per PROCESS_v1 §8.1 (day-1 stub): child's parent slot is
     // severed. Future reparent-to-init lands when init is globally
@@ -1910,7 +2133,7 @@ fn parent_exit_via_step_exit_group_severs_children_parent_slot() {
 #[test]
 fn parent_exit_via_last_thread_cascade_severs_children_parent_slot() {
     // Last-thread cascade exits via step_thread_exit →
-    // step_process_exit, not via step_exit_group. Verify both paths
+    // step_process_exit, not via group exit. Verify both paths
     // sever children.
     let _g = setup();
     let parent = bootstrap();
@@ -1936,7 +2159,7 @@ fn child_severance_does_not_affect_grandchildren() {
 
     assert_eq!(grandchild.parent_pid(), child.pid);
 
-    step_exit_group(&parent, ExitStatus::Exited(0));
+    finish_process_group_for_test(&parent, ExitStatus::Exited(0));
 
     // child's parent severed (None).
     assert!(child.parent_cap().is_none());
@@ -1945,15 +2168,50 @@ fn child_severance_does_not_affect_grandchildren() {
 }
 
 #[test]
-fn step_exit_group_does_not_set_terminating_signal() {
+fn normal_group_exit_does_not_set_terminating_signal() {
     let _g = setup();
     let proc_cap = bootstrap();
 
-    step_exit_group(&proc_cap, ExitStatus::Exited(7));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(7));
 
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(7)));
     assert_eq!(proc_cap.terminating_signal(), None);
+}
+
+#[test]
+fn exit_group_reservation_makes_concurrent_exec_retry_before_detach() {
+    let _g = setup();
+    let process = bootstrap();
+    let leader = first_thread(&process);
+    let (reserved, worker_pause) = bounded_test_pause();
+
+    std::thread::scope(|scope| {
+        let worker_process = process.clone();
+        let exit = scope.spawn(move || {
+            crate::process::execution::step_exit_group_with_posts_after_reserve_for_test(
+                &worker_process,
+                ExitStatus::Exited(17),
+                direct_process_task_post,
+                direct_process_sem_ref_post,
+                move || worker_pause.pause(),
+            )
+        });
+
+        reserved.wait_until_paused();
+        assert_eq!(
+            crate::process::ProcessExecPrep::begin(&process, &leader).err(),
+            Some(crate::process::ExecPrepError::Again),
+        );
+        assert!(!process.is_zombie(), "exit is paused before payload detach");
+        reserved.release();
+        assert_eq!(
+            exit.join().expect("exit worker"),
+            crate::process::ProcessExitOutcome::Completed,
+        );
+    });
+
+    assert!(process.is_zombie());
 }
 
 #[test]

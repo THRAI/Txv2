@@ -6,7 +6,7 @@
 
 #[cfg(tx_ds_metrics)]
 const DS_METRIC_DURATION_NS: tx_observe::EventNameId =
-    tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.ds.method.duration_ns"));
+    tx_observe::EventNameId::from_name(b"debug.ds.method.duration_ns");
 
 #[cfg(tx_ds_metrics)]
 #[inline(always)]
@@ -21,7 +21,7 @@ pub fn measure_for_zone<R>(
     zone: tx_observe::EventNameId,
     f: impl FnOnce() -> R,
 ) -> R {
-    let method = tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(method_name));
+    let method = tx_observe::EventNameId::from_name(method_name);
     let start = tx_observe::clock_now_ns();
     let result = f();
     let duration = tx_observe::clock_now_ns().saturating_sub(start);

@@ -1,0 +1,124 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-24-network-time-integration",
+  "title": "Publish network delegate time and owner-aware wake integration",
+  "status": "active",
+  "created": "2026-07-24",
+  "updated": "2026-07-24",
+  "owner": "codex",
+  "summary": "Reconcile the local network delegate migration onto origin/main without importing unrelated filesystem, VM, or syscall cleanup work.",
+  "scope": {
+    "in": [
+      "crates/tx-time",
+      "crates/tx-services/src/time",
+      "crates/tx-substrate/src/{bus,wake,step}",
+      "crates/tx-reactor",
+      "crates/tx-kernel/src/init/{rs,net.rs}",
+      "crates/tx-subsystems/src/net",
+      "direct tests and workspace manifests required by these surfaces"
+    ],
+    "out": [
+      "ext4 and filesystem migration",
+      "VM migration",
+      "unrelated syscall cleanup",
+      "source worktree cleanup or reset"
+    ],
+    "write_sets": [
+      {
+        "owner": "codex",
+        "paths": [
+          "Cargo.toml",
+          "Cargo.lock",
+          "crates/tx-time",
+          "crates/tx-services",
+          "crates/tx-substrate",
+          "crates/tx-reactor",
+          "crates/tx-kernel",
+          "crates/tx-subsystems",
+          "docs/progress"
+        ],
+        "notes": "Integration worktree only; the original dirty worktree remains untouched."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "Apply the reactor and owner-aware mailbox dependency closure",
+      "status": "completed",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-substrate",
+        "crates/tx-reactor",
+        "crates/tx-services"
+      ],
+      "verification": [
+        "cargo check -p tx-reactor -p tx-substrate"
+      ],
+      "notes": "Use the existing local committed sequence selectively; do not take the broad merge commit."
+    },
+    {
+      "id": "step-2",
+      "title": "Apply the kernel and network delegate integration",
+      "status": "completed",
+      "depends_on": [
+        "step-1"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/init",
+        "crates/tx-subsystems/src/net"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib net:: --no-default-features"
+      ],
+      "notes": "Keep the RTC facade as compatibility support rather than changing board implementations."
+    },
+    {
+      "id": "step-3",
+      "title": "Verify, catch up progress, and publish the integration branch",
+      "status": "in_progress",
+      "depends_on": [
+        "step-2"
+      ],
+      "paths": [
+        "docs/progress"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask progress validate",
+        "git diff --check"
+      ],
+      "notes": "Push only intentionally committed integration work."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo check -p tx-time -p tx-services -p tx-reactor -p tx-substrate",
+    "status": "passed",
+    "notes": "The complete integrated workspace passes cargo check --workspace -j 1."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib net:: --no-default-features",
+      "status": "passed",
+      "notes": "Source migration witness: 256 passed, 0 failed. Re-run in the integration worktree."
+    }
+  ],
+  "risks": [
+    "Owner-aware wake routing spans shared reactor and substrate APIs.",
+    "Latest origin/main may require narrow conflict resolutions against the local migration sequence."
+  ],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

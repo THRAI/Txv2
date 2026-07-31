@@ -20,10 +20,10 @@ use core::task::Waker;
 #[derive(Clone)]
 pub struct RawQueue {
     state: RawWireStorage<RawQueueState>,
-    source_id: WaitSourceId,
 }
 
 struct RawQueueState {
+    source_id: WaitSourceId,
     ready_bits: u64,
     terminal: bool,
     next_subscription: usize,
@@ -33,6 +33,7 @@ struct RawQueueState {
 impl RawQueueState {
     const fn new() -> Self {
         Self {
+            source_id: WaitSourceId::ZERO,
             ready_bits: 0,
             terminal: false,
             next_subscription: 0,
@@ -47,21 +48,18 @@ impl RawQueueState {
 /// handles that operate on this storage without allocating an `Arc`.
 pub struct StaticRawQueue {
     state: SpinLock<RawQueueState>,
-    source_id: WaitSourceId,
 }
 
 impl StaticRawQueue {
     pub const fn new() -> Self {
         Self {
             state: SpinLock::new(RawQueueState::new()),
-            source_id: WaitSourceId::new(0),
         }
     }
 
     pub const fn raw(&'static self) -> RawQueue {
         RawQueue {
             state: RawWireStorage::Static(&self.state),
-            source_id: self.source_id,
         }
     }
 }
@@ -90,23 +88,21 @@ impl RawQueue {
     pub fn new() -> Self {
         Self {
             state: RawWireStorage::Shared(Arc::new(SpinLock::new(RawQueueState::new()))),
-            source_id: WaitSourceId::new(0),
         }
     }
 
     pub fn with_source_id(source_id: WaitSourceId) -> Self {
-        Self {
-            state: RawWireStorage::Shared(Arc::new(SpinLock::new(RawQueueState::new()))),
-            source_id,
-        }
+        let queue = Self::new();
+        queue.set_source_id(source_id);
+        queue
     }
 
     pub fn source_id(&self) -> WaitSourceId {
-        self.source_id
+        self.state.lock().source_id
     }
 
-    pub fn set_source_id(&mut self, id: WaitSourceId) {
-        self.source_id = id;
+    pub fn set_source_id(&self, id: WaitSourceId) {
+        self.state.lock().source_id = id;
     }
 
     /// Compatibility bridge: create a one-shot `TaskMailbox`, register
@@ -158,7 +154,7 @@ impl RawQueue {
             if let Some(mb) = mailbox.upgrade() {
                 mb.post(MailboxEvent::SourceFired {
                     generation,
-                    source: self.source_id,
+                    source: self.source_id(),
                     interests: InterestMask::new(interest),
                 });
             }
@@ -217,13 +213,26 @@ impl RawQueue {
     }
 
     pub fn try_fire(&self, bits: u64) -> Result<usize, RawWireError> {
+        self.try_fire_with_post(bits, |mailbox, event| mailbox.post(event))
+    }
+
+    pub fn fire_with_post<F>(&self, bits: u64, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.try_fire_with_post(bits, post).unwrap_or(0)
+    }
+
+    pub fn try_fire_with_post<F>(&self, bits: u64, mut post: F) -> Result<usize, RawWireError>
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         if bits == 0 {
             return Ok(0);
         }
 
-        let source = self.source_id;
-        let mut woke = 0usize;
-        {
+        let source = self.source_id();
+        let (interests, deliveries) = {
             let mut state = self.state.lock();
             if state.terminal {
                 return Err(RawWireError::Terminal);
@@ -236,13 +245,28 @@ impl RawQueue {
             }
 
             let interests = InterestMask::new(new_bits);
-            // Post SourceFired to each subscriber whose interest overlaps.
+            let mut deliveries = Vec::new();
             for subscriber in &mut state.subscribers {
-                if subscriber.interest & new_bits != 0
-                    && post_source_fired(subscriber, source, interests)
-                {
-                    woke += 1;
+                if subscriber.interest & new_bits != 0 {
+                    if let Some(mailbox) = subscriber.mailbox.upgrade() {
+                        deliveries.push((mailbox, subscriber.generation));
+                    }
                 }
+            }
+            (interests, deliveries)
+        };
+
+        let mut woke = 0usize;
+        for (mailbox, generation) in deliveries {
+            if post(
+                &mailbox,
+                MailboxEvent::SourceFired {
+                    generation,
+                    source,
+                    interests,
+                },
+            ) {
+                woke += 1;
             }
         }
         Ok(woke)
@@ -305,7 +329,7 @@ impl RawQueue {
     }
 
     fn terminate_with_status(&self, terminal_bits: u64) -> TerminateOutcome {
-        let source = self.source_id;
+        let source = self.source_id();
         let mut woke = 0usize;
         let newly_terminal;
         {
@@ -524,6 +548,21 @@ impl<E: WireEventSet> DeclaredQueue<E> {
     pub fn try_fire(&self, bits: E) -> Result<usize, DeclaredWireError> {
         let bits = self.validated_bits(bits)?;
         Ok(self.raw.try_fire(bits)?)
+    }
+
+    pub fn try_fire_with_post<F>(&self, bits: E, post: F) -> Result<usize, DeclaredWireError>
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        let bits = self.validated_bits(bits)?;
+        Ok(self.raw.try_fire_with_post(bits, post)?)
+    }
+
+    pub fn fire_with_post<F>(&self, bits: E, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.try_fire_with_post(bits, post).unwrap_or(0)
     }
 
     pub fn fire(&self, bits: E) -> usize {

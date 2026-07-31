@@ -3,8 +3,8 @@
 //! Per D9 §"Phase D9-C" the wake-substrate migration must demonstrate
 //! that a thread parked inside `Channel::wait_event(_,
 //! WaitProtocol::Interruptible, ...)` is resolved as
-//! `WaitOutcome::Interrupted` when another thread calls
-//! `step_kill_process(pid, SIGTERM)` — and within a bounded number
+//! `WaitOutcome::Interrupted` when another thread uses the
+//! process-directed kill helper for `SIGTERM` — and within a bounded number
 //! of reactor ticks. This is the lost-wake fix's primary regression
 //! test (pre-D9-A, the parked future would miss the delivered
 //! signal because the underlying `Channel` never fired).
@@ -25,7 +25,7 @@
 //!    - The underlying `Channel` is **never** fired in this test —
 //!      the only wake path is the mailbox.
 //! 3. Run the reactor once to park the task.
-//! 4. Call `step_kill_process(proc, SIGTERM)`. This sets
+//! 4. Call the process-directed kill helper for `SIGTERM`. This sets
 //!    `summary.deliverable_signal` AND posts `SignalDelivered` to
 //!    the mailbox, which wakes the task.
 //! 5. Run the reactor again; the task re-polls,
@@ -66,7 +66,7 @@ use tx_subsystems::signal::adapter::wait_routing::{
 
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::process::structure::ProcessIdentity;
-use tx_subsystems::signal::{step_kill_process, KillOutcome, Signum};
+use tx_subsystems::signal::{step_kill_process_with_post, KillOutcome, Signum};
 use tx_subsystems::thread_runtime::structure::ThreadPayload;
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
@@ -124,6 +124,15 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 }
 
 const WAIT_EVENT_MASK: Mask = Mask::from_bits(0x1);
+
+fn kill_process_direct_for_test(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
+    step_kill_process_with_post(target, sig, None, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    })
+}
 
 /// Bridge `ThreadPayload`'s signal-side `InterruptSummary` into the
 /// reactor's `InterruptSource` trait. The reactor and signal
@@ -184,7 +193,7 @@ fn pselect_style_wait_resolves_interrupted_via_signal_mailbox() {
     let leader_payload = leader.payload_cap().expect("live leader");
 
     // Wake mailbox bound to the leader's payload. D9-A's
-    // `post_signal_mailbox` will route `SignalDelivered` events
+    // `post_signal_mailbox_with_post` will route `SignalDelivered` events
     // here.
     let mailbox = Arc::new(TaskMailbox::new());
     leader_payload.bind_mailbox(Arc::downgrade(&mailbox));
@@ -263,12 +272,12 @@ fn pselect_style_wait_resolves_interrupted_via_signal_mailbox() {
     // The reactor's task waker, registered via
     // `MailboxWakeAdapter::poll`, marks the task runnable.
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert!(
         leader_payload.interrupt_summary().deliverable_signal,
-        "D9-A: summary.deliverable_signal set after post_signal",
+        "D9-A: summary.deliverable_signal set after catchable-signal posting",
     );
 
     // ---- Phase 3: re-poll resolves the wait --------------------

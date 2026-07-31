@@ -307,10 +307,9 @@ pub(super) fn commit_mapping_from_root(
             l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;
         }
     }
-    // 这里只负责写入叶子。上层 VmPmap 在登记软件映射后统一调用
-    // synchronize_new_mappings，使 invalid→valid 提交对当前 hart 可见。
-    // 零 ASID/U74 的整表 fence 也由该入口处理；竞争失败的远端 hart 在
-    // 缺页合并路径中自行执行本地同步。
+    // User pmap commits are consumed at the next userspace entry, where
+    // `activate_user_pmap` writes `satp` and issues `sfence.vma`. Avoid a
+    // second per-PTE fence here; unmap/protect still fence at invalidation.
 }
 
 // 解除用户映射：只清空对应叶子项并返回失效凭证供 shootdown。
@@ -437,22 +436,9 @@ pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation])
         return;
     }
 
-    let coalesced = coalesce_invalidation_ranges(invalidations); // 合并相邻区间减少 fence 次数
-    let asid_usable = crate::hw_asid_tagging_usable();
-    if asid_usable {
-        // 带 ASID 硬件：逐区间做地址+ASID 限定的精刷
-        for invalidation in &coalesced {
-            sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
-        }
-    } else {
-        // SiFive U74 勘误 CIP-1200（JH7110/VF2）：带地址限定的 `sfence.vma`
-        // 无法失效全部翻译缓存条目——Linux 的绕过手法是在该硅片上把每一次这种
-        // fence 升级为整表 `sfence.vma`，我们照做。2026-07-03 已在真板上证实：
-        // 某次 store 在一个 VA 上死循环，而其内存中的页表遍历
-        //（按硬件顺序 root->l2e->l1e->l0e 读回）是一条完美的 V|R|W|X|U|A|D 链，
-        // 尽管每轮迭代都发了按 VA 限定的 fence。我们以“零 ASID”探测为判据，
-        // 它当前能唯一地识别出这颗核。
-        sfence_vma_all();
+    let coalesced = coalesce_invalidation_ranges(invalidations);
+    for invalidation in &coalesced {
+        sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
     }
     crate::remote_sfence_vma_asid_batch(asid, &coalesced); // 通知其他 hart 做远程失效
 }
@@ -480,10 +466,10 @@ pub(crate) fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalida
 
 // 分配一个空闲 ASID：在无锁位图上扫描，ASID 0 保留。
 fn alloc_asid() -> Result<Asid, PmapError> {
-    for word_index in 0..ASID_BITMAP_WORDS {
+    for (word_index, word) in ALLOCATED_ASIDS.iter().enumerate().take(ASID_BITMAP_WORDS) {
         loop {
-            let allocated = ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
-            let reserved = if word_index == 0 { 1 } else { 0 }; // 第 0 字的 bit0 对应保留的 ASID 0
+            let allocated = word.load(Ordering::Acquire);
+            let reserved = if word_index == 0 { 1 } else { 0 };
             if allocated | reserved == u64::MAX {
                 break; // 本字已满，换下一字
             }
@@ -496,8 +482,7 @@ fn alloc_asid() -> Result<Asid, PmapError> {
                 if allocated & bit != 0 {
                     continue; // 该位已占用
                 }
-                // CAS 抢占该位；失败说明有并发修改，重读本字重试
-                if ALLOCATED_ASIDS[word_index]
+                if word
                     .compare_exchange(
                         allocated,
                         allocated | bit,

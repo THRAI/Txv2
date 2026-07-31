@@ -40,6 +40,7 @@ pub struct Superblock {
 impl Superblock {
     pub const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
     pub const FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
+    pub const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
     pub const FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
     pub const FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 
@@ -137,6 +138,14 @@ impl Superblock {
 
     pub fn has_metadata_csum(&self) -> bool {
         self.feature_ro_compat & Self::FEATURE_RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    pub fn metadata_csum_seed(&self) -> u32 {
+        if self.feature_incompat & Self::FEATURE_INCOMPAT_CSUM_SEED != 0 {
+            self.checksum_seed
+        } else {
+            crc32c_append(0xFFFF_FFFF, &self.uuid)
+        }
     }
 }
 
@@ -572,12 +581,6 @@ pub struct Extent {
 }
 
 impl Extent {
-    /// On-disk `ee_len` encodes state and length together (Linux
-    /// `ext4_ext_is_unwritten` / `ext4_ext_get_actual_len`): raw values
-    /// `1..=32768` are an INITIALIZED extent of that many blocks — a raw
-    /// length of exactly 0x8000 (32768, the maximum) is initialized, not
-    /// a flag bit — while raw values above 32768 mark an UNWRITTEN extent
-    /// of `ee_len - 32768` blocks.
     pub const UNINITIALIZED_MASK: u16 = 0x8000;
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -598,21 +601,17 @@ impl Extent {
         Ok(())
     }
 
-    pub fn actual_len(&self) -> u32 {
-        if self.len <= Self::UNINITIALIZED_MASK {
-            self.len as u32
-        } else {
-            (self.len - Self::UNINITIALIZED_MASK) as u32
-        }
+    pub fn initialized_len(&self) -> u32 {
+        (self.len & !Self::UNINITIALIZED_MASK) as u32
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.len <= Self::UNINITIALIZED_MASK
+        self.len & Self::UNINITIALIZED_MASK == 0
     }
 
     pub fn contains(&self, logical_block: u32) -> bool {
         logical_block >= self.logical_block
-            && logical_block < self.logical_block.saturating_add(self.actual_len())
+            && logical_block < self.logical_block.saturating_add(self.initialized_len())
     }
 
     pub fn physical_for(&self, logical_block: u32) -> Option<u64> {
@@ -1117,6 +1116,43 @@ pub fn superblock_csum32(superblock_bytes: &[u8]) -> Result<u32> {
 pub fn group_desc_csum16(seed: u32, group_id: u32, desc_bytes: &[u8]) -> u16 {
     let group = group_id.to_le_bytes();
     (metadata_csum32(seed, &[&group, desc_bytes]) & 0xFFFF) as u16
+}
+
+pub fn block_bitmap_csum32(seed: u32, bitmap_bytes: &[u8], block_count: u32) -> Result<u32> {
+    let byte_count = (block_count as usize)
+        .checked_add(7)
+        .ok_or(Ext4FormatError::OutOfBounds)?
+        / 8;
+    Ok(crc32c_append(seed, slice_at(bitmap_bytes, 0, byte_count)?))
+}
+
+pub fn inode_csum32(
+    seed: u32,
+    inode_number: u32,
+    generation: u32,
+    inode_bytes: &[u8],
+) -> Result<u32> {
+    require_len(inode_bytes, 128)?;
+    let inode_number = inode_number.to_le_bytes();
+    let generation = generation.to_le_bytes();
+    let zero = [0u8; 2];
+    let checksum_hi_offset = 130.min(inode_bytes.len());
+    let mut checksum = metadata_csum32(
+        seed,
+        &[
+            &inode_number,
+            &generation,
+            &inode_bytes[..124],
+            &zero,
+            &inode_bytes[126..checksum_hi_offset],
+        ],
+    );
+    if inode_bytes.len() >= 132 {
+        checksum = metadata_csum32(checksum, &[&zero, &inode_bytes[132..]]);
+    } else {
+        checksum = crc32c_append(checksum, &inode_bytes[checksum_hi_offset..]);
+    }
+    Ok(checksum)
 }
 
 pub fn dirblock_csum32(seed: u32, inode: u32, generation: u32, block_bytes: &[u8]) -> u32 {

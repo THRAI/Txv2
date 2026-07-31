@@ -63,6 +63,8 @@ pub enum Errno {
     EEXIST,
     EFBIG,
     EIDRM,
+    /// Accessing a corrupted shared library / ELF interpreter. Linux value: 80.
+    ELIBBAD,
     EFAULT,
     EINVAL,
     EINPROGRESS,
@@ -142,6 +144,7 @@ impl Errno {
             Errno::EFAULT => 14,
             Errno::EFBIG => 27,
             Errno::EIDRM => 43,
+            Errno::ELIBBAD => 80,
             Errno::EINVAL => 22,
             Errno::EINPROGRESS => 115,
             Errno::EIO => 5,
@@ -237,9 +240,9 @@ pub enum YieldShape {
     /// wait subject.
     ///
     /// Per `docs/Txv3/03_STEP_MODEL_v2.md` and PR-8 of the v3
-    /// migration. The [`crate::wake::timer::TimerToken`]
+    /// migration. The [`crate::wake::deadline::TimerToken`]
     /// corresponding to this `token` is held by a
-    /// [`crate::wake::timer::TimerGuard`] (future PR-8 follow-up)
+    /// deadline registration guard (future PR-8 follow-up)
     /// that the driver retires on resume.
     OnTimer { token: TimerId, deadline: Deadline },
     /// Edge-triggered epoll subscription. Resolved identically to
@@ -637,18 +640,13 @@ impl DriveMode {
 /// `.await`/yield). See D1 §"guard is step-local, not ScriptCtx-held".
 ///
 /// PR-9 phase 3 populates `subject` / `deadline` from the syscall
-/// trampoline; subsequent waves populate `mailbox`, `timer_wheel`,
-/// and `trace`.
+/// trampoline; subsequent waves populate `mailbox` and `trace`.
 pub struct ScriptCtx<I: SubjectIdentity = ProcessIdentity> {
     subject: Option<SubjectContext<I>>,
     deadline: Option<Deadline>,
     /// Per-task wake delivery queue for yield resolution.
     /// Owned by the reactor task; `drive()` borrows it to park.
     mailbox: Option<Arc<TaskMailbox>>,
-    /// Reactor timer wheel for OnTimer yield resolution
-    /// (drive-taskmb). Shared across all tasks; clone is cheap
-    /// (internal Arc).
-    timer_wheel: Option<crate::wake::timer::TimerWheel>,
     /// Reactor delegate registry for OnAgent yield resolution
     /// (drive-taskmb). Shared across all tasks.
     delegate_registry: Option<alloc::sync::Arc<crate::step::DelegateRegistry>>,
@@ -662,7 +660,6 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
             subject: None,
             deadline: None,
             mailbox: None,
-            timer_wheel: None,
             delegate_registry: None,
         }
     }
@@ -696,13 +693,6 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         self.deadline
     }
 
-    /// Populate the reactor timer wheel for OnTimer yield resolution
-    /// (drive-taskmb).
-    pub fn with_timer_wheel(mut self, wheel: crate::wake::timer::TimerWheel) -> Self {
-        self.timer_wheel = Some(wheel);
-        self
-    }
-
     /// Task mailbox if populated; `None` for test/placeholder contexts
     /// or before reactor integration.
     pub fn mailbox(&self) -> Option<&Arc<TaskMailbox>> {
@@ -717,12 +707,6 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
     ) -> Self {
         self.delegate_registry = Some(registry);
         self
-    }
-
-    /// Reactor timer wheel if populated; `None` for test/placeholder
-    /// contexts or before reactor integration.
-    pub fn timer_wheel(&self) -> Option<&crate::wake::timer::TimerWheel> {
-        self.timer_wheel.as_ref()
     }
 
     /// Reactor delegate registry if populated; `None` for

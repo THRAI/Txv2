@@ -56,7 +56,7 @@ qemu = subprocess.Popen([
     "-kernel", KERNEL,
     "-bios", BIOS,
     "-initrd", INITRD,
-    "-append", "tx.profile=busybox console=ttyS0",
+    "-append", "tx.profile=busybox tx.boot.mode=busybox console=ttyS0",
     "-d", "guest_errors",
     "-D", f"{PROJECT}/target/qemu-test.log",
 ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

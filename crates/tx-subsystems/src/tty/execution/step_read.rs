@@ -19,6 +19,73 @@ use crate::tty::execution::TTY_READABLE;
 use crate::tty::structure::termios::{ICANON, VMIN, VTIME};
 use crate::tty::structure::TtyIdentity;
 
+/// Blocking plan for a non-canonical `read(2)` on a TTY.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TtyReadWaitPlan {
+    /// A read can complete immediately.
+    Ready,
+    /// The caller must wait for more input; no termios timer is active yet.
+    WaitIndefinite,
+    /// The caller should wait for input or for `VTIME` deciseconds to expire.
+    WaitVtime { deciseconds: u8 },
+}
+
+/// Return whether a process-side `read(2)` on this TTY can complete now.
+///
+/// This is the TTY-owned readiness predicate used by `poll`/`select` callers.
+/// It intentionally follows the same staged non-canonical threshold policy as
+/// [`step_read`]: `VMIN` is honored even when `VTIME` is non-zero, while the
+/// actual timer expiry remains driven by the syscall wait path.
+pub fn tty_read_would_complete(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> bool {
+    matches!(
+        tty_read_wait_plan(tty, usize::MAX, guard),
+        TtyReadWaitPlan::Ready
+    )
+}
+
+/// Return the blocking plan for a `read(2)` of `out_len` bytes.
+pub fn tty_read_wait_plan(
+    tty: &Cap<TtyIdentity>,
+    out_len: usize,
+    guard: &Guard<'_>,
+) -> TtyReadWaitPlan {
+    let payload = match require_live_tty(tty, guard) {
+        Ok(payload) => payload,
+        Err(_) => return TtyReadWaitPlan::Ready,
+    };
+
+    if payload.eof_pending.load(Ordering::Acquire) {
+        return TtyReadWaitPlan::Ready;
+    }
+
+    payload.with_termios(|termios| {
+        payload.with_input_queue(|queue| {
+            if termios.c_lflag & ICANON != 0 {
+                return if queue.is_empty() {
+                    TtyReadWaitPlan::WaitIndefinite
+                } else {
+                    TtyReadWaitPlan::Ready
+                };
+            }
+
+            let queued = queue.len();
+            let vmin = termios.c_cc[VMIN] as usize;
+            let vtime = termios.c_cc[VTIME];
+
+            match (vmin, vtime) {
+                (0, 0) => TtyReadWaitPlan::Ready,
+                (0, _) if queued > 0 => TtyReadWaitPlan::Ready,
+                (0, deciseconds) => TtyReadWaitPlan::WaitVtime { deciseconds },
+                (_, 0) if queued >= vmin.min(out_len) => TtyReadWaitPlan::Ready,
+                (_, 0) => TtyReadWaitPlan::WaitIndefinite,
+                (_, _) if queued >= vmin.min(out_len) => TtyReadWaitPlan::Ready,
+                (_, deciseconds) if queued > 0 => TtyReadWaitPlan::WaitVtime { deciseconds },
+                (_, _) => TtyReadWaitPlan::WaitIndefinite,
+            }
+        })
+    })
+}
+
 /// Drain bytes from a live TTY input queue into `out`.
 ///
 /// Empty queue returns a `Yield` on the TTY's wait source. A canonical
@@ -27,6 +94,23 @@ pub fn step_read(
     tty: &Cap<TtyIdentity>,
     out: &mut [u8],
     guard: &Guard<'_>,
+) -> StepOutcome<usize, ByteProgress> {
+    step_read_inner(tty, out, guard, false)
+}
+
+pub fn step_read_after_vtime(
+    tty: &Cap<TtyIdentity>,
+    out: &mut [u8],
+    guard: &Guard<'_>,
+) -> StepOutcome<usize, ByteProgress> {
+    step_read_inner(tty, out, guard, true)
+}
+
+fn step_read_inner(
+    tty: &Cap<TtyIdentity>,
+    out: &mut [u8],
+    guard: &Guard<'_>,
+    vtime_expired: bool,
 ) -> StepOutcome<usize, ByteProgress> {
     // observe
     // upgrade
@@ -56,17 +140,23 @@ pub fn step_read(
     }
 
     let vmin_policy = payload.with_termios(|termios| {
-        if termios.c_lflag & ICANON != 0 || termios.c_cc[VTIME] != 0 {
+        if termios.c_lflag & ICANON != 0 {
             None
         } else {
-            Some(termios.c_cc[VMIN] as usize)
+            Some((termios.c_cc[VMIN] as usize, termios.c_cc[VTIME]))
         }
     });
 
     let mut threshold_unmet = false;
     let copied = payload.with_input_queue(|queue| {
-        if let Some(vmin) = vmin_policy {
-            let threshold = vmin.min(out.len());
+        if let Some((vmin, vtime)) = vmin_policy {
+            let threshold = match (vmin, vtime, vtime_expired) {
+                (0, 0, _) | (0, _, true) => 0,
+                (0, _, false) => 1,
+                (_, 0, _) => vmin.min(out.len()),
+                (_, _, true) => 1,
+                (_, _, false) => vmin.min(out.len()),
+            };
             if queue.len() < threshold {
                 if queue.is_empty() {
                     tty.input_readable.clear(TTY_READABLE);
@@ -83,20 +173,18 @@ pub fn step_read(
         copied
     });
 
-    // Pre-ELF Phase 5 (item 9): the wait source is the TTY
-    // identity's `wait_channel`, registered with the global
-    // `wait_source` resolver at construction. `step_ingest` fires
-    // it after any byte ingest, so `sys_read`'s
-    // `wait_on_token(token).await` actually parks until UART RX
-    // bytes arrive. Threshold / VMIN logic comes from main's
+    // Pre-ELF Phase 5 (item 9): the readable endpoint is the TTY identity's
+    // registered `WaitSource`. `step_ingest` notifies it after any byte
+    // ingest so `sys_read` parks until UART RX bytes arrive.
+    // Threshold / VMIN logic comes from main's
     // 2026-05-06 tty work.
     if threshold_unmet {
-        crate::tty::notification::yield_readable_for_tty(tty.wait_source_id())
+        crate::tty::notification::yield_readable_for_tty(tty.read_endpoint())
     } else if copied == 0 {
-        if matches!(vmin_policy, Some(0)) {
+        if matches!(vmin_policy, Some((0, _))) {
             V3::Done(0)
         } else {
-            crate::tty::notification::yield_readable_for_tty(tty.wait_source_id())
+            crate::tty::notification::yield_readable_for_tty(tty.read_endpoint())
         }
     } else {
         V3::Done(copied)
@@ -126,6 +214,34 @@ pub fn step_read_for_caller(
     }
 
     step_read(tty, out, guard)
+}
+
+pub fn step_read_after_vtime_for_process(
+    tty: &Cap<TtyIdentity>,
+    out: &mut [u8],
+    caller: &Cap<crate::process::structure::ProcessIdentity>,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
+
+    let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
+        Ok(caller_info) => caller_info,
+        Err(err) => return V3::Err(err.into()),
+    };
+
+    if out.is_empty() {
+        return V3::Done(0);
+    }
+
+    if let Err(err) = require_fg_pgrp_for(tty, Some(caller_info)) {
+        let dispatch = background_read_signal(tty, caller_info);
+        let _ = super::step_ioctl::deliver_signal_dispatch_for_process_with_guard(
+            caller, dispatch, guard,
+        );
+        return V3::Err(err.into());
+    }
+
+    step_read_after_vtime(tty, out, guard)
 }
 
 pub fn step_read_for_process(
@@ -180,7 +296,10 @@ pub struct ReadOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        // Foreground-pgrp authority is explicit in `caller`; this step still
+        // runs under the enclosing script subject.
+        let _ = ctx.subject();
         let __guard = step_engine::guard();
         step_read(self.tty, self.out, &__guard)
     }
@@ -217,6 +336,23 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadForProcessOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let __guard = step_engine::guard();
         step_read_for_process(self.tty, self.out, self.caller, &__guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_read_after_vtime_for_process`].
+#[allow(dead_code)]
+pub struct ReadForProcessAfterVtimeOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub out: &'a mut [u8],
+    pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadForProcessAfterVtimeOp<'a> {
+    type Output = usize;
+    type Progress = ByteProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
+        step_read_after_vtime_for_process(self.tty, self.out, self.caller, &__guard)
     }
 }
 

@@ -66,8 +66,8 @@ const MUTATOR_SIGNALS: &[&str] = &[
     "fs_ops.mkdir(",
     "fs_ops.symlink(",
     // FS mutators on inode metadata (require ownership or CAP_FOWNER).
-    "fs_ops.step_chmod(",
-    "fs_ops.step_chown(",
+    "fs_ops.chmod_inode(",
+    "fs_ops.chown_inode(",
     "fs_ops.step_truncate(",
     // Composite StepOp wraps that internally drive the FS mutators.
     "RenameOp {",

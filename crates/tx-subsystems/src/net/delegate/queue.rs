@@ -1,4 +1,5 @@
 use tx_substrate::bus::{RawQueue, StaticRawQueue};
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 use crate::execution::WaitToken;
 use crate::sync::SpinMutex;
@@ -36,12 +37,18 @@ pub fn net_delegate_wait_token() -> WaitToken {
     )
 }
 
-pub fn net_delegate_kick_poll() -> usize {
-    net_delegate_queue().fire(DelegateWireSet::POLL.bits())
+pub fn net_delegate_kick_poll_with_post<F>(post: F) -> usize
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    net_delegate_queue().fire_with_post(DelegateWireSet::POLL.bits(), post)
 }
 
-pub fn net_delegate_kick_tick() -> usize {
-    net_delegate_queue().fire(DelegateWireSet::TICK.bits())
+pub fn net_delegate_kick_tick_with_post<F>(post: F) -> usize
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    net_delegate_queue().fire_with_post(DelegateWireSet::TICK.bits(), post)
 }
 
 pub fn net_delegate_clear(bits: DelegateWireSet) {

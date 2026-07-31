@@ -17,7 +17,14 @@ fn process_payload_exit_source_default_constructed_and_registered() {
         .expect("live init has an exit_source carrier id");
     // Must be a non-zero, registered id.
     assert!(carrier_id != 0);
-    assert!(crate::wait_source::lookup_wait_channel(carrier_id).is_some());
+    assert!(crate::wait_source::lookup_wait_source(carrier_id).is_some());
+    let endpoint = init
+        .exit_endpoint()
+        .expect("live init exposes an exit endpoint");
+    assert_eq!(
+        tx_substrate::wake::WaitEndpoint::source_id(&endpoint).raw(),
+        carrier_id
+    );
 
     // Exit_port wait token is built from the carrier id + the
     // child-zombified bit.
@@ -30,7 +37,6 @@ fn process_payload_exit_source_default_constructed_and_registered() {
 
 #[test]
 fn post_sigchld_to_parent_fires_exit_source() {
-    use crate::process::adapter::wait_routing::Mask;
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
@@ -40,9 +46,10 @@ fn post_sigchld_to_parent_fires_exit_source() {
     let token = parent
         .exit_source_wait_token()
         .expect("live parent has token");
-    let channel = crate::wait_source::lookup_wait_channel(token.source_id())
-        .expect("registered carrier resolves");
-    let mut wait = channel.wait(Mask::from_bits(token.interest()));
+    let endpoint = parent
+        .exit_endpoint()
+        .expect("live parent exposes an exit endpoint");
+    let mut wait = crate::wait_source::wait_on_endpoint(&endpoint, token.interest());
 
     // Drive a single poll to register the awaiter.
     use core::future::Future;
@@ -61,9 +68,9 @@ fn post_sigchld_to_parent_fires_exit_source() {
     let pre = Pin::new(&mut wait).poll(&mut cx);
     assert!(matches!(pre, Poll::Pending), "no fires yet → Pending");
 
-    // Zombify the child via step_exit_group; this calls
+    // Zombify the child through the group-exit helper; this calls
     // post_sigchld_to_parent which fires the parent's exit_source.
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     // The awaiter should now resolve on next poll.
     let post = Pin::new(&mut wait).poll(&mut cx);
@@ -83,19 +90,19 @@ fn step_fork_clones_init_with_fresh_exit_source() {
     let child_id = child.exit_source_id().expect("child live");
     assert_ne!(
         parent_id, child_id,
-        "each ProcessPayload gets its own Channel + carrier id",
+        "each ProcessPayload gets its own WaitSource + carrier id",
     );
 
     // Both carriers must resolve through the registry.
-    assert!(crate::wait_source::lookup_wait_channel(parent_id).is_some());
-    assert!(crate::wait_source::lookup_wait_channel(child_id).is_some());
+    assert!(crate::wait_source::lookup_wait_source(parent_id).is_some());
+    assert!(crate::wait_source::lookup_wait_source(child_id).is_some());
 }
 
 #[test]
 fn zombie_process_exit_source_id_is_none() {
     let _g = setup();
     let init = bootstrap();
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
     assert!(init.is_zombie());
 
     // After zombification the payload is gone; the carrier id is
@@ -105,11 +112,11 @@ fn zombie_process_exit_source_id_is_none() {
     // cleanup item).
     assert!(init.exit_source_id().is_none());
     assert!(init.exit_source_wait_token().is_none());
-    // fire_exit_source on a zombie is a no-op (returns 0).
+    assert!(init.exit_endpoint().is_none());
+    // fire_exit_source_with_post on a zombie is a no-op (returns 0).
     assert_eq!(
-        init.fire_exit_source(crate::process::adapter::wait_routing::Mask::from_bits(
-            EXIT_SOURCE_CHILD_ZOMBIFIED
-        )),
+        init.fire_exit_source_with_post(EXIT_SOURCE_CHILD_ZOMBIFIED, |mailbox, event| mailbox
+            .post(event),),
         0,
     );
 }

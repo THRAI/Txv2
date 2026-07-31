@@ -123,6 +123,7 @@ fn parse_numbers(text: &str) -> BTreeMap<String, u64> {
 /// ```text
 ///   NR_FOO => sys_foo(...),
 ///   nr if nr == NR_FOO => sys_foo(...),
+///   nr if nr == NR_FOO || nr == NR_FOO_ALIAS => sys_foo(...),
 ///   nr if nr == NR_FOO => {
 ///       sys_foo(...)
 ///           .await
@@ -145,17 +146,22 @@ fn parse_dispatch(text: &str) -> BTreeMap<String, DispatchArm> {
             continue;
         };
         let lhs = &line[..arrow];
-        // The arm's NR_ token lives on the LHS. Find the *last* one (skip
-        // any `nr if nr == NR_FOO` shape's noise word `NR_FOO`).
-        let Some(nr_pos) = lhs.rfind("NR_") else {
-            continue;
-        };
-        let after_nr = &lhs[nr_pos + 3..];
-        let name_end = after_nr
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .unwrap_or(after_nr.len());
-        let name = &after_nr[..name_end];
-        if name.is_empty() {
+        // Every NR_ token on the LHS names a syscall routed through this arm.
+        // Compound guards commonly pair a canonical name with a compatibility
+        // alias, so retaining only the first or last token loses real wiring.
+        let mut names = Vec::new();
+        let mut rest = lhs;
+        while let Some(nr_pos) = rest.find("NR_") {
+            let after_nr = &rest[nr_pos + 3..];
+            let name_end = after_nr
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_nr.len());
+            if name_end != 0 {
+                names.push(after_nr[..name_end].to_string());
+            }
+            rest = &after_nr[name_end..];
+        }
+        if names.is_empty() {
             continue;
         }
 
@@ -204,7 +210,9 @@ fn parse_dispatch(text: &str) -> BTreeMap<String, DispatchArm> {
                 likely_stub: arm_text.contains("ENOSYS") || arm_text.contains("ENOSYS_VALUE"),
             },
         };
-        out.entry(name.to_string()).or_insert(arm);
+        for name in names {
+            out.entry(name).or_insert_with(|| arm.clone());
+        }
     }
     out
 }
@@ -230,7 +238,7 @@ fn locate_handler(handler_dir: &Path, handler: &str) -> Option<(bool, String)> {
             continue;
         };
         // Find `fn <handler>(` or `fn <handler><`.
-        let needle = format!("fn {}", handler);
+        let needle = format!("fn {handler}");
         let Some(pos) = text.find(&needle) else {
             continue;
         };
@@ -937,5 +945,27 @@ pub(crate) fn syscall(root: &Path, args: Vec<String>) -> Result<()> {
         other => Err(format!(
             "unknown syscall subcommand '{other}'; expected list|info|status|sync|pick"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dispatch_tracks_every_nr_in_compound_guard() {
+        let arms = parse_dispatch(
+            "match nr {\n\
+                 nr if nr == NR_CANONICAL || nr == NR_ALIAS => sys_shared(args),\n\
+                 _ => unreachable!(),\n\
+             }",
+        );
+
+        for name in ["CANONICAL", "ALIAS"] {
+            assert!(
+                matches!(arms.get(name), Some(DispatchArm::Handler(handler)) if handler == "sys_shared"),
+                "compound guard did not associate NR_{name} with sys_shared: {arms:?}"
+            );
+        }
     }
 }
