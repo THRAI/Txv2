@@ -1,3 +1,23 @@
+- 2026-07-31 (**LA64 TCP_CRR merge 回归已修复，两条 netperf lane 恢复 5/5**).
+  两次 LA64 诊断先把失败从网络容量问题收敛到通用 EBR 不变量：
+  `SocketPayload` final release 遇到 `epoch=0`、`zone_count=0`、
+  `rcu_count=1` 的 retirement bag，唯一 RCU 回调为
+  `tx_substrate::publication::defer_node`。最终根因是
+  `prepare_head_bags_after_barrier` 把有状态写入
+  `bag.reset_if_empty(candidate)` 放进了 `debug_assert!`；release 优化删除整个
+  表达式，随后 prepared publication enqueue 在未标 epoch 的 bag 中留下节点。
+  `d9df0b05` 将初始化改为无条件执行，并把 enqueue epoch 合同提升为 release
+  assertion；新增 publication→Zone retire 集成回归，修复前 debug 通过而
+  release 稳定失败，修复后两种 profile 均通过。LA64 fresh-image
+  `netperf-musl`、`netperf-glibc` 各 **5/5**，TCP_CRR 分别为 172.27、161.07
+  transactions/s；结合既有 iperf 12/12，Gate C LA64 回到 **22/22**。
+  RV64、LA64 release build 也均通过。没有恢复旧 EBR 状态机、扩大容量，亦未
+  启动已搁置的 Phase 1～8。`cargo -q xtask unit` 仍只有既有 3 个 tx-shims
+  失败和 tx-ext4 的 8 处陈旧 `with_target`；旧 `tests/epoch.rs` 也仍使用已退役
+  EBR 测试 API。**Next**：恢复计划只剩 Gate E b6；仅在用户保留该项时重跑
+  完整同命令 anchor tail。**Blocker**：LTP `setsockopt06` 当前 stall 与历史
+  focused 1/1 的证据冲突。
+
 - 2026-07-30 (**TCP retained close / SO_LINGER 结构调研完成，按额度暂停**).
   确认当前 last-close 失败根因是 transport 所有权提前终止：路径先撤销
   connection/bind、`abort()` 并 `take_payload()`，因此 smoltcp 虽有

@@ -2,8 +2,9 @@
 
 日期：2026-07-31
 
-状态：Gate A～E 已按序执行并完成审查；LA64 TCP_CRR 已归因到 merge 后
-publication/EBR 回收袋不变量，但尚未修复；恢复仍被该项和 LTP b6 证据冲突阻塞。
+状态：Gate A～E 已按序执行并完成审查；LA64 TCP_CRR 的 merge 后
+publication/EBR release 回归已修复并恢复到 22/22；当前只剩 LTP b6
+证据冲突阻塞最终恢复判定。
 
 对比基线：
 
@@ -27,12 +28,16 @@ Phase 1～8 的 OFD release、retained close、positive `SO_LINGER`、readiness
 
 ## 执行结果（2026-07-31）
 
-本轮发现并修复了两个可直接归因于 merge 的回退，并补了一项当前路径所需
+本轮发现并修复了三个可直接归因于 merge 的回退，并补了一项当前路径所需
 的 Linux UDP 兼容语义：
 
 1. OSComp musl/glibc lane 根目录和动态解释器兼容接线丢失；
 2. musl libc-test dynamic lane 从 `runtest.exe` 启动器退化为直接执行
-   `libc.so`，产生 `Not a valid dynamic program`。
+   `libc.so`，产生 `Not a valid dynamic program`；
+3. EBR publication preflight 把 `bag.reset_if_empty(candidate)` 放在
+   `debug_assert!` 中，release 构建删除了 bag epoch 写入，最终由 TCP_CRR
+   压力触发后续 Zone retire 断言。`d9df0b05` 将写入改为无条件执行，并在
+   prepared enqueue 边界保留 release invariant check。
 
 此外，当前 netperf 路径要求零长度 UDP datagram 作为结束信号。`90939012`
 源码本身也会在若干 UDP 路径丢弃空 datagram，因此这里修复的是 Linux 语义
@@ -49,7 +54,7 @@ readiness/容量收敛，故将其保留为显式残余风险。
 | A | 审查后复验：IRQ 7/7、reactor 8/8、fdtable 103/103、TCP lifecycle 27/27、external connect 14/14、veth 4/4、network tick 4/4 |
 | B | 审查后复验：RV64 Git/IRQ 9/9，IRQ claims/completions 80/80；LA64 Git/DNS/HTTP/HTTPS 8/8；HTTP/HTTPS clone 使用本地 hostname，SLIRP DNS 另有 30 秒局部超时 |
 | C RV64 | netperf/iperf musl+glibc 22/22 |
-| C LA64 | iperf 12/12；两条 netperf lane 均先通过四项，再在 TCP_CRR 失败，即 20/22 benchmark points |
+| C LA64 | iperf 12/12；修复后 netperf musl 5/5、glibc 5/5，合计 22/22 benchmark points |
 | D | musl 12/12；glibc 8/12，只有允许的四项 resolver 历史失败 |
 | E | b1、b2、b5 达到可复现目标；b3、b4 与同镜像/runner 的 `90939012` verdict-set 一致；b6 未关闭 |
 
@@ -61,14 +66,14 @@ API 编译不一致。它们不改变 Gate A 的网络定向结果，也不在�
 
 审查后的阻塞判定：
 
-- 祖先 `87ae1d21` 明确记录 LA64 musl/glibc 四组 22/22。一次
-  `90939012` replay 的 TCP_CRR `Out of memory` 只能说明该次运行也撞到容量
-  边界，不能推翻已有成功见证。两次定向诊断进一步证明当前 assertion 不是
-  TCP 表、端口池、physical pages 或 Socket slab 的直接容量问题：
-  `SocketPayload` final release 撞到 `epoch=0`、`zone_count=0`、`rcu_count=1` 的
-  三袋 EBR 状态，唯一节点回调是 `tx_substrate::publication::defer_node`，其生产
-  owner 是 VM `RecipeTree`。这是 merge 后 generic publication/EBR 不变量回归，
-  TCP_CRR 只是压力触发器；不再归入已搁置的网络 Phase 7。
+- 祖先 `87ae1d21` 明确记录 LA64 musl/glibc 四组 22/22。两次定向诊断证明
+  当前 assertion 不是 TCP 表、端口池、physical pages 或 Socket slab 的直接
+  容量问题：`SocketPayload` final release 撞到 `epoch=0`、`zone_count=0`、
+  `rcu_count=1` 的三袋 EBR 状态，唯一节点回调是
+  `tx_substrate::publication::defer_node`。确定性 host 回归进一步证明根因是
+  `debug_assert!(bag.reset_if_empty(candidate))` 在 release 中被整体删除；
+  `d9df0b05` 修复后，同一回归在 debug/release 均通过，LA64 netperf musl 和
+  glibc 也分别恢复为 5/5。TCP_CRR 只是压力触发器，未启动已搁置的 Phase 7。
 - LTP b3、b4 的 current/anchor verdict-set 一致。b6 只对
   `setsockopt06` 做过一次同样 stall 的 anchor replay，未重放完整 anchor tail；
   历史 focused ledger 又有 `setsockopt06` 1/1，因此 Gate E 仍未关闭。
@@ -359,10 +364,6 @@ cargo xtask fault-decode \
    batch，并解释与任何更早 focused pass 的冲突。
 6. 所有日志、命令、HEAD、镜像来源和 blocker 写入 progress。
 
-当前第 3、5 条未满足，所以恢复计划保持 blocked。达到全部条件后也不自动
-进入任何后续网络架构工作。
-
-LA64 第 3 条的下一步不是扩大容量：先给 substrate 增加能覆盖 publication
-retire 与 nested Zone retire 的确定性回归，再恢复 final Cap enqueue 前的
-checked preflight、一次 bounded drain/retry 和 retry 后 fail-fast；修复后先跑
-单条 TCP_CRR，再跑 LA64 musl/glibc 两条完整 netperf lane。
+当前只有第 5 条未满足，所以恢复计划保持 blocked。下一步只需按用户确认的
+范围补齐 LTP b6 的同命令 anchor tail 对照；达到全部条件后也不自动进入任何
+后续网络架构工作。LA64 修复没有恢复旧 EBR 状态机、扩大容量或启动 Phase 1～8。
