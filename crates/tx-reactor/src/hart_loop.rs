@@ -476,7 +476,12 @@ mod step_op_wraps {
             self.markers
         }
 
-        fn run_hart_loop_ready<S>(&mut self, _hart: HartId, _signal: &mut S) -> RunStats
+        fn run_hart_loop_ready<S>(
+            &mut self,
+            _hart: HartId,
+            _signal: &mut S,
+            _poll_budget: HartPollBudget,
+        ) -> RunStats
         where
             S: RescheduleSignal,
         {

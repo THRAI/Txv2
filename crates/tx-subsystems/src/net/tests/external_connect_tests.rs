@@ -1021,6 +1021,17 @@ fn external_udp_sendto_reaches_device_tx() {
     assert_eq!(step_bind(&udp, inet(49_180), &guard), StepOutcome::Done(()));
 
     let dst = IpEndpoint::new(REMOTE_IP, 53);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &udp,
+            Some(dst),
+            b"",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(0),
+        "an empty UDP payload must still enqueue one wire datagram"
+    );
     let outcome = step_send_to_kernel_bytes(
         &udp,
         Some(dst),
@@ -1066,10 +1077,29 @@ fn external_udp_sendto_reaches_device_tx() {
     assert_eq!(tx.udp_failed, 0, "udp lane must not fail");
     assert!(
         tx.udp_packets >= 1,
-        "udp datagram must reach the sink (attempted={}, busy={}, pending={})",
+        "the bounded first TX pass must emit one UDP datagram (attempted={}, busy={}, pending={})",
         tx.udp_attempted,
         tx.udp_busy,
         tx.udp_resolution_pending
+    );
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::from_millis(6),
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("second device tx pass should complete");
+    };
+    assert_eq!(tx.udp_failed, 0, "second udp lane must not fail");
+    assert!(
+        tx.udp_packets >= 1,
+        "the bounded second TX pass must emit the other UDP datagram"
+    );
+    assert_eq!(
+        sink.frames.load(core::sync::atomic::Ordering::Acquire),
+        2,
+        "both the empty and non-empty UDP datagrams must reach the sink"
     );
 }
 

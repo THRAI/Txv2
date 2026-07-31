@@ -1043,7 +1043,10 @@ where
             return SyscallResult::Error(errno_to_i32(errno));
         }
     }
-    if len == 0 && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC)) {
+    if len == 0
+        && socket.kind != SocketKind::Udp
+        && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC))
+    {
         return SyscallResult::Return(0);
     }
 
@@ -1589,7 +1592,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         }
     }
 
-    if total_len == 0 {
+    if total_len == 0 && socket.kind != SocketKind::Udp {
         return SyscallResult::Return(0);
     }
 
@@ -1926,7 +1929,10 @@ where
             return SyscallResult::Error(errno);
         }
     }
-    if total_len == 0 && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC)) {
+    if total_len == 0
+        && socket.kind != SocketKind::Udp
+        && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC))
+    {
         return SyscallResult::Return(0);
     }
 

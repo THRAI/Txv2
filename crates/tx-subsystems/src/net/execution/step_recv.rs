@@ -34,7 +34,7 @@ pub fn step_recv(
     if let Some(errno) = recv_flags_error(witness.flags) {
         return StepOutcome::Err(errno);
     }
-    if payload.shutdown_rd() || len == 0 {
+    if payload.shutdown_rd() || (len == 0 && socket.kind != SocketKind::Udp) {
         return StepOutcome::Done(0);
     }
 
@@ -87,7 +87,7 @@ pub fn step_recv_kernel_bytes(
     if let Some(errno) = stream_recv_state_error(socket, &payload) {
         return StepOutcome::Err(errno);
     }
-    if payload.shutdown_rd() || out.is_empty() {
+    if payload.shutdown_rd() || (out.is_empty() && socket.kind != SocketKind::Udp) {
         return StepOutcome::Done(SocketRecvBytesOutcome::default());
     }
 

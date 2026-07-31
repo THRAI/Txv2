@@ -18234,3 +18234,91 @@
   on those missing APIs. No push was performed; the original dirty source
   worktree was not changed. Next: explicitly approve either a broader
   observation/publication baseline migration or a reduced time-only publish.
+- 2026-07-31 (**feature-network-refactor 合并恢复总账与后续路线图完成；代码恢复与
+  结构完成分层管理**). 对照 premerge 锚点 `90939012`、merge `6d41a347` 和
+  当前 `ad115d68`，确认两个已知 merge 回退——RV64 `NET_IRQ` 和
+  Socket/FileOps 生产接线——均已在 07-30 恢复；当前没有已知未恢复的代码
+  回退，且 TCP generation/connect、`SO_ERROR`、部分 live sockopt 和跨 netns
+  数据面已超过 premerge。仍不能宣称“全部网络功能恢复”：07-30 后缺 LA64
+  Git、双架构 musl/glibc netperf+iperf 及固定 LTP/OSComp verdict-set 的完整
+  复跑；retained last-close/FIN_WAIT/TIME_WAIT/`SO_LINGER`、readiness 双轨、
+  动态对象回收、容量硬编码、L2/L3 所有权及协议缺口是 premerge 本来就有的
+  R3 欠账。已建立 R1 代码恢复/R2 行为恢复/R3 重构完成三层判据和 Phase 0～9
+  计划。**Verification**：只读核对 git first-parent 序列、premerge/current
+  锚点、关键 close/readiness/ether 代码和已有测试记录；新 JSON 通过 `jq`
+  解析与字段/状态/路径核对，`git diff --check` 通过。全仓
+  `cargo xtask progress validate` 仍先被既有 07-24 计划中的非法
+  `completed` 状态阻断；`cargo xtask lint docs` 仍报既有 23 个断链和 6 个
+  stale-vocabulary warning，本次两个 07-31 记录均未出现在失败清单。
+  **Next**：先执行 Phase 0 post-merge 验收基线；后续 Phase 1～8 的原始
+  建议已由下一条范围修正记录明确搁置。路线图见
+  `docs/progress/research/2026-07-31-network-merge-recovery-roadmap.md`，可执行
+  计划见 `docs/progress/plans/2026-07-31-network-merge-recovery.json`。
+- 2026-07-31 (**网络 merge 恢复范围收缩：Phase 1～8 搁置，只验收
+  `90939012` 已有功能**). 按用户确认修正 07-31 路线：OFD release、
+  retained close/`SO_LINGER`、readiness、动态对象/容量、IPv6 fragment、
+  VLAN 和 L2/L3 工作均不是已知 merge 回退，不再属于当前恢复计划。当前
+  唯一 active step 是固定 post-merge 验收：host targeted；RV64 Git/IRQ
+  9/9；LA64 Git 8/8；双架构 musl/glibc netperf+iperf 各 22/22；
+  filtered libc-test network ABI；RV64 musl LTP socket 六分批
+  `40/40、35/35、37/38、93/95、14/17、10/11`，合计 229/236 且
+  verdict-set 不新增差项。旧 `libctest-network`/`lmbench-network`
+  selector 已退役，不能直接使用；前者改用当前 filtered group，后者不作为
+  硬门槛。**Changed**：收缩 active JSON plan，新增精确命令/分数/超时矩阵。
+  **Verification**：只读核对 current Makefile、xtask group selector、Git
+  scripts、LTP witness runner 和 premerge ledger；尚未启动慢测试。
+  **Next**：先确认或重建干净 RV64 OSComp 镜像，再从 host targeted 和双架构
+  Git gate 开始。**Blocker**：当前共享
+  `target/oscomp/testdata/sdcard-rv.img` 有既存 ext4 block-bitmap checksum
+  损坏记录，不能作为正式 OSComp/LTP 证据源。矩阵见
+  `docs/progress/research/2026-07-31-premerge-network-recovery-test-matrix.md`。
+- 2026-07-31 (**merge 前网络功能的有序恢复验收已执行完毕，Phase 1～8
+  继续搁置**). **Changed**：修复三个已确认 merge 回退：恢复 OSComp
+  `/musl/{musl,glibc}` lane 与动态解释器兼容接线；让 UDP 零长度 datagram
+  穿过通用队列和 inline loopback（netperf 依靠它结束测试）；恢复 musl
+  libc-test dynamic lane 的 `runtest.exe` 启动方式。LTP witness runner
+  新增显式干净镜像覆盖，不改写已损坏的共享 RV64 镜像。
+  **Verification**：Gate A 全绿（IRQ 7/7、reactor 8/8、fdtable 102/102、
+  TCP lifecycle 27/27、external connect 14/14、veth 4/4、network tick
+  4/4）；RV64 Git/IRQ 9/9 且 claims/completions 80/80，LA64 Git 8/8；
+  RV64 netperf/iperf 22/22；LA64 iperf 12/12，两个 netperf lane 均先过
+  前四项再在 TCP_CRR 失败；libc-test musl 12/12、glibc 8/12，失败仅为
+  允许的四项 resolver case；LTP b1/b2/b5 保持可复现历史结果，b3/b4/b6
+  与相同镜像/runner 下的 `90939012` 逐项 verdict 完全一致，没有新增
+  网络 syscall 差项。直接 anchor 证明 LA64 TCP_CRR 本来就因容量耗尽
+  `Out of memory`，所以矩阵原写的 LA64 5/5 不是可复现基线；当前在相同
+  点触发 Zone post-barrier enqueue assertion，功能成功集相同但失败方式
+  更差，明确保留为已搁置 Phase 7 的容量/对象生命周期风险，不能写成已修复。
+  **Next**：评审并提交本轮最小恢复补丁；只有用户重新授权后才进入 Phase 7
+  或其他 Phase 1～8 工作。**Blocker**：本轮验收无剩余阻塞；共享
+  `target/oscomp/testdata/sdcard-rv.img` 仍损坏，后续正式跑必须继续使用
+  `target/oscomp/recovery-source/sdcard-rv.img` 或重建干净镜像。完整命令、
+  日志与 rejected hypotheses 见
+  `msp/debug-logs/2026-07-31-premerge-network-recovery-operation-ledger.md`，
+  修正后的判据见
+  `docs/progress/research/2026-07-31-premerge-network-recovery-test-matrix.md`。
+- 2026-07-31 (**恢复补丁审查修正：计划退回 blocked，Phase 1～8 仍不启动**).
+  审查否定了上一条“无剩余阻塞”的结论：祖先 `87ae1d21` 有 LA64
+  netperf/iperf 22/22 的明确记录，当前两条 TCP_CRR Zone assertion 因而是
+  未恢复项；一次 `90939012` ENOMEM replay 不能覆盖已有成功见证。LTP b6
+  也未完成 exact 对账：只重放了同样 stall 的 anchor `setsockopt06`，而历史
+  focused ledger 有 1/1，且 anchor tail 未整体重放。**Changed**：JSON plan
+  和验收矩阵改为 blocked；零长度 UDP 补齐 non-inline sendto、sendmsg/
+  sendmmsg、零长度 recvfrom/recvmsg 的 datagram 消费语义与 syscall/外部 TX
+  测试；Git HTTP/HTTPS 改用本地 hostname，另保留带 30 秒局部超时的真实
+  SLIRP DNS 查询；LTP runner 记录镜像来源且不再吞 timeout 状态；loader
+  shim 按架构创建并让失败 sentinel 反映 symlink 结果。零长度 UDP 是当前
+  netperf 所需的 Linux 兼容修复，`90939012` 源码本身也会丢弃空 datagram，
+  不再称为直接恢复 anchor 实现。**Verification**：审查后 Gate A 再次全绿
+  （IRQ 7/7、reactor 8/8、fdtable 103/103、TCP lifecycle 27/27、external
+  connect 14/14、veth 4/4、network tick 4/4）；RV64/LA64 target build 通过；
+  hostname 版 RV64 Git/IRQ 9/9（80/80）和 LA64 Git 8/8；新鲜镜像 RV64
+  netperf-musl 5/5。零长度 UDP 定向测试、syscall 测试和 init exec 测试通过。
+  全仓 `cargo -q xtask unit` 未全绿：三个无关 `tx-shims` 用例定向复跑仍失败，
+  `tx-ext4` test target 另有八处既有 `with_target` API 编译不一致；本轮不扩修。
+  `cargo fmt --all -- --check` 仍受全仓约 1022 行既有格式漂移阻断；未做批量
+  格式化。零长度 UDP 直接收发和 netperf 已过，但 `recv_available()` 仍按
+  payload 字节数计算，空 datagram 的 `can_recv()`/readiness 收敛继续归入
+  已搁置 Phase 6/7。**Next**：LA64 TCP_CRR 涉及已搁置 Phase 7 容量/对象生命周期，
+  未获重新授权前只记录 blocker，不扩大修改。**Blocker**：LA64 TCP_CRR
+  2 项；LTP b6 `setsockopt06` 历史成功证据冲突；共享 RV64 镜像仍损坏。

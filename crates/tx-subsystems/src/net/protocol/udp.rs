@@ -170,13 +170,9 @@ impl RawUdpSocket {
     }
 
     pub fn ingest_rx_datagram(&self, src: IpEndpoint, dst: IpEndpoint, payload: Vec<u8>) -> bool {
-        if payload.is_empty() {
-            return false;
-        }
-
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
-        let socket = &mut inner.socket;
+            let socket = &mut inner.socket;
             let was_empty = !socket.can_recv();
             let udp_repr = UdpRepr {
                 src_port: src.port,
@@ -199,10 +195,6 @@ impl RawUdpSocket {
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
-        if len == 0 {
-            return Some((0, false));
-        }
-
         let inner = &mut *self.inner.lock();
         let socket = &mut inner.socket;
         if peek {
@@ -216,16 +208,6 @@ impl RawUdpSocket {
     }
 
     pub fn recv_datagram_bytes(&self, out: &mut [u8], peek: bool) -> Option<UdpRecvDrain> {
-        if out.is_empty() {
-            return Some(UdpRecvDrain {
-                bytes: 0,
-                source: unspecified_endpoint(),
-                destination: unspecified_endpoint(),
-                truncated: false,
-                became_empty: false,
-            });
-        }
-
         let inner = &mut *self.inner.lock();
         let socket = &mut inner.socket;
         let bound_port = socket.endpoint().port;
@@ -312,10 +294,6 @@ impl RawUdpSocket {
         payload: Vec<u8>,
         more: bool,
     ) -> Option<(usize, bool)> {
-        if payload.is_empty() {
-            return Some((0, false));
-        }
-
         // D4 composite atomic: capacity check, corking and the actual
         // send_slice all under one lock acquisition.
         let inner = &mut *self.inner.lock();
@@ -513,7 +491,7 @@ impl UdpRxDatagram {
 impl UdpTxDatagram {
     // 名字沿革:同 parse——按 dst 家族分派 v4/v6。
     pub fn emit_ipv4_packet(&self, src: IpEndpoint) -> Option<LoopbackIpPacket> {
-        if src.port == 0 || self.dst.port == 0 || self.payload.is_empty() {
+        if src.port == 0 || self.dst.port == 0 {
             return None;
         }
         if self.dst.family == AddressFamily::Inet6 {

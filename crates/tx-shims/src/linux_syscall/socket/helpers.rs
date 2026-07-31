@@ -321,11 +321,8 @@ pub(super) fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, writ
 
 pub(super) fn drive_udp_loopback_after_sendto(
     socket: &Cap<SocketIdentity>,
-    written: usize,
+    _written: usize,
 ) -> bool {
-    if written == 0 {
-        return false;
-    }
     let Some(payload) = socket.acquire_operational() else {
         return false;
     };

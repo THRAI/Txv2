@@ -1,6 +1,142 @@
 use super::*;
 
 #[test]
+fn dispatch_zero_length_udp_sendmsg_recvmsg_consumes_one_datagram() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let server_addr = sockaddr_in([127, 0, 0, 1], 49_102);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut send_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: 0,
+        iovlen: 0,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [
+                client_fd as u64,
+                (&mut send_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut source_addr = [0u8; SOCKADDR_IN_BYTES as usize];
+    let mut recv_hdr = TestMsghdr {
+        name: source_addr.as_mut_ptr() as u64,
+        namelen: source_addr.len() as u32,
+        _pad0: 0,
+        iov: 0,
+        iovlen: 0,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_RECVMSG,
+            [
+                server_fd as u64,
+                (&mut recv_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(recv_hdr.namelen, SOCKADDR_IN_BYTES);
+
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [server_fd as u64, 0, 0, MSG_DONTWAIT, 0, 0],
+            &ctx,
+        ),
+        SyscallResult::Error(EAGAIN_VALUE),
+        "the zero-length recvmsg must consume exactly one datagram"
+    );
+
+    assert_eq!(
+        socket_req(
+            NR_SENDMSG,
+            [
+                client_fd as u64,
+                (&mut send_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_RECVFROM, [server_fd as u64, 0, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0),
+        "recvfrom with a zero-length buffer must consume one datagram"
+    );
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [server_fd as u64, 0, 0, MSG_DONTWAIT, 0, 0],
+            &ctx,
+        ),
+        SyscallResult::Error(EAGAIN_VALUE)
+    );
+}
+
+#[test]
 fn dispatch_sendmsg_recvmsg_udp_loopback_round_trips_source_addr() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

@@ -36,6 +36,48 @@ fn raw_udp_socket_preserves_datagram_boundary() {
 }
 
 #[test]
+fn raw_udp_socket_preserves_zero_length_datagram_presence() {
+    let raw = RawUdpSocket::new(&SocketOptionSet::default_udp());
+    let src = endpoint(50_012);
+    let dst = endpoint(40_012);
+    assert!(raw.bind_endpoint(dst));
+
+    assert!(
+        raw.ingest_rx_datagram(src, dst, std::vec![]),
+        "an empty UDP payload is still one readable datagram"
+    );
+    assert_eq!(
+        raw.recv_available(),
+        0,
+        "byte availability must not invent payload for an empty datagram"
+    );
+    assert!(
+        raw.can_recv(),
+        "datagram presence must remain distinct from payload byte count"
+    );
+
+    let mut out = [];
+    let drain = raw
+        .recv_datagram_bytes(&mut out, false)
+        .expect("zero-length datagram must be consumable by a zero-length receive");
+    assert_eq!(drain.bytes, 0);
+    assert_eq!(drain.source, src);
+    assert_eq!(drain.destination, dst);
+    assert!(!drain.truncated);
+    assert!(drain.became_empty);
+    assert!(!raw.can_recv());
+
+    assert!(raw.ingest_rx_datagram(src, dst, std::vec![1]));
+    let drain = raw
+        .recv_datagram_bytes(&mut out, false)
+        .expect("a zero-length receive must consume one queued datagram");
+    assert_eq!(drain.bytes, 0);
+    assert!(drain.truncated);
+    assert!(drain.became_empty);
+    assert!(!raw.can_recv());
+}
+
+#[test]
 fn tcp_packet_event_without_segment_is_dropped() {
     // P1-S1: established-connection RX only accepts events carrying a full
     // parsed segment (fed to smoltcp `process_segment`). A bare-byte event —

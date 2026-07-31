@@ -133,10 +133,6 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     if total_payload_len > UDP_IPV4_MAX_PAYLOAD_BYTES {
         return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
     }
-    if bytes.is_empty() {
-        return tx_substrate::step::StepOutcome::Done(0);
-    }
-
     let (local, destination) =
         match udp_loopback_endpoints(&source_payload.protocol_snapshot(), dst) {
             Some(endpoints) => endpoints,
