@@ -26,6 +26,15 @@ pub struct FilesystemStatsLite {
 pub trait BlockImage {
     fn total_blocks(&self) -> u64;
     fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()>;
+    /// Read a regular-file data block.
+    ///
+    /// The default preserves the single-block contract.  Kernel-backed images
+    /// may override this entry point to populate a bounded sequential
+    /// read-ahead window without applying that policy to metadata and journal
+    /// reads.
+    fn read_data_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        self.read_block(block, out)
+    }
     fn write_block(&mut self, block: u64, data: &Page4K) -> Result<()>;
     fn barrier(&mut self) -> Result<()> {
         Ok(())
@@ -107,6 +116,13 @@ impl DirEntryLite {
 pub enum PageRead {
     Data { block: u64 },
     Hole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedPageRead {
+    Page(PageRead),
+    Missing,
+    Stale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +347,37 @@ impl<I: BlockImage> Ext4Pager<I> {
         out: &mut Page4K,
     ) -> Result<PageRead> {
         let disk_inode = self.read_inode(inode)?;
+        self.read_page_from_inode(&disk_inode, file_page_index, out)
+    }
+
+    /// Validate an inode incarnation and read one page after a single inode
+    /// table lookup.  The filesystem adapter previously called `inode_meta`
+    /// and then `read_page`, causing every page-cache miss to parse the same
+    /// inode twice under two pager-lock acquisitions.
+    pub fn read_page_checked(
+        &mut self,
+        inode: InodeNo,
+        expected_generation: u32,
+        file_page_index: u64,
+        out: &mut Page4K,
+    ) -> Result<CheckedPageRead> {
+        let disk_inode = self.read_inode(inode)?;
+        if disk_inode.mode == 0 {
+            return Ok(CheckedPageRead::Missing);
+        }
+        if disk_inode.generation != expected_generation {
+            return Ok(CheckedPageRead::Stale);
+        }
+        self.read_page_from_inode(&disk_inode, file_page_index, out)
+            .map(CheckedPageRead::Page)
+    }
+
+    fn read_page_from_inode(
+        &mut self,
+        disk_inode: &Inode,
+        file_page_index: u64,
+        out: &mut Page4K,
+    ) -> Result<PageRead> {
         let page_start = file_page_index
             .checked_mul(BLOCK_SIZE as u64)
             .ok_or(Ext4FormatError::OutOfBounds)?;
@@ -340,7 +387,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
             BlockMapping::Data(block) => {
-                self.image.read_block(block, out)?;
+                self.image.read_data_block(block, out)?;
                 let valid_len = core::cmp::min(BLOCK_SIZE as u64, disk_inode.size - page_start);
                 out[valid_len as usize..].fill(0);
                 Ok(PageRead::Data { block })

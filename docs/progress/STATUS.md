@@ -1,3 +1,16 @@
+- 2026-07-31 (BuildStorm ext4 连续读取批处理). ext4 文件页缺页现在只读取和校验一次
+  inode，不再先取 metadata 再重复解析；常规文件数据缺页采用有界 8 块预读，RV64 MMIO
+  与 LA64 PCI VirtIO 块设备会把物理连续的 Frame 合并为一次多块请求，分配或批量请求失败
+  时仍回退原单页路径。未改变写回、fsync、调度或全局 pager 锁语义。验证：
+  tx-ext4-format 26/26、tx-ext4 12/12、tx-fs 86/86、tx-drivers 5/5 通过，RV64、LA64
+  与 M1Dock 目标编译通过；统一 `cargo -q xtask unit` 仍只受分支原有 tx-shims 测试桩
+  编译错误和 run_thread future 2112/2048 预算断言阻断。RV64 release/submit 内核已刷新；
+  QEMU 9.2.1、4 GiB、8 hart、可写官方镜像完整 `final` 流程成功，CAgent 10/10，
+  BuildStorm `ok=true cores=8 bytes=1681000 elapsed_s=1120.65`，相对同机旧基线
+  `1183.45s` 缩短 62.80 秒（约 5.3%）；日志为
+  `target/final-rv-io-batch-20260731.log`。Next：在官方 16 GiB/8 hart 平台复测，确认高
+  I/O 延迟环境中的收益；若仍超时，再用锁等待计数判断是否值得拆分全局 ext4 pager 锁。
+  Blocker：尚无官方平台新结果，不能由本机数据推断平台最终耗时。
 - 2026-07-30 (BuildStorm 文件对象与缓存生命周期闭环). ext4 的
   `FsObjectId` 现在同时携带 inode generation，RNode、PageContainer、目录项缓存和
   lookup/readdir 缓存都以完整对象代号区分 inode 复用前后的对象；最后一个文件对象

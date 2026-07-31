@@ -1,5 +1,5 @@
 use step_engine::Guard;
-use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_ext4_format::pager::{BlockImage, CheckedPageRead, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{
     reserve_frame_with_reclaim, FilesystemStats, Frame, FsPageBacking,
@@ -7,7 +7,7 @@ use tx_subsystems::page_backed::{
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
-use crate::read_backend::Ext4FsInstance;
+use crate::read_backend::{inode_no, Ext4FsInstance};
 
 use page_allocator::ZeroPolicy;
 
@@ -126,17 +126,25 @@ where
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
-        let inode = match self.resolve_object(fs_object_id) {
-            Ok((inode, _)) => inode,
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
 
-        if let Err(err) =
-            self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
-        {
-            return StepOutcome::err(err.into());
+        match self.with_pager(|pager| {
+            pager.read_page_checked(
+                inode,
+                fs_object_id.inode_generation(),
+                file_page_index,
+                &mut page,
+            )
+        }) {
+            Ok(CheckedPageRead::Page(_)) => {}
+            Ok(CheckedPageRead::Missing) => return StepOutcome::err(Errno::ENOENT.into()),
+            Ok(CheckedPageRead::Stale) => return StepOutcome::err(Errno::ESTALE.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         }
 
         materialize_frame(&page)

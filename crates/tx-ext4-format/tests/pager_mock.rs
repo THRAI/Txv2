@@ -5,8 +5,8 @@ use tx_ext4_format::ondisk::{
     JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{
-    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead, WritebackReceipt,
-    BLOCK_SIZE,
+    BlockImage, CheckedPageRead, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead,
+    WritebackReceipt, BLOCK_SIZE,
 };
 
 #[derive(Clone)]
@@ -242,6 +242,26 @@ fn pager_reads_inode_meta_and_4k_pages() {
         PageRead::Data { block: 30 }
     );
     assert_eq!(page, filled_page(0x30));
+
+    assert_eq!(
+        pager
+            .read_page_checked(InodeNo::new(12), 0, 0, &mut page)
+            .unwrap(),
+        CheckedPageRead::Page(PageRead::Data { block: 20 })
+    );
+    assert_eq!(page, filled_page(0x20));
+    assert_eq!(
+        pager
+            .read_page_checked(InodeNo::new(12), 1, 0, &mut page)
+            .unwrap(),
+        CheckedPageRead::Stale
+    );
+    assert_eq!(
+        pager
+            .read_page_checked(InodeNo::new(15), 0, 0, &mut page)
+            .unwrap(),
+        CheckedPageRead::Missing
+    );
 }
 
 #[test]

@@ -77,6 +77,17 @@ impl<P: TxPlatform> VirtioPciBlock<P> {
             return StepOutcome::Err(Errno::EINVAL.into());
         }
 
+        if let Some(buf) = contiguous_frame_slice_mut(target) {
+            let Ok(lba) = usize::try_from(block_id.as_u64()) else {
+                return StepOutcome::Err(Errno::EINVAL.into());
+            };
+            return if blk.read_blocks(lba, buf).is_ok() {
+                StepOutcome::Done(())
+            } else {
+                StepOutcome::Err(Errno::EIO.into())
+            };
+        }
+
         for (idx, frame) in target.iter_mut().enumerate() {
             let Some(lba) = block_id
                 .as_u64()
@@ -106,6 +117,17 @@ impl<P: TxPlatform> VirtioPciBlock<P> {
         let sectors_per_page = sectors_per_page(self.block_size());
         if sectors_per_page == 0 {
             return StepOutcome::Err(Errno::EINVAL.into());
+        }
+
+        if let Some(buf) = contiguous_frame_slice(source) {
+            let Ok(lba) = usize::try_from(block_id.as_u64()) else {
+                return StepOutcome::Err(Errno::EINVAL.into());
+            };
+            return if blk.write_blocks(lba, buf).is_ok() {
+                StepOutcome::Done(())
+            } else {
+                StepOutcome::Err(Errno::EIO.into())
+            };
         }
 
         for (idx, frame) in source.iter().enumerate() {
@@ -206,6 +228,36 @@ fn frame_slice_mut(frame: Frame) -> Option<&'static mut [u8]> {
 fn frame_slice(frame: Frame) -> Option<&'static [u8]> {
     let ptr = page_allocator::frame_kernel_addr(frame.ppn()).ok()?;
     Some(unsafe { core::slice::from_raw_parts(ptr, PAGE_SIZE) })
+}
+
+fn contiguous_frame_slice_mut(frames: &mut [Frame]) -> Option<&'static mut [u8]> {
+    let first = *frames.first()?;
+    let base = first.ppn().0;
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.ppn().0 != base.checked_add(index)? {
+            return None;
+        }
+    }
+    let len = frames.len().checked_mul(PAGE_SIZE)?;
+    let ptr = page_allocator::frame_kernel_addr(first.ppn()).ok()?;
+    // SAFETY: the caller supplies exclusive DMA targets.  The verified PPN
+    // sequence is contiguous and direct-map virtual addresses preserve that
+    // adjacency.
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
+}
+
+fn contiguous_frame_slice(frames: &[Frame]) -> Option<&'static [u8]> {
+    let first = *frames.first()?;
+    let base = first.ppn().0;
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.ppn().0 != base.checked_add(index)? {
+            return None;
+        }
+    }
+    let len = frames.len().checked_mul(PAGE_SIZE)?;
+    let ptr = page_allocator::frame_kernel_addr(first.ppn()).ok()?;
+    // SAFETY: the verified PPN sequence is one immutable direct-map range.
+    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
 #[cfg(test)]
