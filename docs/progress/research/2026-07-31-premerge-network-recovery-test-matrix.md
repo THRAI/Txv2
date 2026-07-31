@@ -2,8 +2,8 @@
 
 日期：2026-07-31
 
-状态：Gate A～E 已按序执行并完成审查；恢复仍被 LA64 TCP_CRR 和 LTP b6
-证据冲突阻塞。
+状态：Gate A～E 已按序执行并完成审查；LA64 TCP_CRR 已归因到 merge 后
+publication/EBR 回收袋不变量，但尚未修复；恢复仍被该项和 LTP b6 证据冲突阻塞。
 
 对比基线：
 
@@ -63,7 +63,12 @@ API 编译不一致。它们不改变 Gate A 的网络定向结果，也不在�
 
 - 祖先 `87ae1d21` 明确记录 LA64 musl/glibc 四组 22/22。一次
   `90939012` replay 的 TCP_CRR `Out of memory` 只能说明该次运行也撞到容量
-  边界，不能推翻已有成功见证。当前两个 TCP_CRR 的 Zone assertion 都是未恢复项。
+  边界，不能推翻已有成功见证。两次定向诊断进一步证明当前 assertion 不是
+  TCP 表、端口池、physical pages 或 Socket slab 的直接容量问题：
+  `SocketPayload` final release 撞到 `epoch=0`、`zone_count=0`、`rcu_count=1` 的
+  三袋 EBR 状态，唯一节点回调是 `tx_substrate::publication::defer_node`，其生产
+  owner 是 VM `RecipeTree`。这是 merge 后 generic publication/EBR 不变量回归，
+  TCP_CRR 只是压力触发器；不再归入已搁置的网络 Phase 7。
 - LTP b3、b4 的 current/anchor verdict-set 一致。b6 只对
   `setsockopt06` 做过一次同样 stall 的 anchor replay，未重放完整 anchor tail；
   历史 focused ledger 又有 `setsockopt06` 1/1，因此 Gate E 仍未关闭。
@@ -356,3 +361,8 @@ cargo xtask fault-decode \
 
 当前第 3、5 条未满足，所以恢复计划保持 blocked。达到全部条件后也不自动
 进入任何后续网络架构工作。
+
+LA64 第 3 条的下一步不是扩大容量：先给 substrate 增加能覆盖 publication
+retire 与 nested Zone retire 的确定性回归，再恢复 final Cap enqueue 前的
+checked preflight、一次 bounded drain/retry 和 retry 后 fail-fast；修复后先跑
+单条 TCP_CRR，再跑 LA64 musl/glibc 两条完整 netperf lane。

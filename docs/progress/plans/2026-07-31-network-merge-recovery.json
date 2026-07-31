@@ -66,7 +66,7 @@
         "Run current filtered libc-test network ABI groups; do not use retired libctest-network or lmbench-network selectors.",
         "Compare all six RV64 musl LTP socket split verdict sets against the historical ledger; when an aggregate is not reproducible, replay the complete same-command batch from 90939012 and record any conflict with an older focused pass."
       ],
-      "notes": "The ordered run and follow-up review completed on 2026-07-31, but recovery is blocked. OSComp rootfs compatibility and the musl libc-test launcher were restored. Zero-length UDP delivery is a Linux-compatibility repair required by the current netperf path, not source restoration from 90939012. RV64 Gate C is 22/22. LA64 is 20/22 with two TCP_CRR Zone assertions, while ancestor 87ae1d21 has a recorded 22/22 witness; one 90939012 ENOMEM replay does not supersede that pass. LTP b3/b4 current/anchor verdict sets match, but b6 current setsockopt06 stalls despite a historical focused 1/1 and lacks a complete anchor-tail comparison. Phase 1 through Phase 8 remain deferred, so the blockers are recorded rather than silently expanded."
+      "notes": "The ordered run and follow-up review completed on 2026-07-31, but recovery is blocked. OSComp rootfs compatibility and the musl libc-test launcher were restored. Zero-length UDP delivery is a Linux-compatibility repair required by the current netperf path, not source restoration from 90939012. RV64 Gate C is 22/22. LA64 is 20/22 with two TCP_CRR Zone assertions, while ancestor 87ae1d21 has a recorded 22/22 witness; one 90939012 ENOMEM replay does not supersede that pass. Two focused LA64 diagnostic boots classified TCP_CRR as a generic post-merge publication/EBR bag invariant failure: SocketPayload final release encountered epoch=0 with zero Zone nodes and one VM RecipeTree publication RCU node. This is not deferred network Phase 7 capacity work. LTP b3/b4 current/anchor verdict sets match, but b6 current setsockopt06 stalls despite a historical focused 1/1 and lacks a complete anchor-tail comparison. Phase 1 through Phase 8 remain deferred."
     },
     {
       "id": "phase-1-ofd-release",
@@ -270,7 +270,7 @@
     {
       "command": "RV64 and LA64 netperf/iperf groups",
       "status": "failed",
-      "notes": "RV64 22/22. LA64 iperf 12/12 and both netperf lanes pass their first four cases, but current TCP_CRR hits a kernel Zone assertion. Ancestor 87ae1d21 has a recorded LA64 22/22 witness. Direct 90939012 replay also fails one TCP_CRR through userspace ENOMEM, which classifies one run but does not invalidate the earlier passing baseline."
+      "notes": "RV64 22/22. LA64 iperf 12/12 and both netperf lanes pass their first four cases, but current TCP_CRR hits a kernel Zone assertion. Ancestor 87ae1d21 has a recorded LA64 22/22 witness. Direct 90939012 replay also fails one TCP_CRR through userspace ENOMEM, which classifies one run but does not invalidate the earlier passing baseline. Two bounded diagnostics reproduced SocketPayload retirement at epoch 40 colliding with a bag tagged epoch 0 that held one tx_substrate::publication::defer_node RCU head; both had timer-idle ok and about 252k free pages."
     },
     {
       "command": "filtered RV64 libc-test network ABI",
@@ -310,12 +310,12 @@
     "Comparing only aggregate LTP scores can hide a changed TFAIL, TBROK, TCONF, or TWARN set.",
     "A functional Git pass without the IRQ counter sentinel does not prove the restored RV64 NET_IRQ mechanism ran.",
     "A direct anchor failure can be environment- or capacity-sensitive and must not erase a separate earlier passing witness.",
-    "LA64 TCP_CRR currently fails through a kernel Zone assertion despite the recorded 87ae1d21 LA64 22/22 run; resolving that capacity/object-lifetime path overlaps deferred Phase 7.",
+    "LA64 TCP_CRR currently fails through a kernel Zone assertion despite the recorded 87ae1d21 LA64 22/22 run. Diagnostics classify it as a generic post-merge publication/EBR invariant failure, not deferred network Phase 7 capacity work; the exact writer producing epoch=0 with a non-empty RCU head remains unproven.",
     "LTP setsockopt06 currently stalls while the historical focused ledger records 1/1; one equally stalled anchor replay is insufficient to declare parity.",
     "UDP payload readiness still derives from payload_recv_bytes while empty-datagram presence is represented by can_recv; direct zero-length receive and netperf termination pass, but full readiness convergence remains deferred with Phase 6/7."
   ],
   "blockers": [
-    "LA64 netperf musl and glibc TCP_CRR must return to the recorded 87ae1d21 5/5 behavior; the current Zone post-barrier enqueue assertion overlaps deferred Phase 7 capacity/object lifecycle work and requires user authorization before expansion.",
+    "LA64 netperf musl and glibc TCP_CRR must return to the recorded 87ae1d21 5/5 behavior. The current assertion is a generic post-merge publication/EBR bag invariant failure (epoch=0 with one VM RecipeTree publication RCU head), not deferred network Phase 7; the exact invalid state transition and semantic fix remain open.",
     "Gate E b6 is unresolved: current setsockopt06 stalls while the historical focused witness records 1/1; rerun the full matching anchor batch and diagnose only if the user keeps this case in recovery scope."
   ],
   "handoff": {

@@ -18322,3 +18322,21 @@
   已搁置 Phase 6/7。**Next**：LA64 TCP_CRR 涉及已搁置 Phase 7 容量/对象生命周期，
   未获重新授权前只记录 blocker，不扩大修改。**Blocker**：LA64 TCP_CRR
   2 项；LTP b6 `setsockopt06` 历史成功证据冲突；共享 RV64 镜像仍损坏。
+- 2026-07-31 (**LA64 TCP_CRR 调查完成：归因到 merge 后 publication/EBR
+  回收袋不变量，不是网络 Phase 7 容量问题**). 在基线提交 `f69d762e` 上用两次
+  独立干净 LA64 musl netperf boot 复现：前四项通过，TCP_CRR 释放
+  `SocketPayload` 时，epoch 40 的 bag 1 实际为 `epoch=0`、`zone_count=0`、
+  `rcu_count=1`；唯一 RCU 节点的回调地址解析为
+  `tx_substrate::publication::defer_node`，生产代码唯一 `Published<T>` owner 是
+  VM `RecipeTree`。两次 boot 的 timer-idle 均为 `ok`，仍有约 252k free pages；
+  TCP 表、64 端口区间和 Socket slab 都不是直接失败点。该三袋 EBR/直接 Cap
+  enqueue 路径来自 merge 侧提交 `dd9435f3`，所以 TCP_CRR 是触发器，不是语义
+  owner。**Changed**：仅作临时 panic 诊断并已全部撤销；未修改生产逻辑。
+  **Verification**：诊断日志
+  `target/oscomp/la64-tcp-crr-diag{,2}-f69d762e.txt`；撤销后
+  `cargo xtask build --target la64-qemu --release` 与普通 LA64 submit artifact
+  重建通过。**Next**：先补 substrate 确定性回归和袋 mutation-boundary
+  invariant，再恢复 final Cap 的 checked preflight + bounded drain/retry；禁止用
+  增大 bag/table/port 容量掩盖。**Blocker**：尚未定位是谁把
+  `epoch=0` 与非空 publication head 组合出来，也尚未获授权实现该修复；恢复
+  计划继续 blocked。
