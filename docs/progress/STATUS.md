@@ -1,3 +1,24 @@
+- 2026-08-01 (ext4 Task 11 public flush mutation admission).
+  Advanced Task 11 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `FsPageBacking::flush_page` on mutation-journal
+  ext4 mounts now routes public dirty-page writeback through
+  `Ext4Pager::plan_write_page` plus `JournalMutationRuntime::begin_mutation`
+  instead of `require_mutation_owner()` plus the legacy direct home-block
+  write. Focused tests prove mapped public flush and bounded single-page hole
+  growth both admit a transaction frontier while `CountingImage` records zero
+  home writes; RO and no-runtime mounts remain fail-closed. Verification passed
+  `cargo test -p tx-ext4 --lib --no-default-features flush_public_path --
+  --test-threads=1` (2), `cargo test -p tx-ext4 --lib --no-default-features
+  -- --test-threads=1` (44), `cargo test -p tx-ext4-format --test
+  pager_mock writeback -- --test-threads=1` (2), `cargo test -p tx-ext4
+  --test journal_prepared_transaction -- --test-threads=1` (9), and
+  `cargo fmt --check -p tx-ext4`. Next: finish the pre-dirty PageSlot
+  allocation/admission transition for extending writes, then broaden truncate
+  beyond the inline same-group tail-free shape. Product Tier 1 still requires
+  Task 12 namespace/orphan, Task 14 production cutover/G0 lints, Task 15
+  runner, and Task 16 fresh QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (ext4 Task 11 truncate and multi-page fsync writeback).
   Advanced Task 11 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`

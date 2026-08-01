@@ -132,11 +132,14 @@ where
         fs_object_id: FsObjectId,
         offset: u64,
         frame: &Frame,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if let Err(err) = self.require_mutation_owner() {
-            return StepOutcome::err(err.into());
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
         }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
@@ -149,9 +152,24 @@ where
         if let Err(err) = read_frame_bytes(frame, &mut page) {
             return StepOutcome::err(err.into());
         }
-        match self.with_pager(|pager| pager.write_page(inode, file_page_index, &page)) {
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_write_page(
+                inode,
+                file_page_index,
+                &page,
+                FsyncStamp::new(current.ctime as u64),
+            )
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 

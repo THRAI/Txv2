@@ -378,6 +378,27 @@ fn mounted_counting_truncate_free_fs(
     (mounted, runtime, writes)
 }
 
+fn mounted_counting_write_growth_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 4, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_mount_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
 #[test]
 fn ext4_mutation_mount_rejects_a_non_tier1_fixture() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -513,6 +534,50 @@ fn ext4_truncate_cross_block_shrink_admits_free_revoke_mutation() {
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(21)
+    );
+}
+
+#[test]
+fn ext4_flush_public_path_admits_mapped_writeback_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_mutation_fs(22);
+    let backing = mounted.fs_page_backing();
+    let frame = tx_subsystems::page_backed::Frame::new(
+        page_allocator::zero_frame_ppn().expect("zero frame"),
+    );
+
+    assert_eq!(
+        backing.flush_page(FsObjectId::new(12), 0, &frame, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(22)
+    );
+}
+
+#[test]
+fn ext4_flush_public_path_admits_bounded_hole_growth_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_write_growth_fs(23);
+    let backing = mounted.fs_page_backing();
+    let frame = tx_subsystems::page_backed::Frame::new(
+        page_allocator::zero_frame_ppn().expect("zero frame"),
+    );
+
+    assert_eq!(
+        backing.flush_page(FsObjectId::new(12), 4 * BLOCK_SIZE as u64, &frame, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(23)
     );
 }
 
