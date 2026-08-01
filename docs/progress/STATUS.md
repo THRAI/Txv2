@@ -1,3 +1,23 @@
+- 2026-08-02 (ext4 Tier 1 crash-cut receipt fail-closed).
+  Closed another false-acceptance gap without promoting Task 16. The live Tier
+  1 runner no longer constructs `crash_cuts.completed` from the catalog's
+  `expanded_cut_count`; `run_crash_cut_campaign` now refuses to synthesize
+  `completed=1000` until the deterministic crash-cut/replay campaign is wired.
+  `Tier1AcceptanceReceipt::from_live` also derives G1-G7 from evidence instead
+  of unconditionally marking every gate passed: incomplete crash cuts, missing
+  immutable `e2fsck` images, e2fsck failures, skipped/not-run/failed xfstests,
+  or other product-evidence gaps leave the product gates blocked. Focused
+  verification passed `rustfmt --edition 2024 --check xtask/src/ext4/mod.rs
+  xtask/src/ext4/tests.rs xtask/src/ext4/receipt.rs`, `cargo test -p xtask
+  ext4 -- --test-threads=1` (15), `cargo xtask ext4 tier1 --dry-run`, and the
+  expected placeholder preflight
+  `cargo xtask ext4 tier1 --run-id 2026-08-02-crash-cut-preflight`. The final
+  host gate `cargo -q xtask unit` passed (`tx-shims` 652, `tx-kernel` 114,
+  `tx-ext4` 64, `tx-scripts` 167). This still leaves Task 16 open: the real
+  deterministic crash-cut runner, replay image
+  capture, e2fsck on immutable crash/replay images, pinned xfstests, and final
+  receipt generation remain to be completed.
+
 - 2026-08-02 (ext4 Tier 1 xfstests source-lock verification).
   Advanced Task 15 without promoting Task 16. The Tier 1 runner now parses the
   `source_lock` in `tools/ext4/tier1/xfstests-selection.json`, rejects a

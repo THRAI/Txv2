@@ -193,6 +193,7 @@ impl Tier1AcceptanceReceipt {
         planned_actions: &[String],
         notes: &[String],
     ) -> Self {
+        let gates = gates_from_evidence(&crash_cuts, &e2fsck, &xfstests);
         Self {
             schema: "tx.ext4.tier1_acceptance_receipt.v1".into(),
             candidate: CandidateCommit {
@@ -209,16 +210,7 @@ impl Tier1AcceptanceReceipt {
             crash_cuts,
             e2fsck,
             xfstests,
-            gates: Gates {
-                g0: "passed".into(),
-                g1: "passed".into(),
-                g2: "passed".into(),
-                g3: "passed".into(),
-                g4: "passed".into(),
-                g5: "passed".into(),
-                g6: "passed".into(),
-                g7: "passed".into(),
-            },
+            gates,
             planned_actions: planned_actions.to_vec(),
             notes: notes.to_vec(),
         }
@@ -230,6 +222,89 @@ impl Tier1AcceptanceReceipt {
         }
         let text = serde_json::to_string_pretty(self).map_err(|err| err.to_string())?;
         fs::write(path, text).map_err(|err| err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CrashCuts, E2fsckImageResult, E2fsckSummary, XfstestsSummary, gates_from_evidence,
+    };
+
+    #[test]
+    fn live_gates_block_when_crash_cuts_are_incomplete() {
+        let gates = gates_from_evidence(
+            &CrashCuts {
+                completed: 0,
+                required: 1000,
+                families: vec!["D0".into()],
+            },
+            &E2fsckSummary {
+                immutable_images: vec![E2fsckImageResult {
+                    role: "scratch".into(),
+                    image_sha256: "1".repeat(64),
+                    exit_code: 0,
+                }],
+                failures: 0,
+            },
+            &XfstestsSummary {
+                skipped: 0,
+                not_run: 0,
+                passed: 1,
+                failed: 0,
+            },
+        );
+        assert_eq!(gates.g0, "passed");
+        assert_eq!(gates.g7, "blocked");
+    }
+
+    #[test]
+    fn live_gates_pass_only_with_full_product_evidence() {
+        let gates = gates_from_evidence(
+            &CrashCuts {
+                completed: 1000,
+                required: 1000,
+                families: vec!["D0".into()],
+            },
+            &E2fsckSummary {
+                immutable_images: vec![E2fsckImageResult {
+                    role: "scratch".into(),
+                    image_sha256: "1".repeat(64),
+                    exit_code: 0,
+                }],
+                failures: 0,
+            },
+            &XfstestsSummary {
+                skipped: 0,
+                not_run: 0,
+                passed: 1,
+                failed: 0,
+            },
+        );
+        assert_eq!(gates.g0, "passed");
+        assert_eq!(gates.g7, "passed");
+    }
+}
+
+fn gates_from_evidence(
+    crash_cuts: &CrashCuts,
+    e2fsck: &E2fsckSummary,
+    xfstests: &XfstestsSummary,
+) -> Gates {
+    let crash_ok = crash_cuts.required == 1000 && crash_cuts.completed == crash_cuts.required;
+    let e2fsck_ok = e2fsck.failures == 0 && !e2fsck.immutable_images.is_empty();
+    let xfstests_ok = xfstests.failed == 0 && xfstests.skipped == 0 && xfstests.not_run == 0;
+    let all_ok = crash_ok && e2fsck_ok && xfstests_ok;
+    let product_gate = if all_ok { "passed" } else { "blocked" };
+    Gates {
+        g0: "passed".into(),
+        g1: product_gate.into(),
+        g2: product_gate.into(),
+        g3: product_gate.into(),
+        g4: product_gate.into(),
+        g5: product_gate.into(),
+        g6: product_gate.into(),
+        g7: product_gate.into(),
     }
 }
 

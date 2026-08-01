@@ -137,12 +137,8 @@ fn run_live_tier1(
         }
     }
 
+    let crash_cuts = run_crash_cut_campaign(run, &invocation.authorities.crash_cuts)?;
     let xfstests_summary = run_xfstests_selection(root, run, &invocation.authorities)?;
-    let crash_cuts = receipt::CrashCuts {
-        completed: invocation.authorities.crash_cuts.expanded_cut_count,
-        required: invocation.authorities.crash_cuts.expanded_cut_count,
-        families: invocation.authorities.crash_cuts.families.clone(),
-    };
     let role_images = receipt::RoleImages {
         test: receipt::RoleImage {
             path: test_image.display().to_string(),
@@ -182,6 +178,18 @@ fn run_live_tier1(
     let receipt_path = run.finalize_with_receipt(receipt)?;
     println!("ext4 tier1: wrote {}", receipt_path.display());
     Ok(())
+}
+
+fn run_crash_cut_campaign(
+    _run: &run_workspace::RunWorkspace,
+    crash_cuts: &CrashCutCatalog,
+) -> Result<receipt::CrashCuts> {
+    Err(format!(
+        "deterministic crash-cut campaign runner is not implemented; refusing to synthesize completed={} across {} families from {}",
+        crash_cuts.expanded_cut_count,
+        crash_cuts.families.len(),
+        crash_cuts.file.path.display()
+    ))
 }
 
 #[derive(Debug)]

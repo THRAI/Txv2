@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    Tier1Authorities, XfstestsSourceLock, parse_tier1_args, run_workspace::RunWorkspace,
-    sha256_file, verify_xfstests_source_lock,
+    CrashCutCatalog, Tier1Authorities, XfstestsSourceLock, parse_tier1_args,
+    run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file, verify_xfstests_source_lock,
 };
 
 #[test]
@@ -197,6 +197,40 @@ fn tier1_xfstests_source_lock_checks_revision_and_check_hash() {
     };
     let error = verify_xfstests_source_lock(&xfstests, &bad_lock).expect_err("check hash mismatch");
     assert!(error.contains("xfstests check sha256 mismatch"));
+}
+
+#[test]
+fn tier1_crash_cut_campaign_refuses_synthetic_completion() {
+    let root = temp_root("crash-cut-synthetic");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load(catalog_path).unwrap();
+    run.record_authority_inputs(&super::receipt::authority_input_summary(
+        "0".repeat(64),
+        catalog.sha256().to_string(),
+        "0".repeat(64),
+        "0".repeat(64),
+        0,
+        1000,
+    ))
+    .unwrap();
+
+    let error =
+        run_crash_cut_campaign(&run, &catalog).expect_err("crash cuts must not be synthesized");
+    assert!(error.contains("refusing to synthesize completed=1000"));
 }
 
 fn temp_root(suffix: &str) -> PathBuf {
