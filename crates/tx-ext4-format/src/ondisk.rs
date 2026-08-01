@@ -32,6 +32,8 @@ pub struct Superblock {
     pub journal_inode: u32,
     pub hash_seed: [u32; 4],
     pub default_hash_version: u8,
+    pub required_extra_isize: u16,
+    pub desired_extra_isize: u16,
     pub checksum_type: u8,
     pub checksum_seed: u32,
     pub checksum: u32,
@@ -77,6 +79,8 @@ impl Superblock {
                 read_u32_le(bytes, 248)?,
             ],
             default_hash_version: *slice_at(bytes, 252, 1)?.first().unwrap(),
+            required_extra_isize: read_u16_le(bytes, 348)?,
+            desired_extra_isize: read_u16_le(bytes, 350)?,
             checksum_type: *slice_at(bytes, 373, 1)?.first().unwrap(),
             checksum_seed: read_u32_le(bytes, 624)?,
             checksum: read_u32_le(bytes, 1020)?,
@@ -110,6 +114,8 @@ impl Superblock {
         write_u32_le(bytes, 248, self.hash_seed[3])?;
         slice_at_mut(bytes, 252, 1)?[0] = self.default_hash_version;
         write_u16_le(bytes, 254, self.desc_size)?;
+        write_u16_le(bytes, 348, self.required_extra_isize)?;
+        write_u16_le(bytes, 350, self.desired_extra_isize)?;
         slice_at_mut(bytes, 373, 1)?[0] = self.checksum_type;
         write_u32_le(bytes, 624, self.checksum_seed)?;
         write_u32_le(bytes, 1020, self.checksum)?;
@@ -177,6 +183,8 @@ impl Default for Superblock {
             journal_inode: 8,
             hash_seed: [0; 4],
             default_hash_version: 1,
+            required_extra_isize: 0,
+            desired_extra_isize: 0,
             checksum_type: 0,
             checksum_seed: 0,
             checksum: 0,
@@ -192,10 +200,12 @@ pub struct GroupDesc {
     pub free_blocks_count_hi: u16,
     pub free_inodes_count_hi: u16,
     pub used_dirs_count_hi: u16,
+    pub unused_inodes_count_hi: u16,
     pub free_blocks_count: u16,
     pub free_inodes_count: u16,
     pub used_dirs_count: u16,
     pub flags: u16,
+    pub unused_inodes_count: u16,
     pub block_bitmap_hi: u32,
     pub inode_bitmap_hi: u32,
     pub inode_table_hi: u32,
@@ -216,10 +226,12 @@ impl GroupDesc {
             free_blocks_count_hi: 0,
             free_inodes_count_hi: 0,
             used_dirs_count_hi: 0,
+            unused_inodes_count_hi: 0,
             free_blocks_count: read_u16_le(bytes, 12)?,
             free_inodes_count: read_u16_le(bytes, 14)?,
             used_dirs_count: read_u16_le(bytes, 16)?,
             flags: read_u16_le(bytes, 18)?,
+            unused_inodes_count: read_u16_le(bytes, 28)?,
             block_bitmap_hi: 0,
             inode_bitmap_hi: 0,
             inode_table_hi: 0,
@@ -232,6 +244,7 @@ impl GroupDesc {
             desc.free_blocks_count_hi = read_u16_le(bytes, 44)?;
             desc.free_inodes_count_hi = read_u16_le(bytes, 46)?;
             desc.used_dirs_count_hi = read_u16_le(bytes, 48)?;
+            desc.unused_inodes_count_hi = read_u16_le(bytes, 60)?;
         }
         Ok(desc)
     }
@@ -246,6 +259,7 @@ impl GroupDesc {
         write_u16_le(bytes, 14, self.free_inodes_count)?;
         write_u16_le(bytes, 16, self.used_dirs_count)?;
         write_u16_le(bytes, 18, self.flags)?;
+        write_u16_le(bytes, 28, self.unused_inodes_count)?;
         write_u16_le(bytes, 30, self.checksum)?;
         if bytes.len() >= 64 {
             write_u32_le(bytes, 32, self.block_bitmap_hi)?;
@@ -254,6 +268,7 @@ impl GroupDesc {
             write_u16_le(bytes, 44, self.free_blocks_count_hi)?;
             write_u16_le(bytes, 46, self.free_inodes_count_hi)?;
             write_u16_le(bytes, 48, self.used_dirs_count_hi)?;
+            write_u16_le(bytes, 60, self.unused_inodes_count_hi)?;
         }
         Ok(())
     }

@@ -1,9 +1,9 @@
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin, SetAttr};
 use tx_ext4_format::ondisk::{
-    block_bitmap_csum32, crc32c, crc32c_append, group_desc_csum16, inode_bitmap_csum32,
-    inode_csum32, metadata_csum32, superblock_csum32, BitmapMut, BitmapView, CommitHeader,
-    DirEntryIter, DxCountLimit, DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError, Extent,
-    ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode, JournalBlockTag, JournalHeader,
+    block_bitmap_csum32, crc32c, crc32c_append, dirblock_csum32, group_desc_csum16,
+    inode_bitmap_csum32, inode_csum32, metadata_csum32, superblock_csum32, BitmapMut, BitmapView,
+    CommitHeader, DirEntryIter, DxCountLimit, DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError,
+    Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode, JournalBlockTag, JournalHeader,
     Superblock, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{
@@ -1109,6 +1109,8 @@ fn namespace_plan_creates_directory_without_home_write() {
     let mut image = mock_image();
     let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
     superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock.required_extra_isize = 32;
+    superblock.desired_extra_isize = 32;
     superblock
         .encode(&mut image.block_mut(0)[1024..2048])
         .unwrap();
@@ -1207,6 +1209,7 @@ fn namespace_plan_creates_directory_without_home_write() {
     assert_eq!(inode.size, BLOCK_SIZE as u64);
     assert_eq!(inode.links_count, 2);
     assert_eq!(inode.blocks_512, 8);
+    assert_eq!(inode.extra_isize, 32);
     assert_eq!(inode.ctime, 27);
     assert_eq!(inode.mtime, 27);
     assert_eq!(inode.atime, 27);
@@ -1242,6 +1245,23 @@ fn namespace_plan_creates_directory_without_home_write() {
     assert!(child_entries
         .iter()
         .any(|entry| entry.name == b".." && entry.inode == 2));
+    let tail = &child_dir.after[BLOCK_SIZE - 12..];
+    assert_eq!(&tail[0..4], &[0, 0, 0, 0]);
+    assert_eq!(u16::from_le_bytes(tail[4..6].try_into().unwrap()), 12);
+    assert_eq!(tail[6], 0);
+    assert_eq!(tail[7], 0xDE);
+    let stored_dir_checksum = u32::from_le_bytes(tail[8..12].try_into().unwrap());
+    let mut child_dir_without_checksum = child_dir.after;
+    child_dir_without_checksum[BLOCK_SIZE - 4..].fill(0);
+    assert_eq!(
+        stored_dir_checksum,
+        dirblock_csum32(
+            seed,
+            new_ino.get(),
+            inode.generation,
+            &child_dir_without_checksum[..BLOCK_SIZE - 12]
+        )
+    );
 
     assert_eq!(pager.image().block(2), &block_bitmap_before);
     assert_eq!(pager.image().block(3), &inode_bitmap_before);
@@ -1250,6 +1270,83 @@ fn namespace_plan_creates_directory_without_home_write() {
     assert_eq!(pager.image().block(4), &inode_table_before);
     assert_eq!(pager.image().block(16), &parent_dir_before);
     assert_eq!(pager.image().block(48), &data_before);
+}
+
+#[test]
+fn namespace_plan_create_directory_decrements_group_itable_unused_tail() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    image.block_mut(1)[28..30].copy_from_slice(&51u16.to_le_bytes());
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let (_, _, plan) = pager
+        .plan_create_directory(
+            InodeNo::new(2),
+            b"newdir",
+            0o755,
+            1001,
+            1002,
+            FsyncStamp::new(27),
+        )
+        .unwrap();
+
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    assert_eq!(
+        u16::from_le_bytes(group_desc.after[28..30].try_into().unwrap()),
+        50
+    );
+}
+
+#[test]
+fn namespace_plan_create_directory_preserves_pending_inode_table_after_images() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let inode_table_home_before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let (parent_ino, _, parent_plan) = pager
+        .plan_create_directory(
+            InodeNo::new(2),
+            b"parent",
+            0o755,
+            1001,
+            1002,
+            FsyncStamp::new(27),
+        )
+        .unwrap();
+    assert_eq!(parent_ino, InodeNo::new(14));
+    pager.stage_mutation_after_images(&parent_plan);
+
+    let (_, _, child_plan) = pager
+        .plan_create_directory(parent_ino, b"child", 0o755, 1001, 1002, FsyncStamp::new(28))
+        .unwrap();
+
+    let inode_table = child_plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert_ne!(&inode_table.after, &inode_table_home_before);
+    let parent_inode = Inode::parse(&inode_table.after[13 * 256..14 * 256]).unwrap();
+    assert_eq!(parent_inode.mode, Inode::S_IFDIR | 0o755);
+    assert_eq!(parent_inode.links_count, 3);
+    assert_eq!(parent_inode.ctime, 28);
 }
 
 #[test]

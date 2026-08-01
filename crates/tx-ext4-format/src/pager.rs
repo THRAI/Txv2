@@ -6,7 +6,7 @@ use crate::ondisk::{
     DirEntry, DirEntryIter, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation,
     InodeTableLayout, Superblock,
 };
-use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
+use crate::ondisk::{dirblock_csum32, read_u16_le, read_u32_le, write_u16_le, write_u32_le};
 use crate::{Ext4FormatError, Result};
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -552,8 +552,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     ) -> Result<Ext4MutationPlan> {
         let location = self.inode_location(inode)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         let mut disk_inode = Inode::parse(inode_bytes)?;
@@ -622,8 +621,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     ) -> Result<Ext4MutationPlan> {
         let location = self.inode_location(inode)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         let mut disk_inode = Inode::parse(inode_bytes)?;
@@ -684,8 +682,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let location = self.inode_location(inode)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         let disk_inode = Inode::parse(inode_bytes)?;
@@ -736,8 +733,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let inode_bitmap_home = group.inode_bitmap_block();
         let mut inode_bitmap_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(inode_bitmap_home, &mut inode_bitmap_before)?;
+        self.read_block(inode_bitmap_home, &mut inode_bitmap_before)?;
         let mut inode_bitmap_after = inode_bitmap_before;
         if !BitmapView::new(&inode_bitmap_after).is_set(inode_bit) {
             return Err(Ext4FormatError::Corrupt);
@@ -1038,6 +1034,123 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((group_index, group.block_bitmap_block(), bit))
     }
 
+    fn group_inode_count(&self, group_index: usize) -> Result<usize> {
+        if self.superblock.inodes_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let group_first_index = group_index as u64 * self.superblock.inodes_per_group as u64;
+        let total_inodes = self.superblock.inodes_count as u64;
+        if group_first_index >= total_inodes {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        usize::try_from(core::cmp::min(
+            self.superblock.inodes_per_group as u64,
+            total_inodes - group_first_index,
+        ))
+        .map_err(|_| Ext4FormatError::OutOfBounds)
+    }
+
+    fn sync_group_itable_unused(
+        &self,
+        group_index: usize,
+        inode_bitmap_after: &Page4K,
+        desc_size: usize,
+        offset: usize,
+        after: &mut Page4K,
+    ) -> Result<()> {
+        let group_inode_count = self.group_inode_count(group_index)?;
+        let bitmap = BitmapView::new(inode_bitmap_after);
+        let mut unused = 0usize;
+        for bit in (0..group_inode_count).rev() {
+            if bitmap.is_set(bit) {
+                break;
+            }
+            unused += 1;
+        }
+        let unused = u32::try_from(unused).map_err(|_| Ext4FormatError::OutOfBounds)?;
+        if desc_size < 64 && unused > u16::MAX as u32 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        after[offset + 28..offset + 30].copy_from_slice(&(unused as u16).to_le_bytes());
+        if desc_size >= 64 {
+            after[offset + 60..offset + 62].copy_from_slice(&((unused >> 16) as u16).to_le_bytes());
+        }
+        Ok(())
+    }
+
+    fn new_inode_extra_isize(&self) -> u16 {
+        let available = self.superblock.inode_size.saturating_sub(128);
+        core::cmp::min(
+            core::cmp::max(
+                self.superblock.required_extra_isize,
+                self.superblock.desired_extra_isize,
+            ),
+            available,
+        )
+    }
+
+    fn refresh_dirblock_checksum(
+        &self,
+        dir_ino: InodeNo,
+        disk_inode: &Inode,
+        block: &mut Page4K,
+    ) -> Result<()> {
+        if !self.superblock.has_metadata_csum() {
+            return Ok(());
+        }
+        self.ensure_dirblock_checksum_tail(block)?;
+        block[BLOCK_SIZE - 4..BLOCK_SIZE].fill(0);
+        let checksum = dirblock_csum32(
+            self.superblock.metadata_csum_seed(),
+            dir_ino.get(),
+            disk_inode.generation,
+            &block[..BLOCK_SIZE - 12],
+        );
+        write_u32_le(block, BLOCK_SIZE - 4, checksum)
+    }
+
+    fn ensure_dirblock_checksum_tail(&self, block: &mut Page4K) -> Result<()> {
+        const EXT4_FT_DIR_CSUM: u8 = 0xDE;
+        let tail = BLOCK_SIZE.checked_sub(12).ok_or(Ext4FormatError::Corrupt)?;
+        if block[tail..tail + 4] == [0, 0, 0, 0]
+            && read_u16_le(block, tail + 4)? == 12
+            && block[tail + 6] == 0
+            && block[tail + 7] == EXT4_FT_DIR_CSUM
+        {
+            return Ok(());
+        }
+
+        let mut off = 0usize;
+        while off + 8 <= BLOCK_SIZE {
+            let rec_len = read_u16_le(block, off + 4)? as usize;
+            if rec_len == 0 {
+                break;
+            }
+            if rec_len < 8 || off + rec_len > BLOCK_SIZE {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            if off < tail && off + rec_len == BLOCK_SIZE {
+                let name_len = block[off + 6] as usize;
+                let used = (8 + name_len + 3) & !3;
+                let shortened = rec_len.checked_sub(12).ok_or(Ext4FormatError::Corrupt)?;
+                if shortened < used {
+                    return Err(Ext4FormatError::Unsupported);
+                }
+                write_u16_le(block, off + 4, shortened as u16)?;
+                break;
+            }
+            if off == tail {
+                break;
+            }
+            off += rec_len;
+        }
+
+        block[tail..].fill(0);
+        write_u16_le(block, tail + 4, 12)?;
+        block[tail + 7] = EXT4_FT_DIR_CSUM;
+        Ok(())
+    }
+
     fn plan_group_free_block_decrement(
         &self,
         group_index: usize,
@@ -1188,6 +1301,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         if desc_size >= 64 {
             after[offset + 46..offset + 48].copy_from_slice(&((next >> 16) as u16).to_le_bytes());
         }
+        self.sync_group_itable_unused(group_index, bitmap_after, desc_size, offset, &mut after)?;
         if self.superblock.has_metadata_csum() {
             let bitmap_checksum = inode_bitmap_csum32(
                 self.superblock.metadata_csum_seed(),
@@ -1260,6 +1374,13 @@ impl<I: BlockImage> Ext4Pager<I> {
             after[offset + 46..offset + 48]
                 .copy_from_slice(&((next_free_inodes >> 16) as u16).to_le_bytes());
         }
+        self.sync_group_itable_unused(
+            group_index,
+            inode_bitmap_after,
+            desc_size,
+            offset,
+            &mut after,
+        )?;
         if self.superblock.has_metadata_csum() {
             if let Some(block_bitmap_after) = block_bitmap_after {
                 let block_bitmap_checksum = block_bitmap_csum32(
@@ -1354,6 +1475,13 @@ impl<I: BlockImage> Ext4Pager<I> {
             after[offset + 48..offset + 50]
                 .copy_from_slice(&((next_used_dirs >> 16) as u16).to_le_bytes());
         }
+        self.sync_group_itable_unused(
+            group_index,
+            inode_bitmap_after,
+            desc_size,
+            offset,
+            &mut after,
+        )?;
         if self.superblock.has_metadata_csum() {
             let seed = self.superblock.metadata_csum_seed();
             let block_bitmap_checksum =
@@ -1889,6 +2017,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                             name,
                             &mut after[off..off + rec_len],
                         )?;
+                        self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
                         return Ok((phys, before, after));
                     }
                 } else {
@@ -1911,6 +2040,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                             name,
                             &mut after[off + used..off + rec_len],
                         )?;
+                        self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
                         return Ok((phys, before, after));
                     }
                 }
@@ -1935,8 +2065,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let location = self.inode_location(target_ino)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         let mut disk_inode = Inode::parse(inode_bytes)?;
@@ -2044,6 +2173,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                             new_name,
                             &mut after[off..off + rec_len],
                         )?;
+                        self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
                         let mut plan = Ext4MutationPlan::new(
                             MutationOrigin::Rename,
                             target_ino.get() as u64,
@@ -2152,8 +2282,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let location = self.inode_location(overwritten_ino)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         let mut overwritten_inode = Inode::parse(inode_bytes)?;
@@ -2265,6 +2394,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             } else {
                 after[old_off..old_off + 4].fill(0);
             }
+            self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
             return Ok((phys, before, after));
         }
 
@@ -2290,8 +2420,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let location = self.inode_location(target_ino)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         let mut disk_inode = Inode::parse(inode_bytes)?;
@@ -2349,14 +2478,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         let parent_location = self.inode_location(dir_ino)?;
         let target_location = self.inode_location(target_ino)?;
         let mut parent_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(parent_location.block, &mut parent_table_before)?;
+        self.read_block(parent_location.block, &mut parent_table_before)?;
         let mut parent_table_after = parent_table_before;
         let mut target_table_before = parent_table_before;
         let mut target_table_after = parent_table_after;
         if target_location.block != parent_location.block {
-            self.image
-                .read_block(target_location.block, &mut target_table_before)?;
+            self.read_block(target_location.block, &mut target_table_before)?;
             target_table_after = target_table_before;
         }
 
@@ -2507,6 +2634,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                         } else {
                             after[off..off + 4].fill(0);
                         }
+                        self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
                         return Ok((found_ino, phys, before, after));
                     }
                 }
@@ -2550,6 +2678,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             self.plan_superblock_free_inode_decrement()?;
 
         let mut inode = Inode::default();
+        inode.extra_isize = self.new_inode_extra_isize();
         inode.mode = Inode::S_IFREG | (mode & 0o7777);
         inode.uid = uid;
         inode.gid = gid;
@@ -2565,8 +2694,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let location = self.inode_location(new_ino)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         inode.encode(inode_bytes)?;
@@ -2661,6 +2789,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         )?;
 
         let mut inode = Inode::default();
+        inode.extra_isize = self.new_inode_extra_isize();
         inode.mode = Inode::S_IFDIR | (mode & 0o7777);
         inode.uid = uid;
         inode.gid = gid;
@@ -2679,18 +2808,17 @@ impl<I: BlockImage> Ext4Pager<I> {
             len: 1,
             physical_start: data_block,
         }])?;
+        self.refresh_dirblock_checksum(new_ino, &inode, &mut child_dir_after)?;
 
         let parent_location = self.inode_location(parent_ino)?;
         let new_location = self.inode_location(new_ino)?;
         let mut parent_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(parent_location.block, &mut parent_table_before)?;
+        self.read_block(parent_location.block, &mut parent_table_before)?;
         let mut parent_table_after = parent_table_before;
         let mut new_table_before = parent_table_before;
         let mut new_table_after = parent_table_after;
         if new_location.block != parent_location.block {
-            self.image
-                .read_block(new_location.block, &mut new_table_before)?;
+            self.read_block(new_location.block, &mut new_table_before)?;
             new_table_after = new_table_before;
         }
 
@@ -2823,6 +2951,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             self.plan_superblock_free_inode_decrement()?;
 
         let mut inode = Inode::default();
+        inode.extra_isize = self.new_inode_extra_isize();
         inode.mode = Inode::S_IFLNK | 0o777;
         inode.uid = uid;
         inode.gid = gid;
@@ -2837,8 +2966,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let location = self.inode_location(new_ino)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image
-            .read_block(location.block, &mut inode_table_before)?;
+        self.read_block(location.block, &mut inode_table_before)?;
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         inode.encode(inode_bytes)?;
