@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
-    self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
+    self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3,
 };
 use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
 use tx_ext4_format::ondisk::{BitmapMut, Extent, GroupDesc, Inode, Superblock};
@@ -36,12 +36,16 @@ use tx_subsystems::io_manager::block::{BioVec, DeviceKey};
 use tx_subsystems::io_manager::page::{
     PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
 };
-use tx_subsystems::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
+use tx_subsystems::mount::{
+    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, MountPayloadPin,
+    SourceLabel,
+};
 use tx_subsystems::page_backed::{
     step_write, Frame, FsPageBacking, PageContainer, PageContainerKind, PageIndex,
 };
 use tx_subsystems::vfs::structure::{
-    DirCursor, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking,
+    DEntry, DirCursor, FsObjectId, InodeKind, InodeMeta, InlineName, OpenFile, OpenFileFlags,
+    RNode, RNodeBacking,
 };
 use tx_subsystems::vfs::FsOps;
 
@@ -701,6 +705,27 @@ fn mounted_counting_create_fs(
     (mounted, runtime, writes)
 }
 
+fn mounted_counting_create_fs_with_ring(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_ring(sequence, 5, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_create_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 create mutation ext4 image with ring");
+    (mounted, runtime, writes)
+}
+
 fn mounted_counting_mkdir_fs(
     sequence: u32,
 ) -> (
@@ -919,6 +944,49 @@ fn open_file_for_page_container(pc: &PageContainer) -> OpenFile {
             packet: false,
         },
     )
+}
+
+fn ext4_root_dentry_for_mounted<I>(
+    mounted: &crate::mount::MountedExt4<I>,
+    dev: u32,
+    mount_id: u64,
+) -> (
+    epoch::Cap<DEntry>,
+    epoch::Cap<MountIdentity>,
+    epoch::Cap<MountPayload>,
+)
+where
+    I: BlockImage + Send + 'static,
+{
+    let payload = MountPayload::new_cap(
+        mounted.fs_ops(),
+        mounted.fs_page_backing(),
+        None,
+        DevId::new(dev),
+        MountOptions::default(),
+        "ext4",
+        SourceLabel::Static("ext4"),
+    )
+    .expect("ext4 mount payload for VFS path test");
+    mounted.bind_mount_payload(&payload);
+    let root_rnode = RNode::new_cap_in_mount(
+        mounted.root_fs_object_id,
+        mounted.root_inode_meta,
+        RNodeBacking::Directory,
+        &payload,
+    )
+    .expect("ext4 root rnode");
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("ext4 root dentry");
+    let root_mount = MountIdentity::new_cap_with_root_dentry(
+        MountId::new(mount_id),
+        None,
+        root_dentry.clone(),
+        None,
+        payload.clone(),
+        MountFlags::empty(),
+    )
+    .expect("ext4 root mount identity");
+    (root_dentry, root_mount, payload)
 }
 
 #[test]
@@ -1303,7 +1371,7 @@ fn ext4_chmod_public_path_admits_regular_file_after_create_settlement() {
     init_substrate();
     let guard = epoch::guard();
     let cred = tx_subsystems::vfs::Credential::root();
-    let (mounted, runtime, writes) = mounted_counting_create_fs(32);
+    let (mounted, runtime, writes) = mounted_counting_create_fs_with_ring(32);
     let fs_ops = mounted.fs_ops();
     let (file_id, _) =
         match fs_ops.create_inode(FsObjectId::new(2), b"chmod-new", 0o644, &cred, &guard) {
@@ -1321,6 +1389,134 @@ fn ext4_chmod_public_path_admits_regular_file_after_create_settlement() {
         fs_ops.chmod_inode(file_id, 0o755, &cred, &guard),
         V3::<(), NoProgress>::done(())
     );
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_chmod_public_path_admits_new_file_after_buffered_write_settlement() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(33);
+    let fs_ops = mounted.fs_ops();
+    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"tier1-data", 0o755, &cred, &guard)
+    {
+        V3::Done(created) => created,
+        other => panic!("mkdir tier1-data for chmod-after-write: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+    let (file_id, _) = match fs_ops.create_inode(dir_id, b"file", 0o644, &cred, &guard) {
+        V3::Done(created) => created,
+        other => panic!("create file for chmod-after-write: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+
+    let pc = page_container_for_mounted_file(&mounted, file_id, 0, 8);
+    let of = open_file_for_page_container(&pc);
+    assert_eq!(step_write(&pc, &of, 6, &guard), V3::done(6));
+    let ppn = pc.lookup(PageIndex::new(0)).expect("dirty page 0 resident");
+    let frame = Frame::new(ppn);
+    assert_eq!(
+        mounted
+            .fs_page_backing()
+            .flush_page(file_id, 0, &frame, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(35)
+    );
+
+    assert_eq!(
+        fs_ops.chmod_inode(file_id, 0o755, &cred, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_chmod_public_path_admits_new_file_with_dirty_buffered_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(36);
+    let fs_ops = mounted.fs_ops();
+    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"dirty-data", 0o755, &cred, &guard)
+    {
+        V3::Done(created) => created,
+        other => panic!("mkdir dirty-data for chmod-dirty: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+    let (file_id, _) = match fs_ops.create_inode(dir_id, b"file", 0o644, &cred, &guard) {
+        V3::Done(created) => created,
+        other => panic!("create file for chmod-dirty: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+
+    let pc = page_container_for_mounted_file(&mounted, file_id, 0, 8);
+    let of = open_file_for_page_container(&pc);
+    assert_eq!(step_write(&pc, &of, 6, &guard), V3::done(6));
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
+
+    assert_eq!(
+        fs_ops.chmod_inode(file_id, 0o755, &cred, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_chmod_vfs_path_admits_new_file_with_dirty_buffered_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(39);
+    let fs_ops = mounted.fs_ops();
+    let (root_dentry, _root_mount, mount_payload) =
+        ext4_root_dentry_for_mounted(&mounted, 39, 39);
+    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"dirty-data", 0o755, &cred, &guard)
+    {
+        V3::Done(created) => created,
+        other => panic!("mkdir dirty-data for vfs chmod-dirty: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+    let (file_id, _) = match fs_ops.create_inode(dir_id, b"file", 0o644, &cred, &guard) {
+        V3::Done(created) => created,
+        other => panic!("create file for vfs chmod-dirty: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+
+    let pc = page_container_for_mounted_file(&mounted, file_id, 0, 8);
+    let of = open_file_for_page_container(&pc);
+    assert_eq!(step_write(&pc, &of, 6, &guard), V3::done(6));
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
+    let file_meta = match fs_ops.load_inode_meta(file_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load meta for target dentry: {other:?}"),
+    };
+    let target_rnode = match fs_ops.materialise_rnode(file_id, file_meta, &mount_payload, &guard) {
+        V3::Done(rnode) => rnode,
+        other => panic!("materialise target dentry: {other:?}"),
+    };
+    let target_dentry = DEntry::new_cap(
+        InlineName::new(b"file").expect("inline file name"),
+        target_rnode,
+    )
+    .expect("target dentry");
+    drop(guard);
+
+    let mut chmod = tx_subsystems::vfs::composite::ChmodOp {
+        rooted_at: &root_dentry,
+        path: b"/dirty-data/file",
+        mode: 0o755,
+        cred: &cred,
+        target: Some(target_dentry),
+    };
+    let mut script_ctx = epoch::ScriptCtx::<tx_subsystems::process::ProcessIdentity>::new();
+    assert_eq!(chmod.step(&mut script_ctx), V3::<(), NoProgress>::done(()));
     assert_metadata_settled(&runtime, &writes);
 }
 
