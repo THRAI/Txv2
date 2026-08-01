@@ -44,10 +44,15 @@ use tx_subsystems::vfs::FsOps;
 
 /// Static writable capacity for ext4 regular-file PageContainers.
 ///
-/// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
-/// day-1 growth window so newly-created ext4 files can grow through ordinary
-/// PageBacked writes instead of failing after one page.
-const EXT4_FILE_PAGE_CAP: u64 = 2048;
+/// PageContainer currently has a fixed `page_count` capacity. Newly-created
+/// ext4 files can grow through ordinary PageBacked writes up to this bound;
+/// writes past it fail EINVAL at `write_user_to_pc`'s capacity check. The
+/// original 2048-page (8 MiB) window made `git clone` of any repo whose pack
+/// exceeds 8 MiB die mid-transfer with "fatal: write error: Invalid argument"
+/// (xv6-riscv's ~7.8k-object pack crosses it). The page store is a sparse
+/// BTreeMap, so the cap is a bound, not an allocation — 65536 pages (256 MiB)
+/// costs nothing up front and comfortably covers competition-scale repos.
+const EXT4_FILE_PAGE_CAP: u64 = 65536;
 
 /// Factory for `MountOutput::fs_ops`.
 ///
@@ -123,14 +128,44 @@ where
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err),
         };
-        match self.with_pager(|pager| {
-            pager
-                .write_inode_meta_journaled(inode, inode_meta_lite(meta))
-                .map(|_| ())
-        }) {
+        // In-place write, not `write_inode_meta_journaled`: the journaled
+        // variant only records a jbd2 transaction (no home-block
+        // checkpoint), so chmod/chown/utimensat and write-time mtime
+        // stamps were invisible to every subsequent `read_inode` until a
+        // replay that never runs in-kernel.
+        match self.with_pager(|pager| pager.write_inode_meta(inode, inode_meta_lite(meta))) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(err),
         }
+    }
+
+    /// Update the inode's mode bits (chmod). `S_IFMT` is immutable through
+    /// chmod; only the `0o7777` perm/setid/sticky bits change. DAC ownership
+    /// is enforced upstream by the syscall arm (`sys_fchmodat` ->
+    /// `authorize_chmod`), so this commits the new mode straight through
+    /// `serialize_inode_meta`'s in-place write. git's `init` chmods
+    /// `.git/config.lock` to probe `core.filemode`; without this arm the
+    /// trait default answered ENOSYS and `git init` died mid-way, leaving a
+    /// half-written `.git`. (Restored from the pre-merge tree — the
+    /// `step_chmod` -> `chmod_inode` rename landed in main without the ext4
+    /// impl.)
+    fn chmod_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        _cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let inode = match inode_no(fs_object_id) {
+            Ok(v) => v,
+            Err(err) => return StepOutcome::err(err),
+        };
+        let mut meta = match self.inode_meta_cached(inode) {
+            Ok(m) => map_inode_meta(m),
+            Err(err) => return StepOutcome::err(err),
+        };
+        meta.mode = (meta.mode & 0o170000) | (new_mode & 0o7777);
+        self.serialize_inode_meta(fs_object_id, &meta, guard)
     }
 
     fn create_inode(

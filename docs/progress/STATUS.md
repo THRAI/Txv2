@@ -1,3 +1,523 @@
+- 2026-08-01 (**RV64 guest curl/wget HTTPS 与 ext4 重定向验证完成**).
+  **Changed**：未改内核或母盘；只在 `boot.sh` 生成的临时 disk 副本中运行探针。
+  母盘自带 BusyBox 1.37.0 `wget`，但没有 curl。wget 访问测试仓库 raw README
+  得到 HTTP 200，直接 `-O` 和 stdout shell 重定向均返回 0、落盘 12 字节，
+  两份 `cmp` 一致。临时 `apk add curl` 能完成仓库 DNS/HTTPS 下载，但因
+  ownership 操作和 trigger `chroot` 返回 ENOSYS，apk 总体返回 2；curl 主程序
+  仍成功落盘并可执行。curl 8.14.1 的直接下载和 shell 重定向同样均返回 0、
+  落盘 12 字节，curl 自身两份及 curl/wget 跨工具 `cmp` 全部一致。
+  **Verification**：串口 `target/curl-wget-rv64-20260801.log`；新进程
+  `wc -c`/`cat` 可读四个 ext4 文件，无 panic/hang。**Next**：若要求每次干净
+  boot 都直接提供 curl，应在宿主侧重制 `alpine-riscv64-ex4fs.img` 并预装
+  curl；不要依赖当前 guest apk 路径。**Blocker**：网络功能无 blocker；持久
+  curl 仅受镜像打包以及 apk 所需 ownership/chroot syscall 缺口影响。
+
+- 2026-08-01 (**RV64 大型 Git 工作流恢复：timer 历史槽有界复用，merge 前
+  exit/dup3 文件落盘语义补回**). 大型 clone 的 2,621,440 字节分配失败并非
+  栈不足或总内存 OOM，而是 merge 侧 `dd9435f3` 引入的 `MinHeap.slots`
+  永不复用：10 ms 网络 watchdog 约 327.68 秒积累 32,768 个历史 timer 后，
+  40 字节 Slot 扩容到 65,536 恰好申请该大小。**Changed**：通用 timer heap
+  用 intrusive free-list 复用 cancel/expiry dead slot，key hash 删除改为
+  backward-shift cluster repair，容量按 live heap 而非历史 slot 计；另恢复
+  premerge `90939012` 已有的两条 ext4 落盘旁路——`exit_group`/最后线程退出
+  drain fd 后同步 `step_fsync`，以及成功 `dup3` replacement 后复用 close
+  writeback helper。Phase 1～8 继续搁置，没有扩成统一 OFD release 重构。
+  **Verification**：timer debug/release 35/35（含 cancel/expiry 各 70,000 次
+  churn）、reactor integration 全过、fd_ops_wave2 46/46、两条新 process exit
+  flush 回归通过，RV64 release build 通过；最终 guest 从新鲜镜像完成
+  `oscomp/xv6-riscv` 7780 objects/4127 deltas clone，`echo hello > README`
+  得到 6 字节并可跨进程 `cat`，commit `c49e801` 正确记录 1 insertion。
+  首次 HTTPS push 被 non-fast-forward 正常保护；用户随后明确授权覆盖专用测试
+  分支。由于 boot 使用干净镜像，重新完成 clone/README/commit 后，以显式旧值
+  lease 将 `LLLPPPS/tx-push-test.git` 的 `riscv` 从 `2a48e0de` 更新到
+  `8c482c20`；`git ls-remote` 回读完整 SHA
+  `8c482c202149cae3086370a8bb840a98b764e5db`。没有使用裸 `--force`，也没有
+  触碰其他分支。临时 allocator/syscall 诊断已全部撤销。**Next**：无；该 Git
+  恢复 witness 已闭环。**Blocker**：无。串口与完整分析见
+  `target/git-xv6-full-workflow-after-fsync-restoration-20260801.log` 和
+  `docs/progress/research/2026-08-01-git-large-clone-timer-slot-leak.md`。
+
+- 2026-07-31 (**LA64 TCP_CRR merge 回归已修复，两条 netperf lane 恢复 5/5**).
+  两次 LA64 诊断先把失败从网络容量问题收敛到通用 EBR 不变量：
+  `SocketPayload` final release 遇到 `epoch=0`、`zone_count=0`、
+  `rcu_count=1` 的 retirement bag，唯一 RCU 回调为
+  `tx_substrate::publication::defer_node`。最终根因是
+  `prepare_head_bags_after_barrier` 把有状态写入
+  `bag.reset_if_empty(candidate)` 放进了 `debug_assert!`；release 优化删除整个
+  表达式，随后 prepared publication enqueue 在未标 epoch 的 bag 中留下节点。
+  `d9df0b05` 将初始化改为无条件执行，并把 enqueue epoch 合同提升为 release
+  assertion；新增 publication→Zone retire 集成回归，修复前 debug 通过而
+  release 稳定失败，修复后两种 profile 均通过。LA64 fresh-image
+  `netperf-musl`、`netperf-glibc` 各 **5/5**，TCP_CRR 分别为 172.27、161.07
+  transactions/s；结合既有 iperf 12/12，Gate C LA64 回到 **22/22**。
+  RV64、LA64 release build 也均通过。没有恢复旧 EBR 状态机、扩大容量，亦未
+  启动已搁置的 Phase 1～8。`cargo -q xtask unit` 仍只有既有 3 个 tx-shims
+  失败和 tx-ext4 的 8 处陈旧 `with_target`；旧 `tests/epoch.rs` 也仍使用已退役
+  EBR 测试 API。**Next**：恢复计划只剩 Gate E b6；仅在用户保留该项时重跑
+  完整同命令 anchor tail。**Blocker**：LTP `setsockopt06` 当前 stall 与历史
+  focused 1/1 的证据冲突。
+
+- 2026-07-30 (**TCP retained close / SO_LINGER 结构调研完成，按额度暂停**).
+  确认当前 last-close 失败根因是 transport 所有权提前终止：路径先撤销
+  connection/bind、`abort()` 并 `take_payload()`，因此 smoltcp 虽有
+  FIN_WAIT/TIME_WAIT 和活时钟，也失去后续 demux/poll/deadline 入口；
+  `SO_LINGER` 目前只有 ABI 存取，close/shutdown 从未消费。另发现 dup3 覆盖与
+  exec CLOEXEC 隐式关闭绕过 FileOps last-close hook。推荐按四阶段落地：
+  先统一所有 OFD 最后释放入口；再用有界网络级 `TcpClosingRegistry` 保留
+  socket/payload/index 并接入 delegate deadline/reaper；随后让 positive
+  linger 的显式 close 变成可等待 StepOp；语义稳定后再抽取 net-owned
+  `TcpFlow`，避免第一步同时重写 demux/readiness/table。不能把 registry
+  直接强挂进 netns，否则形成 namespace→socket→namespace 引用环。
+  **Verification**：只读追踪 close、shutdown、delegate、netns 回收及
+  dup3/CLOEXEC 路径，并复核关键源码；`git diff --check` 通过，未修改或运行
+  网络代码。progress validate 仍被 07-24 plan 的非法 `completed` 阻断，
+  docs lint 仍为既有 23 个断链/6 个退役词汇警告，新文档未新增命中。
+  详细方案见
+  `docs/progress/research/2026-07-30-tcp-retained-close-design.md`。
+  **Next**：从 P0 的统一 OFD release 判决测试开始；实现前补 smoltcp 终态/reap
+  判据与 Linux positive linger/O_NONBLOCK/信号语义 witness。
+  **Blocker**：无代码 blocker；本轮按用户额度要求在设计记录后暂停。
+
+- 2026-07-30 (**TCP connect/lifecycle 单一真相与 loopback 公平性收敛完成**).
+  `SocketPayload::control` 现统一持有 TCP 协议状态、活动 connect attempt、
+  单调 generation 和 one-shot pending error；异步完成、egress、readiness
+  发布和 `AF_UNSPEC` reset 都按 generation/tuple 拒绝陈旧工作。
+  `CONNECT_DONE` 与普通可写分离，`SO_ERROR` 读取后清除，外部 connect 使用
+  显式网络时钟和 127 s 超时，不再依赖静止的零时钟。连接索引清理改为
+  forward/reverse/bound 的 reservation 事务：owner mismatch、Busy、同 raw
+  重连和 forward-missing 半连接窗口均不会部分删除新连接；为此 substrate
+  新增可回滚的条件撤销 reservation 和非自旋 `SpinMutex::try_lock`。
+  loopback 改为 round-robin，双向 egress 共用每步 64 包上限，零 TCP budget
+  不再自旋，外部连接不再误触发 loopback immediate work；接收入账按整步 ring
+  delta 统计。last-close 路径明确命名为 `peer_detached` 拓扑拆除，并保证排队
+  数据先交付再 EOF；真正的 FIN 仍只由 `shutdown(SHUT_WR)` 驱动。
+  **Verification**：TCP lifecycle **27/27**、external connect **14/14**、
+  veth **4/4**、clock **2/2**、network tick **4/4**、socket fdtable
+  **102/102**、tx-substrate **41/41**，`git diff --check` 通过；最终竞态复核
+  为 no blocker。完整 `loopback_pending_tests` 的首个真实失败仍是既有 raw
+  ICMP 长度断言 `12 != 32`，后续 5 项仅为 epoch 测试锁中毒。
+  `cargo -q xtask unit` 中 tx-kernel **116/116**、tx-scripts **166/166**；
+  仍只有既有 3 个非网络 tx-shims 断言与 tx-ext4 的 8 处陈旧
+  `BackendPageRequest::with_target`。
+  **Next**：实现可保留 payload 的真正 TCP last-close 状态机
+  （FIN_WAIT/TIME_WAIT/linger），再继续收敛剩余动态 buffer/keepalive 参数和
+  外层/smoltcp 状态重复。
+  **Blocker**：本批无；raw ICMP 夹具与 workspace unit 基线另案处理。
+  progress validate 仍被 07-24 plan 的非法旧状态 `completed` 阻断，docs lint
+  仍为既有 23 个断链/6 个退役词汇警告，本次文档未新增命中。
+
+- 2026-07-30 (**Socket/FileOps 生产接线按四步恢复，必要 socket 特判保留**).
+  `1ae1a789` 恢复 `OpenFile::step_read/step_write -> FileOps` 的 Socket 委派；
+  `8b7bd4ac` 让普通 INET/INET6 `read/write` 回到通用 fd 路径，同时保留
+  netlink `write`、bootstrap read gate 和 64 KiB staging，并在 net payload
+  层补齐 netlink 字节消费；`b2d4e1a6` 恢复 `F_SETFL(O_NONBLOCK)` 与
+  last-close/process-exit hooks，保留 retain-count/两相关闭时序，且 hook
+  通过 owner-aware post callback 同时唤醒 RawQueue/WaitSource；`438037f3`
+  确立 `query_fd_ready` 为 poll/select/epoll 的唯一 fd readiness facade，
+  删除 `FileOps` 重复 poll 接口及 `device -> net::PollMask` 层次泄漏。
+  ioctl、sendto/recvfrom/sendmsg、splice 拒绝和 pipe-backed socketpair 等
+  ABI/能力边界特判未动。**Verification**：tx-shims socket fdtable
+  **97/97**；`cargo xtask build --target rv64-qemu` 通过；真实 QEMU Git/DNS/
+  HTTP/HTTPS **9/9**，NET_IRQ
+  `claims=61/completions=61/wrong-hart=0/missing-device=0`。
+  `cargo -q xtask unit` 仍只有既有 3 个 tx-shims 断言和 tx-ext4 陈旧
+  `with_target` API；tx-subsystems 全 net filter 的首个 bridge 断言在改动前
+  `3f6f8dd7` 也失败，随后 epoch 锁中毒产生级联，不能作为本轮回归结论。
+  实施细节见
+  `docs/progress/research/2026-07-30-network-refactor-merge-structural-audit.md`。
+  **Next**：处理 TCP 外层/smoltcp/shutdown/readiness 与动态 sockopt 的多真相；
+  RawQueue/WaitSource 双载体、L2/L3 所有权和动态网络对象生命周期仍需独立设计。
+  **Blocker**：本项无；progress validate 仍被 07-24 plan 的旧状态
+  `completed` 阻断，docs lint 仍为既有 23 个断链；workspace unit 与 net
+  集合夹具基线另案处理。
+
+- 2026-07-30 (**Socket/FileOps 特判边界复核完成；确认应选择性恢复，不能机械全删**).
+  已对照合并前 feature 锚点 `90939012`、P3-A 落地提交及当前
+  `26e7d79c`：`net/file_ops.rs` 实现未丢，丢的是 VFS/read-write/F_SETFL/
+  last-close 的生产接线；既有 P3-S2 判决测试当前稳定失败于
+  `Err(EINVAL) != Done(4)`，且全仓无生产 `file.file_ops()` 调用。与此同时，
+  合并前本来就有必须保留的特判：netlink `write`、无 mailbox bootstrap
+  read gate、64 KiB socket staging、socket ioctl、splice 拒绝和 pipe-backed
+  socketpair。main 新增的 `query_fd_ready` 已是 poll/select/epoll 的统一 fd
+  facade，也不应机械退回旧实现；需要单独消除其与 FileOps poll 方法的重复及
+  `device::FileOps -> net::PollMask` 层次泄漏。**Verification**：
+  `git diff 90939012..HEAD -- net/file_ops.rs` 为空；
+  `cargo test -p tx-subsystems --lib
+  open_file_read_write_delegate_to_socket_file_ops -- --nocapture` 精确复现失败。
+  详细分类和四步恢复边界见
+  `docs/progress/research/2026-07-30-network-refactor-merge-structural-audit.md`。
+  **Next**：先恢复 VFS Socket read/write 委派，再在保留 netlink/bootstrap/
+  64 KiB 例外的前提下摘除普通 socket syscall 转发，最后收编 F_SETFL/close
+  hook 并裁决 fd-neutral readiness 接口。**Blocker**：无；本轮只调查和记账，
+  未修改网络代码。
+
+- 2026-07-30 (**RV64 真实 NET_IRQ top/bottom-half 链恢复并完成 Git 全链验收**).
+  恢复 `IrqIf::NET_IRQ=2`、virtio notification、外部 IRQ 用户帧 handoff 和
+  `DeferredWake`；top half 仅把 claim 发布到 per-hart 原子状态机，owner-hart
+  bottom half 依次执行 device ACK/poll/kick、释放软件 slot、PLIC complete，
+  IRQ 上下文不拿 EBR guard。首次真机/GDB 发现 claim 虽到达，但无界 reactor
+  inner loop 会把 bottom half 推迟数十秒，10 ms watchdog 仍在掩盖数据面；
+  因而新增通用 `HartPollBudget`，BSP/AP 每 poll 一个 future 即返回，并在
+  poll 前后统一 drain UART/net bottom halves。同步修复 legacy
+  `RawQueueWaitFuture` 已订阅分支的 level recheck，并加入 opt-in IRQ 串口统计与
+  harness 断言。**Verification**：tx-reactor 全测试串行通过；tx-kernel IRQ
+  7/7、RawQueue 回归、RV64 HAL 93/93、LA64 HAL 53/53；rv64/la64 build 均通过；
+  QEMU Git/DNS/HTTP/HTTPS **9/9**，最终
+  `claims=59, completions=59, wrong-hart=0, missing-device=0`。设计与证据见
+  `docs/progress/research/2026-07-30-net-irq-restoration-design.md`，调试过程见
+  `msp/debug-logs/2026-07-30-net-irq-deferred-completion.md`。
+  **Next**：保留 10 ms RX floor 作为明确 watchdog，另做 cold-idle RX 压测后再决定
+  是否移除；LA64 须先确认 virtio-pci GSI，当前保持 `NET_IRQ=0`。
+  **Blocker**：本项无；workspace unit 仍是既有 3 个 tx-shims 断言和 tx-ext4
+  陈旧 `with_target`，docs lint 仍为既有 23 断链。
+
+- 2026-07-30 (**分支/磁盘盘点与首轮 LTP 运行盘清理完成**).
+  当前 `feature-network-refactor` 工作树盘点前干净，相对本地缓存 upstream
+  ahead 34/behind 0，相对 `main` 多 22 commits；本地 21 分支、37 个实际远端
+  跟踪引用、7 个 worktree。仓库可见实占下限约 **259.17 GiB**，其中
+  `target/` 235.69 GiB、`target/oscomp/` 191.77 GiB；最大单项是
+  `ltp-bin`/`ltp-runtest` 留下的 618 个逐轮磁盘路径（61 个有实占），合计
+  **185.01 GiB**。按用户确认的“runner mode × architecture/libc lane 各保留
+  最新 1 个”策略，已删除 53 个旧非空运行盘、保留 8 个最新盘和 557 个空
+  占位文件，精确释放 **172,082,016,256 bytes（160.26 GiB）**。清理后
+  `target/oscomp` 31.51 GiB、`target/` 75.42 GiB、仓库可见实占下限
+  98.91 GiB；文件系统从 80% 降到 62%，可用空间约 179 GiB → 339 GiB。
+  两个 `testdata` 基盘、1251 份 log/judge、submit 证据均保持不变。四个
+  干净辅助 worktree 另可回收约 17.71 GiB；两个 worktree 含未提交内容，
+  禁止直接移除。`.git` 仅 0.29 GiB，分支删除几乎不省空间。详细边界与
+  8 个保留盘清单见
+  `docs/progress/research/2026-07-30-branch-and-disk-cleanup-inventory.md`。
+  **Verification**：删除前确认无匹配 QEMU，断言候选 `61=8+53` 与目标字节数；
+  删除后复核非空盘 8、空盘 557、log/judge 1251、基盘 stat 摘要不变，并用
+  `du`/`df` 核准释放字节数。
+  **Next**：可选清理 Cargo 缓存或四个干净辅助 worktree。
+  **Blocker**：5 个 `nobody:nogroup`、0700 的 LTP 工作目录无法读，故总占用为
+  下限；远端引用未 fetch，只代表本地缓存快照。
+
+- 2026-07-30 (**feature-network-refactor 合并保真度/结构审计完成，Alpine RV64 curl 已落并真机验收**).
+  对当前 `6503312f` 与 07-27 merge `6d41a347` 的 feature parent `90939012`
+  做 blob、调用点和当前实现复核：P0/P1/P4 完整保留，P2 外部 TCP/UDP 数据面、
+  P3-B 单 `SocketImpl`/TCP 单锁及 P3-C 资源收敛仍在；两个明确回退是 **NET_IRQ
+  top/bottom-half 未接入**（当前靠 10 ms RX poll floor）和 **Socket FileOps
+  只有实现、生产 read/write/poll/close 等又回到类型特判**。其余主要欠账：
+  TCP 外层/smoltcp/shutdown/readiness 多状态源，动态 buffer/keepalive/TTL/nodelay
+  sockopt 只改报告值，L2/L3 仅拆文件未拆所有权，wait 双轨，动态 rtnetlink
+  对象泄漏，端口/索引/MSS/MTU 硬编码，以及 IP_HDRINCL/IPv6 fragmentation/NDP
+  校验/VLAN data path 等功能缺口。详细证据与优先级见
+  `docs/progress/research/2026-07-30-network-refactor-merge-structural-audit.md`。
+  镜像侧把真实 RV64 `curl` 加入默认 Alpine 包闭包，并修复 `latest-stable`
+  metadata 永久缓存导致包轮换后 404；默认 rootfs/cpio 已重建。**验证**：
+  `bash -n`、`git diff --check`、`cargo xtask image cpio --profile alpine
+  --target rv64-qemu`；QEMU Guest `curl 8.21.0` 通过 SLIRP 请求宿主
+  `http://10.0.2.2:18080/index.html`，得到 HTTP 200、`TX_CURL_HOST_OK`、rc=0。
+  `cargo -q xtask unit` 仍仅有既有 3 个 tx-shims 断言和 tx-ext4 陈旧
+  `with_target` API（tx-kernel 114/114、tx-scripts 166/166）；progress validate
+  仍被既有 07-24 JSON 的 `completed` 旧状态阻断，docs lint 仍为既有 23 断链。
+  **Next**：先分别恢复 NET_IRQ 和 FileOps 两个回退，再立项 TCP 状态/options
+  单一真相；L2/L3 所有权和 wait 收敛另做大改计划。**Blocker**：curl 无；
+  Alpine 长期 bit-for-bit 复现仍需固定 branch/checksum。
+
+- 2026-07-30 (**续接 07-27～07-29 Claude 的 Git 修复：3/8 → 干净 8/8**).
+  原症状是 HTTP pack 已收 100% 后 `index-pack` 永不返回、QEMU 单核满载；两百万次
+  `Continue` 看门狗把所有者钉到 `vfs::FileFsyncOp`。根因链共三段：① page-backed fsync
+  未完成时原地 `Continue`，且异步请求缺少逐操作 wait/可靠 service kick/终态发布；
+  `/musl` 又没有 backend planner，改 Yield 后无人完成；② planner 写回成功未先回告
+  planner、直接 `BackendPlan::Err` 未终态化；③ `drive_udp_loopback_after_sendto` 无条件
+  破坏性弹出外部 UDP，DNS 包在 device-TX 前被吃掉。同步补强 fork/CoW：pmap-only 私有
+  常驻页先 seed 为 `SharedCow`，map-pin/publish 失败不再吞掉并映射 `ENOMEM`。修复后
+  fsync `22/22`、fork `6/6`、外部 UDP 留队 `1/1`、RV64 build 通过；无诊断注入的
+  `tools/verify-git-net.sh` 最终 **8/8**（HTTP/HTTPS clone、push、pull、DNS 全绿），串口
+  `msp/debug-logs/2026-07-30-git-net-8-of-8-clean.serial.log`。`cargo -q xtask unit`
+  仍仅有既有基线：3 个无关 tx-shims 断言和 tx-ext4 测试陈旧 `with_target` API；
+  同轮 tx-kernel `114/114`、tx-scripts `166/166`。详细根因/证据见
+  `msp/debug-logs/2026-07-30-git-clone-fsync-dns-fork-repair.md`。**Next**：另立范围处理
+  UDP inline/device 队列的 SMP 原子所有权，以及 planner Yield/部分 Bio admission 的终态；
+  6E ordered-JBD2 前不宣称断电持久化。**Blocker**：本次 Git 路径无；修复已提交为
+  `6503312f`。
+
+- 2026-07-28 (**引导期 exec 从 ext4 起不来 = main 既有,不是合并回归;已用同 harness 对照钉死**).
+  合并后 git 端到端 0/8、oscomp suite 也起不来,追下去发现两条通道挂在同一个根因上:
+  引导期 exec (`init/exec.rs` 的 `bootstrap_block_on(exec_script)`) 遇到冷页 fetch 会拿到
+  `ExecError::Deferred` 并直接判失败。`tx.runsh` 跑 Alpine 动态 busybox 中招,main 自己的
+  oscomp sdcard lane 跑 `/musl/musl/busybox` **同样中招**。**对照实验**:同一份
+  `.v6work/suite-run.sh` + 同一个 sdcard 镜像,分别喂合并内核与 main 基线内核
+  (`Txv2-main-baseline`,当场重建 debug),两份日志归一化后 **68 行 vs 68 行、序列完全等价**,
+  差异只有 3 处噪音(net 探测跳过原因/panic 路径/pagealloc 计数)。main 侧显示
+  `sdcard:fail:other`、合并侧显示 `sdcard:fail:deferred`,是同一个错误——差别只在合并侧补齐了
+  `exec_error_tag` 的 6 个新变体(main 的 tag 函数把它们全塞进 `_ => "other"` 兜底,这正是
+  最初误判的直接原因)。**根因**:`materialize_file_page` 的 fetch 是有主协议
+  (`Owner`/`Joined`/`Cached`),而引导期用一次性 `block_on` 驱动,拿不到 resume 语义;
+  活的 `execve` (`proc.rs:611`) 用的是 `ExecScriptOp` + `tx_scripts::drive`(park 后 resume
+  同一个 op),那才是正确范式,但它需要一个已经在跑的反应堆——引导期恰恰还没有。
+  试过把正确范式搬进引导期(跨 poll 持有 future + Pending 时 `boot_reactor_once`),引导直接
+  卡死在第一次 poll 前:`boot_reactor_once` 从 exec future 的 poll 循环里调属重入自锁,已回退
+  (引导卡死比快速失败更糟)。**结论**:引导期 exec 结构性无法跑冷的 ext4 镜像,与驱动写法无关;
+  出路是把它移出引导期(引导 exec 一个静态 shell,由它在用户态走正常 execve)。
+  **验证**:两架构 full-build ok;tx-subsystems 单测集合差相对 main 0 真回归(43 个 page_backed
+  新增失败逐个隔离复跑全过=级联受害者);vendored smoltcp 591/0;R4a epoll-on-socket 探针 2/2
+  (已落树当哨兵);lint 相对 main 无新增失败(两处 ceiling 抬升带决策说明,time-layering 修到 0)。
+  **踩坑记录**:仓库有两个内核产物——`verify-git-net.sh` 用 release、`suite-run.sh` 用 debug;
+  只重建 release 就去跑 suite 会验到旧 debug 内核(本轮实际发生,把 `deferred` 误看成 `other`)。
+  **下一步**:定 `tx.runsh` 出路(需确认 alpine 镜像有无静态 shell);C-1 设备改名回植待做;
+  feature 网桥转发帧数不足(4 个 bridge_tests,main 通过)已判为 feature 既有缺陷,独立立项。
+  **阻塞**:git 端到端与 netperf/iperf 都走引导期 exec,在上面那条出路定下来之前无法验证。
+
+- 2026-07-27 (**merge main → feature-network-refactor 完成**;16 冲突全解,两架构编译通过,LTP 未跑).
+  **前置审计**(`.v6work/PR54_AUDIT.md`):main 的 `dd9435f3`(PR#54 codex/network-time-integration,718 文件)
+  **不是网络增量而是回退** —— 用 blob 身份坐实:main 的 102 个 net 文件里 **50 个与历史祖先逐字节相同、
+  零新增编辑**(`tcp.rs`→2026-06-13、`ether.rs`→2026-06-02、`udp.rs`→P2-S6 DNS 之前);删掉
+  `clock.rs`/`file_ops.rs`/`adapter.rs`/`external_connect_tests.rs`;`FileOps` trait 全树 0 命中;
+  `step_connect.rs` 的 `external` 0 命中。**R4a 实证**:epoll-on-socket 在 main 上无限超时立即返回 0,
+  feature 正确停泊。**合并策略**:网络树按路径整取 feature(79 文件,含 `socket.rs` —— 它只有 main 改过、
+  连冲突都不报),非网络以 main 为底 + 回植 feature 的 5 个修复(sa_restorer/O_TRUNC/dentry 陈旧 walk/
+  mprotect PrivatePageSet/ext4 容量);syscall 层(`socket.rs`+`helpers.rs`)反过来取 main + 回植 17 行
+  (P2-S5 端口轮转 + V5-3 v6 源选择)。**C 类回植**(`.v6work/CCLASS.md`,机械筛 715→116→34 文件):
+  C-2 DGRAM ICMP recv 不带 IPv4 头(+新增 dgram 测试);C-1 设备改名**未做,单独立项**。
+  **又抓到 3 处 main 回退**:`socket.rs` 删 P2-S5 端口轮转、`mod.rs` 删 `net_set_now_ns` 调用(祖先有)、
+  `virtio/net.rs` **重新引入中断抑制 bug**(`disable_interrupts()` 无配对重新使能 → 首个网络 IRQ 永久静音,
+  正是 feature 注释里记录的 P2 卡死根因;已核实 main 全树无 `enable_interrupts` 调用方)。
+  **验证**:rv64+la64 `full-build: ok`;单测集合差 **0 真回归**(47 新增失败中 43 个 `page_backed` 隔离复跑
+  全过=级联受害者,4 个 main 上也失败);smoltcp 上游套件 **591/0**;R4a 探针 **2/2**(已落进树当哨兵)。
+  **遗留**:① lint 两项相对 main 回归 —— `time-wake-retired` 434 站点(feature net 早于 main 的 post 机制,
+  结构性)+ `notification-boundary` 4 站点,需决策抬 ceiling 还是改造;② feature 既有缺陷:4 个 bridge_tests
+  的 `bridge_forwarded>=2` 不过(判别实验已证与合并无关,长期被字节数断言掩盖);③ LTP 四 lane 未跑。
+  **坑**:大规模合并后 cargo 喂陈旧产物报假 `unresolved import`,须 touch 所有 crate 根强制重建。
+
+- 2026-07-26 (**HTTPS 吞吐塌方定性完成:真根因是 syscall 路径固定开销,不是网络** — 只入 harness,未修性能).
+  接着上一条(SWS 修好但 HTTPS 522KB 仍 284 s)继续追,**三个假设连环证伪**:① **TCP RX 丢唤醒** ❌ 真实互联网
+  纯 HTTP 522KB **1 s** 跑完、sha256 全对;② **AF_UNIX socketpair 特殊** ❌ socketpair 与 pipe 在每个 chunk
+  尺寸几乎相同(64B 24.1 vs 27.3 KB/s、4096B 1118 vs 1242 KB/s)——**先前用 `cat|cat` 管道做的排除本身无效**
+  (管道与 socketpair 是两条代码路径),这轮才是真对比;③ **跨进程唤醒延迟** ❌ **单进程内** socketpair 自收自发
+  (无 fork、无调度)已 3.1 ms/轮,跨进程只多 1.1 ms,且 `in_write`/`in_read` 显示两侧几乎全程待在 syscall 内部
+  而非等对方。**真根因=每次 syscall 的固定开销**(`.v6work/ipcbench.c`,`riscv64-linux-musl-gcc -static` 交叉
+  编译后塞进镜像 `/musl/ipcbench`):`getpid()` **235 µs**、`clock_gettime` 316、`write /dev/null` 64B 716、
+  `read /dev/zero` 64B **781** / **4096B 803**(**载荷大小几乎不影响**⇒全是固定每调用开销)、socketpair 与 pipe
+  的 write+read ~1500(≈750/call,**与 `/dev/zero`/`/dev/null` 同价**⇒socket/IPC 无任何特殊)。**PC 采样归因**
+  (`.v6work/pcsample.sh`:QEMU monitor `info registers` + addr2line 聚类,286 样本/200 s,**无单一热点、最高仅
+  3.5%** ⇒ 开销弥散非热循环):内核态 **92%**/用户态 8%;内核内部 **`tx_substrate` 32%** + **`core` 29%**
+  (`SlotKey::{slab_id,slot_id,zone_id}`、`ZoneId::eq`、`align_up`、`atomic_load`,**`drop_in_place<[u8]>` 是
+  第二热符号**)+ 未解析 17% + **真正的 net/fs 逻辑 `tx_subsystems` 仅 6%** + `sbi_set_timer` 4% + `tx_shims` 2%
+  ⇒ **时间花在 zone/capability/slab 记账与字节缓冲 alloc/free 上,不是在做实际工作**。HTTPS 中招只因它每字节
+  syscall 数最多(ssl_client 逐条 TLS 记录经 socketpair 转交);纯 HTTP 单进程大块读,syscall 数少两个数量级。
+  **⚠️ 精确账未平**:284 s ÷ 750 µs = 24.5 万次 op(每 2 字节一次),算术对不上 ⇒ 真实路径单次 op 远贵于微基准
+  (要走 TCP 状态机 + delegate poll);但 PC 采样证明这 200 s guest 是**真在烧 CPU**(92% 内核)而非空等,
+  方向确定。**本次只入两个可复用 harness,未做任何性能修改。** **Next**(未做,均需改内核共享路径,规模超本轮):
+  给 syscall 加按号计数器(`SYSHIST` 只是 40 条崩溃后验环、不能计数)以拿到真实 op 数;或优化 substrate 的
+  每调用记账(能力查找缓存、避免每次 fd 操作 alloc/free 字节缓冲)。**Blocker**:无。
+- 2026-07-26 (**接收端 SWS 避免(RFC 1122 §4.2.3.3)** — 正确性修复,**不解决 HTTPS 慢**). 起因:真实场景验
+  `wget` 时发现 **HTTPS 下载吞吐塌方**(本机同一文件 522KB:纯 HTTP **1 s** / HTTPS **184 s**,差 180 倍;
+  打真实互联网时对端等不及发 RST,表现为"卡死")。**过程中定位到并修掉一个真缺陷**:
+  `external/smoltcp-asterinas/src/socket/tcp.rs` 的 `scaled_window()` **原样上报 rx 缓冲剩余空间、没有任何
+  下限**——wire 实证最小报到 **4 字节**、`win==0` 一次都没出现过,对端老实遵守于是发出 `length 45/90/180/428`
+  的小段,每段一次完整往返(效率剩 3%),ACK 回得慢再触发对端指数退避。修法=剩余空间 < `min(MSS, 容量/2)`
+  时报 0,靠 `window_to_update()`(`new_win>0 && new_win/2>=last_win`,从 `last_win==0` 成立)一次性重开。
+  **两个必须一起改的点**:① `last_scaled_window()` 的 `last_ack + last_win - next_ack` 用的
+  `SeqNumber::sub` **underflow 会 panic**——改前 `last_win` 恒等于真实剩余空间,故 `last_ack+last_win` 正好
+  等于 `process()` 裁剪用的 `remote_seq_no+capacity` 上界,永不越界;报 0 后该恒等式破裂(在途数据仍会被收下),
+  必须改成饱和到 0。② 阈值加 `capacity >= 4*MSS` 门槛:第一版无门槛打挂 3 个上游测试(用 6 字节 / 2×MSS 的
+  退化缓冲),而 SWS 是"拿缓冲利用率换报文大小"的交易,缓冲装不下几个 MSS 时该交易反向(会压成停等);真实
+  缓冲 64KiB:1460 = 45:1,门槛不会排除要治的场景。**验证**:vendored smoltcp 测试套 **591/591**
+  (590 原有 + 新增 `test_receiver_sws_avoidance_suppresses_tiny_window_then_reopens`,**控制实验**:撤掉修复
+  该测试立刻 FAIL);rv64/la64 编译零新增 warning;`tx-subsystems --lib` 集合差 **IDENTICAL(326==326)**;
+  `verify-git-net.sh` **8/8**;netperf/iperf 四 lane **22/22**;纯 HTTP 522KB 仍 1 s、HTTPS 6KB 仍 3 s
+  (无回归);**线上生效确认**:`win 0` 出现 25 次、非零最小 1880(>MSS),修复前最小 4。
+  **⚠️ 但修复目标未达成**:HTTPS 522KB 仍 284 s。**小窗口是症状不是病根**——pcap 显示我方报 0 后
+  **280 秒既不回零窗口探测也不发窗口更新**(对端探测退避 5→8→16→32→60→60→60 s),然后突然开窗 34KB、传输
+  立刻恢复 ⇒ **应用侧(wget/ssl_client)停摆 280 秒**。同一次运行的纯 HTTP 是 406 包/0.4 s,HTTPS 是
+  446 包/283.5 s。**为跑通上游测试套另改了 vendored 的 Cargo.toml(+6:`[workspace]`/rstest dev-dep/放宽
+  missing_docs)与 assembler.rs(+4:唯一用 rand 的 fuzz 测试 cfg(any()) 掉,其 zerocopy 在本 nightly 编不过)**
+  ——这套测试有价值,正是它抓出第一版阈值过激。**Next**:追 AF_UNIX socketpair 唤醒(**先前用 `cat|cat` 管道
+  512KB/1s 做的排除无效——管道与 socketpair 是两条代码路径**);宿主有 `riscv64-linux-musl-gcc`,可交叉编译
+  探针程序对比 pipe/socketpair/各 chunk 尺寸。**Blocker**:无。
+- 2026-07-25 (**net 抽样对账 + V5-2 回归修复:v6 地址槽位 newest-wins**). ① **netperf/iperf 全绿**:rv64 四条
+  lane(netperf-musl 5.0/5、netperf-glibc 5.0/5、iperf-musl 6.0/6、iperf-glibc 6.0/6 = **22/22**,已是天花板
+  故未跑基线对照)。**两个 harness 坑**(已入 memory):**`tx.oscomp=<suite>` 不是选择器**——只有
+  `tx.oscomp.groups=<suite>` 是,写错会静默启动整个默认组列表而 judge **照样打印一个像样的分数**(实测先
+  14/102 再 414/449,netperf 一次没跑);且 `cargo xtask oscomp test` 无法注入 `tx.oscomp.observe=0`,两坑
+  同时中。自研驱动 `.v6work/suite-run.sh` 两个都规避 + **始终 boot 镜像副本**。⚠️ **副作用需用户裁决**:第一次
+  用 `oscomp test` 时它把 QEMU 直接挂到共享的 `target/oscomp/testdata/sdcard-rv.img`(可写),observe-dump 的
+  mid-suite `system_off` 把该 4GB 镜像的 ext4 **block bitmap checksum 弄不一致**(`debugfs` 拒绝打开;对照
+  从未被启动的 `sdcard-la.img` 干净)。功能上仍可用(所有跑分都从副本启动、全满分),`e2fsck -fy` 可修,
+  **但那是用户的派生件,未擅自改**。② **LTP net 抽样对账**(rv.musl,HEAD `0fbe0733` vs 基线 `2c5fe37b`,
+  同一 harness `tools/ltp-runtest-witness.sh` + `KERNEL_DIR` 换核,判据=verdict **集合差**而非 judge 分——
+  官方 shell 形态会把整个模块塌成单个 0/1 项):`net.ipv6_lib` **35 verdict 逐字一致**(judge 42/42==42/42:
+  in6_01 5/5、in6_02 3/3、getaddrinfo_01 22/22、asapi_02 12/12);`net.ipv6` 计数三项全等(40/37/2)但
+  **`ipneigh6_ip` 失败形态退化**——基线"条目在表里、删除失败"→ HEAD"条目根本没进表"。③ **这条退化独立印证了
+  V5-2 的一个真回归**:V5-2 的 boot seed 占住**唯一可路由的 primary v6 槽**,用户/LTP 的
+  `ip -6 addr add fd00:1:1:1::2/64` 落成 secondary,而 `route6_snapshot`(只从 primary 合成连接路由)与
+  `IfaceCommon`(只带一个 v6 地址给 `same_ipv6_prefix`)都不看 secondary ⇒ **存得下但发不出的黑洞** ⇒
+  `decide_ipv6_route` 判 Unreachable ⇒ **NS 压根不发** ⇒ NDISC 学不到邻居。主机探针实证(修复前):
+  `preferred_ipv6_source(peer)=None`、`route6_snapshot_len=1`。V5-2 之前 eth0 无 v6 地址,用户的**第一个**
+  add 会成 primary → 能用,所以这是 V5-2 引入的。**修法**:`add_device_ipv6_addr_by_ifindex` 改 **newest-wins**
+  (新地址占 primary、被顶掉的降 secondary)+ `del_device_ipv6_addr_by_ifindex` 对称地在删 primary 时**提升
+  最近降级的 secondary**(否则"两个地址删一个"会让整条链路 v6 全死)。选 newest-wins 的理由:它在**每种情况下
+  都不比 V5-2 之前差**(单地址完全相同,多地址时"最近配置的能用"严格好过"只有第一个能用");仍偏离 Linux
+  (Linux 路由全部地址),真修法(`route6_snapshot` 覆盖 extras + `IfaceCommon` 带全部 on-link 前缀)记 P5。
+  ④ **v4 侧是同构先天缺口,有意不动**:`add_device_ipv4_addr_by_ifindex` 同样 first-wins、`route_snapshot`
+  同样不看 `ipv4_extra_addrs` ⇒ 这解释了 `net.tcp_cmds` 的 `ipneigh01: ARP entry '10.0.0.1' not listed`
+  (基线同样失败)。**不顺手改 v4**:boot seed 是 `10.0.2.15/24` 而 LTP 会 add `10.0.0.2/24`,v4 若也
+  newest-wins,guest 会在 LTP net 跑的过程中丢掉 10.0.2.15 身份 ⇒ 网关 10.0.2.2 变 off-prefix ⇒ 外部 v4
+  (含 DNS)当场断;v4 是承重路径,不为对称性动它。**验证**:rv64/la64 build 零新增 warning;
+  `tx-subsystems --lib` 集合差 = **+4 恰为本轮新增的 4 个回归测试**(V5-1 的两个 + 本次
+  `user_added_ipv6_address_displaces_the_boot_seeded_primary` 与
+  `rtnetlink_ipv6_addr_add_demotes_then_del_promotes_back`)、**0 既有翻转**;两个受影响模块隔离全绿
+  (rtnetlink 25/25、external_connect 8/8)。**修复后内核复验(全绿)**:① LTP `net.ipv6` verdict 集合与基线
+  **逐字一致(IDENTICAL,TPASS 39)**——退化的 `ipneigh6_ip` 已回到基线形态;② 真机三阶段
+  A 零配置 `fec0::15` + 外部 v6 TCP/UDP 通 → B `ip -6 addr add 2001:db8:1::15/64` 顶替为 primary(此时 fec0::2
+  off-link 不可达=**正确行为**,无默认路由)→ C `del` 后 **`fec0::15` 提升回来、外部 v6 TCP/UDP 双双恢复**;
+  ③ `verify-git-net.sh` **8/8**。文档 `IPV6_EXTERNAL_DATAPLANE_v1.md` §10 记录全部(含 §10.5 验收表)。
+  **⚠️ 两个自己踩的方法学坑(已记 §10.6 + memory)**:(a) **`cargo test` 不重建内核 ELF** ——
+  改完源码只跑单测就去 QEMU 验 = 验的是旧内核(ELF 13:42 建 / 源码 13:47 改),白跑两轮 QEMU,还一度把它误判成
+  "修复无效"甚至"LTP net.ipv6 挂死"(重建后 **不复现**,0 行 cut-spam);**QEMU 验证前必须 `stat` 比 ELF 与源码
+  mtime**。(b) **单测要打真实入口** —— 第一版只调 `add_device_ipv6_addr_by_ifindex`,而 guest 走 rtnetlink
+  消息层,补了经 `rtnetlink_handle_request` 的版本才算真覆盖。**Next**:无必须项;可选=la64 lane 的 net 抽样、
+  net.features/net.multicast 扩样、P5 的多地址可路由化。**Blocker**:`target/oscomp/testdata/sdcard-rv.img`
+  的 ext4 bitmap 需用户裁决是否 `e2fsck -fy`(功能仍可用,所有跑分都从副本启动)。
+- 2026-07-25 (**V5-2 + V5-3:IPv6 开机即用 + v6 源选择接 FIB**). V5-2:此内核无 RA/SLAAC/DHCPv6、也不
+  生成 link-local,`eth0` 开机**没有任何 v6 地址**,整条(已经能用的)外部 v6 数据面要人手打
+  `ip -6 addr add` 才活。修复=`init/net.rs` 的 `publish_boot_net_device_to_namespace` 里,紧挨 v4 的
+  `set_device_ipv4_addr_by_ifindex` 加对位 `set_device_ipv6_addr_by_ifindex(BOOT_ETH_IPV6=fec0::15/64)`
+  (同款 slirp 约定)。**相对审阅稿两处偏离,都是实测驱动**:① **不加 `::/0` 默认路由**——v4 那条是真的
+  (10.0.2.2 确实 NAT 到公网),而 slirp 不把 IPv6 路由出 `fec0::/64`,宣告转发不了的默认路由=伪造可达性,
+  只会把快速 `EADDRNOTAVAIL` 变成挂到 TCP 超时;on-link 的 fec0::2/fec0::3 本就被连接路由覆盖。② **V5-3
+  从"建议做"升级为必要配套**:只落 V5-2 会**引入新回归**——eth0 一有 v6 地址,connect autobind
+  (`helpers.rs:100`)那份 FIB-blind 启发式就会给**任何** v6 目的地(含无路由的全局地址)选出 fec0::15 当源
+  → SYN 入队 → `decide_ipv6_route` 判 Unreachable → 段拒收即留队 → **connect 挂死**。真机对照:
+  `wget http://[2606:4700:4700::1111]:80/` 在 V5-2 单独时 **55s 内未返回**,补上 V5-3 后
+  **`Address not available` / elapsed=0s**。V5-3 本体=新增 `NetNamespacePayload::preferred_ipv6_source(dst)`
+  (走 `best_ipv6_route`),收敛 §2.6 的三份"扫第一个有 v6 地址的 up 非 loopback link"启发式:
+  `helpers.rs` autobind / `step_connect.rs` `select_routed_local` / `payload.rs` `udp_tx_src_hint` 三处
+  **纯 FIB 无兜底**(返 None 是承重的,快速失败靠它),唯 raw ICMPv6 的 `preferred_ipv6_source_for` 保留
+  既有启发式兜底(ping6 打无路由地址时用尽力而为的真实源,好过 `send_raw_ipv6` 回退 `::1`)。**验证**:
+  guest **零手工配置**下 `/proc/net/if_inet6` 有 eth0 行、`ip -6 addr` 显示 fec0::15/64、ping6 3/3、
+  外部 v6 TCP(HTTP 200)、外部 v6 UDP(echo 往返)全绿;v4 对照(TCP/UDP/DNS)全绿。回归门:rv64/la64
+  build 零新增 warning;`tx-subsystems --lib` 集合差 **IDENTICAL(324==324)零回归**;`verify-git-net.sh`
+  **8/8**。**Next**:LTP net 抽样对账(尤其 net.ipv6 —— `/proc/net/if_inet6` 现在多一行 eth0,需确认没有
+  靶子在数行数);任务书 §7 的 RFC 6724 目的地址排序仍**未验证**(注意:musl getaddrinfo 用 **UDP** connect
+  探测,而 UDP autobind 不走 V6 臂,所以 V5-3 的快速失败杠杆目前**只对 TCP 生效**)。**Blocker**:无。
+- 2026-07-25 (**V5-1 外部 IPv6 UDP 打通** — 破坏性弹出 + v6 源地址空洞两连修). 病象:guest 里任何发往
+  外部 v6 单播地址的 UDP(含 DNS)**一个包都到不了网线**,而同时刻 v4 UDP 与 v6 TCP 全通。**双根因**:
+  ① `step_device_tx.rs:342` UDP 车道 `take_udp_tx_datagram()` 是**破坏性弹出**,sink 一旦返回
+  Busy/PendingResolution/Failed 数据报即销毁——TCP 车道用"拒收即留队"(`dispatch_segment_via`,01aea500
+  修大包 wedge 时确立)、raw ICMPv6 用 peek→transmit→commit,**唯独 UDP 会丢数据**;叠加 ② 初始 namespace
+  一轮 delegate 里有**两个 TX sink**(`delegate/runtime.rs:247` boot lane 先跑,`:280` namespace lane 后跑),
+  boot lane 的 iface(`tx-kernel/src/init/net.rs:75-84`)建时**没有 `.with_ipv6`**,对任何非组播 v6 目的地
+  `decide_ipv6_route→Unreachable→Failed{EADDRNOTAVAIL}` ⇒ 数据报在能路由它的 iface 见到 socket 之前就被
+  销毁,**必丢**;③ `payload.rs:1273` `udp_tx_src_hint` 的 V6 臂硬编 `None` → 交给 smoltcp 决议,而
+  CONTEXT_IFACE 是无地址裸 loopback iface,`get_source_address_ipv6` 回退 `LOCALHOST` ⇒ 少数漏网的 v6 UDP
+  **源地址是 `::1`**(网线实证),对端无法应答。**修复**:(a) `udp.rs` 加 `requeue_tx_datagram(datagram, src)`
+  (`push_datagram_inner` 拆出 `push_datagram_with_source`,`local_address` 用**已决议的 src** 保证重试逐字节
+  一致)+ `payload.rs` `restore_udp_tx_datagram`;`process_udp_tx_socket` 三个非 Accepted 臂改为先 restore
+  再计数,ring 满才真丢。**顺带修掉 v4 UDP 在队列满时的静默丢包**。(b) `udp_tx_src_hint` 的 V6 臂镜像 V4 臂
+  走 `best_ipv6_route→preferred_src`(+按 oif_name 扫 link 兜底)——这也是 `best_ipv6_route` 头一次有真实
+  消费者(此前零非测试调用者)。**验证**:真机 `nc -u fec0::2` 收到 `UDPOK-V6`,pcap
+  `fec0::15.49154 > fec0::2:UDP` **源是 fec0::15 不是 ::1**;v6 DNS 查询也以正确源上线(NS/NA→A+AAAA 都发出),
+  **但 slirp 回 ICMPv6 `unreachable route fec0::3`** ⇒ 宿主 `/etc/resolv.conf` 只有 v4 nameserver,libslirp
+  无 v6 DNS 可转发,**环境限制非内核缺陷**(文档 §5 那条"nslookup fec0::3 成功"的验收标准据此修正)。回归门:
+  rv64/la64 build ✅ 零新增 warning;`tx-subsystems --lib` 集合差 = **+2 恰为新增的两个测试、0 既有翻转**
+  (隔离复跑 2/2 绿;全量里整个 external_connect_tests 模块本就级联失败);`verify-git-net.sh` **8/8**;
+  v4 对照(UDP/TCP/DNS)真机全绿。新测试 `refused_udp_datagram_is_requeued_for_the_next_pass`(用 v4 钉死
+  车道语义,与 v6 无关)+ `external_udp6_sendto_uses_the_interface_source_address`,**做过对照实验**:
+  `git stash` 掉三个源文件后两测试都 FAIL。**Next**:V5-2(boot 自动 seed v6 地址+默认路由)。
+  **Blocker**:无。
+- 2026-07-25 (IPv6 外部数据面 Phase 0 调研 — **仅调研,零实现改动**;worktree `.claude/worktrees/ipv6-external`,
+  分支 `claude/ipv6-external-nic`,基线 `feature-network-refactor@2c5fe37b`). 产出正本
+  `docs/design/07_net/IPV6_EXTERNAL_DATAPLANE_v1.md`(txdoc:07-NET-IPV6-EXT-DATAPLANE-V1)。**任务前提被实测
+  推翻一半**:外部 IPv6 **TCP 早就端到端通了**(QEMU 真机 `wget http://[fec0::2]:P/` 完整 SYN/SYN-ACK/GET/200/
+  FIN,pcap 逐帧在文档 §1.4)——`step_device_tx.rs` grep 不到 `Ipv6` 不代表纯 v4,因为
+  `SmoltcpTcpSegment::emit_ipv4_packet`(protocol/tcp.rs:565)与 `UdpTxDatagram::emit_ipv4_packet`
+  (protocol/udp.rs:494)都是**名字误导的双族函数**,`dispatch_ip_at`(ether/mod.rs:346-350)按版本 nibble
+  分派。V3b 的 off-link 网关分支也在真机首验通过(帧送到网关 MAC,§1.5)。**真缺口只有两块**:① **外部 v6
+  UDP 一个包都到不了网线**,双因:G1a `step_device_tx.rs:342` UDP 车道 `take_udp_tx_datagram()` **破坏性弹
+  出**(TCP 用"拒收即留队"、raw-ICMPv6 用 peek/commit,唯独 UDP 丢数据)× G1b 初始 namespace 一轮里有**两个
+  TX sink**,先跑的 boot lane iface(init/net.rs:75-84)**没有 `.with_ipv6`**,对任何非组播 v6 目的地
+  `decide_ipv6_route → Unreachable → Failed{EADDRNOTAVAIL}`;G1c `payload.rs:1273` `udp_tx_src_hint` 的 V6 臂
+  硬编码 `None` → smoltcp 无地址 CONTEXT_IFACE 回退 `::1`,**上线的 v6 UDP 源地址是 `::1`(网线实证)**。
+  ② **guest 开机没有任何 v6 地址/路由**(无 RA/SLAAC/link-local/DHCPv6,`crates/` 下零命中;boot 只 seed 了 v4,
+  init/net.rs:143-186)。**关键证伪**(证据同等重要):NDP 未解析 ❌(热好 NDP + sleep 3s 再发仍零包)、
+  源地址选不出 ❌(bind 到 fec0::15 仍零包)、UDP 车道对 v6 不工作 ❌(**改打组播 ff02::1 同一车道就发出去了**
+  ——这条是分离"车道坏"与"路由判死"的决定性判别)。另证伪一条"v4 回归":**QEMU `-netdev user,ipv6=on` 单独
+  指定会关掉 IPv4**,必须写 `ipv4=on,ipv6=on`,否则伪造出 v4 全死。**方案**(待用户审阅):V5-1 修 UDP
+  (弹出可回退 + V6 src hint 接 `best_ipv6_route`,后者目前是零调用者的死代码)、V5-2 镜像 v4 的 boot seed 自
+  动配 v6(**不做** RA/SLAAC,LTP 价值近零;但已实证 libslirp 收到 RS 会立即回 RA,将来做的话环境现成)、
+  V5-3 v6 源选择收敛到 FIB、V5-4 补外部 v6 回归测试(现在 `external_connect_tests.rs` 里 v6 零命中)。
+  **基线四门已跑**:rv64/la64 build ✅;`cargo test -p tx-subsystems --lib` = 832 passed **322 failed**
+  (失败集合存 `.v6work/unit-baseline.failures`);`verify-git-net.sh` **8/8**。harness 在
+  `.v6work/probe-v6.sh` + `guest-v6.sh`(两个独立 v4/v6 主机 server + filter-dump pcap + guest 探针必须
+  detach 且 out/err/rc 三文件——本 FS 的 `>>` 从 offset 0 重写、wedge 的 `connect()` 不被 `timeout` 杀掉)。
+  **Next**:等审阅通过再进 V5-1。**Blocker**:方案未审;另 slirp `hostfwd` 只支持 IPv4 ⇒ "外部主动连入 guest
+  的 v6 监听"在本环境无法测,只能靠 host 单测覆盖(已写进文档验收计划)。
+- 2026-07-24 (修复 HTTPS 慢速 push SIGSEGV — VM mprotect 全范围快捷路径丢 PrivatePageSet). 病象:git push 到
+  HTTPS 远端+慢速上传时 git-remote-https 必崩 signal 11(repro-push-noprog.sh 100% 复现;HTTP 慢速正常)。
+  **破案链**:SEGV post-mortem 增强(thread_future.rs:全寄存器+a0/a5/s0/sp hexdump+全 recipe 表;syshist
+  环扩 pid.nr(fd,cnt)=ret 并滤 rt_sigaction 洪水)→ 崩溃 pc 实际在 ld-musl(r-x 段 0x94000 对 musl text 尺
+  寸,上轮"libcurl"是错误归属)→ 指令 `sb zero,0(zero)`+ebreak = **musl mallocng 断言自杀陷阱**,寄存器指纹
+  逐条对回 get_meta 源码 = `assert(meta->mem==base)` 失败,meta 页(恒 0xafb000)256B 全零而 group 页完好 →
+  **vmwatch VA 探针**(新 tx-subsystems/vm/probe.rs + execution.rs/types.rs 布点)打出页生命史:try_mprot →
+  zmiss(合法首次零填)→ musl 写入 meta → fork(spawn send-pack)时 forkwatch 查无此页(set 缺失实锤)→
+  fork 降权后父进程写 fault 二次 zmiss **零帧 replace 顶掉有内容帧** → 页归零。**根因**:`VmEntry::
+  split_rewrite`(vm/structure/types.rs)全范围快捷路径(`range==target`)clone 换 prot 时 owners 原样保留,
+  PROT_NONE→RW 的整 entry mprotect 产出**无 PrivatePageSet 的可写私有 entry**(违反 reserve_map/sub_entry 都
+  维护的"可写私有必带 set"不变量);内容只活在 PTE,任何 re-materialize(fork 降权后的写 fault)都零填重来。
+  musl mallocng meta_area 恰以 mmap(PROT_NONE)+逐页 mprotect(RW) 生长,邻页先 RW 留单页 NONE 洞时正好全范围命
+  中。慢速 HTTPS 只是让 TLS 堆压力长出新 meta 页,非网络 bug。**修复**:快捷路径在 `prot.write && !shared &&
+  private.is_none()` 时挂 fresh set;回归单测 vm_entry_full_range_protect_to_writable_attaches_private_set。
+  **验证**:repro HTTPS+HTTP rc=0 两轮(原 100% 崩);tx-subsystems --lib 集合差 vs 无修复基线 **322==322
+  IDENTICAL**;verify-git-net.sh **8/8**;la64 编译通过。探针留树默认静音(init.rs 注释一行可再武装;
+  vmwatch WATCH_LO/HI 在 vm/probe.rs)。**Next**:无必须项;可选=真外网慢速 push 复验。Blocker:无。
+- 2026-07-24 (修复大包上传 wedge/断线 — 外部 TCP 可靠性四连修,git push 真凶). 病象:guest 向 github push
+  17MB pack 报 `curl 16 HTTP2 framing layer`+断线;本地 HTTP/1.1 同样复现(~50% wedge,宿主直推同服务端秒
+  过)。**pcap+代码四层因果链**:① 真凶=TX 弹出即丢——device-TX lane `dispatch_segment` 把段从 smoltcp 弹
+  出(remote_last_seq 已推进、视为在网),`sink.transmit_at` Busy 时段被丢弃 → 每次整窗爆发超出 virtio 队列
+  必自产真洞(pcap 实锤:被 1138 个 dup-ack 讨要的 seq 首次上线是风暴后的重传,首发从未出现);② fork
+  dispatch 重传饥饿门——`!seq_to_transmit` 挡住 should_retransmit,窗口有余量就永不服务 FastRetransmit/RTO,
+  发完新数据还把 FastRetransmit 覆写成新 RTO → 洞长期不补,cwnd 崩塌爬行(~4.4KB/s),rewind 整窗再爆发再
+  丢=自续损耗环;③ 静默泵缺失——deadline 到期只 kick TICK,而 RX 读+dispatch+device-TX 全在 poll_seen 分
+  支,tick 分支只走半开握手 backlog → 全静默(洞+窗口顶死)后 RTO 永无发射机会,双端死等(pcap:对端 ack
+  18121 停格、guest 顶到 18121+65535 窗口边缘后 400s+ 无包);④ 尾期丢唤醒——feed 的 recv 发布被
+  `recv_wq.peek()&HAS_DATA==0` 抑制,读者"见空→[响应入缓冲,发布被抑制]→清线→睡"竞态后永睡(实锤:
+  report-status 响应已 TCP-ACK 入缓冲,git 挂死至 timeout)。**修复**:step_device_tx 改
+  `dispatch_segment_via`(sink 发射进 dispatch 闭包,拒收→闭包 Err→smoltcp 状态回滚段留队,fork 的
+  emit(...)? 语义本就支持);fork tcp.rs 撤 `!seq_to_transmit` 门(真 TCP 洞优先);boot_net_deadline_task
+  超时 TICK+POLL 双拉;feed 撤发布抑制门(重复 fire 幂等)。**验证**:15MB push 本地 HTTP 5/5、HTTPS/TLS
+  (node h2 服务端)rc=0 且 **2m17s 零重传**(修前:永不完成/4.4KB/s 爬行);tx-subsystems net:: 集合差 vs
+  HEAD 字节级一致(199 已知级联失败同款);verify-git-net.sh 8/8。诊断法:QEMU `-object filter-dump` pcap +
+  逐层判别(宿主直推排除服务端→本地 h1 排除 h2/代理→dup-ack 停格定重传缺席→首发缺失定 TX 丢段)。
+  **Next**:la64 重建验证(欠两轮);镜像仅 ~25MB 空闲+ENOSPC 在 close-flush 被静默吞(write 假成功)待
+  修;smoltcp fork 自带测试套 pre-existing 编不过(rstest 缺件)。Blocker:无。
+- 2026-07-24 (修复 `git remote add` 丢 url — VFS walk 解析权归 FS 层). 病象:guest 里 `git remote add me
+  <url>` 后 `git remote -v` 只有名字没网址;`.git/config` 缺 url 行(fetch 行在)。**探针链定根因**(txdiag
+  计数器 → 事件环 → 实例指针三轮迭代):`git remote add` 单进程连做两次 config 改写(写 config.lock →
+  rename 盖 config × 2),第二次改写打开 config 时 dentry 子缓存命中**陈旧实例**读到改写一前的内容,url 于是
+  被第二次改写覆盖丢失。深层结构病:**同一目录可并存多个活 DEntry 实例**(children 弱引用死亡后各 walk 独立
+  重建链条;实证 `.git` 被填进 15+ 个一次性父实例),rename/unlink 的 `remove_cached_child` 打在自己 walk 出
+  的一次性实例上,open 路径命中的 canonical 实例从未被清,直到弱引用自然死亡"自愈"(瞬态、时机依赖;ext4
+  三层缓存 lookup_cache/dir_cache/inode_meta_cache 的按父失效反而全程正确)。**修复**(resolution/step.rs
+  kernel_step 单函数):解析权反转——每组件先走 `FsOps::lookup`(其按父失效全局键控、已证一致),dentry 子缓
+  存降级为"FS 同意 ino 时保留既有 DEntry/RNode(含 PageContainer)身份",ino 不合即丢弃缓存实例重物化。顺带
+  治好同族 unlink-后-open-命中已删 dentry 类。**验证**:remote-add 复现全绿(url/fetch/remote -v/geturl 全
+  正确,ino 链 7183→7192→7194)+ 昨日 stale-stat 复现回归绿 + verify-git-net.sh 8/8。代价:每组件多一次
+  FS-lookup(ext4 侧 BTreeMap 命中,LTP exec 风暴依赖的 ext4 负缓存不变)。**Next**:la64 重建验证;残留结构
+  债(dentry 多实例/rnode+pc 重复物化、NeedIO-resume 路径不保身份)记入 P5。Blocker:无。
+- 2026-07-23 (修复 ext4 覆写已 tracked 文件 git 看不见 — O_TRUNC/stat/mtime 三层根因). 病象:guest 里
+  `git clone` 后 `echo "hello" > README`,cat 见新内容但 `git add .`+`git status` 报 clean(git 只比 lstat
+  size/mtime/ctime,匹配就不读内容)。**内核探针(txdiag,sys_sync 触发 dump)实证根因链**,推翻"stat 读到
+  缓存快照"假设——stat 一直读磁盘真值,是磁盘被写坏:① sys_openat O_TRUNC 只截磁盘 inode、不截活
+  PageContainer → pc.size 停旧值,write 后 restore-dup2 的 step_fsync 把陈旧 size truncate 回磁盘,抹掉
+  O_TRUNC(磁盘=hello\n+整页零+旧 size,pc 死后重开读 hello+2884×\0,hash-object 实证;cat 显示 hello 是
+  shell 吞 NUL 的假象);② mtime 恒 0:写路径无人维护,且 serialize_inode_meta→write_inode_meta_journaled
+  只写 journal 区、从不 checkpoint home block(chmod/chown/utimensat 同坑,utimensat 的 STAT_META_OVERRIDES
+  表即补丁痕迹),mtime≡0 还关掉 git racy-clean 保护。**修复(7 文件)**:fs_basic.rs O_TRUNC 臂对
+  File-kind pc 走 step_truncate 双截(tmpfs Anon-kind 保持旧路,其 truncate 自带双更新;⚠️ EBR guard 不可
+  嵌套,fs_page_backing_for_dentry 须在本地 guard 前调);lifecycle.rs step_fsync size 持久化后 stamp
+  mtime/ctime(同尺寸覆写也能检出);composite.rs live_meta_for_dentry 活 pc size 覆盖(path-stat 与 fstat
+  一致);wall_clock.rs 加 install_monotonic_ns_source/realtime_now_ns_hooked 非泛型时钟 hook + init.rs 启动
+  安装;pager.rs 加 in-place write_inode_meta + namespace.rs serialize 改走它(journal 变体保留给 jbd2 仿真
+  测试)。**验证**:QEMU 最小复现全绿(stat size=6 + 真实 RTC mtime 随写推进、git status="M f"、index/
+  hash-object==blob("hello\n")、applet cat> 路径同绿)+ verify-git-net.sh 8/8(含 git init chmod 走新
+  serialize 路)。xtask unit 未跑(本谱系已知挂,既定裁定用 QEMU 验)。**Next**:la64 重建+
+  verify-git-net-la64.sh(push 前必补);全量 LTP 对账;考虑退役 STAT_META_OVERRIDES。Blocker:无。改动与
+  未提交的 git-clone 猎杀 5 连修同文件纠缠,提交时机由用户定。
 - 2026-07-18 (merge main→final-test + 两大 post-merge 修复). main 76 提交并入:net 重构(#52,55 文件)全量取
   main;9 文本+3 语义冲突逐个核对解——rv boot_static 保 final-test 动态 MMIO 发现+补 main goldfish-rtc 静态区
   (GENERATED_MMIO_REGIONS +1→+2)、tx-hal uart_irq()+NET_IRQ 两侧都留、exec LTP 取 final-test 自洽版(main 版
@@ -17773,3 +18293,109 @@
   on those missing APIs. No push was performed; the original dirty source
   worktree was not changed. Next: explicitly approve either a broader
   observation/publication baseline migration or a reduced time-only publish.
+- 2026-07-31 (**feature-network-refactor 合并恢复总账与后续路线图完成；代码恢复与
+  结构完成分层管理**). 对照 premerge 锚点 `90939012`、merge `6d41a347` 和
+  当前 `ad115d68`，确认两个已知 merge 回退——RV64 `NET_IRQ` 和
+  Socket/FileOps 生产接线——均已在 07-30 恢复；当前没有已知未恢复的代码
+  回退，且 TCP generation/connect、`SO_ERROR`、部分 live sockopt 和跨 netns
+  数据面已超过 premerge。仍不能宣称“全部网络功能恢复”：07-30 后缺 LA64
+  Git、双架构 musl/glibc netperf+iperf 及固定 LTP/OSComp verdict-set 的完整
+  复跑；retained last-close/FIN_WAIT/TIME_WAIT/`SO_LINGER`、readiness 双轨、
+  动态对象回收、容量硬编码、L2/L3 所有权及协议缺口是 premerge 本来就有的
+  R3 欠账。已建立 R1 代码恢复/R2 行为恢复/R3 重构完成三层判据和 Phase 0～9
+  计划。**Verification**：只读核对 git first-parent 序列、premerge/current
+  锚点、关键 close/readiness/ether 代码和已有测试记录；新 JSON 通过 `jq`
+  解析与字段/状态/路径核对，`git diff --check` 通过。全仓
+  `cargo xtask progress validate` 仍先被既有 07-24 计划中的非法
+  `completed` 状态阻断；`cargo xtask lint docs` 仍报既有 23 个断链和 6 个
+  stale-vocabulary warning，本次两个 07-31 记录均未出现在失败清单。
+  **Next**：先执行 Phase 0 post-merge 验收基线；后续 Phase 1～8 的原始
+  建议已由下一条范围修正记录明确搁置。路线图见
+  `docs/progress/research/2026-07-31-network-merge-recovery-roadmap.md`，可执行
+  计划见 `docs/progress/plans/2026-07-31-network-merge-recovery.json`。
+- 2026-07-31 (**网络 merge 恢复范围收缩：Phase 1～8 搁置，只验收
+  `90939012` 已有功能**). 按用户确认修正 07-31 路线：OFD release、
+  retained close/`SO_LINGER`、readiness、动态对象/容量、IPv6 fragment、
+  VLAN 和 L2/L3 工作均不是已知 merge 回退，不再属于当前恢复计划。当前
+  唯一 active step 是固定 post-merge 验收：host targeted；RV64 Git/IRQ
+  9/9；LA64 Git 8/8；双架构 musl/glibc netperf+iperf 各 22/22；
+  filtered libc-test network ABI；RV64 musl LTP socket 六分批
+  `40/40、35/35、37/38、93/95、14/17、10/11`，合计 229/236 且
+  verdict-set 不新增差项。旧 `libctest-network`/`lmbench-network`
+  selector 已退役，不能直接使用；前者改用当前 filtered group，后者不作为
+  硬门槛。**Changed**：收缩 active JSON plan，新增精确命令/分数/超时矩阵。
+  **Verification**：只读核对 current Makefile、xtask group selector、Git
+  scripts、LTP witness runner 和 premerge ledger；尚未启动慢测试。
+  **Next**：先确认或重建干净 RV64 OSComp 镜像，再从 host targeted 和双架构
+  Git gate 开始。**Blocker**：当前共享
+  `target/oscomp/testdata/sdcard-rv.img` 有既存 ext4 block-bitmap checksum
+  损坏记录，不能作为正式 OSComp/LTP 证据源。矩阵见
+  `docs/progress/research/2026-07-31-premerge-network-recovery-test-matrix.md`。
+- 2026-07-31 (**merge 前网络功能的有序恢复验收已执行完毕，Phase 1～8
+  继续搁置**). **Changed**：修复三个已确认 merge 回退：恢复 OSComp
+  `/musl/{musl,glibc}` lane 与动态解释器兼容接线；让 UDP 零长度 datagram
+  穿过通用队列和 inline loopback（netperf 依靠它结束测试）；恢复 musl
+  libc-test dynamic lane 的 `runtest.exe` 启动方式。LTP witness runner
+  新增显式干净镜像覆盖，不改写已损坏的共享 RV64 镜像。
+  **Verification**：Gate A 全绿（IRQ 7/7、reactor 8/8、fdtable 102/102、
+  TCP lifecycle 27/27、external connect 14/14、veth 4/4、network tick
+  4/4）；RV64 Git/IRQ 9/9 且 claims/completions 80/80，LA64 Git 8/8；
+  RV64 netperf/iperf 22/22；LA64 iperf 12/12，两个 netperf lane 均先过
+  前四项再在 TCP_CRR 失败；libc-test musl 12/12、glibc 8/12，失败仅为
+  允许的四项 resolver case；LTP b1/b2/b5 保持可复现历史结果，b3/b4/b6
+  与相同镜像/runner 下的 `90939012` 逐项 verdict 完全一致，没有新增
+  网络 syscall 差项。直接 anchor 证明 LA64 TCP_CRR 本来就因容量耗尽
+  `Out of memory`，所以矩阵原写的 LA64 5/5 不是可复现基线；当前在相同
+  点触发 Zone post-barrier enqueue assertion，功能成功集相同但失败方式
+  更差，明确保留为已搁置 Phase 7 的容量/对象生命周期风险，不能写成已修复。
+  **Next**：评审并提交本轮最小恢复补丁；只有用户重新授权后才进入 Phase 7
+  或其他 Phase 1～8 工作。**Blocker**：本轮验收无剩余阻塞；共享
+  `target/oscomp/testdata/sdcard-rv.img` 仍损坏，后续正式跑必须继续使用
+  `target/oscomp/recovery-source/sdcard-rv.img` 或重建干净镜像。完整命令、
+  日志与 rejected hypotheses 见
+  `msp/debug-logs/2026-07-31-premerge-network-recovery-operation-ledger.md`，
+  修正后的判据见
+  `docs/progress/research/2026-07-31-premerge-network-recovery-test-matrix.md`。
+- 2026-07-31 (**恢复补丁审查修正：计划退回 blocked，Phase 1～8 仍不启动**).
+  审查否定了上一条“无剩余阻塞”的结论：祖先 `87ae1d21` 有 LA64
+  netperf/iperf 22/22 的明确记录，当前两条 TCP_CRR Zone assertion 因而是
+  未恢复项；一次 `90939012` ENOMEM replay 不能覆盖已有成功见证。LTP b6
+  也未完成 exact 对账：只重放了同样 stall 的 anchor `setsockopt06`，而历史
+  focused ledger 有 1/1，且 anchor tail 未整体重放。**Changed**：JSON plan
+  和验收矩阵改为 blocked；零长度 UDP 补齐 non-inline sendto、sendmsg/
+  sendmmsg、零长度 recvfrom/recvmsg 的 datagram 消费语义与 syscall/外部 TX
+  测试；Git HTTP/HTTPS 改用本地 hostname，另保留带 30 秒局部超时的真实
+  SLIRP DNS 查询；LTP runner 记录镜像来源且不再吞 timeout 状态；loader
+  shim 按架构创建并让失败 sentinel 反映 symlink 结果。零长度 UDP 是当前
+  netperf 所需的 Linux 兼容修复，`90939012` 源码本身也会丢弃空 datagram，
+  不再称为直接恢复 anchor 实现。**Verification**：审查后 Gate A 再次全绿
+  （IRQ 7/7、reactor 8/8、fdtable 103/103、TCP lifecycle 27/27、external
+  connect 14/14、veth 4/4、network tick 4/4）；RV64/LA64 target build 通过；
+  hostname 版 RV64 Git/IRQ 9/9（80/80）和 LA64 Git 8/8；新鲜镜像 RV64
+  netperf-musl 5/5。零长度 UDP 定向测试、syscall 测试和 init exec 测试通过。
+  全仓 `cargo -q xtask unit` 未全绿：三个无关 `tx-shims` 用例定向复跑仍失败，
+  `tx-ext4` test target 另有八处既有 `with_target` API 编译不一致；本轮不扩修。
+  `cargo fmt --all -- --check` 仍受全仓约 1022 行既有格式漂移阻断；未做批量
+  格式化。零长度 UDP 直接收发和 netperf 已过，但 `recv_available()` 仍按
+  payload 字节数计算，空 datagram 的 `can_recv()`/readiness 收敛继续归入
+  已搁置 Phase 6/7。**Next**：LA64 TCP_CRR 涉及已搁置 Phase 7 容量/对象生命周期，
+  未获重新授权前只记录 blocker，不扩大修改。**Blocker**：LA64 TCP_CRR
+  2 项；LTP b6 `setsockopt06` 历史成功证据冲突；共享 RV64 镜像仍损坏。
+- 2026-07-31 (**LA64 TCP_CRR 调查完成：归因到 merge 后 publication/EBR
+  回收袋不变量，不是网络 Phase 7 容量问题**). 在基线提交 `f69d762e` 上用两次
+  独立干净 LA64 musl netperf boot 复现：前四项通过，TCP_CRR 释放
+  `SocketPayload` 时，epoch 40 的 bag 1 实际为 `epoch=0`、`zone_count=0`、
+  `rcu_count=1`；唯一 RCU 节点的回调地址解析为
+  `tx_substrate::publication::defer_node`，生产代码唯一 `Published<T>` owner 是
+  VM `RecipeTree`。两次 boot 的 timer-idle 均为 `ok`，仍有约 252k free pages；
+  TCP 表、64 端口区间和 Socket slab 都不是直接失败点。该三袋 EBR/直接 Cap
+  enqueue 路径来自 merge 侧提交 `dd9435f3`，所以 TCP_CRR 是触发器，不是语义
+  owner。**Changed**：仅作临时 panic 诊断并已全部撤销；未修改生产逻辑。
+  **Verification**：诊断日志
+  `target/oscomp/la64-tcp-crr-diag{,2}-f69d762e.txt`；撤销后
+  `cargo xtask build --target la64-qemu --release` 与普通 LA64 submit artifact
+  重建通过。**Next**：先补 substrate 确定性回归和袋 mutation-boundary
+  invariant，再恢复 final Cap 的 checked preflight + bounded drain/retry；禁止用
+  增大 bag/table/port 容量掩盖。**Blocker**：尚未定位是谁把
+  `epoch=0` 与非空 publication head 组合出来，也尚未获授权实现该修复；恢复
+  计划继续 blocked。

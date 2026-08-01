@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use tx_services::time::{
     ClockRead, DeadlineRegistrarHandle, TimekeeperClock, TimekeeperIf, timekeeper,
 };
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::device::{RtcAlarmEmulation, RtcTime};
 use tx_subsystems::tty::execution::{
     IoctlTcgetsOp, IoctlTcsetsOp, IoctlTiocgpgrpOp, IoctlTiocgwinszOp, IoctlTiocnottyOp,
@@ -504,16 +505,11 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => {
                     if (arg & O_NONBLOCK as u64) != 0 {
-                        if let OpenFileBacking::Rnode { rnode } = file.backing() {
-                            if let RNodeBacking::StructBacked {
-                                payload: StructPayload::Socket { identity },
-                            } = rnode.backing()
-                            {
-                                identity.readiness.fire_send_with_post(
-                                    tx_subsystems::net::structure::SendWireSet::SPACE,
-                                    |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
-                                );
-                            }
+                        if let Some(ops) = file.file_ops() {
+                            let mut post = |mailbox: &TaskMailbox, event: MailboxEvent| {
+                                ctx.post_mailbox_ref_event(mailbox, event)
+                            };
+                            ops.on_set_fl_nonblock(&mut post);
                         }
                     }
                     SyscallResult::Return(0)
@@ -625,7 +621,27 @@ fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
 
 fn queue_file_close_writeback(file: &Cap<OpenFile>) {
     if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
-        let _ = pc.queue_dirty_file_writeback();
+        // The async close-writeback admission only makes progress when the
+        // mount has a backend planner driving the L4 pipeline. The bootstrap
+        // sdcard ext4 deliberately has none (block-completion IRQs cannot be
+        // serviced while the bootstrap exec is the only thing running), so
+        // fall back to the synchronous flush — the same planner/no-planner
+        // split `FsyncOp` makes. Without this, every file written on that
+        // mount closed with its bytes still in the page cache: `git init`
+        // left `.git/HEAD` and `.git/config` existing but EMPTY, and git
+        // then reported "not a git repository".
+        let planner_backed = match pc.kind() {
+            tx_subsystems::page_backed::PageContainerKind::File { mount, .. } => {
+                mount.payload().backend_planner().is_some()
+            }
+            _ => true,
+        };
+        if planner_backed {
+            let _ = pc.queue_dirty_file_writeback();
+        } else {
+            let guard = step_engine::guard();
+            let _ = tx_subsystems::page_backed::step_fsync(&pc, &guard);
+        }
     }
 }
 
@@ -1331,27 +1347,68 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         if dentry_meta.kind() == InodeKind::CharDevice {
             // Linux treats O_TRUNC on character devices as a no-op.
         } else {
-            let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
-                Some(b) => b,
-                None => return SyscallResult::Error(ENOSYS_VALUE),
+            use tx_subsystems::page_backed::adapter::step_engine::StepOutcome as V3Trunc;
+            // Page-backed rnodes must truncate the LIVE PageContainer together
+            // with the FS inode (`step_truncate`, the same both-sides path
+            // ftruncate takes). Truncating only the FS side leaves a cached
+            // `pc` at its stale pre-open size: the write lands at offset 0
+            // without shrinking `pc.size_bytes()`, and the close-time
+            // `step_fsync` then persists that stale size straight back over
+            // the truncate — `echo new > tracked-file` kept the old st_size,
+            // so stat-cache-based change detection (git) never saw shell-
+            // redirect edits, while readers got the old length padded from
+            // the fresh zero page.
+            //
+            // Only File-kind containers route through `step_truncate`: an
+            // Anon-kind pc (tmpfs) gets no `FsPageBacking::truncate` callback
+            // from it, which would skip tmpfs's own payload-size update —
+            // tmpfs's `truncate` impl already does the pc-level shrink
+            // itself, so it stays on the `fs_page_backing` arm below.
+            let live_pc = match dentry.rnode().backing() {
+                tx_subsystems::vfs::structure::RNodeBacking::PageBacked { pc }
+                    if matches!(
+                        pc.kind(),
+                        tx_subsystems::page_backed::PageContainerKind::File { .. }
+                    ) =>
+                {
+                    Some(pc.clone())
+                }
+                _ => None,
             };
-            let fs_object_id = dentry.rnode().fs_object_id();
-            match drive(
-                TruncateFsObjectOp {
-                    page_backing: fs_page_backing,
-                    fs_object_id,
-                    new_size: 0,
-                },
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            if let Some(pc) = live_pc {
+                let guard = step_engine::guard();
+                match tx_subsystems::page_backed::step_truncate(&pc, 0, &guard) {
+                    V3Trunc::Done(()) => {}
+                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                    V3Trunc::Err(errno) => {
+                        return SyscallResult::error_from(Errno::from(errno));
+                    }
+                }
+            } else {
+                let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
+                    Some(b) => b,
+                    None => return SyscallResult::Error(ENOSYS_VALUE),
+                };
+                let fs_object_id = dentry.rnode().fs_object_id();
+                match drive(
+                    TruncateFsObjectOp {
+                        page_backing: fs_page_backing,
+                        fs_object_id,
+                        new_size: 0,
+                    },
+                    &mut script_ctx,
+                    DriveMode::Waiting,
+                    mailbox_arc.as_ref(),
+                    delegate_registry_arc.as_deref(),
+                    timer_registrar_handle.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                }
             }
         }
     }
@@ -1553,6 +1610,7 @@ pub(super) fn sys_dup3<'a>(
     if newfd >= soft_limit {
         return SyscallResult::Error(EBADF_VALUE);
     }
+    let replaced_file = (oldfd != newfd).then(|| ctx.process.fd(newfd)).flatten();
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = Dup3Op {
         process: ctx.process.clone(),
@@ -1561,7 +1619,12 @@ pub(super) fn sys_dup3<'a>(
         flags,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(fd) => SyscallResult::Return(fd as i64),
+        Ok(fd) => {
+            if let Some(file) = replaced_file {
+                queue_file_close_writeback(&file);
+            }
+            SyscallResult::Return(fd as i64)
+        }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

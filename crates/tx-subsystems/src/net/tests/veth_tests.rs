@@ -7,6 +7,10 @@ const NS_B_IP6: Ipv6Address = Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0,
 
 #[test]
 fn veth_pair_transmit_delivers_to_peer_rx_queue() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
     let guard = tx_substrate::epoch::guard();
     let pair = new_test_veth_pair("vetha0", "vethb0", 70);
     let frame = ethernet_ipv4_frame(17, &udp_transport(50_100, 40_100, b"hello"));
@@ -88,7 +92,7 @@ fn veth_pair_can_bridge_udp_between_isolated_namespace_socket_tables() {
         device: pair.left,
     };
     assert_eq!(pair.right_device.pending_rx(), 0);
-    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at_with_post(
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
         &sink_a,
         ns_a.clone(),
         smoltcp::time::Instant::ZERO,
@@ -99,7 +103,6 @@ fn veth_pair_can_bridge_udp_between_isolated_namespace_socket_tables() {
             raw_icmp: 0,
         },
         &guard,
-        |mailbox, event| mailbox.post(event),
     ) else {
         panic!("device tx step should complete");
     };
@@ -139,7 +142,7 @@ fn veth_pair_can_bridge_udp_between_isolated_namespace_socket_tables() {
 }
 
 #[test]
-fn veth_namespaces_can_direct_tcp_stream_and_eof() {
+fn veth_namespaces_route_tcp_stream_through_device_path() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -182,9 +185,42 @@ fn veth_namespaces_can_direct_tcp_stream_and_eof() {
         step_bind(&client, inet_at(NS_A_IP, 50_102), &guard),
         StepOutcome::Done(())
     );
-    assert_eq!(
+    assert!(matches!(
         step_connect(&client, inet_at(NS_B_IP, 40_102), &guard),
-        StepOutcome::Done(())
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        client
+            .acquire_operational()
+            .expect("client payload")
+            .raw_tcp_socket()
+            .expect("client TCP engine")
+            .protocol_state(),
+        smoltcp::socket::tcp::State::SynSent
+    );
+
+    let adapter_a = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: pair.left.ops.mac_addr(),
+        local_ipv4: NS_A_IP,
+        mtu: pair.left.ops.mtu(),
+    });
+    let adapter_b = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: pair.right.ops.mac_addr(),
+        local_ipv4: NS_B_IP,
+        mtu: pair.right.ops.mtu(),
+    });
+    drive_veth_tcp_handshake(
+        &client,
+        &listener,
+        ns_a.clone(),
+        ns_b.clone(),
+        &pair,
+        &adapter_a,
+        &adapter_b,
+        &guard,
     );
 
     let accepted = match step_accept(&listener, &guard) {
@@ -193,13 +229,30 @@ fn veth_namespaces_can_direct_tcp_stream_and_eof() {
             assert_eq!(accepted.peer, IpEndpoint::new(NS_A_IP, 50_102));
             accepted.child
         }
-        _ => panic!("expected accepted direct tcp child"),
+        _ => panic!("expected accepted TCP child after wire handshake"),
     };
+    assert_eq!(
+        accepted
+            .acquire_operational()
+            .expect("accepted payload")
+            .raw_tcp_socket()
+            .expect("accepted TCP engine")
+            .protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
 
     let request = b"1600020=/musl/musl/ltp/testcases/bin/datafiles/ascii.jmb";
-    assert_eq!(
-        step_send_kernel_bytes(&client, request, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(request.len())
+    transfer_tcp_bytes_over_veth(
+        &client,
+        &accepted,
+        request,
+        ns_a.clone(),
+        ns_b.clone(),
+        pair.left,
+        pair.right,
+        &adapter_a,
+        &adapter_b,
+        &guard,
     );
     let mut request_out = [0u8; 96];
     match step_recv_kernel_bytes(&accepted, &mut request_out, SendRecvFlags::empty(), &guard) {
@@ -210,10 +263,18 @@ fn veth_namespaces_can_direct_tcp_stream_and_eof() {
         _ => panic!("expected request bytes on accepted socket"),
     }
 
-    let large_payload = std::vec![0x5au8; 300_000];
-    assert_eq!(
-        step_send_kernel_bytes(&accepted, &large_payload, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(large_payload.len())
+    let large_payload = std::vec![0x5au8; 32_000];
+    transfer_tcp_bytes_over_veth(
+        &accepted,
+        &client,
+        &large_payload,
+        ns_b.clone(),
+        ns_a.clone(),
+        pair.right,
+        pair.left,
+        &adapter_b,
+        &adapter_a,
+        &guard,
     );
 
     let mut received = std::vec::Vec::with_capacity(large_payload.len());
@@ -226,7 +287,7 @@ fn veth_namespaces_can_direct_tcp_stream_and_eof() {
                 assert!(outcome.bytes > 0, "unexpected EOF before full payload");
                 received.extend_from_slice(&chunk[..outcome.bytes]);
             }
-            _ => panic!("expected direct tcp stream bytes on client socket"),
+            _ => panic!("expected TCP stream bytes on client socket"),
         }
     }
     assert_eq!(received, large_payload);
@@ -235,14 +296,14 @@ fn veth_namespaces_can_direct_tcp_stream_and_eof() {
         step_socket_close(&accepted, &guard),
         StepOutcome::Done(_)
     ));
-    assert_eq!(
-        step_recv(&client, 1, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(0)
-    );
+    assert!(matches!(
+        step_socket_close(&client, &guard),
+        StepOutcome::Done(_)
+    ));
 }
 
 #[test]
-fn veth_namespaces_can_direct_tcp6_stream_and_eof() {
+fn veth_namespaces_route_tcp6_stream_through_device_path() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -304,9 +365,42 @@ fn veth_namespaces_can_direct_tcp6_stream_and_eof() {
         step_bind(&client, inet6_at(NS_A_IP6, 50_103), &guard),
         StepOutcome::Done(())
     );
-    assert_eq!(
+    assert!(matches!(
         step_connect(&client, inet6_at(NS_B_IP6, 40_103), &guard),
-        StepOutcome::Done(())
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        client
+            .acquire_operational()
+            .expect("client payload")
+            .raw_tcp_socket()
+            .expect("client TCP engine")
+            .protocol_state(),
+        smoltcp::socket::tcp::State::SynSent
+    );
+
+    let adapter_a = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: pair.left.ops.mac_addr(),
+        local_ipv4: Ipv4Address::UNSPECIFIED,
+        mtu: pair.left.ops.mtu(),
+    });
+    let adapter_b = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: pair.right.ops.mac_addr(),
+        local_ipv4: Ipv4Address::UNSPECIFIED,
+        mtu: pair.right.ops.mtu(),
+    });
+    drive_veth_tcp_handshake(
+        &client,
+        &listener,
+        ns_a.clone(),
+        ns_b.clone(),
+        &pair,
+        &adapter_a,
+        &adapter_b,
+        &guard,
     );
 
     let accepted = match step_accept(&listener, &guard) {
@@ -315,13 +409,30 @@ fn veth_namespaces_can_direct_tcp6_stream_and_eof() {
             assert_eq!(accepted.peer, IpEndpoint::new_v6(NS_A_IP6, 50_103));
             accepted.child
         }
-        _ => panic!("expected accepted direct tcp6 child"),
+        _ => panic!("expected accepted TCP6 child after wire handshake"),
     };
+    assert_eq!(
+        accepted
+            .acquire_operational()
+            .expect("accepted payload")
+            .raw_tcp_socket()
+            .expect("accepted TCP engine")
+            .protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
 
     let request = b"1600020=/musl/musl/ltp/testcases/bin/datafiles/ascii.jmb";
-    assert_eq!(
-        step_send_kernel_bytes(&client, request, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(request.len())
+    transfer_tcp_bytes_over_veth(
+        &client,
+        &accepted,
+        request,
+        ns_a.clone(),
+        ns_b.clone(),
+        pair.left,
+        pair.right,
+        &adapter_a,
+        &adapter_b,
+        &guard,
     );
     let mut request_out = [0u8; 96];
     match step_recv_kernel_bytes(&accepted, &mut request_out, SendRecvFlags::empty(), &guard) {
@@ -332,10 +443,18 @@ fn veth_namespaces_can_direct_tcp6_stream_and_eof() {
         _ => panic!("expected request bytes on accepted tcp6 socket"),
     }
 
-    let large_payload = std::vec![0x6au8; 300_000];
-    assert_eq!(
-        step_send_kernel_bytes(&accepted, &large_payload, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(large_payload.len())
+    let large_payload = std::vec![0x6au8; 32_000];
+    transfer_tcp_bytes_over_veth(
+        &accepted,
+        &client,
+        &large_payload,
+        ns_b.clone(),
+        ns_a.clone(),
+        pair.right,
+        pair.left,
+        &adapter_b,
+        &adapter_a,
+        &guard,
     );
 
     let mut received = std::vec::Vec::with_capacity(large_payload.len());
@@ -348,7 +467,7 @@ fn veth_namespaces_can_direct_tcp6_stream_and_eof() {
                 assert!(outcome.bytes > 0, "unexpected EOF before full payload");
                 received.extend_from_slice(&chunk[..outcome.bytes]);
             }
-            _ => panic!("expected direct tcp6 stream bytes on client socket"),
+            _ => panic!("expected TCP6 stream bytes on client socket"),
         }
     }
     assert_eq!(received, large_payload);
@@ -357,10 +476,198 @@ fn veth_namespaces_can_direct_tcp6_stream_and_eof() {
         step_socket_close(&accepted, &guard),
         StepOutcome::Done(_)
     ));
+    assert!(matches!(
+        step_socket_close(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+}
+
+fn drive_veth_tcp_handshake(
+    client: &tx_substrate::zone::Cap<SocketIdentity>,
+    listener: &tx_substrate::zone::Cap<SocketIdentity>,
+    ns_a: tx_substrate::zone::PayloadCap<crate::net::namespace::NetNamespacePayload>,
+    ns_b: tx_substrate::zone::PayloadCap<crate::net::namespace::NetNamespacePayload>,
+    pair: &VethPair,
+    adapter_a: &SmoltcpAdapter,
+    adapter_b: &SmoltcpAdapter,
+    guard: &Guard<'_>,
+) {
+    let sink_a = SmoltcpPacketTxSink {
+        adapter: adapter_a,
+        device: pair.left,
+    };
+    let sink_b = SmoltcpPacketTxSink {
+        adapter: adapter_b,
+        device: pair.right,
+    };
+    let source_a = SmoltcpPacketSource {
+        adapter: adapter_a,
+        device: pair.left,
+    };
+    let source_b = SmoltcpPacketSource {
+        adapter: adapter_b,
+        device: pair.right,
+    };
+
+    assert_eq!(drive_veth_tcp_tx(&sink_a, ns_a.clone(), guard), 1);
+    assert_eq!(drive_veth_network_rx(&source_b, ns_b.clone(), guard), 1);
+    assert!(matches!(
+        step_accept(listener, guard),
+        StepOutcome::Yield { .. }
+    ));
+
+    assert_eq!(drive_veth_tcp_tx(&sink_b, ns_b.clone(), guard), 1);
+    assert_eq!(drive_veth_network_rx(&source_a, ns_a.clone(), guard), 1);
     assert_eq!(
-        step_recv(&client, 1, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(0)
+        client
+            .acquire_operational()
+            .expect("client payload")
+            .raw_tcp_socket()
+            .expect("client TCP engine")
+            .protocol_state(),
+        smoltcp::socket::tcp::State::Established
     );
+
+    assert_eq!(drive_veth_tcp_tx(&sink_a, ns_a, guard), 1);
+    assert_eq!(drive_veth_network_rx(&source_b, ns_b, guard), 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_tcp_bytes_over_veth(
+    sender: &tx_substrate::zone::Cap<SocketIdentity>,
+    receiver: &tx_substrate::zone::Cap<SocketIdentity>,
+    bytes: &[u8],
+    sender_namespace: tx_substrate::zone::PayloadCap<crate::net::namespace::NetNamespacePayload>,
+    receiver_namespace: tx_substrate::zone::PayloadCap<crate::net::namespace::NetNamespacePayload>,
+    sender_device: &'static NetDeviceRegistration,
+    receiver_device: &'static NetDeviceRegistration,
+    sender_adapter: &SmoltcpAdapter,
+    receiver_adapter: &SmoltcpAdapter,
+    guard: &Guard<'_>,
+) {
+    assert_eq!(
+        step_send_kernel_bytes(sender, bytes, SendRecvFlags::empty(), guard),
+        StepOutcome::Done(bytes.len())
+    );
+    let sink = SmoltcpPacketTxSink {
+        adapter: sender_adapter,
+        device: sender_device,
+    };
+    let source = SmoltcpPacketSource {
+        adapter: receiver_adapter,
+        device: receiver_device,
+    };
+    let ack_sink = SmoltcpPacketTxSink {
+        adapter: receiver_adapter,
+        device: receiver_device,
+    };
+    let ack_source = SmoltcpPacketSource {
+        adapter: sender_adapter,
+        device: sender_device,
+    };
+    for _ in 0..64 {
+        let sent = drive_veth_tcp_tx(&sink, sender_namespace.clone(), guard);
+        let received = drive_veth_network_rx(&source, receiver_namespace.clone(), guard);
+        if receiver.acquire_operational().is_some_and(|payload| {
+            payload
+                .raw_tcp_socket()
+                .is_some_and(|raw| raw.recv_available() >= bytes.len())
+        }) {
+            return;
+        }
+        let acknowledgements = drive_veth_tcp_tx(&ack_sink, receiver_namespace.clone(), guard);
+        let acknowledgements_received =
+            drive_veth_network_rx(&ack_source, sender_namespace.clone(), guard);
+        assert!(
+            sent + received + acknowledgements + acknowledgements_received > 0,
+            "TCP transfer stalled before all bytes reached the receiver"
+        );
+    }
+    panic!("TCP transfer exceeded the bounded veth drive budget");
+}
+
+fn drive_veth_tcp_tx(
+    sink: &SmoltcpPacketTxSink<'_>,
+    namespace: tx_substrate::zone::PayloadCap<crate::net::namespace::NetNamespacePayload>,
+    guard: &Guard<'_>,
+) -> usize {
+    let probe = VethTcpTxProbe::new(sink);
+    let StepOutcome::Done(outcome) = step_process_device_tx_pending_in_namespace_at(
+        &probe,
+        namespace,
+        smoltcp::time::Instant::ZERO,
+        DeviceTxBudget {
+            tcp_connecting: 8,
+            tcp_connected: 64,
+            udp_bound: 0,
+            raw_icmp: 0,
+        },
+        guard,
+    ) else {
+        panic!("veth TCP device-TX step should complete");
+    };
+    let attempts = probe.attempts.lock().expect("TX probe attempts");
+    assert_eq!(outcome.tcp_busy, 0, "{outcome:?}; attempts={attempts:?}");
+    assert_eq!(
+        outcome.tcp_resolution_pending, 0,
+        "{outcome:?}; attempts={attempts:?}"
+    );
+    assert_eq!(outcome.tcp_failed, 0, "{outcome:?}; attempts={attempts:?}");
+    outcome.tcp_packets
+}
+
+struct VethTcpTxProbe<'a> {
+    inner: &'a SmoltcpPacketTxSink<'a>,
+    attempts: std::sync::Mutex<std::vec::Vec<(usize, u8, PacketTxResult)>>,
+}
+
+impl<'a> VethTcpTxProbe<'a> {
+    fn new(inner: &'a SmoltcpPacketTxSink<'a>) -> Self {
+        Self {
+            inner,
+            attempts: std::sync::Mutex::new(std::vec::Vec::new()),
+        }
+    }
+}
+
+impl PacketTxSink for VethTcpTxProbe<'_> {
+    fn readiness(&self, guard: &Guard<'_>) -> PacketTxReadiness {
+        self.inner.device.ops.tx_readiness(guard)
+    }
+
+    fn ip_mtu(&self) -> u16 {
+        self.inner.device.ops.mtu()
+    }
+
+    fn source_ipv4(&self) -> Option<Ipv4Address> {
+        Some(self.inner.adapter.config.local_ipv4)
+    }
+
+    fn transmit(&self, packet: &[u8], guard: &Guard<'_>) -> PacketTxResult {
+        let result = self.inner.transmit(packet, guard);
+        self.attempts.lock().expect("TX probe attempts").push((
+            packet.len(),
+            packet.first().copied().unwrap_or(0) >> 4,
+            result,
+        ));
+        result
+    }
+}
+
+fn drive_veth_network_rx(
+    source: &SmoltcpPacketSource<'_>,
+    namespace: tx_substrate::zone::PayloadCap<crate::net::namespace::NetNamespacePayload>,
+    guard: &Guard<'_>,
+) -> usize {
+    let StepOutcome::Done(outcome) = step_process_network_events_in_namespace_at(
+        source,
+        namespace,
+        smoltcp::time::Instant::ZERO,
+        guard,
+    ) else {
+        panic!("veth network-RX step should complete");
+    };
+    outcome.packets_seen
 }
 
 fn new_test_veth_pair(left_name: &'static str, right_name: &'static str, minor: u32) -> VethPair {

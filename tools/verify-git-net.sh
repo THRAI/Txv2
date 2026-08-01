@@ -7,11 +7,12 @@
 # and the raw serial log is left on disk for inspection.
 #
 # Usage:   bash tools/verify-git-net.sh
+#          TX_REQUIRE_NET_IRQ=1 bash tools/verify-git-net.sh
 # Needs:   python3, openssl, git, qemu-system-riscv64, debugfs (e2fsprogs) on the host.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-K="$ROOT/target/riscv64gc-unknown-none-elf/release/tx-kernel-riscv64-qemu-virt"
+K="${TXKERNEL:-$ROOT/target/riscv64gc-unknown-none-elf/release/tx-kernel-riscv64-qemu-virt}"
 IMG="$ROOT/local-images/alpine-linux-riscv64-ext4fs.img"
 WORK="$(mktemp -d /tmp/verifygit-XXXXXX)"
 HTTP_PORT=$(( (RANDOM % 2000) + 19000 ))
@@ -20,6 +21,18 @@ MARKER="VERIFY-MARKER-$$-$(date +%s)"
 PUSHMARK="PUSH-MARKER-$$"
 SERIAL="$WORK/serial.log"
 HTTP_PID=""; HTTPS_PID=""
+REQUIRE_NET_IRQ="${TX_REQUIRE_NET_IRQ:-0}"
+EXTRA_CMDLINE="${TX_EXTRA_CMDLINE:-}"
+QEMU_EXTRA_ARGS=()
+if [ -n "${TX_QEMU_TRACE:-}" ]; then
+  QEMU_EXTRA_ARGS+=(-trace "$TX_QEMU_TRACE")
+fi
+if [ -n "${TX_QEMU_GDB_PORT:-}" ]; then
+  QEMU_EXTRA_ARGS+=(-gdb "tcp::$TX_QEMU_GDB_PORT")
+fi
+if [ "$REQUIRE_NET_IRQ" = "1" ]; then
+  EXTRA_CMDLINE="${EXTRA_CMDLINE:+$EXTRA_CMDLINE }tx.net.irq_report=1"
+fi
 
 cleanup() { [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null; [ -n "$HTTPS_PID" ] && kill "$HTTPS_PID" 2>/dev/null; }
 trap cleanup EXIT
@@ -35,9 +48,12 @@ say "== Txv2 git verification =="
 say "worktree : $ROOT"
 [ -f "$IMG" ] || { say "FATAL: image not found: $IMG"; exit 2; }
 if [ ! -f "$K" ]; then
+  [ -z "${TXKERNEL:-}" ] \
+    || { say "FATAL: TXKERNEL does not exist: $K"; exit 2; }
   say "kernel ELF missing — building (cargo xtask build --target rv64-qemu)..."
   ( cd "$ROOT" && cargo xtask build --target rv64-qemu ) >"$WORK/build.log" 2>&1 \
     || { say "FATAL: build failed (see $WORK/build.log)"; exit 2; }
+  [ -f "$K" ] || { say "FATAL: build completed but kernel is missing: $K"; exit 2; }
 fi
 say "kernel   : $K"
 say "ports    : http=$HTTP_PORT https=$HTTPS_PORT   marker=$MARKER"
@@ -53,7 +69,8 @@ printf '%s\n' "$MARKER" > "$SEED/README"
 git -C "$SEED" add -A; git -C "$SEED" commit -qm "C1 base"
 git -C "$SEED" remote add origin "$SH/test.git"; git -C "$SEED" push -q origin master
 openssl req -x509 -newkey rsa:2048 -keyout "$SH/key.pem" -out "$SH/cert.pem" -days 5 -nodes \
-  -subj "/CN=mygit.local" -addext "subjectAltName=IP:10.0.2.2,IP:127.0.0.1" >/dev/null 2>&1
+  -subj "/CN=txverify.test" \
+  -addext "subjectAltName=DNS:txverify.test,IP:10.0.2.2,IP:127.0.0.1" >/dev/null 2>&1
 
 # --- host: minimal smart-HTTP(S) git server (shells out to git-http-backend) ---
 cat > "$WORK/srv.py" <<'PYEOF'
@@ -108,7 +125,9 @@ BB=/musl/bin/busybox
 export GIT_PAGER=cat HOME=/musl/root GIT_EXEC_PATH=/musl/usr/libexec/git-core GIT_TEMPLATE_DIR= \
        GIT_SSL_NO_VERIFY=true GIT_CURL_VERBOSE=1 PATH=/musl/usr/bin:/musl/bin:/usr/bin:/bin
 G="git -c gc.auto=0 -c maintenance.auto=false -c http.sslVerify=false -c user.email=g@g -c user.name=guest"
-$BB mkdir -p /etc 2>/dev/null; echo "nameserver 10.0.2.3" > /etc/resolv.conf
+$BB mkdir -p /etc 2>/dev/null
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
+echo "10.0.2.2 txverify.test" >> /etc/hosts
 echo "VG:git_version:[$(git --version 2>&1 | $BB head -1)]"
 # Task1: local init/add/commit/log with a real tracked file (cp avoids the shell ext4-write bug)
 $BB mkdir -p /musl/root/t1; cd /musl/root/t1
@@ -117,9 +136,9 @@ $G init -q . >/dev/null 2>&1; $G add tracked.txt; $G commit -qm "LOCAL-COMMIT-MA
 echo "VG:local_log:[$($G log --oneline 2>&1 | $BB head -1)]"
 echo "VG:local_content:[$($G cat-file -p HEAD:tracked.txt 2>&1)]"
 cd /musl/root
-echo "VG:http_clone_out:[$($G clone http://10.0.2.2:__HTTP_PORT__/test.git H 2>&1 | $BB tail -1)]"
+echo "VG:http_clone_out:[$($BB timeout 60 $G clone http://txverify.test:__HTTP_PORT__/test.git H 2>&1 | $BB tail -1)]"
 echo "VG:http_readme:[$($G -C /musl/root/H cat-file -p HEAD:README 2>&1)]"
-echo "VG:https_clone_out:[$($BB timeout 90 $G clone https://10.0.2.2:__HTTPS_PORT__/test.git S 2>&1 | $BB tail -1)]"
+echo "VG:https_clone_out:[$($BB timeout 90 $G clone https://txverify.test:__HTTPS_PORT__/test.git S 2>&1 | $BB tail -1)]"
 echo "VG:https_readme:[$($G -C /musl/root/S cat-file -p HEAD:README 2>&1)]"
 # push (empty commit avoids the shell ext4-write-content bug; tests push transport)
 cd /musl/root/H
@@ -128,9 +147,11 @@ echo "VG:push_out:[$($BB timeout 60 $G push origin master 2>&1 | $BB tail -1)]"
 # pull: S was cloned before the push above → pulling must fast-forward to the pushed commit
 echo "VG:pull_out:[$($BB timeout 60 $G -C /musl/root/S -c pull.ff=only pull 2>&1 | $BB tail -1)]"
 echo "VG:pull_log:[$($G -C /musl/root/S log --oneline 2>&1 | $BB head -1)]"
-# DNS: git getaddrinfo resolves a hostname over the SLIRP DNS (10.0.2.3)
-$BB timeout 30 $G ls-remote https://github.com:__HTTPS_PORT__/x.git >/tmp/dns.txt 2>&1
-echo "VG:dns:[$($BB grep -aiE 'was resolved|Trying [0-9]' /tmp/dns.txt 2>&1 | $BB head -1)]"
+# DNS: query the SLIRP DNS directly. Do not couple this witness to whether an
+# unrelated public host accepts or rejects a random high TCP port.
+$BB timeout 30 $BB nslookup github.com 10.0.2.3 >/tmp/dns.txt 2>&1
+dns_rc=$?
+echo "VG:dns:[rc=$dns_rc $($BB grep -ai '^Name:.*github.com' /tmp/dns.txt 2>&1 | $BB head -1)]"
 echo "VG:END"
 GUESTEOF
 sed -i "s/__HTTP_PORT__/$HTTP_PORT/g; s/__HTTPS_PORT__/$HTTPS_PORT/g; s/__PUSHMARK__/$PUSHMARK/g" "$WORK/tx-run.sh"
@@ -144,7 +165,10 @@ timeout 220 qemu-system-riscv64 -machine virt -kernel "$K" -m 1G -nographic -smp
   -drive "file=$WORK/disk.img,if=none,format=raw,id=x0,file.locking=off" \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=net,bus=virtio-mmio-bus.1 -netdev user,id=net \
-  -no-reboot -rtc base=utc -append "tx.runsh=/musl/tx-run.sh console=ttyS0" > "$SERIAL" 2>&1
+  "${QEMU_EXTRA_ARGS[@]}" \
+  -no-reboot -rtc base=utc \
+  -append "tx.runsh=/musl/tx-run.sh console=ttyS0${EXTRA_CMDLINE:+ $EXTRA_CMDLINE}" \
+  > "$SERIAL" 2>&1
 say ""
 
 g() { grep -a "^VG:$1:" "$SERIAL" 2>/dev/null | sed "s/^VG:$1://" | head -1; }
@@ -161,7 +185,21 @@ else
   check "Task2 push" 1 "push_out=$(g push_out)"
 fi
 v=$(g pull_log);      case "$v" in *$PUSHMARK*) check "Task2 pull" 0 "$v";; *) check "Task2 pull" 1 "pull_out=$(g pull_out)";; esac
-v=$(g dns);           case "$v" in *resolved*|*Trying\ [0-9]*) check "DNS resolution" 0 "$v";; *) check "DNS resolution" 1 "${v:-<no resolve line>}";; esac
+v=$(g dns);           case "$v" in *rc=0*github.com*) check "DNS resolution" 0 "$v";; *) check "DNS resolution" 1 "${v:-<no resolve line>}";; esac
+if [ "$REQUIRE_NET_IRQ" = "1" ]; then
+  irq_line=$(grep -a '^txkernel:.*:irq:net:' "$SERIAL" 2>/dev/null | tail -1)
+  if printf '%s\n' "$irq_line" | awk -F: '
+      NF >= 12 && $5 == "claims" && ($6 + 0) > 0 &&
+      $7 == "completions" && $6 == $8 &&
+      $9 == "wrong-hart" && ($10 + 0) == 0 &&
+      $11 == "missing-device" && ($12 + 0) == 0 { ok = 1 }
+      END { exit(ok ? 0 : 1) }
+    '; then
+    check "NET_IRQ claim/complete" 0 "$irq_line"
+  else
+    check "NET_IRQ claim/complete" 1 "${irq_line:-<no irq report>}"
+  fi
+fi
 
 say ""
 say "== summary: $pass passed, $fail failed =="

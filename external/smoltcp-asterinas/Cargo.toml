@@ -17,6 +17,7 @@ license = "0BSD"
 autoexamples = false
 
 [lints.rust]
+missing_docs = "allow"   # relaxed so the vendored test suite can be run
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [dependencies]
@@ -323,3 +324,8 @@ required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interfac
 
 [profile.release]
 debug = 2
+
+[workspace]
+
+[dev-dependencies]
+rstest = "0.18"

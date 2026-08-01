@@ -1,0 +1,14 @@
+# Run artifacts (serial logs, pcaps, the 723MB image copy, cargo/test output).
+# Only the harness scripts and the unit-test failure baseline are tracked.
+run/
+*.log
+*.raw
+*.failures.new
+unit-v51.failures
+unit-v53.failures
+unit-v52fix.failures
+suites/
+unit-v52fix2.failures
+ipcbench
+*.tpl
+unit-sws.failures

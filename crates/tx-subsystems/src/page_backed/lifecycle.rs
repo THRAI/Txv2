@@ -4,6 +4,12 @@ use crate::page_backed::adapter::step_engine::{
 };
 use alloc::vec::Vec;
 
+enum SynchronousWritebackAdmission {
+    Generation(PageGeneration),
+    Legacy,
+    Busy,
+}
+
 impl PageCacheIndex {
     fn withdraw_from(&mut self, first: PageIndex) {
         self.erase_from(first);
@@ -57,6 +63,68 @@ impl PageContainer {
 
     fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn) {
         self.state.lock().pages.clear_dirty_if_match(page, ppn);
+    }
+
+    fn begin_synchronous_writeback(
+        &self,
+        page: PageIndex,
+        ppn: Ppn,
+    ) -> SynchronousWritebackAdmission {
+        let mut state = self.state.lock();
+        let Some(snapshot) = state.file_page_slots.get(&page).map(PageSlot::snapshot) else {
+            return SynchronousWritebackAdmission::Legacy;
+        };
+        let slot_ppn = match snapshot.state {
+            PageSlotState::Dirty { ppn } | PageSlotState::Resident { ppn } => ppn,
+            PageSlotState::Empty
+            | PageSlotState::Fetching
+            | PageSlotState::Writeback { .. }
+            | PageSlotState::Error { .. } => return SynchronousWritebackAdmission::Busy,
+        };
+        if slot_ppn != ppn {
+            return SynchronousWritebackAdmission::Busy;
+        }
+        if state
+            .pages
+            .set_mark(page, PageCacheMark::Writeback)
+            .is_err()
+        {
+            return SynchronousWritebackAdmission::Busy;
+        }
+        let Some(writeback) = state
+            .file_page_slots
+            .get(&page)
+            .and_then(|slot| slot.begin_writeback().ok())
+        else {
+            let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+            return SynchronousWritebackAdmission::Busy;
+        };
+        SynchronousWritebackAdmission::Generation(writeback.generation)
+    }
+
+    fn complete_synchronous_writeback(
+        &self,
+        page: PageIndex,
+        generation: PageGeneration,
+    ) -> Result<(), Errno> {
+        let mut state = self.state.lock();
+        let slot = state.file_page_slots.get(&page).ok_or(Errno::EIO)?;
+        let snapshot = slot
+            .complete_writeback(generation, Ok(()))
+            .map_err(|_| Errno::EIO)?;
+        let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+        if matches!(snapshot.state, PageSlotState::Resident { .. }) {
+            let _ = state.pages.clear_mark(page, PageCacheMark::Dirty);
+        }
+        Ok(())
+    }
+
+    fn abort_synchronous_writeback(&self, page: PageIndex, generation: PageGeneration) {
+        let mut state = self.state.lock();
+        if let Some(slot) = state.file_page_slots.get(&page) {
+            let _ = slot.abort_writeback(generation);
+        }
+        let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
     }
 }
 
@@ -112,7 +180,19 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
 
     let mut pages_so_far: u32 = 0;
     for (page, ppn) in pc.dirty_pages_snapshot() {
+        let admission = pc.begin_synchronous_writeback(page, ppn);
+        if matches!(admission, SynchronousWritebackAdmission::Busy) {
+            let progress = if pages_so_far == 0 {
+                PageProgress::EMPTY
+            } else {
+                PageProgress::new(pages_so_far)
+            };
+            return V3::continue_with(progress);
+        }
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+            if let SynchronousWritebackAdmission::Generation(generation) = admission {
+                pc.abort_synchronous_writeback(page, generation);
+            }
             return V3::err(Errno::EINVAL.into());
         };
         match mount.payload().fs_page_backing.flush_page(
@@ -122,10 +202,23 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
             guard,
         ) {
             V3::Done(()) => {
-                pc.clear_dirty_if_match(page, ppn);
+                match admission {
+                    SynchronousWritebackAdmission::Generation(generation) => {
+                        if let Err(errno) = pc.complete_synchronous_writeback(page, generation) {
+                            return V3::err(errno.into());
+                        }
+                    }
+                    SynchronousWritebackAdmission::Legacy => {
+                        pc.clear_dirty_if_match(page, ppn);
+                    }
+                    SynchronousWritebackAdmission::Busy => unreachable!(),
+                }
                 pages_so_far = pages_so_far.saturating_add(1);
             }
             V3::Continue { progress: _ } => {
+                if let SynchronousWritebackAdmission::Generation(generation) = admission {
+                    pc.abort_synchronous_writeback(page, generation);
+                }
                 let progress = if pages_so_far == 0 {
                     PageProgress::EMPTY
                 } else {
@@ -134,6 +227,9 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
                 return V3::continue_with(progress);
             }
             V3::Yield { progress: _, shape } => {
+                if let SynchronousWritebackAdmission::Generation(generation) = admission {
+                    pc.abort_synchronous_writeback(page, generation);
+                }
                 let Some((carrier, interests)) =
                     crate::page_backed::notification::wait_source_parts(&shape)
                 else {
@@ -148,7 +244,12 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
                     progress, carrier, interests,
                 );
             }
-            V3::Err(v3_errno) => return V3::err(v3_errno),
+            V3::Err(v3_errno) => {
+                if let SynchronousWritebackAdmission::Generation(generation) = admission {
+                    pc.abort_synchronous_writeback(page, generation);
+                }
+                return V3::err(v3_errno);
+            }
         }
     }
 
@@ -162,7 +263,9 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
             .fs_page_backing
             .truncate(*fs_object_id, size, guard)
         {
-            V3::Done(()) => {}
+            V3::Done(()) => {
+                stamp_write_times(mount, *fs_object_id, guard);
+            }
             V3::Continue { progress: _ } => return V3::continue_with(PageProgress::EMPTY),
             V3::Yield { progress: _, shape } => {
                 let Some((carrier, interests)) =
@@ -209,6 +312,39 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
         V3::Err(v3_errno) => V3::err(v3_errno),
     }
+}
+
+/// Stamp mtime/ctime on the FS inode after a successful writeback so
+/// metadata-based change detection (git's stat cache trusts size+mtime)
+/// observes shell-redirect and applet writes. Close/fd-release is the
+/// only flush point (no background writeback daemon), so stamping here
+/// covers every writer. Best-effort: hosts without an installed
+/// wall-clock source (unit tests) and filesystems without
+/// `serialize_inode_meta` skip silently — the data flush above already
+/// succeeded.
+fn stamp_write_times(
+    mount: &crate::mount::MountPayloadPin,
+    fs_object_id: FsObjectId,
+    guard: &Guard<'_>,
+) {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+    let Some(now_ns) = tx_services::time::realtime_now_ns_hooked() else {
+        return;
+    };
+    let ts = crate::vfs::structure::Timespec::new(
+        (now_ns / 1_000_000_000) as i64,
+        (now_ns % 1_000_000_000) as i32,
+    );
+    let mut meta = match mount.payload().fs_ops.load_inode_meta(fs_object_id, guard) {
+        V3::Done(meta) => meta,
+        _ => return,
+    };
+    meta.mtime = ts;
+    meta.ctime = ts;
+    let _ = mount
+        .payload()
+        .fs_ops
+        .serialize_inode_meta(fs_object_id, &meta, guard);
 }
 
 /// `step_truncate` — v3 outcome shape over `PageProgress`.
@@ -378,7 +514,7 @@ pub fn step_fallocate(
 // the `*Op` types incrementally.
 
 /// `StepOp` wrap of [`step_fsync`].
-#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
+#[allow(dead_code)]// txdoc:pr2-step-op-scaffold
 pub struct FsyncOp<'a> {
     pub pc: &'a PageContainer,
     state: FileFsyncState,
@@ -410,7 +546,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
 
         match self.state.advance(self.pc) {
             Err(errno) => V3::err(errno.into()),
-            Ok(None) => V3::continue_with(PageProgress::EMPTY),
+            Ok(None) => self.state.pending_outcome(PageProgress::EMPTY),
             Ok(Some(Ok(()))) => V3::done(()),
             Ok(Some(Err(errno))) => V3::err(errno.into()),
         }
@@ -437,7 +573,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
 }
 
 /// `StepOp` wrap of [`step_fallocate`].
-#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
+#[allow(dead_code)]// txdoc:pr2-step-op-scaffold
 pub struct FallocateOp<'a> {
     pub pc: &'a PageContainer,
     pub new_size: u64,

@@ -42,7 +42,7 @@ pub use structure::{
     OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
     ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, StructPayload, Timespec,
-    VFS_NAME_MAX, VfsName, render_dentry_path,
+    VFS_NAME_MAX, VfsName, render_dentry_path, render_dentry_path_in_namespace,
 };
 pub use walker::{
     OpenFileWithMount, ResolvedDEntryWithMount, SYMLOOP_MAX, step_open,

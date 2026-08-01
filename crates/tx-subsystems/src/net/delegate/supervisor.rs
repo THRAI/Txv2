@@ -1,6 +1,5 @@
 use smoltcp::time::Instant;
-use tx_reactor::wait::WaitOutcome;
-use tx_services::time::DeadlineRegistrar;
+use tx_reactor::wait::{Channel, WaitOutcome};
 
 use super::{net_delegate_wait_tick_deadline, smoltcp_instant_to_reactor_deadline_ns};
 
@@ -89,14 +88,11 @@ impl NetDelegateSupervisor {
     }
 }
 
-pub async fn net_delegate_wait_supervised_deadline<R>(
-    timer_registrar: &R,
+pub async fn net_delegate_wait_supervised_deadline(
+    timer_channel: Channel,
     arm: NetDelegateTimerArm,
-) -> NetDelegateTimerWake
-where
-    R: DeadlineRegistrar + ?Sized,
-{
-    let outcome = net_delegate_wait_tick_deadline(timer_registrar, arm.deadline_ns).await;
+) -> NetDelegateTimerWake {
+    let outcome = net_delegate_wait_tick_deadline(timer_channel, arm.deadline_ns).await;
     NetDelegateTimerWake {
         generation: arm.generation,
         outcome,

@@ -153,7 +153,8 @@ impl LocalRetireGuard {
         }
         for candidate in [epoch, next] {
             let bag = &mut state.bags[candidate as usize % super::bag::EPOCH_BAG_COUNT];
-            debug_assert!(bag.reset_if_empty(candidate));
+            let prepared = bag.reset_if_empty(candidate);
+            assert!(prepared, "retire bag changed after successful preflight");
         }
         Ok(())
     }
@@ -165,7 +166,7 @@ impl LocalRetireGuard {
     ) {
         let state = unsafe { &mut *self.local.retire_state_ptr() };
         let bag = &mut state.bags[epoch as usize % super::bag::EPOCH_BAG_COUNT];
-        debug_assert_eq!(bag.epoch, epoch);
+        assert_eq!(bag.epoch, epoch, "prepared retire bag epoch changed");
         debug_assert!(unsafe { !head.as_ref().is_queued() });
         let previous = bag.rcu_head;
         unsafe {

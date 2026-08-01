@@ -16,6 +16,7 @@ mod gift;
 mod lock_metrics;
 pub mod notification;
 mod pmap;
+pub mod probe;
 pub mod project;
 pub mod scripts;
 pub mod step_ops;

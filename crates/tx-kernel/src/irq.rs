@@ -1,8 +1,8 @@
-//! Pre-ELF Phase 5 (item 9): IRQ dispatch table + UART RX handler.
+//! IRQ dispatch plus deferred UART and virtio-net bottom halves.
 //!
 //! tx-kernel owns one global `IrqDispatchTable`. Boot-time
-//! `install_irq_handlers::<P>()` populates the UART slot with
-//! `uart_rx_irq_handler::<P>` and publishes the table to the platform via
+//! `install_irq_handlers::<P>()` populates the platform-declared UART, RTC,
+//! and network slots, then publishes the table to the platform via
 //! `<P as IrqIf>::install_dispatch_table`.
 //!
 //! Per Open Q #4 (`docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
@@ -22,16 +22,16 @@
 //! illegal in interrupt handlers anyway (re-entrant guard creation would
 //! stall reclaim indefinitely).
 //!
-//! The fix: the IRQ handler reads bytes from the UART FIFO and stores
-//! them in `UART_RX_PENDING` (a SpinMutex-protected ring buffer), then
-//! returns `IrqHandled::Wake` to reschedule the reactor.  The reactor
-//! loop calls `drain_uart_rx_pending` between task-poll iterations;
-//! that draining runs with irq_depth=0 and is free to create epoch
-//! guards and call `step_ingest`.
+//! UART copies FIFO bytes into an IRQ-safe buffer. Virtio-net publishes an
+//! atomic deferred-claim slot and intentionally leaves controller completion
+//! outstanding. The reactor drains both paths in task context; the net bottom
+//! half ACKs the level-triggered device before completing the original claim
+//! on its claimant hart.
 
 use crate::adapter::step_engine::{spin_mutex, SpinMutex};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use tx_hal::{
-    ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, TxPlatform,
+    ConsoleIf, CpuId, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, TxPlatform,
     IRQ_DISPATCH_TABLE_SIZE,
 };
 use tx_services::time::{platform::HalRtcDevice, RtcDeviceOps as TimeRtcDeviceOps};
@@ -80,6 +80,147 @@ impl UartRxPending {
 static UART_RX_PENDING: SpinMutex<UartRxPending> =
     spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
 
+const DEFERRED_IRQ_IDLE: u8 = 0;
+const DEFERRED_IRQ_PUBLISHING: u8 = 1;
+const DEFERRED_IRQ_PENDING: u8 = 2;
+const DEFERRED_IRQ_DRAINING: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredIrqClaim {
+    irq: u32,
+    owner: CpuId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredIrqDrain {
+    Idle,
+    Owned(DeferredIrqClaim),
+    WrongHart { owner: CpuId },
+}
+
+/// One hart's lock-free deferred controller claim.
+///
+/// Claim metadata is written only while `phase == Publishing`, published by
+/// the Release transition to `Pending`, and immutable until the owning hart
+/// moves it through `Draining` back to `Idle`. Keeping the fields separate
+/// avoids opaque bit packing while the phase CAS prevents partial publication.
+struct DeferredIrqSlot {
+    phase: AtomicU8,
+    irq: AtomicU32,
+    owner: AtomicUsize,
+}
+
+impl DeferredIrqSlot {
+    const fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(DEFERRED_IRQ_IDLE),
+            irq: AtomicU32::new(0),
+            owner: AtomicUsize::new(0),
+        }
+    }
+
+    fn publish(&self, claim: DeferredIrqClaim) {
+        assert_ne!(claim.irq, 0, "deferred IRQ claim must be non-zero");
+        assert_eq!(
+            self.phase.compare_exchange(
+                DEFERRED_IRQ_IDLE,
+                DEFERRED_IRQ_PUBLISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(DEFERRED_IRQ_IDLE),
+            "deferred IRQ slot already owns a controller claim",
+        );
+        self.irq.store(claim.irq, Ordering::Relaxed);
+        self.owner.store(claim.owner.0, Ordering::Relaxed);
+        self.phase.store(DEFERRED_IRQ_PENDING, Ordering::Release);
+    }
+
+    fn begin_drain(&self, current: CpuId) -> DeferredIrqDrain {
+        if self.phase.load(Ordering::Acquire) != DEFERRED_IRQ_PENDING {
+            return DeferredIrqDrain::Idle;
+        }
+        let owner = CpuId(self.owner.load(Ordering::Relaxed));
+        if owner != current {
+            return DeferredIrqDrain::WrongHart { owner };
+        }
+        if self
+            .phase
+            .compare_exchange(
+                DEFERRED_IRQ_PENDING,
+                DEFERRED_IRQ_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return DeferredIrqDrain::Idle;
+        }
+        DeferredIrqDrain::Owned(DeferredIrqClaim {
+            irq: self.irq.load(Ordering::Relaxed),
+            owner,
+        })
+    }
+
+    fn retry(&self, claim: DeferredIrqClaim) {
+        self.assert_draining(claim);
+        self.phase.store(DEFERRED_IRQ_PENDING, Ordering::Release);
+    }
+
+    /// Release software ownership immediately before controller completion.
+    ///
+    /// A new level assertion cannot be claimed until the outstanding
+    /// controller transaction completes. Publishing `Idle` first therefore
+    /// guarantees that a claim delivered immediately after `complete()` finds
+    /// an available software slot.
+    fn release_before_completion(&self, claim: DeferredIrqClaim) {
+        self.assert_draining(claim);
+        self.irq.store(0, Ordering::Relaxed);
+        self.owner.store(0, Ordering::Relaxed);
+        self.phase.store(DEFERRED_IRQ_IDLE, Ordering::Release);
+    }
+
+    fn assert_draining(&self, claim: DeferredIrqClaim) {
+        debug_assert_eq!(self.phase.load(Ordering::Acquire), DEFERRED_IRQ_DRAINING);
+        debug_assert_eq!(self.irq.load(Ordering::Relaxed), claim.irq);
+        debug_assert_eq!(self.owner.load(Ordering::Relaxed), claim.owner.0);
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        self.irq.store(0, Ordering::Relaxed);
+        self.owner.store(0, Ordering::Relaxed);
+        self.phase.store(DEFERRED_IRQ_IDLE, Ordering::Release);
+    }
+}
+
+/// A claim is published into the claimant hart's slot and drained by looking
+/// up the current hart's slot. Other harts therefore observe `Idle` instead of
+/// contending for one global slot or manufacturing false wrong-hart reports.
+static NET_RX_DEFERRED_CLAIMS: [DeferredIrqSlot; tx_hal::MAX_HARTS] =
+    [const { DeferredIrqSlot::new() }; tx_hal::MAX_HARTS];
+static NET_IRQ_CLAIMS: AtomicU64 = AtomicU64::new(0);
+static NET_IRQ_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static NET_IRQ_WRONG_HART_DRAINS: AtomicU64 = AtomicU64::new(0);
+static NET_IRQ_MISSING_DEVICE_DRAINS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NetIrqStats {
+    pub claims: u64,
+    pub completions: u64,
+    pub wrong_hart_drains: u64,
+    pub missing_device_drains: u64,
+}
+
+pub(crate) fn net_irq_stats() -> NetIrqStats {
+    NetIrqStats {
+        claims: NET_IRQ_CLAIMS.load(Ordering::Acquire),
+        completions: NET_IRQ_COMPLETIONS.load(Ordering::Acquire),
+        wrong_hart_drains: NET_IRQ_WRONG_HART_DRAINS.load(Ordering::Acquire),
+        missing_device_drains: NET_IRQ_MISSING_DEVICE_DRAINS.load(Ordering::Acquire),
+    }
+}
+
 /// Register `handler` as the dispatch entry for IRQ number `irq`.
 ///
 /// Idempotent on identical handler; panics on conflict (same slot,
@@ -117,6 +258,17 @@ pub fn reset_dispatch_table_for_test() {
 pub fn reset_pending_uart_rx_for_test() {
     let mut pending = UART_RX_PENDING.lock();
     pending.len = 0;
+}
+
+#[cfg(test)]
+pub fn reset_pending_net_irq_for_test() {
+    for slot in &NET_RX_DEFERRED_CLAIMS {
+        slot.reset();
+    }
+    NET_IRQ_CLAIMS.store(0, Ordering::Release);
+    NET_IRQ_COMPLETIONS.store(0, Ordering::Release);
+    NET_IRQ_WRONG_HART_DRAINS.store(0, Ordering::Release);
+    NET_IRQ_MISSING_DEVICE_DRAINS.store(0, Ordering::Release);
 }
 
 /// Snapshot the handler currently registered for `irq`, if any.
@@ -167,6 +319,10 @@ pub(crate) fn install_irq_handlers<P: TxPlatform>() {
         tx_fs::devfs::rtc_event_source_id();
         register_irq_handler(rtc_irq, rtc_alarm_irq_handler::<P>);
     }
+    let net_irq = <P as IrqIf>::NET_IRQ;
+    if net_irq != 0 {
+        register_irq_handler(net_irq, net_rx_irq_handler::<P>);
+    }
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
     <P as IrqIf>::set_priority(uart_irq, 1);
     <P as IrqIf>::unmask(uart_irq);
@@ -174,6 +330,64 @@ pub(crate) fn install_irq_handlers<P: TxPlatform>() {
         <P as IrqIf>::set_priority(rtc_irq, 1);
         <P as IrqIf>::unmask(rtc_irq);
     }
+    if net_irq != 0 {
+        <P as IrqIf>::set_priority(net_irq, 1);
+        <P as IrqIf>::unmask(net_irq);
+    }
+}
+
+/// Virtio-net IRQ top half.
+///
+/// The driver ACK path takes locks, so IRQ context only publishes the claimed
+/// IRQ and claimant hart. `DeferredWake` tells the trap dispatcher to leave
+/// controller completion outstanding; the controller gateway then throttles
+/// this source until [`drain_net_rx_irq`] clears the device and completes the
+/// claim from the same hart.
+pub fn net_rx_irq_handler<P: TxPlatform>(irq: u32) -> IrqHandled {
+    assert_eq!(
+        irq,
+        <P as IrqIf>::NET_IRQ,
+        "network handler received the wrong IRQ",
+    );
+    let owner = <P as tx_hal::SmpIf>::current_cpu_id();
+    let slot = NET_RX_DEFERRED_CLAIMS
+        .get(owner.0)
+        .expect("network IRQ claimant hart exceeds MAX_HARTS");
+    slot.publish(DeferredIrqClaim { irq, owner });
+    NET_IRQ_CLAIMS.fetch_add(1, Ordering::AcqRel);
+    IrqHandled::DeferredWake
+}
+
+/// Drain one deferred virtio-net claim in task context.
+///
+/// Returns `true` only after the device source was acknowledged, its queues
+/// were polled, and the original controller claim was completed. A call from a
+/// non-owner hart leaves the claim untouched for the claimant reactor.
+pub(crate) fn drain_net_rx_irq<P: TxPlatform>() -> bool {
+    let current = <P as tx_hal::SmpIf>::current_cpu_id();
+    let Some(slot) = NET_RX_DEFERRED_CLAIMS.get(current.0) else {
+        return false;
+    };
+    let claim = match slot.begin_drain(current) {
+        DeferredIrqDrain::Idle => return false,
+        DeferredIrqDrain::WrongHart { .. } => {
+            NET_IRQ_WRONG_HART_DRAINS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        DeferredIrqDrain::Owned(claim) => claim,
+    };
+
+    let Some(registration) = tx_subsystems::net::net_device_by_name(b"eth0") else {
+        NET_IRQ_MISSING_DEVICE_DRAINS.fetch_add(1, Ordering::Relaxed);
+        slot.retry(claim);
+        return false;
+    };
+
+    let _ = registration.ops.ack_interrupt_and_fire();
+    slot.release_before_completion(claim);
+    <P as IrqIf>::complete(claim.irq);
+    NET_IRQ_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
+    true
 }
 
 /// RTC alarm IRQ handler.

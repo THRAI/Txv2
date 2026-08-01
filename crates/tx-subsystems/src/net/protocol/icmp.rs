@@ -6,6 +6,7 @@ use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpProtocol, IpRepr,
     Ipv4Address as SmoltcpIpv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address as SmoltcpIpv6Address,
+    Ipv6Repr,
 };
 
 use crate::net::packet::LoopbackIpPacket;
@@ -79,6 +80,9 @@ pub struct RawIcmpSocket {
     rx_queue: SpinMutex<VecDeque<Icmpv4EchoPacket>>,
     rx_ipv6_queue: SpinMutex<VecDeque<RawIpv6Packet>>,
     tx_queue: SpinMutex<VecDeque<Icmpv4EchoPacket>>,
+    /// External v6 echo requests bound for the device-TX lane (mirror of the
+    /// v4 `tx_queue`; loopback v6 echoes are answered inline and never queue).
+    tx6_queue: SpinMutex<VecDeque<Icmpv6EchoPacket>>,
     recv_capacity: usize,
     send_capacity: usize,
 }
@@ -113,6 +117,7 @@ impl RawIcmpSocket {
             rx_queue: SpinMutex::new(VecDeque::new()),
             rx_ipv6_queue: SpinMutex::new(VecDeque::new()),
             tx_queue: SpinMutex::new(VecDeque::new()),
+            tx6_queue: SpinMutex::new(VecDeque::new()),
             recv_capacity: options.socket.recv_buf_size,
             send_capacity: options.socket.send_buf_size,
         }
@@ -178,6 +183,33 @@ impl RawIcmpSocket {
         self.pop_tx_echo()
     }
 
+    // External v6 echo TX queue (mirror of the v4 `tx_echo` family above).
+    pub fn enqueue_tx6_echo(&self, packet: Icmpv6EchoPacket) -> Option<(usize, bool)> {
+        let bytes = icmpv6_echo_message_len(&packet);
+        let mut tx = self.tx6_queue.lock();
+        let queued: usize = tx.iter().map(icmpv6_echo_message_len).sum();
+        let available = self.send_capacity.saturating_sub(queued);
+        if bytes > available {
+            return None;
+        }
+        tx.push_back(packet);
+        let queued_after: usize = tx.iter().map(icmpv6_echo_message_len).sum();
+        Some((bytes, queued_after == self.send_capacity))
+    }
+
+    pub fn peek_tx6_echo(&self) -> Option<Icmpv6EchoPacket> {
+        self.tx6_queue.lock().front().cloned()
+    }
+
+    /// Pop the head after the sink accepted it; returns `became_available`.
+    pub fn commit_tx6_echo_sent(&self) -> Option<bool> {
+        let mut tx = self.tx6_queue.lock();
+        let had_no_space =
+            tx.iter().map(icmpv6_echo_message_len).sum::<usize>() == self.send_capacity;
+        tx.pop_front()?;
+        Some(had_no_space)
+    }
+
     pub fn ingest_rx_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
         let bytes = icmpv4_echo_raw_packet_len(&packet);
         let mut rx = self.rx_queue.lock();
@@ -218,6 +250,10 @@ impl RawIcmpSocket {
         self.recv_len_with_ipv4_header(len, peek, true)
     }
 
+    /// `SOCK_RAW` reports the whole IPv4 packet; `SOCK_DGRAM` (the Linux ping
+    /// socket) reports only the ICMP message. Callers pass
+    /// `is_raw_icmp_socket()` so the datagram flavour does not hand userspace
+    /// 20 bytes of IPv4 header it never asked for.
     pub fn recv_len_with_ipv4_header(
         &self,
         len: usize,
@@ -263,6 +299,9 @@ impl RawIcmpSocket {
         self.recv_bytes_with_ipv4_header(out, peek, true)
     }
 
+    /// See [`RawIcmpSocket::recv_len_with_ipv4_header`] for why the IPv4 header
+    /// is conditional. The `include_ipv4_header` arm stays zero-copy: only the
+    /// datagram arm materialises a `Vec`.
     pub fn recv_bytes_with_ipv4_header(
         &self,
         out: &mut [u8],
@@ -282,10 +321,17 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let packet_bytes = if include_ipv4_header {
-                    build_icmpv4_echo_reply(packet).as_bytes().to_vec()
+                // Both locals are declared up front so the raw arm can borrow
+                // straight out of `LoopbackIpPacket` instead of copying into a
+                // `Vec` just to unify the two branch types.
+                let raw_packet;
+                let message;
+                let packet_bytes: &[u8] = if include_ipv4_header {
+                    raw_packet = build_icmpv4_echo_reply(packet);
+                    raw_packet.as_bytes()
                 } else {
-                    build_icmpv4_echo_reply_message(packet)
+                    message = build_icmpv4_echo_reply_message(packet);
+                    &message
                 };
                 let bytes = core::cmp::min(packet_bytes.len(), out.len());
                 out[..bytes].copy_from_slice(&packet_bytes[..bytes]);
@@ -467,6 +513,31 @@ pub fn parse_icmpv6_payload_unchecked(
 
 pub fn build_icmpv6_echo_request_message(packet: &Icmpv6EchoPacket) -> Vec<u8> {
     build_icmpv6_echo_message(packet, true)
+}
+
+/// Full IPv6 packet (header + ICMPv6 echo request) for the device-TX lane —
+/// mirror of [`build_icmpv4_echo_request`].
+pub fn build_icmpv6_echo_request_packet(packet: &Icmpv6EchoPacket) -> LoopbackIpPacket {
+    let icmp_bytes = build_icmpv6_echo_request_message(packet);
+    let ip_repr = IpRepr::Ipv6(Ipv6Repr {
+        src_addr: to_smoltcp_ipv6(packet.src),
+        dst_addr: to_smoltcp_ipv6(packet.dst),
+        next_header: IpProtocol::Icmpv6,
+        payload_len: icmp_bytes.len(),
+        hop_limit: 64,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let checksum = ChecksumCapabilities::default();
+    let mut bytes = vec![0u8; ip_header_len + icmp_bytes.len()];
+    ip_repr.emit(&mut bytes[..ip_header_len], &checksum);
+    bytes[ip_header_len..].copy_from_slice(&icmp_bytes);
+    LoopbackIpPacket::new(bytes)
+}
+
+/// ICMPv6 echo message length (8-byte echo header + payload) — TX-queue
+/// accounting, mirror of `icmpv4_echo_message_len`.
+fn icmpv6_echo_message_len(packet: &Icmpv6EchoPacket) -> usize {
+    8 + packet.payload.len()
 }
 
 pub fn build_icmpv6_echo_reply_message(packet: &Icmpv6EchoPacket) -> Vec<u8> {

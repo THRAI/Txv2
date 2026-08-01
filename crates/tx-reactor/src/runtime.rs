@@ -53,6 +53,34 @@ pub struct RunStats {
     pub completed: usize,
 }
 
+/// Maximum number of ready futures polled by one hart-loop step.
+///
+/// A bounded step lets the runtime owner regain control at a predictable
+/// task-context boundary for work such as deferred IRQ completion.  The
+/// reactor only enforces the scheduling boundary; it does not know which
+/// maintenance the owner performs between steps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HartPollBudget {
+    max_polls: usize,
+}
+
+impl HartPollBudget {
+    /// Preserve the traditional behavior: keep polling until no task is ready.
+    pub const UNTIL_IDLE: Self = Self {
+        max_polls: usize::MAX,
+    };
+
+    /// Return to the runtime owner after at most `max_polls` future polls.
+    pub const fn up_to(max_polls: usize) -> Self {
+        assert!(max_polls > 0, "hart poll budget must be non-zero");
+        Self { max_polls }
+    }
+
+    const fn exhausted_by(self, polled: usize) -> bool {
+        polled >= self.max_polls
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskPublishReport {
     pub task: TaskKey,
@@ -493,6 +521,31 @@ impl SharedReactor {
         S: RescheduleSignal,
         C: SliceClock,
     {
+        self.run_hart_loop_concurrent_with_slice_clock_and_poll_budget(
+            hart,
+            now_ns,
+            signal,
+            slice_clock,
+            HartPollBudget::UNTIL_IDLE,
+        )
+    }
+
+    /// Run one concurrent hart-loop step with an explicit future-poll budget.
+    ///
+    /// The method returns only after the last polled future has been committed,
+    /// task-local state has been cleared, and timer/wake updates have run.
+    pub fn run_hart_loop_concurrent_with_slice_clock_and_poll_budget<S, C>(
+        &self,
+        hart: HartId,
+        now_ns: u64,
+        signal: &mut S,
+        slice_clock: &mut C,
+        poll_budget: HartPollBudget,
+    ) -> Option<HartLoopStep>
+    where
+        S: RescheduleSignal,
+        C: SliceClock,
+    {
         use crate::waker::task_waker;
         use core::task::{Context, Poll};
 
@@ -669,6 +722,10 @@ impl SharedReactor {
                     view.advance_time_to_with_reschedule(slice_clock.now_ns(), hart, signal);
                 timer_wakes = timer_wakes.saturating_add(wakes);
                 report.merge(view.drain_wakes_for_hart(hart, signal));
+            }
+
+            if poll_budget.exhausted_by(stats.polled) {
+                break;
             }
         }
 
@@ -1033,10 +1090,24 @@ impl HartRuntimeView<'_> {
     where
         S: RescheduleSignal,
     {
-        self.run_until_idle_on_hart_with_reschedule_and_slice_clock(
+        self.run_ready_on_hart_with_reschedule(hart, signal, HartPollBudget::UNTIL_IDLE)
+    }
+
+    /// Poll ready work on `hart` with the no-op slice clock.
+    pub fn run_ready_on_hart_with_reschedule<S>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+        poll_budget: HartPollBudget,
+    ) -> RunStats
+    where
+        S: RescheduleSignal,
+    {
+        self.run_ready_on_hart_with_reschedule_and_slice_clock(
             hart,
             signal,
             &mut NoopSliceClock,
+            poll_budget,
         )
     }
 
@@ -1045,6 +1116,26 @@ impl HartRuntimeView<'_> {
         hart: HartId,
         signal: &mut S,
         slice_clock: &mut C,
+    ) -> RunStats
+    where
+        S: RescheduleSignal,
+        C: SliceClock,
+    {
+        self.run_ready_on_hart_with_reschedule_and_slice_clock(
+            hart,
+            signal,
+            slice_clock,
+            HartPollBudget::UNTIL_IDLE,
+        )
+    }
+
+    /// Poll ready work on `hart` until idle or until `poll_budget` is spent.
+    pub fn run_ready_on_hart_with_reschedule_and_slice_clock<S, C>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+        slice_clock: &mut C,
+        poll_budget: HartPollBudget,
     ) -> RunStats
     where
         S: RescheduleSignal,
@@ -1198,6 +1289,10 @@ impl HartRuntimeView<'_> {
                         }
                     }
                 }
+            }
+
+            if poll_budget.exhausted_by(stats.polled) {
+                break;
             }
         }
 
@@ -1982,11 +2077,21 @@ impl Reactor {
     where
         S: RescheduleSignal,
     {
-        self.run_until_idle_on_hart_with_reschedule_and_slice_clock(
-            hart,
-            signal,
-            &mut NoopSliceClock,
-        )
+        self.run_ready_on_hart_with_reschedule(hart, signal, HartPollBudget::UNTIL_IDLE)
+    }
+
+    /// Poll ready work on `hart` with the no-op slice clock.
+    pub fn run_ready_on_hart_with_reschedule<S>(
+        &self,
+        hart: HartId,
+        signal: &mut S,
+        poll_budget: HartPollBudget,
+    ) -> RunStats
+    where
+        S: RescheduleSignal,
+    {
+        self.hart_runtime_view(hart)
+            .run_ready_on_hart_with_reschedule(hart, signal, poll_budget)
     }
 
     pub fn run_until_idle_on_hart_with_reschedule_and_slice_clock<S, C>(

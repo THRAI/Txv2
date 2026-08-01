@@ -169,7 +169,8 @@ pub use driver::CurrentHartDeadlineTimer;
 #[cfg(any(test, feature = "test-support"))]
 pub use keeper::reset_for_test;
 pub use keeper::{
-    install_realtime_timer_notifier, install_vvar_publish_hook, timekeeper, timekeeper_clock,
+    install_monotonic_ns_source, install_realtime_timer_notifier, install_vvar_publish_hook,
+    realtime_now_ns_hooked, timekeeper, timekeeper_clock,
     RealtimeSeedError, RealtimeTimerNotifier, RealtimeWritebackPolicy, Timekeeper, TimekeeperClock,
     TimekeeperIf, VvarPublishHook, VvarSnapshot, WallClockError, DEFAULT_REALTIME_EPOCH_BASE_NS,
 };

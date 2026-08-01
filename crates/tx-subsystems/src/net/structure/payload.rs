@@ -6,6 +6,7 @@ use smoltcp::time::{Duration, Instant};
 use tx_substrate::zone::Cap;
 use tx_substrate::zone::PayloadCap;
 
+use crate::execution::Errno;
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::nfnetlink::{NetlinkNetfilterState, RawNetlinkNetfilterSocket};
 use crate::net::rtnetlink::{NetlinkRouteState, RawNetlinkRouteSocket};
@@ -19,6 +20,7 @@ use super::super::protocol::{
 };
 use super::identity::SocketIdentity;
 use super::multicast::{Ipv4MulticastGroup, Ipv4MulticastMemberships};
+use super::readiness::{SendWireSet, SocketReadiness};
 use super::types::{
     AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address, PacketSocketState, ProtocolNumber,
     RawIcmpState, RdsState, SockAddrLl, SockShutdownCmd, SocketKind, SocketOptionSet, SocketType,
@@ -30,22 +32,184 @@ pub const TCP_BACKLOG_TIMEOUT_STAGING_MILLIS: i64 = 30_000;
 pub const TCP_BACKLOG_RETRANSMIT_LIMIT_STAGING: u8 = 3;
 pub const TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS: i64 = 1_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpConnectAttempt {
+    generation: TcpStateGeneration,
+    local: IpEndpoint,
+    remote: IpEndpoint,
+}
+
+impl TcpConnectAttempt {
+    pub(crate) const fn generation(self) -> TcpStateGeneration {
+        self.generation
+    }
+
+    pub const fn local(self) -> IpEndpoint {
+        self.local
+    }
+
+    pub const fn remote(self) -> IpEndpoint {
+        self.remote
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TcpStateGeneration(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TcpConnectProgress {
+    Started(TcpConnectAttempt),
+    InProgress,
+    NotTcp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TcpConnectDisposition {
+    KeepConnecting,
+    Connected,
+}
+
+pub(crate) enum TcpFlowGenerationTry<R> {
+    Busy,
+    Stale,
+    Current(R),
+}
+
+struct SocketControlState {
+    protocol: SocketProtocol,
+    pending_error: Option<Errno>,
+    active_tcp_connect_attempt: Option<TcpConnectAttempt>,
+    tcp_state_generation: TcpStateGeneration,
+}
+
+impl SocketControlState {
+    fn record_error(&mut self, error: Errno) {
+        self.pending_error = Some(error);
+    }
+
+    fn allocate_tcp_connect_attempt(
+        &mut self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+    ) -> TcpConnectAttempt {
+        let generation = self.advance_tcp_state_generation();
+        TcpConnectAttempt {
+            generation,
+            local,
+            remote,
+        }
+    }
+
+    fn advance_tcp_state_generation(&mut self) -> TcpStateGeneration {
+        let mut next = self.tcp_state_generation.0.wrapping_add(1);
+        if next == 0 {
+            next = 1;
+        }
+        let generation = TcpStateGeneration(next);
+        self.tcp_state_generation = generation;
+        generation
+    }
+}
+
+fn tcp_flow_endpoints(protocol: &SocketProtocol) -> Option<(IpEndpoint, IpEndpoint)> {
+    match protocol {
+        SocketProtocol::Tcp(
+            TcpState::Connecting { local, remote } | TcpState::Connected { local, remote },
+        ) => Some((*local, *remote)),
+        _ => None,
+    }
+}
+
+/// P3-B S1 (audit ⑨): exactly ONE protocol engine per socket. Replaces
+/// the nine parallel `Option<RawX>` slots — invalid states (two engines,
+/// or none) are unrepresentable, and the former 2–8-tuple matches
+/// collapse to single-arm matches. The `SocketProtocol` FSM stays
+/// separate on purpose: it is the syscall-level intent state (shared by
+/// Sctp via `TcpState`), not the engine discriminator.
+pub(crate) enum SocketImpl {
+    Tcp(RawTcpSocket),
+    Udp(RawUdpSocket),
+    Icmp(RawIcmpSocket),
+    Unix(RawUnixSocket),
+    Rds(RawRdsSocket),
+    Sctp(RawSctpSocket),
+    Packet(RawPacketSocket),
+    NetlinkRoute(RawNetlinkRouteSocket),
+    NetlinkNetfilter(RawNetlinkNetfilterSocket),
+}
+
+impl SocketImpl {
+    pub(crate) fn tcp(&self) -> Option<&RawTcpSocket> {
+        match self {
+            Self::Tcp(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn udp(&self) -> Option<&RawUdpSocket> {
+        match self {
+            Self::Udp(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn icmp(&self) -> Option<&RawIcmpSocket> {
+        match self {
+            Self::Icmp(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn unix(&self) -> Option<&RawUnixSocket> {
+        match self {
+            Self::Unix(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn rds(&self) -> Option<&RawRdsSocket> {
+        match self {
+            Self::Rds(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn sctp(&self) -> Option<&RawSctpSocket> {
+        match self {
+            Self::Sctp(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn packet(&self) -> Option<&RawPacketSocket> {
+        match self {
+            Self::Packet(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn netlink_route(&self) -> Option<&RawNetlinkRouteSocket> {
+        match self {
+            Self::NetlinkRoute(raw) => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn netlink_netfilter(&self) -> Option<&RawNetlinkNetfilterSocket> {
+        match self {
+            Self::NetlinkNetfilter(raw) => Some(raw),
+            _ => None,
+        }
+    }
+}
+
 pub struct SocketPayload {
     pub(crate) family: SpinMutex<AddressFamily>,
     pub(crate) net_namespace: PayloadCap<NetNamespacePayload>,
-    pub(crate) protocol: SpinMutex<SocketProtocol>,
+    control: SpinMutex<SocketControlState>,
     pub(crate) options: SpinMutex<SocketOptionSet>,
     pub(crate) ip_multicast: SpinMutex<Ipv4MulticastMemberships>,
-    pub(crate) raw_tcp: Option<RawTcpSocket>,
-    pub(crate) raw_udp: Option<RawUdpSocket>,
-    pub(crate) raw_icmp: Option<RawIcmpSocket>,
-    pub(crate) raw_unix: Option<RawUnixSocket>,
-    pub(crate) raw_rds: Option<RawRdsSocket>,
-    pub(crate) raw_sctp: Option<RawSctpSocket>,
-    pub(crate) raw_packet: Option<RawPacketSocket>,
-    pub(crate) raw_netlink_route: Option<RawNetlinkRouteSocket>,
-    pub(crate) raw_netlink_netfilter: Option<RawNetlinkNetfilterSocket>,
-    pub(crate) io: SpinMutex<SocketIoState>,
+    pub(crate) imp: SocketImpl,
     pub(crate) unix_peer_cred: SpinMutex<Option<UnixPeerCred>>,
     pub(crate) tcp_backlog: SpinMutex<TcpBacklog>,
     pub shutdown_rd: AtomicBool,
@@ -76,162 +240,69 @@ impl SocketPayload {
         options: SocketOptionSet,
         net_namespace: PayloadCap<NetNamespacePayload>,
     ) -> Self {
-        let raw_packet = matches!(kind, SocketKind::Packet).then(|| RawPacketSocket::new(&options));
-        let (
-            protocol,
-            raw_tcp,
-            raw_udp,
-            raw_icmp,
-            raw_unix,
-            raw_rds,
-            raw_sctp,
-            raw_netlink_route,
-            raw_netlink_netfilter,
-        ) = match kind {
+        // kind → (intent FSM, engine) is a clean surjection: every kind
+        // activates exactly one engine (UnixDatagram/UnixStream share
+        // Unix; NetlinkXfrm/NetlinkNetfilter share NetlinkNetfilter).
+        // The former out-of-band `raw_packet` fill is normalised here.
+        let (protocol, imp) = match kind {
             SocketKind::UnixDatagram => (
                 SocketProtocol::UnixDatagram(UnixDatagramState::Unbound),
-                None,
-                None,
-                None,
-                Some(RawUnixSocket::new(&options)),
-                None,
-                None,
-                None,
-                None,
+                SocketImpl::Unix(RawUnixSocket::new(&options)),
             ),
             SocketKind::UnixStream => (
                 SocketProtocol::UnixStream(UnixStreamState::Init),
-                None,
-                None,
-                None,
-                Some(RawUnixSocket::new(&options)),
-                None,
-                None,
-                None,
-                None,
+                SocketImpl::Unix(RawUnixSocket::new(&options)),
             ),
             SocketKind::Tcp => (
                 SocketProtocol::Tcp(TcpState::Init),
-                Some(RawTcpSocket::new(&options)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                SocketImpl::Tcp(RawTcpSocket::new(&options)),
             ),
             SocketKind::Udp => (
                 SocketProtocol::Udp(UdpInner::Unbound),
-                None,
-                Some(RawUdpSocket::new(&options)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                SocketImpl::Udp(RawUdpSocket::new(&options)),
             ),
             SocketKind::Sctp => (
                 SocketProtocol::Sctp(TcpState::Init),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(RawSctpSocket::new(&options)),
-                None,
-                None,
+                SocketImpl::Sctp(RawSctpSocket::new(&options)),
             ),
             SocketKind::RdsSeqPacket => (
                 SocketProtocol::Rds(RdsState::Unbound),
-                None,
-                None,
-                None,
-                None,
-                Some(RawRdsSocket::new(&options)),
-                None,
-                None,
-                None,
+                SocketImpl::Rds(RawRdsSocket::new(&options)),
             ),
             SocketKind::RawIcmp => (
                 SocketProtocol::RawIcmp(RawIcmpState::new(ProtocolNumber(1))),
-                None,
-                None,
-                Some(RawIcmpSocket::new(&options)),
-                None,
-                None,
-                None,
-                None,
-                None,
+                SocketImpl::Icmp(RawIcmpSocket::new(&options)),
             ),
             SocketKind::NetlinkRoute => (
                 SocketProtocol::NetlinkRoute(NetlinkRouteState),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(RawNetlinkRouteSocket::new()),
-                None,
+                SocketImpl::NetlinkRoute(RawNetlinkRouteSocket::new()),
             ),
-            SocketKind::NetlinkXfrm => (
+            SocketKind::NetlinkXfrm | SocketKind::NetlinkNetfilter => (
                 SocketProtocol::NetlinkNetfilter(NetlinkNetfilterState),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(RawNetlinkNetfilterSocket::new()),
-            ),
-            SocketKind::NetlinkNetfilter => (
-                SocketProtocol::NetlinkNetfilter(NetlinkNetfilterState),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(RawNetlinkNetfilterSocket::new()),
+                SocketImpl::NetlinkNetfilter(RawNetlinkNetfilterSocket::new()),
             ),
             SocketKind::Packet => (
                 SocketProtocol::Packet(PacketSocketState::new(0)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                SocketImpl::Packet(RawPacketSocket::new(&options)),
             ),
         };
         let payload = Self {
             family: SpinMutex::new(family),
             net_namespace,
-            protocol: SpinMutex::new(protocol),
+            control: SpinMutex::new(SocketControlState {
+                protocol,
+                pending_error: None,
+                active_tcp_connect_attempt: None,
+                tcp_state_generation: TcpStateGeneration(0),
+            }),
             options: SpinMutex::new(options),
             ip_multicast: SpinMutex::new(Ipv4MulticastMemberships::empty()),
-            raw_tcp,
-            raw_udp,
-            raw_icmp,
-            raw_unix,
-            raw_rds,
-            raw_sctp,
-            raw_packet,
-            raw_netlink_route,
-            raw_netlink_netfilter,
-            io: SpinMutex::new(SocketIoState::new()),
+            imp,
             unix_peer_cred: SpinMutex::new(None),
             tcp_backlog: SpinMutex::new(TcpBacklog::new()),
             shutdown_rd: AtomicBool::new(false),
             shutdown_wr: AtomicBool::new(false),
         };
-        payload.refresh_io_from_raw();
         payload
     }
 
@@ -259,8 +330,311 @@ impl SocketPayload {
         self.shutdown_wr.load(Ordering::Acquire)
     }
 
+    pub fn socket_error(&self) -> Option<Errno> {
+        self.control.lock().pending_error
+    }
+
+    pub fn set_socket_error(&self, error: Errno) {
+        self.control.lock().record_error(error);
+    }
+
+    pub fn take_socket_error(&self, readiness: &SocketReadiness) -> Option<Errno> {
+        let mut control = self.control.lock();
+        let error = control.pending_error.take();
+        if error.is_some() {
+            // fail_tcp_connect_attempt publishes CONNECT_DONE under this same
+            // control lock. Clearing it here makes SO_ERROR consumption and
+            // connect() retry atomic with respect to a new failure edge.
+            readiness.clear_send(SendWireSet::CONNECT_DONE);
+        }
+        error
+    }
+
     pub fn protocol_snapshot(&self) -> SocketProtocol {
-        self.protocol.lock().clone()
+        self.control.lock().protocol.clone()
+    }
+
+    pub(crate) fn begin_tcp_connect(
+        &self,
+        initial_local: IpEndpoint,
+        remote: IpEndpoint,
+        select_bound_local: impl FnOnce(IpEndpoint) -> IpEndpoint,
+        prepare: impl FnOnce(),
+    ) -> TcpConnectProgress {
+        let mut control = self.control.lock();
+        let local = match &control.protocol {
+            SocketProtocol::Tcp(TcpState::Init) => initial_local,
+            SocketProtocol::Tcp(TcpState::Bound { local }) => select_bound_local(*local),
+            SocketProtocol::Tcp(TcpState::Connecting { .. }) => {
+                return TcpConnectProgress::InProgress;
+            }
+            SocketProtocol::Tcp(_) => return TcpConnectProgress::InProgress,
+            _ => return TcpConnectProgress::NotTcp,
+        };
+        let attempt = control.allocate_tcp_connect_attempt(local, remote);
+        prepare();
+        control.protocol = SocketProtocol::Tcp(TcpState::Connecting { local, remote });
+        control.active_tcp_connect_attempt = Some(attempt);
+        TcpConnectProgress::Started(attempt)
+    }
+
+    pub(crate) fn active_tcp_connect_attempt(&self) -> Option<TcpConnectAttempt> {
+        self.control.lock().active_tcp_connect_attempt
+    }
+
+    /// Run one transport/index operation while the syscall-facing attempt is
+    /// still exactly `expected`. The control lock deliberately spans
+    /// `operation`: AF_UNSPEC reset and a later connect generation cannot
+    /// interleave between validation and the side effect.
+    pub(crate) fn transact_tcp_connect_attempt<R>(
+        &self,
+        expected: Option<TcpConnectAttempt>,
+        expected_generation: TcpStateGeneration,
+        operation: impl FnOnce(IpEndpoint, IpEndpoint) -> (R, TcpConnectDisposition),
+    ) -> Option<R> {
+        let mut control = self.control.lock();
+        if control.active_tcp_connect_attempt != expected
+            || control.tcp_state_generation != expected_generation
+        {
+            return None;
+        }
+        let (local, remote) = match control.protocol {
+            SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
+            _ => return None,
+        };
+        if expected.is_some_and(|attempt| attempt.local != local || attempt.remote != remote) {
+            return None;
+        }
+
+        let (result, disposition) = operation(local, remote);
+        if disposition == TcpConnectDisposition::Connected {
+            control.protocol = SocketProtocol::Tcp(TcpState::Connected { local, remote });
+            control.active_tcp_connect_attempt = None;
+        }
+        Some(result)
+    }
+
+    /// Process one segment only if it still belongs to the current TCP flow.
+    ///
+    /// Holding `control` across the raw-engine operation gives reset/connect
+    /// the same lock order (`control -> raw TCP`) and prevents an event found
+    /// through an old connection-table entry from mutating a replacement
+    /// flow. The returned generation must also guard any deferred readiness
+    /// publication derived from the operation.
+    pub(crate) fn process_current_tcp_flow<R>(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        operation: impl FnOnce(&RawTcpSocket) -> R,
+    ) -> Option<(TcpStateGeneration, R)> {
+        let control = self.control.lock();
+        if !matches!(
+            control.protocol,
+            SocketProtocol::Tcp(
+                TcpState::Connecting {
+                    local: current_local,
+                    remote: current_remote,
+                } | TcpState::Connected {
+                    local: current_local,
+                    remote: current_remote,
+                }
+            ) if current_local == local && current_remote == remote
+        ) {
+            return None;
+        }
+        let raw = self.imp.tcp()?;
+        let generation = control.tcp_state_generation;
+        Some((generation, operation(raw)))
+    }
+
+    pub(crate) fn tcp_flow_snapshot(&self) -> Option<(TcpStateGeneration, IpEndpoint, IpEndpoint)> {
+        let control = self.control.lock();
+        let (local, remote) = tcp_flow_endpoints(&control.protocol)?;
+        Some((control.tcp_state_generation, local, remote))
+    }
+
+    /// Run a TCP-engine operation only for the exact flow generation observed
+    /// by the caller. This is the egress counterpart of
+    /// [`Self::process_current_tcp_flow`]: an old loopback handshake or drain
+    /// cannot dispatch a segment from a replacement connection that happens
+    /// to reuse the same endpoints.
+    pub(crate) fn with_tcp_flow_generation<R>(
+        &self,
+        expected_generation: TcpStateGeneration,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        operation: impl FnOnce(&RawTcpSocket) -> R,
+    ) -> Option<R> {
+        let control = self.control.lock();
+        if control.tcp_state_generation != expected_generation
+            || tcp_flow_endpoints(&control.protocol) != Some((local, remote))
+        {
+            return None;
+        }
+        let raw = self.imp.tcp()?;
+        Some(operation(raw))
+    }
+
+    /// Try to hold this flow's control generation across a cross-socket
+    /// operation. `Busy` lets a caller that already holds another socket's
+    /// control lock drop and retry instead of deadlocking on inverse lock
+    /// order; `Stale` distinguishes identity reuse from the observed flow.
+    #[cfg(test)]
+    pub(crate) fn try_with_tcp_flow_generation<R>(
+        &self,
+        expected_generation: TcpStateGeneration,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        operation: impl FnOnce() -> R,
+    ) -> TcpFlowGenerationTry<R> {
+        let Some(control) = self.control.try_lock() else {
+            return TcpFlowGenerationTry::Busy;
+        };
+        if control.tcp_state_generation != expected_generation
+            || tcp_flow_endpoints(&control.protocol) != Some((local, remote))
+        {
+            return TcpFlowGenerationTry::Stale;
+        }
+        TcpFlowGenerationTry::Current(operation())
+    }
+
+    /// Try to hold the currently indexed flow while a cross-socket
+    /// transaction commits. The caller must already reserve the connection
+    /// index slot; that reservation prevents a same-tuple replacement between
+    /// this endpoint check and `operation`.
+    pub(crate) fn try_with_tcp_flow<R>(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        operation: impl FnOnce() -> R,
+    ) -> TcpFlowGenerationTry<R> {
+        let Some(control) = self.control.try_lock() else {
+            return TcpFlowGenerationTry::Busy;
+        };
+        if tcp_flow_endpoints(&control.protocol) != Some((local, remote)) {
+            return TcpFlowGenerationTry::Stale;
+        }
+        TcpFlowGenerationTry::Current(operation())
+    }
+
+    /// Publish readiness derived from TCP transport state only while the flow
+    /// that produced it is still current. The publish runs under `control` so
+    /// AF_UNSPEC cannot clear readiness and then be followed by an old event.
+    pub(crate) fn publish_current_tcp_flow<R>(
+        &self,
+        expected_generation: TcpStateGeneration,
+        publish: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let control = self.control.lock();
+        if control.tcp_state_generation != expected_generation
+            || !matches!(
+                control.protocol,
+                SocketProtocol::Tcp(TcpState::Connecting { .. } | TcpState::Connected { .. })
+            )
+        {
+            return None;
+        }
+        Some(publish())
+    }
+
+    pub(crate) fn cancel_tcp_connect_attempt(
+        &self,
+        attempt: TcpConnectAttempt,
+        cleanup: impl FnOnce(IpEndpoint, IpEndpoint),
+    ) -> bool {
+        let mut control = self.control.lock();
+        if control.active_tcp_connect_attempt != Some(attempt) {
+            return false;
+        }
+        let (local, remote) = match control.protocol {
+            SocketProtocol::Tcp(TcpState::Connecting { local, remote })
+                if local == attempt.local && remote == attempt.remote =>
+            {
+                (local, remote)
+            }
+            _ => return false,
+        };
+        cleanup(local, remote);
+        control.protocol = SocketProtocol::Tcp(TcpState::Bound { local });
+        control.active_tcp_connect_attempt = None;
+        control.advance_tcp_state_generation();
+        true
+    }
+
+    pub(crate) fn fail_tcp_connect_attempt(
+        &self,
+        attempt: TcpConnectAttempt,
+        error: Errno,
+        cleanup: impl FnOnce(IpEndpoint, IpEndpoint),
+        publish: impl FnOnce() -> usize,
+    ) -> Option<usize> {
+        let mut control = self.control.lock();
+        if control.active_tcp_connect_attempt != Some(attempt) {
+            return None;
+        }
+        let (local, remote) = match control.protocol {
+            SocketProtocol::Tcp(TcpState::Connecting { local, remote })
+                if local == attempt.local && remote == attempt.remote =>
+            {
+                (local, remote)
+            }
+            _ => return None,
+        };
+
+        // Index cleanup is best-effort. The transport has already delivered a
+        // terminal edge, so Busy/Missing must not strand the socket forever in
+        // Connecting. Owner-conditional cleanup prevents removing a newer
+        // socket that reused the same tuple.
+        cleanup(local, remote);
+        control.protocol = SocketProtocol::Tcp(TcpState::Bound { local });
+        control.active_tcp_connect_attempt = None;
+        control.record_error(error);
+        control.advance_tcp_state_generation();
+        Some(publish())
+    }
+
+    /// Atomically disconnect TCP via AF_UNSPEC. Cleanup, engine reset,
+    /// readiness clearing, and the syscall-facing state change all happen
+    /// while the control state excludes a new connect generation.
+    pub(crate) fn reset_tcp_connection(
+        &self,
+        expected_generation: TcpStateGeneration,
+        expected_local: IpEndpoint,
+        expected_remote: IpEndpoint,
+        cleanup: impl FnOnce(IpEndpoint, IpEndpoint) -> bool,
+        clear_readiness: impl FnOnce(),
+    ) -> Result<(), Errno> {
+        let mut control = self.control.lock();
+        let (local, remote) = match control.protocol {
+            SocketProtocol::Tcp(
+                TcpState::Connecting { local, remote } | TcpState::Connected { local, remote },
+            ) => (local, remote),
+            SocketProtocol::Tcp(_) => return Err(Errno::EINVAL),
+            _ => return Err(Errno::EAFNOSUPPORT),
+        };
+        if control.tcp_state_generation != expected_generation
+            || local != expected_local
+            || remote != expected_remote
+        {
+            return Err(Errno::ECANCELED);
+        }
+        let Some(raw_tcp) = self.imp.tcp() else {
+            return Err(Errno::EOPNOTSUPP);
+        };
+
+        if !cleanup(local, remote) {
+            return Err(Errno::ECANCELED);
+        }
+        self.with_options(|options| raw_tcp.reset(options));
+        control.pending_error = None;
+        control.active_tcp_connect_attempt = None;
+        clear_readiness();
+        // AF_UNSPEC makes this socket bindable again. The caller removes an
+        // owner-matching tcp_bound entry in the same control transaction;
+        // accepted children legitimately have no such entry.
+        control.protocol = SocketProtocol::Tcp(TcpState::Init);
+        control.advance_tcp_state_generation();
+        Ok(())
     }
 
     pub fn bind_packet_socket(&self, sockaddr: SockAddrLl) -> Result<(), crate::execution::Errno> {
@@ -382,11 +756,24 @@ impl SocketPayload {
     }
 
     pub(crate) fn with_protocol<R>(&self, f: impl FnOnce(&SocketProtocol) -> R) -> R {
-        f(&self.protocol.lock())
+        f(&self.control.lock().protocol)
     }
 
     pub(crate) fn with_protocol_mut<R>(&self, f: impl FnOnce(&mut SocketProtocol) -> R) -> R {
-        f(&mut self.protocol.lock())
+        let mut control = self.control.lock();
+        let previous_tcp_flow = tcp_flow_endpoints(&control.protocol);
+        let result = f(&mut control.protocol);
+        if tcp_flow_endpoints(&control.protocol) != previous_tcp_flow {
+            control.active_tcp_connect_attempt = None;
+            control.advance_tcp_state_generation();
+        }
+        if !matches!(
+            control.protocol,
+            SocketProtocol::Tcp(TcpState::Connecting { .. })
+        ) {
+            control.active_tcp_connect_attempt = None;
+        }
+        result
     }
 
     pub(crate) fn mark_shutdown(&self, how: SockShutdownCmd) -> ShutdownMark {
@@ -428,8 +815,17 @@ impl SocketPayload {
         self.ip_multicast.lock().leave(group)
     }
 
+    /// P3-B S3 (D7): readiness derived live from the engine + backlog on
+    /// every call — there is no cached `io` field to tear (R1b gone). The
+    /// per-engine single lock (S2) makes each field's read atomic; this
+    /// snapshot is not atomic across the three fields, which is fine —
+    /// poll re-reads each independently anyway.
     pub fn io_snapshot(&self) -> SocketIoState {
-        *self.io.lock()
+        SocketIoState {
+            recv_len: self.raw_recv_available(),
+            send_space: self.raw_send_available(),
+            accept_pending: self.tcp_backlog.lock().connected_len(),
+        }
     }
 
     pub fn unix_peer_cred(&self) -> Option<UnixPeerCred> {
@@ -441,38 +837,72 @@ impl SocketPayload {
     }
 
     pub fn raw_tcp_socket(&self) -> Option<&RawTcpSocket> {
-        self.raw_tcp.as_ref()
+        self.imp.tcp()
+    }
+
+    /// Update the SOL_SOCKET keepalive flag and the live TCP engine as one
+    /// socket-owned transition. Non-TCP sockets retain the Linux-compatible
+    /// round-trip flag even though they have no TCP keepalive engine.
+    pub fn set_socket_keep_alive(&self, enabled: bool) {
+        self.with_options_mut(|options| {
+            if let Some(raw_tcp) = self.imp.tcp() {
+                raw_tcp.set_keep_alive_enabled(enabled, options.tcp.keepidle);
+            }
+            options.socket.keep_alive = enabled;
+        });
+    }
+
+    pub fn socket_keep_alive(&self) -> bool {
+        self.imp.tcp().map_or_else(
+            || self.with_options(|options| options.socket.keep_alive),
+            RawTcpSocket::keep_alive_enabled,
+        )
+    }
+
+    pub fn set_tcp_nodelay(&self, enabled: bool) -> Result<(), crate::execution::Errno> {
+        let Some(raw_tcp) = self.imp.tcp() else {
+            return Err(crate::execution::Errno::ENOPROTOOPT);
+        };
+        self.with_options_mut(|options| {
+            raw_tcp.set_nodelay(enabled);
+            options.tcp.nodelay = enabled;
+        });
+        Ok(())
+    }
+
+    pub fn tcp_nodelay(&self) -> Result<bool, crate::execution::Errno> {
+        self.imp
+            .tcp()
+            .map(RawTcpSocket::nodelay)
+            .ok_or(crate::execution::Errno::ENOPROTOOPT)
     }
 
     pub fn reset_raw_tcp_socket(&self) -> Result<(), crate::execution::Errno> {
-        let Some(raw_tcp) = self.raw_tcp.as_ref() else {
+        let Some(raw_tcp) = self.imp.tcp() else {
             return Err(crate::execution::Errno::EOPNOTSUPP);
         };
         self.with_options(|options| raw_tcp.reset(options));
-        self.refresh_io_from_raw();
         Ok(())
     }
 
     pub fn tcp_recv_closed_by_peer(&self) -> bool {
-        self.raw_tcp
-            .as_ref()
-            .is_some_and(RawTcpSocket::is_recv_closed)
+        self.imp.tcp().is_some_and(RawTcpSocket::is_recv_closed)
     }
 
     pub fn raw_udp_socket(&self) -> Option<&RawUdpSocket> {
-        self.raw_udp.as_ref()
+        self.imp.udp()
     }
 
     pub fn raw_icmp_socket(&self) -> Option<&RawIcmpSocket> {
-        self.raw_icmp.as_ref()
+        self.imp.icmp()
     }
 
     pub(crate) fn raw_netlink_route_socket(&self) -> Option<&RawNetlinkRouteSocket> {
-        self.raw_netlink_route.as_ref()
+        self.imp.netlink_route()
     }
 
     pub(crate) fn raw_netlink_netfilter_socket(&self) -> Option<&RawNetlinkNetfilterSocket> {
-        self.raw_netlink_netfilter.as_ref()
+        self.imp.netlink_netfilter()
     }
 
     pub(crate) fn record_unix_datagram(
@@ -480,16 +910,14 @@ impl SocketPayload {
         source: Option<UnixSocketPath>,
         payload: Vec<u8>,
     ) -> Option<bool> {
-        let raw_unix = self.raw_unix.as_ref()?;
+        let raw_unix = self.imp.unix()?;
         let became_readable = raw_unix.ingest_datagram(source, payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
     pub(crate) fn record_unix_stream_bytes(&self, payload: Vec<u8>) -> Option<bool> {
-        let raw_unix = self.raw_unix.as_ref()?;
+        let raw_unix = self.imp.unix()?;
         let became_readable = raw_unix.ingest_stream_bytes(payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
@@ -499,9 +927,8 @@ impl SocketPayload {
         destination: IpEndpoint,
         payload: Vec<u8>,
     ) -> Option<bool> {
-        let raw_rds = self.raw_rds.as_ref()?;
+        let raw_rds = self.imp.rds()?;
         let became_readable = raw_rds.ingest_packet(source, destination, payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
@@ -513,28 +940,27 @@ impl SocketPayload {
         ppid: u32,
         source: Option<IpEndpoint>,
     ) -> Option<bool> {
-        let raw_sctp = self.raw_sctp.as_ref()?;
+        let raw_sctp = self.imp.sctp()?;
         let became_readable =
             raw_sctp.ingest_message(payload, notification, stream, ppid, source)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
     /// 1-to-many: find or create the association to `peer`; returns (id, is_new).
     pub(crate) fn sctp_ensure_assoc(&self, peer: IpEndpoint) -> Option<(u32, bool)> {
-        Some(self.raw_sctp.as_ref()?.ensure_assoc(peer))
+        Some(self.imp.sctp()?.ensure_assoc(peer))
     }
 
     pub(crate) fn sctp_peers(&self) -> Vec<SctpAssoc> {
-        self.raw_sctp
-            .as_ref()
+        self.imp
+            .sctp()
             .map_or_else(Vec::new, RawSctpSocket::peers_snapshot)
     }
 
     /// Remove the 1-to-many association named by `assoc_id`, returning its peer
     /// endpoint if it existed.
     pub fn sctp_remove_assoc(&self, assoc_id: u32) -> Option<IpEndpoint> {
-        self.raw_sctp.as_ref()?.remove_assoc(assoc_id)
+        self.imp.sctp()?.remove_assoc(assoc_id)
     }
 
     /// Peer endpoint of the 1-to-many (SEQPACKET) association named by
@@ -558,14 +984,14 @@ impl SocketPayload {
 
     /// All local addresses this socket is bound to (primary bind + sctp_bindx).
     pub fn sctp_local_addrs(&self) -> Vec<IpEndpoint> {
-        self.raw_sctp
-            .as_ref()
+        self.imp
+            .sctp()
             .map_or_else(Vec::new, RawSctpSocket::local_addrs)
     }
 
     /// Record an additional bound local address (bind primary / sctp_bindx).
     pub fn sctp_add_local_addr(&self, endpoint: IpEndpoint) {
-        if let Some(raw) = self.raw_sctp.as_ref() {
+        if let Some(raw) = self.imp.sctp() {
             raw.add_local_addr(endpoint);
         }
     }
@@ -592,15 +1018,12 @@ impl SocketPayload {
 
     /// Number of 1-to-many (SEQPACKET) associations on this socket.
     pub fn sctp_assoc_count(&self) -> usize {
-        self.raw_sctp
-            .as_ref()
-            .map_or(0, |raw| raw.peers_snapshot().len())
+        self.imp.sctp().map_or(0, |raw| raw.peers_snapshot().len())
     }
 
     pub fn record_packet_frame(&self, source: SockAddrLl, payload: Vec<u8>) -> Option<bool> {
-        let raw_packet = self.raw_packet.as_ref()?;
+        let raw_packet = self.imp.packet()?;
         let became_readable = raw_packet.ingest_frame(source, payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
@@ -622,34 +1045,17 @@ impl SocketPayload {
         dst: IpEndpoint,
         payload: Vec<u8>,
     ) -> bool {
-        let became_readable = match (&self.raw_tcp, &self.raw_udp) {
-            (Some(raw_tcp), None) => raw_tcp.ingest_rx_bytes(&payload),
-            (None, Some(raw_udp)) => raw_udp.ingest_rx_datagram(src, dst, payload),
-            _ => false,
-        };
-        self.refresh_io_from_raw();
-        became_readable
-    }
-
-    pub(crate) fn record_tcp_stream_bytes(&self, payload: &[u8]) -> Option<bool> {
-        let raw_tcp = self.raw_tcp.as_ref()?;
-        let became_readable = raw_tcp.ingest_rx_bytes_unbounded(payload);
-        self.refresh_io_from_raw();
-        Some(became_readable)
-    }
-
-    pub(crate) fn record_send_space(&self, bytes: usize) -> bool {
-        let became_available = match &self.raw_tcp {
-            Some(raw_tcp) => raw_tcp.ack_tx_bytes(bytes),
+        // TCP RX no longer lands here: established-connection segments feed
+        // smoltcp via `process_segment` and the data lives in its rx ring.
+        let became_readable = match self.imp.udp() {
+            Some(raw_udp) => raw_udp.ingest_rx_datagram(src, dst, payload),
             None => false,
         };
-        self.refresh_io_from_raw();
-        became_available
+        became_readable
     }
 
     pub(crate) fn consume_recv_bytes(&self, len: usize) -> Option<SocketIoConsume> {
         let (bytes, became_empty) = self.raw_recv_len(len, false)?;
-        self.refresh_io_from_raw();
         Some(SocketIoConsume {
             bytes,
             became_empty,
@@ -662,9 +1068,8 @@ impl SocketPayload {
         flags: super::types::SendRecvFlags,
     ) -> Option<SocketRecvBytesOutcome> {
         let peek = flags.contains(super::types::SendRecvFlags::MSG_PEEK);
-        if let Some(raw_packet) = &self.raw_packet {
+        if let Some(raw_packet) = self.imp.packet() {
             let drain = raw_packet.recv_frame_bytes(out, peek)?;
-            self.refresh_io_from_raw();
             return Some(SocketRecvBytesOutcome {
                 bytes: drain.bytes,
                 source: None,
@@ -685,15 +1090,8 @@ impl SocketPayload {
                 SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
             )
         });
-        let outcome = match (
-            &self.raw_tcp,
-            &self.raw_udp,
-            &self.raw_icmp,
-            &self.raw_unix,
-            &self.raw_rds,
-            &self.raw_sctp,
-        ) {
-            (Some(raw_tcp), None, None, None, None, None) => match raw_tcp.recv_bytes(out, peek) {
+        let outcome = match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => match raw_tcp.recv_bytes(out, peek) {
                 Some((bytes, became_empty)) => SocketRecvBytesOutcome {
                     bytes,
                     source: None,
@@ -722,7 +1120,7 @@ impl SocketPayload {
                 },
                 None => return None,
             },
-            (None, Some(raw_udp), None, None, None, None) => {
+            SocketImpl::Udp(raw_udp) => {
                 let drain = raw_udp.recv_datagram_bytes(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
@@ -738,7 +1136,7 @@ impl SocketPayload {
                     sctp_ppid: 0,
                 }
             }
-            (None, None, Some(raw_icmp), None, None, None) => {
+            SocketImpl::Icmp(raw_icmp) => {
                 let drain =
                     raw_icmp.recv_bytes_with_ipv4_header(out, peek, self.is_raw_icmp_socket())?;
                 let source = match drain.source {
@@ -763,7 +1161,7 @@ impl SocketPayload {
                     sctp_ppid: 0,
                 }
             }
-            (None, None, None, Some(raw_unix), None, None) => {
+            SocketImpl::Unix(raw_unix) => {
                 let drain = raw_unix.recv_bytes(out, peek, unix_stream)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
@@ -779,7 +1177,7 @@ impl SocketPayload {
                     sctp_ppid: 0,
                 }
             }
-            (None, None, None, None, Some(raw_rds), None) => {
+            SocketImpl::Rds(raw_rds) => {
                 let drain = raw_rds.recv_packet_bytes(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
@@ -795,7 +1193,7 @@ impl SocketPayload {
                     sctp_ppid: 0,
                 }
             }
-            (None, None, None, None, None, Some(raw_sctp)) => {
+            SocketImpl::Sctp(raw_sctp) => {
                 let drain = raw_sctp.recv_message(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
@@ -811,9 +1209,44 @@ impl SocketPayload {
                     sctp_ppid: drain.ppid,
                 }
             }
+            SocketImpl::NetlinkRoute(raw_netlink) => {
+                let response = raw_netlink.pop_response(peek)?;
+                let bytes = core::cmp::min(out.len(), response.len());
+                out[..bytes].copy_from_slice(&response.as_slice()[..bytes]);
+                SocketRecvBytesOutcome {
+                    bytes,
+                    source: None,
+                    unix_source: None,
+                    packet_source: None,
+                    destination: None,
+                    truncated: bytes < response.len(),
+                    became_empty: !peek && raw_netlink.is_empty(),
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
+                }
+            }
+            SocketImpl::NetlinkNetfilter(raw_netlink) => {
+                let response = raw_netlink.pop_response(peek)?;
+                let bytes = core::cmp::min(out.len(), response.len());
+                out[..bytes].copy_from_slice(&response[..bytes]);
+                SocketRecvBytesOutcome {
+                    bytes,
+                    source: None,
+                    unix_source: None,
+                    packet_source: None,
+                    destination: None,
+                    truncated: bytes < response.len(),
+                    became_empty: !peek && raw_netlink.is_empty(),
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
+                }
+            }
             _ => return None,
         };
-        self.refresh_io_from_raw();
         Some(outcome)
     }
 
@@ -822,36 +1255,32 @@ impl SocketPayload {
     }
 
     pub fn udp_corked_send_len(&self) -> usize {
-        self.raw_udp
-            .as_ref()
-            .map(RawUdpSocket::corked_tx_len)
-            .unwrap_or(0)
+        self.imp.udp().map(RawUdpSocket::corked_tx_len).unwrap_or(0)
     }
 
     pub(crate) fn reserve_send_space(&self, len: usize) -> Option<SocketSendReserve> {
-        let (bytes, became_full, needs_poll_kick) =
-            match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-                (Some(raw_tcp), None, None) => {
-                    let reserve = raw_tcp.enqueue_tx_len(len)?;
-                    (
-                        reserve.bytes,
-                        reserve.became_full,
-                        reserve.flushed_to_protocol,
-                    )
+        let (bytes, became_full, needs_poll_kick) = match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => {
+                let reserve = raw_tcp.enqueue_tx_len(len)?;
+                (
+                    reserve.bytes,
+                    reserve.became_full,
+                    reserve.flushed_to_protocol,
+                )
+            }
+            SocketImpl::Udp(raw_udp) => match self.udp_connected_remote() {
+                Some(dst) => {
+                    raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
+                    let (bytes, became_full) = raw_udp.enqueue_tx_len_to(dst, len)?;
+                    (bytes, became_full, false)
                 }
-                (None, Some(raw_udp), None) => match self.udp_connected_remote() {
-                    Some(dst) => {
-                        let (bytes, became_full) = raw_udp.enqueue_tx_len_to(dst, len)?;
-                        (bytes, became_full, false)
-                    }
-                    None => {
-                        let (bytes, became_full) = raw_udp.enqueue_tx_len(len)?;
-                        (bytes, became_full, false)
-                    }
-                },
-                _ => return None,
-            };
-        self.refresh_io_from_raw();
+                None => {
+                    let (bytes, became_full) = raw_udp.enqueue_tx_len(len)?;
+                    (bytes, became_full, false)
+                }
+            },
+            _ => return None,
+        };
         Some(SocketSendReserve {
             bytes,
             became_full,
@@ -863,41 +1292,43 @@ impl SocketPayload {
         &self,
         bytes: &[u8],
         flags: super::types::SendRecvFlags,
-    ) -> Option<SocketSendReserve> {
+    ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
         let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
-        let (bytes, became_full, needs_poll_kick) =
-            match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-                (Some(raw_tcp), None, None) => {
-                    let reserve = raw_tcp.enqueue_tx_bytes_with_more(bytes, more)?;
-                    (
-                        reserve.bytes,
-                        reserve.became_full,
-                        reserve.flushed_to_protocol,
-                    )
+        let (bytes, became_full, needs_poll_kick) = match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
+                Some(reserve) => (
+                    reserve.bytes,
+                    reserve.became_full,
+                    reserve.flushed_to_protocol,
+                ),
+                None => return Ok(None),
+            },
+            SocketImpl::Udp(raw_udp) => {
+                // A plain send() with no msg_name still needs a destination:
+                // use the connected peer, or fail EDESTADDRREQ like Linux (and
+                // like the sendto path in reserve_send_bytes_to_with_flags).
+                // The pre-refactor VecDeque accepted an unaddressable datagram
+                // and silently dropped it at drain; the smoltcp tx ring cannot
+                // stage an unspecified dst, so reject up front rather than
+                // report success for bytes that never leave (and leave the
+                // send-buffer accounting inconsistent).
+                let dst = match self.udp_connected_remote() {
+                    Some(dst) => dst,
+                    None => return Err(crate::execution::Errno::EDESTADDRREQ),
+                };
+                raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
+                match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
+                    Some((bytes, became_full)) => (bytes, became_full, false),
+                    None => return Ok(None),
                 }
-                (None, Some(raw_udp), None) => match self.udp_connected_remote() {
-                    Some(dst) => {
-                        let (bytes, became_full) =
-                            raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more)?;
-                        (bytes, became_full, false)
-                    }
-                    None => {
-                        let (bytes, became_full) = raw_udp.enqueue_tx_bytes_to_with_more(
-                            IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
-                            bytes,
-                            more,
-                        )?;
-                        (bytes, became_full, false)
-                    }
-                },
-                _ => return None,
-            };
-        self.refresh_io_from_raw();
-        Some(SocketSendReserve {
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(SocketSendReserve {
             bytes,
             became_full,
             needs_poll_kick,
-        })
+        }))
     }
 
     pub(crate) fn reserve_send_bytes_to_with_flags(
@@ -907,61 +1338,56 @@ impl SocketPayload {
         flags: super::types::SendRecvFlags,
     ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
         let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
-        let (bytes, became_full, needs_poll_kick) =
-            match (&self.raw_tcp, &self.raw_udp, &self.raw_icmp) {
-                (Some(raw_tcp), None, None) => {
-                    match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
-                        Some(reserve) => (
-                            reserve.bytes,
-                            reserve.became_full,
-                            reserve.flushed_to_protocol,
-                        ),
-                        None => return Ok(None),
-                    }
+        let (bytes, became_full, needs_poll_kick) = match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
+                Some(reserve) => (
+                    reserve.bytes,
+                    reserve.became_full,
+                    reserve.flushed_to_protocol,
+                ),
+                None => return Ok(None),
+            },
+            SocketImpl::Udp(raw_udp) => {
+                let dst = match dst.or_else(|| self.udp_connected_remote()) {
+                    Some(dst) => dst,
+                    None => return Err(crate::execution::Errno::EDESTADDRREQ),
+                };
+                raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
+                match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
+                    Some((bytes, became_full)) => (bytes, became_full, false),
+                    None => return Ok(None),
                 }
-                (None, Some(raw_udp), None) => {
-                    let dst = match dst.or_else(|| self.udp_connected_remote()) {
-                        Some(dst) => dst,
-                        None => return Err(crate::execution::Errno::EDESTADDRREQ),
-                    };
-                    match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
-                        Some((bytes, became_full)) => (bytes, became_full, false),
-                        None => return Ok(None),
-                    }
+            }
+            SocketImpl::Icmp(raw_icmp) => {
+                let dst = match dst {
+                    Some(dst) => dst,
+                    None => return Err(crate::execution::Errno::EDESTADDRREQ),
+                };
+                if dst.family != AddressFamily::Inet {
+                    return Err(crate::execution::Errno::EAFNOSUPPORT);
                 }
-                (None, None, Some(raw_icmp)) => {
-                    let dst = match dst {
-                        Some(dst) => dst,
-                        None => return Err(crate::execution::Errno::EDESTADDRREQ),
-                    };
-                    if dst.family != AddressFamily::Inet {
-                        return Err(crate::execution::Errno::EAFNOSUPPORT);
+                let local = self.raw_icmp_bound_local().unwrap_or(Ipv4Address::LOOPBACK);
+                let event = match parse_icmpv4_payload(local, dst.addr, bytes) {
+                    Icmpv4Event::Malformed if self.is_icmp_datagram_socket() => {
+                        parse_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
                     }
-                    let local = self.raw_icmp_bound_local().unwrap_or(Ipv4Address::LOOPBACK);
-                    let event = match parse_icmpv4_payload(local, dst.addr, bytes) {
-                        Icmpv4Event::Malformed if self.is_icmp_datagram_socket() => {
-                            parse_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
-                        }
-                        Icmpv4Event::Malformed if self.is_raw_icmp_socket() => {
-                            parse_raw_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
-                        }
-                        event => event,
-                    };
-                    let packet = match event {
-                        Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => packet,
-                        Icmpv4Event::Malformed => return Err(crate::execution::Errno::EINVAL),
-                        Icmpv4Event::Unsupported => {
-                            return Err(crate::execution::Errno::EOPNOTSUPP)
-                        }
-                    };
-                    match raw_icmp.enqueue_tx_echo(packet) {
-                        Some((bytes, became_full)) => (bytes, became_full, false),
-                        None => return Ok(None),
+                    Icmpv4Event::Malformed if self.is_raw_icmp_socket() => {
+                        parse_raw_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
                     }
+                    event => event,
+                };
+                let packet = match event {
+                    Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => packet,
+                    Icmpv4Event::Malformed => return Err(crate::execution::Errno::EINVAL),
+                    Icmpv4Event::Unsupported => return Err(crate::execution::Errno::EOPNOTSUPP),
+                };
+                match raw_icmp.enqueue_tx_echo(packet) {
+                    Some((bytes, became_full)) => (bytes, became_full, false),
+                    None => return Ok(None),
                 }
-                _ => return Ok(None),
-            };
-        self.refresh_io_from_raw();
+            }
+            _ => return Ok(None),
+        };
         Ok(Some(SocketSendReserve {
             bytes,
             became_full,
@@ -969,30 +1395,30 @@ impl SocketPayload {
         }))
     }
 
-    pub(crate) fn take_tcp_tx_bytes(&self, max_len: usize) -> Option<SocketTxDrain> {
-        let raw_tcp = self.raw_tcp.as_ref()?;
-        let (bytes, became_available) = raw_tcp.dequeue_tx_bytes(max_len)?;
-        self.refresh_io_from_raw();
-        Some(SocketTxDrain {
-            bytes,
-            became_available,
-        })
-    }
-
     pub(crate) fn take_udp_tx_datagram(&self) -> Option<SocketUdpTxDrain> {
-        let raw_udp = self.raw_udp.as_ref()?;
+        let raw_udp = self.imp.udp()?;
         let drain = raw_udp.pop_tx_datagram()?;
-        self.refresh_io_from_raw();
         Some(SocketUdpTxDrain {
             datagram: drain.datagram,
+            src: drain.src,
             became_available: drain.became_available,
         })
     }
 
+    /// V5-1: undo a [`Self::take_udp_tx_datagram`] when the device sink
+    /// refused the packet, so the next sink (or the next pass) can retry it.
+    /// Returns false when the tx ring filled up behind us — only then is the
+    /// datagram genuinely dropped.
+    pub(crate) fn restore_udp_tx_datagram(&self, drain: SocketUdpTxDrain) -> bool {
+        let Some(raw_udp) = self.imp.udp() else {
+            return false;
+        };
+        raw_udp.requeue_tx_datagram(drain.datagram, drain.src)
+    }
+
     pub(crate) fn take_icmp_tx_echo(&self) -> Option<SocketIcmpTxDrain> {
-        let raw_icmp = self.raw_icmp.as_ref()?;
+        let raw_icmp = self.imp.icmp()?;
         let drain = raw_icmp.pop_tx_echo()?;
-        self.refresh_io_from_raw();
         Some(SocketIcmpTxDrain {
             packet: drain.packet,
             became_available: drain.became_available,
@@ -1000,34 +1426,48 @@ impl SocketPayload {
     }
 
     pub(crate) fn peek_icmp_tx_echo(&self) -> Option<Icmpv4EchoPacket> {
-        self.raw_icmp.as_ref()?.peek_tx_echo()
+        self.imp.icmp()?.peek_tx_echo()
     }
 
     pub(crate) fn commit_icmp_tx_echo_sent(&self) -> Option<SocketIcmpTxDrain> {
-        let raw_icmp = self.raw_icmp.as_ref()?;
+        let raw_icmp = self.imp.icmp()?;
         let drain = raw_icmp.commit_tx_echo_sent()?;
-        self.refresh_io_from_raw();
         Some(SocketIcmpTxDrain {
             packet: drain.packet,
             became_available: drain.became_available,
         })
     }
 
+    // External v6 echo TX queue (mirror of the v4 icmp_tx_echo family above).
+    pub(crate) fn enqueue_icmp6_tx_echo(
+        &self,
+        packet: crate::net::protocol::Icmpv6EchoPacket,
+    ) -> Option<(usize, bool)> {
+        self.imp.icmp()?.enqueue_tx6_echo(packet)
+    }
+
+    pub(crate) fn peek_icmp6_tx_echo(&self) -> Option<crate::net::protocol::Icmpv6EchoPacket> {
+        self.imp.icmp()?.peek_tx6_echo()
+    }
+
+    /// Returns `became_available` after the sink accepted the head packet.
+    pub(crate) fn commit_icmp6_tx_echo_sent(&self) -> Option<bool> {
+        self.imp.icmp()?.commit_tx6_echo_sent()
+    }
+
     pub(crate) fn record_icmp_recv_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
         let became_readable = self
-            .raw_icmp
-            .as_ref()
+            .imp
+            .icmp()
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_echo_reply(packet));
-        self.refresh_io_from_raw();
         became_readable
     }
 
     pub(crate) fn record_raw_ipv6_packet(&self, packet: RawIpv6Packet) -> bool {
         let became_readable = self
-            .raw_icmp
-            .as_ref()
+            .imp
+            .icmp()
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_ipv6_packet(packet));
-        self.refresh_io_from_raw();
         became_readable
     }
 
@@ -1047,24 +1487,24 @@ impl SocketPayload {
     }
 
     pub fn raw_icmp_protocol(&self) -> Option<ProtocolNumber> {
-        match &*self.protocol.lock() {
+        self.with_protocol(|protocol| match protocol {
             SocketProtocol::RawIcmp(state) => Some(state.protocol),
             _ => None,
-        }
+        })
     }
 
     pub(crate) fn raw_icmp_bound_local6(&self) -> Option<Ipv6Address> {
-        match &*self.protocol.lock() {
+        self.with_protocol(|protocol| match protocol {
             SocketProtocol::RawIcmp(state) => state.bound_local6,
             _ => None,
-        }
+        })
     }
 
     pub fn raw_icmp6_filter(&self) -> Option<[u32; 8]> {
-        match &*self.protocol.lock() {
+        self.with_protocol(|protocol| match protocol {
             SocketProtocol::RawIcmp(state) => Some(state.icmp6_filter),
             _ => None,
-        }
+        })
     }
 
     pub fn set_raw_icmp6_filter(&self, filter: [u32; 8]) -> Result<(), crate::execution::Errno> {
@@ -1080,17 +1520,7 @@ impl SocketPayload {
     }
 
     pub(crate) fn peek_udp_tx_datagram(&self) -> Option<UdpTxDatagram> {
-        self.raw_udp.as_ref()?.peek_tx_datagram()
-    }
-
-    pub(crate) fn commit_udp_tx_datagram_sent(&self) -> Option<SocketUdpTxDrain> {
-        let raw_udp = self.raw_udp.as_ref()?;
-        let drain = raw_udp.commit_tx_datagram_sent()?;
-        self.refresh_io_from_raw();
-        Some(SocketUdpTxDrain {
-            datagram: drain.datagram,
-            became_available: drain.became_available,
-        })
+        self.imp.udp()?.peek_tx_datagram()
     }
 
     pub(crate) fn set_accept_limit(&self, limit: usize) {
@@ -1101,7 +1531,6 @@ impl SocketPayload {
         let mut backlog = self.tcp_backlog.lock();
         let was_empty = backlog.connected_is_empty();
         backlog.push_connected(entry)?;
-        self.io.lock().accept_pending = backlog.connected_len();
         Some(was_empty)
     }
 
@@ -1131,6 +1560,33 @@ impl SocketPayload {
         self.tcp_backlog.lock().connecting_child(local, peer)
     }
 
+    /// Snapshot of every half-open child in the connecting backlog. The
+    /// device-TX half-open lane drives their pending smoltcp segments
+    /// (initial SYN-ACK + RTO retransmits) — they are not in the
+    /// connections table until the final ACK promotes them (P2-S3).
+    pub(crate) fn connecting_children(&self) -> Vec<Cap<SocketIdentity>> {
+        self.tcp_backlog.lock().connecting_children()
+    }
+
+    /// P3-C S1 (R2b): drain BOTH backlog queues on listener close and
+    /// return the `connected` (accept-ready) children — those were
+    /// double-registered into a connections table at handshake time
+    /// (step_connect.rs `insert_*_connection`/`insert_unix_stream_peer` +
+    /// `enqueue_accept_entry`), so the caller must withdraw them from the
+    /// right table (keyed by `(local, peer)` for TCP/SCTP, by `child.raw()`
+    /// for UnixStream) to release the strong `Cap` that otherwise pins the
+    /// child (and its ns) forever. `connecting` (half-open) children live
+    /// only in the backlog Vec and are freed as the drained entries drop.
+    pub(crate) fn drain_backlog_for_close(&self) -> Vec<SocketAcceptEntry> {
+        let mut backlog = self.tcp_backlog.lock();
+        let mut connected = Vec::new();
+        while let Some(entry) = backlog.pop_connected() {
+            connected.push(entry);
+        }
+        backlog.clear_connecting();
+        connected
+    }
+
     pub(crate) fn promote_connecting_to_accept(
         &self,
         local: IpEndpoint,
@@ -1139,7 +1595,6 @@ impl SocketPayload {
         let mut backlog = self.tcp_backlog.lock();
         let was_empty = backlog.connected_is_empty();
         backlog.promote_connecting(local, peer)?;
-        self.io.lock().accept_pending = backlog.connected_len();
         Some(was_empty)
     }
 
@@ -1147,7 +1602,6 @@ impl SocketPayload {
         let mut backlog = self.tcp_backlog.lock();
         let entry = backlog.pop_connected()?;
         let became_empty = backlog.connected_is_empty();
-        self.io.lock().accept_pending = backlog.connected_len();
         Some(SocketAcceptPop {
             entry,
             became_empty,
@@ -1155,7 +1609,7 @@ impl SocketPayload {
     }
 
     fn raw_recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
-        if let Some(raw_packet) = &self.raw_packet {
+        if let Some(raw_packet) = self.imp.packet() {
             return raw_packet.recv_len(len, peek);
         }
         let unix_stream = self.with_protocol(|protocol| {
@@ -1164,46 +1618,25 @@ impl SocketPayload {
                 SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
             )
         });
-        match (
-            &self.raw_tcp,
-            &self.raw_udp,
-            &self.raw_icmp,
-            &self.raw_unix,
-            &self.raw_rds,
-            &self.raw_sctp,
-            &self.raw_netlink_route,
-            &self.raw_netlink_netfilter,
-        ) {
-            (Some(raw_tcp), None, None, None, None, None, None, None) => raw_tcp
+        match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => raw_tcp
                 .recv_len(len, peek)
                 .or_else(|| raw_tcp.is_recv_closed().then_some((0, false))),
-            (None, Some(raw_udp), None, None, None, None, None, None) => {
-                raw_udp.recv_len(len, peek)
-            }
-            (None, None, Some(raw_icmp), None, None, None, None, None) => {
+            SocketImpl::Udp(raw_udp) => raw_udp.recv_len(len, peek),
+            SocketImpl::Icmp(raw_icmp) => {
                 raw_icmp.recv_len_with_ipv4_header(len, peek, self.is_raw_icmp_socket())
             }
-            (None, None, None, Some(raw_unix), None, None, None, None) => {
-                raw_unix.recv_len(len, peek, unix_stream)
-            }
-            (None, None, None, None, Some(raw_rds), None, None, None) => {
-                raw_rds.recv_len(len, peek)
-            }
-            (None, None, None, None, None, Some(raw_sctp), None, None) => {
-                raw_sctp.recv_len(len, peek)
-            }
-            (None, None, None, None, None, None, Some(raw_netlink), None) => {
-                raw_netlink.recv_len(len)
-            }
-            (None, None, None, None, None, None, None, Some(raw_netlink)) => {
-                raw_netlink.recv_len(len)
-            }
+            SocketImpl::Unix(raw_unix) => raw_unix.recv_len(len, peek, unix_stream),
+            SocketImpl::Rds(raw_rds) => raw_rds.recv_len(len, peek),
+            SocketImpl::Sctp(raw_sctp) => raw_sctp.recv_len(len, peek),
+            SocketImpl::NetlinkRoute(raw_netlink) => raw_netlink.recv_len(len),
+            SocketImpl::NetlinkNetfilter(raw_netlink) => raw_netlink.recv_len(len),
             _ => None,
         }
     }
 
     fn raw_recv_available(&self) -> usize {
-        if let Some(raw_packet) = &self.raw_packet {
+        if let Some(raw_packet) = self.imp.packet() {
             return raw_packet.recv_available();
         }
         let unix_stream = self.with_protocol(|protocol| {
@@ -1212,69 +1645,41 @@ impl SocketPayload {
                 SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
             )
         });
-        match (
-            &self.raw_tcp,
-            &self.raw_udp,
-            &self.raw_icmp,
-            &self.raw_unix,
-            &self.raw_rds,
-            &self.raw_sctp,
-            &self.raw_netlink_route,
-            &self.raw_netlink_netfilter,
-        ) {
-            (Some(raw_tcp), None, None, None, None, None, None, None) => raw_tcp.recv_available(),
-            (None, Some(raw_udp), None, None, None, None, None, None) => raw_udp.recv_available(),
-            (None, None, Some(raw_icmp), None, None, None, None, None) => raw_icmp.recv_available(),
-            (None, None, None, Some(raw_unix), None, None, None, None) => {
-                raw_unix.recv_available(unix_stream)
-            }
-            (None, None, None, None, Some(raw_rds), None, None, None) => raw_rds.recv_available(),
-            (None, None, None, None, None, Some(raw_sctp), None, None) => raw_sctp.recv_available(),
-            (None, None, None, None, None, None, Some(raw_netlink), None) => {
-                raw_netlink.recv_available()
-            }
-            (None, None, None, None, None, None, None, Some(raw_netlink)) => {
-                raw_netlink.recv_available()
-            }
+        match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => raw_tcp.recv_available(),
+            SocketImpl::Udp(raw_udp) => raw_udp.recv_available(),
+            SocketImpl::Icmp(raw_icmp) => raw_icmp.recv_available(),
+            SocketImpl::Unix(raw_unix) => raw_unix.recv_available(unix_stream),
+            SocketImpl::Rds(raw_rds) => raw_rds.recv_available(),
+            SocketImpl::Sctp(raw_sctp) => raw_sctp.recv_available(),
+            SocketImpl::NetlinkRoute(raw_netlink) => raw_netlink.recv_available(),
+            SocketImpl::NetlinkNetfilter(raw_netlink) => raw_netlink.recv_available(),
             _ => 0,
         }
     }
 
     fn raw_send_available(&self) -> usize {
-        if let Some(raw_packet) = &self.raw_packet {
+        if let Some(raw_packet) = self.imp.packet() {
             return raw_packet.send_available();
         }
-        match (
-            &self.raw_tcp,
-            &self.raw_udp,
-            &self.raw_icmp,
-            &self.raw_unix,
-            &self.raw_rds,
-            &self.raw_sctp,
-            &self.raw_netlink_route,
-            &self.raw_netlink_netfilter,
-        ) {
-            (Some(raw_tcp), None, None, None, None, None, None, None) => raw_tcp.send_available(),
-            (None, Some(raw_udp), None, None, None, None, None, None) => raw_udp.send_available(),
-            (None, None, Some(raw_icmp), None, None, None, None, None) => raw_icmp.send_available(),
-            (None, None, None, Some(raw_unix), None, None, None, None) => raw_unix.send_available(),
-            (None, None, None, None, Some(raw_rds), None, None, None) => raw_rds.send_available(),
-            (None, None, None, None, None, Some(raw_sctp), None, None) => raw_sctp.send_available(),
-            (None, None, None, None, None, None, Some(raw_netlink), None) => {
-                raw_netlink.send_available()
-            }
-            (None, None, None, None, None, None, None, Some(raw_netlink)) => {
-                raw_netlink.send_available()
-            }
+        match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => raw_tcp.send_available(),
+            SocketImpl::Udp(raw_udp) => raw_udp.send_available(),
+            SocketImpl::Icmp(raw_icmp) => raw_icmp.send_available(),
+            SocketImpl::Unix(raw_unix) => raw_unix.send_available(),
+            SocketImpl::Rds(raw_rds) => raw_rds.send_available(),
+            SocketImpl::Sctp(raw_sctp) => raw_sctp.send_available(),
+            SocketImpl::NetlinkRoute(raw_netlink) => raw_netlink.send_available(),
+            SocketImpl::NetlinkNetfilter(raw_netlink) => raw_netlink.send_available(),
             _ => 0,
         }
     }
 
     pub(crate) fn raw_icmp_bound_local(&self) -> Option<Ipv4Address> {
-        match &*self.protocol.lock() {
+        self.with_protocol(|protocol| match protocol {
             SocketProtocol::RawIcmp(state) => state.bound_local,
             _ => None,
-        }
+        })
     }
 
     fn is_icmp_datagram_socket(&self) -> bool {
@@ -1286,19 +1691,68 @@ impl SocketPayload {
     }
 
     fn udp_connected_remote(&self) -> Option<IpEndpoint> {
-        match &*self.protocol.lock() {
-            SocketProtocol::Udp(UdpInner::Connected { remote, .. }) => Some(remote),
+        self.with_protocol(|protocol| match protocol {
+            SocketProtocol::Udp(UdpInner::Connected { remote, .. }) => Some(*remote),
             _ => None,
-        }
-        .copied()
+        })
     }
 
-    pub(crate) fn refresh_io_from_raw(&self) {
-        let recv_len = self.raw_recv_available();
-        let send_space = self.raw_send_available();
-        let mut io = self.io.lock();
-        io.recv_len = recv_len;
-        io.send_space = send_space;
+    fn udp_bound_local(&self) -> Option<IpEndpoint> {
+        self.with_protocol(|protocol| match protocol {
+            SocketProtocol::Udp(UdpInner::Bound { local })
+            | SocketProtocol::Udp(UdpInner::Connected { local, .. }) => Some(*local),
+            _ => None,
+        })
+    }
+
+    /// Resolve the source address to stamp on outgoing UDP datagrams
+    /// (P2-S6). The context iface carries no addresses, so smoltcp's
+    /// dispatch-side source selection cannot be relied on: use the bound
+    /// address when concrete, the loopback rule for loopback-destined
+    /// datagrams, else the namespace route's preferred source.
+    fn udp_tx_src_hint(&self, dst: IpEndpoint) -> Option<IpEndpoint> {
+        if let Some(local) = self.udp_bound_local() {
+            if !local.is_unspecified() {
+                return Some(local);
+            }
+        }
+        if dst.is_loopback() || dst.is_unspecified() {
+            return Some(IpEndpoint::loopback_for_family(dst.family, 0));
+        }
+        match dst.ip_addr() {
+            super::IpAddress::V4(addr) => self
+                .net_namespace()
+                .best_ipv4_route(addr)
+                .and_then(|route| {
+                    route.preferred_src.or_else(|| {
+                        self.net_namespace()
+                            .link_snapshot()
+                            .into_iter()
+                            .find(|link| {
+                                link.name == route.oif_name
+                                    && link.is_up
+                                    && !link.is_loopback
+                                    && link.ipv4_addr.is_some()
+                            })
+                            .and_then(|link| link.ipv4_addr)
+                    })
+                })
+                .map(|src| IpEndpoint::new(src, 0)),
+            // V5-1: mirror of the V4 arm above. This used to be a hard `None`,
+            // which handed source selection to smoltcp — and the context iface
+            // carries no addresses, so `get_source_address_ipv6` fell back to
+            // `Ipv6Address::LOCALHOST`. Every external v6 UDP datagram that did
+            // reach the wire carried src=`::1` and could never be answered.
+            // (The v4 arm has no such symptom only because the v4 fallback
+            // returns None and smoltcp then drops the packet silently.)
+            //
+            // This is also the first real consumer of `best_ipv6_route`, which
+            // was fully implemented but had zero non-test callers.
+            super::IpAddress::V6(addr) => self
+                .net_namespace()
+                .preferred_ipv6_source(addr)
+                .map(|src| IpEndpoint::new_v6(src, 0)),
+        }
     }
 }
 
@@ -1321,16 +1775,6 @@ pub struct SocketIoState {
     pub recv_len: usize,
     pub send_space: usize,
     pub accept_pending: usize,
-}
-
-impl SocketIoState {
-    pub const fn new() -> Self {
-        Self {
-            recv_len: 0,
-            send_space: 0,
-            accept_pending: 0,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1373,14 +1817,10 @@ pub struct SocketSendReserve {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SocketTxDrain {
-    pub bytes: Vec<u8>,
-    pub became_available: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SocketUdpTxDrain {
     pub datagram: UdpTxDatagram,
+    /// Dispatch-resolved source endpoint (see `UdpTxDatagramDrain::src`).
+    pub src: IpEndpoint,
     pub became_available: bool,
 }
 
@@ -2130,6 +2570,20 @@ impl TcpBacklog {
     ) -> Option<Cap<SocketIdentity>> {
         self.find_connecting(local, peer)
             .map(|index| self.connecting[index].child.clone())
+    }
+
+    pub fn connecting_children(&self) -> Vec<Cap<SocketIdentity>> {
+        self.connecting
+            .iter()
+            .map(|entry| entry.child.clone())
+            .collect()
+    }
+
+    /// P3-C S1 (R2b): drop every half-open child on listener close. These
+    /// are not in the connections table (promoted only on final ACK), so
+    /// clearing the Vec releases their `Cap` directly.
+    pub fn clear_connecting(&mut self) {
+        self.connecting.clear();
     }
 
     pub fn cleanup_connecting(&mut self, now: Instant) -> (usize, usize, usize, usize) {

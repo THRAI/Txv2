@@ -1,6 +1,8 @@
 use tx_substrate::bus::RawPort;
+use tx_substrate::step::WaitSourceId;
 use tx_substrate::zone::PayloadCap;
 
+use crate::net::adapter::wait_routing;
 use crate::sync::SpinMutex;
 use crate::wait_source;
 
@@ -88,12 +90,45 @@ const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
 }
 
 impl SocketWaitCarriers {
+    /// P3-S1 (R4a): dual-register every readiness carrier under ONE id
+    /// from the v3 notification namespace — the subsystems registry (for
+    /// `wait_on_token`: ppoll/pselect and the legacy socket park paths)
+    /// AND the substrate registry (for `await_wait_source`: epoll).
+    /// Mirrors the eventfd pattern (`eventfd/notification.rs`
+    /// `new_wait_points`). Before this, epoll looked socket carriers up
+    /// in a registry they were never in, so `epoll_wait` on a
+    /// pure-socket set returned 0 immediately instead of blocking.
     fn register(readiness: &SocketReadiness, urgent_port: &RawPort) -> Self {
+        let recv = crate::allocate_notification_source_id();
+        let send = crate::allocate_notification_source_id();
+        let accept = crate::allocate_notification_source_id();
+        let urgent = crate::allocate_notification_source_id();
+
+        // `register_wait_queue`/`register_wait_port` honour an id the carrier
+        // already carries and only allocate when it is still 0, so stamping the
+        // notification id first pins the registration to that id. The two id
+        // spaces do not overlap: notification ids start at 1 << 32, the
+        // registry's own allocator starts at 1.
+        readiness.recv_wq.set_source_id(WaitSourceId::new(recv));
+        readiness.send_wq.set_source_id(WaitSourceId::new(send));
+        readiness.accept_wq.set_source_id(WaitSourceId::new(accept));
+        urgent_port.set_source_id(WaitSourceId::new(urgent));
+        wait_source::register_wait_queue(readiness.recv_wq.clone());
+        wait_source::register_wait_queue(readiness.send_wq.clone());
+        wait_source::register_wait_queue(readiness.accept_wq.clone());
+        wait_source::register_wait_port(urgent_port.clone());
+
+        readiness.install_substrate_mirrors(
+            wait_routing::new_wait_source(recv),
+            wait_routing::new_wait_source(send),
+            wait_routing::new_wait_source(accept),
+        );
+
         Self {
-            recv: wait_source::register_wait_queue(readiness.recv_wq.clone()),
-            send: wait_source::register_wait_queue(readiness.send_wq.clone()),
-            accept: wait_source::register_wait_queue(readiness.accept_wq.clone()),
-            urgent: wait_source::register_wait_port(urgent_port.clone()),
+            recv,
+            send,
+            accept,
+            urgent,
         }
     }
 
@@ -102,6 +137,9 @@ impl SocketWaitCarriers {
         wait_source::release_wait_source(self.send);
         wait_source::release_wait_source(self.accept);
         wait_source::release_wait_source(self.urgent);
+        wait_routing::unregister_source(self.recv);
+        wait_routing::unregister_source(self.send);
+        wait_routing::unregister_source(self.accept);
     }
 }
 

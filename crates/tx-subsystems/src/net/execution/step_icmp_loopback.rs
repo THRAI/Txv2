@@ -4,7 +4,6 @@ use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::initial_loopback_iface;
 use crate::net::protocol::{LoopbackIface, PollContext};
 use crate::net::structure::SocketIdentity;
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LoopbackIcmpTransferOutcome {
@@ -16,39 +15,25 @@ pub struct LoopbackIcmpTransferOutcome {
     pub peer_wake_fired: bool,
 }
 
-pub fn step_process_loopback_icmp_with_post<F>(
+pub fn step_process_loopback_icmp(
     source: &Cap<SocketIdentity>,
     budget: usize,
     guard: &Guard<'_>,
-    post: F,
-) -> StepOutcome<LoopbackIcmpTransferOutcome>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
+) -> StepOutcome<LoopbackIcmpTransferOutcome> {
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_loopback_icmp_on_iface_with_post::<F>(
-        source,
-        budget,
-        initial_loopback_iface(),
-        guard,
-        post,
-    )
+    step_process_loopback_icmp_on_iface(source, budget, initial_loopback_iface(), guard)
 }
 
-pub fn step_process_loopback_icmp_on_iface_with_post<F>(
+pub fn step_process_loopback_icmp_on_iface(
     source: &Cap<SocketIdentity>,
     budget: usize,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-    mut post: F,
-) -> StepOutcome<LoopbackIcmpTransferOutcome>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
+) -> StepOutcome<LoopbackIcmpTransferOutcome> {
     // observe
     // upgrade
     // reserve
@@ -57,20 +42,22 @@ where
     let Some(source_payload) = source.acquire_operational() else {
         return StepOutcome::Done(LoopbackIcmpTransferOutcome::default());
     };
-    let mut ctx =
-        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
+    let mut ctx = PollContext::new_with_table(
+        crate::net::clock::net_now_instant(),
+        source_payload.socket_table(),
+    );
     let mut source_wake_fired = false;
 
     if let Some(publish) = ctx.poll_icmp_egress_one(source, iface, guard) {
         source_wake_fired = publish.publish.send_has_space;
-        publish.publish_with_post(&mut post);
+        publish.publish();
     }
 
     let ingress = ctx.poll_icmp_ingress(iface, guard, budget);
     let mut peer_wake_fired = false;
     for publish in ingress.publishes {
         peer_wake_fired |= publish.publish.recv_has_data;
-        publish.publish_with_post(&mut post);
+        publish.publish();
     }
 
     StepOutcome::Done(LoopbackIcmpTransferOutcome {

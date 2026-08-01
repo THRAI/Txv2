@@ -509,6 +509,8 @@ fn raw_udp_socket_close_releases_corked_and_queued_payloads() {
 
     let raw = RawUdpSocket::new(&options);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 12345);
+    // P2-S6: the smoltcp ring is the queue; `send` needs a bound socket.
+    assert!(raw.bind_endpoint(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_242)));
 
     assert_eq!(
         raw.enqueue_tx_datagram_with_more(dst, alloc::vec![0xAA; 4000], true),
@@ -576,9 +578,7 @@ fn socket_readiness_has_independent_queues() {
     assert_eq!(identity.readiness.send_wq.peek(), 0);
     assert_eq!(identity.readiness.accept_wq.peek(), 0);
 
-    identity
-        .readiness
-        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
+    identity.readiness.fire_recv(RecvWireSet::HAS_DATA);
 
     assert_eq!(
         identity.readiness.recv_wq.peek(),
@@ -636,7 +636,7 @@ fn net_delegate_queue_registers_rawqueue_and_wakes_on_poll() {
     let mut cx = Context::from_waker(&waker);
 
     assert!(matches!(Pin::new(&mut future).poll(&mut cx), Poll::Pending));
-    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
+    crate::net::delegate::net_delegate_kick_poll();
     assert!(matches!(
         Pin::new(&mut future).poll(&mut cx),
         Poll::Ready(WaitOutcome::Ready)
@@ -708,4 +708,142 @@ fn checks_require_witnesses_preserve_guard_scoped_identity() {
 
     let poll = require_socket_poll_target(&tcp, &guard).expect("poll witness");
     assert_eq!(poll.identity.raw(), tcp.raw());
+}
+
+/// P3-S1 (R4a) decisive test: socket readiness carriers must be visible
+/// to the SUBSTRATE wait-source registry (the one epoll's
+/// `await_wait_source` looks up) and `fire_*` must wake a substrate
+/// subscriber. Before S1, `lookup_source` returned None for socket
+/// carriers, so `epoll_wait` on a pure-socket set returned 0 immediately
+/// instead of blocking (registry mismatch, audit R4a).
+#[test]
+fn socket_readiness_carriers_visible_to_substrate_registry() {
+    init_zones();
+    let socket = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp socket");
+
+    use tx_substrate::wake;
+
+    for (name, id) in [
+        ("recv", socket.wait_carriers.recv),
+        ("send", socket.wait_carriers.send),
+        ("accept", socket.wait_carriers.accept),
+    ] {
+        assert!(
+            wake::lookup_source(tx_substrate::step::WaitSourceId::new(id)).is_some(),
+            "socket {name} carrier must resolve in the substrate registry (R4a)"
+        );
+    }
+
+    let source = wake::lookup_source(tx_substrate::step::WaitSourceId::new(
+        socket.wait_carriers.recv,
+    ))
+    .expect("recv carrier");
+    let mailbox = alloc::sync::Arc::new(wake::mailbox::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = source.register(
+        alloc::sync::Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(RecvWireSet::HAS_DATA.bits()),
+    );
+    assert!(mailbox.poll().is_none(), "no event before fire");
+    socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    assert!(
+        mailbox.poll().is_some(),
+        "fire_recv must notify the substrate mirror (epoll wake path)"
+    );
+}
+
+/// P3-C S2 (R2c): the graceful-close cleanup path must withdraw the
+/// connection from the socket's OWN netns table, not the global
+/// initial-ns SOCKET_TABLE. Before the fix a non-initial-netns
+/// connection routed through cleanup left its real ns entry undeleted
+/// (leak + R2f ns pin). Registers a Connected socket in an isolated ns,
+/// runs cleanup, and asserts the isolated ns table entry is gone while
+/// the initial SOCKET_TABLE was never touched.
+#[test]
+fn tcp_cleanup_withdraws_from_owning_namespace_table() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let ns = crate::net::create_isolated_net_namespace_for_test("r2c-ns")
+        .expect("isolated ns")
+        .payload_cap()
+        .expect("ns payload");
+    let sock = registry::create_socket_in_namespace(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+        ns.clone(),
+    )
+    .expect("socket");
+    let local = endpoint(41_920);
+    let remote = endpoint(51_920);
+    let key = ConnectionKey::new(local, remote);
+
+    // Force the socket into Connected and register the connection in the
+    // isolated ns table (mirrors what a completed handshake does).
+    sock.acquire_operational()
+        .expect("payload")
+        .with_protocol_mut(|p| {
+            *p = SocketProtocol::Tcp(TcpState::Connected { local, remote });
+        });
+    ns.socket_table()
+        .insert_tcp_connection(key, sock.clone())
+        .expect("register connection in isolated ns");
+    assert!(
+        ns.socket_table()
+            .lookup_tcp_connection(key, &guard)
+            .is_some(),
+        "precondition: connection registered in isolated ns"
+    );
+    // The global initial-ns table must NOT have it (that's the whole point).
+    assert!(
+        SOCKET_TABLE
+            .as_table()
+            .lookup_tcp_connection(key, &guard)
+            .is_none(),
+        "connection must live only in the isolated ns table"
+    );
+
+    let StepOutcome::Done(outcome) = step_tcp_connection_cleanup(&sock, &guard) else {
+        panic!("cleanup should complete");
+    };
+    assert!(outcome.was_connected);
+    assert!(
+        outcome.local_withdrawn,
+        "R2c: cleanup must withdraw from the owning ns table"
+    );
+    assert!(
+        ns.socket_table()
+            .lookup_tcp_connection(key, &guard)
+            .is_none(),
+        "R2c: isolated ns connection must be gone after cleanup"
+    );
+}
+
+/// P3-C S4 (R2d): a default TCP socket's actual smoltcp ring backing is
+/// clamped (≤64KB/dir), cutting the former eager 320KB/socket, while the
+/// reported SO_RCVBUF/SNDBUF (option value) is unchanged. Verifies the
+/// clamp via send_available (which reads the real ring capacity) staying
+/// ≤ the cap even though the socket requested the 256KB/64KB defaults.
+#[test]
+fn tcp_socket_backing_is_clamped_below_default() {
+    let raw = crate::net::protocol::RawTcpSocket::new(&SocketOptionSet::default_tcp());
+    // Reported capacity = requested option (unchanged, for getsockopt).
+    assert_eq!(raw.send_capacity(), 65_536);
+    assert_eq!(raw.recv_capacity(), 262_144);
+    // A tiny-buffer socket keeps its exact (sub-cap) size — clamp only bites
+    // the oversized default; the recv ring's actual size is what recv_len
+    // caps against, not the reported 262144.
+    let mut small = SocketOptionSet::default_tcp();
+    small.socket.recv_buf_size = 4096;
+    small.socket.send_buf_size = 4096;
+    let raw_small = crate::net::protocol::RawTcpSocket::new(&small);
+    assert_eq!(raw_small.recv_capacity(), 4096);
+    assert_eq!(raw_small.send_capacity(), 4096);
 }

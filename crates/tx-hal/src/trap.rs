@@ -315,7 +315,12 @@ pub trait KernelTrapSink<P: TxPlatform> {
 
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
-    fn on_external_irq(cpu: CpuId) -> TrapAction;
+    /// Handle an external device interrupt.
+    ///
+    /// Implementations that reschedule after interrupting userspace must first
+    /// preserve `view` through the same userspace-run handoff used for timer
+    /// preemption.
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
     fn on_ipi(cpu: CpuId) -> TrapAction;
 

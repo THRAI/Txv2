@@ -25,11 +25,14 @@ struct KeySlot {
     slot_index: usize,
 }
 
+const NO_FREE_SLOT: usize = usize::MAX;
+
 /// Indexed binary min-heap ordered by `(deadline_ns, key.raw())`.
 pub(super) struct MinHeap {
     heap: Vec<HeapEntry>,
     slots: Vec<Slot>,
     key_slots: Vec<Option<KeySlot>>,
+    free_head: usize,
 }
 
 impl MinHeap {
@@ -38,25 +41,28 @@ impl MinHeap {
             heap: Vec::new(),
             slots: Vec::new(),
             key_slots: Vec::new(),
+            free_head: NO_FREE_SLOT,
         }
     }
 
     pub(super) fn has_insert_capacity(&self) -> bool {
         self.heap.len() < self.heap.capacity()
-            && self.slots.len() < self.slots.capacity()
+            && (self.free_head != NO_FREE_SLOT || self.slots.len() < self.slots.capacity())
             && self.key_slots_can_insert()
     }
 
     /// Reserve one insertion slot while the engine state is not spin-locked.
     pub(super) fn reserve_for_insert(&mut self) {
         self.heap.reserve(1);
-        self.slots.reserve(1);
+        if self.free_head == NO_FREE_SLOT {
+            self.slots.reserve(1);
+        }
         if self.key_slots_can_insert() {
             return;
         }
 
         let required = self
-            .slots
+            .heap
             .len()
             .checked_add(1)
             .and_then(|count| count.checked_mul(2))
@@ -65,7 +71,9 @@ impl MinHeap {
         let mut key_slots = Vec::with_capacity(required);
         key_slots.resize(required, None);
         for (slot_index, slot) in self.slots.iter().enumerate() {
-            Self::insert_key_slot_into(&mut key_slots, slot.key, slot_index);
+            if slot.live {
+                Self::insert_key_slot_into(&mut key_slots, slot.key, slot_index);
+            }
         }
         self.key_slots = key_slots;
     }
@@ -80,7 +88,7 @@ impl MinHeap {
     fn key_slots_can_insert(&self) -> bool {
         !self.key_slots.is_empty()
             && self
-                .slots
+                .heap
                 .len()
                 .checked_add(1)
                 .and_then(|count| count.checked_mul(2))
@@ -119,6 +127,34 @@ impl MinHeap {
             }
             index = (index + 1) % key_slots.len();
         }
+    }
+
+    fn probe_distance(home: usize, position: usize, len: usize) -> usize {
+        if position >= home {
+            position - home
+        } else {
+            len - (home - position)
+        }
+    }
+
+    /// Remove one open-addressed entry and backward-shift the remaining probe
+    /// cluster so lookups may still stop at the first empty bucket.
+    fn remove_key_slot(&mut self, key: TimerKey) -> Option<usize> {
+        let mut hole = Self::key_slot_index(&self.key_slots, key)?;
+        let removed = self.key_slots[hole]?;
+        let len = self.key_slots.len();
+        let mut scan = (hole + 1) % len;
+
+        while let Some(entry) = self.key_slots[scan] {
+            let home = Self::hash(entry.key) % len;
+            if Self::probe_distance(home, hole, len) < Self::probe_distance(home, scan, len) {
+                self.key_slots[hole] = Some(entry);
+                hole = scan;
+            }
+            scan = (scan + 1) % len;
+        }
+        self.key_slots[hole] = None;
+        Some(removed.slot_index)
     }
 
     fn slot_index(&self, key: TimerKey) -> Option<usize> {
@@ -202,6 +238,17 @@ impl MinHeap {
         }
         removed
     }
+
+    fn recycle_slot(&mut self, key: TimerKey) {
+        let slot_index = self
+            .remove_key_slot(key)
+            .expect("retired timer key must have an index slot");
+        let slot = &mut self.slots[slot_index];
+        assert!(slot.live, "retired timer slot must be live");
+        slot.live = false;
+        slot.heap_index = self.free_head;
+        self.free_head = slot_index;
+    }
 }
 
 impl TimerQueue for MinHeap {
@@ -210,15 +257,24 @@ impl TimerQueue for MinHeap {
             self.has_insert_capacity(),
             "timer heap capacity was not prepared"
         );
-        let index = self.slots.len();
         let heap_index = self.heap.len();
-        self.slots.push(Slot {
+        let slot = Slot {
             key,
             deadline_ns,
             generation: 0,
             heap_index,
             live: true,
-        });
+        };
+        let index = if self.free_head == NO_FREE_SLOT {
+            let index = self.slots.len();
+            self.slots.push(slot);
+            index
+        } else {
+            let index = self.free_head;
+            self.free_head = self.slots[index].heap_index;
+            self.slots[index] = slot;
+            index
+        };
         Self::insert_key_slot_into(&mut self.key_slots, key, index);
         self.heap.push(HeapEntry {
             key,
@@ -237,9 +293,7 @@ impl TimerQueue for MinHeap {
         }
         let heap_index = slot.heap_index;
         self.remove_at(heap_index);
-        self.slot_mut(key)
-            .expect("removed heap entry must have a slot")
-            .live = false;
+        self.recycle_slot(key);
         true
     }
 
@@ -273,7 +327,7 @@ impl TimerQueue for MinHeap {
                 continue;
             };
             if slot.live && slot.generation == removed.generation {
-                slot.live = false;
+                self.recycle_slot(removed.key);
                 assert!(
                     out.len() < out.capacity(),
                     "timer due output capacity was not prepared"
@@ -356,5 +410,69 @@ mod tests {
         queue.drain_due(30, &mut out);
         assert_eq!(out, vec![keys[0], keys[4], keys[3], keys[2]]);
         assert_eq!(queue.next_deadline_ns(), None);
+    }
+
+    #[test]
+    fn key_index_deletion_preserves_wrapped_probe_chain() {
+        let mut queue = MinHeap::new();
+        let keys: Vec<_> = (1..)
+            .map(TimerKey::new)
+            .filter(|key| MinHeap::hash(*key) % 8 == 7)
+            .take(3)
+            .collect();
+        for (offset, key) in keys.iter().copied().enumerate() {
+            insert(&mut queue, key, 10 + offset as u64);
+        }
+
+        assert_eq!(queue.key_slots.len(), 8);
+        assert!(queue.remove(keys[0]));
+        assert!(queue.rearm(keys[1], 5));
+        assert!(queue.remove(keys[2]));
+
+        let mut out = Vec::with_capacity(1);
+        queue.drain_due(5, &mut out);
+        assert_eq!(out, vec![keys[1]]);
+        assert_eq!(queue.next_deadline_ns(), None);
+    }
+
+    #[test]
+    fn canceled_slots_are_reused_across_long_churn() {
+        let mut queue = MinHeap::new();
+
+        for raw in 1..=70_000 {
+            let key = TimerKey::new(raw);
+            insert(&mut queue, key, raw);
+            assert!(queue.remove(key));
+            assert!(
+                queue.slots.len() <= 1,
+                "canceled timer slots must not accumulate"
+            );
+        }
+
+        assert!(queue.heap.is_empty());
+        assert_eq!(queue.slots.len(), 1);
+        assert_eq!(queue.key_slots.len(), 8);
+    }
+
+    #[test]
+    fn expired_slots_are_reused_across_long_churn() {
+        let mut queue = MinHeap::new();
+        let mut out = Vec::with_capacity(1);
+
+        for raw in 1..=70_000 {
+            let key = TimerKey::new(raw);
+            insert(&mut queue, key, raw);
+            queue.drain_due(raw, &mut out);
+            assert_eq!(out.as_slice(), &[key]);
+            out.clear();
+            assert!(
+                queue.slots.len() <= 1,
+                "expired timer slots must not accumulate"
+            );
+        }
+
+        assert!(queue.heap.is_empty());
+        assert_eq!(queue.slots.len(), 1);
+        assert_eq!(queue.key_slots.len(), 8);
     }
 }

@@ -64,7 +64,7 @@ fn execution_poll_reports_socket_readiness() {
     let local = inet(40_015);
 
     assert_eq!(step_bind(&udp, local, &guard), StepOutcome::Done(()));
-    udp.readiness.fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
+    udp.readiness.fire_recv(RecvWireSet::HAS_DATA);
 
     let mask = match step_poll_ready(&udp, &guard) {
         StepOutcome::Done(mask) => mask,

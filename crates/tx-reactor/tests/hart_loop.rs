@@ -1,11 +1,11 @@
 use std::cell::Cell;
 use tx_reactor::{
     hart_loop::{
-        step_hart_loop, step_hart_loop_at, HartLoopDeadlineAction, HartLoopDecision,
-        HartLoopRuntime,
+        step_hart_loop, step_hart_loop_at, step_hart_loop_at_with_poll_budget,
+        HartLoopDeadlineAction, HartLoopDecision, HartLoopRuntime,
     },
     preempt::{PreemptMarkers, PreemptionPoint},
-    HartId, NoopRescheduleSignal, RescheduleSignal, RunStats, WakeDispatchReport,
+    HartId, HartPollBudget, NoopRescheduleSignal, RescheduleSignal, RunStats, WakeDispatchReport,
 };
 use tx_services::time::CurrentHartDeadlineTimer;
 
@@ -17,6 +17,7 @@ struct FakeHartRuntime {
     stats: RunStats,
     next_deadline_ns: Option<u64>,
     advanced_to: Option<u64>,
+    poll_budget: Option<HartPollBudget>,
 }
 
 impl Default for FakeHartRuntime {
@@ -28,6 +29,7 @@ impl Default for FakeHartRuntime {
             stats: RunStats::empty(),
             next_deadline_ns: None,
             advanced_to: None,
+            poll_budget: None,
         }
     }
 }
@@ -57,10 +59,16 @@ impl HartLoopRuntime for FakeHartRuntime {
         self.markers
     }
 
-    fn run_hart_loop_ready<S>(&mut self, _hart: HartId, _signal: &mut S) -> RunStats
+    fn run_hart_loop_ready<S>(
+        &mut self,
+        _hart: HartId,
+        _signal: &mut S,
+        poll_budget: HartPollBudget,
+    ) -> RunStats
     where
         S: RescheduleSignal,
     {
+        self.poll_budget = Some(poll_budget);
         self.stats
     }
 }
@@ -264,4 +272,15 @@ fn clock_adapter_supplies_step_time() {
 
     assert_eq!(step.now_ns, 400);
     assert_eq!(runtime.advanced_to, Some(400));
+}
+
+#[test]
+fn bounded_step_forwards_poll_budget_to_runtime() {
+    let mut runtime = FakeHartRuntime::default();
+    let mut signal = NoopRescheduleSignal::new();
+    let budget = HartPollBudget::up_to(1);
+
+    let _ = step_hart_loop_at_with_poll_budget(&mut runtime, HartId(0), 500, &mut signal, budget);
+
+    assert_eq!(runtime.poll_budget, Some(budget));
 }

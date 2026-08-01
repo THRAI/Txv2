@@ -7,11 +7,13 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet, TcpPacket, UdpPacket,
 };
 
 use crate::execution::Errno;
+use crate::net::clock::net_now_instant;
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::protocol::{parse_icmpv4_payload, Icmpv4Event};
 use crate::net::structure::Ipv4Address;
@@ -145,6 +147,16 @@ struct NetfilterRuleEntry {
     counters: NetfilterRuleCounters,
 }
 
+/// P3-C S5 (R2e): conntrack bound + aging. The former unbounded `Vec`s
+/// grew one entry per distinct forwarded flow with no TTL and no cap, and
+/// each packet did an O(n) reply scan → unbounded memory + per-packet cost
+/// growing without limit. A per-entry `last_seen` (refreshed on hit) plus
+/// lazy TTL expiry and a hard cap keep both bounded (bounded table ⇒
+/// bounded scan). TTL/cap mirror the ARP-cache and IPv4-reassembly
+/// precedents. `now` comes from the P0-unfrozen `net_now_instant()`.
+const CONNTRACK_TTL: Duration = Duration::from_secs(120);
+const CONNTRACK_MAX_ENTRIES: usize = 4096;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MasqueradeConntrack {
     protocol: NetfilterConntrackProtocol,
@@ -154,6 +166,7 @@ struct MasqueradeConntrack {
     masquerade_src_port: u16,
     external_dst: Ipv4Address,
     external_dst_port: u16,
+    last_seen: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,6 +178,7 @@ struct DnatConntrack {
     public_dst_port: u16,
     private_dst: Ipv4Address,
     private_dst_port: u16,
+    last_seen: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -733,6 +747,7 @@ pub fn apply_postrouting_nat_ipv4_in_namespace(
             masquerade_src_port: tuple.src_port,
             external_dst: dst,
             external_dst_port: tuple.dst_port,
+            last_seen: net_now_instant(),
         },
     );
     rewrite_ipv4_nat(packet, Some(masquerade_src), None, None, None)
@@ -766,6 +781,7 @@ pub fn apply_prerouting_nat_ipv4_in_namespace(
                 public_dst_port: tuple.dst_port,
                 private_dst,
                 private_dst_port: private_port,
+                last_seen: net_now_instant(),
             },
         );
         return rewrite_ipv4_nat(packet, None, Some(private_dst), None, Some(private_port));
@@ -854,8 +870,44 @@ fn find_dnat_rule_in_namespace(
     })
 }
 
+/// R2e: drop entries whose `last_seen + TTL` has passed, then enforce the
+/// hard cap by evicting the oldest survivor(s). Runs on every insert so
+/// the table stays bounded in both memory and scan cost. `now` is the
+/// P0-unfrozen live clock.
+fn expire_and_cap_masquerade(entries: &mut Vec<MasqueradeConntrack>, now: Instant) {
+    entries.retain(|e| e.last_seen + CONNTRACK_TTL > now);
+    while entries.len() >= CONNTRACK_MAX_ENTRIES {
+        // Evict the least-recently-seen entry.
+        if let Some((idx, _)) = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.last_seen.total_micros())
+        {
+            entries.swap_remove(idx);
+        } else {
+            break;
+        }
+    }
+}
+
+fn expire_and_cap_dnat(entries: &mut Vec<DnatConntrack>, now: Instant) {
+    entries.retain(|e| e.last_seen + CONNTRACK_TTL > now);
+    while entries.len() >= CONNTRACK_MAX_ENTRIES {
+        if let Some((idx, _)) = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.last_seen.total_micros())
+        {
+            entries.swap_remove(idx);
+        } else {
+            break;
+        }
+    }
+}
+
 fn remember_masquerade_in_namespace(netns: &NetNamespacePayload, entry: MasqueradeConntrack) {
     let mut state = netns.netfilter_state().lock();
+    expire_and_cap_masquerade(&mut state.masquerade_conntrack, entry.last_seen);
     if let Some(existing) = state.masquerade_conntrack.iter_mut().find(|existing| {
         existing.protocol == entry.protocol
             && existing.original_src == entry.original_src
@@ -865,7 +917,7 @@ fn remember_masquerade_in_namespace(netns: &NetNamespacePayload, entry: Masquera
             && existing.external_dst == entry.external_dst
             && existing.external_dst_port == entry.external_dst_port
     }) {
-        *existing = entry;
+        *existing = entry; // refreshes last_seen
         return;
     }
     state.masquerade_conntrack.push(entry);
@@ -873,6 +925,7 @@ fn remember_masquerade_in_namespace(netns: &NetNamespacePayload, entry: Masquera
 
 fn remember_dnat_in_namespace(netns: &NetNamespacePayload, entry: DnatConntrack) {
     let mut state = netns.netfilter_state().lock();
+    expire_and_cap_dnat(&mut state.dnat_conntrack, entry.last_seen);
     if let Some(existing) = state.dnat_conntrack.iter_mut().find(|existing| {
         existing.protocol == entry.protocol
             && existing.client_src == entry.client_src
@@ -882,7 +935,7 @@ fn remember_dnat_in_namespace(netns: &NetNamespacePayload, entry: DnatConntrack)
             && existing.private_dst == entry.private_dst
             && existing.private_dst_port == entry.private_dst_port
     }) {
-        *existing = entry;
+        *existing = entry; // refreshes last_seen
         return;
     }
     state.dnat_conntrack.push(entry);
@@ -894,19 +947,19 @@ fn find_dnat_reply_in_namespace(
     dst: Ipv4Address,
     tuple: L4Tuple,
 ) -> Option<DnatConntrack> {
-    netns
-        .netfilter_state()
-        .lock()
-        .dnat_conntrack
-        .iter()
-        .copied()
-        .find(|entry| {
-            entry.protocol == tuple.protocol
-                && entry.private_dst == src
-                && entry.private_dst_port == tuple.src_port
-                && entry.client_src == dst
-                && entry.client_src_port == tuple.dst_port
-        })
+    // R2e: refresh last_seen on a reply hit so an inbound-only active flow
+    // does not expire mid-connection (matches Linux: any-direction packet
+    // keeps the entry alive).
+    let mut state = netns.netfilter_state().lock();
+    let entry = state.dnat_conntrack.iter_mut().find(|entry| {
+        entry.protocol == tuple.protocol
+            && entry.private_dst == src
+            && entry.private_dst_port == tuple.src_port
+            && entry.client_src == dst
+            && entry.client_src_port == tuple.dst_port
+    })?;
+    entry.last_seen = net_now_instant();
+    Some(*entry)
 }
 
 fn entry_matches_reply_tuple(entry: MasqueradeConntrack, tuple: L4Tuple) -> bool {
@@ -1139,4 +1192,55 @@ fn to_smoltcp_ipv4(addr: Ipv4Address) -> SmoltcpIpv4Address {
 
 fn from_smoltcp_ipv4(addr: SmoltcpIpv4Address) -> Ipv4Address {
     Ipv4Address::new(addr.octets())
+}
+
+#[cfg(test)]
+mod conntrack_aging_tests {
+    use super::*;
+
+    fn masq(port: u16, last_seen: Instant) -> MasqueradeConntrack {
+        MasqueradeConntrack {
+            protocol: NetfilterConntrackProtocol::Tcp,
+            original_src: Ipv4Address::new([10, 0, 0, 1]),
+            original_src_port: port,
+            masquerade_src: Ipv4Address::new([192, 168, 1, 1]),
+            masquerade_src_port: port,
+            external_dst: Ipv4Address::new([8, 8, 8, 8]),
+            external_dst_port: 80,
+            last_seen,
+        }
+    }
+
+    /// R2e: entries past `last_seen + CONNTRACK_TTL` are dropped on the
+    /// next insert-time sweep; fresh ones survive.
+    #[test]
+    fn expire_removes_stale_entries() {
+        let mut entries = alloc::vec![
+            masq(1, Instant::from_millis(0)),
+            masq(2, Instant::from_millis(1000)),
+        ];
+        // now = 0 + TTL + 1ms → entry #1 (last_seen=0) is stale, #2 fresh.
+        let now = Instant::from_millis(0) + CONNTRACK_TTL + Duration::from_millis(1);
+        expire_and_cap_masquerade(&mut entries, now);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_src_port, 2);
+    }
+
+    /// R2e: the hard cap bounds the table; inserting past it evicts the
+    /// least-recently-seen entry.
+    #[test]
+    fn cap_evicts_oldest_when_full() {
+        let mut entries: Vec<MasqueradeConntrack> = (0..CONNTRACK_MAX_ENTRIES as u16)
+            .map(|i| masq(i, Instant::from_millis(i as i64 + 10)))
+            .collect();
+        // The oldest (port 0, last_seen=10ms) must be the eviction victim
+        // when we make room for one more within TTL.
+        let now = Instant::from_millis(100);
+        expire_and_cap_masquerade(&mut entries, now);
+        assert!(entries.len() < CONNTRACK_MAX_ENTRIES);
+        assert!(
+            !entries.iter().any(|e| e.original_src_port == 0),
+            "least-recently-seen entry must be evicted"
+        );
+    }
 }

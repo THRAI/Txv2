@@ -9,7 +9,7 @@ use crate::net::structure::{
     SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
-use super::step_tcp_loopback::step_tcp_loopback_transfer_with_post;
+use super::step_tcp_loopback::step_tcp_loopback_transfer;
 
 const TCP_CLOSE_FLUSH_PASSES: usize = 8;
 
@@ -48,12 +48,21 @@ pub fn step_socket_close(
         SocketProtocol::Tcp(TcpState::Listening { local, .. }) => {
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
+            // R2b: drain the accept backlog. Accept-ready children were
+            // double-registered into the connections table at handshake
+            // time; withdraw them so their strong Cap (and the ns it
+            // pins) is released. Half-open children drop with the queue.
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn += withdraw_ok(
+                    table.withdraw_tcp_connection(ConnectionKey::new(entry.local, entry.peer)),
+                );
+            }
         }
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
             tcp_flushed_bytes += flush_tcp_tx_before_close(socket, guard);
             if let Some(peer) = lookup_tcp_peer_connection(table, remote, local, guard) {
-                let peer_wakes = mark_tcp_peer_closed(&peer);
+                let peer_wakes = mark_tcp_in_kernel_peer_detached(&peer);
                 peer_recv_woken += peer_wakes.recv_woken;
                 peer_send_woken += peer_wakes.send_woken;
             }
@@ -70,6 +79,13 @@ pub fn step_socket_close(
             peer_recv_woken += notify_sctp_seqpacket_peers_closed(&payload, table, guard);
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
+            // R2b: SCTP listeners share the same backlog; accept-ready
+            // children were registered into the sctp connections table.
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn += withdraw_ok(
+                    table.withdraw_sctp_connection(ConnectionKey::new(entry.local, entry.peer)),
+                );
+            }
         }
         SocketProtocol::Sctp(TcpState::Connecting { local, remote })
         | SocketProtocol::Sctp(TcpState::Connected { local, remote }) => {
@@ -128,9 +144,17 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_unix_peer(socket.raw()));
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {}
-        SocketProtocol::UnixStream(UnixStreamState::Bound { local })
-        | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
+        SocketProtocol::UnixStream(UnixStreamState::Bound { local }) => {
             bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
+        }
+        SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
+            bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
+            // R2b: UnixStream listeners share the backlog; accept-ready
+            // children were registered as stream peers keyed by raw().
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn +=
+                    withdraw_ok(table.withdraw_unix_stream_peer(entry.child.raw()));
+            }
         }
         SocketProtocol::UnixStream(UnixStreamState::Connected { peer_raw, .. }) => {
             if let Some(peer) = table.lookup_unix_stream_peer(socket.raw(), guard) {
@@ -154,17 +178,9 @@ pub fn step_socket_close(
         raw_udp.close();
     }
     let payload_taken = socket.take_payload().is_some();
-    let recv_woken = peer_recv_woken
-        + socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
-    let send_woken = peer_send_woken
-        + socket
-            .readiness
-            .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
-    let accept_woken = socket
-        .readiness
-        .fire_accept_with_post(AcceptWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    let recv_woken = peer_recv_woken + socket.readiness.fire_recv(RecvWireSet::BROKEN);
+    let send_woken = peer_send_woken + socket.readiness.fire_send(SendWireSet::BROKEN);
+    let accept_woken = socket.readiness.fire_accept(AcceptWireSet::BROKEN);
 
     StepOutcome::Done(SocketCloseOutcome {
         payload_taken,
@@ -197,13 +213,10 @@ fn flush_tcp_tx_before_close(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) ->
             break;
         }
 
-        let moved =
-            match step_tcp_loopback_transfer_with_post(socket, queued, guard, |mailbox, event| {
-                mailbox.post(event)
-            }) {
-                StepOutcome::Done(outcome) => outcome.bytes_moved,
-                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } | StepOutcome::Err(_) => 0,
-            };
+        let moved = match step_tcp_loopback_transfer(socket, queued, guard) {
+            StepOutcome::Done(outcome) => outcome.bytes_moved,
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } | StepOutcome::Err(_) => 0,
+        };
         if moved == 0 {
             break;
         }
@@ -218,20 +231,20 @@ struct PeerCloseWakes {
     send_woken: usize,
 }
 
-fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
+fn mark_tcp_in_kernel_peer_detached(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     let Some(payload) = peer.acquire_operational() else {
         return PeerCloseWakes::default();
     };
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
-        raw_tcp.mark_recv_closed_by_peer();
+        // last-close currently destroys the local SocketPayload immediately,
+        // unlike shutdown(SHUT_WR), whose raw socket remains alive to drive a
+        // real FIN handshake. Mark this staging topology loss explicitly so
+        // the peer cannot enqueue bytes into a vanished endpoint. A future
+        // retained FIN_WAIT/TIME_WAIT control block can remove this shortcut.
+        raw_tcp.mark_in_kernel_peer_detached();
     }
-    payload.refresh_io_from_raw();
-    let recv_woken = peer
-        .readiness
-        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
-    let send_woken = peer
-        .readiness
-        .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
+    let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
     PeerCloseWakes {
         recv_woken,
         send_woken,
@@ -253,12 +266,8 @@ fn lookup_tcp_peer_connection(
 }
 
 fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
-    let recv_woken = peer
-        .readiness
-        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
-    let send_woken = peer
-        .readiness
-        .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
+    let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
     PeerCloseWakes {
         recv_woken,
         send_woken,
@@ -358,8 +367,7 @@ fn notify_sctp_peer_assoc_closed(
             .is_some();
     }
     if fired {
-        peer.readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event))
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA)
     } else {
         0
     }
@@ -408,8 +416,7 @@ fn enqueue_sctp_shutdown_event(peer: &Cap<SocketIdentity>) {
         .record_sctp_message(bytes, true, 0, 0, None)
         .is_some()
     {
-        peer.readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
 }
 
@@ -494,8 +501,6 @@ fn withdraw_rds_bound_if_owner(
 }
 
 fn mark_unix_peer_broken(peer: &Cap<SocketIdentity>) {
-    peer.readiness
-        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
-    peer.readiness
-        .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    peer.readiness.fire_recv(RecvWireSet::BROKEN);
+    peer.readiness.fire_send(SendWireSet::BROKEN);
 }

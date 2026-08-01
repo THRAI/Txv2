@@ -37,7 +37,7 @@ pub(super) fn maybe_autobind_connect_client(
     let remote_endpoint = remote.as_ip_endpoint();
     let local_endpoint_base = connect_autobind_local_base(socket, remote_endpoint);
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in super::ephemeral_port_candidates() {
         let local_endpoint = IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port);
         if ephemeral_port_in_use(socket, port) {
             continue;
@@ -99,12 +99,13 @@ fn connect_autobind_local_base(
                 || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
                 |src| IpEndpoint::new(src, 0),
             ),
-        tx_subsystems::net::structure::IpAddress::V6(_) => payload
+        // V5-3: routed like the V4 arm above (was "first up non-loopback link
+        // with any v6 address", FIB-blind). No route to `dst` => unspecified
+        // local => `step_connect` returns EADDRNOTAVAIL immediately, which is
+        // what keeps an unreachable global v6 destination from hanging.
+        tx_subsystems::net::structure::IpAddress::V6(dst) => payload
             .net_namespace()
-            .link_snapshot()
-            .into_iter()
-            .find(|link| link.is_up && !link.is_loopback && link.ipv6_addr.is_some())
-            .and_then(|link| link.ipv6_addr)
+            .preferred_ipv6_source(dst)
             .map_or_else(
                 || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
                 |src| IpEndpoint::new_v6(src, 0),
@@ -169,7 +170,7 @@ pub(super) fn maybe_autobind_udp_sendto(
         IpEndpoint::unspecified_for_family(family, 0)
     };
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in super::ephemeral_port_candidates() {
         let local =
             sockaddr_from_endpoint(IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port));
         let outcome = {
@@ -200,9 +201,7 @@ pub(super) fn drive_tcp_loopback_after_connect(
         return Ok(false);
     }
     let guard = tx_substrate::epoch::guard();
-    match step_tcp_loopback_handshake_with_post(socket, &guard, |mailbox, event| {
-        mailbox.post(event)
-    }) {
+    match step_tcp_loopback_handshake(socket, &guard) {
         StepOutcome::Done(_) => Ok(true),
         StepOutcome::Err(Errno::EOPNOTSUPP) => Ok(false),
         StepOutcome::Err(errno) => Err(errno),
@@ -223,7 +222,7 @@ pub(super) fn bind_with_ephemeral_port(
         return step_unit_result(outcome);
     }
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in super::ephemeral_port_candidates() {
         if ephemeral_port_in_use(socket, port) {
             continue;
         }
@@ -314,28 +313,16 @@ pub(super) fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, writ
         return;
     }
     let guard = tx_substrate::epoch::guard();
-    let _ = step_tcp_loopback_transfer_with_post(socket, written, &guard, |mailbox, event| {
-        mailbox.post(event)
-    });
+    let _ = step_tcp_loopback_transfer(socket, written, &guard);
     socket
         .readiness
         .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
 }
 
-pub(super) fn drive_udp_loopback_after_sendto_with_post<F>(
+pub(super) fn drive_udp_loopback_after_sendto(
     socket: &Cap<SocketIdentity>,
-    written: usize,
-    post: F,
-) -> bool
-where
-    F: FnMut(
-        &tx_substrate::wake::mailbox::TaskMailbox,
-        tx_substrate::wake::mailbox::MailboxEvent,
-    ) -> bool,
-{
-    if written == 0 {
-        return false;
-    }
+    _written: usize,
+) -> bool {
     let Some(payload) = socket.acquire_operational() else {
         return false;
     };
@@ -345,26 +332,26 @@ where
     ) {
         return false;
     }
+    // Loopback egress destructively removes the head datagram. Keep external
+    // traffic on the device-TX lane; otherwise a DNS query such as
+    // 10.0.2.3:53 is consumed locally and can never reach the NIC.
+    match payload
+        .raw_udp_socket()
+        .and_then(|raw| raw.peek_tx_datagram())
+    {
+        Some(datagram) if datagram.dst.is_loopback() => {}
+        _ => return false,
+    }
     let guard = tx_substrate::epoch::guard();
     matches!(
-        step_process_loopback_udp_with_post(socket, 8, &guard, post),
+        step_process_loopback_udp(socket, 8, &guard),
         StepOutcome::Done(outcome) if outcome.bytes_moved > 0 || outcome.tx_packets > 0
     )
 }
 
-pub(super) fn drive_loopback_after_sendto_with_post<F>(
-    socket: &Cap<SocketIdentity>,
-    written: usize,
-    post: F,
-) -> bool
-where
-    F: FnMut(
-        &tx_substrate::wake::mailbox::TaskMailbox,
-        tx_substrate::wake::mailbox::MailboxEvent,
-    ) -> bool,
-{
+pub(super) fn drive_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) -> bool {
     drive_tcp_loopback_after_sendto(socket, written);
-    drive_udp_loopback_after_sendto_with_post(socket, written, post)
+    drive_udp_loopback_after_sendto(socket, written)
 }
 
 pub(super) async fn yield_after_sendto_if_needed(socket: &Cap<SocketIdentity>) {
@@ -382,9 +369,7 @@ pub(super) async fn finish_sendto_progress(
     if flags.contains(SendRecvFlags::MSG_MORE) {
         return;
     }
-    let _ = drive_loopback_after_sendto_with_post(socket, written, |mailbox, event| {
-        ctx.post_mailbox_ref_event(mailbox, event)
-    });
+    let _ = drive_loopback_after_sendto(socket, written);
     yield_after_sendto_if_needed(socket).await;
 }
 
@@ -446,7 +431,7 @@ pub(super) fn sendto_can_drive_loopback_inline(
             dst.is_some_and(|dst| local_allows_loopback_inline(local) && dst.is_loopback())
         }
         SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
-            local_allows_loopback_inline(local) && remote.is_loopback()
+            local_allows_loopback_inline(local) && dst.unwrap_or(remote).is_loopback()
         }
         _ => false,
     }
@@ -526,39 +511,6 @@ pub(crate) fn socket_identity_from_file(
 pub(super) fn open_file_is_path_only(file: &OpenFile) -> bool {
     let flags = file.flags();
     !flags.read && !flags.write
-}
-
-pub(crate) fn socket_poll_mask_from_file(
-    file: &Cap<OpenFile>,
-    guard: &tx_substrate::epoch::Guard<'_>,
-) -> Option<Result<PollMask, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_ready(&socket, guard) {
-        StepOutcome::Done(mask) => Ok(mask),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(PollMask::empty()),
-    })
-}
-
-pub(crate) fn socket_poll_wait_token_from_file(
-    file: &Cap<OpenFile>,
-    interests: PollMask,
-    guard: &tx_substrate::epoch::Guard<'_>,
-) -> Option<Result<Option<tx_subsystems::execution::WaitToken>, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_wait_token(&socket, interests, guard) {
-        StepOutcome::Done(token) => Ok(token),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(None),
-    })
 }
 
 pub(super) fn read_sockaddr_in<'a>(
@@ -1331,6 +1283,15 @@ pub(super) fn socket_is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
         matches!(
             payload.protocol_snapshot(),
             SocketProtocol::Tcp(TcpState::Connecting { .. })
+        )
+    })
+}
+
+pub(super) fn socket_is_tcp_connected(socket: &Cap<SocketIdentity>) -> bool {
+    socket.acquire_operational().is_some_and(|payload| {
+        matches!(
+            payload.protocol_snapshot(),
+            SocketProtocol::Tcp(TcpState::Connected { .. })
         )
     })
 }

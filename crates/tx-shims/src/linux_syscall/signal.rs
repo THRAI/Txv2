@@ -857,13 +857,25 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         None
     } else {
         let mut bytes = [0u8; SIGACTION_BYTES];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, act_ptr as u64) {
+        if let Err(errno) =
+            bootstrap_copy_from_user(&ctx.aspace, &mut bytes[..24], act_ptr as u64)
+        {
             return SyscallResult::error_from(errno);
         }
         let handler = read_u64_le(&bytes[0..8]);
         let flags = SaFlags::new(read_u64_le(&bytes[8..16]));
         let mask = SignalMask::new(read_u64_le(&bytes[16..24]));
-        let restorer = read_u64_le(&bytes[24..32]);
+        // The RV64/LA64 kernel sigaction ABI has NO sa_restorer — the user
+        // struct is 24 bytes (handler, flags, mask). The previous code read
+        // bytes [24..32] as a "restorer", capturing the caller's stack
+        // garbage past the struct (musl leaves its trailing spare word
+        // uninitialised). The ITIMER SIGALRM lane then used that garbage as
+        // the handler's return address: on handler return the thread
+        // jumped into data and died on a fatal trap — observed as the
+        // git-clone progress-timer crash (pc=ra+3, odd ra, fixed in-page
+        // offset) and the long-standing netperf RR/CRR flaky segv. Signal
+        // return always goes through the kernel's own trampoline.
+        let restorer = 0u64;
 
         // SIG_DFL == 0, SIG_IGN == 1 per Linux generic ABI; everything
         // else is a userspace function-pointer handler.
@@ -919,15 +931,14 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             SigDisposition::Ignore => 1,  // SIG_IGN
             SigDisposition::Handler(addr) => addr as u64,
         };
-        // Build a 32-byte image and copy out through the canonical
-        // user-VA lane. RV64 musl layout: 4×u64 little-endian
-        // (handler, flags, mask, unused/restorer).
+        // Copy out only the 24 ABI bytes (handler, flags, mask): RV64/LA64
+        // have no sa_restorer, and writing a 4th word sprayed 8 bytes past
+        // the caller's struct onto their stack.
         let mut image = [0u8; SIGACTION_BYTES];
         image[0..8].copy_from_slice(&handler_value.to_le_bytes());
         image[8..16].copy_from_slice(&prev_entry.flags.bits().to_le_bytes());
         image[16..24].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
-        image[24..32].copy_from_slice(&(prev_entry.restorer as u64).to_le_bytes());
-        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image) {
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image[..24]) {
             return SyscallResult::error_from(errno);
         }
     }

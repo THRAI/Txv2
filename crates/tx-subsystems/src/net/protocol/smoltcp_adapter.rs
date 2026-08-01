@@ -40,12 +40,20 @@ impl SmoltcpAdapter {
         demux_rx_frame_with_smoltcp(frame)
     }
 
-    pub fn emit_tx_frame(&self, ipv4_packet: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(14 + ipv4_packet.len());
+    pub fn emit_tx_frame(&self, ip_packet: &[u8]) -> Vec<u8> {
+        let ethertype = if ip_packet
+            .first()
+            .is_some_and(|version_ihl| version_ihl >> 4 == 6)
+        {
+            [0x86, 0xdd]
+        } else {
+            [0x08, 0x00]
+        };
+        let mut frame = Vec::with_capacity(14 + ip_packet.len());
         frame.extend_from_slice(&EthernetAddress::BROADCAST.octets());
         frame.extend_from_slice(&self.config.local_mac.octets());
-        frame.extend_from_slice(&[0x08, 0x00]);
-        frame.extend_from_slice(ipv4_packet);
+        frame.extend_from_slice(&ethertype);
+        frame.extend_from_slice(ip_packet);
         frame
     }
 }
@@ -82,6 +90,10 @@ impl SmoltcpPacketTxSink<'_> {
 impl PacketTxSink for SmoltcpPacketTxSink<'_> {
     fn readiness(&self, guard: &Guard<'_>) -> PacketTxReadiness {
         self.device.ops.tx_readiness(guard)
+    }
+
+    fn ip_mtu(&self) -> u16 {
+        self.device.ops.mtu()
     }
 
     fn source_ipv4(&self) -> Option<Ipv4Address> {

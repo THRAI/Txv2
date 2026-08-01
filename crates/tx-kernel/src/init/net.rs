@@ -10,12 +10,11 @@ use core::marker::PhantomData;
 use smoltcp::time::Instant;
 use tx_hal::TxPlatform;
 use tx_services::time::{timekeeper_clock, ClockRead};
-use tx_substrate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_substrate::SpinMutex;
 use tx_subsystems::net::delegate::{
-    net_delegate_kick_tick_with_post, net_delegate_task_loop_owned_with_deadline_hook,
-    NetDelegateDriver, NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm,
-    NetDelegateTimerWake,
+    net_delegate_kick_poll, net_delegate_kick_tick,
+    net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver,
+    NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
 };
 #[cfg(test)]
 use tx_subsystems::net::device::VIRTIO_NET0_DEVICE;
@@ -27,9 +26,10 @@ use tx_subsystems::net::packet::{
     PacketDispatch, PacketSource, PacketTxReadiness, PacketTxResult, PacketTxSink,
 };
 use tx_subsystems::net::protocol::{EtherIface, IfaceCommon, LoopbackIface};
-use tx_subsystems::net::structure::Ipv4Address;
+use tx_subsystems::net::structure::{Ipv4Address, Ipv6Address};
 use tx_subsystems::net::{
     initial_loopback_iface, initial_net_namespace_payload, NetAdminAuthority,
+    NetNamespaceRouteConfig,
 };
 
 use super::{CoreInit, BOOT_REACTOR};
@@ -38,6 +38,12 @@ const DEADLINE_UPDATED: tx_reactor::wait::Mask = tx_reactor::wait::Mask::from_bi
 const BOOT_ETH_IPV4: Ipv4Address = Ipv4Address::new([10, 0, 2, 15]);
 const BOOT_ETH_NETMASK: Ipv4Address = Ipv4Address::new([255, 255, 255, 0]);
 const BOOT_ETH_GATEWAY: Ipv4Address = Ipv4Address::new([10, 0, 2, 2]);
+/// V5-2: static v6 address for the boot NIC, mirroring `BOOT_ETH_IPV4` under
+/// the same SLIRP convention (`fec0::/64`, host side `fec0::2`, DNS `fec0::3`).
+const BOOT_ETH_IPV6: Ipv6Address = Ipv6Address::new([
+    0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+]);
+const BOOT_ETH_IPV6_PREFIX_LEN: u8 = 64;
 const BOOT_ETH_NAME: &str = "eth0";
 
 static BOOT_NET_RUNTIME: SpinMutex<Option<&'static BootNetRuntime>> = SpinMutex::new(None);
@@ -157,19 +163,90 @@ fn publish_boot_net_device_to_namespace(
             Some(BOOT_ETH_IPV4),
             Some(24),
         );
-        return;
+    } else {
+        let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
     }
-    let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
+    // V5-2: same treatment for IPv6. This kernel has no RA/SLAAC/DHCPv6 and
+    // generates no link-local address, so without this seed `eth0` comes up
+    // with NO v6 address at all: `/proc/net/if_inet6` lists only `lo`,
+    // `decide_ipv6_route` answers `Unreachable` for every destination, and the
+    // whole (working) external v6 datapath is unreachable until a human types
+    // `ip -6 addr add`. Address chosen to mirror BOOT_ETH_IPV4 under the same
+    // SLIRP convention (host side `fec0::2`, DNS `fec0::3`).
+    //
+    // Deliberately NO `::/0` default route, unlike the v4 seed below. v4's
+    // default route is real — 10.0.2.2 genuinely NATs to the v4 internet — but
+    // SLIRP does not route IPv6 off `fec0::/64`, and advertising a default
+    // router that cannot forward turns a fast `EADDRNOTAVAIL` into a connect
+    // that hangs until TCP gives up. On-link (`fec0::2`/`fec0::3`) needs no
+    // route entry: the connected prefix covers it. A host with real v6
+    // upstream can still `ip -6 route add default via ...` (the V3b gateway
+    // path is verified on hardware), and a future RA/SLAAC stage would install
+    // it from the advertisement instead of guessing here.
+    if let Some(link) = namespace
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == registration.name)
+    {
+        let _ = namespace.set_device_ipv6_addr_by_ifindex(
+            authority,
+            link.ifindex,
+            Some(BOOT_ETH_IPV6),
+            Some(BOOT_ETH_IPV6_PREFIX_LEN),
+        );
+    }
+    // Boot default route (0.0.0.0/0 via the SLIRP gateway). On Linux this
+    // line is DHCP's job; the boot lane configures the iface statically, so
+    // the FIB must be seeded here too. Without it every off-link v4 dst is
+    // unroutable: TCP connect selects no source address, `step_send`
+    // hard-fails, and `gateway_for_device` leaves the per-link iface without
+    // a gateway so TX dies EADDRNOTAVAIL before ARP. The L2 next-hop is
+    // already covered by the static gateway ARP installed at runtime setup.
+    // EEXIST on re-publish is benign.
+    let _ = namespace.add_ipv4_route(
+        authority,
+        NetNamespaceRouteConfig {
+            dst: Ipv4Address::UNSPECIFIED,
+            prefix_len: 0,
+            gateway: Some(BOOT_ETH_GATEWAY),
+            oif_name: Some(registration.name),
+            preferred_src: Some(BOOT_ETH_IPV4),
+            table: 254,
+            protocol: 3,   // RTPROT_BOOT
+            scope: 0,      // RT_SCOPE_UNIVERSE
+            route_type: 1, // RTN_UNICAST
+        },
+    );
+}
+
+impl BootNetRuntime {
+    /// Cross-feed NDP learning to the namespace's iface for the SAME netdev.
+    ///
+    /// The boot lane drains the shared RX queue into its own v4-only iface,
+    /// but external v6 TX/pending live on the namespace's
+    /// `ensure_ether_iface_for_link` iface — without this, an NA lands in the
+    /// boot iface's table and the namespace iface re-solicits forever.
+    /// `learn_ndisc_from_dispatch` learns without replying (no guard), so the
+    /// boot iface remains the only NS responder.
+    fn cross_feed_ndisc(&self, dispatch: &PacketDispatch, now: Instant) {
+        for iface in initial_net_namespace_payload().ether_ifaces_snapshot() {
+            if iface.netdev.devt == self.ether_iface.netdev.devt {
+                iface.learn_ndisc_from_dispatch(dispatch, now);
+            }
+        }
+    }
 }
 
 impl PacketSource for BootNetRuntime {
     fn next_packet(&self) -> Option<PacketDispatch> {
         let frame = self.ether_iface.netdev.ops.receive()?;
-        Some(self.ether_iface.process_frame_at(
+        let dispatch = self.ether_iface.process_frame_at(
             frame,
             Instant::ZERO,
             Option::<&tx_subsystems::execution::Guard<'_>>::None,
-        ))
+        );
+        self.cross_feed_ndisc(&dispatch, Instant::ZERO);
+        Some(dispatch)
     }
 
     fn next_packet_at(
@@ -178,13 +255,19 @@ impl PacketSource for BootNetRuntime {
         guard: &tx_subsystems::execution::Guard<'_>,
     ) -> Option<PacketDispatch> {
         let frame = self.ether_iface.netdev.ops.receive()?;
-        Some(self.ether_iface.process_frame_at(frame, now, Some(guard)))
+        let dispatch = self.ether_iface.process_frame_at(frame, now, Some(guard));
+        self.cross_feed_ndisc(&dispatch, now);
+        Some(dispatch)
     }
 }
 
 impl PacketTxSink for BootNetRuntime {
     fn readiness(&self, guard: &tx_subsystems::execution::Guard<'_>) -> PacketTxReadiness {
         self.ether_iface.netdev.ops.tx_readiness(guard)
+    }
+
+    fn ip_mtu(&self) -> u16 {
+        self.ether_iface.netdev.ops.mtu()
     }
 
     fn readiness_at(
@@ -228,6 +311,8 @@ impl<P: TxPlatform> BootNetDelegateDriver<P> {
 
 impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
     fn now(&self) -> Instant {
+        // Absorbed from main: the platform monotonic counter is read through
+        // the `tx-time` timekeeper now, not `P::read_ns()` directly.
         let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
         Instant::from_micros(micros.min(i64::MAX as u64) as i64)
     }
@@ -254,15 +339,6 @@ impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
 
     fn loopback_budget(&self) -> LoopbackPollBudget {
         LoopbackPollBudget::default()
-    }
-
-    fn post_net_mailbox_ref_event(
-        &self,
-        mailbox: &TaskMailbox,
-        event: MailboxEvent,
-        hint: MailboxSchedulerHint,
-    ) -> bool {
-        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(mailbox, event, hint)
     }
 }
 
@@ -318,7 +394,24 @@ impl<P: TxPlatform> CoreInit<P> {
                         BootNetDelegateDriver::<P>::new(runtime),
                         config,
                         move |next_deadline| {
-                            let _ = runtime.refresh_delegate_deadline(next_deadline);
+                            // RX watchdog: the real NET_IRQ path is wired on
+                            // RV64, but QEMU virtio-mmio has historically
+                            // admitted a cold idle RX frame without a usable
+                            // interrupt. A quiet established stream (reader
+                            // blocked in read(), smoltcp with no pending
+                            // timers) can otherwise yield `next_deadline =
+                            // None` and sleep forever. Keep a 10 ms backstop
+                            // until that transport behavior has a stronger
+                            // witness; normal traffic wakes through IRQ first.
+                            let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
+                            let now =
+                                Instant::from_micros(micros.min(i64::MAX as u64) as i64);
+                            let floor = now + smoltcp::time::Duration::from_millis(10);
+                            let clamped = Some(match next_deadline {
+                                Some(deadline) if deadline < floor => deadline,
+                                _ => floor,
+                            });
+                            let _ = runtime.refresh_delegate_deadline(clamped);
                         },
                     )
                     .await;
@@ -333,7 +426,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
-                boot_net_deadline_task::<P>(runtime),
+                boot_net_deadline_task(runtime),
                 tx_reactor::InitialSchedMeta::kernel()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
             )
@@ -356,6 +449,22 @@ impl<P: TxPlatform> CoreInit<P> {
             runtime
         })?;
 
+        // Static ARP for the SLIRP gateway (10.0.2.2 -> 52:55:0a:00:02:02):
+        // dynamic ARP replies are learned by the per-namespace device iface,
+        // not this one, so without this the SYN is dropped pending resolution
+        // and re-ARPs forever. Harmless for loopback-only boots (never routed).
+        runtime.ether_iface.install_static_arp(
+            BOOT_ETH_GATEWAY,
+            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]),
+        );
+        // P2-S6: SLIRP's DNS server (10.0.2.3) uses the same synthetic-MAC
+        // convention as the gateway; the static entry unblocks the first
+        // query (ARP learning hardening is P4/D10).
+        runtime.ether_iface.install_static_arp(
+            Ipv4Address::new([10, 0, 2, 3]),
+            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x03]),
+        );
+
         let mut slot = BOOT_NET_RUNTIME.lock();
         if let Some(existing) = *slot {
             Some(existing)
@@ -377,7 +486,7 @@ fn instant_from_ns(ns: u64) -> Instant {
     Instant::from_micros(micros.min(i64::MAX as u64) as i64)
 }
 
-async fn boot_net_deadline_task<P: TxPlatform>(runtime: &'static BootNetRuntime) {
+async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
     loop {
         let Some(arm) = runtime.current_deadline_arm() else {
             let _ = runtime.deadline_channel.wait(DEADLINE_UPDATED).await;
@@ -401,13 +510,19 @@ async fn boot_net_deadline_task<P: TxPlatform>(runtime: &'static BootNetRuntime)
                     tick_fired: true,
                 };
                 if runtime.consume_timer_wake(wake) {
-                    net_delegate_kick_tick_with_post(|mailbox, event| {
-                        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(
-                            mailbox,
-                            event,
-                            MailboxSchedulerHint::Normal,
-                        )
-                    });
+                    net_delegate_kick_tick();
+                    // Also raise POLL: the whole established-connection
+                    // pipeline (device RX read, smoltcp dispatch — and with
+                    // it RTO/fast retransmits — device-TX drain) lives in
+                    // the delegate's poll_seen branch; the tick branch only
+                    // walks the half-open handshake backlog. Without this a
+                    // fully quiet wire is fatal to a connection with a lost
+                    // segment: no RX ⇒ no POLL ⇒ dispatch never runs ⇒ the
+                    // RTO retransmit is never emitted and both ends wait
+                    // forever (observed: 17MB git push over slirp wedged
+                    // mid-upload; peer stuck at dup-ACK 18121 while we sat
+                    // on unacked data at the window edge, silent for 400s+).
+                    net_delegate_kick_poll();
                 }
             }
             tx_reactor::wait::WaitOutcome::Ready

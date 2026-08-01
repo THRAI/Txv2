@@ -6,10 +6,9 @@
 // `impl<P: TxPlatform> CoreInit<P>` block in `init.rs` and
 // `init::exec`.
 //
-// The helper creates `/bin/{sh,busybox,ls}` and `/usr/bin/env` as
-// rootfs-tmpfs symlinks pointing at `/musl/musl/busybox` so the
-// OSComp `libctest`, `lua`, and `libcbench` wrapper scripts find
-// their shebang interpreters. See the doc-comment on
+// The helper creates `/bin/{sh,busybox,ls}`, `/usr/bin/env`, and the
+// OSComp dynamic-loader compatibility names as rootfs-tmpfs symlinks
+// into the sdcard mounted at `/musl`. See the doc-comment on
 // `populate_rootfs_shebang_shims` for the full design rationale.
 
 use super::*;
@@ -26,6 +25,8 @@ impl<P: TxPlatform> CoreInit<P> {
     /// /bin/sh         → /musl/musl/busybox  (handles `#!/bin/sh`)
     /// /bin/ls         → /musl/musl/busybox  (lets BusyBox `which ls` pass)
     /// /usr/bin/env    → /musl/musl/busybox  (handles `#!/usr/bin/env …`)
+    /// /lib/ld-musl-*  → /musl/musl/lib/libc.so
+    /// /lib*/ld-linux-* → /musl/glibc/lib/<same basename>
     /// ```
     ///
     /// The wrapper scripts (`scripts/lua/test.sh`, `run-static.sh`,
@@ -70,9 +71,10 @@ impl<P: TxPlatform> CoreInit<P> {
                 return;
             }
         };
-        let _ = symlink_into(fs_ops, bin_id, b"busybox", b"/musl/musl/busybox", &cred);
-        let _ = symlink_into(fs_ops, bin_id, b"sh", b"/musl/musl/busybox", &cred);
-        let _ = symlink_into(fs_ops, bin_id, b"ls", b"/musl/musl/busybox", &cred);
+        let mut shims_ok = true;
+        shims_ok &= symlink_into(fs_ops, bin_id, b"busybox", b"/musl/musl/busybox", &cred);
+        shims_ok &= symlink_into(fs_ops, bin_id, b"sh", b"/musl/musl/busybox", &cred);
+        shims_ok &= symlink_into(fs_ops, bin_id, b"ls", b"/musl/musl/busybox", &cred);
 
         // /usr and /usr/bin
         let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {
@@ -91,10 +93,89 @@ impl<P: TxPlatform> CoreInit<P> {
                 return;
             }
         };
-        let _ = symlink_into(fs_ops, usr_bin_id, b"env", b"/musl/musl/busybox", &cred);
+        shims_ok &= symlink_into(fs_ops, usr_bin_id, b"env", b"/musl/musl/busybox", &cred);
+
+        // The official OSComp binaries keep Linux-compatible PT_INTERP
+        // names, while the actual loaders live inside the sdcard trees.
+        // Create only the current architecture's namespace compatibility;
+        // an unrelated architecture must not be able to break the basic
+        // shebang shims above.
+        match P::ARCH {
+            tx_hal::Arch::Riscv64 => {
+                let lib_id = match mkdir_or_find(
+                    fs_ops,
+                    root_fs_object_id,
+                    b"lib",
+                    0o755,
+                    &cred,
+                ) {
+                    Some(id) => id,
+                    None => {
+                        Self::write_board_sentinel_prefix();
+                        tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib\n");
+                        return;
+                    }
+                };
+                shims_ok &= symlink_into(
+                    fs_ops,
+                    lib_id,
+                    b"ld-musl-riscv64-sf.so.1",
+                    b"/musl/musl/lib/libc.so",
+                    &cred,
+                );
+                shims_ok &= symlink_into(
+                    fs_ops,
+                    lib_id,
+                    b"ld-musl-riscv64.so.1",
+                    b"/musl/musl/lib/libc.so",
+                    &cred,
+                );
+                shims_ok &= symlink_into(
+                    fs_ops,
+                    lib_id,
+                    b"ld-linux-riscv64-lp64d.so.1",
+                    b"/musl/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+                    &cred,
+                );
+            }
+            tx_hal::Arch::LoongArch64 => {
+                let lib64_id = match mkdir_or_find(
+                    fs_ops,
+                    root_fs_object_id,
+                    b"lib64",
+                    0o755,
+                    &cred,
+                ) {
+                    Some(id) => id,
+                    None => {
+                        Self::write_board_sentinel_prefix();
+                        tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib64\n");
+                        return;
+                    }
+                };
+                shims_ok &= symlink_into(
+                    fs_ops,
+                    lib64_id,
+                    b"ld-musl-loongarch-lp64d.so.1",
+                    b"/musl/musl/lib/libc.so",
+                    &cred,
+                );
+                shims_ok &= symlink_into(
+                    fs_ops,
+                    lib64_id,
+                    b"ld-linux-loongarch-lp64d.so.1",
+                    b"/musl/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+                    &cred,
+                );
+            }
+        }
 
         Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":shebang-shims:ok\n");
+        if shims_ok {
+            tx_hal::console_write_str::<P>(":shebang-shims:ok\n");
+        } else {
+            tx_hal::console_write_str::<P>(":shebang-shims:err:symlink\n");
+        }
     }
 
     /// Populate the rootfs tmpfs with the writable scratch
@@ -1926,8 +2007,9 @@ fn mkdir_or_find(
     }
 }
 
-/// Best-effort symlink — ignores errors so a re-boot doesn't panic
-/// when the symlink is already present.
+/// Create a symlink and report whether the requested name is now usable.
+/// `EEXIST` is success for the idempotent boot-time population path; other
+/// errors feed the caller's error sentinel instead of a false `:ok` marker.
 fn symlink_into(
     fs_ops: &alloc::sync::Arc<dyn tx_subsystems::vfs::FsOps>,
     parent: tx_subsystems::vfs::FsObjectId,
@@ -1938,6 +2020,6 @@ fn symlink_into(
     let guard = step_engine::guard();
     matches!(
         fs_ops.symlink(parent, name, target, cred, &guard),
-        StepOutcome::Done(_)
+        StepOutcome::Done(_) | StepOutcome::Err(step_engine::Errno::EEXIST)
     )
 }

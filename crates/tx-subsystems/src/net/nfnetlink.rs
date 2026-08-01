@@ -11,7 +11,6 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::Cap;
 
 use crate::cred::Cred;
@@ -242,15 +241,11 @@ impl RawNetlinkNetfilterSocket {
     }
 }
 
-pub fn netlink_netfilter_send_with_post<F>(
+pub fn netlink_netfilter_send(
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
     cred: Cred,
-    mut post: F,
-) -> Result<usize, Errno>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
+) -> Result<usize, Errno> {
     if socket.kind != SocketKind::NetlinkNetfilter {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -268,11 +263,8 @@ where
     if !packet.is_empty() {
         raw.queue_response(packet);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
-        socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
     Ok(bytes.len())
 }
@@ -298,22 +290,17 @@ pub fn netlink_netfilter_recv(
     } else {
         copied
     };
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
     Ok(reported)
 }
 
-pub fn netlink_xfrm_send_with_post<F>(
+pub fn netlink_xfrm_send(
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
     cred: Cred,
-    mut post: F,
-) -> Result<usize, Errno>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
+) -> Result<usize, Errno> {
     if socket.kind != SocketKind::NetlinkXfrm {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -330,11 +317,8 @@ where
     if !packet.is_empty() {
         raw.queue_response(packet);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
-        socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
     Ok(bytes.len())
 }
@@ -360,7 +344,6 @@ pub fn netlink_xfrm_recv(
     } else {
         copied
     };
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }

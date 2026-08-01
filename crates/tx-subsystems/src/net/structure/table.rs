@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use tx_substrate::epoch::Guard;
-use tx_substrate::index::{Index, IndexError};
-use tx_substrate::mutation::{self, MutationError};
+use tx_substrate::index::{Index, IndexError, IndexReservation};
+use tx_substrate::mutation::{self, MutationError, WithdrawReservation};
 use tx_substrate::zone::Cap;
 
 use super::identity::SocketIdentity;
@@ -127,6 +127,52 @@ pub struct SocketTable {
     unix_path_nodes: Index<UnixSocketPath, (), UNIX_PATH_NODE_SLOTS>,
     unix_bound: Index<UnixSocketPath, Cap<SocketIdentity>, UNIX_BOUND_SLOTS>,
     unix_stream_peers: Index<UnixStreamPeerKey, Cap<SocketIdentity>, UNIX_STREAM_PEER_SLOTS>,
+}
+
+pub(crate) struct TcpDisconnectIndexReservations<'a> {
+    forward: Option<WithdrawReservation<'a, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>>,
+    reverse: Option<TcpReverseIndexReservation<'a>>,
+    bound: Option<
+        WithdrawReservation<'a, LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
+    >,
+}
+
+enum TcpReverseIndexReservation<'a> {
+    Vacant(IndexReservation<'a, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>),
+    Occupied(WithdrawReservation<'a, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>),
+}
+
+impl TcpDisconnectIndexReservations<'_> {
+    pub(crate) fn has_owned_forward(&self) -> bool {
+        self.forward.is_some()
+    }
+
+    pub(crate) fn reverse_socket(&self) -> Option<Cap<SocketIdentity>> {
+        match self.reverse.as_ref()? {
+            TcpReverseIndexReservation::Vacant(_) => None,
+            TcpReverseIndexReservation::Occupied(reservation) => {
+                reservation.value().try_clone_live()
+            }
+        }
+    }
+
+    pub(crate) fn commit(&mut self, withdraw_reverse: bool) {
+        if let Some(reservation) = self.forward.take() {
+            let _ = reservation.withdraw();
+        }
+        if let Some(reverse) = self.reverse.take() {
+            match reverse {
+                TcpReverseIndexReservation::Occupied(reservation) if withdraw_reverse => {
+                    let _ = reservation.withdraw();
+                }
+                TcpReverseIndexReservation::Vacant(reservation) => drop(reservation),
+                TcpReverseIndexReservation::Occupied(reservation) => drop(reservation),
+            }
+        }
+        if let Some(reservation) = self.bound.take() {
+            let _ = reservation.withdraw();
+        }
+    }
 }
 
 impl SocketTable {
@@ -316,6 +362,56 @@ impl SocketTable {
         mutation::withdraw(&self.tcp_connections, &key)
     }
 
+    pub fn withdraw_tcp_connection_if_owner(
+        &self,
+        key: ConnectionKey,
+        socket_raw: u32,
+    ) -> Result<Option<Cap<SocketIdentity>>, MutationError> {
+        mutation::withdraw_if(&self.tcp_connections, &key, |socket| {
+            socket.raw() == socket_raw
+        })
+    }
+
+    pub(crate) fn reserve_tcp_disconnect_if_owners(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        forward_owner: u32,
+    ) -> Result<TcpDisconnectIndexReservations<'_>, MutationError> {
+        let forward = reserve_owned_socket(
+            &self.tcp_connections,
+            &ConnectionKey::new(local, remote),
+            forward_owner,
+        )?;
+        let reverse = Some(reserve_tcp_reverse_slot(
+            &self.tcp_connections,
+            remote,
+            local,
+        )?);
+        let bound = reserve_owned_socket(
+            &self.tcp_bound,
+            &LocalEndpointKey::new(local),
+            forward_owner,
+        )?;
+        Ok(TcpDisconnectIndexReservations {
+            forward,
+            reverse,
+            bound,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_tcp_connection_if_owner_for_test(
+        &self,
+        key: ConnectionKey,
+        owner: u32,
+    ) -> Result<
+        Option<WithdrawReservation<'_, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>>,
+        MutationError,
+    > {
+        reserve_owned_socket(&self.tcp_connections, &key, owner)
+    }
+
     pub fn withdraw_sctp_connection(
         &self,
         key: ConnectionKey,
@@ -328,6 +424,18 @@ impl SocketTable {
         endpoint: IpEndpoint,
     ) -> Result<Cap<SocketIdentity>, MutationError> {
         mutation::withdraw(&self.tcp_bound, &LocalEndpointKey::new(endpoint))
+    }
+
+    pub fn withdraw_tcp_bound_if_owner(
+        &self,
+        endpoint: IpEndpoint,
+        socket_raw: u32,
+    ) -> Result<Option<Cap<SocketIdentity>>, MutationError> {
+        mutation::withdraw_if(
+            &self.tcp_bound,
+            &LocalEndpointKey::new(endpoint),
+            |socket| socket.raw() == socket_raw,
+        )
     }
 
     pub fn withdraw_sctp_bound(
@@ -752,6 +860,40 @@ impl SocketTable {
     pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.unix_bound
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+}
+
+fn reserve_owned_socket<'a, K: Eq, const N: usize>(
+    index: &'a Index<K, Cap<SocketIdentity>, N>,
+    key: &K,
+    owner: u32,
+) -> Result<Option<WithdrawReservation<'a, K, Cap<SocketIdentity>, N>>, MutationError> {
+    match mutation::reserve_withdraw_if(index, key, |socket| socket.raw() == owner) {
+        Ok(Some(reservation)) => Ok(Some(reservation)),
+        // An occupied key owned by a replacement flow is a conflict, not an
+        // optional absence. Let the caller roll the whole disconnect
+        // transaction back rather than clearing stale local state around the
+        // replacement's indexes.
+        Ok(None) => Err(MutationError::AlreadyPresent),
+        Err(MutationError::Missing) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn reserve_tcp_reverse_slot(
+    index: &Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
+    local: IpEndpoint,
+    remote: IpEndpoint,
+) -> Result<TcpReverseIndexReservation<'_>, MutationError> {
+    let key = ConnectionKey::new(local, remote);
+    match mutation::reserve_withdraw_if(index, &key, |_| true) {
+        Ok(Some(reservation)) => Ok(TcpReverseIndexReservation::Occupied(reservation)),
+        Ok(None) => unreachable!("unconditional reverse reservation predicate"),
+        Err(MutationError::Missing) => index
+            .reserve(key)
+            .map(TcpReverseIndexReservation::Vacant)
+            .map_err(|_| MutationError::Busy),
+        Err(error) => Err(error),
     }
 }
 

@@ -125,6 +125,43 @@ fn dispatch_recvfrom_large_user_buffer_returns_short_read() {
 }
 
 #[test]
+fn dispatch_external_udp_sendto_keeps_datagram_for_device_tx() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let dns_addr = sockaddr_in([10, 0, 2, 3], 53);
+    let query = *b"dns-query";
+
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                query.as_ptr() as u64,
+                query.len() as u64,
+                0,
+                dns_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(query.len() as i64)
+    );
+
+    let file = process.fd(fd as u32).expect("resolve UDP file");
+    let socket =
+        crate::linux_syscall::socket::socket_identity_from_file(&file).expect("resolve UDP socket");
+    let payload = socket.acquire_operational().expect("UDP payload");
+    let datagram = payload
+        .raw_udp_socket()
+        .and_then(|raw| raw.peek_tx_datagram())
+        .expect("external datagram must remain queued for device TX");
+    assert_eq!(datagram.dst.port, 53);
+    assert!(!datagram.dst.is_loopback());
+}
+
+#[test]
 fn dispatch_udp_connect_autobinds_and_reaches_wildcard_bound_peer() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

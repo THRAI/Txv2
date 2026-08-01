@@ -493,7 +493,9 @@ impl ExecError {
     fn from_vdso_map_error(error: VmMapError) -> Self {
         match error {
             VmMapError::WouldBlock => Self::Retry,
-            VmMapError::NoFreeRange | VmMapError::Private(_) => Self::OutOfMemory,
+            VmMapError::NoFreeRange
+            | VmMapError::Private(_)
+            | VmMapError::PageAlloc(_) => Self::OutOfMemory,
             VmMapError::Pmap(_) => Self::IoError,
             VmMapError::AlreadyMapped
             | VmMapError::InvalidRange

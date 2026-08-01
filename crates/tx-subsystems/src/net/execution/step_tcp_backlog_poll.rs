@@ -44,11 +44,16 @@ pub(super) fn poll_tcp_backlog_for_listener_loopback(
         return Err(Errno::EINVAL);
     }
 
-    Ok(payload
-        .poll_tcp_backlog_retransmit(now, |entry| retransmit_syn_ack_to_loopback(entry, iface)))
+    Ok(payload.poll_tcp_backlog_retransmit(now, |entry| {
+        retransmit_syn_ack_to_loopback(entry, now, iface)
+    }))
 }
 
-fn retransmit_syn_ack_to_loopback(entry: &TcpBacklogEntry, iface: &LoopbackIface) -> bool {
+fn retransmit_syn_ack_to_loopback(
+    entry: &TcpBacklogEntry,
+    now: Instant,
+    iface: &LoopbackIface,
+) -> bool {
     let Some(child_payload) = entry.child.acquire_operational() else {
         return false;
     };
@@ -56,14 +61,17 @@ fn retransmit_syn_ack_to_loopback(entry: &TcpBacklogEntry, iface: &LoopbackIface
         return false;
     };
 
-    let Some(segment) = raw_tcp
-        .retransmit_syn_ack_segment()
-        .or_else(|| raw_tcp.dispatch_segment())
-    else {
-        return false;
+    // The SYN-ACK retransmit timer lives in smoltcp now (P0 unfroze it).
+    // `dispatch_segment` emitting nothing means the RTO simply has not
+    // expired yet — that is NOT a failed connection, so return true to keep
+    // the backlog entry (false would drop the half-open connection). A
+    // child that smoltcp has given up on turns Closed and is culled by
+    // `connecting_entry_failed` before this closure runs.
+    let Some(segment) = raw_tcp.dispatch_segment_at(now) else {
+        return true;
     };
     let Some(packet) = segment.emit_ipv4_packet() else {
-        return false;
+        return true;
     };
 
     iface.dispatch_ip(packet)

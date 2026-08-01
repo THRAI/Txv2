@@ -266,8 +266,23 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
     let guard = user_access_guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
-        V3::Err(V3Errno::EFAULT) => {
+        V3::Err(_first_err) => {
             drop(guard);
+            // fork narrow-copy leaves the child's inherited stack/anon pages
+            // unmapped until a refault; a kernel-side read of argv/envp on
+            // those pages comes back not just as EFAULT but as the pmap-layer
+            // "needs refresh" errno (EDESTADDRREQ) too. Either way the fix is
+            // the same: materialise the range by hand (anon pages resolve
+            // synchronously) and retry once. A genuinely bad pointer fails the
+            // retry and falls through to the errno mapping below.
+            if let Some(range) = covering_user_range(uaddr, core::mem::size_of::<T>()) {
+                let _ = aspace.reserve_user_range_for_access(range, UserAccessKind::Read);
+                let retry_guard = user_access_guard();
+                if let V3::Done(v) = aspace.read_user(UserPtr::<T>::new(uaddr as usize), &retry_guard)
+                {
+                    return Ok(v);
+                }
+            }
             #[cfg(target_os = "none")]
             {
                 Err(Errno::EFAULT)
@@ -538,6 +553,19 @@ pub(super) fn bootstrap_read_user_cstr(
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
             drop(guard);
+            // See `bootstrap_read_user`: same fork copy-narrowing refault
+            // duty, string flavour.
+            if let Some(range) = covering_user_range(uaddr, max_len) {
+                let _ = aspace.reserve_user_range_for_access(range, UserAccessKind::Read);
+                let retry_guard = user_access_guard();
+                if let V3::Done(v) = aspace.read_user_cstr(
+                    UserPtr::<u8>::new(uaddr as usize),
+                    max_len,
+                    &retry_guard,
+                ) {
+                    return Ok(v);
+                }
+            }
             #[cfg(target_os = "none")]
             {
                 Err(Errno::EFAULT)

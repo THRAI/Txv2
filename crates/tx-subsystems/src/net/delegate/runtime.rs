@@ -1,27 +1,25 @@
 use smoltcp::time::Instant;
 use tx_reactor::wait::WaitOutcome;
-use tx_substrate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Guard, StepOutcome};
 use crate::net::execution::{
-    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at_with_post,
-    step_process_loopback_pending_in_namespace_with_post,
-    step_process_network_events_in_namespace_at_with_post, step_process_network_tick_in_namespace,
-    step_process_network_tick_loopback_in_namespace, ArpFlushOutcome, DeviceTxBudget,
-    DeviceTxOutcome, LoopbackPendingOutcome, LoopbackPollBudget, ARP_FLUSH_BUDGET_DEFAULT,
+    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
+    step_process_loopback_pending_in_namespace, step_process_network_events_in_namespace_at,
+    step_process_network_tick_in_namespace, step_process_network_tick_loopback_in_namespace,
+    ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome, LoopbackPendingOutcome, LoopbackPollBudget,
+    ARP_FLUSH_BUDGET_DEFAULT,
 };
 use crate::net::namespace::{
-    drive_all_net_namespace_runtimes_at_with_post, initial_net_namespace_payload,
-    NetNamespacePayload,
+    drive_all_net_namespace_runtimes_at, initial_net_namespace_payload, NetNamespacePayload,
 };
 use crate::net::packet::{PacketSource, PacketTxSink};
 use crate::net::protocol::{EtherIface, LoopbackIface};
 use crate::wait_source;
 
 use super::{
-    net_delegate_clear, net_delegate_kick_poll_with_post, net_delegate_queue,
-    net_delegate_wait_token, DelegateWireSet,
+    net_delegate_clear, net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token,
+    DelegateWireSet,
 };
 
 pub trait NetDelegateDriver {
@@ -54,19 +52,6 @@ pub trait NetDelegateDriver {
 
     fn loopback_budget(&self) -> LoopbackPollBudget {
         LoopbackPollBudget::default()
-    }
-
-    fn post_delegate_poll_wake(&self, mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
-        self.post_net_mailbox_ref_event(mailbox, event, MailboxSchedulerHint::Normal)
-    }
-
-    fn post_net_mailbox_ref_event(
-        &self,
-        mailbox: &TaskMailbox,
-        event: MailboxEvent,
-        hint: MailboxSchedulerHint,
-    ) -> bool {
-        mailbox.post_with_scheduler_hint(event, hint)
     }
 }
 
@@ -146,9 +131,9 @@ where
         .max_ready_steps
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
-        let token = net_delegate_wait_token();
+        let wait_token = net_delegate_wait_token();
         let Some(wait) =
-            wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
+            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
         else {
             report.waits_failed += 1;
             break;
@@ -180,9 +165,9 @@ pub async fn net_delegate_task_loop_with_deadline_hook(
         .max_ready_steps
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
-        let token = net_delegate_wait_token();
+        let wait_token = net_delegate_wait_token();
         let Some(wait) =
-            wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
+            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
         else {
             report.waits_failed += 1;
             break;
@@ -208,6 +193,15 @@ pub fn net_delegate_step_once(
     driver: &dyn NetDelegateDriver,
     guard: &Guard<'_>,
 ) -> NetDelegateRuntimeOutcome {
+    // Publish the driver's clock before any step below reaches
+    // `with_context`, so smoltcp timers (retransmit/RTT/TIME-WAIT) see
+    // fresh time on the poll path.
+    crate::net::clock::net_set_now_ns(
+        u64::try_from(driver.now().total_micros())
+            .unwrap_or(0)
+            .saturating_mul(1_000),
+    );
+
     let ready = net_delegate_queue().peek();
     let poll_seen = ready & DelegateWireSet::POLL.bits() != 0;
     let tick_seen = ready & DelegateWireSet::TICK.bits() != 0;
@@ -221,14 +215,11 @@ pub fn net_delegate_step_once(
     let net_namespace = driver.net_namespace();
 
     if poll_seen {
-        let StepOutcome::Done(events) = step_process_network_events_in_namespace_at_with_post(
+        let StepOutcome::Done(events) = step_process_network_events_in_namespace_at(
             driver.packet_source(),
             net_namespace.clone(),
             driver.now(),
             guard,
-            |mailbox, event| {
-                driver.post_net_mailbox_ref_event(mailbox, event, MailboxSchedulerHint::Normal)
-            },
         ) else {
             return outcome;
         };
@@ -241,15 +232,12 @@ pub fn net_delegate_step_once(
             earliest_deadline(outcome.next_deadline, events.backlog.next_deadline);
 
         if let Some(iface) = driver.loopback_iface() {
-            let StepOutcome::Done(loopback) = step_process_loopback_pending_in_namespace_with_post(
+            let StepOutcome::Done(loopback) = step_process_loopback_pending_in_namespace(
                 driver.now(),
                 net_namespace.clone(),
                 iface,
                 driver.loopback_budget(),
                 guard,
-                |mailbox, event| {
-                    driver.post_net_mailbox_ref_event(mailbox, event, MailboxSchedulerHint::Normal)
-                },
             ) else {
                 return outcome;
             };
@@ -258,29 +246,18 @@ pub fn net_delegate_step_once(
             outcome.sockets_touched += loopback.sockets_touched;
             outcome.wakes_fired += loopback.wakes_fired;
             if loopback.made_progress() {
-                outcome.wakes_fired += net_delegate_kick_poll_with_post(|mailbox, event| {
-                    driver.post_delegate_poll_wake(mailbox, event)
-                });
+                outcome.wakes_fired += net_delegate_kick_poll();
             }
         }
 
         if let Some(sink) = driver.packet_tx_sink() {
-            let StepOutcome::Done(device_tx) =
-                step_process_device_tx_pending_in_namespace_at_with_post(
-                    sink,
-                    net_namespace.clone(),
-                    driver.now(),
-                    driver.device_tx_budget(),
-                    guard,
-                    |mailbox, event| {
-                        driver.post_net_mailbox_ref_event(
-                            mailbox,
-                            event,
-                            MailboxSchedulerHint::Normal,
-                        )
-                    },
-                )
-            else {
+            let StepOutcome::Done(device_tx) = step_process_device_tx_pending_in_namespace_at(
+                sink,
+                net_namespace.clone(),
+                driver.now(),
+                driver.device_tx_budget(),
+                guard,
+            ) else {
                 return outcome;
             };
             outcome.device_tx.merge(device_tx);
@@ -290,9 +267,7 @@ pub fn net_delegate_step_once(
                 || device_tx.udp_packets != 0
                 || device_tx.raw_icmp_packets != 0
             {
-                outcome.wakes_fired += net_delegate_kick_poll_with_post(|mailbox, event| {
-                    driver.post_delegate_poll_wake(mailbox, event)
-                });
+                outcome.wakes_fired += net_delegate_kick_poll();
             }
         }
 
@@ -304,20 +279,13 @@ pub fn net_delegate_step_once(
             };
             outcome.arp_flush = arp_flush;
             if arp_flush.sent != 0 {
-                outcome.wakes_fired += net_delegate_kick_poll_with_post(|mailbox, event| {
-                    driver.post_delegate_poll_wake(mailbox, event)
-                });
+                outcome.wakes_fired += net_delegate_kick_poll();
             }
         }
 
-        let namespace_runtime =
-            drive_all_net_namespace_runtimes_at_with_post(driver.now(), guard, |mailbox, event| {
-                driver.post_net_mailbox_ref_event(mailbox, event, MailboxSchedulerHint::Normal)
-            });
+        let namespace_runtime = drive_all_net_namespace_runtimes_at(driver.now(), guard);
         if namespace_runtime.made_progress() {
-            outcome.wakes_fired += net_delegate_kick_poll_with_post(|mailbox, event| {
-                driver.post_delegate_poll_wake(mailbox, event)
-            });
+            outcome.wakes_fired += net_delegate_kick_poll();
         }
         outcome.sockets_touched += namespace_runtime.sockets_touched;
         outcome.wakes_fired += namespace_runtime.wakes_fired;

@@ -99,6 +99,60 @@ fn loopback_pending_step_drives_tcp_connected_transfer() {
 }
 
 #[test]
+fn loopback_pending_zero_tcp_budget_does_not_reschedule_immediate_work() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (client, listener, _local, _remote) = prepare_loopback_connecting(40_196, 50_196);
+    let guard = tx_substrate::epoch::guard();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert!(matches!(
+        step_accept(&listener, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"x", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(1)
+    );
+
+    for budget in [
+        LoopbackPollBudget {
+            tcp_connecting: 0,
+            tcp_connected: 0,
+            udp_bound: 0,
+            raw_icmp: 0,
+            packet_budget: 0,
+            tcp_transfer_bytes: 64,
+        },
+        LoopbackPollBudget {
+            tcp_connecting: 0,
+            tcp_connected: 1,
+            udp_bound: 0,
+            raw_icmp: 0,
+            packet_budget: 0,
+            tcp_transfer_bytes: 0,
+        },
+    ] {
+        let outcome = match step_process_loopback_pending(
+            smoltcp::time::Instant::ZERO,
+            loopback_iface(),
+            budget,
+            &guard,
+        ) {
+            StepOutcome::Done(outcome) => outcome,
+            other => panic!("unexpected loopback pending outcome: {other:?}"),
+        };
+        assert!(!outcome.tcp_immediate_work_remaining);
+        assert!(!outcome.made_progress());
+    }
+}
+
+#[test]
 fn loopback_pending_step_drives_udp_connected_datagram() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -222,7 +276,7 @@ fn loopback_pending_step_drives_raw_icmp_echo() {
         .expect("net epoch test lock");
     loopback_iface().clear_for_test_or_bootstrap();
     let guard = tx_substrate::epoch::guard();
-    let valid = ValidSocketType::validate(2, 3, 1).expect("ping socket");
+    let valid = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let socket = match step_socket_create(valid, &guard) {
         StepOutcome::Done(socket) => socket,
         other => panic!("unexpected socket create outcome: {other:?}"),

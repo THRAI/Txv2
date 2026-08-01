@@ -29,6 +29,10 @@ pub type VvarPublishHook = fn(VvarSnapshot);
 
 static REALTIME_TIMER_NOTIFIER: AtomicUsize = AtomicUsize::new(0);
 static VVAR_PUBLISH_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// Platform monotonic-ns reader for callers without a `P` bound. Page-backed
+/// writeback stamps file mtimes below the platform generic, so it cannot
+/// reach `timekeeper_clock::<P>()`. Zero until the boot path installs one.
+static MONOTONIC_NS_SOURCE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn install_realtime_timer_notifier(notifier: RealtimeTimerNotifier) {
     REALTIME_TIMER_NOTIFIER.store(notifier as usize, Ordering::Release);
@@ -36,6 +40,26 @@ pub fn install_realtime_timer_notifier(notifier: RealtimeTimerNotifier) {
 
 pub fn install_vvar_publish_hook(hook: VvarPublishHook) {
     VVAR_PUBLISH_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Install the platform's monotonic clock reader so non-generic code can
+/// read CLOCK_REALTIME via [`realtime_now_ns_hooked`].
+pub fn install_monotonic_ns_source(source: fn() -> u64) {
+    MONOTONIC_NS_SOURCE.store(source as usize, Ordering::Release);
+}
+
+/// CLOCK_REALTIME for callers without a `P` bound. `None` until the boot
+/// path installs the monotonic source, so host unit tests (which never
+/// install one) keep epoch timestamps instead of inventing a clock.
+pub fn realtime_now_ns_hooked() -> Option<u64> {
+    let raw = MONOTONIC_NS_SOURCE.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: the only store is `install_monotonic_ns_source`, which writes a
+    // valid `fn() -> u64`; fn pointers are non-null and never deallocated.
+    let source: fn() -> u64 = unsafe { core::mem::transmute(raw) };
+    Some(add_signed_ns(source(), WALL_CLOCK.realtime_offset_ns()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

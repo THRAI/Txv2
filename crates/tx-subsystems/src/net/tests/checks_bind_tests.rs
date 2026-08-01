@@ -134,9 +134,7 @@ fn socket_facade_routes_bind_listen_and_poll_to_steps() {
         .handle
         .identity
         .readiness
-        .fire_accept_with_post(AcceptWireSet::HAS_PENDING, |mailbox, event| {
-            mailbox.post(event)
-        });
+        .fire_accept(AcceptWireSet::HAS_PENDING);
 
     let mask = match socket_poll_ready_facade(output.handle.poll_capability(PollMask::IN), &guard) {
         StepOutcome::Done(mask) => mask,

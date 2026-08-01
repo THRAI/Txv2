@@ -9,7 +9,9 @@ use std::{
     task::{Wake, Waker},
 };
 
-use tx_reactor::{yield_now, Reactor, RunStats, TaskStatus};
+use tx_reactor::{
+    yield_now, HartId, HartPollBudget, NoopRescheduleSignal, Reactor, RunStats, TaskStatus,
+};
 
 struct CountingWake {
     wakes: Arc<AtomicUsize>,
@@ -60,6 +62,42 @@ fn reactor_task_yields_once_then_completes() {
         reactor.run_until_idle(),
         RunStats {
             polled: 2,
+            completed: 1
+        }
+    );
+    assert_eq!(stage.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_status(task), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn bounded_ready_run_returns_between_yielding_future_polls() {
+    let stage = Arc::new(AtomicUsize::new(0));
+    let reactor = Reactor::new();
+    let task = {
+        let stage = Arc::clone(&stage);
+        reactor.submit(async move {
+            stage.store(1, Ordering::SeqCst);
+            yield_now().await;
+            stage.store(2, Ordering::SeqCst);
+        })
+    };
+    let mut signal = NoopRescheduleSignal::new();
+    let one_poll = HartPollBudget::up_to(1);
+
+    assert_eq!(
+        reactor.run_ready_on_hart_with_reschedule(HartId(0), &mut signal, one_poll),
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    assert_eq!(stage.load(Ordering::SeqCst), 1);
+    assert_eq!(reactor.task_status(task), Some(TaskStatus::Runnable));
+
+    assert_eq!(
+        reactor.run_ready_on_hart_with_reschedule(HartId(0), &mut signal, one_poll),
+        RunStats {
+            polled: 1,
             completed: 1
         }
     );

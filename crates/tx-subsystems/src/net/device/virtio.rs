@@ -4,11 +4,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::device::DevT;
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::net::delegate::net_delegate_kick_poll_with_post;
+use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::yield_on_token;
 use crate::net::packet::{PacketTxReadiness, RxFrame};
 use crate::sync::SpinMutex;
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 use super::{EthernetAddress, NetDeviceOps, NetDeviceRegistration};
 
@@ -227,17 +226,13 @@ impl VirtioNetDevice {
         }
     }
 
-    pub fn inject_rx_and_fire_poll_with_post_for_test_or_irq<F>(
+    pub fn inject_rx_and_fire_poll_for_test_or_irq(
         &self,
         frame: RxFrame,
-        mut post: F,
-    ) -> VirtioNetRxInjectOutcome
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
+    ) -> VirtioNetRxInjectOutcome {
         let mut outcome = self.inject_rx_for_test_or_irq(frame);
         if outcome.accepted {
-            outcome.poll_wakes = self.fire_poll_with_post(&mut post);
+            outcome.poll_wakes = self.fire_poll();
         }
         outcome
     }
@@ -268,33 +263,22 @@ impl VirtioNetDevice {
         outcome
     }
 
-    pub fn complete_tx_and_fire_poll_with_post_for_test_or_irq<F>(
+    pub fn complete_tx_and_fire_poll_for_test_or_irq(
         &self,
         budget: usize,
-        mut post: F,
-    ) -> VirtioNetTxCompleteOutcome
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
+    ) -> VirtioNetTxCompleteOutcome {
         let mut outcome = self.complete_tx_for_test_or_irq(budget);
         if outcome.completed != 0 {
-            outcome.poll_wakes = self.fire_poll_with_post(&mut post);
+            outcome.poll_wakes = self.fire_poll();
         }
         outcome
     }
 
-    pub fn handle_irq_with_post<F>(
-        &self,
-        event: VirtioNetIrqEvent,
-        mut post: F,
-    ) -> VirtioNetIrqOutcome
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
+    pub fn handle_irq(&self, event: VirtioNetIrqEvent) -> VirtioNetIrqOutcome {
         match event {
             VirtioNetIrqEvent::RxAvailable => VirtioNetIrqOutcome {
                 rx_ready: true,
-                poll_wakes: self.fire_poll_with_post(&mut post),
+                poll_wakes: self.fire_poll(),
                 ..VirtioNetIrqOutcome::default()
             },
             VirtioNetIrqEvent::TxComplete { budget } => {
@@ -305,13 +289,13 @@ impl VirtioNetDevice {
                     poll_wakes: if completion.completed == 0 {
                         0
                     } else {
-                        self.fire_poll_with_post(&mut post)
+                        self.fire_poll()
                     },
                     ..VirtioNetIrqOutcome::default()
                 }
             }
             VirtioNetIrqEvent::ConfigChanged => VirtioNetIrqOutcome {
-                poll_wakes: self.fire_poll_with_post(&mut post),
+                poll_wakes: self.fire_poll(),
                 ..VirtioNetIrqOutcome::default()
             },
         }
@@ -345,11 +329,8 @@ impl VirtioNetDevice {
         self.stats.clear_for_test_or_bootstrap();
     }
 
-    fn fire_poll_with_post<F>(&self, post: F) -> usize
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
-        let wakes = net_delegate_kick_poll_with_post(post);
+    fn fire_poll(&self) -> usize {
+        let wakes = net_delegate_kick_poll();
         self.stats.irq_polls.fetch_add(1, Ordering::Relaxed);
         wakes
     }

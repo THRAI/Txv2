@@ -53,6 +53,9 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 /// tasks block on WaitSources rather than timer-backed futures.
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 const POLLING_IDLE_SPINS: usize = 256;
+/// Return from the reactor after each future poll so task-context device IRQ
+/// work runs promptly on the hart that claimed the interrupt.
+const REACTOR_POLLS_PER_DEVICE_IRQ_CHECK: usize = 1;
 
 fn platform_rtc_read_time_ns<P>() -> Result<u64, TimeError>
 where
@@ -653,6 +656,11 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
+            // PROBE(proxy-push segv hunt): the vmwatch page-lifecycle probes
+            // in tx-subsystems::vm are compiled in but quiet by default.
+            // Uncomment to re-arm them (events on the WATCH_LO..WATCH_HI user
+            // VA range print to the console as `txkernel:vmwatch:*`):
+            // tx_subsystems::vm::probe::install_probe_sink(vm_probe_sink::<P>);
             Self::write_demo_boot_banner();
             init::<P>();
             crate::zones::register_all().expect("tx_kernel zone registration failed");
@@ -719,7 +727,23 @@ impl<P: TxPlatform> CoreInit<P> {
             if boot_plan.args.mount_sdcard {
                 Self::mount_sdcard_at_musl();
             }
+            // `tx.runsh` runs Alpine userland out of the mounted ext4 image,
+            // but it still needs the kernel rootfs skeleton: `/bin/sh`
+            // shebang shims, `/tmp`, identity files, resolver databases. The
+            // lane boots without a mode flag, so `BootPlan` classifies it as
+            // `LinuxLike` and would skip all of that — and then git's helper
+            // spawn and the `overlay_image_dirs_for_runsh` bind mounts have
+            // nothing to attach to. The pre-merge tree had no such gate and
+            // always populated; force the legacy behaviour for this lane.
+            let runsh_lane = exec::cmdline_value::<P>("tx.runsh").is_some();
             match boot_plan.rootfs_setup {
+                _ if runsh_lane => {
+                    Self::populate_rootfs_shebang_shims();
+                    Self::populate_rootfs_tmp_dirs();
+                    Self::populate_rootfs_identity_files();
+                    Self::populate_rootfs_kernel_config();
+                    Self::populate_rootfs_network_databases();
+                }
                 RootfsSetup::LinuxLike => {
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":rootfs-shims:skip:");
@@ -1037,6 +1061,13 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
+        // Route CLOCK_REALTIME to code below the platform generic
+        // (page-backed writeback stamps file mtimes on flush). The hook now
+        // lives in `tx-time` alongside main's other non-generic time hooks;
+        // main's own RTC seeding runs from `vdso::init` via
+        // `RealtimeControl::seed_realtime_from_persistent`, so the feature
+        // branch's `P::read_rtc_epoch_ns()` block is dropped as redundant.
+        tx_services::time::install_monotonic_ns_source(P::read_ns);
     }
 
     /// Mount tmpfs as the rootfs.
@@ -1669,48 +1700,42 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{
-            mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
-            Ext4FileIoRuntimeBinder, JournalPagePool,
-        };
-        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
-        use tx_subsystems::io_manager::block::DeviceKey;
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
+        use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
         };
 
-        let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
-        let Some(geometry) = image.block_geometry(device) else {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
-            return;
-        };
-        // The pool holds the active ordered transaction's descriptor, commit,
-        // metadata journal copies, and later home-block checkpoint copies.
-        // Ext4Pager currently supports at most four inline extent mutations,
-        // so 32 pages leaves headroom without allowing unbounded staging.
-        let pool = match JournalPagePool::new(32) {
-            Ok(pool) => pool,
+        // Plain read-write mount, NOT the journal-discovering variant.
+        //
+        // `mount_ext4_read_write_with_discovered_journal` attaches a backend
+        // planner, which routes page fetches through the async io_manager
+        // (`try_materialize_file_page_from_backend_plan`). That path only
+        // completes once block-completion interrupts are being serviced,
+        // which is not true during bootstrap exec: the fetch for the first
+        // userspace image parks forever, `exec_script` never resolves, and
+        // boot falls through to `/init` -> ENOENT -> panic.
+        //
+        // Without the planner the fetch falls back to ext4's synchronous
+        // `fetch_page` (`tx-ext4/src/pager.rs`). That is what the pre-merge
+        // tree did and what `tools/verify-git-net.sh` passes 8/8 on.
+        // Journalled writeback for this mount is given up in exchange; the
+        // sdcard image is a test fixture, and the pre-merge tree ran the
+        // same way.
+        let mount_output = match mount_ext4_read_write(image) {
+            Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
                 return;
             }
         };
-        let mount_output =
-            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
-                Ok(out) => out,
-                Err(_) => {
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
-                    return;
-                }
-            };
-        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
-            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
-        )));
+        // No file-I/O service binder either, for the same reason as the
+        // missing backend planner below: the per-container service task it
+        // registers only makes progress once block completions are being
+        // delivered, which is not the case during bootstrap exec.
 
         let root_mount = ROOT_MOUNT
             .lock()
@@ -1745,7 +1770,22 @@ impl<P: TxPlatform> CoreInit<P> {
             publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"musl", musl_rnode_in_root);
 
         // Build the ext4 mount payload.
-        let ext4_payload = MountPayload::new_cap_with_backend_planner(
+        //
+        // NO backend planner on this mount, deliberately. A planner routes
+        // page fetches through the async io_manager
+        // (`try_materialize_file_page_from_backend_plan`), whose completion
+        // depends on a block-completion interrupt. The bootstrap exec that
+        // loads the first userspace image runs before any of that can be
+        // serviced: the fetch parks forever and `exec_script` never resolves,
+        // so `/musl/...` binaries are unloadable and boot falls through to
+        // `/init` -> ENOENT -> panic. Without a planner the fetch falls back
+        // to ext4's synchronous `fetch_page` (`tx-ext4/src/pager.rs`), which
+        // is what the pre-merge tree did and what `tools/verify-git-net.sh`
+        // passes 8/8 on.
+        //
+        // Scoped to this mount only: mounts created later, once the reactor
+        // and block IRQs are live, may attach a planner normally.
+        let ext4_payload = MountPayload::new_cap(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
@@ -1753,7 +1793,6 @@ impl<P: TxPlatform> CoreInit<P> {
             MountOptions::default(),
             "ext4",
             SourceLabel::Static("vda"),
-            mount_output.backend_planner(),
         )
         .expect("mount_sdcard_at_musl: ext4 payload reservation");
 
@@ -2510,11 +2549,13 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
+        let drained_device_before_poll = Self::drain_device_irq_bottom_halves();
         let step = if USE_CONCURRENT_POLL.load(core::sync::atomic::Ordering::Relaxed) {
             Self::boot_reactor_once_concurrent(cpu_id)
         } else {
             Self::boot_reactor_once(cpu_id)
         };
+        let drained_device_after_poll = Self::drain_device_irq_bottom_halves();
 
         // Reclaim terminal child tasks before publishing queued children so
         // hot pthread create/join loops reuse reactor task slots promptly.
@@ -2526,7 +2567,9 @@ impl<P: TxPlatform> CoreInit<P> {
         let submitted_child = Self::drain_pending_child_submits();
         let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
 
-        drained_terminal_before_submit
+        drained_device_before_poll
+            || drained_device_after_poll
+            || drained_terminal_before_submit
             || submitted_child
             || drained_terminal_after_poll
             || step.is_some_and(|step| !step.should_idle())
@@ -2539,7 +2582,13 @@ impl<P: TxPlatform> CoreInit<P> {
         // Force a guard acquire+drop to clear stale epoch state.
         drop(step_engine::guard());
         let step = BOOT_REACTOR.with_hart_runtime(hart, |runtime| {
-            boot_runtime::hart_loop::step_hart_loop_at(runtime, hart, now_ns, &mut signal)
+            boot_runtime::hart_loop::step_hart_loop_at_with_poll_budget(
+                runtime,
+                hart,
+                now_ns,
+                &mut signal,
+                boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
+            )
         })?;
         Self::program_boot_reactor_deadline(hart);
         Some(step)
@@ -2574,11 +2623,12 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         let mut slice_clock = KernelSliceClock::<P>(core::marker::PhantomData);
-        let step = BOOT_REACTOR.run_hart_loop_concurrent_with_slice_clock(
+        let step = BOOT_REACTOR.run_hart_loop_concurrent_with_slice_clock_and_poll_budget(
             hart,
             now_ns,
             &mut signal,
             &mut slice_clock,
+            boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
         )?;
         Self::program_boot_reactor_deadline(hart);
         Some(step)
@@ -2590,6 +2640,130 @@ impl<P: TxPlatform> CoreInit<P> {
             reactor.program_current_hart_deadline(&mut deadline_timer);
         });
     }
+
+    /// Bind-mount the mounted Alpine ext4 image's top-level subtrees
+    /// (`/musl/usr` -> `/usr`, `/musl/lib` -> `/lib`, `/musl/bin` -> `/bin`,
+    /// `/musl/sbin` -> `/sbin`) over the empty rootfs skeleton directories.
+    ///
+    /// For the `tx.runsh` (on-site-finals git) lane only — call it from the
+    /// bootstrap path when `tx.runsh` is set.
+    ///
+    /// The image is mounted at `/musl`, but its binaries and its own *absolute*
+    /// symlinks assume a real root layout: `/usr/bin/git`, `/bin/sh ->
+    /// /bin/busybox`, the musl loader's default library search (`/lib:/usr/lib`),
+    /// and git's compiled-in `/bin/sh` for spawning helpers (index-pack,
+    /// upload-pack). Those all land on the read-only kernel rootfs, not `/musl`,
+    /// so git clone reaches the network but dies at helper spawn. The
+    /// `populate_rootfs_*` shims already create `/usr`, `/lib`, `/bin`, ... as
+    /// empty tmpfs dirs, so a plain top-level symlink can't take their place
+    /// (EEXIST). Instead, mount the matching ext4 subtree over each empty
+    /// skeleton dir, so the mounted image behaves as the root fs for the
+    /// helper-spawn paths git relies on. Gated to this lane, so the OSComp
+    /// tmpfs layout is untouched. Best-effort: a missing image dir or a backend
+    /// that would block is skipped rather than aborting boot. (Ported from
+    /// net-git e7992ef8 — git Task2.)
+    pub(super) fn overlay_image_dirs_for_runsh() {
+        use step_engine::StepOutcome as V3;
+        let Some(musl_mount) = MUSL_MOUNT.lock().clone() else {
+            return;
+        };
+        let Some(root_mount) = ROOT_MOUNT.lock().clone() else {
+            return;
+        };
+        let Ok(ext4_payload) = musl_mount.payload_cap() else {
+            return;
+        };
+        let ext4_payload = ext4_payload.into_cap();
+        let ext4_fs_ops = ext4_payload.fs_ops.clone();
+        let ext4_root_id = musl_mount.root().fs_object_id();
+        let Ok(rootfs_payload) = root_mount.payload_cap() else {
+            return;
+        };
+        let rootfs_payload = rootfs_payload.into_cap();
+        let rootfs_fs_ops = rootfs_payload.fs_ops.clone();
+
+        for name in [
+            b"usr".as_slice(),
+            b"lib".as_slice(),
+            b"bin".as_slice(),
+            b"sbin".as_slice(),
+        ] {
+            let guard = step_engine::guard();
+            // Source: the ext4 subtree (e.g. /musl/usr).
+            let V3::Done(ext4_sub_id) = ext4_fs_ops.lookup(ext4_root_id, name, &guard) else {
+                drop(guard);
+                continue;
+            };
+            let V3::Done(ext4_sub_meta) = ext4_fs_ops.load_inode_meta(ext4_sub_id, &guard) else {
+                drop(guard);
+                continue;
+            };
+            // Mountpoint: the empty tmpfs skeleton dir (e.g. /usr).
+            let V3::Done(skel_id) =
+                rootfs_fs_ops.lookup(tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID, name, &guard)
+            else {
+                drop(guard);
+                continue;
+            };
+            let V3::Done(skel_meta) = rootfs_fs_ops.load_inode_meta(skel_id, &guard) else {
+                drop(guard);
+                continue;
+            };
+            drop(guard);
+
+            // ext4 subtree root RNode (with the ext4 containing-mount hint so
+            // the walker resolves the right FsOps after crossing the mount).
+            let ext4_sub_rnode = {
+                let raw = RNode::new(ext4_sub_id, ext4_sub_meta, RNodeBacking::Directory)
+                    .with_containing_mount(&ext4_payload);
+                let Ok(res) = step_engine::reserve_for::<RNode>() else {
+                    continue;
+                };
+                step_engine::sign_for(res, raw)
+            };
+            // Mountpoint DEntry on the rootfs — published into the root
+            // dentry's child cache, exactly like the `/musl` mountpoint.
+            //
+            // This is the load-bearing step. The walker's mount crossing
+            // (`crossing_mount_for`, vfs/resolution/step.rs) consults the
+            // mount NAMESPACE first, and `MountNamespace::mount_for` matches
+            // by DEntry cap key — the walker must hold the *same* DEntry
+            // instance we register. Publishing via `cache_child` makes the
+            // walker's lookup of e.g. "lib" under the root hit this instance
+            // (its rnode carries the authoritative tmpfs fs_object_id, so
+            // the resolution-authority filter accepts the cached child). A
+            // free-floating `DEntry::new_cap` — what the pre-merge tree did,
+            // when crossings were keyed by (payload, fs_object_id) — is
+            // invisible to the DEntry-keyed namespace: the walk then falls
+            // into the EMPTY tmpfs skeleton dir and the loader dies with
+            // ENOENT on /lib/ld-musl-riscv64.so.1.
+            let Ok(skel_rnode) = RNode::new_cap(skel_id, skel_meta, RNodeBacking::Directory) else {
+                continue;
+            };
+            let mountpoint_dentry =
+                publish_boot_mountpoint_dentry(root_mount.root_dentry(), name, skel_rnode);
+            let Ok(overlay_mount) = MountIdentity::new_cap(
+                mount::allocate_mount_id(),
+                Some(mountpoint_dentry.clone()),
+                ext4_sub_rnode,
+                Some(root_mount.clone()),
+                ext4_payload.clone(),
+                MountFlags::empty(),
+            ) else {
+                continue;
+            };
+            mount::register_mount(&rootfs_payload, skel_id, overlay_mount.clone());
+            if let Some(mnt_ns) = init_mount_namespace() {
+                mnt_ns.register_mount(&mountpoint_dentry, overlay_mount);
+            }
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":runsh:overlay:");
+            tx_hal::console_write_bytes::<P>(name);
+            tx_hal::console_write_str::<P>(":ok\n");
+        }
+    }
+
+    /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
 
     pub(super) fn poll_boot_reactor_idle_window(hart: boot_runtime::HartId) -> bool {
         let mut observed = false;
@@ -2843,6 +3017,17 @@ mod init_setuid_fixture;
 #[cfg(test)]
 mod init_lseek_fixture;
 mod rootfs_shims;
+
+/// PROBE(proxy-push segv hunt): monomorphized raw console sink handed to the
+/// tx-subsystems vmwatch probes. ASCII-only lines from the probe emitter.
+/// Quiet by default — see the commented `install_probe_sink` call in
+/// `init_substrate_if_ready` to re-arm.
+#[allow(dead_code)]
+fn vm_probe_sink<P: TxPlatform>(bytes: &[u8]) {
+    if let Ok(s) = core::str::from_utf8(bytes) {
+        tx_hal::console_write_str::<P>(s);
+    }
+}
 
 #[cfg(test)]
 mod tests;

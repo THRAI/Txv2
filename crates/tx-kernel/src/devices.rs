@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::marker::PhantomData;
 
 use crate::adapter::step_engine::{NoProgress, StepOutcome};
-use tx_hal::{Arch, TxPlatform};
+use tx_hal::{Arch, IrqIf, TxPlatform};
 use tx_subsystems::device::{
     register_block_devices, BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT,
     PhysicalBlockNumber,
@@ -148,15 +148,29 @@ impl<P: TxPlatform> KernelNetDevices<P> {
     }
 
     fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
+        // "virtio1" (0x1000_2000), NOT "virtio0" — the block driver owns
+        // virtio0 (0x1000_1000). Probing virtio0 here binds the block device
+        // and `init()` rejects it with `WrongDeviceType`, leaving the guest
+        // with no network at all.
         let net = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioNet::<P, 256>::new(
-            "virtio0",
+            "virtio1",
         )));
         if let Err(err) = net.init() {
             Self::write_net_init_error::<P>(err);
             return StepOutcome::Done(());
         }
-
-        self.register_eth0(net)
+        // Publish `eth0` before allowing the device to assert its line. The
+        // controller handler is installed earlier in boot, while virtio
+        // notifications remain disabled throughout `init()`.
+        match self.register_eth0(net) {
+            StepOutcome::Done(()) => {
+                if <P as IrqIf>::NET_IRQ != 0 {
+                    net.enable_interrupts();
+                }
+                StepOutcome::Done(())
+            }
+            other => other,
+        }
     }
 
     fn init_la64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {

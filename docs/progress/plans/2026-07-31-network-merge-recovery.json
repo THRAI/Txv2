@@ -1,0 +1,328 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-31-network-merge-recovery",
+  "title": "Verify current network behavior against the pre-merge feature baseline",
+  "status": "blocked",
+  "created": "2026-07-31",
+  "updated": "2026-07-31",
+  "owner": "codex-and-user",
+  "summary": "Verify that current HEAD preserves the network behavior evidenced at premerge anchor 90939012; Phase 1 through Phase 8 architecture work is explicitly deferred and is not part of this recovery plan.",
+  "scope": {
+    "in": [
+      "post-merge network acceptance evidence",
+      "targeted host network regressions",
+      "RV64 and LA64 Git, DNS, HTTP, and HTTPS witnesses",
+      "RV64 and LA64 musl/glibc netperf and iperf groups",
+      "focused libc-test network ABI witnesses",
+      "the fixed RV64 musl LTP socket split and verdict-set comparison",
+      "docs/progress and network debug logs"
+    ],
+    "out": [
+      "whole-tree rollback to premerge-feature-20260727",
+      "mechanical removal of required socket ABI/netlink/bootstrap special cases",
+      "unrelated filesystem, VM, process, or syscall cleanup",
+      "SCTP, NFS, RPC, netfilter, or remote-host suite expansion without a separately approved witness",
+      "Phase 1 through Phase 8 architecture work: OFD release unification, retained TCP close, positive SO_LINGER, option/readiness convergence, dynamic object lifecycle, capacity cleanup, IPv6 fragmentation, VLAN, and L2/L3 ownership changes",
+      "restoration of retired test-only selectors such as lmbench-network"
+    ],
+    "write_sets": []
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md",
+      "docs/Txv3/01_CONCEPTS_v5.md",
+      "docs/Txv3/02_INVARIANTS_v5.md",
+      "docs/Txv3/03_STEP_MODEL_v2.md",
+      "docs/design/00_meta-framework/object_model_v2.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-07-31-network-merge-recovery-roadmap.md",
+      "docs/progress/research/2026-07-31-premerge-network-recovery-test-matrix.md",
+      "docs/progress/research/2026-07-30-network-refactor-merge-structural-audit.md",
+      "docs/progress/research/2026-07-30-net-irq-restoration-design.md",
+      "docs/progress/research/2026-07-30-tcp-retained-close-design.md",
+      "docs/LTP/ltp-network-syscall-progress.md",
+      "docs/LTP/runtests/ltp-runtest-network-progress.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "phase-0-postmerge-parity",
+      "title": "Verify current HEAD against the fixed pre-merge network acceptance baseline",
+      "status": "blocked",
+      "depends_on": [],
+      "paths": [
+        "target/oscomp",
+        "msp/debug-logs",
+        "docs/progress"
+      ],
+      "verification": [
+        "Follow docs/progress/research/2026-07-31-premerge-network-recovery-test-matrix.md exactly.",
+        "Run the targeted host IRQ, reactor, socket fdtable, TCP lifecycle, external connect, veth, and network tick tests.",
+        "Require RV64 Git/DNS/HTTP/HTTPS plus NET_IRQ 9/9 and LA64 Git/DNS/HTTP/HTTPS 8/8.",
+        "Require RV64 and LA64 netperf/iperf musl/glibc groups to remain 22/22 per architecture; use direct anchor replay only as supplementary failure classification, not to erase an earlier passing witness.",
+        "Run current filtered libc-test network ABI groups; do not use retired libctest-network or lmbench-network selectors.",
+        "Compare all six RV64 musl LTP socket split verdict sets against the historical ledger; when an aggregate is not reproducible, replay the complete same-command batch from 90939012 and record any conflict with an older focused pass."
+      ],
+      "notes": "The ordered run and follow-up review completed on 2026-07-31, but recovery remains blocked only by the LTP b6 evidence conflict. OSComp rootfs compatibility and the musl libc-test launcher were restored. Zero-length UDP delivery is a Linux-compatibility repair required by the current netperf path, not source restoration from 90939012. RV64 Gate C is 22/22. LA64 Gate C returned to 22/22 after d9df0b05 fixed a release-only EBR publication preflight bug: debug_assert had removed the state-changing empty-bag epoch initialization, creating epoch=0 with one queued publication RCU node. A deterministic debug/release host regression and both LA64 netperf lanes now pass. This is not deferred network Phase 7 capacity work. LTP b3/b4 current/anchor verdict sets match, but b6 current setsockopt06 stalls despite a historical focused 1/1 and lacks a complete anchor-tail comparison. Phase 1 through Phase 8 remain deferred."
+    },
+    {
+      "id": "phase-1-ofd-release",
+      "title": "Unify every OpenFile/OFD final-release path",
+      "status": "canceled",
+      "depends_on": [
+        "phase-0-postmerge-parity"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/process",
+        "crates/tx-subsystems/src/vfs",
+        "crates/tx-shims/src/linux_syscall/fs_basic.rs"
+      ],
+      "verification": [
+        "Decision tests cover close, close_range, process exit, dup3 replacement, exec CLOEXEC, dup/fork non-final references, and exactly-once begin-close.",
+        "Existing pipe, socketpair, fdtable, and Git network witnesses do not regress."
+      ],
+      "notes": "Deferred by user on 2026-07-31. This was not implemented before merge and is not required for pre-merge recovery."
+    },
+    {
+      "id": "phase-2-tcp-closing-registry",
+      "title": "Retain closing TCP transports independently of fd lifetime",
+      "status": "canceled",
+      "depends_on": [
+        "phase-1-ofd-release"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/structure",
+        "crates/tx-subsystems/src/net/execution",
+        "crates/tx-subsystems/src/net/delegate",
+        "crates/tx-subsystems/src/net/tests"
+      ],
+      "verification": [
+        "Default close sends queued data before FIN.",
+        "SO_LINGER(on,0) produces a real RST path without the current application-data flush loop.",
+        "Closing tuples cannot be reused before terminal state.",
+        "Registry capacity, fairness, namespace release, and full-capacity behavior have tests."
+      ],
+      "notes": "Deferred by user on 2026-07-31. This was a future retained-close design, not a merge regression."
+    },
+    {
+      "id": "phase-3-closing-reaper",
+      "title": "Drive closing TCP entries through delegate deadlines and a generation-safe reaper",
+      "status": "canceled",
+      "depends_on": [
+        "phase-2-tcp-closing-registry"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/delegate",
+        "crates/tx-subsystems/src/net/execution/step_process_network_events.rs",
+        "crates/tx-subsystems/src/net/structure/table.rs",
+        "crates/tx-subsystems/src/net/tests"
+      ],
+      "verification": [
+        "FIN_WAIT, TIME_WAIT, RST-send, and deadline paths terminate predictably.",
+        "Reaper work is bounded and round-robin.",
+        "Stale generations cannot remove replacement connections.",
+        "Terminal or timed-out tuples become bindable again."
+      ],
+      "notes": "Deferred by user on 2026-07-31. FIN_WAIT/TIME_WAIT reaper work is outside pre-merge recovery."
+    },
+    {
+      "id": "phase-4-positive-linger",
+      "title": "Add explicit-close waiting for positive SO_LINGER",
+      "status": "canceled",
+      "depends_on": [
+        "phase-3-closing-reaper"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/fs_basic.rs",
+        "crates/tx-subsystems/src/process",
+        "crates/tx-subsystems/src/net",
+        "crates/tx-scripts"
+      ],
+      "verification": [
+        "Linux witnesses define positive linger, O_NONBLOCK, signal interruption, timeout, and fd-removal behavior.",
+        "Explicit close waits on a dedicated completion or deadline.",
+        "Exit, exec CLOEXEC, dup3 replacement, and other implicit closes never block.",
+        "Completion is not inferred from generic BROKEN readiness."
+      ],
+      "notes": "Deferred by user on 2026-07-31. Positive SO_LINGER was not a completed pre-merge feature."
+    },
+    {
+      "id": "phase-5-option-truth",
+      "title": "Make remaining dynamic TCP options affect live transport behavior",
+      "status": "canceled",
+      "depends_on": [
+        "phase-4-positive-linger"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/socket.rs",
+        "crates/tx-subsystems/src/net/protocol/tcp.rs",
+        "crates/tx-subsystems/src/net/structure/payload.rs",
+        "crates/tx-subsystems/src/net/tests"
+      ],
+      "verification": [
+        "SO_SNDBUF/SO_RCVBUF behavior matches the documented live-resize or rejection policy.",
+        "TTL/hop-limit changes affect emitted packets.",
+        "TCP_MAXSEG follows route, egress MTU, and IP family.",
+        "Wire-level tests accompany getsockopt round-trip tests."
+      ],
+      "notes": "Deferred by user on 2026-07-31. Only already-established pre-merge option behavior is covered by the active regression tests."
+    },
+    {
+      "id": "phase-6-readiness-truth",
+      "title": "Converge socket readiness onto one level truth and one registration protocol",
+      "status": "canceled",
+      "depends_on": [
+        "phase-5-option-truth"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/structure/readiness.rs",
+        "crates/tx-subsystems/src/net/execution/step_poll.rs",
+        "crates/tx-subsystems/src/vfs/fd_ready.rs",
+        "crates/tx-reactor",
+        "crates/tx-substrate/src/wake"
+      ],
+      "verification": [
+        "poll, select, epoll, connect completion, F_SETFL, and close stress tests show no lost or duplicate semantic wake.",
+        "Register-recheck behavior remains correct.",
+        "query_fd_ready remains the fd-neutral production facade."
+      ],
+      "notes": "Deferred by user on 2026-07-31. Readiness convergence is long-term architecture work."
+    },
+    {
+      "id": "phase-7-object-lifecycle-capacity",
+      "title": "Give dynamic network devices real ownership and replace environment-dependent ceilings",
+      "status": "canceled",
+      "depends_on": [
+        "phase-6-readiness-truth"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/rtnetlink.rs",
+        "crates/tx-subsystems/src/net/device",
+        "crates/tx-subsystems/src/net/namespace.rs",
+        "crates/tx-subsystems/src/net/structure/table.rs",
+        "crates/tx-shims/src/linux_syscall/socket.rs"
+      ],
+      "verification": [
+        "Repeated create/delete returns dynamic device memory and allows same-name reuse.",
+        "Partial veth/bridge/VLAN creation rolls back atomically.",
+        "Port allocation is namespace-correct and exceeds the current 64-port test ceiling.",
+        "Table and MTU/MSS capacity behavior has explicit limits and pressure tests."
+      ],
+      "notes": "Deferred by user on 2026-07-31. Dynamic-object reclamation and capacity policy are outside recovery."
+    },
+    {
+      "id": "phase-8-protocol-slices",
+      "title": "Close selected L2/L3 and protocol gaps through independent witnesses",
+      "status": "canceled",
+      "depends_on": [
+        "phase-7-object-lifecycle-capacity"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/protocol/ether",
+        "crates/tx-subsystems/src/net/device/vlan.rs",
+        "crates/tx-shims/src/linux_syscall/socket.rs",
+        "docs/LTP"
+      ],
+      "verification": [
+        "NDP rejects hop limits other than 255.",
+        "IP_HDRINCL has real packet-injection witnesses.",
+        "IPv6 fragmentation/reassembly is bounded and timeout-safe.",
+        "VLAN performs real 802.1Q tagging and RX demux.",
+        "Any L2/L3 ownership split preserves the established network suite."
+      ],
+      "notes": "Deferred by user on 2026-07-31. No new protocol feature is required to match the pre-merge baseline."
+    },
+    {
+      "id": "phase-9-final-acceptance",
+      "title": "Re-run the full layered acceptance matrix and close the recovery ledger",
+      "status": "canceled",
+      "depends_on": [
+        "phase-8-protocol-slices"
+      ],
+      "paths": [
+        "docs/progress",
+        "docs/LTP",
+        "msp/debug-logs"
+      ],
+      "verification": [
+        "Relevant host tests, both target builds, RV64 IRQ-backed Git/curl, LA64 poll-backed witness, OSComp network groups, benchmark lanes, and fixed LTP verdict sets are recorded.",
+        "Every remaining failure is classified with an owner and blocker.",
+        "cargo xtask progress validate passes.",
+        "cargo xtask lint docs reports no new failure from the recovery records."
+      ],
+      "notes": "Superseded by the active phase-0 fixed acceptance matrix. Recovery closes immediately when phase 0 passes."
+    }
+  ],
+  "verification": [
+    {
+      "command": "Gate A targeted host tests",
+      "status": "passed",
+      "notes": "Post-review rerun: IRQ 7/7, reactor 8/8, socket fdtable 103/103, TCP lifecycle 27/27, external connect 14/14, veth 4/4, network tick 4/4."
+    },
+    {
+      "command": "RV64 and LA64 Git/DNS/HTTP/HTTPS witnesses",
+      "status": "passed",
+      "notes": "Post-review rerun: RV64 9/9 with IRQ claims/completions 80/80 and zero wrong-hart/missing-device events; LA64 8/8. HTTP/HTTPS clones use the local txverify.test hostname; a separately bounded SLIRP lookup covers external DNS."
+    },
+    {
+      "command": "RV64 and LA64 netperf/iperf groups",
+      "status": "passed",
+      "notes": "RV64 22/22. LA64 iperf retained 12/12; after d9df0b05, fresh-image netperf-musl and netperf-glibc runs both passed 5/5 including TCP_CRR, restoring LA64 to 22/22. Logs: target/oscomp/la64-tcp-crr-fixed-d9df0b05-musl.txt and target/oscomp/la64-tcp-crr-fixed-d9df0b05-glibc.txt."
+    },
+    {
+      "command": "tx-substrate publication-to-Zone release regression",
+      "status": "passed",
+      "notes": "The new focused test passed in debug before the fix but failed deterministically in release at the Zone enqueue invariant. After d9df0b05 it passes in both profiles, proving that prepared EBR bags retain their epoch tag in optimized builds."
+    },
+    {
+      "command": "filtered RV64 libc-test network ABI",
+      "status": "passed",
+      "notes": "musl 12/12; glibc 8/12 with only static/dynamic dn_expand_empty and dn_expand_ptr_0 failures."
+    },
+    {
+      "command": "RV64 musl LTP socket six-batch replay",
+      "status": "failed",
+      "notes": "b1, b2, and b5 retained the supported historical result; b3 and b4 matched direct 90939012 verdict sets. Current and one anchor replay both stalled in setsockopt06, but the historical focused ledger records setsockopt06 1/1 and the anchor tail was not replayed. Gate E therefore remains unresolved rather than exact-match complete."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "The repository-wide unit gate is not green: three unrelated tx-shims tests fail reproducibly (signal rt_sigaction mask, execve argv overflow, and AF_UNIX socketpair blocking write), and the tx-ext4 test target has eight stale BackendPageRequest::with_target call sites. None is in the touched network recovery path, so they are recorded rather than expanded into this task."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "The repository-wide validator stops on the pre-existing docs/progress/plans/2026-07-24-network-time-integration.json use of step status `completed`; jq parsing and direct field/status/path review of this new record passed."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "failed",
+      "notes": "Repository baseline still reports 23 broken links and 6 stale-vocabulary warnings; none of the new 2026-07-31 recovery records appears in the failure list."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Whitespace and patch-integrity check passed for the full current patch."
+    }
+  ],
+  "risks": [
+    "Treating historical pre-merge benchmark scores as current evidence would produce a false recovery claim.",
+    "Using retired libctest-network or lmbench-network selectors can silently run default groups and create false evidence.",
+    "Using a damaged shared RV64 OSComp image can misclassify ext4 failures as network regressions.",
+    "Comparing only aggregate LTP scores can hide a changed TFAIL, TBROK, TCONF, or TWARN set.",
+    "A functional Git pass without the IRQ counter sentinel does not prove the restored RV64 NET_IRQ mechanism ran.",
+    "A direct anchor failure can be environment- or capacity-sensitive and must not erase a separate earlier passing witness.",
+    "LTP setsockopt06 currently stalls while the historical focused ledger records 1/1; one equally stalled anchor replay is insufficient to declare parity.",
+    "UDP payload readiness still derives from payload_recv_bytes while empty-datagram presence is represented by can_recv; direct zero-length receive and netperf termination pass, but full readiness convergence remains deferred with Phase 6/7."
+  ],
+  "blockers": [
+    "Gate E b6 is unresolved: current setsockopt06 stalls while the historical focused witness records 1/1; rerun the full matching anchor batch and diagnose only if the user keeps this case in recovery scope."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

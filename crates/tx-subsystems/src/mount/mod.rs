@@ -815,6 +815,46 @@ impl MountNamespace {
         None
     }
 
+    /// Object-identity fallback for [`Self::mount_for`]: match by the
+    /// mountpoint's (parent-mount payload, fs_object_id) instead of the
+    /// DEntry cap key.
+    ///
+    /// The registered mountpoint DEntry is held only WEAKLY, by its parent
+    /// directory's child cache. Any mutation invalidation on the parent —
+    /// the guest's first `mkdir -p /etc` invalidating "/" — drops it, and
+    /// the next walk materialises a fresh instance whose cap key no longer
+    /// matches the one registered here: the mount silently vanishes
+    /// (observed as `/musl` resolving to the empty tmpfs skeleton dir,
+    /// killing every git path mid-run). Matching by (parent payload,
+    /// object id) survives dentry-cache churn while staying
+    /// namespace-local.
+    pub fn mount_for_mountpoint_object(
+        &self,
+        parent_payload: &Cap<MountPayload>,
+        fs_object_id: FsObjectId,
+    ) -> Option<Cap<MountIdentity>> {
+        let want = cap_payload_ptr(parent_payload);
+        for entry in self.mounts.lock().iter().rev() {
+            let mount = entry.mount.clone_cap();
+            let Some(mountpoint) = mount.mountpoint() else {
+                continue;
+            };
+            if mountpoint.rnode().fs_object_id() != fs_object_id {
+                continue;
+            }
+            let Some(parent) = mount.parent() else {
+                continue;
+            };
+            let Ok(parent_payload_cap) = parent.payload_cap() else {
+                continue;
+            };
+            if cap_payload_ptr(&parent_payload_cap.into_cap()) == want {
+                return Some(mount);
+            }
+        }
+        None
+    }
+
     pub fn mount_containing_dentry(&self, dentry: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
         let mut root = dentry.clone();
         while let Some(parent) = root.parent_hint() {
@@ -1139,6 +1179,24 @@ pub fn mount_for(
             && entry.child_fs_object_id == child_fs_object_id
         {
             return Some(entry.mount.clone_cap());
+        }
+    }
+    None
+}
+
+/// The mountpoint dentry a mounted filesystem's root is attached to, from
+/// the global table. Sibling of [`dotdot_parent_for_mount_root`] (which
+/// returns the mountpoint's *parent* for `..` semantics); this returns the
+/// mountpoint itself so a namespace-less walk can climb across a mount
+/// boundary toward the real root — without it, a walk rooted inside a
+/// mounted fs treats that fs's root as "/" and every absolute path
+/// resolves against the wrong tree.
+pub fn mountpoint_for_mount_root(root: &Cap<DEntry>) -> Option<Cap<DEntry>> {
+    let root_key = root.key();
+    for entry in MOUNT_TABLE.lock().iter().rev() {
+        let mount = entry.mount.clone_cap();
+        if mount.root_dentry().key() == root_key {
+            return mount.mountpoint();
         }
     }
     None

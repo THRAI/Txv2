@@ -1031,6 +1031,7 @@ where
             || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
         );
         close_socket_files_for_process_exit(&closed_fds);
+        flush_page_backed_files_for_process_exit(&closed_fds);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
             || {
@@ -1132,6 +1133,7 @@ fn step_process_exit_inner<F, G>(
             || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
         );
         close_socket_files_for_process_exit(&closed_fds);
+        flush_page_backed_files_for_process_exit(&closed_fds);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
             || drop(closed_fds),
@@ -1193,18 +1195,39 @@ fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
             continue;
         }
 
-        let crate::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() else {
-            continue;
-        };
-        let crate::vfs::structure::RNodeBacking::StructBacked {
-            payload: crate::vfs::structure::StructPayload::Socket { identity },
-        } = rnode.backing()
-        else {
+        let Some(ops) = file.file_ops() else {
             continue;
         };
 
         let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        let _ = crate::net::execution::step_socket_close(identity, &guard);
+        ops.on_last_close(&guard);
+    }
+}
+
+/// Flush page-backed files removed by process teardown.
+///
+/// The bootstrap ext4 mount has no background writeback planner, so process
+/// exit is the last opportunity to persist redirected shell/applet writes
+/// whose descriptors were never passed through `close(2)`. Deduplicate shared
+/// open-file descriptions so multiple fd aliases trigger one flush.
+fn flush_page_backed_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+    use crate::vfs::structure::{OpenFileBacking, RNodeBacking};
+
+    let mut seen_files = Vec::new();
+    for file in fds.values() {
+        if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
+            continue;
+        }
+        let raw_file = file.raw();
+        if seen_files.contains(&raw_file) {
+            continue;
+        }
+        seen_files.push(raw_file);
+
+        if let RNodeBacking::PageBacked { pc } = file.rnode().backing() {
+            let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+            let _ = crate::page_backed::step_fsync(&pc, &guard);
+        }
     }
 }
 
@@ -1618,7 +1641,12 @@ pub fn step_getcwd(target: &Cap<ProcessIdentity>) -> Option<alloc::vec::Vec<u8>>
     // publish
     let payload = target.upgrade_operational().ok()?;
     let cwd = payload.cwd()?;
-    crate::vfs::render_dentry_path(&cwd)
+    // Namespace-aware: a cwd inside a mounted fs (e.g. the sdcard ext4 at
+    // /musl) must render with its mountpoint prefix, or callers that
+    // round-trip getcwd() through an absolute walk resolve a directory
+    // that does not exist.
+    let ns = target.mount_namespace_cap();
+    crate::vfs::render_dentry_path_in_namespace(&cwd, ns.as_ref())
 }
 
 /// Day-1 setpgid: supports creating a fresh process group rooted at

@@ -1,7 +1,7 @@
 # LTP syscall network progress
 
-Date: 2026-05-27
-Branch: `feature-network`
+Date: 2026-07-31
+Branch: `feature-network-refactor`
 
 This is the current working ledger for the 50 OSComp LTP socket/network syscall
 cases from `runtest/syscalls`. These are not the upstream LTP `net.*` suites.
@@ -9,6 +9,34 @@ Do not use `LTP_BATCH=net` as the progress signal: ordinary batches filter
 these prefixes, so `net 0` means "manual only", not "no network tests".
 
 ## Current Summary
+
+### 2026-07-31 merge-recovery replay
+
+The ordered recovery run used the verified clean source
+`target/oscomp/recovery-source/sdcard-rv.img`. The witness runner now accepts
+`LTP_BIN_RV_IMAGE`/`LTP_BIN_LA_IMAGE` overrides so that this source can be used
+without replacing the damaged shared RV64 image.
+
+The clean image/current runner does not reproduce every historical aggregate
+below, so the non-matching batches were replayed from the exact pre-merge
+`90939012` source with the same image and command:
+
+| Batch | Current recovery result | Direct anchor comparison |
+|---|---|---|
+| b1 | actual 40/40, including old-style `listen01` TPASS lines | historical supported set retained |
+| b2 | actual 35/35, including old-style send/recv TPASS lines | historical supported set retained |
+| b3 | judge 12/14 plus the same old-style TPASS/TBROK/SIGSEGV lines | exact verdict-set match |
+| b4 | judge 57/62 plus seven old-style `connect01` TPASS lines | exact verdict-set match |
+| b5 | 14/17; only RV64-inapplicable legacy `socketcall` cases absent | historical result retained |
+| b6 | `setsockopt02..05` 5/6, `setsockopt07..10` 4/4; `setsockopt06` stalls | one anchor `setsockopt06` replay also stalls, but the historical focused ledger records 1/1; unresolved |
+
+This replay found no current/anchor difference in b3 or b4. It does not close
+b6 and does not replace the historical `229/236` ledger with a new aggregate:
+the current `setsockopt06` stall conflicts with the historical focused 1/1,
+and only that single case—not the complete anchor tail—was replayed. Recovery
+logs are under `target/oscomp/ltp-runtest/recovery-*`; the commands and
+classification are in
+`msp/debug-logs/2026-07-31-premerge-network-recovery-operation-ledger.md`.
 
 Reliable focused results already in `target/oscomp`:
 
