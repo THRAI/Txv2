@@ -1,3 +1,31 @@
+- 2026-08-01 (ext4 Task 12 fast-symlink admission).
+  Advanced Task 12 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `Ext4Pager::plan_create_fast_symlink` now
+  builds an immutable inline symlink create mutation with InodeBitmap,
+  GroupDescriptor, Superblock, InodeTable, and DirectoryBlock after-images;
+  targets longer than the 60-byte inline `i_block` payload remain fail-closed.
+  `FsOps::symlink` now admits that bounded fast-symlink shape through
+  `JournalMutationRuntime::begin_mutation`, returns the frozen symlink
+  `FsObjectId`/`InodeMeta`, keeps RO/no-runtime mounts fail-closed, and leaves
+  existing `read_link` support to read the inline target bytes from the
+  committed home image after settlement. Verification passed `cargo test -p
+  tx-ext4-format --test pager_mock
+  namespace_plan_creates_fast_symlink_without_home_write -- --test-threads=1`,
+  `cargo test -p tx-ext4-format --test pager_mock namespace_plan_ --
+  --test-threads=1` (9), `cargo test -p tx-ext4-format --test pager_mock --
+  --test-threads=1` (32), `cargo test -p tx-ext4 --lib --no-default-features
+  ext4_symlink_public_path_admits_fast_symlink_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4 --lib --no-default-features --
+  --test-threads=1` (55), `cargo test -p tx-ext4 --test
+  journal_prepared_transaction -- --test-threads=1` (9), `cargo test -p
+  tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7), touched-file
+  `rustfmt --check`, and `cargo -q xtask unit` (646 + 114 + 55 + 166).
+  Next: continue Task 12 with unlinked-open/orphan/destroy cleanup plus
+  crash-truncate/e2fsck evidence. Product Tier 1 still requires Task 14
+  production cutover/G0 lints, Task 15 runner, and Task 16 fresh
+  QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (ext4 Task 12 mkdir admission).
   Advanced Task 12 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`

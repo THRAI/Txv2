@@ -654,13 +654,61 @@ where
 
     fn symlink(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &Guard<'_>,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.lookup_cached(parent_ino, name) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e.into()),
+        }
+        let (new_ino, mutation) = match self.with_pager(|pager| {
+            pager.plan_create_fast_symlink(
+                parent_ino,
+                name,
+                link_target,
+                cred.uid,
+                cred.gid,
+                FsyncStamp::new(0),
+            )
+        }) {
+            Ok(result) => result,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
+            Ok(()) => {
+                self.invalidate_lookup_cache_for(parent_ino);
+                StepOutcome::done((
+                    inode_fs_object_id(new_ino),
+                    InodeMeta {
+                        mode: Inode::S_IFLNK | 0o777,
+                        uid: cred.uid,
+                        gid: cred.gid,
+                        size: link_target.len() as u64,
+                        atime: Timespec::default(),
+                        mtime: Timespec::default(),
+                        ctime: Timespec::default(),
+                        nlinks: 1,
+                        blocks: 0,
+                        flags: 0,
+                    },
+                ))
+            }
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
     }
 
     fn readdir(

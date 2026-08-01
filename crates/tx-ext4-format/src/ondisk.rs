@@ -469,6 +469,16 @@ impl Inode {
         Ok(Some(slice_at(&self.i_block, 0, self.size as usize)?))
     }
 
+    pub fn set_inline_symlink_target(&mut self, target: &[u8]) -> Result<()> {
+        if target.len() > EXTENT_ROOT_BYTES {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        self.i_block = [0; EXTENT_ROOT_BYTES];
+        self.i_block[..target.len()].copy_from_slice(target);
+        self.size = target.len() as u64;
+        Ok(())
+    }
+
     pub fn is_dir(&self) -> bool {
         self.mode & Self::S_IFMT == Self::S_IFDIR
     }

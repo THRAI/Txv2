@@ -2495,6 +2495,96 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((new_ino, data_block, plan))
     }
 
+    /// Build the bounded fast-symlink create mutation.
+    ///
+    /// Tier 1 only admits inline symlink targets that fit in `i_block`; longer
+    /// targets require data-block allocation and remain fail-closed.
+    pub fn plan_create_fast_symlink(
+        &mut self,
+        parent_ino: InodeNo,
+        name: &[u8],
+        link_target: &[u8],
+        uid: u32,
+        gid: u32,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<(InodeNo, Ext4MutationPlan)> {
+        let (new_ino, group_index, bitmap_home, bitmap_before, bitmap_after) =
+            self.plan_inode_allocation()?;
+        let (group_desc_home, group_desc_before, group_desc_after) =
+            self.plan_group_free_inode_decrement(group_index, &bitmap_after)?;
+        let (superblock_home, superblock_before, superblock_after) =
+            self.plan_superblock_free_inode_decrement()?;
+
+        let mut inode = Inode::default();
+        inode.mode = Inode::S_IFLNK | 0o777;
+        inode.uid = uid;
+        inode.gid = gid;
+        inode.atime = fsync_stamp
+            .raw()
+            .try_into()
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        inode.ctime = inode.atime;
+        inode.mtime = inode.atime;
+        inode.links_count = 1;
+        inode.set_inline_symlink_target(link_target)?;
+
+        let location = self.inode_location(new_ino)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        inode.encode(inode_bytes)?;
+        self.refresh_inode_checksum(new_ino, &inode, inode_bytes)?;
+
+        let (dir_home, dir_before, dir_after) =
+            self.plan_append_dir_entry_after_image(parent_ino, name, new_ino, 7)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Create, new_ino.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: bitmap_home,
+            role: MetaRole::InodeBitmap,
+            before_version: crc32c(0, &bitmap_before) as u64,
+            after: bitmap_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: group_desc_home,
+            role: MetaRole::GroupDescriptor,
+            before_version: crc32c(0, &group_desc_before) as u64,
+            after: group_desc_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: superblock_home,
+            role: MetaRole::Superblock,
+            before_version: crc32c(0, &superblock_before) as u64,
+            after: superblock_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: dir_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &dir_before) as u64,
+            after: dir_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok((new_ino, plan))
+    }
+
     /// Create a new regular file in `parent_ino`.  Returns the new inode.
     pub fn create_regular_file(
         &mut self,
