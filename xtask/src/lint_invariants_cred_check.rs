@@ -35,8 +35,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 /// Strings whose presence in a `sys_*` body indicates the syscall
 /// invokes a cred-relevant mutator. Match is substring-based, so each

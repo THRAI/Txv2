@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::util::{compact_cargo, tail_lines, CargoOutcome};
 use crate::Result;
+use crate::util::{CargoOutcome, compact_cargo, tail_lines};
 
 const HOST_PACKAGES: &[&str] = &["tx-shims", "tx-kernel", "tx-ext4", "tx-scripts"];
 

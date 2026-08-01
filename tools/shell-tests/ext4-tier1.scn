@@ -1,0 +1,27 @@
+# ext4 Tier 1 shell scenario placeholder.
+# The runner hashes this file as one of the pinned authorities and
+# later stages can replace the no-op groups with real guest commands.
+
+group data
+sleep 0
+
+group setattr
+sleep 0
+
+group namespace
+sleep 0
+
+group orphan
+sleep 0
+
+group durability
+sleep 0
+
+group detach
+sleep 0
+
+group remount
+sleep 0
+
+group execute-from-scratch
+sleep 0

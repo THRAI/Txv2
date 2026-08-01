@@ -8,8 +8,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 /// Ratchet ceiling: number of `_ctx: &mut ScriptCtx` occurrences.
 /// Will be set to measured baseline after first run.

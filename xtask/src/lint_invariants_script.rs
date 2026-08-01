@@ -10,8 +10,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 /// Ratchet ceiling: number of script files importing `tx_subsystems::*::structure`.
 /// Will be set to measured baseline.

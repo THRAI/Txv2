@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 const MAX_LEGACY_ZONE_INTERFACE_SITES: usize = 0;
 

@@ -3,8 +3,8 @@ use std::path::Path;
 use serde_json::json;
 
 use super::*;
-use crate::util::{option_value, optional_option_value, relative};
 use crate::Result;
+use crate::util::{option_value, optional_option_value, relative};
 
 use super::validate::*;
 

@@ -1,11 +1,11 @@
 use std::path::Path;
 
+use crate::Result;
 use crate::check_build;
 use crate::doctor;
 use crate::image;
 use crate::target::TxTarget;
 use crate::util::optional_option_value;
-use crate::Result;
 
 const DEFAULT_TARGET: &str = "rv64-qemu";
 

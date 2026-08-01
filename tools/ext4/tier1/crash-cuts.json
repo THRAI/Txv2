@@ -1,0 +1,31 @@
+{
+  "schema": "tx.ext4.crash_cut_catalog.v1",
+  "status": "catalog-authority-declared",
+  "expanded_cut_count": 1000,
+  "families": [
+    {"id": "D0", "label": "before ordered-data submission", "group": "data"},
+    {"id": "D1", "label": "ordered data complete, before its flush", "group": "data"},
+    {"id": "D2", "label": "after ordered-data flush", "group": "data"},
+    {"id": "D3", "label": "partial descriptor/metadata/revoke journal body", "group": "journal"},
+    {"id": "D4", "label": "journal body complete, before its flush", "group": "journal"},
+    {"id": "D5", "label": "after journal-body flush, before commit", "group": "journal"},
+    {"id": "D6", "label": "commit submitted with unknown completion", "group": "commit"},
+    {"id": "D7", "label": "commit durable, before checkpoint", "group": "checkpoint"},
+    {"id": "D8", "label": "partial checkpoint", "group": "checkpoint"},
+    {"id": "D9", "label": "checkpoint durable, before tail advancement", "group": "checkpoint"},
+    {"id": "D10", "label": "tail advanced, before cache settlement/publication", "group": "settlement"},
+    {"id": "D11", "label": "detach drained, before clean-state write", "group": "detach"},
+    {"id": "D12", "label": "clean-state write complete, before final flush", "group": "detach"}
+  ],
+  "overlays": [
+    {
+      "name": "revoke-durability",
+      "applies_to": ["destroy", "unlink", "rename-overwrite", "truncate"]
+    },
+    {
+      "name": "first-reuse",
+      "applies_to": ["destroy", "truncate"]
+    }
+  ],
+  "notes": "Deterministic crash-cut catalog placeholder for the Tier 1 runner. The real acceptance campaign expands this catalog into the immutable per-cut campaign plan."
+}

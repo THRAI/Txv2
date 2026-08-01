@@ -10,8 +10,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 #[derive(Clone, Debug)]
 struct Rule {
@@ -166,11 +166,7 @@ fn code_before_comment(line: &str) -> Option<&str> {
         .split_once("//")
         .map_or(line, |(before, _)| before)
         .trim();
-    if code.is_empty() {
-        None
-    } else {
-        Some(code)
-    }
+    if code.is_empty() { None } else { Some(code) }
 }
 
 #[cfg(test)]

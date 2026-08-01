@@ -9,8 +9,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 /// Ratchet ceiling: number of mutation calls found in checks/ files.
 const MAX_MUTATIONS_IN_CHECKS: usize = 0;

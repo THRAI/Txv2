@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::target::{installed_targets, target_triple, TxTarget};
-use crate::util::{collect_files, relative, shell_join};
 use crate::Result;
+use crate::target::{TxTarget, installed_targets, target_triple};
+use crate::util::{collect_files, relative, shell_join};
 
 const MAX_AUTHORED_RUST_FILE_LINES: usize = 1_800;
 const AUTHORED_RUST_FILE_LINE_BASELINES: &[(&str, usize)] = &[
@@ -140,16 +140,32 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "step-discipline" => crate::lint_invariants_step::lint_invariants_step_discipline(root),
         "step-v4-vocabulary" => crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary(root),
         "step-no-await" => crate::lint_invariants_step_v3::lint_invariants_step_no_await(root),
-        "step-sync-signature" => crate::lint_invariants_step_v3::lint_invariants_step_sync_signature(root),
-        "step-interface" => crate::lint_invariants_step_interface::lint_invariants_step_interface(root),
+        "step-sync-signature" => {
+            crate::lint_invariants_step_v3::lint_invariants_step_sync_signature(root)
+        }
+        "step-interface" => {
+            crate::lint_invariants_step_interface::lint_invariants_step_interface(root)
+        }
         "step" => {
             // Convenience: run all four step-related lints
             type LintRule = fn(&Path) -> Result<()>;
             let rules: &[(&str, LintRule)] = &[
-                ("step-discipline", crate::lint_invariants_step::lint_invariants_step_discipline),
-                ("step-v4-vocabulary", crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary),
-                ("step-no-await", crate::lint_invariants_step_v3::lint_invariants_step_no_await),
-                ("step-sync-signature", crate::lint_invariants_step_v3::lint_invariants_step_sync_signature),
+                (
+                    "step-discipline",
+                    crate::lint_invariants_step::lint_invariants_step_discipline,
+                ),
+                (
+                    "step-v4-vocabulary",
+                    crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary,
+                ),
+                (
+                    "step-no-await",
+                    crate::lint_invariants_step_v3::lint_invariants_step_no_await,
+                ),
+                (
+                    "step-sync-signature",
+                    crate::lint_invariants_step_v3::lint_invariants_step_sync_signature,
+                ),
             ];
             let mut errors: Vec<String> = Vec::new();
             for (name, rule) in rules {
@@ -158,7 +174,11 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                     errors.push(format!("{name}: {e}"));
                 }
             }
-            if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("\n"))
+            }
         }
         "subject-context" => crate::lint_invariants_subj::lint_invariants_subject_context(root),
         "witness-scope" => crate::lint_invariants_witness::lint_invariants_witness_scope(root),
@@ -166,45 +186,127 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "script-boundary" => crate::lint_invariants_script::lint_invariants_script_boundary(root),
         "checks-purity" => crate::lint_invariants_checks::lint_invariants_checks_purity(root),
         "cred-check" => crate::lint_invariants_cred_check::lint_invariants_cred_check(root),
-        "legacy-wait-channel" => crate::lint_invariants_wait::lint_invariants_legacy_wait_channel(root),
+        "legacy-wait-channel" => {
+            crate::lint_invariants_wait::lint_invariants_legacy_wait_channel(root)
+        }
         "zone-interface" => crate::lint_invariants_zone::lint_invariants_zone_interface(root),
         "api-language" => crate::lint_invariants_api_language::lint_invariants_api_language(root),
-        "notification-boundary" => crate::lint_invariants_notification::lint_invariants_notification_boundary(root),
-        "observe-producer-boundary" => crate::lint_invariants_observe::lint_invariants_observe_producer_boundary(root),
-        "time-layering" => crate::lint_invariants_time_layering::lint_invariants_time_layering(root),
-        "time-wake-retired" => crate::lint_invariants_time_wake::lint_invariants_time_wake_retired(root),
+        "notification-boundary" => {
+            crate::lint_invariants_notification::lint_invariants_notification_boundary(root)
+        }
+        "observe-producer-boundary" => {
+            crate::lint_invariants_observe::lint_invariants_observe_producer_boundary(root)
+        }
+        "time-layering" => {
+            crate::lint_invariants_time_layering::lint_invariants_time_layering(root)
+        }
+        "time-wake-retired" => {
+            crate::lint_invariants_time_wake::lint_invariants_time_wake_retired(root)
+        }
         "boot-setup" => lint_invariants_boot_setup(root),
         "step-guard" => crate::lint_step_guard::lint_invariants_step_guard(root),
         "no-adhoc-drive" => crate::lint_invariants_drive::lint_invariants_no_adhoc_drive(root),
-        "syscall-adhoc-loop" => crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root),
-        "syscall-no-await" => crate::lint_invariants_syscall::lint_invariants_syscall_no_await(root),
-        "syscall-ctx-bridge" => crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge(root),
+        "syscall-adhoc-loop" => {
+            crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root)
+        }
+        "syscall-no-await" => {
+            crate::lint_invariants_syscall::lint_invariants_syscall_no_await(root)
+        }
+        "syscall-ctx-bridge" => {
+            crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge(root)
+        }
         "all" => {
             type LintRule = fn(&Path) -> Result<()>;
             let rules: &[(&str, LintRule)] = &[
-                ("step-discipline", crate::lint_invariants_step::lint_invariants_step_discipline),
-                ("step-v4-vocabulary", crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary),
-                ("step-no-await", crate::lint_invariants_step_v3::lint_invariants_step_no_await),
-                ("step-sync-signature", crate::lint_invariants_step_v3::lint_invariants_step_sync_signature),
-                ("subject-context", crate::lint_invariants_subj::lint_invariants_subject_context),
-                ("witness-scope", crate::lint_invariants_witness::lint_invariants_witness_scope),
-                ("signal-publish", crate::lint_invariants_signal::lint_invariants_signal_publish),
-                ("script-boundary", crate::lint_invariants_script::lint_invariants_script_boundary),
-                ("checks-purity", crate::lint_invariants_checks::lint_invariants_checks_purity),
-                ("cred-check", crate::lint_invariants_cred_check::lint_invariants_cred_check),
-                ("step-guard", crate::lint_step_guard::lint_invariants_step_guard),
-                ("legacy-wait-channel", crate::lint_invariants_wait::lint_invariants_legacy_wait_channel),
-                ("zone-interface", crate::lint_invariants_zone::lint_invariants_zone_interface),
-                ("api-language", crate::lint_invariants_api_language::lint_invariants_api_language),
-                ("notification-boundary", crate::lint_invariants_notification::lint_invariants_notification_boundary),
-                ("observe-producer-boundary", crate::lint_invariants_observe::lint_invariants_observe_producer_boundary),
-                ("time-layering", crate::lint_invariants_time_layering::lint_invariants_time_layering),
-                ("time-wake-retired", crate::lint_invariants_time_wake::lint_invariants_time_wake_retired),
+                (
+                    "step-discipline",
+                    crate::lint_invariants_step::lint_invariants_step_discipline,
+                ),
+                (
+                    "step-v4-vocabulary",
+                    crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary,
+                ),
+                (
+                    "step-no-await",
+                    crate::lint_invariants_step_v3::lint_invariants_step_no_await,
+                ),
+                (
+                    "step-sync-signature",
+                    crate::lint_invariants_step_v3::lint_invariants_step_sync_signature,
+                ),
+                (
+                    "subject-context",
+                    crate::lint_invariants_subj::lint_invariants_subject_context,
+                ),
+                (
+                    "witness-scope",
+                    crate::lint_invariants_witness::lint_invariants_witness_scope,
+                ),
+                (
+                    "signal-publish",
+                    crate::lint_invariants_signal::lint_invariants_signal_publish,
+                ),
+                (
+                    "script-boundary",
+                    crate::lint_invariants_script::lint_invariants_script_boundary,
+                ),
+                (
+                    "checks-purity",
+                    crate::lint_invariants_checks::lint_invariants_checks_purity,
+                ),
+                (
+                    "cred-check",
+                    crate::lint_invariants_cred_check::lint_invariants_cred_check,
+                ),
+                (
+                    "step-guard",
+                    crate::lint_step_guard::lint_invariants_step_guard,
+                ),
+                (
+                    "legacy-wait-channel",
+                    crate::lint_invariants_wait::lint_invariants_legacy_wait_channel,
+                ),
+                (
+                    "zone-interface",
+                    crate::lint_invariants_zone::lint_invariants_zone_interface,
+                ),
+                (
+                    "api-language",
+                    crate::lint_invariants_api_language::lint_invariants_api_language,
+                ),
+                (
+                    "notification-boundary",
+                    crate::lint_invariants_notification::lint_invariants_notification_boundary,
+                ),
+                (
+                    "observe-producer-boundary",
+                    crate::lint_invariants_observe::lint_invariants_observe_producer_boundary,
+                ),
+                (
+                    "time-layering",
+                    crate::lint_invariants_time_layering::lint_invariants_time_layering,
+                ),
+                (
+                    "time-wake-retired",
+                    crate::lint_invariants_time_wake::lint_invariants_time_wake_retired,
+                ),
                 ("boot-setup", lint_invariants_boot_setup),
-                ("no-adhoc-drive", crate::lint_invariants_drive::lint_invariants_no_adhoc_drive),
-                ("syscall-adhoc-loop", crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop),
-                ("syscall-no-await", crate::lint_invariants_syscall::lint_invariants_syscall_no_await),
-                ("syscall-ctx-bridge", crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge),
+                (
+                    "no-adhoc-drive",
+                    crate::lint_invariants_drive::lint_invariants_no_adhoc_drive,
+                ),
+                (
+                    "syscall-adhoc-loop",
+                    crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop,
+                ),
+                (
+                    "syscall-no-await",
+                    crate::lint_invariants_syscall::lint_invariants_syscall_no_await,
+                ),
+                (
+                    "syscall-ctx-bridge",
+                    crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge,
+                ),
             ];
             let mut errors: Vec<String> = Vec::new();
             for (name, rule) in rules {
@@ -325,7 +427,9 @@ pub(crate) fn lint_docs(root: &Path) -> Result<()> {
     }
 
     if stale_warnings > 0 {
-        println!("docs lint: {stale_warnings} stale-vocabulary mention(s) found in active docs; treated as warnings because current docs discuss retired terms");
+        println!(
+            "docs lint: {stale_warnings} stale-vocabulary mention(s) found in active docs; treated as warnings because current docs discuss retired terms"
+        );
     }
 
     // Harvest TXV3 tag references from Rust sources under crates/, boards/,
@@ -1054,9 +1158,11 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "#[cfg(target_arch = \"riscv64\")] fn bad() {}",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("must not cfg on target_arch")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("must not cfg on target_arch"))
+        );
     }
 
     #[test]
@@ -1066,9 +1172,11 @@ mod tests {
             "crates/tx-subsystems/src/foo.rs",
             "#[allow(dead_code)]\nstruct Stale;",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("dead-code allowances hide stale")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("dead-code allowances hide stale"))
+        );
     }
 
     #[test]
@@ -1088,9 +1196,11 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "struct HalManager;",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("runtime HAL vocabulary")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("runtime HAL vocabulary"))
+        );
     }
 
     #[test]
@@ -1100,9 +1210,11 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "pub fn kernel_main(cpu_id: CpuId, firmware_arg: BootArg) -> ! { loop {} }",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("must consume BootHandoff")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("must consume BootHandoff"))
+        );
     }
 
     #[test]
@@ -1112,9 +1224,11 @@ mod tests {
             "crates/tx-subsystems/src/sync.rs",
             "pub(crate) struct SpinMutex<T> { locked: AtomicBool, value: UnsafeCell<T> }",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("private SpinMutex implementation")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("private SpinMutex implementation"))
+        );
     }
 
     #[test]
@@ -1124,9 +1238,11 @@ mod tests {
             "crates/tx-subsystems/src/process/adapter.rs",
             "pub use tx_substrate::{AtomicSlot, SpinMutex};",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("raw tx_substrate::SpinMutex")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("raw tx_substrate::SpinMutex"))
+        );
     }
 
     #[test]
@@ -1146,9 +1262,11 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "type Bad = Zone<Foo, EbrPolicy>;",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("raw Zone<T, Policy>")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("raw Zone<T, Policy>"))
+        );
     }
 
     #[test]
@@ -1168,9 +1286,11 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "use tx_hal_riscv64_qemu_virt::Platform;",
         );
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("concrete RV64 platform")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("concrete RV64 platform"))
+        );
     }
 
     #[test]
@@ -1213,9 +1333,11 @@ fn sym() -> usize {
 "#,
         );
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("boot-static capture")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("boot-static capture"))
+        );
     }
 
     #[test]
@@ -1226,9 +1348,11 @@ fn sym() -> usize {
             "#[allow(dead_code)]\nfn stale_boot_helper() {}",
         );
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("unused/dead-code allowances")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("unused/dead-code allowances"))
+        );
     }
 
     #[test]
@@ -1239,9 +1363,11 @@ fn sym() -> usize {
             "pub struct SessionPgrp { pub session_leader: Cap<ProcessIdentity> }",
         );
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("TTY-CTL-1 violation")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("TTY-CTL-1 violation"))
+        );
     }
 
     #[test]
@@ -1252,9 +1378,11 @@ fn sym() -> usize {
             "pub session: Option<Weak<Session>>,\npub foreground_pgrp: Option<Weak<ProcessGroup>>,",
         );
 
-        assert!(findings
-            .iter()
-            .all(|finding| !finding.contains("TTY-CTL-1")));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.contains("TTY-CTL-1"))
+        );
     }
 
     #[test]
@@ -1265,9 +1393,11 @@ fn sym() -> usize {
             "pub struct Session { pub foreground_pgrp: AtomicSlot<Option<Weak<ProcessGroup>>> }",
         );
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("TTY-CTL-1a violation")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("TTY-CTL-1a violation"))
+        );
     }
 
     #[test]
@@ -1281,9 +1411,11 @@ fn sym() -> usize {
             "pub fn foreground_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> { None }",
         );
 
-        assert!(findings
-            .iter()
-            .all(|finding| !finding.contains("TTY-CTL-1a")));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.contains("TTY-CTL-1a"))
+        );
     }
 
     #[test]
@@ -1294,9 +1426,11 @@ fn sym() -> usize {
             "/// The `foreground_pgrp:` field on TtyIdentity.SessionPgrp is the home.",
         );
 
-        assert!(findings
-            .iter()
-            .all(|finding| !finding.contains("TTY-CTL-1a")));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.contains("TTY-CTL-1a"))
+        );
     }
 
     #[test]
@@ -1312,9 +1446,11 @@ fn bad<P: tx_hal::TxPlatform>() -> bool {
 "#,
         );
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("boot cmdline parsing")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("boot cmdline parsing"))
+        );
     }
 
     #[test]
@@ -1345,9 +1481,11 @@ fn bad() {
 "#,
         );
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("user-space boot setup")));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("user-space boot setup"))
+        );
     }
 
     #[test]

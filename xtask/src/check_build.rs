@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use crate::lint::{lint_arch, lint_docs, lint_unused};
-use crate::target::{installed_targets, target_triple, TxTarget};
-use crate::util::run_cmd;
 use crate::Result;
+use crate::lint::{lint_arch, lint_docs, lint_unused};
+use crate::target::{TxTarget, installed_targets, target_triple};
+use crate::util::run_cmd;
 
 pub(crate) fn check(root: &Path) -> Result<()> {
     run_cmd(root, "cargo", &["fmt", "--check"])?;

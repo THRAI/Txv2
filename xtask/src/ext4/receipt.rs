@@ -1,0 +1,210 @@
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Tier1AcceptanceReceipt {
+    pub schema: String,
+    pub candidate: CandidateCommit,
+    pub authorities: Tier1Authorities,
+    pub role_images: RoleImages,
+    pub crash_cuts: CrashCuts,
+    pub e2fsck: E2fsckSummary,
+    pub xfstests: XfstestsSummary,
+    pub gates: Gates,
+    pub planned_actions: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CandidateCommit {
+    pub commit: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Tier1Authorities {
+    pub capability_ledger_sha256: String,
+    pub crash_cut_catalog_sha256: String,
+    pub xfstests_selection_sha256: String,
+    pub shell_scenario_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Tier1AuthorityInputs {
+    pub capability_ledger_sha256: String,
+    pub crash_cut_catalog_sha256: String,
+    pub xfstests_selection_sha256: String,
+    pub shell_scenario_sha256: String,
+    pub xfstests_case_count: usize,
+    pub crash_cut_expanded_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoleImages {
+    pub test: RoleImage,
+    pub scratch: RoleImage,
+    pub workload: RoleImage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoleImage {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CrashCuts {
+    pub completed: usize,
+    pub required: usize,
+    pub families: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct E2fsckSummary {
+    pub immutable_images: Vec<E2fsckImageResult>,
+    pub failures: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct E2fsckImageResult {
+    pub role: String,
+    pub image_sha256: String,
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct XfstestsSummary {
+    pub skipped: usize,
+    pub not_run: usize,
+    pub passed: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Gates {
+    #[serde(rename = "G0")]
+    pub g0: String,
+    #[serde(rename = "G1")]
+    pub g1: String,
+    #[serde(rename = "G2")]
+    pub g2: String,
+    #[serde(rename = "G3")]
+    pub g3: String,
+    #[serde(rename = "G4")]
+    pub g4: String,
+    #[serde(rename = "G5")]
+    pub g5: String,
+    #[serde(rename = "G6")]
+    pub g6: String,
+    #[serde(rename = "G7")]
+    pub g7: String,
+}
+
+impl Tier1AcceptanceReceipt {
+    pub(crate) fn from_dry_run(
+        run_id: &str,
+        commit: String,
+        authorities: Tier1AuthorityInputs,
+        planned_actions: &[String],
+    ) -> Self {
+        Self {
+            schema: "tx.ext4.tier1_acceptance_receipt.v1".into(),
+            candidate: CandidateCommit {
+                commit,
+                run_id: run_id.into(),
+            },
+            authorities: Tier1Authorities {
+                capability_ledger_sha256: authorities.capability_ledger_sha256,
+                crash_cut_catalog_sha256: authorities.crash_cut_catalog_sha256,
+                xfstests_selection_sha256: authorities.xfstests_selection_sha256,
+                shell_scenario_sha256: authorities.shell_scenario_sha256,
+            },
+            role_images: RoleImages {
+                test: RoleImage {
+                    path: "target/ext4/tier1/<run-id>/test.img".into(),
+                    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
+                },
+                scratch: RoleImage {
+                    path: "target/ext4/tier1/<run-id>/scratch.img".into(),
+                    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
+                },
+                workload: RoleImage {
+                    path: "target/ext4/tier1/<run-id>/workload.img".into(),
+                    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
+                },
+            },
+            crash_cuts: CrashCuts {
+                completed: 0,
+                required: authorities.crash_cut_expanded_count,
+                families: vec![
+                    "D0".into(),
+                    "D1".into(),
+                    "D2".into(),
+                    "D3".into(),
+                    "D4".into(),
+                    "D5".into(),
+                    "D6".into(),
+                    "D7".into(),
+                    "D8".into(),
+                    "D9".into(),
+                    "D10".into(),
+                    "D11".into(),
+                    "D12".into(),
+                ],
+            },
+            e2fsck: E2fsckSummary {
+                immutable_images: Vec::new(),
+                failures: 0,
+            },
+            xfstests: XfstestsSummary {
+                skipped: 0,
+                not_run: 0,
+                passed: authorities.xfstests_case_count,
+                failed: 0,
+            },
+            gates: Gates {
+                g0: "planned".into(),
+                g1: "planned".into(),
+                g2: "planned".into(),
+                g3: "planned".into(),
+                g4: "planned".into(),
+                g5: "planned".into(),
+                g6: "planned".into(),
+                g7: "planned".into(),
+            },
+            planned_actions: planned_actions.to_vec(),
+            notes: vec!["dry-run only; live Tier 1 campaign not executed".into()],
+        }
+    }
+
+    pub(crate) fn write_json(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(|err| err.to_string())?;
+        fs::write(path, text).map_err(|err| err.to_string())
+    }
+}
+
+pub(crate) fn authority_input_summary(
+    capability_ledger_sha256: String,
+    crash_cut_catalog_sha256: String,
+    xfstests_selection_sha256: String,
+    shell_scenario_sha256: String,
+    xfstests_case_count: usize,
+    crash_cut_expanded_count: usize,
+) -> Tier1AuthorityInputs {
+    Tier1AuthorityInputs {
+        capability_ledger_sha256,
+        crash_cut_catalog_sha256,
+        xfstests_selection_sha256,
+        shell_scenario_sha256,
+        xfstests_case_count,
+        crash_cut_expanded_count,
+    }
+}

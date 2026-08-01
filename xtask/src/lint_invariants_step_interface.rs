@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 const TARGET_DIRS: &[&str] = &[
     "crates/tx-subsystems/src",

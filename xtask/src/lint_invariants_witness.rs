@@ -12,8 +12,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 /// Ratchet ceiling for `IdentRef` appearing in struct field position.
 /// Set to 0 at baseline (2026-05-14 measurement).

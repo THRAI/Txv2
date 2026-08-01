@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::util::run_cmd_owned;
 use crate::Result;
+use crate::util::run_cmd_owned;
 
 pub(crate) fn kernel_user_layouts(root: &Path, args: Vec<String>) -> Result<()> {
     let script = root.join("tools/check-kernel-user-layouts.py");

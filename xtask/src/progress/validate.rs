@@ -3,13 +3,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::*;
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 pub(super) fn progress_validate(root: &Path) -> Result<()> {
     let mut files = Vec::new();

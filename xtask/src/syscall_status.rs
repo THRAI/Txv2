@@ -15,11 +15,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use crate::syscall_ref::{
-    extra_locals, load_reference, number_mismatches, reference_by_local_name, true_missing,
-    LocalNr, LINUX_REF_SUBMODULE, RV64_REFERENCE_JSON, RV64_REFERENCE_URL,
-};
 use crate::Result;
+use crate::syscall_ref::{
+    LINUX_REF_SUBMODULE, LocalNr, RV64_REFERENCE_JSON, RV64_REFERENCE_URL, extra_locals,
+    load_reference, number_mismatches, reference_by_local_name, true_missing,
+};
 
 const STATUS_DOC: &str = "docs/progress/SYSCALL_STATUS.md";
 const NUMBERS_RS: &str = "crates/tx-shims/src/linux_syscall/numbers.rs";
@@ -218,11 +218,7 @@ fn guarded_arm_name(line: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
         .collect();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +568,9 @@ fn print_one(
                 println!("    `tx-shell-syscall-fixup` for the observe→fix→verify loop");
             } else {
                 println!("  - add a match arm in {MOD_RS} routing to a handler");
-                println!("  - load `tx-syscall-dispatch` for lane choice (Immediate / OneShotStepOp / async)");
+                println!(
+                    "  - load `tx-syscall-dispatch` for lane choice (Immediate / OneShotStepOp / async)"
+                );
                 println!("  - target an OSComp or LTP test that exercises this syscall");
                 println!("    (see {STATUS_DOC} for the gold-standard correctness bar)");
             }

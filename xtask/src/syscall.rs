@@ -20,11 +20,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::syscall_ref::{
-    extra_locals, load_reference, number_mismatches, reference_by_local_name, true_missing,
-    LocalNr, LINUX_REF_SUBMODULE, RV64_REFERENCE_JSON, RV64_REFERENCE_URL,
-};
 use crate::Result;
+use crate::syscall_ref::{
+    LINUX_REF_SUBMODULE, LocalNr, RV64_REFERENCE_JSON, RV64_REFERENCE_URL, extra_locals,
+    load_reference, number_mismatches, reference_by_local_name, true_missing,
+};
 
 const NUMBERS_REL: &str = "crates/tx-shims/src/linux_syscall/numbers.rs";
 const DISPATCH_REL: &str = "crates/tx-shims/src/linux_syscall/mod.rs";

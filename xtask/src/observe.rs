@@ -13,8 +13,8 @@ use std::process::Command;
 
 use object::{Object, ObjectSymbol};
 
-use crate::util::{command_exists, optional_option_value, run_cmd_owned};
 use crate::Result;
+use crate::util::{command_exists, optional_option_value, run_cmd_owned};
 
 /// Packed demo-record descriptor: (kind, level, name, span, parent, payload_tag, payload_len, payload).
 type DemoRecord = (u8, u8, u32, u64, u64, u16, u16, [u8; 16]);
@@ -2407,8 +2407,8 @@ fn observe_demo(args: &[String]) -> Result<()> {
         p[1] = 1; // progress_empty
         p[2] = 1; // progress_kind=Byte
         p[3] = 1; // shape_kind=OnWaitSource
-                  // errno (4..8) = 0
-                  // progress_value (8..12) = 0
+        // errno (4..8) = 0
+        // progress_value (8..12) = 0
         p
     };
     let payload_step_done = {
@@ -2522,13 +2522,13 @@ fn observe_demo(args: &[String]) -> Result<()> {
     buf[12..14].copy_from_slice(&1u16.to_le_bytes()); // hart_count = 1
     buf[14] = RING_ORDER; // ring_order = 4
     buf[15] = 0u8; // flags
-                   // _pad0 (16-19) = 0
-                   // boot_id (24-31) = 0
-                   // clock_id (32-35) = 0 (Unknown)
-                   // _pad1 (36-39) = 0
-                   // clock_freq_hz (40-47) = 0
-                   // string_table_off (48-55) = 0
-                   // string_table_len (56-63) = 0
+    // _pad0 (16-19) = 0
+    // boot_id (24-31) = 0
+    // clock_id (32-35) = 0 (Unknown)
+    // _pad1 (36-39) = 0
+    // clock_freq_hz (40-47) = 0
+    // string_table_off (48-55) = 0
+    // string_table_len (56-63) = 0
     buf[64..72].copy_from_slice(&(RINGS_OFF as u64).to_le_bytes()); // rings_off
 
     // ── TxTraceHartRing (208 bytes at offset 72) ──────────────────────────────
@@ -2565,7 +2565,7 @@ fn observe_demo(args: &[String]) -> Result<()> {
         slot[52..54].copy_from_slice(&payload_tag.to_le_bytes()); // payload_tag
         slot[54..56].copy_from_slice(&payload_len.to_le_bytes()); // payload_len
         slot[56..72].copy_from_slice(&payload); // payload
-                                                // _pad3 (72-79) = 0 (already zeroed)
+        // _pad3 (72-79) = 0 (already zeroed)
     }
 
     fs::write(&output_path, &buf)

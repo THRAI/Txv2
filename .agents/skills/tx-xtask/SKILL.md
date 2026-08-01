@@ -22,6 +22,7 @@ binary disagree, the binary wins.
 | Decode a trap from serial log or scause/sepc/stval | `cargo xtask fault-decode --target rv64-qemu --serial PATH` |
 | Decode a syscall trace from serial log | `cargo xtask trap-trace --serial PATH --syscalls` |
 | Run guest shell scenarios | `cargo xtask shell-test --target rv64-qemu --script PATH` |
+| Inspect ext4 Tier 1 plan/authorities | `cargo xtask ext4 tier1 --dry-run` |
 | Validate progress JSON records | `cargo xtask progress validate` |
 | Run an architecture / docs / boundary lint | `cargo xtask lint arch\|docs\|unused\|boundary\|invariants` |
 | Decode a `.txtrace` file → JSON | `cargo xtask observe replay --file PATH` |
@@ -158,6 +159,14 @@ Runs guest shell scenarios from a script file. Flags:
 - `--group NAME[,NAME...]` — run only the named test group(s).
 - `--list-groups` — print available group names from the script.
 - `--keep-going` — don't stop on first failure.
+
+### `cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run]`
+
+Runs the ext4 Tier 1 acceptance planner/runner. `--dry-run` prints the
+ordered action list and resolved authority hashes without launching QEMU or
+producing a final receipt. The eventual live runner will own fresh images,
+crash cuts, replay, `e2fsck -fn`, pinned xfstests, and the immutable
+acceptance receipt under `target/ext4/tier1/<run-id>/`.
 
 ## Diagnose
 

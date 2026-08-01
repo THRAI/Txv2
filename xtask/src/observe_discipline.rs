@@ -47,8 +47,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 /// Forbidden patterns that must not appear inside a `StepOp::step` body.
 ///
@@ -331,7 +331,7 @@ fn is_impl_step_op_header(line: &str) -> bool {
         return false;
     };
     let after_impl_kw = &line[impl_pos + 4..]; // skip "impl"
-                                               // Next char must be a space or '<' (to avoid matching e.g. "reimpl").
+    // Next char must be a space or '<' (to avoid matching e.g. "reimpl").
     let first_char = after_impl_kw.chars().next().unwrap_or('\0');
     if first_char != ' ' && first_char != '<' {
         return false;

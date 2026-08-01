@@ -7,6 +7,7 @@ mod boundary_report;
 mod check_build;
 mod ci;
 mod doctor;
+mod ext4;
 mod fault_decode;
 mod full_build;
 mod image;
@@ -78,6 +79,7 @@ pub fn run() -> Result<()> {
         "trap-trace" => trap_trace::trap_trace(&root, args.collect()),
         "shell-test" => shell_test::shell_test(&root, args.collect()),
         "image" => image::image(&root, args.collect()),
+        "ext4" => ext4::ext4(&root, args.collect()),
         "kernel-user-layouts" => kernel_user_layouts::kernel_user_layouts(&root, args.collect()),
         "oscomp" => oscomp::oscomp(&root, args.collect()),
         "submit" => submit::submit(&root, args.collect()),
@@ -116,6 +118,7 @@ fn print_usage() {
            cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
+           cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run]\n\
            cargo xtask kernel-user-layouts [--arch riscv64|loongarch64] [--dump]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
            cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE] [--suite SUITE] [--data DIR] [--dry-run]\n\

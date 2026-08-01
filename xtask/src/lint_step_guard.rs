@@ -23,8 +23,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 /// Ratchet ceiling: number of `pub guard: &Guard` fields tolerated. Per the
 /// fix that landed alongside the contract-violation cleanup (see

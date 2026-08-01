@@ -3,8 +3,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::target::Profile;
 use crate::Result;
+use crate::target::Profile;
 
 pub(crate) fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {

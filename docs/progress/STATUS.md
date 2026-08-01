@@ -1,3 +1,18 @@
+- 2026-08-01 (ext4 Task 15 Tier 1 runner scaffold).
+  Landed the first `cargo xtask ext4 tier1` plumbing in `xtask/src/ext4/`:
+  the top-level xtask dispatch now recognizes `ext4 tier1`, dry-run resolves
+  and hashes the three pinned authorities plus the shell scenario, the new
+  `RunWorkspace` owns temporary state and failure receipts, and the new
+  `acceptance-receipt` draft shape carries the candidate commit, authority
+  hashes, role-image slots, crash-cut summary, xfstests summary, and gate
+  placeholders. Added the pinned `tools/ext4/tier1/xfstests-selection.json`,
+  `tools/ext4/tier1/crash-cuts.json`, and `tools/shell-tests/ext4-tier1.scn`
+  inputs needed for dry-run and future campaign wiring. Verification passed
+  `cargo test -p xtask ext4 -- --test-threads=1` and `cargo xtask ext4 tier1
+  --dry-run`; the live QEMU/e2fsck/xfstests campaign is still not wired, so
+  Task 15 remains in progress and Task 16 remains blocked on fresh product
+  evidence.
+
 - 2026-08-01 (tx-shims mount-table test isolation).
   Fixed a full-suite test pollution source in `crates/tx-shims/src/linux_syscall/tests.rs`:
   the shared setup now resets the global mount table before each test, matching the

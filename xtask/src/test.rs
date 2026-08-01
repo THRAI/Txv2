@@ -19,13 +19,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::Result;
 use crate::check_build;
 use crate::image;
 use crate::qemu;
 use crate::target::TxTarget;
 use crate::trap_trace;
 use crate::util::optional_option_value;
-use crate::Result;
 
 const DEFAULT_TARGET: &str = "rv64-qemu";
 const VDSO_WITNESS_SOURCE: &str = "tools/shell-tests/vdso-phase5-probe.c";
@@ -856,18 +856,22 @@ mod tests {
     #[test]
     fn vdso_witness_qemu_args_require_guest_markers() {
         let args = qemu_args_for_vdso_witness(TxTarget::Rv64Qemu, Some("30000".to_string()), false);
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_PASS_MARKER]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_FALLBACK_MARKER]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_SIGNAL_RESTORER_MARKER]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--timeout-ms", "30000"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_PASS_MARKER])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_FALLBACK_MARKER])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_SIGNAL_RESTORER_MARKER])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--timeout-ms", "30000"])
+        );
         assert!(args.windows(2).any(|pair| pair == ["--smp", "1"]));
         assert!(!args.windows(2).any(|pair| {
             pair == [
@@ -881,9 +885,10 @@ mod tests {
     fn vvar_smp_witness_qemu_args_require_four_harts_and_stress_marker() {
         let args = qemu_args_for_vvar_smp_witness(TxTarget::Rv64Qemu, None, false);
         assert!(args.windows(2).any(|pair| pair == ["--smp", "4"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_VVAR_SMP_MARKER]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--expect-marker", VDSO_WITNESS_VVAR_SMP_MARKER])
+        );
     }
 
     #[test]
@@ -996,9 +1001,10 @@ mod tests {
                 "--expect-marker",
                 "txkernel:qemu-riscv64-virt:reactor:owner-wake:smp:ok"
             ]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--timeout-ms", "60000"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--timeout-ms", "60000"])
+        );
         assert!(args.contains(&"--dry-run".to_string()));
         assert!(!args.contains(&"--no-block".to_string()));
     }

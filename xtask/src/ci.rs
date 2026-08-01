@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::target::{installed_targets, target_triple, TxTarget};
-use crate::util::{command_display, tail_lines};
 use crate::Result;
+use crate::target::{TxTarget, installed_targets, target_triple};
+use crate::util::{command_display, tail_lines};
 
 const CI_REPORTING_REF: &str = "docs/design/00_meta-framework/CI_REPORTING_v1.md";
 

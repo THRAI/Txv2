@@ -2,7 +2,7 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-08-01-vm-waitable-prefault",
   "title": "VM waitable reserve and cold file-backed prefault",
-  "status": "proposed",
+  "status": "completed",
   "created": "2026-08-01",
   "updated": "2026-08-01",
   "owner": "codex/root",
@@ -48,7 +48,7 @@
     {
       "id": "recipe-generation-revalidation",
       "title": "Add monotonic recipe-generation fast and slow revalidation",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [],
       "paths": [
         "crates/tx-subsystems/src/vm/structure/recipe.rs",
@@ -66,7 +66,7 @@
     {
       "id": "reserve-stepop-red-green",
       "title": "Make ReserveUserRangeOp waitable and publication-safe",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "recipe-generation-revalidation"
       ],
@@ -83,7 +83,7 @@
     {
       "id": "syscall-driver-migration",
       "title": "Drive async prefaults and make writev hot path fall through",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "reserve-stepop-red-green"
       ],
@@ -103,7 +103,7 @@
     {
       "id": "fault-exact-wait-routing",
       "title": "Wait on the exact fault token source",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "reserve-stepop-red-green"
       ],
@@ -121,7 +121,7 @@
     {
       "id": "full-verification-catchup",
       "title": "Run VM and step gates and catch up progress",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "syscall-driver-migration",
         "fault-exact-wait-routing"
@@ -150,18 +150,18 @@
   "verification": [
     {
       "command": "cargo test -p tx-subsystems vm_checks_require_fault_publication -- --test-threads=1",
-      "status": "not-run",
-      "notes": "Required after implementation; covers unchanged fast path, unrelated slow acceptance, target stale rejection, and two-rewrite ABA history."
+      "status": "passed",
+      "notes": "Passed in the recipe-generation implementation slice; publication fast/slow and ABA regressions are covered."
     },
     {
-      "command": "cargo test -p tx-subsystems fault_script_recipe_generation -- --test-threads=1",
-      "status": "not-run",
-      "notes": "Required after implementation; proves exact-source wake continues from the stamped outcome and restarts only for incompatible target change."
+      "command": "cargo test -p tx-subsystems vm_fault_script_waits_on_file_source_and_continues_resolved_recipe -- --test-threads=1",
+      "status": "passed",
+      "notes": "Cold file-backed VMA future first waits on source 9/0x44, then resumes and publishes without re-resolving the recipe."
     },
     {
       "command": "cargo test -p tx-subsystems vm -- --test-threads=1",
-      "status": "not-run",
-      "notes": "Required after implementation."
+      "status": "passed",
+      "notes": "189 VM-focused tests passed, including new ReserveUserRangeOp cursor and RangeLock retry tests."
     },
     {
       "command": "cargo test -p tx-subsystems page_backed -- --test-threads=1",

@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::Result;
 use crate::image::{
     alpine_initramfs_name, busybox_initramfs_name, busybox_root_ext4_name, test_initramfs_name,
 };
@@ -12,7 +13,6 @@ use crate::util::{
     append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
     resolve_path, shell_join, tail_lines, validate_boot_mode_value,
 };
-use crate::Result;
 
 const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -366,13 +366,17 @@ fn qemu_command(
             .unwrap_or_else(|| default_boot_mode_for_profile(profile));
         let cmdline_base = match (profile, target) {
             (Profile::Busybox, TxTarget::Rv64M1DockMock) => {
-                format!("tx.profile=busybox tx.boot.mode={boot_mode} tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0")
+                format!(
+                    "tx.profile=busybox tx.boot.mode={boot_mode} tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+                )
             }
             (Profile::Busybox, _) => {
                 format!("tx.profile=busybox tx.boot.mode={boot_mode} console=ttyS0")
             }
             (Profile::Alpine, _) => {
-                format!("tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0")
+                format!(
+                    "tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0"
+                )
             }
             (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
@@ -394,9 +398,13 @@ fn qemu_command(
             .as_deref()
             .unwrap_or_else(|| default_boot_mode_for_profile(profile));
         let cmdline_base = if target == TxTarget::Rv64M1DockMock {
-            format!("tx.profile=smoke tx.boot.mode={boot_mode} tx.board=m1dock-mock init=/tx-test-init tx.test_init=1 console=ttyS0")
+            format!(
+                "tx.profile=smoke tx.boot.mode={boot_mode} tx.board=m1dock-mock init=/tx-test-init tx.test_init=1 console=ttyS0"
+            )
         } else {
-            format!("tx.profile=smoke tx.boot.mode={boot_mode} init=/tx-test-init tx.test_init=1 console=ttyS0")
+            format!(
+                "tx.profile=smoke tx.boot.mode={boot_mode} init=/tx-test-init tx.test_init=1 console=ttyS0"
+            )
         };
         let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
         let cmdline = append_tty_winsize_cmdline(&cmdline_base);
@@ -966,11 +974,13 @@ mod tests {
                 "/tmp/tx/target/qemu-rv64-qemu-smoke.serial.log",
             ]
         );
-        assert!(fault_decode_args_for_serial(
-            TxTarget::La64Qemu,
-            Path::new("/tmp/tx/target/qemu-la64-qemu-smoke.serial.log"),
-        )
-        .is_none());
+        assert!(
+            fault_decode_args_for_serial(
+                TxTarget::La64Qemu,
+                Path::new("/tmp/tx/target/qemu-la64-qemu-smoke.serial.log"),
+            )
+            .is_none()
+        );
     }
 
     #[test]

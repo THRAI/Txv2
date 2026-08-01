@@ -1,12 +1,12 @@
 use std::env;
 use std::path::Path;
 
+use crate::Result;
 use crate::oscomp::OSCOMP_AUTOTEST;
 use crate::target::{
-    installed_components, installed_targets, require_target, target_triple, TxTarget, RV64_TARGET,
+    RV64_TARGET, TxTarget, installed_components, installed_targets, require_target, target_triple,
 };
 use crate::util::{check_version, command_exists};
-use crate::Result;
 
 pub(crate) fn doctor(root: &Path) -> Result<()> {
     println!("txKernel doctor");
@@ -106,7 +106,9 @@ pub(crate) fn doctor(root: &Path) -> Result<()> {
     if oscomp.join("kernel").join("run.py").exists() {
         println!("ok: OSComp autotest submodule at {OSCOMP_AUTOTEST}");
     } else {
-        println!("warn: OSComp autotest submodule missing; run `git submodule update --init --recursive`");
+        println!(
+            "warn: OSComp autotest submodule missing; run `git submodule update --init --recursive`"
+        );
     }
 
     if missing_required.is_empty() {

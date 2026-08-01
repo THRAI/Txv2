@@ -848,6 +848,7 @@ dependencies = [
  "serde_json",
  "syn",
  "toml",
+ "tx-ext4-format",
 ]
 
 [[package]]
