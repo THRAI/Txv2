@@ -455,6 +455,7 @@ fn tier1_crash_cut_campaign_writes_deterministic_manifest_before_executor_error(
     let error =
         run_crash_cut_campaign(&mut run, &catalog).expect_err("executor remains fail-closed");
     assert!(error.contains("deterministic crash-cut executor is not implemented"));
+    assert!(error.contains("crash-cut-outcomes.json"));
     let manifest = run.working_dir().join("crash-campaign-plan.json");
     let value: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
@@ -474,6 +475,72 @@ fn tier1_crash_cut_campaign_writes_deterministic_manifest_before_executor_error(
     assert_eq!(cuts[0]["family"], "D0");
     assert_eq!(cuts[13]["family"], "D0");
     assert_eq!(cuts[999]["immutable_image"], "crash-cut-0999.img");
+}
+
+#[test]
+fn tier1_crash_cut_campaign_consumes_executor_outcome_manifest() {
+    let root = temp_root("crash-cut-outcome-consume");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    write_json(
+        &run.working_dir().join("crash-cut-outcomes.json"),
+        r#"{
+          "schema":"tx.ext4.crash_cut_outcome_manifest.v1",
+          "completed":2,
+          "required":1000,
+          "families":["D0","D1"],
+          "outcomes":[
+            {
+              "cut_id":"crash-cut-0000",
+              "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "e2fsck_exit_code":0,
+              "replay_exit_code":0
+            },
+            {
+              "cut_id":"crash-cut-0001",
+              "immutable_image_sha256":"2222222222222222222222222222222222222222222222222222222222222222",
+              "e2fsck_exit_code":0,
+              "replay_exit_code":0
+            }
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
+
+    let evidence =
+        run_crash_cut_campaign(&mut run, &catalog).expect("clean executor outcomes are accepted");
+    assert_eq!(evidence.summary.completed, 2);
+    assert_eq!(evidence.summary.required, 1000);
+    assert_eq!(evidence.immutable_images.len(), 2);
+    assert_eq!(evidence.immutable_images[0].role, "crash-cut-0000");
+    assert!(run.working_dir().join("crash-campaign-plan.json").is_file());
 }
 
 #[test]

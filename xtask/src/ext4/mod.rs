@@ -332,9 +332,15 @@ fn run_crash_cut_campaign(
     if let Some(campaign) = &crash_cuts.campaign {
         let manifest = write_crash_cut_execution_manifest(run, crash_cuts, campaign)?;
         run.record_artifact("crash-campaign-plan", manifest.clone())?;
+        let outcomes = run.working_dir().join("crash-cut-outcomes.json");
+        if outcomes.is_file() {
+            run.record_artifact("crash-cut-outcomes", outcomes.clone())?;
+            return CrashCutCampaignEvidence::from_outcome_manifest(&outcomes);
+        }
         return Err(format!(
-            "deterministic crash-cut executor is not implemented; wrote {} but refusing to synthesize completed={} across {} families from {}",
+            "deterministic crash-cut executor is not implemented; wrote {} and expected outcome manifest {} but refusing to synthesize completed={} across {} families from {}",
             manifest.display(),
+            outcomes.display(),
             crash_cuts.expanded_cut_count,
             crash_cuts.families.len(),
             crash_cuts.file.path.display()

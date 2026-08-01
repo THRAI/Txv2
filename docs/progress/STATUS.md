@@ -1,3 +1,19 @@
+- 2026-08-02 (ext4 Tier 1 crash outcome manifest consumed by runner).
+  Advanced Task 15/16 crash executor wiring without promoting final
+  acceptance. After writing `crash-campaign-plan.json`,
+  `run_crash_cut_campaign` now checks the same run workspace for
+  `crash-cut-outcomes.json`; when present, it records the artifact and parses it
+  through `CrashCutCampaignEvidence::from_outcome_manifest()`, so clean executor
+  output flows into the receipt's crash-image e2fsck aggregation path. When the
+  manifest is absent, the runner still fails closed and names the expected
+  outcome path instead of synthesizing crash completion. Verification passed
+  focused `tier1_crash_cut_campaign` (3), focused `xtask ext4` (32), `cargo
+  xtask ext4 tier1 --dry-run`, and the expected fail-closed live preflight
+  `task16-outcome-consume-preflight-20260802072546`. Task 16 remains open: the
+  deterministic QEMU crash/replay executor, real 1000-cut immutable images,
+  per-image `e2fsck -fn`, pinned xfstests, and final G0-G7 receipt are still
+  missing.
+
 - 2026-08-02 (ext4 Tier 1 crash outcome aggregation boundary).
   Advanced Task 15/16 crash evidence plumbing without promoting final
   acceptance. Added a typed `CrashCutOutcome` boundary and
