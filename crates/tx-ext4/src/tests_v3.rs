@@ -30,7 +30,7 @@ use tx_subsystems::fs_iface::{
     BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
     PageFrameRef,
 };
-use tx_subsystems::io_manager::block::DeviceKey;
+use tx_subsystems::io_manager::block::{BioVec, DeviceKey};
 use tx_subsystems::io_manager::page::{
     PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
 };
@@ -262,6 +262,29 @@ fn build_tier1_mount_image() -> MemImage {
     superblock
         .encode(&mut image.block_mut(0)[1024..2048])
         .expect("encode Tier 1 superblock");
+    image
+}
+
+fn build_two_page_mapped_image() -> MemImage {
+    let mut image = build_image();
+    let mut file_inode = Inode::default();
+    file_inode.mode = 0x8000 | 0o644;
+    file_inode.uid = 1000;
+    file_inode.gid = 1000;
+    file_inode.size = 2 * BLOCK_SIZE as u64;
+    file_inode.links_count = 1;
+    file_inode.blocks_512 = 16;
+    file_inode.flags = Inode::EXTENTS_FL;
+    file_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 2,
+            physical_start: 20,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 12, &file_inode);
+    *image.block_mut(21) = [0x21; BLOCK_SIZE];
+    BitmapMut::new(image.block_mut(2)).set(21).unwrap();
     image
 }
 
@@ -512,6 +535,81 @@ fn ext4_mapped_write_mutation_requires_a_mutation_owner() {
     assert_eq!(
         provider.plan_writeback_mutation(&request),
         Err(V3Errno::EOPNOTSUPP)
+    );
+}
+
+#[test]
+fn ext4_multi_page_direct_writeback_planner_accepts_mapped_batch() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = Ext4FsInstance::open(build_two_page_mapped_image(), false)
+        .expect("open two-page ext4 mem image");
+    fs.bind_metadata_mutation_runtime(mutation_runtime_for_test(22));
+    let provider = Ext4PagerMutationPlanSource::new();
+    provider.bind(&fs);
+    let source = IoDataSource::direct(
+        IoDataLeaseId::new(90),
+        alloc::vec![
+            BioVec::new(0x100, 0, BLOCK_SIZE as u32),
+            BioVec::new(0x101, 0, BLOCK_SIZE as u32),
+        ],
+    );
+    let request = BackendPageRequest::new_with_source(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(72),
+        PageIoRange::new(0, 2),
+        PageIoOp::Writeback,
+        PageIoFlags::WRITEBACK,
+        Some(PageGeneration::new(9)),
+        source,
+    );
+
+    let plan = provider
+        .plan_writeback_mutation(&request)
+        .expect("mapped multi-page Direct writeback plan");
+    assert_eq!(plan.data.len(), 2);
+    assert_eq!(plan.data[0].logical_page, 0);
+    assert_eq!(plan.data[0].physical_block, 20);
+    assert_eq!(plan.data[1].logical_page, 1);
+    assert_eq!(plan.data[1].physical_block, 21);
+    assert_eq!(plan.metadata.len(), 1);
+    assert_eq!(plan.metadata[0].home, 4);
+
+    let short_direct = BackendPageRequest::new_with_source(
+        request.object,
+        PageIoRequestId::new(73),
+        request.range,
+        request.op,
+        request.flags,
+        request.generation_hint,
+        IoDataSource::direct(
+            IoDataLeaseId::new(91),
+            alloc::vec![BioVec::new(0x200, 0, BLOCK_SIZE as u32)],
+        ),
+    );
+    assert_eq!(
+        provider.plan_writeback_mutation(&short_direct),
+        Err(V3Errno::EINVAL)
+    );
+
+    let partial_direct = BackendPageRequest::new_with_source(
+        request.object,
+        PageIoRequestId::new(74),
+        request.range,
+        request.op,
+        request.flags,
+        request.generation_hint,
+        IoDataSource::direct(
+            IoDataLeaseId::new(92),
+            alloc::vec![
+                BioVec::new(0x300, 0, BLOCK_SIZE as u32),
+                BioVec::new(0x301, 16, (BLOCK_SIZE - 16) as u32),
+            ],
+        ),
+    );
+    assert_eq!(
+        provider.plan_writeback_mutation(&partial_direct),
+        Err(V3Errno::EINVAL)
     );
 }
 

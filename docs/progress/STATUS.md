@@ -22,7 +22,11 @@
   admission: contiguous same-generation dirty pages submit as one L4
   `PageIoRange`, retain one multi-page `OwnedFileIoRequest`, expose a Direct
   vec source to the backend, and settle every PageSlot in the completion range
-  through the same owner before releasing the L4 row.
+  through the same owner before releasing the L4 row. The ext4 L5 writeback
+  planner now has direct tests proving a mutation-runtime-bound provider
+  accepts already-mapped multi-page Direct requests, rejects malformed Direct
+  vec shapes, and the journal bridge splits a multi-page Direct source into
+  one ordered-data node per page before the durability fence.
   Verification passed `cargo test -p tx-subsystems --lib page_data_lease --
   --test-threads=1` (3), `cargo test -p tx-subsystems --lib
   file_fsync_frontier -- --test-threads=1` (1), `cargo test -p tx-subsystems
@@ -32,10 +36,13 @@
   tx-ext4-format --test pager_mock truncate -- --test-threads=1` (2), `cargo
   test -p tx-ext4 --lib --no-default-features truncate -- --test-threads=1`
   (3), including the new tail-block revoke/deferred-free admission path,
+  `cargo test -p tx-ext4 --lib --no-default-features multi_page_direct --
+  --test-threads=1` (1), `cargo test -p tx-ext4 --test
+  journal_prepared_transaction -- --test-threads=1` (9),
   `cargo test -p tx-ext4 --lib --no-default-features --
-  --test-threads=1` (41), `cargo test -p tx-ext4 --test mutation_lifecycle --
+  --test-threads=1` (42), `cargo test -p tx-ext4 --test mutation_lifecycle --
   --test-threads=1` (7), `cargo xtask progress validate`, `cargo xtask lint
-  docs`, `cargo -q xtask unit` (646 + 114 + 41 + 166), scoped `rustfmt`, and
+  docs`, `cargo -q xtask unit` (646 + 114 + 42 + 166), scoped `rustfmt`, and
   scoped `git diff --check`. Next: add bounded extent growth with
   claim/PageSlot transition and broaden truncate beyond the inline same-group
   tail-free shape. Blockers for product Tier 1 remain Task 12
