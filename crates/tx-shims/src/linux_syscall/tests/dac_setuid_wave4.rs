@@ -24,10 +24,11 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_EACCESS, AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMOD,
-    NR_FCHMODAT, NR_FCHMODAT2, NR_FCHOWN, NR_FCHOWNAT, NR_NEWFSTATAT, NR_OPENAT, O_RDONLY, R_OK,
-    W_OK, X_OK,
+    fs_path::fs_change_errno_magnitude, AT_EACCESS, AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_FACCESSAT,
+    NR_FACCESSAT2, NR_FCHMOD, NR_FCHMODAT, NR_FCHMODAT2, NR_FCHOWN, NR_FCHOWNAT, NR_NEWFSTATAT,
+    NR_OPENAT, O_RDONLY, R_OK, W_OK, X_OK,
 };
+use tx_substrate::step::Errno;
 
 /// errno magnitudes the tests check against (positive Linux RV64
 /// generic ABI values; the dispatcher returns the positive
@@ -35,8 +36,11 @@ use crate::linux_syscall::{
 const E_PERM: i32 = 1;
 const E_BADF: i32 = 9;
 const E_ACCES: i32 = 13;
+const E_BUSY: i32 = 16;
 const E_ROFS: i32 = 30;
 const E_NAMETOOLONG: i32 = 36;
+const E_OPNOTSUPP: i32 = 95;
+const E_STALE: i32 = 116;
 const STAT_MODE_OFF: usize = 16;
 const STAT_BYTES: usize = 128;
 
@@ -196,6 +200,16 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
 // -----------------------------------------------------------------
 // fchmodat
 // -----------------------------------------------------------------
+
+#[test]
+fn fs_change_errno_magnitude_preserves_fs_mutation_errnos() {
+    assert_eq!(fs_change_errno_magnitude(Errno::EPERM), E_PERM);
+    assert_eq!(fs_change_errno_magnitude(Errno::EROFS), E_ROFS);
+    assert_eq!(fs_change_errno_magnitude(Errno::EIO), 5);
+    assert_eq!(fs_change_errno_magnitude(Errno::EBUSY), E_BUSY);
+    assert_eq!(fs_change_errno_magnitude(Errno::EOPNOTSUPP), E_OPNOTSUPP);
+    assert_eq!(fs_change_errno_magnitude(Errno::ESTALE), E_STALE);
+}
 
 /// `fchmodat(AT_FDCWD, "/f", 0o600, 0)` against a tmpfs file owned
 /// by uid 1000 succeeds when the caller is uid 1000. Verifies the

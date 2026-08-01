@@ -631,10 +631,13 @@ fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
     }
 }
 
-fn queue_file_close_writeback(file: &Cap<OpenFile>) {
-    if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
-        let _ = pc.queue_dirty_file_writeback();
-    }
+fn queue_file_close_writeback(_file: &Cap<OpenFile>) {
+    // close(2) is not a durability fence.  The PageBacked background
+    // writeback admission path can leave an ext4 ordered-data mutation active
+    // after close returns, which makes an immediately-following metadata
+    // mutation (for example chmod after shell redirection) fail with EBUSY.
+    // Keep close as fd-table teardown only until fsync/sync/umount own the
+    // waitable transaction frontier for this path.
 }
 
 fn maybe_destroy_zero_link_inode_after_fd_remove(file: &Cap<OpenFile>) {
@@ -1516,9 +1519,8 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(file) => {
-            // Close is not a durability fence. It only admits the file just
-            // removed from the fd table to L4; fsync/fdatasync own the ordered
-            // journal commit.
+            // Close is not a durability fence. fsync/fdatasync/sync/umount
+            // own ordered writeback and journal settlement.
             queue_file_close_writeback(&file);
             file.flock_release();
             fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);

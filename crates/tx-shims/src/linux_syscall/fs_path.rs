@@ -117,19 +117,11 @@ pub(crate) fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F
 }
 
 /// Translate an `Errno` from `chmod_inode` / `chown_inode` to the
-/// dispatched `-errno` magnitude. Mirrors the existing
-/// `errno_to_i32` table; the inline match keeps the file-mode arms
-/// readable (only the four errnos the FsOps surface produces are
-/// listed; everything else collapses to `-EINVAL`).
+/// dispatched `-errno` magnitude. Use the central Linux ABI table so
+/// filesystem mutation failures stay visible to the syscall boundary
+/// instead of being collapsed to `-EINVAL`.
 pub(super) fn fs_change_errno_magnitude(errno: Errno) -> i32 {
-    match errno {
-        Errno::EPERM => EPERM_VALUE,
-        Errno::EROFS => EROFS_VALUE,
-        Errno::EACCES => EACCES_VALUE,
-        Errno::ENOENT => 2,
-        Errno::ENOSYS => ENOSYS_VALUE,
-        _ => EINVAL_VALUE,
-    }
+    errno.linux_i32()
 }
 
 /// Resolve the in-scope `Arc<dyn FsOps>` for the given dentry.
