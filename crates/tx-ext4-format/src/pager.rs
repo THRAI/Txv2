@@ -1,10 +1,9 @@
 use crate::journal::Jbd2Superblock;
 use crate::ondisk::{
-    block_bitmap_csum32, crc32c, encode_dir_entry, encode_journal_commit,
-    encode_journal_descriptor, group_desc_csum16, inode_bitmap_csum32, inode_csum32,
-    parse_journal_descriptor, superblock_csum32, BitmapMut, BitmapView, BlockMapping, CommitHeader,
-    DirEntry, DirEntryIter, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation,
-    InodeTableLayout, Superblock,
+    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentIdx,
+    ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock, block_bitmap_csum32,
+    crc32c, encode_dir_entry, encode_journal_commit, encode_journal_descriptor, group_desc_csum16,
+    inode_bitmap_csum32, inode_csum32, parse_journal_descriptor, superblock_csum32,
 };
 use crate::ondisk::{dirblock_csum32, read_u16_le, read_u32_le, write_u16_le, write_u32_le};
 use crate::{Ext4FormatError, Result};
@@ -653,12 +652,13 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(plan)
     }
 
-    /// Build a bounded destroy plan for a VFS-proven dead regular inode.
+    /// Build a bounded destroy plan for a VFS-proven dead inode.
     ///
-    /// The first Tier 1 destroy slice supports zero-link regular files whose
+    /// Tier 1 supports zero-link regular files and empty directories whose
     /// data blocks live in an inline initialized extent leaf and one block
-    /// group. Directory destroy, indexed extents, unwritten extents, and
-    /// nonzero-link inodes remain fail-closed.
+    /// group, plus inline fast symlinks. Indexed extents, unwritten extents,
+    /// non-empty directories, block-backed symlinks, and nonzero-link inodes
+    /// remain fail-closed.
     pub fn plan_destroy_inode(
         &mut self,
         inode: InodeNo,
@@ -686,23 +686,37 @@ impl<I: BlockImage> Ext4Pager<I> {
         let mut inode_table_after = inode_table_before;
         let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
         let disk_inode = Inode::parse(inode_bytes)?;
-        if !disk_inode.is_file() || disk_inode.links_count != 0 {
+        if disk_inode.links_count != 0 {
             return Err(Ext4FormatError::Unsupported);
         }
 
-        let mut freed = Vec::new();
-        let extents = match ExtentNode::parse(disk_inode.extent_root_bytes())? {
-            ExtentNode::Leaf(extents) => extents,
-            ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
-        };
-        for extent in extents {
-            if !extent.is_initialized() {
+        let releases_directory = disk_inode.is_dir();
+        let mut freed = if disk_inode.is_file() || releases_directory {
+            let mut blocks = Vec::new();
+            let extents = match ExtentNode::parse(disk_inode.extent_root_bytes())? {
+                ExtentNode::Leaf(extents) => extents,
+                ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
+            };
+            for extent in extents {
+                if !extent.is_initialized() {
+                    return Err(Ext4FormatError::Unsupported);
+                }
+                for logical in 0..extent.initialized_len() {
+                    blocks.push(extent.physical_start + logical as u64);
+                }
+            }
+            if releases_directory {
+                self.ensure_destroy_directory_is_empty(inode, &blocks)?;
+            }
+            blocks
+        } else if disk_inode.is_symlink() {
+            if disk_inode.inline_symlink_target()?.is_none() {
                 return Err(Ext4FormatError::Unsupported);
             }
-            for logical in 0..extent.initialized_len() {
-                freed.push(extent.physical_start + logical as u64);
-            }
-        }
+            Vec::new()
+        } else {
+            return Err(Ext4FormatError::Unsupported);
+        };
         freed.sort_unstable();
         if freed.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(Ext4FormatError::Corrupt);
@@ -740,16 +754,28 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         BitmapMut::new(&mut inode_bitmap_after).clear(inode_bit)?;
 
-        inode_bytes.fill(0);
+        let mut deleted_inode = Inode::default();
+        deleted_inode.mode = disk_inode.mode;
+        deleted_inode.ctime = disk_inode.ctime;
+        deleted_inode.dtime = u32::try_from(fsync_stamp.raw()).unwrap_or(u32::MAX);
+        if deleted_inode.dtime == 0 {
+            deleted_inode.dtime = 1;
+        }
+        deleted_inode.generation = disk_inode.generation;
+        deleted_inode.extra_isize = disk_inode.extra_isize;
+        deleted_inode.encode(inode_bytes)?;
+        self.refresh_inode_checksum(inode, &deleted_inode, inode_bytes)?;
 
         let released_blocks =
             u32::try_from(freed.len()).map_err(|_| Ext4FormatError::Unsupported)?;
+        let released_dirs = if releases_directory { 1 } else { 0 };
         let (group_desc_home, group_desc_before, group_desc_after) = self
             .plan_group_destroy_counts(
                 inode_group,
                 block_bitmap_update.as_ref().map(|(_, _, after)| after),
                 &inode_bitmap_after,
                 released_blocks,
+                released_dirs,
             )?;
         let (superblock_home, superblock_before, superblock_after) =
             self.plan_superblock_destroy_counts(released_blocks as u64)?;
@@ -802,6 +828,22 @@ impl<I: BlockImage> Ext4Pager<I> {
         })
         .map_err(|_| Ext4FormatError::Corrupt)?;
         Ok(plan)
+    }
+
+    fn ensure_destroy_directory_is_empty(&self, dir_ino: InodeNo, blocks: &[u64]) -> Result<()> {
+        for block in blocks {
+            let mut dir_block = [0u8; BLOCK_SIZE];
+            self.read_block(*block, &mut dir_block)?;
+            for entry in DirEntryIter::new(&dir_block) {
+                let entry = entry?;
+                match entry.name {
+                    b"." if entry.inode == dir_ino.get() => {}
+                    b".." => {}
+                    _ => return Err(Ext4FormatError::Unsupported),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn plan_truncate_tail_free(
@@ -1332,6 +1374,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         block_bitmap_after: Option<&Page4K>,
         inode_bitmap_after: &Page4K,
         released_blocks: u32,
+        released_dirs: u32,
     ) -> Result<(u64, Page4K, Page4K)> {
         let desc_size = self.superblock.group_desc_size();
         let byte_offset = group_index
@@ -1354,25 +1397,35 @@ impl<I: BlockImage> Ext4Pager<I> {
             | (u32::from(descriptor.free_blocks_count_hi) << 16);
         let free_inodes = u32::from(descriptor.free_inodes_count)
             | (u32::from(descriptor.free_inodes_count_hi) << 16);
+        let used_dirs = u32::from(descriptor.used_dirs_count)
+            | (u32::from(descriptor.used_dirs_count_hi) << 16);
         let next_free_blocks = free_blocks
             .checked_add(released_blocks)
             .ok_or(Ext4FormatError::OutOfBounds)?;
         let next_free_inodes = free_inodes
             .checked_add(1)
             .ok_or(Ext4FormatError::OutOfBounds)?;
+        let next_used_dirs = used_dirs
+            .checked_sub(released_dirs)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
         if desc_size < 64
-            && (next_free_blocks > u16::MAX as u32 || next_free_inodes > u16::MAX as u32)
+            && (next_free_blocks > u16::MAX as u32
+                || next_free_inodes > u16::MAX as u32
+                || next_used_dirs > u16::MAX as u32)
         {
             return Err(Ext4FormatError::Corrupt);
         }
         let mut after = before;
         after[offset + 12..offset + 14].copy_from_slice(&(next_free_blocks as u16).to_le_bytes());
         after[offset + 14..offset + 16].copy_from_slice(&(next_free_inodes as u16).to_le_bytes());
+        after[offset + 16..offset + 18].copy_from_slice(&(next_used_dirs as u16).to_le_bytes());
         if desc_size >= 64 {
             after[offset + 44..offset + 46]
                 .copy_from_slice(&((next_free_blocks >> 16) as u16).to_le_bytes());
             after[offset + 46..offset + 48]
                 .copy_from_slice(&((next_free_inodes >> 16) as u16).to_le_bytes());
+            after[offset + 48..offset + 50]
+                .copy_from_slice(&((next_used_dirs >> 16) as u16).to_le_bytes());
         }
         self.sync_group_itable_unused(
             group_index,

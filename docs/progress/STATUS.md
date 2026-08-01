@@ -1,3 +1,18 @@
+- 2026-08-02 (ext4 normal destroy/free e2fsck slice clean).
+  Advanced Task 12/16 evidence without promoting final acceptance. `unlinkat`
+  now destroys zero-link closed files/directories immediately while preserving
+  open-unlink deferral; `Ext4Pager::plan_destroy_inode` now preserves nonzero
+  `dtime`, frees empty directories and fast symlinks, updates used-dir/free
+  counters, and keeps the mutation path journal-owned. The Tier 1 orphan shell
+  group now closes fd 3 after proving open-unlinked readability, so normal
+  detach does not intentionally leave a live zero-link inode. Verification
+  passed focused host tests, `cargo xtask build --target rv64-qemu`, a fresh
+  TEST/SCRATCH/WORKLOAD 8-group QEMU run using
+  `target/ext4/probe/tier1-role-*-destroy-free-close-20260802062938.img`, and
+  offline `e2fsck -fn` exit 0 on TEST, SCRATCH, and WORKLOAD. Task 16 remains
+  open: deterministic crash/replay, immutable crash-image `e2fsck`, pinned
+  xfstests, and final G0-G7 receipt are still missing.
+
 - 2026-08-02 (ext4 Tier 1 role scenario reaches three live images).
   Advanced Task 15 without promoting Task 16. The live Tier 1 shell args now
   pass TEST, SCRATCH, and WORKLOAD images in stable `txblk0..2` order, and

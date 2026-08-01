@@ -50,7 +50,7 @@ expect "/ # " within 10000
 
 group orphan
 sleep 250
-send "/bin/busybox mkdir -p /musl/tier1-orphan; printf orphan > /musl/tier1-orphan/live; exec 3</musl/tier1-orphan/live; /bin/busybox rm /musl/tier1-orphan/live; /bin/busybox cat <&3; echo tier1-orphan-status:$?\n"
+send "/bin/busybox mkdir -p /musl/tier1-orphan; printf orphan > /musl/tier1-orphan/live; exec 3</musl/tier1-orphan/live; /bin/busybox rm /musl/tier1-orphan/live; /bin/busybox cat <&3; status=$?; exec 3<&-; echo tier1-orphan-status:$status\n"
 expect "orphan" within 10000
 expect "tier1-orphan-status:0" within 10000
 expect "/ # " within 10000

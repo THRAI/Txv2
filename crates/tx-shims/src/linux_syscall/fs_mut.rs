@@ -90,6 +90,33 @@ fn resolve_cwd_for_path(dirfd: i32, path: &[u8], ctx: &SyscallCtx<'_>) -> Result
     dirfd_anchor_errno(dirfd, path, ctx)
 }
 
+fn cached_child_retains_target(
+    parent: &Cap<DEntry>,
+    name: &[u8],
+    target: tx_subsystems::vfs::FsObjectId,
+) -> bool {
+    let Ok(name) = tx_subsystems::vfs::InlineName::new(name) else {
+        return false;
+    };
+    parent
+        .cached_child(name)
+        .is_some_and(|child| child.rnode().fs_object_id() == target)
+}
+
+fn maybe_destroy_zero_link_inode_after_namespace_remove(
+    fs_ops: &Arc<dyn tx_subsystems::vfs::FsOps>,
+    target: tx_subsystems::vfs::FsObjectId,
+) {
+    let guard = step_engine::guard();
+    let meta = match fs_ops.load_inode_meta(target, &guard) {
+        StepOutcome::Done(meta) => meta,
+        StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => return,
+    };
+    if meta.nlinks == 0 {
+        let _ = fs_ops.destroy_inode(target, &guard);
+    }
+}
+
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
 /// before the basename are dropped. Returns `(b"", path)` for a
@@ -387,7 +414,12 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     };
     match result {
         Ok(()) => {
+            let retained_by_live_dentry =
+                cached_child_retains_target(&parent_dentry, basename, target_id);
             parent_dentry.remove_cached_child_by_name(basename);
+            if !retained_by_live_dentry {
+                maybe_destroy_zero_link_inode_after_namespace_remove(&fs_ops, target_id);
+            }
             SyscallResult::Return(0)
         }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),

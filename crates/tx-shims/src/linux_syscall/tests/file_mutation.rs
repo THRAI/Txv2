@@ -701,6 +701,35 @@ fn dispatch_unlinkat_removes_regular_file() {
 }
 
 #[test]
+fn dispatch_unlinkat_closed_regular_file_destroys_inode_immediately() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"closed");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/closed");
+    let req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"closed"),
+        "/closed should be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "unlinkat of a closed zero-link file must run backend destroy"
+    );
+    drop(path);
+}
+
+#[test]
 fn dispatch_unlinkat_open_regular_file_defers_destroy() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
@@ -853,6 +882,39 @@ fn dispatch_unlinkat_at_removedir_removes_empty_directory() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert!(!lookup_exists(&tmpfs, b"d"), "/d should be removed");
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_at_removedir_closed_empty_directory_destroys_inode_immediately() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    make_dir(&tmpfs, b"d");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/d");
+    let req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            AT_REMOVEDIR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(!lookup_exists(&tmpfs, b"d"), "/d should be removed");
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "rmdir of a closed zero-link directory must run backend destroy"
+    );
     drop(path);
 }
 
