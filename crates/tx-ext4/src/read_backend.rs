@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use tx_ext4_format::capability::CapabilityProfileHash;
 use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
@@ -13,7 +14,7 @@ use tx_ext4_format::pager::{
 };
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
-use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner};
+use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner, IoDataSource};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::page_backed::PageContainer;
 use tx_subsystems::vfs::structure::DirCursor;
@@ -64,7 +65,7 @@ where
         &self,
         request: &BackendPageRequest,
     ) -> Result<Ext4MutationPlan, Errno> {
-        if request.range.page_count() != 1 {
+        if request.range.is_empty() {
             return Err(Errno::EINVAL);
         }
         let generation = request.generation_hint.ok_or(Errno::EINVAL)?;
@@ -75,19 +76,53 @@ where
             .and_then(Weak::upgrade)
             .ok_or(Errno::EIO)?;
         let inode = inode_no(FsObjectId::new(request.object.raw()))?;
-        backend.require_mutation_owner()?;
+        if backend.is_read_only() {
+            return Err(Errno::EROFS);
+        }
+        if backend.metadata_mutation_runtime().is_none() {
+            return Err(Errno::EOPNOTSUPP);
+        }
 
         // The runtime replaces this placeholder with the L4-owned source.
         // The format plan therefore remains metadata-only from L5's view.
+        if request.range.page_count() == 1 {
+            return backend.with_pager(|pager| {
+                pager.plan_write_page(
+                    inode,
+                    request.range.start_page(),
+                    &[0; BLOCK_SIZE],
+                    FsyncStamp::new(generation.raw()),
+                )
+            });
+        }
+        validate_multi_page_write_source(&request.source, request.range.page_count())?;
+        let page_count = usize::try_from(request.range.page_count()).map_err(|_| Errno::EINVAL)?;
+        let pages = vec![[0; BLOCK_SIZE]; page_count];
         backend.with_pager(|pager| {
-            pager.plan_write_page(
+            pager.plan_write_pages(
                 inode,
                 request.range.start_page(),
-                &[0; BLOCK_SIZE],
+                &pages,
                 FsyncStamp::new(generation.raw()),
             )
         })
     }
+}
+
+fn validate_multi_page_write_source(source: &IoDataSource, page_count: u64) -> Result<(), Errno> {
+    let IoDataSource::Direct { vecs, .. } = source else {
+        return Err(Errno::EINVAL);
+    };
+    if vecs.len() != usize::try_from(page_count).map_err(|_| Errno::EINVAL)? {
+        return Err(Errno::EINVAL);
+    }
+    if vecs
+        .iter()
+        .any(|vec| vec.offset != 0 || vec.len != BLOCK_SIZE as u32)
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 pub(crate) struct Ext4FsInstance<I> {

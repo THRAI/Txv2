@@ -1581,6 +1581,120 @@ fn file_fsync_session_waits_for_its_captured_writeback_without_duplicate_submiss
 }
 
 #[test]
+fn file_fsync_frontier_groups_contiguous_pages_by_generation() {
+    let frontier = FileFsyncFrontier::from_pages_for_test(alloc::vec![
+        (PageIndex::new(4), PageGeneration::new(9)),
+        (PageIndex::new(2), PageGeneration::new(7)),
+        (PageIndex::new(3), PageGeneration::new(7)),
+        (PageIndex::new(5), PageGeneration::new(10)),
+        (PageIndex::new(8), PageGeneration::new(10)),
+    ]);
+
+    let batches = frontier.contiguous_batches();
+
+    assert_eq!(batches.len(), 4);
+    assert_eq!(batches[0].range(), PageIoRange::new(2, 2));
+    assert_eq!(batches[0].generation(), PageGeneration::new(7));
+    assert_eq!(batches[1].range(), PageIoRange::new(4, 1));
+    assert_eq!(batches[1].generation(), PageGeneration::new(9));
+    assert_eq!(batches[2].range(), PageIoRange::new(5, 1));
+    assert_eq!(batches[2].generation(), PageGeneration::new(10));
+    assert_eq!(batches[3].range(), PageIoRange::new(8, 1));
+    assert_eq!(batches[3].generation(), PageGeneration::new(10));
+}
+
+#[test]
+fn file_fsync_session_submits_contiguous_dirty_pages_as_one_owned_batch() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(100), 4);
+    let mut ppns = alloc::vec::Vec::new();
+    let generation = {
+        let mut state = pc.state.lock();
+        for page in [PageIndex::new(0), PageIndex::new(1)] {
+            let frame = cached_frame_for_test();
+            let ppn = frame.ppn;
+            ppns.push(ppn);
+            state
+                .pages
+                .install_if_absent(page, frame)
+                .expect("seed page");
+            let slot = state.file_page_slots.entry(page).or_default();
+            let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+                panic!("fetch owner");
+            };
+            slot.complete_fetch(generation, Ok(ppn))
+                .expect("resident slot");
+            slot.mark_dirty().expect("dirty slot");
+            state.pages.mark_dirty(page).expect("dirty page cache");
+        }
+        PageGeneration::new(2)
+    };
+
+    let session = pc
+        .begin_file_fsync_session()
+        .expect("file page container has an fsync session");
+    assert_eq!(
+        session.advance(),
+        FileFsyncFrontierAdvance::Submitted { pages: 2 }
+    );
+    assert_eq!(pc.file_io_request_count_for_test(), 1);
+    let request = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(0, 2),
+            PageIoOp::Writeback,
+        )
+        .cloned()
+        .expect("batched writeback request");
+    let (source, target) = pc.prepare_owned_file_io_request(&request);
+    assert_eq!(target, IoDataTarget::None);
+    assert_eq!(
+        source,
+        IoDataSource::direct(
+            IoDataLeaseId::new(request.id.raw()),
+            alloc::vec![
+                BioVec::new(ppns[0].0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32),
+                BioVec::new(ppns[1].0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32),
+            ],
+        )
+    );
+
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            request.id,
+            PageIoRange::new(0, 2),
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("batch completion turn");
+
+    assert_eq!(session.advance(), FileFsyncFrontierAdvance::Complete);
+    for (page, ppn) in [(PageIndex::new(0), ppns[0]), (PageIndex::new(1), ppns[1])] {
+        assert_eq!(
+            pc.file_page_slot_snapshot_for_test(page)
+                .expect("slot")
+                .state,
+            PageSlotState::Resident { ppn }
+        );
+        let marks = pc.page_marks(page).expect("marks");
+        assert!(!marks.dirty);
+        assert!(!marks.writeback);
+    }
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+}
+
+#[test]
 fn file_fsync_session_resubmits_a_redirty_after_its_earlier_writeback_finishes() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

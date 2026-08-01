@@ -451,6 +451,55 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(plan)
     }
 
+    /// Build an immutable writeback plan for a contiguous run of already
+    /// mapped data pages. Extent growth/allocation stays on the single-page
+    /// path until the allocation claim and PageSlot transition are wired as
+    /// one vertical slice.
+    pub fn plan_write_pages(
+        &mut self,
+        inode: InodeNo,
+        start_file_page: u64,
+        pages: &[Page4K],
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        if pages.is_empty() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let disk_inode = self.read_inode(inode)?;
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::FlushPage, inode.get() as u64, fsync_stamp);
+        let loc = self.inode_location(inode)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image.read_block(loc.block, &mut inode_table_before)?;
+        plan.push_metadata(MetadataBlock {
+            home: loc.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_before,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+
+        for (offset, page) in pages.iter().enumerate() {
+            let file_page_index = start_file_page
+                .checked_add(offset as u64)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            let block =
+                match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
+                    BlockMapping::Data(block) => block,
+                    BlockMapping::Hole | BlockMapping::NeedNode(_) => {
+                        return Err(Ext4FormatError::Unsupported);
+                    }
+                };
+            plan.data.push(SealedDataWrite {
+                logical_page: file_page_index,
+                physical_block: block,
+                bytes: *page,
+            });
+        }
+        Ok(plan)
+    }
+
     /// Build the complete inode-table after-image for a bounded metadata-only
     /// update. This function is pure with respect to the home image: callers
     /// must admit the returned plan through `MutationHandle` before writing it.
@@ -517,6 +566,49 @@ impl<I: BlockImage> Ext4Pager<I> {
         fsync_stamp: FsyncStamp,
     ) -> Result<Ext4MutationPlan> {
         self.plan_setattr(inode, SetAttr::Mode(mode), fsync_stamp)
+    }
+
+    /// Build a metadata-only truncate plan for size changes that do not
+    /// require block reclamation. Cross-block shrink still needs the
+    /// revoke/deferred-free vertical slice and is deliberately fail-closed.
+    pub fn plan_truncate_size(
+        &mut self,
+        inode: InodeNo,
+        new_size: u64,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        let location = self.inode_location(inode)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        let mut disk_inode = Inode::parse(inode_bytes)?;
+        if !disk_inode.is_file() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        if new_size < disk_inode.size
+            && rounded_data_blocks(new_size)? < rounded_data_blocks(disk_inode.size)?
+        {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        disk_inode.size = new_size;
+        disk_inode.encode_preserving_unknown(inode_bytes)?;
+        self.refresh_inode_checksum(inode, &disk_inode, inode_bytes)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Truncate, inode.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok(plan)
     }
 
     fn refresh_inode_checksum(
@@ -1459,6 +1551,10 @@ fn logical_block(file_page_index: u64) -> Result<u32> {
     file_page_index
         .try_into()
         .map_err(|_| Ext4FormatError::OutOfBounds)
+}
+
+fn rounded_data_blocks(size: u64) -> Result<u64> {
+    Ok(div_ceil_u64(size, BLOCK_SIZE as u64))
 }
 
 fn seconds_from_ns(timestamp_ns: u64) -> Result<u32> {

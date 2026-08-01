@@ -369,6 +369,44 @@ fn pager_plans_mapped_write_without_mutating_home_block() {
 }
 
 #[test]
+fn pager_plans_mapped_write_batch_without_duplicate_metadata_anchor() {
+    let image = mock_image();
+    let original_20 = *image.block(20);
+    let original_21 = *image.block(21);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let pages = [filled_page(0xA0), filled_page(0xA1)];
+
+    let plan = pager
+        .plan_write_pages(InodeNo::new(12), 0, &pages, FsyncStamp::new(18))
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::FlushPage);
+    assert_eq!(plan.metadata.len(), 1);
+    assert_eq!(plan.metadata[0].home, 4);
+    assert_eq!(plan.data.len(), 2);
+    assert_eq!(plan.data[0].logical_page, 0);
+    assert_eq!(plan.data[0].physical_block, 20);
+    assert_eq!(plan.data[0].bytes, pages[0]);
+    assert_eq!(plan.data[1].logical_page, 1);
+    assert_eq!(plan.data[1].physical_block, 21);
+    assert_eq!(plan.data[1].bytes, pages[1]);
+    assert_eq!(pager.image().block(20), &original_20);
+    assert_eq!(pager.image().block(21), &original_21);
+}
+
+#[test]
+fn pager_rejects_write_batch_that_crosses_a_hole() {
+    let image = mock_image();
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let pages = [filled_page(0xB0), filled_page(0xB1)];
+
+    assert_eq!(
+        pager.plan_write_pages(InodeNo::new(12), 1, &pages, FsyncStamp::new(19)),
+        Err(Ext4FormatError::Unsupported)
+    );
+}
+
+#[test]
 fn pager_plans_hole_write_with_bitmap_and_inode_after_images() {
     let mut image = mock_image();
     mark_block_bitmap_used(&mut image, 48);
@@ -614,6 +652,76 @@ fn setattr_plan_updates_owner_and_times_without_mutating_home_inode() {
     assert_eq!(
         (times_inode.atime, times_inode.mtime, times_inode.ctime),
         (5, 8, 13)
+    );
+    assert_eq!(pager.image().block(4), &before);
+}
+
+#[test]
+fn truncate_plan_updates_size_without_mutating_home_inode() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    let before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_truncate_size(
+            InodeNo::new(12),
+            4 * BLOCK_SIZE as u64 - 17,
+            FsyncStamp::new(16),
+        )
+        .unwrap();
+    assert_eq!(
+        plan.origin,
+        tx_ext4_format::mutation::MutationOrigin::Truncate
+    );
+    assert_eq!(plan.object, 12);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 1);
+
+    let inode_table = &plan.metadata[0];
+    assert_eq!(
+        inode_table.role,
+        tx_ext4_format::mutation::MetaRole::InodeTable
+    );
+    assert_eq!(inode_table.home, 4);
+    let inode_bytes = &inode_table.after[11 * 256..12 * 256];
+    let after_inode = Inode::parse(inode_bytes).unwrap();
+    assert_eq!(after_inode.size, 4 * BLOCK_SIZE as u64 - 17);
+    assert_eq!(pager.image().block(4), &before);
+
+    let stored_checksum = u32::from(u16::from_le_bytes(
+        inode_bytes[124..126].try_into().unwrap(),
+    )) | (u32::from(u16::from_le_bytes(
+        inode_bytes[130..132].try_into().unwrap(),
+    )) << 16);
+    assert_eq!(
+        stored_checksum,
+        inode_csum32(
+            crc32c_append(0xFFFF_FFFF, &superblock.uuid),
+            12,
+            u32::from_le_bytes(inode_bytes[100..104].try_into().unwrap()),
+            inode_bytes
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn truncate_plan_rejects_cross_block_shrink_until_free_path_exists() {
+    let image = mock_image();
+    let before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    assert_eq!(
+        pager.plan_truncate_size(InodeNo::new(12), BLOCK_SIZE as u64, FsyncStamp::new(17)),
+        Err(tx_ext4_format::Ext4FormatError::Unsupported)
     );
     assert_eq!(pager.image().block(4), &before);
 }

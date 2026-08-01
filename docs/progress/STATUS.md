@@ -1,3 +1,40 @@
+- 2026-08-01 (ext4 Task 11 truncate and multi-page fsync writeback).
+  Advanced Task 11 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  from pending to in-progress. `Ext4Pager::plan_truncate_size` now produces a
+  pure inode-table after-image for regular-file size changes that do not need
+  block reclamation, preserves unknown inode bytes, refreshes metadata_csum,
+  and rejects cross-block shrink until the revoke/deferred-free truncate path
+  is wired. `FsPageBacking::truncate` on mutation-journal mounts now admits the
+  plan through `JournalMutationRuntime::begin_mutation`, leaves the home image
+  untouched, and exposes the mount transaction frontier; RO and no-runtime
+  mounts remain fail-closed. PageBacked now has a retained multi-page
+  `PageDataLease` constructor that projects a multi-page payload as neutral
+  `IoDataSource::Direct` vecs, while preserving the single-page PageCache
+  projection for existing writeback, and `FileFsyncFrontier` can derive stable
+  contiguous `(range, generation)` batches from its captured frontier. The
+  fsync frontier now consumes those batches in actual PageBacked writeback
+  admission: contiguous same-generation dirty pages submit as one L4
+  `PageIoRange`, retain one multi-page `OwnedFileIoRequest`, expose a Direct
+  vec source to the backend, and settle every PageSlot in the completion range
+  through the same owner before releasing the L4 row.
+  Verification passed `cargo test -p tx-subsystems --lib page_data_lease --
+  --test-threads=1` (3), `cargo test -p tx-subsystems --lib
+  file_fsync_frontier -- --test-threads=1` (1), `cargo test -p tx-subsystems
+  --lib file_fsync_session_submits_contiguous_dirty_pages_as_one_owned_batch
+  -- --test-threads=1` (1), `cargo test -p tx-subsystems --lib page_backed
+  -- --test-threads=1` (158), `cargo test -p
+  tx-ext4-format --test pager_mock truncate -- --test-threads=1` (2), `cargo
+  test -p tx-ext4 --lib --no-default-features truncate -- --test-threads=1`
+  (3), `cargo test -p tx-ext4 --lib --no-default-features --
+  --test-threads=1` (41), `cargo test -p tx-ext4 --test mutation_lifecycle --
+  --test-threads=1` (7), and scoped `rustfmt`. Next: teach the ext4 L5
+  writeback mutation planner to accept multi-page Direct sources, add bounded
+  extent growth with claim/PageSlot transition, and wire real truncate
+  free/revoke settlement. Blockers for product Tier 1 remain Task 12
+  namespace/orphan, Task 14 production cutover, Task 15 runner, and Task 16
+  fresh QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (origin/main merge readiness plan).
   Added `docs/superpowers/plans/2026-08-01-merge-origin-main.md` after
   checking the refreshed `origin/main` merge surface from

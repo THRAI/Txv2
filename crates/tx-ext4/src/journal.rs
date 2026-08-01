@@ -1417,8 +1417,10 @@ impl<P: Ext4MutationPlanSource> Ext4WritePlanSource for JournalMutationWriteSour
             return Err(Errno::EINVAL);
         }
         let mutation = self.planner.plan_writeback_mutation(request)?;
+        let data_sources =
+            split_writeback_data_sources(&request.source, request.range.page_count())?;
         self.runtime
-            .begin_mutation_with_data_sources(&mutation, vec![request.source.clone()], guard)
+            .begin_mutation_with_data_sources(&mutation, data_sources, guard)
             .map_err(journal_mutation_runtime_errno)
     }
 
@@ -1440,6 +1442,41 @@ fn journal_mutation_runtime_errno(error: JournalMutationRuntimeError) -> Errno {
     match error {
         JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
         JournalMutationRuntimeError::Image(_) | JournalMutationRuntimeError::Stage(_) => Errno::EIO,
+    }
+}
+
+fn split_writeback_data_sources(
+    source: &IoDataSource,
+    page_count: u64,
+) -> Result<Vec<IoDataSource>, Errno> {
+    if page_count == 0 {
+        return Err(Errno::EINVAL);
+    }
+    match source {
+        IoDataSource::PageCache {
+            lease,
+            frame,
+            offset,
+            len,
+        } if page_count == 1 && *len == JBD2_BLOCK_SIZE as u32 => {
+            Ok(vec![IoDataSource::page_cache(
+                *lease, *frame, *offset, *len,
+            )])
+        }
+        IoDataSource::Direct { lease, vecs } => {
+            if vecs.len() != usize::try_from(page_count).map_err(|_| Errno::EINVAL)? {
+                return Err(Errno::EINVAL);
+            }
+            let mut out = Vec::new();
+            for vec in vecs {
+                if vec.offset != 0 || vec.len != JBD2_BLOCK_SIZE as u32 {
+                    return Err(Errno::EINVAL);
+                }
+                out.push(IoDataSource::direct(*lease, alloc::vec![*vec]));
+            }
+            Ok(out)
+        }
+        _ => Err(Errno::EINVAL),
     }
 }
 

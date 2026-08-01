@@ -14,21 +14,45 @@ pub(super) struct PageDataLease {
 
 impl PageDataLease {
     pub(super) fn single(id: IoDataLeaseId, page: PageLease) -> Self {
-        Self {
-            id,
-            pages: alloc::boxed::Box::new([page]),
+        Self::from_pages(id, alloc::vec![page]).expect("single page lease is non-empty")
+    }
+
+    pub(super) fn from_pages(
+        id: IoDataLeaseId,
+        pages: Vec<PageLease>,
+    ) -> Result<Self, PageDataLeaseError> {
+        if pages.is_empty() {
+            return Err(PageDataLeaseError::Empty);
         }
+        Ok(Self {
+            id,
+            pages: pages.into_boxed_slice(),
+        })
     }
 
     pub(super) fn source(&self) -> IoDataSource {
-        let page = &self.pages[0];
-        IoDataSource::page_cache(
+        if self.pages.len() == 1 {
+            let page = &self.pages[0];
+            return IoDataSource::page_cache(
+                self.id,
+                PageFrameRef::new(page.ppn()),
+                0,
+                crate::vm::USER_PAGE_SIZE as u32,
+            );
+        }
+        IoDataSource::direct(
             self.id,
-            PageFrameRef::new(page.ppn()),
-            0,
-            crate::vm::USER_PAGE_SIZE as u32,
+            self.pages
+                .iter()
+                .map(|page| BioVec::new(page.ppn().0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32))
+                .collect(),
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PageDataLeaseError {
+    Empty,
 }
 
 #[derive(Debug)]
@@ -894,6 +918,64 @@ mod v3_tests {
     fn cached_frame_for_test() -> CachedFrame {
         setup_host_substrate();
         allocate_cached_frame().expect("cached frame")
+    }
+
+    fn page_lease_for_test() -> PageLease {
+        let frame = cached_frame_for_test();
+        PageLease {
+            ppn: frame.ppn,
+            cache_pin: frame.pin,
+        }
+    }
+
+    #[test]
+    fn page_data_lease_projects_multi_page_source_without_copying_payload() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+
+        assert!(matches!(
+            PageDataLease::from_pages(IoDataLeaseId::new(7), Vec::new()),
+            Err(PageDataLeaseError::Empty)
+        ));
+
+        let first = page_lease_for_test();
+        let second = page_lease_for_test();
+        let first_ppn = first.ppn();
+        let second_ppn = second.ppn();
+        let lease = PageDataLease::from_pages(IoDataLeaseId::new(7), alloc::vec![first, second])
+            .expect("multi-page lease");
+
+        assert_eq!(
+            lease.source(),
+            IoDataSource::direct(
+                IoDataLeaseId::new(7),
+                alloc::vec![
+                    BioVec::new(first_ppn.0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32),
+                    BioVec::new(second_ppn.0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn page_data_lease_keeps_single_page_projection_stable() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let page = page_lease_for_test();
+        let ppn = page.ppn();
+
+        let lease = PageDataLease::from_pages(IoDataLeaseId::new(8), alloc::vec![page])
+            .expect("single-page lease");
+
+        assert_eq!(
+            lease.source(),
+            IoDataSource::page_cache(
+                IoDataLeaseId::new(8),
+                PageFrameRef::new(ppn),
+                0,
+                crate::vm::USER_PAGE_SIZE as u32,
+            )
+        );
     }
 
     // ------- step_fsync -------------------------------------------------

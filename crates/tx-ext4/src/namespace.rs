@@ -96,7 +96,9 @@ fn fsync_stamp_from_meta(meta: &InodeMeta) -> Result<FsyncStamp, Errno> {
     timespec_to_ns(meta.ctime).map(FsyncStamp::new)
 }
 
-fn journal_mutation_runtime_errno(error: crate::journal::JournalMutationRuntimeError) -> Errno {
+pub(crate) fn journal_mutation_runtime_errno(
+    error: crate::journal::JournalMutationRuntimeError,
+) -> Errno {
     match error {
         crate::journal::JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
         crate::journal::JournalMutationRuntimeError::Image(_)

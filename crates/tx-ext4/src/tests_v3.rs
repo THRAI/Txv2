@@ -425,6 +425,44 @@ fn ext4_chmod_and_chown_public_paths_admit_metadata_mutations() {
 }
 
 #[test]
+fn ext4_truncate_public_path_admits_metadata_mutation_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_mutation_fs(20);
+    let backing = mounted.fs_page_backing();
+
+    assert_eq!(
+        backing.truncate(FsObjectId::new(12), BLOCK_SIZE as u64 + 13, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(20)
+    );
+}
+
+#[test]
+fn ext4_truncate_rejects_cross_block_shrink_until_free_path_exists() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_mutation_fs(21);
+    let backing = mounted.fs_page_backing();
+
+    assert_eq!(
+        backing.truncate(FsObjectId::new(12), 0, &guard),
+        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::default()
+    );
+}
+
+#[test]
 fn ext4_mapped_write_mutation_requires_a_mutation_owner() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();

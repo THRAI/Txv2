@@ -1,10 +1,12 @@
 use step_engine::Guard;
+use tx_ext4_format::mutation::FsyncStamp;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
+use crate::namespace::journal_mutation_runtime_errno;
 use crate::read_backend::{inode_no, Ext4FsInstance};
 
 use page_allocator::ZeroPolicy;
@@ -157,18 +159,31 @@ where
         &self,
         fs_object_id: FsObjectId,
         new_size: u64,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if let Err(err) = self.require_mutation_owner() {
-            return StepOutcome::err(err.into());
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
         }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match self.with_pager(|pager| pager.set_inode_size(inode, new_size)) {
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_truncate_size(inode, new_size, FsyncStamp::new(current.ctime as u64))
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
