@@ -561,6 +561,187 @@ impl FsPageBacking for RecordingFs {
     }
 }
 
+struct RejectingPrepareFs {
+    calls: AtomicUsize,
+    fetches: AtomicUsize,
+}
+
+impl RejectingPrepareFs {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl FsOps for RejectingPrepareFs {
+    fn lookup(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<FsObjectId, NoProgress> {
+        V3Out::err(V3Errno::ENOSYS)
+    }
+
+    fn load_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<InodeMeta, NoProgress> {
+        V3Out::done(InodeMeta::new(InodeKind::Regular, 0o644))
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn readdir(
+        &self,
+        _fs_object_id: FsObjectId,
+        _cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
+        V3Out::done(None)
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+}
+
+impl FsPageBacking for RejectingPrepareFs {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Out<Frame, NoProgress> {
+        self.fetches.fetch_add(1, Ordering::AcqRel);
+        V3Out::done(Frame::new(
+            page_allocator::zero_frame_ppn().expect("zero frame"),
+        ))
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn prepare_write_range(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _len: usize,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        V3Out::err(V3Errno::EOPNOTSUPP)
+    }
+}
+
 struct ReentrantFs {
     fetches: AtomicUsize,
     reentered: AtomicBool,
@@ -4620,6 +4801,33 @@ fn pagebacked_step_write_marks_dirty_and_advances_offset() {
     assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE + 17) as u64);
     assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
     assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
+}
+
+#[test]
+fn file_page_write_prepares_backend_before_dirty_publication() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RejectingPrepareFs::new());
+    let fs_ops: Arc<dyn FsOps> = fs.clone();
+    let page_backing: Arc<dyn FsPageBacking> = fs.clone();
+    let pc = file_page_container(fs_ops, page_backing, FsObjectId::new(121), 2);
+    pc.set_size_bytes(0);
+    let of = open_file_for_pc(&pc);
+
+    assert_eq!(
+        step_write(&pc, &of, 32, &guard),
+        V3Out::Err(V3Errno::EOPNOTSUPP)
+    );
+    assert_eq!(fs.calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        fs.fetches.load(Ordering::Acquire),
+        0,
+        "backend rejection must happen before PageBacked fetches or installs a writable page"
+    );
+    assert_eq!(of.offset(), 0);
+    assert_eq!(pc.resident_pages(), 0);
+    assert!(pc.page_marks(PageIndex::new(0)).is_none());
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use step_engine::Guard;
-use tx_ext4_format::mutation::FsyncStamp;
+use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking};
@@ -74,6 +74,22 @@ fn read_frame_bytes(frame: &Frame, page: &mut Page4K) -> core::result::Result<()
             core::ptr::copy_nonoverlapping(src as *const u8, page.as_mut_ptr(), BLOCK_SIZE);
         }
     }
+    Ok(())
+}
+
+fn replace_reserved_write_bytes(
+    mutation: &mut Ext4MutationPlan,
+    file_page_index: u64,
+    page: &Page4K,
+) -> core::result::Result<(), Errno> {
+    let Some(write) = mutation
+        .data
+        .iter_mut()
+        .find(|write| write.logical_page == file_page_index)
+    else {
+        return Err(Errno::EIO);
+    };
+    write.bytes = *page;
     Ok(())
 }
 
@@ -156,19 +172,34 @@ where
             Ok(meta) => meta,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let mutation = match self.with_pager(|pager| {
-            pager.plan_write_page(
-                inode,
-                file_page_index,
-                &page,
-                FsyncStamp::new(current.ctime as u64),
-            )
-        }) {
-            Ok(mutation) => mutation,
-            Err(err) => return StepOutcome::err(err.into()),
+        let reserved = self.buffered_write_reservation(inode, file_page_index);
+        let had_reservation = reserved.is_some();
+        let mut mutation = match reserved {
+            Some(mutation) => mutation,
+            None => match self.with_pager(|pager| {
+                pager.plan_write_page(
+                    inode,
+                    file_page_index,
+                    &page,
+                    FsyncStamp::new(current.ctime as u64),
+                )
+            }) {
+                Ok(mutation) => mutation,
+                Err(err) => return StepOutcome::err(err.into()),
+            },
         };
+        if had_reservation {
+            if let Err(err) = replace_reserved_write_bytes(&mut mutation, file_page_index, &page) {
+                return StepOutcome::err(err.into());
+            }
+        }
         match runtime.begin_mutation(&mutation, guard) {
-            Ok(()) => StepOutcome::done(()),
+            Ok(()) => {
+                if had_reservation {
+                    self.clear_buffered_write_reservation(inode, file_page_index);
+                }
+                StepOutcome::done(())
+            }
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
@@ -202,6 +233,58 @@ where
         match runtime.begin_mutation(&mutation, guard) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
+    }
+
+    fn prepare_write_range(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        len: usize,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if len == 0 {
+            return StepOutcome::done(());
+        }
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        if self.metadata_mutation_runtime().is_none() {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let Some(end) = offset.checked_add(len as u64) else {
+            return StepOutcome::err(Errno::EINVAL.into());
+        };
+        let file_page_index = offset / BLOCK_SIZE as u64;
+        if end == 0 || (end - 1) / BLOCK_SIZE as u64 != file_page_index {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let zero_page: Page4K = [0; BLOCK_SIZE];
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_write_page(
+                inode,
+                file_page_index,
+                &zero_page,
+                FsyncStamp::new(current.ctime as u64),
+            )
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        if mutation.allocations.is_empty() {
+            return StepOutcome::done(());
+        }
+        match self.reserve_buffered_write(inode, file_page_index, mutation) {
+            Ok(()) => StepOutcome::done(()),
+            Err(err) => StepOutcome::err(err.into()),
         }
     }
 

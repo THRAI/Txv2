@@ -60,6 +60,20 @@ pub trait FsPageBacking: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
 
+    /// Pre-admit a buffered write before PageBacked publishes a dirty file
+    /// page. The default preserves tmpfs/devfs/procfs-style backends that do
+    /// not need allocation claims; journaling backends override this to fail
+    /// closed or retain filesystem-owned growth state before PageSlot dirties.
+    fn prepare_write_range(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _len: usize,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
+    }
+
     /// Filesystem-wide flush, the storage backend for `syncfs(2)`.
     /// Default delegates to `fsync_file(ROOT)`; journaling filesystems
     /// override to issue a single barrier across all dirty inodes.

@@ -34,9 +34,13 @@ use tx_subsystems::io_manager::block::{BioVec, DeviceKey};
 use tx_subsystems::io_manager::page::{
     PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
 };
-use tx_subsystems::mount::{DevId, MountOptions, MountPayload, SourceLabel};
-use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, InodeMeta};
+use tx_subsystems::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
+use tx_subsystems::page_backed::{
+    step_write, Frame, FsPageBacking, PageContainer, PageContainerKind, PageIndex,
+};
+use tx_subsystems::vfs::structure::{
+    DirCursor, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking,
+};
 use tx_subsystems::vfs::FsOps;
 
 use crate::planner::{Ext4BlockGeometry, Ext4FsyncPlanSource, Ext4PlannerBinding};
@@ -399,6 +403,58 @@ fn mounted_counting_write_growth_fs(
     (mounted, runtime, writes)
 }
 
+fn page_container_for_mounted_file<I>(
+    mounted: &crate::mount::MountedExt4<I>,
+    fs_object_id: FsObjectId,
+    size_bytes: u64,
+    page_count: u64,
+) -> PageContainer
+where
+    I: BlockImage + Send + 'static,
+{
+    let mount = MountPayload::new_cap(
+        mounted.fs_ops(),
+        mounted.fs_page_backing(),
+        None,
+        DevId::new(8),
+        MountOptions::default(),
+        "ext4",
+        SourceLabel::Static("ext4"),
+    )
+    .expect("ext4 mount payload");
+    let pc = PageContainer::new(
+        PageContainerKind::File {
+            mount: MountPayloadPin::acquire(&epoch::PayloadCap::from_cap(mount)),
+            fs_object_id,
+        },
+        page_count,
+    );
+    pc.set_size_bytes(size_bytes);
+    pc
+}
+
+fn open_file_for_page_container(pc: &PageContainer) -> OpenFile {
+    let pc = PageContainer::new_cap(pc.kind().clone(), pc.page_count())
+        .expect("page container cap for open file");
+    let rnode = RNode::new_cap(
+        FsObjectId::new(700),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::PageBacked { pc },
+    )
+    .expect("rnode cap");
+    OpenFile::new(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+}
+
 #[test]
 fn ext4_mutation_mount_rejects_a_non_tier1_fixture() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -600,6 +656,60 @@ fn ext4_mapped_write_mutation_requires_a_mutation_owner() {
     assert_eq!(
         provider.plan_writeback_mutation(&request),
         Err(V3Errno::EOPNOTSUPP)
+    );
+}
+
+#[test]
+fn ext4_prepare_write_range_requires_a_mutation_owner_before_dirty_publication() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let guard = epoch::guard();
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsPageBacking>::prepare_write_range(
+            &*fs,
+            FsObjectId::new(12),
+            4 * BLOCK_SIZE as u64,
+            BLOCK_SIZE,
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP)
+    );
+}
+
+#[test]
+fn ext4_buffered_extending_write_reserves_before_dirty_and_flushes_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_write_growth_fs(24);
+    let pc = page_container_for_mounted_file(&mounted, FsObjectId::new(12), BLOCK_SIZE as u64, 8);
+    let of = open_file_for_page_container(&pc);
+    of.set_offset(4 * BLOCK_SIZE as u64);
+
+    assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
+    assert_eq!(of.offset(), 4 * BLOCK_SIZE as u64 + 32);
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert!(pc.page_marks(PageIndex::new(4)).expect("page 4").dirty);
+
+    let ppn = pc.lookup(PageIndex::new(4)).expect("dirty page 4 resident");
+    let frame = Frame::new(ppn);
+    assert_eq!(
+        mounted.fs_page_backing().flush_page(
+            FsObjectId::new(12),
+            4 * BLOCK_SIZE as u64,
+            &frame,
+            &guard
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 0);
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(24)
     );
 }
 

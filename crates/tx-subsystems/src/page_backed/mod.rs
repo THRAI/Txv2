@@ -2948,6 +2948,27 @@ impl PageContainer {
         if self.file_page_access_conflicts_with_reservation(page, access) {
             return StepOutcome::Err(V3Errno::EBUSY);
         }
+        if access == MaterializeAccess::Write {
+            let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+                return StepOutcome::Err(V3Errno::EINVAL);
+            };
+            match mount.payload().fs_page_backing.prepare_write_range(
+                fs_object_id,
+                offset,
+                crate::vm::USER_PAGE_SIZE,
+                guard,
+            ) {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Continue { .. } => return StepOutcome::Err(V3Errno::EAGAIN),
+                StepOutcome::Yield { shape, .. } => {
+                    if let Some((carrier, interests)) = notification::wait_source_parts(&shape) {
+                        return notification::yield_on_wait_source(NoProgress, carrier, interests);
+                    }
+                    return StepOutcome::Err(V3Errno::EIO);
+                }
+                StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            }
+        }
         let fetch_id = match self.begin_file_page_fetch(page, access) {
             FilePageFetchStart::Cached(materialized) => {
                 return match materialized {

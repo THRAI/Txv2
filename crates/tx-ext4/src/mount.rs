@@ -58,6 +58,11 @@ where
     pub fn capability_profile_hash(&self) -> Option<CapabilityProfileHash> {
         self.backend.capability_profile_hash()
     }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_write_reservation_count_for_test(&self) -> usize {
+        self.backend.buffered_write_reservation_count_for_test()
+    }
 }
 
 /// Wire type so the tx-fs bridge crate can name the mounted

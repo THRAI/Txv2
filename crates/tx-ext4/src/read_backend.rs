@@ -4,6 +4,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -135,6 +136,7 @@ pub(crate) struct Ext4FsInstance<I> {
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
     metadata_mutation_runtime: SpinMutex<Option<Arc<JournalMutationRuntime>>>,
+    buffered_write_reservations: SpinMutex<BTreeMap<(u32, u64), Ext4MutationPlan>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
     /// every page-cache writeback rejects with `EROFS`. The flag is
@@ -178,6 +180,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             mount_pin: SpinMutex::new(None),
             file_page_container_binder: SpinMutex::new(None),
             metadata_mutation_runtime: SpinMutex::new(None),
+            buffered_write_reservations: SpinMutex::new(BTreeMap::new()),
             read_only: AtomicBool::new(read_only),
             legacy_writeback_enabled: AtomicBool::new(true),
             capability_profile_hash: SpinMutex::new(None),
@@ -212,6 +215,46 @@ impl<I: BlockImage> Ext4FsInstance<I> {
 
     pub(crate) fn metadata_mutation_runtime(&self) -> Option<Arc<JournalMutationRuntime>> {
         self.metadata_mutation_runtime.lock().clone()
+    }
+
+    pub(crate) fn reserve_buffered_write(
+        &self,
+        inode: InodeNo,
+        file_page_index: u64,
+        mutation: Ext4MutationPlan,
+    ) -> Result<(), Errno> {
+        let key = (inode.get(), file_page_index);
+        let mut reservations = self.buffered_write_reservations.lock();
+        if reservations.contains_key(&key) {
+            return Ok(());
+        }
+        if !reservations.is_empty() {
+            return Err(Errno::EBUSY);
+        }
+        reservations.insert(key, mutation);
+        Ok(())
+    }
+
+    pub(crate) fn buffered_write_reservation(
+        &self,
+        inode: InodeNo,
+        file_page_index: u64,
+    ) -> Option<Ext4MutationPlan> {
+        self.buffered_write_reservations
+            .lock()
+            .get(&(inode.get(), file_page_index))
+            .cloned()
+    }
+
+    pub(crate) fn clear_buffered_write_reservation(&self, inode: InodeNo, file_page_index: u64) {
+        self.buffered_write_reservations
+            .lock()
+            .remove(&(inode.get(), file_page_index));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_write_reservation_count_for_test(&self) -> usize {
+        self.buffered_write_reservations.lock().len()
     }
 
     /// Returns `true` when this mount was opened with `MS_RDONLY`
