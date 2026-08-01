@@ -1,3 +1,26 @@
+- 2026-08-01 (**RV64 大型 Git 工作流恢复：timer 历史槽有界复用，merge 前
+  exit/dup3 文件落盘语义补回**). 大型 clone 的 2,621,440 字节分配失败并非
+  栈不足或总内存 OOM，而是 merge 侧 `dd9435f3` 引入的 `MinHeap.slots`
+  永不复用：10 ms 网络 watchdog 约 327.68 秒积累 32,768 个历史 timer 后，
+  40 字节 Slot 扩容到 65,536 恰好申请该大小。**Changed**：通用 timer heap
+  用 intrusive free-list 复用 cancel/expiry dead slot，key hash 删除改为
+  backward-shift cluster repair，容量按 live heap 而非历史 slot 计；另恢复
+  premerge `90939012` 已有的两条 ext4 落盘旁路——`exit_group`/最后线程退出
+  drain fd 后同步 `step_fsync`，以及成功 `dup3` replacement 后复用 close
+  writeback helper。Phase 1～8 继续搁置，没有扩成统一 OFD release 重构。
+  **Verification**：timer debug/release 35/35（含 cancel/expiry 各 70,000 次
+  churn）、reactor integration 全过、fd_ops_wave2 46/46、两条新 process exit
+  flush 回归通过，RV64 release build 通过；最终 guest 从新鲜镜像完成
+  `oscomp/xv6-riscv` 7780 objects/4127 deltas clone，`echo hello > README`
+  得到 6 字节并可跨进程 `cat`，commit `c49e801` 正确记录 1 insertion。
+  HTTPS push 已鉴权并到达远端，但被 non-fast-forward 正常保护；随后 pull
+  fetch 成功，因未配置 merge/rebase/ff-only 策略而停止，未 force push、远端
+  未改写。临时 allocator/syscall 诊断已全部撤销。**Next**：由用户选择该测试
+  仓库的 pull reconciliation 策略后，才能继续普通 push。**Blocker**：仅剩
+  Git 历史策略选择，不是内核功能故障。串口与完整分析见
+  `target/git-xv6-full-workflow-after-fsync-restoration-20260801.log` 和
+  `docs/progress/research/2026-08-01-git-large-clone-timer-slot-leak.md`。
+
 - 2026-07-31 (**LA64 TCP_CRR merge 回归已修复，两条 netperf lane 恢复 5/5**).
   两次 LA64 诊断先把失败从网络容量问题收敛到通用 EBR 不变量：
   `SocketPayload` final release 遇到 `epoch=0`、`zone_count=0`、
