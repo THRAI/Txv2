@@ -1362,6 +1362,98 @@ impl<I: BlockImage> Ext4Pager<I> {
         Err(Ext4FormatError::OutOfBounds)
     }
 
+    /// Build the bounded same-directory regular-file rename mutation.
+    ///
+    /// This Tier 1 slice rewrites the existing dirent in place, so it supports
+    /// names that fit in the original record. Cross-directory moves,
+    /// overwrite, and directory rename stay fail-closed until their complete
+    /// nlink/`..`/orphan plans exist.
+    pub fn plan_rename_dir_entry(
+        &mut self,
+        dir_ino: InodeNo,
+        old_name: &[u8],
+        new_name: &[u8],
+        target_ino: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        if new_name.len() > 255 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        let new_min = (8usize + new_name.len() + 3) & !3;
+        let disk_inode = self.read_inode(dir_ino)?;
+        if !disk_inode.is_dir() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+
+        for page_index in 0..page_count {
+            let phys = match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(b) => b,
+                BlockMapping::Hole => continue,
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            };
+            let mut before = [0u8; BLOCK_SIZE];
+            self.image.read_block(phys, &mut before)?;
+            let mut after = before;
+
+            let mut off = 0usize;
+            while off + 8 <= BLOCK_SIZE {
+                let rec_len = read_u16_le(&after, off + 4)? as usize;
+                if rec_len == 0 || off + rec_len > BLOCK_SIZE {
+                    break;
+                }
+                let ino_here = u32::from_le_bytes(after[off..off + 4].try_into().unwrap());
+                if ino_here != 0 {
+                    let name_len = after[off + 6] as usize;
+                    let name_end = off + 8 + name_len;
+                    if name_end <= BLOCK_SIZE
+                        && name_len == new_name.len()
+                        && &after[off + 8..name_end] == new_name
+                    {
+                        return Err(Ext4FormatError::Unsupported);
+                    }
+                    if name_end <= BLOCK_SIZE
+                        && name_len == old_name.len()
+                        && &after[off + 8..name_end] == old_name
+                    {
+                        let found_ino = InodeNo::new(ino_here);
+                        if found_ino != target_ino {
+                            return Err(Ext4FormatError::Corrupt);
+                        }
+                        let file_type = after[off + 7];
+                        if file_type == 2 || new_min > rec_len {
+                            return Err(Ext4FormatError::Unsupported);
+                        }
+                        encode_dir_entry(
+                            target_ino.get(),
+                            rec_len as u16,
+                            file_type,
+                            new_name,
+                            &mut after[off..off + rec_len],
+                        )?;
+                        let mut plan = Ext4MutationPlan::new(
+                            MutationOrigin::Rename,
+                            target_ino.get() as u64,
+                            fsync_stamp,
+                        );
+                        plan.push_metadata(MetadataBlock {
+                            home: phys,
+                            role: MetaRole::DirectoryBlock,
+                            before_version: crc32c(0, &before) as u64,
+                            after,
+                            depends_on: Vec::new(),
+                        })
+                        .map_err(|_| Ext4FormatError::Corrupt)?;
+                        return Ok(plan);
+                    }
+                }
+                off += rec_len;
+            }
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
+    }
+
     /// Build the bounded namespace mutation for unlinking one directory
     /// entry. The plan removes the dirent and decrements the target inode's
     /// link count, but deliberately does not free inode or data storage; that

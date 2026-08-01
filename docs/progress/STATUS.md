@@ -30024,3 +30024,22 @@
   breadth/reservation cleanup, Task 12 create/mkdir/link/symlink/rmdir,
   rename/overwrite/orphan/destroy, Task 14 G0 production cutover, Task 15
   `cargo xtask ext4 tier1`, and Task 16 fresh QEMU/e2fsck/xfstests receipt.
+
+- 2026-08-01 (ext4 Task 12 same-directory rename mutation slice).
+  Updated
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  `Ext4Pager::plan_rename_dir_entry` now produces an immutable `Rename`
+  DirectoryBlock after-image for same-directory regular-file renames that fit
+  the original dirent record, without mutating the home image. `FsOps::rename`
+  admits that supported shape through `JournalMutationRuntime`; read-only,
+  no-runtime, cross-directory, overwrite, and directory rename shapes remain
+  fail-closed. Verification passed
+  `cargo test -p tx-ext4-format --test pager_mock -- --test-threads=1` (25),
+  `cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1`
+  (48), `cargo test -p tx-ext4 --test journal_prepared_transaction -- --test-threads=1`
+  (9), `cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1`
+  (7), and touched-file rustfmt. Remaining blockers: Task 11 truncate
+  breadth/reservation cleanup, Task 12 create/mkdir/link/symlink/rmdir,
+  cross-directory rename/overwrite/orphan/destroy, Task 14 G0 production
+  cutover, Task 15 `cargo xtask ext4 tier1`, and Task 16 fresh
+  QEMU/e2fsck/xfstests receipt.

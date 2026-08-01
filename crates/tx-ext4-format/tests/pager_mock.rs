@@ -844,6 +844,45 @@ fn namespace_plan_unlinks_dir_entry_and_decrements_nlink_without_home_write() {
 }
 
 #[test]
+fn namespace_plan_renames_regular_file_in_place_without_home_write() {
+    let image = mock_image();
+    let dir_before = *image.block(16);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_rename_dir_entry(
+            InodeNo::new(2),
+            b"hello",
+            b"moved",
+            InodeNo::new(12),
+            FsyncStamp::new(21),
+        )
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Rename);
+    assert_eq!(plan.object, 12);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 1);
+    assert_eq!(
+        plan.metadata[0].role,
+        tx_ext4_format::mutation::MetaRole::DirectoryBlock
+    );
+    assert_eq!(plan.metadata[0].home, 16);
+
+    let entries: Vec<_> = DirEntryIter::new(&plan.metadata[0].after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!entries.iter().any(|entry| entry.name == b"hello"));
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"moved" && entry.inode == 12));
+    assert_eq!(pager.image().block(16), &dir_before);
+}
+
+#[test]
 fn pager_writeback_and_journal_replay_on_mock_image() {
     let image = mock_image();
     let mut pager = Ext4Pager::open(image).unwrap();

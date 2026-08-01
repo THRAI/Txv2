@@ -379,59 +379,60 @@ where
         old_name: &[u8],
         new_parent: FsObjectId,
         new_name: &[u8],
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if let Err(err) = self.require_mutation_owner() {
-            return StepOutcome::err(err.into());
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        if old_parent != new_parent {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        if old_name == new_name {
+            return StepOutcome::done(());
         }
         let old_parent_ino = match inode_no(old_parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let new_parent_ino = match inode_no(new_parent) {
-            Ok(v) => v,
-            Err(e) => return StepOutcome::err(e.into()),
-        };
 
-        // Resolve old inode number and its ext4 file_type.
-        let old_ino = match self.with_pager(|pager| pager.lookup(old_parent_ino, old_name)) {
+        let old_ino = match self.lookup_cached(old_parent_ino, old_name) {
             Ok(Some(ino)) => ino,
             Ok(None) => return StepOutcome::err(Errno::ENOENT.into()),
             Err(e) => return StepOutcome::err(e.into()),
         };
-        // Derive ext4 dir-entry file_type from the inode mode.
-        // EXT4_FT_REG_FILE=1, EXT4_FT_DIR=2.
-        let file_type = match self.with_pager(|pager| pager.inode_meta(old_ino)) {
-            Ok(meta) => {
-                if meta.mode & 0xF000 == 0x4000 {
-                    2u8
-                } else {
-                    1u8
-                }
-            }
+        match self.lookup_cached(old_parent_ino, new_name) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e.into()),
+        }
+        let current = match self.inode_meta_cached(old_ino) {
+            Ok(meta) => meta,
             Err(e) => return StepOutcome::err(e.into()),
         };
-
-        // Remove destination entry if it already exists (best-effort;
-        // the syscall layer already enforces RENAME_NOREPLACE before we
-        // get here, so this path is for overwrite-replace semantics).
-        let _ = self.with_pager(|pager| pager.remove_dir_entry(new_parent_ino, new_name));
-
-        // Install the new directory entry.
-        if let Err(e) = self.with_pager(|pager| {
-            pager.append_dir_entry(new_parent_ino, new_name, old_ino, file_type)
-        }) {
-            return StepOutcome::err(e.into());
+        if current.mode & 0xF000 != 0x8000 {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
         }
-        self.invalidate_lookup_cache_for(new_parent_ino);
-
-        // Remove the old directory entry.
-        match self.with_pager(|pager| pager.remove_dir_entry(old_parent_ino, old_name)) {
-            Ok(_) => {
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_rename_dir_entry(
+                old_parent_ino,
+                old_name,
+                new_name,
+                old_ino,
+                FsyncStamp::new(current.ctime as u64),
+            )
+        }) {
+            Ok(mutation) => mutation,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
+            Ok(()) => {
                 self.invalidate_lookup_cache_for(old_parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
