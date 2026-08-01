@@ -13,11 +13,13 @@
   flush 回归通过，RV64 release build 通过；最终 guest 从新鲜镜像完成
   `oscomp/xv6-riscv` 7780 objects/4127 deltas clone，`echo hello > README`
   得到 6 字节并可跨进程 `cat`，commit `c49e801` 正确记录 1 insertion。
-  HTTPS push 已鉴权并到达远端，但被 non-fast-forward 正常保护；随后 pull
-  fetch 成功，因未配置 merge/rebase/ff-only 策略而停止，未 force push、远端
-  未改写。临时 allocator/syscall 诊断已全部撤销。**Next**：由用户选择该测试
-  仓库的 pull reconciliation 策略后，才能继续普通 push。**Blocker**：仅剩
-  Git 历史策略选择，不是内核功能故障。串口与完整分析见
+  首次 HTTPS push 被 non-fast-forward 正常保护；用户随后明确授权覆盖专用测试
+  分支。由于 boot 使用干净镜像，重新完成 clone/README/commit 后，以显式旧值
+  lease 将 `LLLPPPS/tx-push-test.git` 的 `riscv` 从 `2a48e0de` 更新到
+  `8c482c20`；`git ls-remote` 回读完整 SHA
+  `8c482c202149cae3086370a8bb840a98b764e5db`。没有使用裸 `--force`，也没有
+  触碰其他分支。临时 allocator/syscall 诊断已全部撤销。**Next**：无；该 Git
+  恢复 witness 已闭环。**Blocker**：无。串口与完整分析见
   `target/git-xv6-full-workflow-after-fsync-restoration-20260801.log` 和
   `docs/progress/research/2026-08-01-git-large-clone-timer-slot-leak.md`。
 

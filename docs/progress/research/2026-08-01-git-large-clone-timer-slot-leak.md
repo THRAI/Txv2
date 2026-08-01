@@ -14,16 +14,17 @@ The requested guest workflow now gets through the kernel-sensitive parts:
 - a new process reads `hello` back;
 - `git add .` and `git commit -m"ddd"` succeed, producing guest commit
   `c49e801` with one insertion instead of an empty README;
-- HTTPS push authenticates and reaches GitHub, where normal non-fast-forward
-  protection rejects it because `me/riscv` already has commits not in the
-  fresh xv6 clone;
-- `git pull me riscv` fetches successfully, then stops because modern Git
-  requires an explicit merge, rebase, or fast-forward-only policy for the
-  divergent branches.
+- the first HTTPS push authenticates and reaches GitHub, where normal
+  non-fast-forward protection rejects the divergent update;
+- after the user explicitly authorizes replacing this dedicated test branch, a
+  second clean guest rebuilds the same local state and
+  `--force-with-lease=<explicit-old-tip>` updates only remote `riscv`;
+- `git ls-remote` verifies that the remote tip is exactly the pushed commit.
 
-No force push was attempted and the remote branch was not modified. Choosing a
-pull reconciliation policy is repository-history policy, not a remaining
-kernel defect.
+The guarded overwrite changed `refs/heads/riscv` from
+`2a48e0de338f61a36b0e8f7938f8d726ce133535` to
+`8c482c202149cae3086370a8bb840a98b764e5db`. A bare `--force` was not used and
+no other branch was touched.
 
 The final serial log is:
 
@@ -161,6 +162,8 @@ commit:      c49e801 ddd, 1 insertion / 48 deletions
 push:        authenticated HTTPS; rejected non-fast-forward
 pull:        fetched me/riscv; stopped for reconciliation policy
 final cat:   hello
+authorized retry: explicit force-with-lease updated 2a48e0de -> 8c482c20
+remote readback:  8c482c202149cae3086370a8bb840a98b764e5db
 ```
 
 All temporary allocator caller and in-flight syscall diagnostics were removed
@@ -168,16 +171,19 @@ before the final release build. The resulting tree contains only the timer
 repair, the two premerge file-flush restorations, their tests, and progress
 records.
 
-## Remaining decision
+## Remote completion
 
-To make the remote push succeed, the user must choose how the unrelated or
-divergent `riscv` histories should be reconciled:
+The boot helper regenerates a clean guest image, so the authorized overwrite
+run recloned xv6 and recreated the README commit as `8c482c20` before pushing.
+The exact guarded mutation was:
 
-- merge: `git pull --no-rebase me riscv`;
-- rebase: `git pull --rebase me riscv`;
-- fast-forward only: `git pull --ff-only me riscv` (expected to reject while
-  the local commit diverges).
+```sh
+git fetch me riscv
+git push \
+  --force-with-lease=refs/heads/riscv:2a48e0de338f61a36b0e8f7938f8d726ce133535 \
+  me HEAD:refs/heads/riscv
+```
 
-After a successful merge or rebase and conflict review, an ordinary
-`git push me riscv` can be attempted. Force push is outside this recovery and
-was not used.
+Git reported `2a48e0d...8c482c2 HEAD -> riscv (forced update)`. Direct
+`ls-remote` readback matched the full local HEAD. The test-repository workflow
+therefore has no remaining action or blocker.
