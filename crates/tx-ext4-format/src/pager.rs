@@ -1531,6 +1531,155 @@ impl<I: BlockImage> Ext4Pager<I> {
         Err(Ext4FormatError::OutOfBounds)
     }
 
+    /// Build the bounded same-directory regular-file rename-overwrite
+    /// mutation. The overwritten inode's storage is deliberately not freed;
+    /// later orphan/destroy owns that lifecycle.
+    pub fn plan_rename_overwrite_dir_entry(
+        &mut self,
+        dir_ino: InodeNo,
+        old_name: &[u8],
+        new_name: &[u8],
+        old_ino: InodeNo,
+        overwritten_ino: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        if old_ino == overwritten_ino {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let (dir_home, dir_before, dir_after) = self.plan_rename_overwrite_after_image(
+            dir_ino,
+            old_name,
+            new_name,
+            old_ino,
+            overwritten_ino,
+        )?;
+
+        let old_inode = self.read_inode(old_ino)?;
+        if !old_inode.is_file() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        let location = self.inode_location(overwritten_ino)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        let mut overwritten_inode = Inode::parse(inode_bytes)?;
+        if !overwritten_inode.is_file() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        overwritten_inode.links_count = overwritten_inode
+            .links_count
+            .checked_sub(1)
+            .ok_or(Ext4FormatError::Corrupt)?;
+        overwritten_inode.ctime = fsync_stamp
+            .raw()
+            .try_into()
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        overwritten_inode.encode_preserving_unknown(inode_bytes)?;
+        self.refresh_inode_checksum(overwritten_ino, &overwritten_inode, inode_bytes)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Rename, old_ino.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: dir_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &dir_before) as u64,
+            after: dir_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok(plan)
+    }
+
+    fn plan_rename_overwrite_after_image(
+        &mut self,
+        dir_ino: InodeNo,
+        old_name: &[u8],
+        new_name: &[u8],
+        old_ino: InodeNo,
+        overwritten_ino: InodeNo,
+    ) -> Result<(u64, Page4K, Page4K)> {
+        let disk_inode = self.read_inode(dir_ino)?;
+        if !disk_inode.is_dir() || disk_inode.is_htree_indexed() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+
+        for page_index in 0..page_count {
+            let phys = match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(block) => block,
+                BlockMapping::Hole => continue,
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            };
+            let mut before = [0u8; BLOCK_SIZE];
+            self.image.read_block(phys, &mut before)?;
+            let mut after = before;
+            let mut prev_off: Option<usize> = None;
+            let mut old_entry: Option<(usize, Option<usize>)> = None;
+            let mut new_entry: Option<usize> = None;
+
+            let mut off = 0usize;
+            while off + 8 <= BLOCK_SIZE {
+                let rec_len = read_u16_le(&after, off + 4)? as usize;
+                if rec_len == 0 || off + rec_len > BLOCK_SIZE {
+                    break;
+                }
+                let ino_here = u32::from_le_bytes(after[off..off + 4].try_into().unwrap());
+                if ino_here != 0 {
+                    let name_len = after[off + 6] as usize;
+                    let name_end = off + 8 + name_len;
+                    if name_end > BLOCK_SIZE {
+                        return Err(Ext4FormatError::Corrupt);
+                    }
+                    if name_len == old_name.len() && &after[off + 8..name_end] == old_name {
+                        if InodeNo::new(ino_here) != old_ino {
+                            return Err(Ext4FormatError::Corrupt);
+                        }
+                        if after[off + 7] == 2 {
+                            return Err(Ext4FormatError::Unsupported);
+                        }
+                        old_entry = Some((off, prev_off));
+                    } else if name_len == new_name.len() && &after[off + 8..name_end] == new_name {
+                        if InodeNo::new(ino_here) != overwritten_ino {
+                            return Err(Ext4FormatError::Corrupt);
+                        }
+                        if after[off + 7] == 2 {
+                            return Err(Ext4FormatError::Unsupported);
+                        }
+                        new_entry = Some(off);
+                    }
+                }
+                prev_off = Some(off);
+                off += rec_len;
+            }
+
+            let (Some((old_off, old_prev)), Some(new_off)) = (old_entry, new_entry) else {
+                continue;
+            };
+            after[new_off..new_off + 4].copy_from_slice(&old_ino.get().to_le_bytes());
+            if let Some(prev) = old_prev {
+                let prev_rec = read_u16_le(&after, prev + 4)? as usize;
+                let old_rec = read_u16_le(&after, old_off + 4)? as usize;
+                write_u16_le(&mut after, prev + 4, (prev_rec + old_rec) as u16)?;
+            } else {
+                after[old_off..old_off + 4].fill(0);
+            }
+            return Ok((phys, before, after));
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
+    }
+
     /// Build the bounded namespace mutation for unlinking one directory
     /// entry. The plan removes the dirent and decrements the target inode's
     /// link count, but deliberately does not free inode or data storage; that

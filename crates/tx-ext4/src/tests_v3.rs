@@ -321,6 +321,40 @@ fn build_tier1_empty_dir_image() -> MemImage {
     image
 }
 
+fn build_tier1_rename_overwrite_image() -> MemImage {
+    let mut image = build_tier1_mount_image();
+
+    let mut other_inode = Inode::default();
+    other_inode.mode = 0x8000 | 0o644;
+    other_inode.uid = 1000;
+    other_inode.gid = 1000;
+    other_inode.size = BLOCK_SIZE as u64;
+    other_inode.links_count = 1;
+    other_inode.blocks_512 = 8;
+    other_inode.flags = Inode::EXTENTS_FL;
+    other_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 21,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 14, &other_inode);
+
+    encode_dir(
+        image.block_mut(16),
+        &[
+            (2, 2, b".".as_slice()),
+            (2, 2, b"..".as_slice()),
+            (12, 1, b"hello".as_slice()),
+            (14, 1, b"other".as_slice()),
+        ],
+    );
+    *image.block_mut(21) = [0x21; BLOCK_SIZE];
+    BitmapMut::new(image.block_mut(2)).set(21).unwrap();
+    image
+}
+
 fn build_two_page_mapped_image() -> MemImage {
     let mut image = build_image();
     let mut file_inode = Inode::default();
@@ -515,6 +549,27 @@ fn mounted_counting_rename_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_rename_overwrite_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 2, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_rename_overwrite_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 rename-overwrite mutation ext4 image");
     (mounted, runtime, writes)
 }
 
@@ -910,6 +965,30 @@ fn ext4_rename_public_path_admits_same_dir_mutation_without_home_write() {
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(26)
+    );
+}
+
+#[test]
+fn ext4_rename_public_path_admits_same_dir_overwrite_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_rename_overwrite_fs(29);
+
+    assert_eq!(
+        mounted.fs_ops().rename(
+            FsObjectId::new(2),
+            b"hello",
+            FsObjectId::new(2),
+            b"other",
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(29)
     );
 }
 

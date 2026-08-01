@@ -403,11 +403,11 @@ where
             Ok(None) => return StepOutcome::err(Errno::ENOENT.into()),
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.lookup_cached(old_parent_ino, new_name) {
-            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
-            Ok(None) => {}
+        let overwritten_ino = match self.lookup_cached(old_parent_ino, new_name) {
+            Ok(Some(ino)) => Some(ino),
+            Ok(None) => None,
             Err(e) => return StepOutcome::err(e.into()),
-        }
+        };
         let current = match self.inode_meta_cached(old_ino) {
             Ok(meta) => meta,
             Err(e) => return StepOutcome::err(e.into()),
@@ -415,14 +415,35 @@ where
         if current.mode & 0xF000 != 0x8000 {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         }
-        let mutation = match self.with_pager(|pager| {
-            pager.plan_rename_dir_entry(
+        let overwritten_meta = match overwritten_ino {
+            Some(ino) => match self.inode_meta_cached(ino) {
+                Ok(meta) => Some(meta),
+                Err(e) => return StepOutcome::err(e.into()),
+            },
+            None => None,
+        };
+        if overwritten_meta
+            .as_ref()
+            .is_some_and(|meta| meta.mode & 0xF000 != 0x8000)
+        {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let mutation = match self.with_pager(|pager| match overwritten_ino {
+            Some(ino) => pager.plan_rename_overwrite_dir_entry(
+                old_parent_ino,
+                old_name,
+                new_name,
+                old_ino,
+                ino,
+                FsyncStamp::new(current.ctime as u64),
+            ),
+            None => pager.plan_rename_dir_entry(
                 old_parent_ino,
                 old_name,
                 new_name,
                 old_ino,
                 FsyncStamp::new(current.ctime as u64),
-            )
+            ),
         }) {
             Ok(mutation) => mutation,
             Err(e) => return StepOutcome::err(e.into()),

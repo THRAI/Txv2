@@ -1,3 +1,32 @@
+- 2026-08-01 (ext4 Task 12 rename-overwrite admission).
+  Advanced Task 12 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `Ext4Pager::plan_rename_overwrite_dir_entry`
+  now builds a bounded same-directory regular-file overwrite rename mutation:
+  it rewrites the destination dirent to the old inode, removes the old dirent,
+  decrements the overwritten inode link count, refreshes inode checksum state,
+  and emits DirectoryBlock plus InodeTable after-images without mutating the
+  home image. `FsOps::rename` now admits that supported overwrite shape through
+  `JournalMutationRuntime::begin_mutation`; cross-directory moves, directory
+  rename, non-regular overwrite, and orphan/storage reclamation remain
+  fail-closed or deferred. Verification passed `cargo test -p tx-ext4-format
+  --test pager_mock
+  namespace_plan_rename_overwrites_regular_file_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_ -- --test-threads=1` (5), `cargo test -p
+  tx-ext4-format --test pager_mock -- --test-threads=1` (28), `cargo test -p
+  tx-ext4 --lib --no-default-features
+  ext4_rename_public_path_admits_same_dir_overwrite_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4 --lib --no-default-features
+  rename_public_path -- --test-threads=1` (2), `cargo test -p tx-ext4 --lib
+  --no-default-features -- --test-threads=1` (51), `cargo test -p tx-ext4
+  --test journal_prepared_transaction -- --test-threads=1` (9), `cargo test
+  -p tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7), and touched
+  file `rustfmt --check`. Next: continue Task 12 with create/mkdir or symlink,
+  then cross-directory rename and classic orphan/destroy cleanup. Product Tier
+  1 still requires Task 14 production cutover/G0 lints, Task 15 runner, and
+  Task 16 fresh QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (ext4 Task 12 hard-link admission).
   Advanced Task 12 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`

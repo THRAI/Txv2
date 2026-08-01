@@ -934,6 +934,89 @@ fn namespace_plan_renames_regular_file_in_place_without_home_write() {
 }
 
 #[test]
+fn namespace_plan_rename_overwrites_regular_file_without_home_write() {
+    let mut image = mock_image();
+    let mut other_inode = Inode::default();
+    other_inode.mode = 0x8000 | 0o644;
+    other_inode.size = BLOCK_SIZE as u64;
+    other_inode.links_count = 1;
+    other_inode.blocks_512 = 8;
+    other_inode.flags = Inode::EXTENTS_FL;
+    other_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 31,
+        }])
+        .unwrap();
+    write_inode(&mut image, 14, &other_inode);
+    encode_directory(
+        image.block_mut(16),
+        &[
+            (2, 2, b".".as_slice()),
+            (2, 2, b"..".as_slice()),
+            (12, 1, b"hello".as_slice()),
+            (14, 1, b"other".as_slice()),
+            (13, 2, b"nested".as_slice()),
+        ],
+    );
+    let dir_before = *image.block(16);
+    let inode_before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_rename_overwrite_dir_entry(
+            InodeNo::new(2),
+            b"hello",
+            b"other",
+            InodeNo::new(12),
+            InodeNo::new(14),
+            FsyncStamp::new(24),
+        )
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Rename);
+    assert_eq!(plan.object, 12);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 2);
+
+    let dir_block = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::DirectoryBlock)
+        .unwrap();
+    assert_eq!(dir_block.home, 16);
+    let entries: Vec<_> = DirEntryIter::new(&dir_block.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!entries.iter().any(|entry| entry.name == b"hello"));
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"other" && entry.inode == 12));
+    assert!(!entries
+        .iter()
+        .any(|entry| entry.name == b"other" && entry.inode == 14));
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert_eq!(inode_table.home, 4);
+    let old_inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
+    let overwritten_inode = Inode::parse(&inode_table.after[13 * 256..14 * 256]).unwrap();
+    assert_eq!(old_inode.links_count, 1);
+    assert_eq!(overwritten_inode.links_count, 0);
+    assert_eq!(overwritten_inode.ctime, 24);
+
+    assert_eq!(pager.image().block(16), &dir_before);
+    assert_eq!(pager.image().block(4), &inode_before);
+}
+
+#[test]
 fn namespace_plan_rmdirs_empty_directory_without_home_write() {
     let mut image = mock_image();
     encode_directory(
