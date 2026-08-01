@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOp,
-    StepOutcome,
+    self as step_engine, Cap, SpinMutex, StepOp, StepOutcome, guard, page_allocator, reserve_for,
+    sign_for,
 };
 use crate::adapter::vfs_exec::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
@@ -46,15 +46,15 @@ use tx_subsystems::page_backed::{
     PageIndex,
 };
 use tx_subsystems::process::{
-    bootstrap_init_process, step_chdir, step_chdir_with_mount, step_set_mount_namespace,
-    ChdirOutcome, ProcessIdentity,
+    ChdirOutcome, ProcessIdentity, bootstrap_init_process, step_chdir, step_chdir_with_mount,
+    step_set_mount_namespace,
 };
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vm::{AddressSpace, UserVirtAddr, USER_PAGE_SIZE};
+use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE, UserVirtAddr};
 use tx_subsystems::zones;
 
-use super::{exec_script, ExecError};
+use super::{ExecError, exec_script};
 
 // ---------------------------------------------------------------------------
 // Test platform — minimal `PmapIf` that satisfies `AddressSpace::new`.
@@ -507,7 +507,9 @@ impl FsPageBacking for OffsetErrnoPageBacking {
         ) {
             Ok(reservation) => reservation,
             Err(_) => {
-                return step_engine::StepOutcome::err(tx_subsystems::execution::Errno::EBUSY.into())
+                return step_engine::StepOutcome::err(
+                    tx_subsystems::execution::Errno::EBUSY.into(),
+                );
             }
         };
         let owned = reservation.commit();
@@ -1811,11 +1813,7 @@ fn dynamic_exec_layout_retries_after_recoverable_candidate_error() {
         super::select_combined_layout(large_dynamic_layout_plan(), None, 64 * 1024 * 1024, || {
             let call = calls.get();
             calls.set(call + 1);
-            if call == 0 {
-                u64::MAX
-            } else {
-                0
-            }
+            if call == 0 { u64::MAX } else { 0 }
         })
         .expect("second layout candidate should fit");
 
@@ -2147,7 +2145,7 @@ fn exec_script_invalid_elf_returns_enoexec_without_kernel_shell_fallback() {
 }
 
 #[test]
-fn shebang_busybox_sh_normalization_consumes_applet_arg() {
+fn shebang_busybox_sh_preserves_working_busybox_applet_shape() {
     let header = b"#!/bin/busybox sh\n./lua $1\n";
     let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
     let original_argv: [&[u8]; 2] = [b"./test.sh", b"date.lua"];
@@ -2156,11 +2154,37 @@ fn shebang_busybox_sh_normalization_consumes_applet_arg() {
         super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv)
             .expect("shebang argv");
 
+    assert_eq!(interp_path, b"/bin/busybox");
+    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        argv_refs,
+        vec![
+            b"/bin/busybox".as_slice(),
+            b"sh".as_slice(),
+            b"./test.sh".as_slice(),
+            b"date.lua".as_slice()
+        ]
+    );
+}
+
+#[test]
+fn shebang_bin_sh_keeps_linux_interpreter_shape() {
+    let header = b"#!/bin/sh\necho ok\n";
+    let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
+
+    let (interp_path, argv) = super::shebang_exec_argv(
+        interp,
+        opt_arg,
+        b"/musl/tier1-exec.sh",
+        &[b"/musl/tier1-exec.sh"],
+    )
+    .expect("shebang argv");
+
     assert_eq!(interp_path, b"/bin/sh");
     let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
     assert_eq!(
         argv_refs,
-        vec![b"/bin/sh".as_slice(), b"./test.sh", b"date.lua"]
+        vec![b"/bin/sh".as_slice(), b"/musl/tier1-exec.sh".as_slice()]
     );
 }
 
@@ -2573,7 +2597,7 @@ fn bootstrap_with_file_meta(
 /// `drop_to` helper but routed through public mutators since
 /// `payload` is `pub(crate)` to tx-scripts.
 fn set_non_root_cred(process: &Cap<ProcessIdentity>, uid: u32) {
-    use tx_subsystems::cred::{step_setresuid, CredChange, Uid as CredUid};
+    use tx_subsystems::cred::{CredChange, Uid as CredUid, step_setresuid};
     let outcome = step_setresuid(
         process,
         Some(CredUid(uid)),

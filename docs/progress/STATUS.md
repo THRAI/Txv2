@@ -1,3 +1,23 @@
+- 2026-08-02 (ext4 execute-from-scratch split: standalone passes, data-then-exec
+  still exposes a shebang reopen gap).
+  Changed the Tier 1 execute scenario to write scripts with
+  `#!/bin/busybox sh` and fixed `tx-scripts` shebang argv construction so an
+  explicit `#!/bin/busybox sh` interpreter is preserved as
+  `/bin/busybox sh script ...` instead of being normalized to `/bin/sh`.
+  The change is backed by a new host assertion that keeps `/bin/sh` shebangs in
+  the normal Linux interpreter shape while preserving the BusyBox applet shape.
+  Verification passed `cargo test -p tx-scripts shebang_ -- --test-threads=1`,
+  `cargo test -p tx-scripts exec_script_ -- --test-threads=1`,
+  `cargo xtask build --target rv64-qemu`, and a fresh QEMU
+  `cargo xtask shell-test --target rv64-qemu --profile busybox
+  --extra-rv64-ext4 target/ext4/probe/busybox-tier1-exec-busybox-shebang-rebuilt-20260802.img
+  --script tools/shell-tests/ext4-tier1.scn --group execute-from-scratch`.
+  The wider product path is still not closed: a fresh QEMU run with
+  `--group data,execute-from-scratch` still fails after the data group with
+  `sh: /musl/tier1-exec.sh: not found` and `tier1-exec-status:127`, while the
+  standalone execute group passes. Next: root-cause the post-data shebang reopen
+  gap before promoting the Tier 1 runner or Task 16 receipt.
+
 - 2026-08-02 (ext4 pending metadata visibility advanced; data group now blocked by single active transaction).
   Added a mount-local pending metadata after-image view to `Ext4Pager` and route
   admitted metadata mutations through `Ext4FsInstance::begin_metadata_mutation`,

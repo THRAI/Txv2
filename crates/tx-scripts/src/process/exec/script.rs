@@ -44,11 +44,11 @@ use alloc::vec::Vec;
 
 use tx_hal::{Arch, EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{
-    commit_prepared_exec_cred, prepare_exec_cred_in, Capability, ExecSetidPolicy, Gid, Uid,
+    Capability, ExecSetidPolicy, Gid, Uid, commit_prepared_exec_cred, prepare_exec_cred_in,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{MountFlags, MountNamespace};
-use tx_subsystems::page_backed::{read_exact_at, PageContainer};
+use tx_subsystems::page_backed::{PageContainer, read_exact_at};
 use tx_subsystems::process::{
     InstallBrkForExecOp, ProcessExecPrep, ProcessIdentity, ResetSignalDispositionsForExecOp,
 };
@@ -58,14 +58,14 @@ use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
     LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_INITIAL_RESERVATION,
 };
-use tx_subsystems::vm::{map_vdso_into_aspace, VdsoLayout, VdsoMapping, VmMapError};
+use tx_subsystems::vm::{VdsoLayout, VdsoMapping, VmMapError, map_vdso_into_aspace};
 
-use super::image_reader::{read_elf_image, ImageReadError, ImageRole};
+use super::image_reader::{ImageReadError, ImageRole, read_elf_image};
 use super::loader::{
-    ElfLayoutError, ExecImagePlan, ImageRange, LoadSegment as ParsedLoadSegment,
-    SegmentFlags as ParsedSegmentFlags, ELF64_PHENT,
+    ELF64_PHENT, ElfLayoutError, ExecImagePlan, ImageRange, LoadSegment as ParsedLoadSegment,
+    SegmentFlags as ParsedSegmentFlags,
 };
-use super::stack::{build_initial_user_stack, AuxvFacts, StackBuildError};
+use super::stack::{AuxvFacts, StackBuildError, build_initial_user_stack};
 use crate::adapter::step_engine::{
     self as step_engine, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome,
 };
@@ -1818,31 +1818,18 @@ fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 
 /// Build argv for a shebang re-exec.
 ///
-/// OSComp Lua uses helper scripts with `#!/bin/busybox sh`. Txv2
-/// publishes `/bin/sh` consistently across boot modes, while
-/// `/bin/busybox` is not guaranteed to exist. When normalising that
-/// exact shebang to `/bin/sh`, the original busybox applet selector
-/// (`sh`) must be consumed; otherwise busybox receives
-/// `/bin/sh sh script ...` and tries to open a script literally named
-/// `sh`.
+/// The busybox profile runs shell commands reliably through the explicit
+/// multi-call shape `/bin/busybox sh ...`; launching the shell through the
+/// `/bin/sh` applet symlink can stall before the first post-exec syscall on
+/// the current initramfs. Preserve explicit busybox shebangs in that shape
+/// while keeping normal Linux binfmt_script ordering.
 fn shebang_exec_argv(
     interp: &[u8],
     opt_arg: Option<&[u8]>,
     script_path: &[u8],
     original_argv: &[&[u8]],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), ExecError> {
-    let normalized_interp = if interp == b"/bin/busybox" {
-        b"/bin/sh".as_slice()
-    } else {
-        interp
-    };
-    let interp_path = try_copy_exec_bytes(normalized_interp)?;
-    let mut opt_arg = opt_arg;
-    if interp == b"/bin/busybox" {
-        if matches!(opt_arg, Some(b"sh" | b"ash")) {
-            opt_arg = None;
-        }
-    }
+    let interp_path = try_copy_exec_bytes(interp)?;
 
     // Linux binfmt_script shape: [interp, opt_arg?, script_path,
     // original argv[1..]...].

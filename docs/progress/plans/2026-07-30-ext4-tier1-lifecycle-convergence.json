@@ -402,7 +402,7 @@
         "cargo fmt --check --package xtask",
         "cargo -q xtask unit"
       ],
-      "notes": "RunWorkspace now exists and owns temporary directories, child-process cleanup, authority hashing, and failure receipts for the public `cargo xtask ext4 tier1` entry. The command dispatch, dry-run authority resolution, and acceptance-receipt draft shape are in place, but the live QEMU/e2fsck/xfstests campaign is still not wired and Task 16 remains blocked on fresh product evidence."
+      "notes": "RunWorkspace now exists and owns temporary directories, child-process cleanup, authority hashing, and failure receipts for the public `cargo xtask ext4 tier1` entry. The command dispatch, dry-run authority resolution, and acceptance-receipt draft shape are in place, and the pinned shell scenario now uses an explicit `#!/bin/busybox sh` execute-from-scratch script shape backed by tx-scripts shebang argv tests. The live QEMU/e2fsck/xfstests campaign is still not wired and Task 16 remains blocked on fresh product evidence."
     },
     {
       "id": "task-16-acceptance",
@@ -461,7 +461,7 @@
     "Host contract tests and reused serial logs can be mistaken for product evidence without fresh QEMU, immutable image, e2fsck, and xfstests receipts."
   ],
   "blockers": [
-    "2026-08-02 fresh QEMU data group now passes mkdir visibility but fails the following file creation with `Resource busy`; the ring/source lifecycle still exposes the single active uncheckpointed transaction instead of settling or queueing ordered metadata mutations before the next guest-visible mutation.",
+    "2026-08-02 fresh QEMU data and standalone execute-from-scratch groups pass independently, but `--group data,execute-from-scratch` still fails with `sh: /musl/tier1-exec.sh: not found` and `tier1-exec-status:127`; root-cause the post-data shebang reopen/live-view gap before promoting the full Tier 1 scenario.",
     "Current production namespace and pager paths still contain direct home writes and are not yet behind one MutationHandle.",
     "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
     "The public cargo xtask ext4 tier1 command and its immutable acceptance receipt do not yet exist."

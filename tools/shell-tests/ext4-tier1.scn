@@ -53,7 +53,7 @@ expect "/ # " within 30000
 
 group execute-from-scratch
 sleep 250
-send "printf '#!/bin/sh\\necho tier1-exec-ok\\n' > /musl/tier1-exec.sh; /bin/busybox chmod +x /musl/tier1-exec.sh; /musl/tier1-exec.sh; echo tier1-exec-status:$?\n"
+send "printf '#!/bin/busybox sh\\necho tier1-exec-ok\\n' > /musl/tier1-exec.sh; /bin/busybox chmod +x /musl/tier1-exec.sh; /musl/tier1-exec.sh; echo tier1-exec-status:$?\n"
 expect "tier1-exec-ok" within 10000
 expect "tier1-exec-status:0" within 10000
 expect "/ # " within 10000
