@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    CrashCutCatalog, Tier1Authorities, XfstestsSourceLock, parse_tier1_args,
-    parse_xfstests_summary, run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file,
-    tier1_shell_test_args, verify_xfstests_source_lock,
+    CrashCutCampaignEvidence, CrashCutCatalog, CrashCutOutcome, Tier1Authorities,
+    XfstestsSourceLock, parse_tier1_args, parse_xfstests_summary, run_crash_cut_campaign,
+    run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args, verify_xfstests_source_lock,
 };
 use crate::target::TxTarget;
 
@@ -27,12 +27,27 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
     let temp = root.join("target/ext4/tier1/.failed-run.tmp");
     {
         let mut run = RunWorkspace::create(&root, "failed-run").unwrap();
+        write_text(
+            &run.temporary_path_for_test()
+                .join("crash-campaign-plan.json"),
+            "{}\n",
+        );
+        run.record_artifact(
+            "crash-campaign-plan",
+            run.temporary_path_for_test()
+                .join("crash-campaign-plan.json"),
+        )
+        .unwrap();
         let child = run.spawn_test_child("exit 17").unwrap();
         run.record_child(child);
         run.mark_failed_for_test("child-exit");
     }
     assert!(
         root.join("target/ext4/tier1/failed-run/failed-receipt.json")
+            .exists()
+    );
+    assert!(
+        root.join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
             .exists()
     );
     assert!(!temp.exists());
@@ -118,6 +133,81 @@ fn tier1_live_rejects_placeholder_authorities_before_acceptance_receipt() {
 }
 
 #[test]
+fn tier1_live_rejects_acceptance_ready_crash_catalog_without_campaign_plan() {
+    let root = temp_root("missing-crash-campaign-plan");
+    write_json(
+        &root.join("tools/ext4/tier1/capability-ledger.json"),
+        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        r#"{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"acceptance-ready",
+          "tier":"tier1",
+          "source_lock":{
+            "path":"external/xfstests",
+            "revision":"acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509",
+            "check_sha256":"104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642"
+          },
+          "selected":[{"case_id":"generic/001"}]
+        }"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/crash-cuts.json"),
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    write_text(
+        &root.join("tools/shell-tests/ext4-tier1.scn"),
+        "# ext4 tier1\n",
+    );
+
+    let error = Tier1Authorities::load(&root)
+        .unwrap()
+        .ensure_live_acceptance_ready()
+        .expect_err("acceptance-ready crash catalog must be executable");
+    assert!(error.contains("crash-cut catalog is acceptance-ready but missing campaign plan"));
+}
+
+#[test]
+fn tier1_rejects_crash_campaign_with_missing_script_artifact() {
+    let root = temp_root("missing-crash-script");
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/missing-workload.scn",
+            "replay_script":"tools/ext4/tier1/missing-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+
+    let error = CrashCutCatalog::load_with_root(catalog_path, &root)
+        .expect_err("campaign scripts must exist before acceptance-ready use");
+    assert!(error.contains("missing campaign.workload_script artifact"));
+}
+
+#[test]
 fn tier1_shell_matrix_passes_role_images_in_device_order() {
     let root = temp_root("scratch-matrix");
     let scenario = root.join("tools/shell-tests/ext4-tier1.scn");
@@ -151,6 +241,62 @@ fn tier1_shell_matrix_passes_role_images_in_device_order() {
             scratch.display().to_string(),
             workload.display().to_string()
         ]
+    );
+}
+
+#[test]
+fn tier1_live_plan_runs_g0_lints_before_building_candidate() {
+    let root = temp_root("g0-plan");
+    write_json(
+        &root.join("tools/ext4/tier1/capability-ledger.json"),
+        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        r#"{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"selection-authority-declared",
+          "tier":"tier1",
+          "source_lock":{
+            "path":"external/xfstests",
+            "revision":"acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509",
+            "check_sha256":"104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642"
+          },
+          "selected":[{"case_id":"generic/001"}]
+        }"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/crash-cuts.json"),
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"catalog-authority-declared",
+          "expanded_cut_count":1000,
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    write_text(
+        &root.join("tools/shell-tests/ext4-tier1.scn"),
+        "# ext4 tier1\n",
+    );
+
+    let invocation =
+        parse_tier1_args(&root, &["tier1".into(), "--dry-run".into()]).expect("dry run invocation");
+    let actions = invocation.planned_actions();
+    let g0_position = actions
+        .iter()
+        .position(|action| action == "run G0 ext4 ownership and durability lints")
+        .expect("G0 lint action must be part of Tier 1 plan");
+    let build_position = actions
+        .iter()
+        .position(|action| action == "build candidate")
+        .expect("build action must be part of Tier 1 plan");
+    assert!(
+        g0_position < build_position,
+        "G0 lints must run before expensive product evidence"
     );
 }
 
@@ -256,7 +402,7 @@ fn tier1_crash_cut_campaign_refuses_synthetic_completion() {
           ]
         }"#,
     );
-    let catalog = CrashCutCatalog::load(catalog_path).unwrap();
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
     run.record_authority_inputs(&super::receipt::authority_input_summary(
         "0".repeat(64),
         catalog.sha256().to_string(),
@@ -268,8 +414,237 @@ fn tier1_crash_cut_campaign_refuses_synthetic_completion() {
     .unwrap();
 
     let error =
-        run_crash_cut_campaign(&run, &catalog).expect_err("crash cuts must not be synthesized");
+        run_crash_cut_campaign(&mut run, &catalog).expect_err("crash cuts must not be synthesized");
     assert!(error.contains("refusing to synthesize completed=1000"));
+}
+
+#[test]
+fn tier1_crash_cut_campaign_writes_deterministic_manifest_before_executor_error() {
+    let root = temp_root("crash-cut-manifest");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
+
+    let error =
+        run_crash_cut_campaign(&mut run, &catalog).expect_err("executor remains fail-closed");
+    assert!(error.contains("deterministic crash-cut executor is not implemented"));
+    let manifest = run.working_dir().join("crash-campaign-plan.json");
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(value["schema"], "tx.ext4.crash_cut_execution_manifest.v1");
+    assert_eq!(value["expanded_cut_count"], 1000);
+    assert_eq!(
+        value["workload_script_sha256"],
+        sha256_file(&root.join("tools/ext4/tier1/crash-workload.scn")).unwrap()
+    );
+    assert_eq!(
+        value["replay_script_sha256"],
+        sha256_file(&root.join("tools/ext4/tier1/crash-replay.scn")).unwrap()
+    );
+    let cuts = value["cuts"].as_array().unwrap();
+    assert_eq!(cuts.len(), 1000);
+    assert_eq!(cuts[0]["id"], "crash-cut-0000");
+    assert_eq!(cuts[0]["family"], "D0");
+    assert_eq!(cuts[13]["family"], "D0");
+    assert_eq!(cuts[999]["immutable_image"], "crash-cut-0999.img");
+}
+
+#[test]
+fn tier1_crash_cut_evidence_requires_e2fsck_image_per_completed_cut() {
+    let summary = super::receipt::CrashCuts {
+        completed: 2,
+        required: 1000,
+        families: vec!["D0".into()],
+    };
+    let one_image = vec![super::receipt::E2fsckImageResult {
+        role: "crash-cut-0000".into(),
+        image_sha256: "1".repeat(64),
+        exit_code: 0,
+    }];
+    let error = CrashCutCampaignEvidence::new(summary.clone(), one_image)
+        .expect_err("completed crash cuts need matching e2fsck image records");
+    assert!(error.contains("crash-cut e2fsck coverage mismatch"));
+
+    let two_images = vec![
+        super::receipt::E2fsckImageResult {
+            role: "crash-cut-0000".into(),
+            image_sha256: "1".repeat(64),
+            exit_code: 0,
+        },
+        super::receipt::E2fsckImageResult {
+            role: "crash-cut-0001".into(),
+            image_sha256: "2".repeat(64),
+            exit_code: 0,
+        },
+    ];
+    CrashCutCampaignEvidence::new(summary, two_images).expect("matching crash-cut e2fsck evidence");
+}
+
+#[test]
+fn tier1_crash_cut_evidence_requires_clean_per_cut_outcomes() {
+    let summary = super::receipt::CrashCuts {
+        completed: 2,
+        required: 1000,
+        families: vec!["D0".into(), "D1".into()],
+    };
+    let missing = vec![CrashCutOutcome {
+        cut_id: "crash-cut-0000".into(),
+        immutable_image_sha256: "1".repeat(64),
+        e2fsck_exit_code: 0,
+        replay_exit_code: 0,
+    }];
+    let error = CrashCutCampaignEvidence::from_outcomes(summary.clone(), missing)
+        .expect_err("completed cuts need matching outcome rows");
+    assert!(error.contains("crash-cut outcome coverage mismatch"));
+
+    let dirty_replay = vec![
+        CrashCutOutcome {
+            cut_id: "crash-cut-0000".into(),
+            immutable_image_sha256: "1".repeat(64),
+            e2fsck_exit_code: 0,
+            replay_exit_code: 0,
+        },
+        CrashCutOutcome {
+            cut_id: "crash-cut-0001".into(),
+            immutable_image_sha256: "2".repeat(64),
+            e2fsck_exit_code: 0,
+            replay_exit_code: 1,
+        },
+    ];
+    let error = CrashCutCampaignEvidence::from_outcomes(summary.clone(), dirty_replay)
+        .expect_err("replay failures must block crash evidence");
+    assert!(error.contains("replay failed for crash-cut-0001"));
+
+    let clean = vec![
+        CrashCutOutcome {
+            cut_id: "crash-cut-0000".into(),
+            immutable_image_sha256: "1".repeat(64),
+            e2fsck_exit_code: 0,
+            replay_exit_code: 0,
+        },
+        CrashCutOutcome {
+            cut_id: "crash-cut-0001".into(),
+            immutable_image_sha256: "2".repeat(64),
+            e2fsck_exit_code: 0,
+            replay_exit_code: 0,
+        },
+    ];
+    let evidence =
+        CrashCutCampaignEvidence::from_outcomes(summary, clean).expect("clean outcomes aggregate");
+    assert_eq!(evidence.immutable_images.len(), 2);
+    assert_eq!(evidence.immutable_images[0].role, "crash-cut-0000");
+    assert_eq!(evidence.immutable_images[1].role, "crash-cut-0001");
+}
+
+#[test]
+fn tier1_crash_cut_outcome_manifest_parses_into_clean_evidence() {
+    let root = temp_root("crash-outcome-manifest");
+    let path = root.join("crash-cut-outcomes.json");
+    write_json(
+        &path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_outcome_manifest.v1",
+          "completed":2,
+          "required":1000,
+          "families":["D0","D1"],
+          "outcomes":[
+            {
+              "cut_id":"crash-cut-0000",
+              "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "e2fsck_exit_code":0,
+              "replay_exit_code":0
+            },
+            {
+              "cut_id":"crash-cut-0001",
+              "immutable_image_sha256":"2222222222222222222222222222222222222222222222222222222222222222",
+              "e2fsck_exit_code":0,
+              "replay_exit_code":0
+            }
+          ]
+        }"#,
+    );
+
+    let evidence =
+        CrashCutCampaignEvidence::from_outcome_manifest(&path).expect("clean outcome manifest");
+    assert_eq!(evidence.summary.completed, 2);
+    assert_eq!(evidence.summary.required, 1000);
+    assert_eq!(evidence.summary.families, vec!["D0", "D1"]);
+    assert_eq!(evidence.immutable_images.len(), 2);
+    assert_eq!(evidence.immutable_images[0].role, "crash-cut-0000");
+}
+
+#[test]
+fn tier1_crash_cut_outcome_manifest_rejects_dirty_or_incomplete_rows() {
+    let root = temp_root("dirty-crash-outcome-manifest");
+    let path = root.join("crash-cut-outcomes.json");
+    write_json(
+        &path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_outcome_manifest.v1",
+          "completed":2,
+          "required":1000,
+          "families":["D0"],
+          "outcomes":[
+            {
+              "cut_id":"crash-cut-0000",
+              "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "e2fsck_exit_code":0,
+              "replay_exit_code":0
+            }
+          ]
+        }"#,
+    );
+    let error = CrashCutCampaignEvidence::from_outcome_manifest(&path)
+        .expect_err("missing outcome rows must fail closed");
+    assert!(error.contains("crash-cut outcome coverage mismatch"));
+
+    write_json(
+        &path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_outcome_manifest.v1",
+          "completed":1,
+          "required":1000,
+          "families":["D0"],
+          "outcomes":[
+            {
+              "cut_id":"crash-cut-0000",
+              "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "e2fsck_exit_code":4,
+              "replay_exit_code":0
+            }
+          ]
+        }"#,
+    );
+    let error = CrashCutCampaignEvidence::from_outcome_manifest(&path)
+        .expect_err("dirty e2fsck must fail closed");
+    assert!(error.contains("e2fsck failed for crash-cut-0000"));
 }
 
 #[test]

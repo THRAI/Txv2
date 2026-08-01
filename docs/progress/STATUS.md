@@ -1,3 +1,106 @@
+- 2026-08-02 (ext4 Tier 1 crash outcome aggregation boundary).
+  Advanced Task 15/16 crash evidence plumbing without promoting final
+  acceptance. Added a typed `CrashCutOutcome` boundary and
+  `CrashCutCampaignEvidence::from_outcomes()`: completed crash cuts now require
+  matching per-cut outcome rows, each with a real immutable image sha,
+  `e2fsck_exit_code=0`, and `replay_exit_code=0`, before they can become the
+  receipt's crash-image e2fsck evidence. This keeps future executor work from
+  bypassing replay success by directly constructing image records. Verification
+  passed the red/green focused xtask test, `CARGO_INCREMENTAL=0 cargo test -p
+  xtask ext4 -- --test-threads=1` (29), `CARGO_INCREMENTAL=0 cargo xtask ext4
+  tier1 --dry-run`, and the expected fail-closed live preflight
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id
+  task16-outcome-boundary-preflight-20260802071347`. Task 16 remains open: the
+  deterministic QEMU crash/replay executor, real crash-image e2fsck results,
+  pinned xfstests, and final G0-G7 receipt are still missing.
+
+- 2026-08-02 (ext4 Tier 1 crash campaign inputs materialized).
+  Advanced Task 15/16 crash-runner inputs without promoting final acceptance.
+  `tools/ext4/tier1/crash-cuts.json` now declares the campaign workload and
+  replay scripts while keeping placeholder status, so live acceptance still
+  rejects it. Added `tools/ext4/tier1/crash-workload.scn` and
+  `tools/ext4/tier1/crash-replay.scn`; `CrashCutCatalog::load_with_root`
+  verifies campaign scripts exist and records their sha256, and the generated
+  `crash-campaign-plan.json` plus dry-run output now include those script
+  hashes. Verification passed the red/green focused tests, `cargo test -p
+  xtask ext4 -- --test-threads=1` (28), `cargo xtask ext4 tier1 --dry-run`
+  showing workload/replay sha256, `cargo xtask shell-test --target rv64-qemu
+  --profile busybox --script tools/ext4/tier1/crash-workload.scn
+  --list-groups`, `cargo xtask shell-test --target rv64-qemu --profile busybox
+  --script tools/ext4/tier1/crash-replay.scn --list-groups`, and expected
+  fail-closed live preflight `cargo xtask ext4 tier1 --run-id
+  task16-campaign-inputs-preflight-20260802070853`. Task 16 remains open: the
+  deterministic QEMU crash/replay executor, real crash-image e2fsck results,
+  pinned xfstests, and final G0-G7 receipt are still missing.
+
+- 2026-08-02 (ext4 Tier 1 crash campaign manifest artifact).
+  Advanced Task 15/16 crash-runner scaffolding without promoting final
+  acceptance. Failed `RunWorkspace` drops now preserve temporary artifacts by
+  moving the temporary run directory to the final run directory and writing
+  `failed-receipt.json` there, so pre-crash/executor inputs are not lost. When
+  a crash catalog has a campaign plan, `run_crash_cut_campaign` now writes a
+  deterministic `crash-campaign-plan.json` with schema
+  `tx.ext4.crash_cut_execution_manifest.v1`, all 1000 cut IDs, stable family
+  assignment, workload/replay scripts, kill policy, immutable-copy e2fsck mode,
+  and per-cut immutable image names, then still fails closed because the real
+  QEMU kill/replay executor is not implemented. Verification passed the
+  red/green focused xtask tests, `cargo test -p xtask ext4 -- --test-threads=1`
+  (27), `cargo xtask ext4 tier1 --dry-run`, and the expected fail-closed live
+  preflight `cargo xtask ext4 tier1 --run-id
+  task16-crash-manifest-preflight-20260802070010`, which still rejects the
+  current placeholder xfstests and crash-cut authorities. Task 16 remains open:
+  the deterministic QEMU crash/replay executor, real crash-image e2fsck
+  results, pinned xfstests, and final G0-G7 receipt are still missing.
+
+- 2026-08-02 (ext4 Tier 1 crash catalog requires executable campaign plan).
+  Advanced Task 15/16 preflight hardening without promoting final acceptance.
+  `CrashCutCatalog` now parses an optional `campaign` execution plan and
+  `ensure_live_acceptance_ready()` rejects any `acceptance-ready` crash-cut
+  catalog that lacks one. The campaign plan requires repository-relative
+  workload and replay scripts, `kill_policy=deterministic-phase-marker-v1`, and
+  `e2fsck_mode=immutable-copy`; dry-run prints those fields when present. This
+  prevents a false promotion by changing only `status` while the deterministic
+  crash/replay inputs remain undeclared. Verification passed the red/green
+  focused xtask test, `cargo test -p xtask ext4 -- --test-threads=1` (26),
+  `cargo xtask ext4 tier1 --dry-run`, and the expected fail-closed live
+  preflight `cargo xtask ext4 tier1 --run-id
+  task16-crash-campaign-plan-preflight-20260802065132`, which still rejects the
+  current placeholder xfstests and crash-cut authorities. Task 16 remains open:
+  the deterministic crash/replay runner itself, pinned xfstests, and final
+  G0-G7 receipt are still missing.
+
+- 2026-08-02 (ext4 Tier 1 crash campaign e2fsck evidence boundary).
+  Advanced Task 15/16 runner wiring without promoting final acceptance.
+  `run_crash_cut_campaign` now returns a typed `CrashCutCampaignEvidence`
+  boundary instead of a bare `CrashCuts` summary, and that evidence must carry
+  at least one immutable e2fsck image record per completed crash cut before it
+  can be constructed. The live Tier 1 receipt path now runs the crash campaign
+  before final e2fsck aggregation, appends crash-campaign immutable image
+  results to TEST/SCRATCH/WORKLOAD e2fsck results, and computes e2fsck failures
+  over the combined set. Verification passed the red/green focused xtask test,
+  `cargo test -p xtask ext4 -- --test-threads=1` (25), `cargo xtask ext4
+  tier1 --dry-run`, and the expected fail-closed live preflight `cargo xtask
+  ext4 tier1 --run-id task16-crash-e2fsck-preflight-20260802064650`, which
+  still rejects placeholder xfstests and crash-cut authorities. Task 16 remains
+  open: the deterministic crash/replay runner itself, pinned xfstests, and
+  final G0-G7 receipt are still missing.
+
+- 2026-08-02 (ext4 Tier 1 runner now carries G0 lint stage).
+  Advanced Task 15/16 runner evidence without promoting final acceptance.
+  `cargo xtask ext4 tier1 --dry-run` now advertises the G0 ext4 ownership and
+  durability lint stage as the first product action, and the live runner calls
+  `cargo xtask lint invariants ext4-lifecycle-ownership`,
+  `cargo xtask lint invariants ext4-no-direct-home-write`, and `cargo xtask
+  lint invariants ext4-durability-flags` before build/QEMU once authority
+  manifests are acceptance-ready. Verification passed the red/green focused
+  xtask test, the three G0 lints with 0 findings, `cargo test -p xtask ext4
+  -- --test-threads=1` (24), `cargo xtask ext4 tier1 --dry-run`, and the
+  expected fail-closed live preflight `cargo xtask ext4 tier1 --run-id
+  task16-g0-preflight-20260802064026`, which still rejects placeholder
+  xfstests and crash-cut authorities. Task 16 remains open: deterministic
+  crash/replay, immutable crash-image `e2fsck`, pinned xfstests, and final
+  G0-G7 receipt are still missing.
+
 - 2026-08-02 (ext4 normal destroy/free e2fsck slice clean).
   Advanced Task 12/16 evidence without promoting final acceptance. `unlinkat`
   now destroys zero-link closed files/directories immediately while preserving

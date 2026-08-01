@@ -2,6 +2,12 @@
   "schema": "tx.ext4.crash_cut_catalog.v1",
   "status": "catalog-authority-declared",
   "expanded_cut_count": 1000,
+  "campaign": {
+    "workload_script": "tools/ext4/tier1/crash-workload.scn",
+    "replay_script": "tools/ext4/tier1/crash-replay.scn",
+    "kill_policy": "deterministic-phase-marker-v1",
+    "e2fsck_mode": "immutable-copy"
+  },
   "families": [
     {"id": "D0", "label": "before ordered-data submission", "group": "data"},
     {"id": "D1", "label": "ordered data complete, before its flush", "group": "data"},

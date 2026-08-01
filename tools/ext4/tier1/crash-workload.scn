@@ -1,0 +1,30 @@
+# ext4 Tier 1 crash workload.
+#
+# This script is the deterministic crash campaign workload input. The crash
+# executor will run this workload against SCRATCH and kill QEMU at phase markers
+# from the expanded crash-campaign manifest.
+
+wait ":mount:sdcard:ext4:ok" within 90000
+wait "/ # " within 90000
+
+send "/bin/busybox sync; /bin/busybox umount -l /musl; /bin/busybox mkdir -p /musl; /bin/busybox mount -t ext4 /dev/block/vdb /musl; echo crash-workload-mount:$?\n"
+expect "crash-workload-mount:0" within 30000
+expect "/ # " within 30000
+
+group ordered-data
+send "/bin/busybox mkdir -p /musl/crash-data; printf crash-data > /musl/crash-data/file; /bin/busybox sync; echo crash-workload-data:$?\n"
+expect "crash-workload-data:0" within 30000
+expect "/ # " within 30000
+
+group namespace
+send "/bin/busybox mkdir -p /musl/crash-ns; printf ns > /musl/crash-ns/a; /bin/busybox mv /musl/crash-ns/a /musl/crash-ns/b; /bin/busybox rm /musl/crash-ns/b; /bin/busybox rmdir /musl/crash-ns; /bin/busybox sync; echo crash-workload-namespace:$?\n"
+expect "crash-workload-namespace:0" within 30000
+expect "/ # " within 30000
+
+group orphan
+send "/bin/busybox mkdir -p /musl/crash-orphan; printf orphan > /musl/crash-orphan/live; exec 3</musl/crash-orphan/live; /bin/busybox rm /musl/crash-orphan/live; /bin/busybox cat <&3; status=$?; exec 3<&-; /bin/busybox sync; echo crash-workload-orphan:$status\n"
+expect "orphan" within 10000
+expect "crash-workload-orphan:0" within 30000
+expect "/ # " within 30000
+
+quit

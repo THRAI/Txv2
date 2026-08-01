@@ -172,7 +172,7 @@ impl RunWorkspace {
         self.child_processes.clear();
     }
 
-    fn write_failed_receipt(&self) {
+    fn write_failed_receipt(&self, dir: &Path) {
         let authorities = self.authorities.clone().unwrap_or_else(|| {
             authority_input_summary(
                 "0".repeat(64),
@@ -193,8 +193,8 @@ impl RunWorkspace {
         );
         let receipt =
             Tier1AcceptanceReceipt::from_dry_run(&self.run_id, commit, authorities, &[note]);
-        let _ = fs::create_dir_all(&self.final_dir);
-        let _ = receipt.write_json(&self.final_dir.join("failed-receipt.json"));
+        let _ = fs::create_dir_all(dir);
+        let _ = receipt.write_json(&dir.join("failed-receipt.json"));
     }
 }
 
@@ -204,8 +204,15 @@ impl Drop for RunWorkspace {
             return;
         }
         self.kill_children();
-        self.write_failed_receipt();
-        let _ = fs::remove_dir_all(&self.temporary);
+        self.write_failed_receipt(&self.temporary);
+        if self.final_dir.exists() {
+            let _ = fs::remove_dir_all(&self.final_dir);
+        }
+        if self.temporary.exists() {
+            let _ = fs::rename(&self.temporary, &self.final_dir);
+        } else {
+            self.write_failed_receipt(&self.final_dir);
+        }
     }
 }
 

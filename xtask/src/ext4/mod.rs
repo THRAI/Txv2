@@ -14,6 +14,12 @@ use crate::util::{
 mod receipt;
 mod run_workspace;
 
+const G0_EXT4_LINTS: &[&str] = &[
+    "ext4-lifecycle-ownership",
+    "ext4-no-direct-home-write",
+    "ext4-durability-flags",
+];
+
 #[cfg(test)]
 mod tests;
 
@@ -65,6 +71,8 @@ fn run_live_tier1(
         }
     }
 
+    run_g0_lints(root)?;
+
     full_build::full_build(
         root,
         vec![
@@ -111,8 +119,8 @@ fn run_live_tier1(
         ),
     )?;
 
+    let crash_campaign = run_crash_cut_campaign(run, &invocation.authorities.crash_cuts)?;
     let mut e2fsck_results = Vec::new();
-    let mut e2fsck_failures = 0usize;
     for (role, path) in [
         ("test", &test_image),
         ("scratch", &scratch_image),
@@ -120,9 +128,6 @@ fn run_live_tier1(
     ] {
         let (exit_code, output) =
             run_capture(root, &e2fsck, &["-fn".into(), path.display().to_string()])?;
-        if exit_code != 0 {
-            e2fsck_failures += 1;
-        }
         e2fsck_results.push(receipt::E2fsckImageResult {
             role: role.into(),
             image_sha256: sha256_file(path)?,
@@ -132,8 +137,11 @@ fn run_live_tier1(
             println!("{output}");
         }
     }
-
-    let crash_cuts = run_crash_cut_campaign(run, &invocation.authorities.crash_cuts)?;
+    e2fsck_results.extend(crash_campaign.immutable_images);
+    let e2fsck_failures = e2fsck_results
+        .iter()
+        .filter(|image| image.exit_code != 0)
+        .count();
     let xfstests_summary = run_xfstests_selection(root, run, &invocation.authorities)?;
     let role_images = receipt::RoleImages {
         test: receipt::RoleImage {
@@ -162,7 +170,7 @@ fn run_live_tier1(
         commit,
         invocation.authorities.as_input_summary(),
         role_images,
-        crash_cuts,
+        crash_campaign.summary,
         receipt::E2fsckSummary {
             immutable_images: e2fsck_results,
             failures: e2fsck_failures,
@@ -199,16 +207,185 @@ fn tier1_shell_test_args(
     ]
 }
 
+#[derive(Debug)]
+struct CrashCutCampaignEvidence {
+    summary: receipt::CrashCuts,
+    immutable_images: Vec<receipt::E2fsckImageResult>,
+}
+
+#[derive(Debug, Clone)]
+struct CrashCutOutcome {
+    cut_id: String,
+    immutable_image_sha256: String,
+    e2fsck_exit_code: i32,
+    replay_exit_code: i32,
+}
+
+impl CrashCutCampaignEvidence {
+    #[allow(dead_code)]
+    fn new(
+        summary: receipt::CrashCuts,
+        immutable_images: Vec<receipt::E2fsckImageResult>,
+    ) -> Result<Self> {
+        if immutable_images.len() < summary.completed {
+            return Err(format!(
+                "crash-cut e2fsck coverage mismatch: completed={} immutable_images={}",
+                summary.completed,
+                immutable_images.len()
+            ));
+        }
+        Ok(Self {
+            summary,
+            immutable_images,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn from_outcomes(summary: receipt::CrashCuts, outcomes: Vec<CrashCutOutcome>) -> Result<Self> {
+        if outcomes.len() < summary.completed {
+            return Err(format!(
+                "crash-cut outcome coverage mismatch: completed={} outcomes={}",
+                summary.completed,
+                outcomes.len()
+            ));
+        }
+        let mut immutable_images = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            if outcome.e2fsck_exit_code != 0 {
+                return Err(format!(
+                    "e2fsck failed for {} with exit {}",
+                    outcome.cut_id, outcome.e2fsck_exit_code
+                ));
+            }
+            if outcome.replay_exit_code != 0 {
+                return Err(format!(
+                    "replay failed for {} with exit {}",
+                    outcome.cut_id, outcome.replay_exit_code
+                ));
+            }
+            immutable_images.push(receipt::E2fsckImageResult {
+                role: outcome.cut_id,
+                image_sha256: outcome.immutable_image_sha256,
+                exit_code: outcome.e2fsck_exit_code,
+            });
+        }
+        Self::new(summary, immutable_images)
+    }
+
+    #[allow(dead_code)]
+    fn from_outcome_manifest(path: &Path) -> Result<Self> {
+        let value = read_json(path)?;
+        let schema = value
+            .get("schema")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "{}: missing schema tx.ext4.crash_cut_outcome_manifest.v1",
+                    path.display()
+                )
+            })?;
+        if schema != "tx.ext4.crash_cut_outcome_manifest.v1" {
+            return Err(format!(
+                "{}: expected schema tx.ext4.crash_cut_outcome_manifest.v1, found {schema}",
+                path.display()
+            ));
+        }
+        let completed = required_usize(&value, "completed", path)?;
+        let required = required_usize(&value, "required", path)?;
+        let families = required_string_array(&value, "families", path)?;
+        let outcomes = value
+            .get("outcomes")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| format!("{}: missing outcomes", path.display()))?
+            .iter()
+            .map(|entry| CrashCutOutcome::parse(entry, path))
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_outcomes(
+            receipt::CrashCuts {
+                completed,
+                required,
+                families,
+            },
+            outcomes,
+        )
+    }
+}
+
+impl CrashCutOutcome {
+    fn parse(value: &serde_json::Value, path: &Path) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{}: outcome entries must be objects", path.display()))?;
+        Ok(Self {
+            cut_id: required_object_string(object, "cut_id", path)?,
+            immutable_image_sha256: required_object_string(object, "immutable_image_sha256", path)?,
+            e2fsck_exit_code: required_object_i32(object, "e2fsck_exit_code", path)?,
+            replay_exit_code: required_object_i32(object, "replay_exit_code", path)?,
+        })
+    }
+}
+
 fn run_crash_cut_campaign(
-    _run: &run_workspace::RunWorkspace,
+    run: &mut run_workspace::RunWorkspace,
     crash_cuts: &CrashCutCatalog,
-) -> Result<receipt::CrashCuts> {
+) -> Result<CrashCutCampaignEvidence> {
+    if let Some(campaign) = &crash_cuts.campaign {
+        let manifest = write_crash_cut_execution_manifest(run, crash_cuts, campaign)?;
+        run.record_artifact("crash-campaign-plan", manifest.clone())?;
+        return Err(format!(
+            "deterministic crash-cut executor is not implemented; wrote {} but refusing to synthesize completed={} across {} families from {}",
+            manifest.display(),
+            crash_cuts.expanded_cut_count,
+            crash_cuts.families.len(),
+            crash_cuts.file.path.display()
+        ));
+    }
     Err(format!(
         "deterministic crash-cut campaign runner is not implemented; refusing to synthesize completed={} across {} families from {}",
         crash_cuts.expanded_cut_count,
         crash_cuts.families.len(),
         crash_cuts.file.path.display()
     ))
+}
+
+fn write_crash_cut_execution_manifest(
+    run: &run_workspace::RunWorkspace,
+    crash_cuts: &CrashCutCatalog,
+    campaign: &CrashCutCampaignPlan,
+) -> Result<PathBuf> {
+    let cuts = (0..crash_cuts.expanded_cut_count)
+        .map(|idx| {
+            let family = &crash_cuts.families[idx % crash_cuts.families.len()];
+            serde_json::json!({
+                "id": format!("crash-cut-{idx:04}"),
+                "index": idx,
+                "family": family,
+                "workload_script": campaign.workload_script.display().to_string(),
+                "workload_script_sha256": &campaign.workload_script_sha256,
+                "replay_script": campaign.replay_script.display().to_string(),
+                "replay_script_sha256": &campaign.replay_script_sha256,
+                "kill_policy": &campaign.kill_policy,
+                "e2fsck_mode": &campaign.e2fsck_mode,
+                "immutable_image": format!("crash-cut-{idx:04}.img")
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schema": "tx.ext4.crash_cut_execution_manifest.v1",
+        "expanded_cut_count": crash_cuts.expanded_cut_count,
+        "families": &crash_cuts.families,
+        "workload_script": campaign.workload_script.display().to_string(),
+        "workload_script_sha256": &campaign.workload_script_sha256,
+        "replay_script": campaign.replay_script.display().to_string(),
+        "replay_script_sha256": &campaign.replay_script_sha256,
+        "kill_policy": &campaign.kill_policy,
+        "e2fsck_mode": &campaign.e2fsck_mode,
+        "cuts": cuts
+    });
+    let path = run.working_dir().join("crash-campaign-plan.json");
+    let text = serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
+    fs::write(&path, text).map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
 }
 
 #[derive(Debug)]
@@ -247,6 +424,17 @@ impl Tier1Invocation {
             self.authorities.crash_cuts.file.path.display(),
             self.authorities.crash_cuts.sha256()
         );
+        if let Some(campaign) = &self.authorities.crash_cuts.campaign {
+            println!(
+                "ext4 tier1: crash campaign workload={} sha256 {} replay={} sha256 {} kill-policy={} e2fsck-mode={}",
+                campaign.workload_script.display(),
+                campaign.workload_script_sha256,
+                campaign.replay_script.display(),
+                campaign.replay_script_sha256,
+                campaign.kill_policy,
+                campaign.e2fsck_mode
+            );
+        }
         println!(
             "ext4 tier1: shell-scenario {} sha256 {}",
             self.authorities.shell_scenario.path.display(),
@@ -264,6 +452,7 @@ impl Tier1Invocation {
 
     fn planned_actions(&self) -> Vec<String> {
         vec![
+            "run G0 ext4 ownership and durability lints".into(),
             "build candidate".into(),
             "build busybox ext4 base image".into(),
             "create fresh TEST/SCRATCH/WORKLOAD images".into(),
@@ -275,6 +464,22 @@ impl Tier1Invocation {
             "write immutable acceptance receipt".into(),
         ]
     }
+}
+
+fn run_g0_lints(root: &Path) -> Result<()> {
+    for rule in G0_EXT4_LINTS {
+        run_cmd_owned_in(
+            root,
+            "cargo",
+            &[
+                "xtask".into(),
+                "lint".into(),
+                "invariants".into(),
+                (*rule).into(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
@@ -328,7 +533,10 @@ impl Tier1Authorities {
             selection: XfstestsSelection::load(
                 root.join("tools/ext4/tier1/xfstests-selection.json"),
             )?,
-            crash_cuts: CrashCutCatalog::load(root.join("tools/ext4/tier1/crash-cuts.json"))?,
+            crash_cuts: CrashCutCatalog::load_with_root(
+                root.join("tools/ext4/tier1/crash-cuts.json"),
+                root,
+            )?,
             shell_scenario: AuthorityFile::load(root.join("tools/shell-tests/ext4-tier1.scn"))?,
         })
     }
@@ -530,10 +738,30 @@ struct CrashCutCatalog {
     status: String,
     expanded_cut_count: usize,
     families: Vec<String>,
+    campaign: Option<CrashCutCampaignPlan>,
+}
+
+#[derive(Debug)]
+struct CrashCutCampaignPlan {
+    workload_script: PathBuf,
+    workload_script_sha256: String,
+    replay_script: PathBuf,
+    replay_script_sha256: String,
+    kill_policy: String,
+    e2fsck_mode: String,
 }
 
 impl CrashCutCatalog {
+    #[allow(dead_code)]
     fn load(path: PathBuf) -> Result<Self> {
+        Self::load_inner(path, None)
+    }
+
+    fn load_with_root(path: PathBuf, root: &Path) -> Result<Self> {
+        Self::load_inner(path, Some(root))
+    }
+
+    fn load_inner(path: PathBuf, root: Option<&Path>) -> Result<Self> {
         let value: serde_json::Value = read_json(&path)?;
         let schema = value
             .get("schema")
@@ -586,6 +814,7 @@ impl CrashCutCatalog {
                 ));
             }
         }
+        let campaign = CrashCutCampaignPlan::load_optional(&value, &path, root)?;
         Ok(Self {
             file: AuthorityFile::load(path)?,
             status,
@@ -599,6 +828,7 @@ impl CrashCutCatalog {
                         .map(str::to_string)
                 })
                 .collect(),
+            campaign,
         })
     }
 
@@ -607,15 +837,163 @@ impl CrashCutCatalog {
     }
 
     fn live_acceptance_blocker(&self) -> Option<String> {
-        if self.status == "acceptance-ready" {
-            None
-        } else {
-            Some(format!(
+        if self.status != "acceptance-ready" {
+            return Some(format!(
                 "crash-cut catalog status is `{}`; expected `acceptance-ready`",
                 self.status
-            ))
+            ));
         }
+        if self.campaign.is_none() {
+            return Some("crash-cut catalog is acceptance-ready but missing campaign plan".into());
+        }
+        None
     }
+}
+
+impl CrashCutCampaignPlan {
+    fn load_optional(
+        value: &serde_json::Value,
+        path: &Path,
+        root: Option<&Path>,
+    ) -> Result<Option<Self>> {
+        let Some(campaign) = value.get("campaign") else {
+            return Ok(None);
+        };
+        let campaign = campaign
+            .as_object()
+            .ok_or_else(|| format!("{}: campaign must be an object", path.display()))?;
+        let workload_script = required_repo_relative_path(campaign, "workload_script", path)?;
+        let replay_script = required_repo_relative_path(campaign, "replay_script", path)?;
+        let kill_policy = required_string(campaign, "kill_policy", path)?;
+        if kill_policy != "deterministic-phase-marker-v1" {
+            return Err(format!(
+                "{}: campaign.kill_policy must be deterministic-phase-marker-v1",
+                path.display()
+            ));
+        }
+        let e2fsck_mode = required_string(campaign, "e2fsck_mode", path)?;
+        if e2fsck_mode != "immutable-copy" {
+            return Err(format!(
+                "{}: campaign.e2fsck_mode must be immutable-copy",
+                path.display()
+            ));
+        }
+        let workload_script_sha256 =
+            required_existing_campaign_artifact_sha256(root, &workload_script, "workload_script")?;
+        let replay_script_sha256 =
+            required_existing_campaign_artifact_sha256(root, &replay_script, "replay_script")?;
+        Ok(Some(Self {
+            workload_script,
+            workload_script_sha256,
+            replay_script,
+            replay_script_sha256,
+            kill_policy,
+            e2fsck_mode,
+        }))
+    }
+}
+
+fn required_existing_campaign_artifact_sha256(
+    root: Option<&Path>,
+    relative_path: &Path,
+    key: &str,
+) -> Result<String> {
+    let Some(root) = root else {
+        return Ok("0".repeat(64));
+    };
+    let artifact = root.join(relative_path);
+    if !artifact.is_file() {
+        return Err(format!(
+            "missing campaign.{key} artifact {}",
+            artifact.display()
+        ));
+    }
+    sha256_file(&artifact)
+}
+
+fn required_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<String> {
+    object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: missing campaign.{key}", path.display()))
+}
+
+fn required_usize(value: &serde_json::Value, key: &str, path: &Path) -> Result<usize> {
+    let Some(raw) = value.get(key).and_then(|value| value.as_u64()) else {
+        return Err(format!("{}: missing {key}", path.display()));
+    };
+    usize::try_from(raw).map_err(|_| format!("{}: {key} is too large", path.display()))
+}
+
+fn required_string_array(value: &serde_json::Value, key: &str, path: &Path) -> Result<Vec<String>> {
+    value
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing {key}", path.display()))?
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!(
+                        "{}: {key} entries must be non-empty strings",
+                        path.display()
+                    )
+                })
+        })
+        .collect()
+}
+
+fn required_object_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<String> {
+    object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: missing outcome.{key}", path.display()))
+}
+
+fn required_object_i32(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<i32> {
+    let Some(raw) = object.get(key).and_then(|value| value.as_i64()) else {
+        return Err(format!("{}: missing outcome.{key}", path.display()));
+    };
+    i32::try_from(raw).map_err(|_| format!("{}: outcome.{key} is out of range", path.display()))
+}
+
+fn required_repo_relative_path(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<PathBuf> {
+    let value = required_string(object, key, path)?;
+    let value = PathBuf::from(value);
+    if value.is_absolute()
+        || value
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "{}: campaign.{key} must be repository-relative without `..`",
+            path.display()
+        ));
+    }
+    Ok(value)
 }
 
 fn read_json(path: &Path) -> Result<serde_json::Value> {
