@@ -1420,12 +1420,27 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             let mounted = if read_only {
                 tx_fs::tx_ext4::mount_ext4_read_only(image)
             } else {
-                tx_fs::tx_ext4::mount_ext4_read_write(image)
+                let device = tx_subsystems::io_manager::block::DeviceKey::new(reg.devt.raw());
+                let Some(geometry) = image.block_geometry(device) else {
+                    return SyscallResult::Error(EIO_VALUE);
+                };
+                let pool = match tx_fs::tx_ext4::JournalPagePool::new(32) {
+                    Ok(pool) => pool,
+                    Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+                };
+                tx_fs::tx_ext4::mount_ext4_read_write_with_discovered_journal(
+                    image, geometry, device, pool,
+                )
             };
             let mounted = match mounted {
                 Ok(m) => m,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
+            mounted.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+                tx_fs::tx_ext4::Ext4FileIoRuntimeBinder::new(
+                    tx_subsystems::device::BlockDeviceHandle::whole(reg),
+                ),
+            )));
             let root_id = mounted.root_fs_object_id;
             let root_meta = mounted.root_inode_meta.clone();
             let fs_ops = mounted.fs_ops();

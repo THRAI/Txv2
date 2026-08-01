@@ -118,19 +118,40 @@ fn tier1_live_rejects_placeholder_authorities_before_acceptance_receipt() {
 }
 
 #[test]
-fn tier1_shell_matrix_runs_against_scratch_image() {
+fn tier1_shell_matrix_passes_role_images_in_device_order() {
     let root = temp_root("scratch-matrix");
     let scenario = root.join("tools/shell-tests/ext4-tier1.scn");
+    let test = root.join("target/ext4/tier1/run/test.img");
     let scratch = root.join("target/ext4/tier1/run/scratch.img");
-    let args = tier1_shell_test_args(TxTarget::Rv64Qemu, &scenario, &scratch);
+    let workload = root.join("target/ext4/tier1/run/workload.img");
+    let args = tier1_shell_test_args(TxTarget::Rv64Qemu, &scenario, &test, &scratch, &workload);
     let rendered = args.join(" ");
 
     assert!(rendered.contains("--target rv64-qemu"));
     assert!(rendered.contains("--profile busybox"));
     assert!(rendered.contains("--extra-rv64-ext4"));
+    assert!(rendered.contains(&test.display().to_string()));
     assert!(rendered.contains(&scratch.display().to_string()));
-    assert!(!rendered.contains("workload.img"));
-    assert!(!rendered.contains("test.img"));
+    assert!(rendered.contains(&workload.display().to_string()));
+    let role_paths: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| {
+            if arg == "--extra-rv64-ext4" {
+                args.get(idx + 1).cloned()
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        role_paths,
+        vec![
+            test.display().to_string(),
+            scratch.display().to_string(),
+            workload.display().to_string()
+        ]
+    );
 }
 
 #[test]

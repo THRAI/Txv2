@@ -1,3 +1,30 @@
+- 2026-08-02 (ext4 Tier 1 role scenario reaches three live images).
+  Advanced Task 15 without promoting Task 16. The live Tier 1 shell args now
+  pass TEST, SCRATCH, and WORKLOAD images in stable `txblk0..2` order, and
+  `tools/shell-tests/ext4-tier1.scn` consumes all three roles: boot-mounted
+  TEST is verified, WORKLOAD is mounted read-only and rejects writes with
+  EROFS, then SCRATCH is mounted read-write for the data, setattr, namespace,
+  orphan, durability, remount, execute, and detach groups. Dynamic ext4
+  `sys_mount` now uses the same discovered-journal RW mount path and
+  `Ext4FileIoRuntimeBinder` wiring as the boot `/musl` mount; otherwise
+  SCRATCH namespace mutation returned EOPNOTSUPP. Verification passed
+  `rustfmt --edition 2024 --check crates/tx-shims/src/linux_syscall/fs_mut.rs
+  xtask/src/ext4/mod.rs xtask/src/ext4/tests.rs`, `cargo check -p tx-shims -q`,
+  `cargo test -p tx-shims --lib mount -- --test-threads=1` (11),
+  `cargo test -p xtask ext4 -- --test-threads=1` (23),
+  `cargo xtask build --target rv64-qemu`, and a fresh full 8-group QEMU
+  `cargo xtask shell-test --target rv64-qemu --profile busybox
+  --extra-rv64-ext4 target/ext4/probe/tier1-role-test.img
+  --extra-rv64-ext4 target/ext4/probe/tier1-role-scratch.img
+  --extra-rv64-ext4 target/ext4/probe/tier1-role-workload.img --script
+  tools/shell-tests/ext4-tier1.scn` with 8 passed and 0 failed, and final
+  `cargo -q xtask unit` (652 + 114 + 64 + 167). Offline `e2fsck -fn` on the
+  temporary TEST and WORKLOAD images exited 0, but SCRATCH still failed with
+  invalid unused-inode accounting and inode checksum errors after the RW
+  matrix. Task 16 remains open: SCRATCH checkpoint/accounting, normal immutable
+  `e2fsck -fn`, deterministic crash/replay, pinned xfstests, and final G0-G7
+  receipt still need closure.
+
 - 2026-08-02 (ext4 Tier 1 three-drive RV64 foundation).
   Advanced the TEST/SCRATCH/WORKLOAD role wiring foundation without promoting
   Task 16. RV64 QEMU platform info now exposes `virtio0`, `virtio1`, and

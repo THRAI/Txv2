@@ -102,7 +102,13 @@ fn run_live_tier1(
     let scenario = root.join("tools/shell-tests/ext4-tier1.scn");
     shell_test::shell_test(
         root,
-        tier1_shell_test_args(base_target, &scenario, &scratch_image),
+        tier1_shell_test_args(
+            base_target,
+            &scenario,
+            &test_image,
+            &scratch_image,
+            &workload_image,
+        ),
     )?;
 
     let mut e2fsck_results = Vec::new();
@@ -170,7 +176,13 @@ fn run_live_tier1(
     Ok(())
 }
 
-fn tier1_shell_test_args(target: TxTarget, scenario: &Path, scratch_image: &Path) -> Vec<String> {
+fn tier1_shell_test_args(
+    target: TxTarget,
+    scenario: &Path,
+    test_image: &Path,
+    scratch_image: &Path,
+    workload_image: &Path,
+) -> Vec<String> {
     vec![
         "--target".into(),
         target.name().to_string(),
@@ -179,7 +191,11 @@ fn tier1_shell_test_args(target: TxTarget, scenario: &Path, scratch_image: &Path
         "--script".into(),
         scenario.display().to_string(),
         "--extra-rv64-ext4".into(),
+        test_image.display().to_string(),
+        "--extra-rv64-ext4".into(),
         scratch_image.display().to_string(),
+        "--extra-rv64-ext4".into(),
+        workload_image.display().to_string(),
     ]
 }
 
