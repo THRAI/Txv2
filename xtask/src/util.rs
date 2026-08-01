@@ -283,6 +283,17 @@ pub(crate) fn command_exists(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn command_or_candidates(program: &str, candidates: &[&str]) -> Option<String> {
+    if command_exists(program) {
+        return Some(program.to_string());
+    }
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| command_exists(candidate))
+        .map(str::to_string)
+}
+
 pub(crate) fn collect_files(root: &Path, extensions: &[&str]) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     collect_files_inner(root, root, extensions, &mut out)?;

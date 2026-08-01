@@ -9,9 +9,15 @@ wait "/ # " within 90000
 
 group data
 sleep 250
-send "mkdir -p /musl/tier1-data; printf 'alpha\\n' > /musl/tier1-data/file; cat /musl/tier1-data/file; echo tier1-data-status:$?\n"
+send "mkdir -p /musl/tier1-data; echo tier1-data-mkdir:$?\n"
+expect "tier1-data-mkdir:0" within 10000
+expect "/ # " within 10000
+send "printf 'alpha\\n' > /musl/tier1-data/file; echo tier1-data-write:$?\n"
+expect "tier1-data-write:0" within 10000
+expect "/ # " within 10000
+send "cat /musl/tier1-data/file; echo tier1-data-read:$?\n"
 expect "alpha" within 10000
-expect "tier1-data-status:0" within 10000
+expect "tier1-data-read:0" within 10000
 expect "/ # " within 10000
 
 group setattr

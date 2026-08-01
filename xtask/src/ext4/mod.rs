@@ -7,7 +7,9 @@ use crate::image;
 use crate::shell_test;
 use crate::Result;
 use crate::target::TxTarget;
-use crate::util::{command_exists, optional_option_value, run_cmd_owned_in, shell_join};
+use crate::util::{
+    command_exists, command_or_candidates, optional_option_value, run_cmd_owned_in, shell_join,
+};
 
 mod receipt;
 mod run_workspace;
@@ -44,8 +46,19 @@ fn run_live_tier1(
 ) -> Result<()> {
     let action_log = invocation.planned_actions();
     let base_target = TxTarget::Rv64Qemu;
+    let e2fsck = command_or_candidates(
+        "e2fsck",
+        &[
+            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
+            "/opt/homebrew/sbin/e2fsck",
+            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/e2fsck",
+            "/usr/local/opt/e2fsprogs/sbin/e2fsck",
+            "/usr/local/sbin/e2fsck",
+        ],
+    )
+    .ok_or_else(|| "e2fsck is required for the live Tier 1 runner".to_string())?;
 
-    for tool in ["e2fsck", "git"] {
+    for tool in ["git"] {
         if !command_exists(tool) {
             return Err(format!("{tool} is required for the live Tier 1 runner"));
         }
@@ -54,6 +67,16 @@ fn run_live_tier1(
     full_build::full_build(
         root,
         vec!["--target".into(), base_target.name().to_string(), "--skip-doctor".into()],
+    )?;
+    image::image(
+        root,
+        vec![
+            "ext4".into(),
+            "--profile".into(),
+            "busybox".into(),
+            "--target".into(),
+            base_target.name().to_string(),
+        ],
     )?;
 
     let base_image = root
@@ -93,7 +116,7 @@ fn run_live_tier1(
     ] {
         let (exit_code, output) = run_capture(
             root,
-            "e2fsck",
+            &e2fsck,
             &["-fn".into(), path.display().to_string()],
         )?;
         if exit_code != 0 {
@@ -204,6 +227,7 @@ impl Tier1Invocation {
     fn planned_actions(&self) -> Vec<String> {
         vec![
             "build candidate".into(),
+            "build busybox ext4 base image".into(),
             "create fresh TEST/SCRATCH/WORKLOAD images".into(),
             "run guest matrix".into(),
             "execute deterministic crash cuts".into(),

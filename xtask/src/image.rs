@@ -8,7 +8,8 @@ use std::process::Command;
 use crate::Result;
 use crate::target::{Profile, TxTarget};
 use crate::util::{
-    command_exists, option_value, optional_option_value, run_cmd_owned, run_shell, shell_escape,
+    command_exists, command_or_candidates, option_value, optional_option_value, run_cmd_owned,
+    run_shell, shell_escape,
 };
 
 pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
@@ -207,11 +208,19 @@ fn image_ext4_busybox(
     target: TxTarget,
     output_name: &str,
 ) -> Result<()> {
-    if !command_exists("mkfs.ext4") {
-        return Err("mkfs.ext4 is required to create the busybox ext4 image".into());
-    }
+    let mkfs_ext4 = command_or_candidates(
+        "mkfs.ext4",
+        &[
+            "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/opt/homebrew/sbin/mkfs.ext4",
+            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/mkfs.ext4",
+            "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/usr/local/sbin/mkfs.ext4",
+        ],
+    )
+    .ok_or_else(|| "mkfs.ext4 is required to create the busybox ext4 image".to_string())?;
     let size = optional_option_value(args, "--size").unwrap_or_else(|| "64M".to_string());
-    let layout = prepare_busybox_rootfs(root, target)?;
+    let layout = prepare_busybox_ext4_rootfs(root, target)?;
     let out = root.join("target").join("images").join(output_name);
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
@@ -224,9 +233,17 @@ fn image_ext4_busybox(
     )?;
     run_cmd_owned(
         root,
-        "mkfs.ext4",
+        &mkfs_ext4,
         &[
             "-F".into(),
+            "-b".into(),
+            "4096".into(),
+            "-I".into(),
+            "256".into(),
+            "-O".into(),
+            "^orphan_file,^metadata_csum_seed".into(),
+            "-E".into(),
+            "lazy_itable_init=0,lazy_journal_init=0".into(),
             "-L".into(),
             "TXROOT".into(),
             "-d".into(),
@@ -236,6 +253,21 @@ fn image_ext4_busybox(
     )?;
     println!("wrote {} ({size})", out.display());
     Ok(())
+}
+
+fn prepare_busybox_ext4_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
+    let busybox = resolve_busybox(root, target)?;
+
+    let layout = root
+        .join("target")
+        .join("rootfs")
+        .join(format!("busybox-ext4-{}", target.name()));
+    if layout.exists() {
+        fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(layout.join("musl")).map_err(|err| err.to_string())?;
+    fs::copy(&busybox, layout.join("musl").join("busybox")).map_err(|err| err.to_string())?;
+    Ok(layout)
 }
 
 fn remove_existing_image(path: &Path) -> Result<()> {

@@ -4,10 +4,10 @@
     "block_size": 4096,
     "inode_sizes": [128, 256],
     "feature_bits": {
-      "compat_allowed": 4,
+      "compat_allowed": 60,
       "incompat_required": 64,
-      "incompat_allowed": 8388,
-      "ro_compat_allowed": 1032,
+      "incompat_allowed": 8902,
+      "ro_compat_allowed": 1131,
       "metadata_csum_required": true,
       "ordered_jbd2_required": true
     },
