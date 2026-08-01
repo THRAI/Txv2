@@ -792,6 +792,110 @@ fn truncate_plan_releases_complete_tail_blocks_with_revoke_claims() {
 }
 
 #[test]
+fn destroy_plan_frees_zero_link_regular_inode_without_home_write() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 31);
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut victim = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    victim.links_count = 0;
+    victim.dtime = 44;
+    write_inode(&mut image, 12, &victim);
+
+    let block_bitmap_before = *image.block(2);
+    let inode_bitmap_before = *image.block(3);
+    let inode_table_before = *image.block(4);
+    let superblock_before = *image.block(0);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_destroy_inode(InodeNo::new(12), FsyncStamp::new(44))
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Destroy);
+    assert_eq!(plan.object, 12);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert_eq!(
+        plan.revokes,
+        vec![
+            tx_ext4_format::mutation::RevokeRecord { physical_block: 20 },
+            tx_ext4_format::mutation::RevokeRecord { physical_block: 21 },
+            tx_ext4_format::mutation::RevokeRecord { physical_block: 30 }
+        ]
+    );
+    assert_eq!(
+        plan.deferred_frees,
+        vec![
+            tx_ext4_format::mutation::DeferredFreeClaim { physical_block: 20 },
+            tx_ext4_format::mutation::DeferredFreeClaim { physical_block: 21 },
+            tx_ext4_format::mutation::DeferredFreeClaim { physical_block: 30 }
+        ]
+    );
+
+    let block_bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    assert_eq!(block_bitmap.home, 2);
+    assert!(!BitmapView::new(&block_bitmap.after).is_set(20));
+    assert!(!BitmapView::new(&block_bitmap.after).is_set(21));
+    assert!(!BitmapView::new(&block_bitmap.after).is_set(30));
+
+    let inode_bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeBitmap)
+        .unwrap();
+    assert_eq!(inode_bitmap.home, 3);
+    assert!(!BitmapView::new(&inode_bitmap.after).is_set(11));
+
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    let parsed_group = GroupDesc::parse(&group_desc.after[..64]).unwrap();
+    assert_eq!(parsed_group.free_blocks_count, 35);
+    assert_eq!(parsed_group.free_inodes_count, 53);
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let parsed_superblock = Superblock::parse(&superblock.after[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.free_blocks_count, 35);
+    assert_eq!(parsed_superblock.free_inodes_count, 53);
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert!(inode_table.after[11 * 256..12 * 256]
+        .iter()
+        .all(|byte| *byte == 0));
+
+    assert_eq!(pager.image().block(2), &block_bitmap_before);
+    assert_eq!(pager.image().block(3), &inode_bitmap_before);
+    assert_eq!(pager.image().block(4), &inode_table_before);
+    assert_eq!(pager.image().block(0), &superblock_before);
+}
+
+#[test]
+fn destroy_plan_rejects_nonzero_link_inode() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    assert_eq!(
+        pager.plan_destroy_inode(InodeNo::new(12), FsyncStamp::new(45)),
+        Err(Ext4FormatError::Unsupported)
+    );
+}
+
+#[test]
 fn namespace_plan_unlinks_dir_entry_and_decrements_nlink_without_home_write() {
     let image = mock_image();
     let dir_before = *image.block(16);

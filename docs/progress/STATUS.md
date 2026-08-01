@@ -1,3 +1,28 @@
+- 2026-08-01 (ext4 Task 12 zero-link destroy admission).
+  Advanced Task 12 without marking it complete. `Ext4Pager::plan_destroy_inode`
+  now builds a bounded immutable Destroy mutation for zero-link regular files
+  with inline initialized extent leaves in one block group: it clears data-block
+  and inode bitmap bits, increments group/superblock free block+inode counters,
+  clears the inode-table record, emits revoke/deferred-free claims for released
+  data blocks, and leaves home blocks untouched. `FsOps::destroy_inode` now
+  admits that bounded shape through the mount-owned
+  `JournalMutationRuntime::begin_mutation`; read-only mounts remain `EROFS` and
+  mounts without a mutation runtime remain `EOPNOTSUPP`. Directory destroy,
+  indexed/unwritten/cross-group extents, classic orphan recovery, crash-truncate
+  replay, and e2fsck/xfstests evidence remain open. Verification passed
+  `cargo test -p tx-ext4-format --test pager_mock destroy_plan_ --
+  --test-threads=1` (2), `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_ -- --test-threads=1` (9), `cargo test -p tx-ext4-format
+  --test pager_mock -- --test-threads=1` (34), `cargo test -p tx-ext4 --lib
+  --no-default-features ext4_destroy_public_path_admits_zero_link_regular_inode_without_home_write
+  -- --test-threads=1`, `cargo test -p tx-ext4 --lib --no-default-features
+  namespace -- --test-threads=1` (5), `cargo test -p tx-ext4 --lib
+  --no-default-features -- --test-threads=1` (56), `cargo test -p tx-ext4
+  --test journal_prepared_transaction -- --test-threads=1` (9), and
+  `cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7);
+  after fixing the pre-existing VM recipe-generation guard regression,
+  `cargo -q xtask unit` also passed (646 + 114 + 56 + 166).
+
 - 2026-08-01 (VM recipe-generation guard compatibility).
   Fixed the previous recipe-generation follow-up so VM checks reuse an active
   epoch guard with `borrow_current_guard().unwrap_or_else(guard)` instead of

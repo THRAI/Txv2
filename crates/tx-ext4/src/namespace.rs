@@ -753,10 +753,36 @@ where
 
     fn destroy_inode(
         &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_destroy_inode(inode, FsyncStamp::new(current.ctime.into()))
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
+            Ok(()) => {
+                self.settle_metadata_caches();
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
     }
 
     fn settle_file(

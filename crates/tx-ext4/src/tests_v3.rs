@@ -284,6 +284,29 @@ fn build_tier1_mount_image() -> MemImage {
     image
 }
 
+fn build_tier1_destroy_image() -> MemImage {
+    let mut image = build_tier1_mount_image();
+    mark_inode_bitmap_used(&mut image, 12);
+    let mut victim = Inode::default();
+    victim.mode = 0x8000 | 0o644;
+    victim.uid = 1000;
+    victim.gid = 1000;
+    victim.size = BLOCK_SIZE as u64;
+    victim.links_count = 0;
+    victim.blocks_512 = 8;
+    victim.flags = Inode::EXTENTS_FL;
+    victim.dtime = 41;
+    victim
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 20,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 12, &victim);
+    image
+}
+
 fn build_tier1_empty_dir_image() -> MemImage {
     let mut image = build_tier1_mount_image();
 
@@ -586,6 +609,27 @@ fn mounted_counting_unlink_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_destroy_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 5, true);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_destroy_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 destroy mutation ext4 image");
     (mounted, runtime, writes)
 }
 
@@ -1084,6 +1128,24 @@ fn ext4_unlink_public_path_admits_namespace_mutation_without_home_write() {
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(25)
+    );
+}
+
+#[test]
+fn ext4_destroy_public_path_admits_zero_link_regular_inode_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_destroy_fs(26);
+
+    assert_eq!(
+        mounted.fs_ops().destroy_inode(FsObjectId::new(12), &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(26)
     );
 }
 
@@ -1606,10 +1668,9 @@ fn ext4_v3_mutation_methods_require_a_mutation_owner() {
         V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP)
     );
 
-    // destroy_inode is still unimplemented.
     assert_eq!(
         <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, FsObjectId::new(12), &guard),
-        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP)
     );
 }
 

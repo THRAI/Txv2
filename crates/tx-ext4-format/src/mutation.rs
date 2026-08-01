@@ -17,6 +17,7 @@ pub enum MutationOrigin {
     Unlink,
     Rename,
     Truncate,
+    Destroy,
 }
 
 /// The bounded inode metadata updates supported by the Tier 1 planner.

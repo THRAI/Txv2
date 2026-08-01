@@ -615,6 +615,159 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(plan)
     }
 
+    /// Build a bounded destroy plan for a VFS-proven dead regular inode.
+    ///
+    /// The first Tier 1 destroy slice supports zero-link regular files whose
+    /// data blocks live in an inline initialized extent leaf and one block
+    /// group. Directory destroy, indexed extents, unwritten extents, and
+    /// nonzero-link inodes remain fail-closed.
+    pub fn plan_destroy_inode(
+        &mut self,
+        inode: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        if self.superblock.inodes_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let inode_index = inode
+            .get()
+            .checked_sub(1)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let inode_group = usize::try_from(inode_index / self.superblock.inodes_per_group)
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        let inode_bit = usize::try_from(inode_index % self.superblock.inodes_per_group)
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        let group = self
+            .groups
+            .get(inode_group)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+
+        let location = self.inode_location(inode)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        let disk_inode = Inode::parse(inode_bytes)?;
+        if !disk_inode.is_file() || disk_inode.links_count != 0 {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        let mut freed = Vec::new();
+        let extents = match ExtentNode::parse(disk_inode.extent_root_bytes())? {
+            ExtentNode::Leaf(extents) => extents,
+            ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
+        };
+        for extent in extents {
+            if !extent.is_initialized() {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            for logical in 0..extent.initialized_len() {
+                freed.push(extent.physical_start + logical as u64);
+            }
+        }
+        freed.sort_unstable();
+        if freed.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        let mut block_bitmap_update = None;
+        if let Some(first) = freed.first().copied() {
+            let (block_group, bitmap_home, _) = self.block_group_for_physical(first)?;
+            if block_group != inode_group {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            let mut bitmap_before = [0u8; BLOCK_SIZE];
+            self.image.read_block(bitmap_home, &mut bitmap_before)?;
+            let mut bitmap_after = bitmap_before;
+            for physical_block in freed.iter().copied() {
+                let (candidate_group, candidate_home, bit) =
+                    self.block_group_for_physical(physical_block)?;
+                if candidate_group != block_group || candidate_home != bitmap_home {
+                    return Err(Ext4FormatError::Unsupported);
+                }
+                if !BitmapView::new(&bitmap_after).is_set(bit) {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                BitmapMut::new(&mut bitmap_after).clear(bit)?;
+            }
+            block_bitmap_update = Some((bitmap_home, bitmap_before, bitmap_after));
+        }
+
+        let inode_bitmap_home = group.inode_bitmap_block();
+        let mut inode_bitmap_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(inode_bitmap_home, &mut inode_bitmap_before)?;
+        let mut inode_bitmap_after = inode_bitmap_before;
+        if !BitmapView::new(&inode_bitmap_after).is_set(inode_bit) {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        BitmapMut::new(&mut inode_bitmap_after).clear(inode_bit)?;
+
+        inode_bytes.fill(0);
+
+        let released_blocks =
+            u32::try_from(freed.len()).map_err(|_| Ext4FormatError::Unsupported)?;
+        let (group_desc_home, group_desc_before, group_desc_after) = self
+            .plan_group_destroy_counts(
+                inode_group,
+                block_bitmap_update.as_ref().map(|(_, _, after)| after),
+                &inode_bitmap_after,
+                released_blocks,
+            )?;
+        let (superblock_home, superblock_before, superblock_after) =
+            self.plan_superblock_destroy_counts(released_blocks as u64)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Destroy, inode.get() as u64, fsync_stamp);
+        if let Some((home, before, after)) = block_bitmap_update {
+            for physical_block in freed.iter().copied() {
+                plan.defer_free(physical_block);
+            }
+            plan.push_metadata(MetadataBlock {
+                home,
+                role: MetaRole::BlockBitmap,
+                before_version: crc32c(0, &before) as u64,
+                after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
+        plan.push_metadata(MetadataBlock {
+            home: inode_bitmap_home,
+            role: MetaRole::InodeBitmap,
+            before_version: crc32c(0, &inode_bitmap_before) as u64,
+            after: inode_bitmap_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: group_desc_home,
+            role: MetaRole::GroupDescriptor,
+            before_version: crc32c(0, &group_desc_before) as u64,
+            after: group_desc_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: superblock_home,
+            role: MetaRole::Superblock,
+            before_version: crc32c(0, &superblock_before) as u64,
+            after: superblock_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok(plan)
+    }
+
     fn plan_truncate_tail_free(
         &self,
         plan: &mut Ext4MutationPlan,
@@ -1019,6 +1172,91 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((home, before, after))
     }
 
+    fn plan_group_destroy_counts(
+        &self,
+        group_index: usize,
+        block_bitmap_after: Option<&Page4K>,
+        inode_bitmap_after: &Page4K,
+        released_blocks: u32,
+    ) -> Result<(u64, Page4K, Page4K)> {
+        let desc_size = self.superblock.group_desc_size();
+        let byte_offset = group_index
+            .checked_mul(desc_size)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let gdt_start = if self.superblock.block_size() == 1024 {
+            2
+        } else {
+            1
+        };
+        let home = gdt_start + (byte_offset / BLOCK_SIZE) as u64;
+        let offset = byte_offset % BLOCK_SIZE;
+        if offset + desc_size > BLOCK_SIZE {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let mut before = [0u8; BLOCK_SIZE];
+        self.image.read_block(home, &mut before)?;
+        let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
+        let free_blocks = u32::from(descriptor.free_blocks_count)
+            | (u32::from(descriptor.free_blocks_count_hi) << 16);
+        let free_inodes = u32::from(descriptor.free_inodes_count)
+            | (u32::from(descriptor.free_inodes_count_hi) << 16);
+        let next_free_blocks = free_blocks
+            .checked_add(released_blocks)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let next_free_inodes = free_inodes
+            .checked_add(1)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        if desc_size < 64
+            && (next_free_blocks > u16::MAX as u32 || next_free_inodes > u16::MAX as u32)
+        {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut after = before;
+        after[offset + 12..offset + 14].copy_from_slice(&(next_free_blocks as u16).to_le_bytes());
+        after[offset + 14..offset + 16].copy_from_slice(&(next_free_inodes as u16).to_le_bytes());
+        if desc_size >= 64 {
+            after[offset + 44..offset + 46]
+                .copy_from_slice(&((next_free_blocks >> 16) as u16).to_le_bytes());
+            after[offset + 46..offset + 48]
+                .copy_from_slice(&((next_free_inodes >> 16) as u16).to_le_bytes());
+        }
+        if self.superblock.has_metadata_csum() {
+            if let Some(block_bitmap_after) = block_bitmap_after {
+                let block_bitmap_checksum = block_bitmap_csum32(
+                    self.superblock.metadata_csum_seed(),
+                    block_bitmap_after,
+                    self.superblock.blocks_per_group,
+                )?;
+                after[offset + 24..offset + 26]
+                    .copy_from_slice(&(block_bitmap_checksum as u16).to_le_bytes());
+                if desc_size >= 64 {
+                    after[offset + 56..offset + 58]
+                        .copy_from_slice(&((block_bitmap_checksum >> 16) as u16).to_le_bytes());
+                }
+            }
+            let inode_bitmap_checksum = inode_bitmap_csum32(
+                self.superblock.metadata_csum_seed(),
+                inode_bitmap_after,
+                self.superblock.inodes_per_group,
+            )?;
+            after[offset + 26..offset + 28]
+                .copy_from_slice(&(inode_bitmap_checksum as u16).to_le_bytes());
+            if desc_size >= 64 {
+                after[offset + 58..offset + 60]
+                    .copy_from_slice(&((inode_bitmap_checksum >> 16) as u16).to_le_bytes());
+            }
+            after[offset + 30..offset + 32].fill(0);
+            let group_id = u32::try_from(group_index).map_err(|_| Ext4FormatError::OutOfBounds)?;
+            let checksum = group_desc_csum16(
+                self.superblock.metadata_csum_seed(),
+                group_id,
+                &after[offset..offset + desc_size],
+            );
+            after[offset + 30..offset + 32].copy_from_slice(&checksum.to_le_bytes());
+        }
+        Ok((home, before, after))
+    }
+
     fn plan_group_mkdir_counts(
         &self,
         group_index: usize,
@@ -1180,6 +1418,35 @@ impl<I: BlockImage> Ext4Pager<I> {
         let mut after = before;
         after[1024 + 12..1024 + 16].copy_from_slice(&(next as u32).to_le_bytes());
         after[1024 + 0x158..1024 + 0x15c].copy_from_slice(&((next >> 32) as u32).to_le_bytes());
+        if observed.has_metadata_csum() {
+            let superblock = &mut after[1024..2048];
+            superblock[1020..1024].fill(0);
+            let checksum = superblock_csum32(superblock)?;
+            superblock[1020..1024].copy_from_slice(&checksum.to_le_bytes());
+        }
+        Ok((0, before, after))
+    }
+
+    fn plan_superblock_destroy_counts(
+        &self,
+        released_blocks: u64,
+    ) -> Result<(u64, Page4K, Page4K)> {
+        let mut before = [0u8; BLOCK_SIZE];
+        self.image.read_block(0, &mut before)?;
+        let observed = Superblock::parse(&before[1024..2048])?;
+        let next_free_blocks = observed
+            .free_blocks_count
+            .checked_add(released_blocks)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let next_free_inodes = observed
+            .free_inodes_count
+            .checked_add(1)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let mut after = before;
+        after[1024 + 12..1024 + 16].copy_from_slice(&(next_free_blocks as u32).to_le_bytes());
+        after[1024 + 0x158..1024 + 0x15c]
+            .copy_from_slice(&((next_free_blocks >> 32) as u32).to_le_bytes());
+        after[1024 + 16..1024 + 20].copy_from_slice(&next_free_inodes.to_le_bytes());
         if observed.has_metadata_csum() {
             let superblock = &mut after[1024..2048];
             superblock[1020..1024].fill(0);
