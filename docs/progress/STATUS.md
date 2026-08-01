@@ -1,3 +1,11 @@
+- 2026-08-01 (tx-shims mount-table test isolation).
+  Fixed a full-suite test pollution source in `crates/tx-shims/src/linux_syscall/tests.rs`:
+  the shared setup now resets the global mount table before each test, matching the
+  isolation pattern already used in `tx-subsystems`. This unblocked the full
+  `cargo test -p tx-shims --lib -- --test-threads=1` run, which had been reporting
+  `/f` as a directory after mount-state tests had run. Verification passed the full
+  lib suite with 650 tests. Remaining work stays on Task 12 and later product gates.
+
 - 2026-08-01 (ext4 Task 12 unlinked-open destroy lifetime).
   Advanced Task 12 without marking it complete. The syscall layer no longer
   calls `FsOps::destroy_inode` directly from `unlinkat`, `O_TMPFILE` helper
@@ -45,6 +53,23 @@
   changed, so `cargo xtask progress validate` is not applicable. Next: add TDD
   protect collector tests, instrument the four batch layers, then run a
   lossless Vec/chunked guest A/B before changing the default backend.
+
+- 2026-08-01 (VM pmap zero-copy materialization design recorded).
+  Recorded the current optimization direction in
+  `docs/progress/decisions/2026-08-01-vm-pmap-materialization-sidecar-batch.md`
+  and corrected the companion research note. The settled design uses the
+  hardware page-table hierarchy as the sparse resident index, with root-owned
+  PT-node sidecars carrying occupancy, prune, generation, `MapPin`, and
+  transition metadata; `VmEntry` remains a range-level recipe value. Range
+  mutation is split into detached-cell, fixed-block PTE, invalidation-run, and
+  shootdown-transport gathers, with no global sorted-Vec movement and no
+  HAL/shootdown work under the sidecar lock. The note also records
+  direction-aware recipe/PTE ordering as a proposed correction to the current
+  VM prose. This is a design record only: no Rust implementation or benchmark
+  receipt changed. Verification: `git diff --check` and `cargo xtask lint docs`;
+  next step is to update the canonical VM/HAL/Page Substrate contracts, with
+  RV64 root/ASID, LA64 shootdown, and M1Dock parity still blocking SMP batch
+  implementation.
 
 - 2026-08-01 (ext4 Task 12 zero-link destroy admission).
   Advanced Task 12 without marking it complete. `Ext4Pager::plan_destroy_inode`
