@@ -30004,3 +30004,23 @@
   data/truncate, Task 12 namespace/orphan plans, Task 14 production cutover/G0
   lints, Task 15 `cargo xtask ext4 tier1`, and Task 16 fresh
   QEMU/e2fsck/xfstests receipt.
+
+- 2026-08-01 (ext4 Task 11/12 buffered write and unlink mutation slices).
+  Updated
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  The Task 11 buffered-write slice is committed as `8e51f621`: PageBacked now
+  calls `FsPageBacking::prepare_write_range` before dirty PageSlot publication,
+  and ext4 reserves a single-page growth mutation before replacing its sealed
+  bytes during `flush_page`, with no direct home writes. This follow-up starts
+  Task 12: `Ext4Pager::plan_unlink_dir_entry` emits an immutable `Unlink`
+  mutation with DirectoryBlock plus InodeTable after-images, decrements target
+  nlink, and `FsOps::unlink` admits it through `JournalMutationRuntime` on
+  mutation-journal mounts. Verification passed
+  `cargo test -p tx-ext4-format --test pager_mock -- --test-threads=1` (24),
+  `cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1`
+  (47), `cargo test -p tx-ext4 --test journal_prepared_transaction -- --test-threads=1`
+  (9), `cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1`
+  (7), and touched-file rustfmt. Remaining blockers: Task 11 truncate
+  breadth/reservation cleanup, Task 12 create/mkdir/link/symlink/rmdir,
+  rename/overwrite/orphan/destroy, Task 14 G0 production cutover, Task 15
+  `cargo xtask ext4 tier1`, and Task 16 fresh QEMU/e2fsck/xfstests receipt.

@@ -792,6 +792,58 @@ fn truncate_plan_releases_complete_tail_blocks_with_revoke_claims() {
 }
 
 #[test]
+fn namespace_plan_unlinks_dir_entry_and_decrements_nlink_without_home_write() {
+    let image = mock_image();
+    let dir_before = *image.block(16);
+    let inode_before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_unlink_dir_entry(
+            InodeNo::new(2),
+            b"hello",
+            InodeNo::new(12),
+            FsyncStamp::new(20),
+        )
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Unlink);
+    assert_eq!(plan.object, 12);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 2);
+
+    let dir_block = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::DirectoryBlock)
+        .unwrap();
+    assert_eq!(dir_block.home, 16);
+    let names: Vec<_> = DirEntryIter::new(&dir_block.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert!(!names.iter().any(|name| *name == b"hello"));
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert_eq!(inode_table.home, 4);
+    let inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.links_count, 0);
+    assert_eq!(inode.ctime, 20);
+
+    assert_eq!(pager.image().block(16), &dir_before);
+    assert_eq!(pager.image().block(4), &inode_before);
+}
+
+#[test]
 fn pager_writeback_and_journal_replay_on_mock_image() {
     let image = mock_image();
     let mut pager = Ext4Pager::open(image).unwrap();

@@ -403,6 +403,27 @@ fn mounted_counting_write_growth_fs(
     (mounted, runtime, writes)
 }
 
+fn mounted_counting_unlink_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 2, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_mount_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
 fn page_container_for_mounted_file<I>(
     mounted: &crate::mount::MountedExt4<I>,
     fs_object_id: FsObjectId,
@@ -710,6 +731,26 @@ fn ext4_buffered_extending_write_reserves_before_dirty_and_flushes_without_home_
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(24)
+    );
+}
+
+#[test]
+fn ext4_unlink_public_path_admits_namespace_mutation_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_unlink_fs(25);
+
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .unlink(FsObjectId::new(2), b"hello", FsObjectId::new(12), &guard,),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(25)
     );
 }
 

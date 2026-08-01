@@ -1362,53 +1362,124 @@ impl<I: BlockImage> Ext4Pager<I> {
         Err(Ext4FormatError::OutOfBounds)
     }
 
-    /// Remove the directory entry named `name` from `dir_ino`.  Returns the
-    /// inode number that was removed.
-    pub fn remove_dir_entry(&mut self, dir_ino: InodeNo, name: &[u8]) -> Result<InodeNo> {
+    /// Build the bounded namespace mutation for unlinking one directory
+    /// entry. The plan removes the dirent and decrements the target inode's
+    /// link count, but deliberately does not free inode or data storage; that
+    /// is owned by the later orphan/destroy lifecycle.
+    pub fn plan_unlink_dir_entry(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+        target_ino: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        let (found_ino, dir_home, dir_before, dir_after) =
+            self.plan_remove_dir_entry_after_image(dir_ino, name)?;
+        if found_ino != target_ino {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        let location = self.inode_location(target_ino)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        let mut disk_inode = Inode::parse(inode_bytes)?;
+        if disk_inode.is_dir() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        disk_inode.links_count = disk_inode
+            .links_count
+            .checked_sub(1)
+            .ok_or(Ext4FormatError::Corrupt)?;
+        disk_inode.ctime = fsync_stamp
+            .raw()
+            .try_into()
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        disk_inode.encode_preserving_unknown(inode_bytes)?;
+        self.refresh_inode_checksum(target_ino, &disk_inode, inode_bytes)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Unlink, target_ino.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: dir_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &dir_before) as u64,
+            after: dir_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok(plan)
+    }
+
+    fn plan_remove_dir_entry_after_image(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+    ) -> Result<(InodeNo, u64, Page4K, Page4K)> {
         let disk_inode = self.read_inode(dir_ino)?;
         let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
 
         for page_index in 0..page_count {
-            let mut page = [0u8; BLOCK_SIZE];
             let phys = match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
                 BlockMapping::Data(b) => b,
                 BlockMapping::Hole => continue,
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
-            self.image.read_block(phys, &mut page)?;
+            let mut before = [0u8; BLOCK_SIZE];
+            self.image.read_block(phys, &mut before)?;
+            let mut after = before;
 
             let mut prev_off: Option<usize> = None;
             let mut off = 0usize;
             while off + 8 <= BLOCK_SIZE {
-                let rec_len = read_u16_le(&page, off + 4)? as usize;
+                let rec_len = read_u16_le(&after, off + 4)? as usize;
                 if rec_len == 0 || off + rec_len > BLOCK_SIZE {
                     break;
                 }
-                let ino_here = u32::from_le_bytes(page[off..off + 4].try_into().unwrap());
+                let ino_here = u32::from_le_bytes(after[off..off + 4].try_into().unwrap());
                 if ino_here != 0 {
-                    let name_len = page[off + 6] as usize;
+                    let name_len = after[off + 6] as usize;
                     let name_end = off + 8 + name_len;
                     if name_end <= BLOCK_SIZE
                         && name_len == name.len()
-                        && &page[off + 8..name_end] == name
+                        && &after[off + 8..name_end] == name
                     {
                         let found_ino = InodeNo::new(ino_here);
                         if let Some(prev) = prev_off {
-                            let prev_rec = read_u16_le(&page, prev + 4)? as usize;
+                            let prev_rec = read_u16_le(&after, prev + 4)? as usize;
                             let merged = (prev_rec + rec_len) as u16;
-                            write_u16_le(&mut page, prev + 4, merged)?;
+                            write_u16_le(&mut after, prev + 4, merged)?;
                         } else {
-                            page[off..off + 4].fill(0);
+                            after[off..off + 4].fill(0);
                         }
-                        self.image.write_block(phys, &page)?;
-                        return Ok(found_ino);
+                        return Ok((found_ino, phys, before, after));
                     }
                 }
                 prev_off = Some(off);
                 off += rec_len;
             }
         }
+
         Err(Ext4FormatError::OutOfBounds)
+    }
+
+    /// Remove the directory entry named `name` from `dir_ino`.  Returns the
+    /// inode number that was removed.
+    pub fn remove_dir_entry(&mut self, dir_ino: InodeNo, name: &[u8]) -> Result<InodeNo> {
+        let (found_ino, phys, _before, after) =
+            self.plan_remove_dir_entry_after_image(dir_ino, name)?;
+        self.image.write_block(phys, &after)?;
+        Ok(found_ino)
     }
 
     /// Create a new regular file in `parent_ino`.  Returns the new inode.

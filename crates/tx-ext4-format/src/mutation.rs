@@ -13,6 +13,7 @@ pub enum MutationOrigin {
     FlushPage,
     SetAttr,
     Create,
+    Unlink,
     Rename,
     Truncate,
 }
