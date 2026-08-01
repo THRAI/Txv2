@@ -1,3 +1,19 @@
+- 2026-08-02 (ext4 Tier 1 e2fsck coverage gate tightened).
+  Closed a receipt-level false-acceptance gap without promoting Task 16.
+  `Tier1AcceptanceReceipt::from_live` now requires the evidence-derived product
+  gates to see clean e2fsck results for TEST/SCRATCH/WORKLOAD plus at least one
+  immutable image per completed crash cut. Every e2fsck image record must carry
+  exit code 0 and a nonzero 64-hex sha256, and the xfstests passed count must
+  match the authority-selected case count. Verification passed
+  `cargo test -p xtask ext4 -- --test-threads=1` (20),
+  `cargo xtask ext4 tier1 --dry-run`, expected fail-closed
+  `cargo xtask ext4 tier1 --run-id 2026-08-02-e2fsck-coverage-preflight`,
+  `cargo xtask progress validate`, `cargo xtask lint docs`, `cargo -q xtask
+  unit` (652 + 114 + 64 + 167), and `git diff --check`. Task 16 remains open:
+  deterministic crash/replay execution, e2fsck on the resulting immutable
+  images, pinned xfstests, and the final G0-G7 receipt still need live product
+  evidence.
+
 - 2026-08-02 (ext4 Tier 1 xfstests output parser fail-closed).
   Closed the xfstests exit-code-only acceptance gap. `run_xfstests_selection`
   now parses the `./check` output after a zero exit and requires an explicit

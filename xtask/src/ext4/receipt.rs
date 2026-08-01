@@ -193,7 +193,12 @@ impl Tier1AcceptanceReceipt {
         planned_actions: &[String],
         notes: &[String],
     ) -> Self {
-        let gates = gates_from_evidence(&crash_cuts, &e2fsck, &xfstests);
+        let gates = gates_from_evidence(
+            &crash_cuts,
+            &e2fsck,
+            &xfstests,
+            authorities.xfstests_case_count,
+        );
         Self {
             schema: "tx.ext4.tier1_acceptance_receipt.v1".into(),
             candidate: CandidateCommit {
@@ -253,6 +258,7 @@ mod tests {
                 passed: 1,
                 failed: 0,
             },
+            1,
         );
         assert_eq!(gates.g0, "passed");
         assert_eq!(gates.g7, "blocked");
@@ -260,6 +266,11 @@ mod tests {
 
     #[test]
     fn live_gates_pass_only_with_full_product_evidence() {
+        let mut immutable_images =
+            vec![ok_image("test"), ok_image("scratch"), ok_image("workload")];
+        for idx in 0..1000 {
+            immutable_images.push(ok_image(&format!("crash-cut-{idx:04}")));
+        }
         let gates = gates_from_evidence(
             &CrashCuts {
                 completed: 1000,
@@ -267,11 +278,7 @@ mod tests {
                 families: vec!["D0".into()],
             },
             &E2fsckSummary {
-                immutable_images: vec![E2fsckImageResult {
-                    role: "scratch".into(),
-                    image_sha256: "1".repeat(64),
-                    exit_code: 0,
-                }],
+                immutable_images,
                 failures: 0,
             },
             &XfstestsSummary {
@@ -280,9 +287,121 @@ mod tests {
                 passed: 1,
                 failed: 0,
             },
+            1,
         );
         assert_eq!(gates.g0, "passed");
         assert_eq!(gates.g7, "passed");
+    }
+
+    #[test]
+    fn live_gates_block_when_e2fsck_does_not_cover_every_crash_cut() {
+        let gates = gates_from_evidence(
+            &CrashCuts {
+                completed: 1000,
+                required: 1000,
+                families: vec!["D0".into()],
+            },
+            &E2fsckSummary {
+                immutable_images: vec![ok_image("test"), ok_image("scratch"), ok_image("workload")],
+                failures: 0,
+            },
+            &XfstestsSummary {
+                skipped: 0,
+                not_run: 0,
+                passed: 1,
+                failed: 0,
+            },
+            1,
+        );
+        assert_eq!(gates.g0, "passed");
+        assert_eq!(gates.g7, "blocked");
+    }
+
+    #[test]
+    fn live_gates_block_when_e2fsck_image_result_is_not_clean_or_immutable() {
+        let mut immutable_images =
+            vec![ok_image("test"), ok_image("scratch"), ok_image("workload")];
+        for idx in 0..1000 {
+            immutable_images.push(ok_image(&format!("crash-cut-{idx:04}")));
+        }
+        immutable_images[3].exit_code = 4;
+        let dirty_exit = gates_from_evidence(
+            &CrashCuts {
+                completed: 1000,
+                required: 1000,
+                families: vec!["D0".into()],
+            },
+            &E2fsckSummary {
+                immutable_images: immutable_images.clone(),
+                failures: 0,
+            },
+            &XfstestsSummary {
+                skipped: 0,
+                not_run: 0,
+                passed: 1,
+                failed: 0,
+            },
+            1,
+        );
+        assert_eq!(dirty_exit.g7, "blocked");
+
+        immutable_images[3].exit_code = 0;
+        immutable_images[3].image_sha256 = "0".repeat(64);
+        let placeholder_hash = gates_from_evidence(
+            &CrashCuts {
+                completed: 1000,
+                required: 1000,
+                families: vec!["D0".into()],
+            },
+            &E2fsckSummary {
+                immutable_images,
+                failures: 0,
+            },
+            &XfstestsSummary {
+                skipped: 0,
+                not_run: 0,
+                passed: 1,
+                failed: 0,
+            },
+            1,
+        );
+        assert_eq!(placeholder_hash.g7, "blocked");
+    }
+
+    #[test]
+    fn live_gates_block_when_xfstests_count_does_not_match_authority() {
+        let mut immutable_images =
+            vec![ok_image("test"), ok_image("scratch"), ok_image("workload")];
+        for idx in 0..1000 {
+            immutable_images.push(ok_image(&format!("crash-cut-{idx:04}")));
+        }
+        let gates = gates_from_evidence(
+            &CrashCuts {
+                completed: 1000,
+                required: 1000,
+                families: vec!["D0".into()],
+            },
+            &E2fsckSummary {
+                immutable_images,
+                failures: 0,
+            },
+            &XfstestsSummary {
+                skipped: 0,
+                not_run: 0,
+                passed: 1,
+                failed: 0,
+            },
+            2,
+        );
+        assert_eq!(gates.g7, "blocked");
+    }
+
+    fn ok_image(role: &str) -> E2fsckImageResult {
+        E2fsckImageResult {
+            role: role.into(),
+            image_sha256: "1".repeat(64),
+            exit_code: 0,
+        }
     }
 }
 
@@ -290,10 +409,15 @@ fn gates_from_evidence(
     crash_cuts: &CrashCuts,
     e2fsck: &E2fsckSummary,
     xfstests: &XfstestsSummary,
+    expected_xfstests_cases: usize,
 ) -> Gates {
     let crash_ok = crash_cuts.required == 1000 && crash_cuts.completed == crash_cuts.required;
-    let e2fsck_ok = e2fsck.failures == 0 && !e2fsck.immutable_images.is_empty();
-    let xfstests_ok = xfstests.failed == 0 && xfstests.skipped == 0 && xfstests.not_run == 0;
+    let e2fsck_ok = e2fsck_covers_completed_crash_cuts(crash_cuts, e2fsck);
+    let xfstests_ok = xfstests.failed == 0
+        && xfstests.skipped == 0
+        && xfstests.not_run == 0
+        && xfstests.passed == expected_xfstests_cases
+        && expected_xfstests_cases != 0;
     let all_ok = crash_ok && e2fsck_ok && xfstests_ok;
     let product_gate = if all_ok { "passed" } else { "blocked" };
     Gates {
@@ -306,6 +430,34 @@ fn gates_from_evidence(
         g6: product_gate.into(),
         g7: product_gate.into(),
     }
+}
+
+fn e2fsck_covers_completed_crash_cuts(crash_cuts: &CrashCuts, e2fsck: &E2fsckSummary) -> bool {
+    const ROLE_IMAGE_COUNT: usize = 3;
+    if e2fsck.failures != 0 {
+        return false;
+    }
+    if !["test", "scratch", "workload"].iter().all(|role| {
+        e2fsck
+            .immutable_images
+            .iter()
+            .any(|image| image.role == *role)
+    }) {
+        return false;
+    }
+    if e2fsck.immutable_images.len() < ROLE_IMAGE_COUNT + crash_cuts.completed {
+        return false;
+    }
+    e2fsck
+        .immutable_images
+        .iter()
+        .all(|image| image.exit_code == 0 && is_real_sha256(&image.image_sha256))
+}
+
+fn is_real_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.chars().all(|ch| ch.is_ascii_hexdigit())
+        && value.chars().any(|ch| ch != '0')
 }
 
 pub(crate) fn authority_input_summary(
