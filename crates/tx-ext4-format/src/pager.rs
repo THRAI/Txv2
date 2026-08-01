@@ -1304,29 +1304,46 @@ impl<I: BlockImage> Ext4Pager<I> {
         new_ino: InodeNo,
         file_type: u8,
     ) -> Result<()> {
+        let (phys, _before, after) =
+            self.plan_append_dir_entry_after_image(dir_ino, name, new_ino, file_type)?;
+        self.image.write_block(phys, &after)?;
+        Ok(())
+    }
+
+    fn plan_append_dir_entry_after_image(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+        new_ino: InodeNo,
+        file_type: u8,
+    ) -> Result<(u64, Page4K, Page4K)> {
         if name.len() > 255 {
             return Err(Ext4FormatError::OutOfBounds);
         }
         let new_min = (8usize + name.len() + 3) & !3;
         let disk_inode = self.read_inode(dir_ino)?;
+        if !disk_inode.is_dir() || disk_inode.is_htree_indexed() {
+            return Err(Ext4FormatError::Unsupported);
+        }
         let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
 
         for page_index in 0..page_count {
-            let mut page = [0u8; BLOCK_SIZE];
             let phys = match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
                 BlockMapping::Data(b) => b,
                 BlockMapping::Hole => continue,
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
-            self.image.read_block(phys, &mut page)?;
+            let mut before = [0u8; BLOCK_SIZE];
+            self.image.read_block(phys, &mut before)?;
+            let mut after = before;
 
             let mut off = 0usize;
             while off + 8 <= BLOCK_SIZE {
-                let rec_len = read_u16_le(&page, off + 4)? as usize;
+                let rec_len = read_u16_le(&after, off + 4)? as usize;
                 if rec_len == 0 || off + rec_len > BLOCK_SIZE {
                     break;
                 }
-                let ino_here = u32::from_le_bytes(page[off..off + 4].try_into().unwrap());
+                let ino_here = u32::from_le_bytes(after[off..off + 4].try_into().unwrap());
                 if ino_here == 0 {
                     if rec_len >= new_min {
                         encode_dir_entry(
@@ -1334,32 +1351,92 @@ impl<I: BlockImage> Ext4Pager<I> {
                             rec_len as u16,
                             file_type,
                             name,
-                            &mut page[off..off + rec_len],
+                            &mut after[off..off + rec_len],
                         )?;
-                        self.image.write_block(phys, &page)?;
-                        return Ok(());
+                        return Ok((phys, before, after));
                     }
                 } else {
-                    let name_len = page[off + 6] as usize;
+                    let name_len = after[off + 6] as usize;
+                    let name_end = off + 8 + name_len;
+                    if name_end <= BLOCK_SIZE
+                        && name_len == name.len()
+                        && &after[off + 8..name_end] == name
+                    {
+                        return Err(Ext4FormatError::Unsupported);
+                    }
                     let used = (8 + name_len + 3) & !3;
                     let free = rec_len.saturating_sub(used);
                     if free >= new_min {
-                        write_u16_le(&mut page, off + 4, used as u16)?;
+                        write_u16_le(&mut after, off + 4, used as u16)?;
                         encode_dir_entry(
                             new_ino.get(),
                             free as u16,
                             file_type,
                             name,
-                            &mut page[off + used..off + rec_len],
+                            &mut after[off + used..off + rec_len],
                         )?;
-                        self.image.write_block(phys, &page)?;
-                        return Ok(());
+                        return Ok((phys, before, after));
                     }
                 }
                 off += rec_len;
             }
         }
         Err(Ext4FormatError::OutOfBounds)
+    }
+
+    /// Build the bounded hard-link mutation for an existing regular file.
+    /// Directory hard links and allocation of new directory blocks stay
+    /// fail-closed until the complete namespace/orphan lifecycle exists.
+    pub fn plan_link_dir_entry(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+        target_ino: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        let (dir_home, dir_before, dir_after) =
+            self.plan_append_dir_entry_after_image(dir_ino, name, target_ino, 1)?;
+
+        let location = self.inode_location(target_ino)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        let mut disk_inode = Inode::parse(inode_bytes)?;
+        if !disk_inode.is_file() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        disk_inode.links_count = disk_inode
+            .links_count
+            .checked_add(1)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        disk_inode.ctime = fsync_stamp
+            .raw()
+            .try_into()
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        disk_inode.encode_preserving_unknown(inode_bytes)?;
+        self.refresh_inode_checksum(target_ino, &disk_inode, inode_bytes)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Link, target_ino.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: dir_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &dir_before) as u64,
+            after: dir_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok(plan)
     }
 
     /// Build the bounded same-directory regular-file rename mutation.

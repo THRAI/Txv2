@@ -438,12 +438,55 @@ where
 
     fn link(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.lookup_cached(parent_ino, name) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e.into()),
+        }
+        let current = match self.inode_meta_cached(target_ino) {
+            Ok(meta) => meta,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        if current.mode & 0xF000 != 0x8000 {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_link_dir_entry(
+                parent_ino,
+                name,
+                target_ino,
+                FsyncStamp::new(current.ctime as u64),
+            )
+        }) {
+            Ok(mutation) => mutation,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
+            Ok(()) => {
+                self.invalidate_lookup_cache_for(parent_ino);
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
     }
 
     fn mkdir(

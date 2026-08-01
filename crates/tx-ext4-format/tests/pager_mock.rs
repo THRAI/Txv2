@@ -844,6 +844,57 @@ fn namespace_plan_unlinks_dir_entry_and_decrements_nlink_without_home_write() {
 }
 
 #[test]
+fn namespace_plan_links_regular_file_and_increments_nlink_without_home_write() {
+    let image = mock_image();
+    let dir_before = *image.block(16);
+    let inode_before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_link_dir_entry(
+            InodeNo::new(2),
+            b"alias",
+            InodeNo::new(12),
+            FsyncStamp::new(23),
+        )
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Link);
+    assert_eq!(plan.object, 12);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 2);
+
+    let dir_block = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::DirectoryBlock)
+        .unwrap();
+    assert_eq!(dir_block.home, 16);
+    let entries: Vec<_> = DirEntryIter::new(&dir_block.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"alias" && entry.inode == 12));
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert_eq!(inode_table.home, 4);
+    let inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.links_count, 2);
+    assert_eq!(inode.ctime, 23);
+
+    assert_eq!(pager.image().block(16), &dir_before);
+    assert_eq!(pager.image().block(4), &inode_before);
+}
+
+#[test]
 fn namespace_plan_renames_regular_file_in_place_without_home_write() {
     let image = mock_image();
     let dir_before = *image.block(16);
