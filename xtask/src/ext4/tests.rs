@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     CrashCutCatalog, Tier1Authorities, XfstestsSourceLock, parse_tier1_args,
-    run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file, verify_xfstests_source_lock,
+    parse_xfstests_summary, run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file,
+    verify_xfstests_source_lock,
 };
 
 #[test]
@@ -231,6 +232,39 @@ fn tier1_crash_cut_campaign_refuses_synthetic_completion() {
     let error =
         run_crash_cut_campaign(&run, &catalog).expect_err("crash cuts must not be synthesized");
     assert!(error.contains("refusing to synthesize completed=1000"));
+}
+
+#[test]
+fn tier1_xfstests_parser_requires_passed_all_summary() {
+    let summary = parse_xfstests_summary(
+        "FSTYP -- ext4\ngeneric/013 1s\nRan: generic/013\nPassed all 1 tests\n",
+        1,
+    )
+    .expect("passed all summary");
+    assert_eq!(summary.passed, 1);
+    assert_eq!(summary.not_run, 0);
+    assert_eq!(summary.failed, 0);
+
+    let missing = parse_xfstests_summary("Ran: generic/013\n", 1)
+        .expect_err("missing summary must fail closed");
+    assert!(missing.contains("missing `Passed all N tests`"));
+}
+
+#[test]
+fn tier1_xfstests_parser_rejects_notrun_and_count_mismatch() {
+    let notrun = parse_xfstests_summary(
+        "generic/013 -- not run: requires scratch\nNot run: generic/013\n",
+        1,
+    )
+    .expect_err("not-run must fail closed");
+    assert!(notrun.contains("not-run cases"));
+
+    let mismatch = parse_xfstests_summary(
+        "generic/013 1s\ngeneric/035 1s\nRan: generic/013 generic/035\nPassed all 2 tests\n",
+        1,
+    )
+    .expect_err("count mismatch must fail closed");
+    assert!(mismatch.contains("passed count mismatch"));
 }
 
 fn temp_root(suffix: &str) -> PathBuf {

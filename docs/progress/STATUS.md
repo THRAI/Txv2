@@ -1,3 +1,18 @@
+- 2026-08-02 (ext4 Tier 1 xfstests output parser fail-closed).
+  Closed the xfstests exit-code-only acceptance gap. `run_xfstests_selection`
+  now parses the `./check` output after a zero exit and requires an explicit
+  `Passed all N tests` summary whose N matches the selected manifest case
+  count. It fails closed on `Not run:`, `Failures:`, `Failed ...`, missing
+  passed-all summaries, or count mismatches instead of recording every selected
+  case as passed solely from exit status. Focused verification passed
+  `rustfmt --edition 2024 --check xtask/src/ext4/mod.rs xtask/src/ext4/tests.rs
+  xtask/src/ext4/receipt.rs`, `cargo test -p xtask ext4 -- --test-threads=1`
+  (17), `cargo xtask ext4 tier1 --dry-run`, and the expected placeholder
+  preflight `cargo xtask ext4 tier1 --run-id
+  2026-08-02-xfstests-summary-preflight`. Task 16 remains open: selected
+  xfstests still have not been run against acceptance-ready authorities or
+  recorded in an immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 crash-cut receipt fail-closed).
   Closed another false-acceptance gap without promoting Task 16. The live Tier
   1 runner no longer constructs `crash_cuts.completed` from the catalog's

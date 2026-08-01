@@ -761,10 +761,48 @@ fn run_xfstests_selection(
         ));
     }
 
+    parse_xfstests_summary(&output, tests.len())
+}
+
+fn parse_xfstests_summary(output: &str, expected_cases: usize) -> Result<receipt::XfstestsSummary> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Not run:") {
+            return Err(format!("xfstests reported not-run cases: {trimmed}"));
+        }
+        if trimmed.starts_with("Failures:") || trimmed.starts_with("Failed ") {
+            return Err(format!("xfstests reported failures: {trimmed}"));
+        }
+    }
+
+    let mut passed_all = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("Passed all ") else {
+            continue;
+        };
+        let Some(count) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(count) = count.parse::<usize>() else {
+            continue;
+        };
+        passed_all = Some(count);
+    }
+
+    let Some(passed) = passed_all else {
+        return Err("xfstests output missing `Passed all N tests` summary".into());
+    };
+    if passed != expected_cases {
+        return Err(format!(
+            "xfstests passed count mismatch: expected {expected_cases}, output reported {passed}"
+        ));
+    }
+
     Ok(receipt::XfstestsSummary {
         skipped: 0,
         not_run: 0,
-        passed: tests.len(),
+        passed,
         failed: 0,
     })
 }
