@@ -225,12 +225,19 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         runtime: &JournalMutationRuntime,
         mutation: &Ext4MutationPlan,
         guard: &Guard<'_>,
-    ) -> Result<(), JournalMutationRuntimeError> {
+    ) -> Result<(), JournalMutationRuntimeError>
+    where
+        I: Send + 'static,
+    {
         runtime.begin_mutation(mutation, guard)?;
         let _ = self.with_pager(|pager| {
             pager.stage_mutation_after_images(mutation);
             Ok(())
         });
+        if mutation.data.is_empty() {
+            self.settle_metadata_mutation(runtime)
+                .map_err(JournalMutationRuntimeError::Settlement)?;
+        }
         Ok(())
     }
 

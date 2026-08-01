@@ -104,6 +104,7 @@ pub(crate) fn journal_mutation_runtime_errno(
         crate::journal::JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
         crate::journal::JournalMutationRuntimeError::Image(_)
         | crate::journal::JournalMutationRuntimeError::Stage(_) => Errno::EIO,
+        crate::journal::JournalMutationRuntimeError::Settlement(errno) => errno,
     }
 }
 

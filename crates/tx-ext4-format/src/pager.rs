@@ -241,6 +241,25 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
     }
 
+    pub fn apply_l6_write_page(
+        &mut self,
+        start_lba: u64,
+        sectors_per_block: u64,
+        page: &Page4K,
+    ) -> Result<()> {
+        if sectors_per_block == 0 || start_lba % sectors_per_block != 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let block = start_lba / sectors_per_block;
+        self.image.write_block(block, page)?;
+        self.image.invalidate_block(block);
+        Ok(())
+    }
+
+    pub fn apply_l6_barrier(&mut self) -> Result<()> {
+        self.image.barrier()
+    }
+
     /// Invalidate the image adapter's derived block cache after an L6-owned
     /// checkpoint. The format pager itself retains no metadata cache.
     pub fn settle_image_cache(&mut self) {

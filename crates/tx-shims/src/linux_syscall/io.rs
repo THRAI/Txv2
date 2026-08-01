@@ -1665,6 +1665,7 @@ async fn sys_write_pagebacked<'a>(
         Ok(total) => {
             emit_debug_counter(b"debug.write.pagebacked.done", total as i64);
             emit_debug_counter(b"debug.write.pagebacked.phase", 4);
+            publish_pagebacked_size_after_write(file);
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
@@ -1676,6 +1677,29 @@ async fn sys_write_pagebacked<'a>(
             SyscallResult::error_from(errno)
         }
     }
+}
+
+fn publish_pagebacked_size_after_write(file: &Cap<tx_subsystems::vfs::structure::OpenFile>) {
+    let Some(pc) = super::vm::extract_page_container(file) else {
+        return;
+    };
+    let rnode = file.rnode();
+    let fs_object_id = rnode.fs_object_id();
+    let Some(fs_ops) = super::fs_basic::fs_ops_for_rnode(rnode) else {
+        return;
+    };
+    let guard = crate::adapter::step_engine::guard();
+    let mut meta = match fs_ops.load_inode_meta(fs_object_id, &guard) {
+        crate::adapter::step_engine::StepOutcome::Done(meta) => meta,
+        _ => rnode.meta(),
+    };
+    let size = pc.size_bytes();
+    if meta.size == size {
+        return;
+    }
+    meta.size = size;
+    super::fs_basic::record_stat_meta_override(fs_object_id, meta);
+    let _ = fs_ops.serialize_inode_meta(fs_object_id, &meta, &guard);
 }
 
 async fn sys_direct_pagebacked<'a>(

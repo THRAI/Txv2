@@ -151,6 +151,17 @@ fn init_substrate() {
     }
 }
 
+fn assert_metadata_settled(runtime: &JournalMutationRuntime, writes: &AtomicUsize) {
+    assert!(
+        writes.load(Ordering::Acquire) > 0,
+        "metadata mutation must reach durable journal/checkpoint writes before success",
+    );
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::default()
+    );
+}
+
 fn write_inode_at(image: &mut MemImage, ino: u32, inode: &Inode) {
     let index = (ino - 1) as usize;
     let offset = index * 256;
@@ -960,11 +971,7 @@ fn ext4_metadata_serialize_admits_a_journal_mutation_without_home_write() {
         fs_ops.serialize_inode_meta(FsObjectId::new(12), &meta, &guard),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(17)
-    );
+    assert_metadata_settled(&runtime, &writes);
     assert!(matches!(
         runtime.source().plan_fsync(&BackendPageRequest::new(
             FsObjectKey::new(12),
@@ -974,7 +981,7 @@ fn ext4_metadata_serialize_admits_a_journal_mutation_without_home_write() {
             PageIoFlags::BARRIER,
             None,
         )),
-        BackendPlan::SubmitGraph(_)
+        BackendPlan::Err(V3Errno::EAGAIN)
     ));
 }
 
@@ -991,11 +998,7 @@ fn ext4_chmod_and_chown_public_paths_admit_metadata_mutations() {
         chmod_ops.chmod_inode(FsObjectId::new(12), 0o600, &cred, &guard),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(chmod_writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        chmod_runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(18)
-    );
+    assert_metadata_settled(&chmod_runtime, &chmod_writes);
 
     let (chown_mount, chown_runtime, chown_writes) = mounted_counting_mutation_fs(19);
     let chown_ops = chown_mount.fs_ops();
@@ -1003,11 +1006,7 @@ fn ext4_chmod_and_chown_public_paths_admit_metadata_mutations() {
         chown_ops.chown_inode(FsObjectId::new(12), Some(1000), Some(1000), &cred, &guard),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(chown_writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        chown_runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(19)
-    );
+    assert_metadata_settled(&chown_runtime, &chown_writes);
 }
 
 #[test]
@@ -1022,11 +1021,7 @@ fn ext4_truncate_public_path_admits_metadata_mutation_without_home_write() {
         backing.truncate(FsObjectId::new(12), BLOCK_SIZE as u64 + 13, &guard),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(20)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1041,11 +1036,7 @@ fn ext4_truncate_cross_block_shrink_admits_free_revoke_mutation() {
         backing.truncate(FsObjectId::new(12), 0, &guard),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(21)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1181,11 +1172,7 @@ fn ext4_unlink_public_path_admits_namespace_mutation_without_home_write() {
             .unlink(FsObjectId::new(2), b"hello", FsObjectId::new(12), &guard,),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(25)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1199,11 +1186,7 @@ fn ext4_destroy_public_path_admits_zero_link_regular_inode_without_home_write() 
         mounted.fs_ops().destroy_inode(FsObjectId::new(12), &guard),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(26)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1234,11 +1217,7 @@ fn ext4_create_public_path_admits_regular_file_without_home_write() {
             },
         ))
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(31)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1269,11 +1248,7 @@ fn ext4_mkdir_public_path_admits_directory_without_home_write() {
             },
         ))
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(32)
-    );
+    assert_metadata_settled(&runtime, &writes);
     assert_eq!(
         mounted
             .fs_ops()
@@ -1297,7 +1272,6 @@ fn ext4_mkdir_public_path_admits_directory_without_home_write() {
             flags: Inode::EXTENTS_FL,
         })
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -1328,11 +1302,7 @@ fn ext4_symlink_public_path_admits_fast_symlink_without_home_write() {
             },
         ))
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(33)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1348,11 +1318,7 @@ fn ext4_link_public_path_admits_namespace_mutation_without_home_write() {
             .link(FsObjectId::new(2), b"alias", FsObjectId::new(12), &guard,),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(28)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1372,11 +1338,7 @@ fn ext4_rename_public_path_admits_same_dir_mutation_without_home_write() {
         ),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(26)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1396,11 +1358,7 @@ fn ext4_rename_public_path_admits_same_dir_overwrite_without_home_write() {
         ),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(29)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1420,11 +1378,7 @@ fn ext4_rename_public_path_admits_cross_dir_regular_file_without_home_write() {
         ),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(30)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1440,11 +1394,7 @@ fn ext4_rmdir_public_path_admits_namespace_mutation_without_home_write() {
             .rmdir(FsObjectId::new(2), b"empty", FsObjectId::new(13), &guard,),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(27)
-    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -1967,11 +1917,7 @@ fn ext4_mkdir_public_path_admits_directory_with_ring_runtime_without_home_write(
             },
         ))
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(
-        runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(32)
-    );
+    assert_metadata_settled(&runtime, &writes);
     assert_eq!(
         mounted
             .fs_ops()
@@ -1995,7 +1941,27 @@ fn ext4_mkdir_public_path_admits_directory_with_ring_runtime_without_home_write(
             flags: Inode::EXTENTS_FL,
         })
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .create_inode(FsObjectId::new(14), b"file", 0o100640, &cred, &guard,),
+        V3::<_, NoProgress>::done((
+            FsObjectId::new(15),
+            InodeMeta {
+                mode: 0o100640,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                atime: Default::default(),
+                mtime: Default::default(),
+                ctime: Default::default(),
+                nlinks: 1,
+                blocks: 0,
+                flags: Inode::EXTENTS_FL,
+            },
+        ))
+    );
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]

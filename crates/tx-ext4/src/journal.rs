@@ -1378,6 +1378,7 @@ pub enum JournalMutationRuntimeError {
     Image(MutationJournalImageError),
     Stage(PreparedJournalTransactionError),
     Busy(JournalTransactionStateError),
+    Settlement(Errno),
 }
 
 /// L5 metadata owner for a single immutable ext4 writeback mutation.
@@ -1442,6 +1443,7 @@ fn journal_mutation_runtime_errno(error: JournalMutationRuntimeError) -> Errno {
     match error {
         JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
         JournalMutationRuntimeError::Image(_) | JournalMutationRuntimeError::Stage(_) => Errno::EIO,
+        JournalMutationRuntimeError::Settlement(errno) => errno,
     }
 }
 
