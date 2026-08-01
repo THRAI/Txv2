@@ -107,8 +107,10 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let list_groups = args.iter().any(|a| a == "--list-groups");
     let keep_going = args.iter().any(|a| a == "--keep-going");
     let parallel = args.iter().any(|a| a == "--parallel");
-    let extra_rv64_ext4 = optional_option_value(&args, "--extra-rv64-ext4")
-        .map(|path| resolve_path(root, PathBuf::from(path)));
+    let extra_rv64_ext4: Vec<PathBuf> = option_values(&args, "--extra-rv64-ext4")?
+        .into_iter()
+        .map(|path| resolve_path(root, PathBuf::from(path)))
+        .collect();
     let boot_mode = optional_option_value(&args, "--boot-mode")
         .map(|value| validate_boot_mode_value(&value).map(|()| value))
         .transpose()?;
@@ -232,7 +234,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                             target,
                             profile,
                             smp,
-                            extra_rv64_ext4: extra_rv64_ext4.as_deref(),
+                            extra_rv64_ext4: &extra_rv64_ext4,
                             boot_mode: boot_mode.as_deref(),
                             append_cmdline: append_cmdline.as_deref(),
                             setup: &setup,
@@ -297,7 +299,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         target,
         profile,
         smp,
-        extra_rv64_ext4.as_deref(),
+        &extra_rv64_ext4,
         append_cmdline.as_deref(),
         boot_mode.as_deref(),
     )?;
@@ -816,7 +818,7 @@ struct IsolatedGroupRun<'a> {
     target: TxTarget,
     profile: Profile,
     smp: usize,
-    extra_rv64_ext4: Option<&'a Path>,
+    extra_rv64_ext4: &'a [PathBuf],
     boot_mode: Option<&'a str>,
     append_cmdline: Option<&'a str>,
     setup: &'a [Directive],
@@ -909,7 +911,7 @@ fn build_qemu_command(
     target: TxTarget,
     profile: Profile,
     smp: usize,
-    extra_rv64_ext4: Option<&Path>,
+    extra_rv64_ext4: &[PathBuf],
     append_cmdline: Option<&str>,
     boot_mode: Option<&str>,
 ) -> Result<Vec<String>> {
@@ -972,19 +974,41 @@ fn build_qemu_command(
         _ => cmdline_base,
     };
     args.push(append_tty_winsize_cmdline(&cmdline));
-    if let Some(path) = extra_rv64_ext4 {
-        if target != TxTarget::Rv64Qemu {
-            return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
-        }
+    if !extra_rv64_ext4.is_empty() && target != TxTarget::Rv64Qemu {
+        return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
+    }
+    if extra_rv64_ext4.len() > 3 {
+        return Err("--extra-rv64-ext4 supports at most three RV64 virtio-mmio drives".into());
+    }
+    for (idx, path) in extra_rv64_ext4.iter().enumerate() {
         args.push("-drive".into());
         args.push(format!(
-            "file={},format=raw,if=none,id=txblk0",
-            path.display()
+            "file={},format=raw,if=none,id=txblk{idx}",
+            path.display(),
         ));
         args.push("-device".into());
-        args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
+        args.push(format!(
+            "virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
+        ));
     }
     Ok(args)
+}
+
+fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        if args[idx] == name {
+            let Some(value) = args.get(idx + 1) else {
+                return Err(format!("option {name} needs a value"));
+            };
+            values.push(value.clone());
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -999,7 +1023,7 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
-            None,
+            &[],
             None,
             None,
         )
@@ -1025,7 +1049,7 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             4,
-            None,
+            &[],
             None,
             None,
         )
@@ -1036,13 +1060,13 @@ mod tests {
     #[test]
     fn shell_test_can_attach_rv64_ext4_drive_on_bus0() {
         let root = Path::new("/tmp/tx");
-        let image = Path::new("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
+        let image = PathBuf::from("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
         let command = build_qemu_command(
             root,
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
-            Some(image),
+            &[image],
             None,
             None,
         )
@@ -1054,6 +1078,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_test_can_attach_three_rv64_ext4_drives_on_stable_buses() {
+        let root = Path::new("/tmp/tx");
+        let images = vec![
+            PathBuf::from("/tmp/tx/test.img"),
+            PathBuf::from("/tmp/tx/scratch.img"),
+            PathBuf::from("/tmp/tx/workload.img"),
+        ];
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            &images,
+            None,
+            None,
+        )
+        .expect("build qemu command");
+        let rendered = command.join(" ");
+
+        for (idx, name) in ["test", "scratch", "workload"].iter().enumerate() {
+            assert!(rendered.contains(&format!(
+                "-drive file=/tmp/tx/{name}.img,format=raw,if=none,id=txblk{idx}"
+            )));
+            assert!(rendered.contains(&format!(
+                "-device virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
+            )));
+        }
+    }
+
+    #[test]
     fn shell_test_can_append_kernel_cmdline_tokens() {
         let root = Path::new("/tmp/tx");
         let command = build_qemu_command(
@@ -1061,7 +1115,7 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
-            None,
+            &[],
             Some("tx.mount.sdcard=0"),
             None,
         )
@@ -1081,7 +1135,7 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
-            None,
+            &[],
             None,
             Some("contest"),
         )

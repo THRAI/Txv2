@@ -1,14 +1,15 @@
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::adapter::step_engine::{NoProgress, StepOutcome};
 use tx_hal::{Arch, TxPlatform};
 use tx_subsystems::device::{
-    register_block_devices, BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT,
-    PhysicalBlockNumber,
+    BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT, PhysicalBlockNumber,
+    register_block_devices,
 };
 use tx_subsystems::execution::Guard;
-use tx_subsystems::net::{register_net_devices, NetDeviceRegistration};
+use tx_subsystems::net::{NetDeviceRegistration, register_net_devices};
 use tx_subsystems::page_backed::Frame;
 
 pub struct KernelBlockDevices<P: TxPlatform> {
@@ -55,26 +56,27 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
 
     fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
         let scratch = scratch_block_registration();
-        let block = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioBlock::<P>::new(
-            "virtio0",
-        )));
-        if let Err(err) = block.init() {
-            let _ = err;
-            let registrations: &'static [&'static BlockDeviceRegistration] =
-                Box::leak(Box::new([scratch]));
-            return register_block_devices(registrations);
+        let mut registrations: Vec<&'static BlockDeviceRegistration> = Vec::new();
+        for (idx, (region, name)) in [("virtio0", "vda"), ("virtio1", "vdb"), ("virtio2", "vdc")]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let block = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioBlock::<P>::new(
+                region,
+            )));
+            if block.init().is_err() {
+                continue;
+            }
+            registrations.push(Box::leak(Box::new(BlockDeviceRegistration {
+                devt: DevT::new(254, idx as u32),
+                name,
+                ops: block,
+            })));
         }
 
-        let registration = Box::leak(Box::new(BlockDeviceRegistration {
-            devt: DevT::new(254, 0),
-            name: "vda",
-            ops: block,
-        }));
-        let registrations: &'static [&'static BlockDeviceRegistration] = Box::leak(Box::new([
-            registration as &'static BlockDeviceRegistration,
-            scratch,
-        ]));
-        register_block_devices(registrations)
+        registrations.push(scratch);
+        register_block_devices(Box::leak(registrations.into_boxed_slice()))
     }
 }
 
@@ -123,7 +125,7 @@ impl BlockDevice for ScratchBlockDevice {
 fn scratch_block_registration() -> &'static BlockDeviceRegistration {
     let block = Box::leak(Box::new(ScratchBlockDevice));
     Box::leak(Box::new(BlockDeviceRegistration {
-        devt: DevT::new(254, 1),
+        devt: DevT::new(254, 255),
         name: "ltpdev",
         ops: block,
     }))

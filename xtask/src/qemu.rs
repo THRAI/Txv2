@@ -34,7 +34,7 @@ struct QemuOptions {
     interactive: bool,
     boot_mode: Option<String>,
     append_cmdline: Option<String>,
-    extra_rv64_ext4: Option<PathBuf>,
+    extra_rv64_ext4: Vec<PathBuf>,
     net: QemuNet,
     host_ping: Option<HostPingOptions>,
 }
@@ -149,8 +149,10 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
         .map(|value| validate_boot_mode_value(&value).map(|()| value))
         .transpose()?;
     let append_cmdline = optional_option_value(args, "--append-cmdline");
-    let extra_rv64_ext4 = optional_option_value(args, "--extra-rv64-ext4")
-        .map(|path| resolve_path(root, PathBuf::from(path)));
+    let extra_rv64_ext4 = option_values(args, "--extra-rv64-ext4")?
+        .into_iter()
+        .map(|path| resolve_path(root, PathBuf::from(path)))
+        .collect();
     let net = qemu_net(args)?;
     let host_ping = host_ping_options(args, expect_sentinel, &net)?;
 
@@ -285,11 +287,14 @@ fn qemu_command(
     profile: Profile,
     options: &QemuOptions,
 ) -> Result<Vec<String>> {
-    if options.extra_rv64_ext4.is_some() && target != TxTarget::Rv64Qemu {
+    if !options.extra_rv64_ext4.is_empty() && target != TxTarget::Rv64Qemu {
         return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
     }
-    if options.extra_rv64_ext4.is_some() && profile == Profile::Busybox && !options.no_block {
+    if !options.extra_rv64_ext4.is_empty() && profile == Profile::Busybox && !options.no_block {
         return Err("--extra-rv64-ext4 conflicts with the busybox default block image; pass --no-block or use --profile alpine".into());
+    }
+    if options.extra_rv64_ext4.len() > 3 {
+        return Err("--extra-rv64-ext4 supports at most three RV64 virtio-mmio drives".into());
     }
 
     let kernel = target.kernel_path(root);
@@ -452,14 +457,16 @@ fn qemu_command(
             ));
         }
     }
-    if let Some(path) = &options.extra_rv64_ext4 {
+    for (idx, path) in options.extra_rv64_ext4.iter().enumerate() {
         args.push("-drive".into());
         args.push(format!(
-            "file={},format=raw,if=none,id=txblk0",
-            path.display()
+            "file={},format=raw,if=none,id=txblk{idx}",
+            path.display(),
         ));
         args.push("-device".into());
-        args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
+        args.push(format!(
+            "virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
+        ));
     }
     append_net_args(&mut args, target, &options.net);
     args.push("-d".into());
@@ -874,7 +881,7 @@ mod tests {
             interactive: false,
             boot_mode: None,
             append_cmdline: None,
-            extra_rv64_ext4: None,
+            extra_rv64_ext4: Vec::new(),
             net: QemuNet::None,
             host_ping: None,
         }
@@ -1354,7 +1361,7 @@ mod tests {
     fn qemu_can_attach_rv64_ext4_drive_on_bus0() {
         let image = PathBuf::from("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
         let options = QemuOptions {
-            extra_rv64_ext4: Some(image),
+            extra_rv64_ext4: vec![image],
             ..test_options()
         };
 
@@ -1371,6 +1378,36 @@ mod tests {
             "-drive file=/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4,format=raw,if=none,id=txblk0"
         ));
         assert!(command.contains("-device virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0"));
+    }
+
+    #[test]
+    fn qemu_can_attach_three_rv64_ext4_drives_on_stable_buses() {
+        let options = QemuOptions {
+            extra_rv64_ext4: vec![
+                PathBuf::from("/tmp/tx/test.img"),
+                PathBuf::from("/tmp/tx/scratch.img"),
+                PathBuf::from("/tmp/tx/workload.img"),
+            ],
+            ..test_options()
+        };
+
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            &options,
+        )
+        .unwrap()
+        .join(" ");
+
+        for (idx, name) in ["test", "scratch", "workload"].iter().enumerate() {
+            assert!(command.contains(&format!(
+                "-drive file=/tmp/tx/{name}.img,format=raw,if=none,id=txblk{idx}"
+            )));
+            assert!(command.contains(&format!(
+                "-device virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
+            )));
+        }
     }
 
     #[test]

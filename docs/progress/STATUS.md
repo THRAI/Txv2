@@ -1,3 +1,23 @@
+- 2026-08-02 (ext4 Tier 1 three-drive RV64 foundation).
+  Advanced the TEST/SCRATCH/WORKLOAD role wiring foundation without promoting
+  Task 16. RV64 QEMU platform info now exposes `virtio0`, `virtio1`, and
+  `virtio2` MMIO slots; kernel block-device init probes those slots and
+  registers successful devices as `vda`, `vdb`, and `vdc`, with fallback
+  `ltpdev` moved to `DevT(254,255)` to avoid role minor collisions.
+  `cargo xtask qemu` and `cargo xtask shell-test` now accept repeated
+  `--extra-rv64-ext4 PATH` values and render them as `txblk0..2` on
+  `virtio-mmio-bus.0..2`. Verification passed `cargo test -p xtask ext4 --
+  --test-threads=1` (23), `cargo test -p xtask attach -- --test-threads=1`
+  (4), `cargo test -p tx-hal-riscv64-qemu-virt qemu_mmio_regions_include --
+  --test-threads=1` (2), `cargo check -p tx-kernel -q`, `cargo xtask ext4
+  tier1 --dry-run`, a three-drive `cargo xtask qemu --target rv64-qemu
+  --profile alpine --dry-run --extra-rv64-ext4 ...` rendering check, `cargo
+  xtask progress validate`, `cargo xtask lint docs`, `cargo -q xtask unit`
+  (652 + 114 + 64 + 167), and `git diff --check`.
+  Remaining role work: the public Tier 1 runner still needs a real
+  TEST/SCRATCH/WORKLOAD role scenario and live QEMU/e2fsck/xfstests receipt
+  evidence before Task 16 can close.
+
 - 2026-08-02 (ext4 Tier 1 live matrix now targets SCRATCH image).
   Corrected the public Tier 1 runner's guest matrix target without promoting
   Task 16. `run_live_tier1` still stages TEST/SCRATCH/WORKLOAD images, but the

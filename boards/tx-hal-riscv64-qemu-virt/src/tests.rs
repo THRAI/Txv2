@@ -6,11 +6,11 @@ use tx_hal::{
 };
 
 use crate::{
-    asid_residency_mask, clear_asid_residency, clear_current_asid_residency, dispatch_trap_frame,
-    enter_irq_context, for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu,
-    mark_ipi_ack, percpu_tls_for_cpu, remote_sfence_targets_for_asid_from,
-    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
-    RV64_PERCPU_AREAS,
+    Platform, RV64_PERCPU_AREAS, Rv64TrapFrame, asid_residency_mask, clear_asid_residency,
+    clear_current_asid_residency, dispatch_trap_frame, enter_irq_context,
+    for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu, mark_ipi_ack,
+    percpu_tls_for_cpu, remote_sfence_targets_for_asid_from, remote_sfence_targets_from,
+    trap::classify_rv64_trap,
 };
 
 static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -379,6 +379,23 @@ fn qemu_mmio_regions_include_goldfish_rtc() {
     assert_eq!(rtc.phys.size, 0x1000);
     assert_eq!(rtc.virt.start, VirtAddr(0xffff_ffc0_0010_1000));
     assert_eq!(rtc.virt.size, 0x1000);
+}
+
+#[test]
+fn qemu_mmio_regions_include_three_virtio_block_slots() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    let regions = crate::boot_static::qemu_mmio_regions();
+    for (idx, name) in ["virtio0", "virtio1", "virtio2"].iter().enumerate() {
+        let region = regions
+            .iter()
+            .find(|region| region.name == *name)
+            .expect("virtio mmio region");
+        let offset = idx as usize * 0x1000;
+        assert_eq!(region.phys.start, PhysAddr(0x1000_1000 + offset));
+        assert_eq!(region.virt.start, VirtAddr(0xffff_ffc0_1000_1000 + offset));
+        assert_eq!(region.phys.size, 0x1000);
+        assert_eq!(region.virt.size, 0x1000);
+    }
 }
 
 #[test]

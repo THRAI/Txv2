@@ -6,12 +6,12 @@ use tx_hal::{
     PhysRange, PlatformConfig, PlatformInfo, VirtAddr, VirtRange,
 };
 
+use crate::Platform;
 use crate::pmap::topology::{
     DIRECT_MAP_BASE, KERNEL_ALIAS_L0_TABLES, KERNEL_BOOTSTRAP_ALIAS_SIZE, KERNEL_VIRT_BASE,
     PAGE_SIZE, PT_NODE_POOL_ENTRIES, QEMU_KERNEL_PHYS_BASE,
 };
 use crate::time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
-use crate::Platform;
 
 pub(crate) const MAX_MEMORY_REGIONS: usize = 8;
 pub(crate) const CMDLINE_CAPACITY: usize = 16384;
@@ -117,7 +117,7 @@ struct BootstrapPmapInfoCell(UnsafeCell<Option<BootstrapPmapInfo>>);
 struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
-struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 5]>);
+struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 7]>);
 struct TimebaseFrequencyCell(UnsafeCell<u64>);
 struct PossibleCpuCountCell(UnsafeCell<usize>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
@@ -154,7 +154,7 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     possible_cpu_count: 1,
 }));
 static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
-    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 5]));
+    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 7]));
 static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
 static POSSIBLE_CPU_COUNT: PossibleCpuCountCell = PossibleCpuCountCell(UnsafeCell::new(1));
@@ -214,7 +214,7 @@ const fn empty_mmio_region() -> MmioRegion {
     }
 }
 
-pub(crate) fn qemu_mmio_regions() -> [MmioRegion; 5] {
+pub(crate) fn qemu_mmio_regions() -> [MmioRegion; 7] {
     [
         MmioRegion {
             name: "goldfish-rtc",
@@ -272,6 +272,30 @@ pub(crate) fn qemu_mmio_regions() -> [MmioRegion; 5] {
             },
             virt: VirtRange {
                 start: VirtAddr(DIRECT_MAP_BASE + 0x1000_1000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+        MmioRegion {
+            name: "virtio1",
+            phys: PhysRange {
+                start: PhysAddr(0x1000_2000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x1000_2000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+        MmioRegion {
+            name: "virtio2",
+            phys: PhysRange {
+                start: PhysAddr(0x1000_3000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x1000_3000),
                 size: 0x1000,
             },
             flags: MMIO_RW_DEVICE,
