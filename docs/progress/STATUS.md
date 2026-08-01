@@ -1,3 +1,32 @@
+- 2026-08-01 (ext4 Task 12 mkdir admission).
+  Advanced Task 12 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `Ext4Pager::plan_create_directory` now builds
+  an immutable mkdir mutation with BlockBitmap, InodeBitmap, GroupDescriptor,
+  Superblock, parent/child InodeTable, parent DirectoryBlock, and initialized
+  child DirectoryBlock after-images, including metadata_csum bitmap and inode
+  checksum refreshes, while leaving home blocks untouched. `FsOps::mkdir` now
+  admits that supported directory create shape through
+  `JournalMutationRuntime::begin_mutation`, returns the new directory
+  `FsObjectId` and frozen `InodeMeta`, keeps RO/no-runtime mounts fail-closed,
+  and the obsolete `require_mutation_owner()` fail-closed shim was removed
+  after its callsites reached explicit runtime admission. Verification passed
+  `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_creates_directory_without_home_write -- --test-threads=1`,
+  `cargo test -p tx-ext4-format --test pager_mock namespace_plan_ --
+  --test-threads=1` (8), `cargo test -p tx-ext4-format --test pager_mock --
+  --test-threads=1` (31), `cargo test -p tx-ext4 --lib --no-default-features
+  ext4_mkdir_public_path_admits_directory_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4 --lib --no-default-features --
+  --test-threads=1` (54), `cargo test -p tx-ext4 --test
+  journal_prepared_transaction -- --test-threads=1` (9), `cargo test -p
+  tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7), and
+  touched-file `rustfmt --check`; `cargo -q xtask unit` passed (646 + 114 +
+  54 + 166). Next: continue Task 12 with symlink, unlinked-open/orphan/destroy
+  cleanup, and crash-truncate/e2fsck evidence. Product Tier 1 still requires
+  Task 14 production cutover/G0 lints, Task 15 runner, and Task 16 fresh
+  QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (ext4 Task 12 regular-file create admission).
   Advanced Task 12 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`

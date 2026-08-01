@@ -281,16 +281,6 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         *self.capability_profile_hash.lock()
     }
 
-    /// MutationHandle is the sole authority allowed to reach persistent pager
-    /// mutation. Until that lifecycle owner exists, every writable surface is
-    /// deliberately fail-closed.
-    pub(crate) fn require_mutation_owner(&self) -> Result<(), Errno> {
-        if self.is_read_only() {
-            return Err(Errno::EROFS);
-        }
-        Err(Errno::EOPNOTSUPP)
-    }
-
     pub(crate) fn with_pager<T>(
         &self,
         f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,

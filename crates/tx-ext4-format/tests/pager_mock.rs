@@ -1001,6 +1001,154 @@ fn namespace_plan_creates_regular_file_without_home_write() {
 }
 
 #[test]
+fn namespace_plan_creates_directory_without_home_write() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let block_bitmap_before = *image.block(2);
+    let inode_bitmap_before = *image.block(3);
+    let group_desc_before = *image.block(1);
+    let superblock_before = *image.block(0);
+    let inode_table_before = *image.block(4);
+    let parent_dir_before = *image.block(16);
+    let data_before = *image.block(48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let (new_ino, data_block, plan) = pager
+        .plan_create_directory(
+            InodeNo::new(2),
+            b"newdir",
+            0o755,
+            1001,
+            1002,
+            FsyncStamp::new(27),
+        )
+        .unwrap();
+
+    assert_eq!(new_ino, InodeNo::new(14));
+    assert_eq!(data_block, 48);
+    assert_eq!(plan.origin, MutationOrigin::Create);
+    assert_eq!(plan.object, 14);
+    assert!(plan.data.is_empty());
+    assert_eq!(plan.allocations.len(), 1);
+    assert_eq!(plan.allocations[0].physical_block, 48);
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 7);
+
+    let block_bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    assert_eq!(block_bitmap.home, 2);
+    assert!(BitmapView::new(&block_bitmap.after).is_set(48));
+
+    let inode_bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeBitmap)
+        .unwrap();
+    assert_eq!(inode_bitmap.home, 3);
+    assert!(!BitmapView::new(&inode_bitmap_before).is_set(13));
+    assert!(BitmapView::new(&inode_bitmap.after).is_set(13));
+
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    let parsed_group = GroupDesc::parse(&group_desc.after[..64]).unwrap();
+    assert_eq!(parsed_group.free_blocks_count, 31);
+    assert_eq!(parsed_group.free_inodes_count, 51);
+    assert_eq!(parsed_group.used_dirs_count, 2);
+    let seed = Superblock::parse(&superblock_before[1024..2048])
+        .unwrap()
+        .metadata_csum_seed();
+    assert_eq!(
+        u16::from_le_bytes(group_desc.after[24..26].try_into().unwrap()),
+        block_bitmap_csum32(seed, &block_bitmap.after, 64).unwrap() as u16
+    );
+    assert_eq!(
+        u16::from_le_bytes(group_desc.after[26..28].try_into().unwrap()),
+        inode_bitmap_csum32(seed, &inode_bitmap.after, 64).unwrap() as u16
+    );
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let parsed_superblock = Superblock::parse(&superblock.after[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.free_blocks_count, 31);
+    assert_eq!(parsed_superblock.free_inodes_count, 51);
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let parent_inode = Inode::parse(&inode_table.after[256..512]).unwrap();
+    assert_eq!(parent_inode.links_count, 4);
+    assert_eq!(parent_inode.ctime, 27);
+    let inode = Inode::parse(&inode_table.after[13 * 256..14 * 256]).unwrap();
+    assert_eq!(inode.mode, Inode::S_IFDIR | 0o755);
+    assert_eq!(inode.uid, 1001);
+    assert_eq!(inode.gid, 1002);
+    assert_eq!(inode.size, BLOCK_SIZE as u64);
+    assert_eq!(inode.links_count, 2);
+    assert_eq!(inode.blocks_512, 8);
+    assert_eq!(inode.ctime, 27);
+    assert_eq!(inode.mtime, 27);
+    assert_eq!(inode.atime, 27);
+    assert_eq!(
+        inode.map_extent_block(0).unwrap(),
+        tx_ext4_format::ondisk::BlockMapping::Data(48)
+    );
+
+    let parent_dir = plan.metadata.iter().find(|block| block.home == 16).unwrap();
+    assert_eq!(
+        parent_dir.role,
+        tx_ext4_format::mutation::MetaRole::DirectoryBlock
+    );
+    let parent_entries: Vec<_> = DirEntryIter::new(&parent_dir.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(parent_entries
+        .iter()
+        .any(|entry| entry.name == b"newdir" && entry.inode == 14 && entry.file_type == 2));
+
+    let child_dir = plan.metadata.iter().find(|block| block.home == 48).unwrap();
+    assert_eq!(
+        child_dir.role,
+        tx_ext4_format::mutation::MetaRole::DirectoryBlock
+    );
+    let child_entries: Vec<_> = DirEntryIter::new(&child_dir.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(child_entries.len(), 2);
+    assert!(child_entries
+        .iter()
+        .any(|entry| entry.name == b"." && entry.inode == 14));
+    assert!(child_entries
+        .iter()
+        .any(|entry| entry.name == b".." && entry.inode == 2));
+
+    assert_eq!(pager.image().block(2), &block_bitmap_before);
+    assert_eq!(pager.image().block(3), &inode_bitmap_before);
+    assert_eq!(pager.image().block(1), &group_desc_before);
+    assert_eq!(pager.image().block(0), &superblock_before);
+    assert_eq!(pager.image().block(4), &inode_table_before);
+    assert_eq!(pager.image().block(16), &parent_dir_before);
+    assert_eq!(pager.image().block(48), &data_before);
+}
+
+#[test]
 fn namespace_plan_renames_regular_file_in_place_without_home_write() {
     let image = mock_image();
     let dir_before = *image.block(16);

@@ -554,32 +554,56 @@ where
         name: &[u8],
         mode: u16,
         cred: &Credential,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        if let Err(err) = self.require_mutation_owner() {
-            return StepOutcome::err(err.into());
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
         }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager(|pager| pager.lookup(parent_ino, name)) {
+        match self.lookup_cached(parent_ino, name) {
             Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
             Ok(None) => {}
             Err(e) => return StepOutcome::err(e.into()),
         }
-        match self.with_pager(|pager| {
-            pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
+        let (new_ino, _data_block, mutation) = match self.with_pager(|pager| {
+            pager.plan_create_directory(
+                parent_ino,
+                name,
+                mode,
+                cred.uid,
+                cred.gid,
+                FsyncStamp::new(0),
+            )
         }) {
-            Ok(new_ino) => {
+            Ok(result) => result,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
+            Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
-                let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
-                    Ok(m) => m,
-                    Err(e) => return StepOutcome::err(e.into()),
-                };
-                StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
+                StepOutcome::done((
+                    inode_fs_object_id(new_ino),
+                    InodeMeta {
+                        mode: Inode::S_IFDIR | (mode & 0o7777),
+                        uid: cred.uid,
+                        gid: cred.gid,
+                        size: tx_ext4_format::pager::BLOCK_SIZE as u64,
+                        atime: Timespec::default(),
+                        mtime: Timespec::default(),
+                        ctime: Timespec::default(),
+                        nlinks: 2,
+                        blocks: 8,
+                        flags: Inode::EXTENTS_FL,
+                    },
+                ))
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 

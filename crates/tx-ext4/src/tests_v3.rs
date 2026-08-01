@@ -187,6 +187,13 @@ fn mark_inode_bitmap_used(image: &mut MemImage, count: usize) {
     }
 }
 
+fn mark_block_bitmap_used(image: &mut MemImage, count: usize) {
+    let mut bitmap = BitmapMut::new(image.block_mut(2));
+    for bit in 0..count {
+        bitmap.set(bit).unwrap();
+    }
+}
+
 fn build_image() -> MemImage {
     let mut image = MemImage::new(64);
 
@@ -421,6 +428,12 @@ fn build_tier1_create_image() -> MemImage {
     image
 }
 
+fn build_tier1_mkdir_image() -> MemImage {
+    let mut image = build_tier1_create_image();
+    mark_block_bitmap_used(&mut image, 48);
+    image
+}
+
 fn build_two_page_mapped_image() -> MemImage {
     let mut image = build_image();
     let mut file_inode = Inode::default();
@@ -594,6 +607,27 @@ fn mounted_counting_create_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 create mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_mkdir_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 7, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_mkdir_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 mkdir mutation ext4 image");
     (mounted, runtime, writes)
 }
 
@@ -1064,6 +1098,41 @@ fn ext4_create_public_path_admits_regular_file_without_home_write() {
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(31)
+    );
+}
+
+#[test]
+fn ext4_mkdir_public_path_admits_directory_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_mkdir_fs(32);
+
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .mkdir(FsObjectId::new(2), b"newdir", 0o755, &cred, &guard,),
+        V3::<_, NoProgress>::done((
+            FsObjectId::new(14),
+            InodeMeta {
+                mode: 0o40755,
+                uid: 0,
+                gid: 0,
+                size: BLOCK_SIZE as u64,
+                atime: Default::default(),
+                mtime: Default::default(),
+                ctime: Default::default(),
+                nlinks: 2,
+                blocks: 8,
+                flags: Inode::EXTENTS_FL,
+            },
+        ))
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(32)
     );
 }
 
