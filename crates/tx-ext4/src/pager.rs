@@ -193,7 +193,7 @@ where
                 return StepOutcome::err(err.into());
             }
         }
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 if had_reservation {
                     self.clear_buffered_write_reservation(inode, file_page_index);
@@ -230,7 +230,7 @@ where
             Ok(mutation) => mutation,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }

@@ -1,23 +1,41 @@
-- 2026-08-01 (VM/pmap tail-latency implementation plan).
-  Added the end-to-end execution plan in
-  `docs/progress/plans/2026-08-01-vm-pmap-tail-latency.json` and the detailed
-  operator-facing plan in
-  `docs/superpowers/plans/2026-08-01-vm-pmap-tail-latency.md`. The first phase
-  is attribution, not code promotion: run interleaved same-image baseline and
-  candidate measurements, correct the `lat_mmap` interpretation, and publish
-  the canonical pmap performance contract. The implementation order then
-  removes protect singleton invalidations and temporary Vec copies, eliminates
-  resident suffix movement, shortens the shadow lock, adds PT occupancy-based
-  prune, and only then enables acknowledged platform shootdown batching.
-  Structural gates are zero shifted resident entries, zero full PT empty-table
-  scans, committed-prefix retryability, and no HAL/shootdown/pin release under
-  the shadow lock. No Rust implementation or guest benchmark was changed in
-  this step. Verification passed `jq empty` for the new plan; repository-wide
-  `cargo xtask progress validate` remains blocked by the pre-existing invalid
-  `completed` status in `docs/progress/plans/2026-08-01-vm-waitable-prefault.json`.
-  Next: capture the matched baseline and then land the contract before TDD
-  implementation. Platform blockers remain RV64 root/ASID reuse acknowledgement,
-  LA64 remote shootdown/activation state, and M1Dock parity.
+- 2026-08-02 (ext4 pending metadata visibility advanced; data group now blocked by single active transaction).
+  Added a mount-local pending metadata after-image view to `Ext4Pager` and route
+  admitted metadata mutations through `Ext4FsInstance::begin_metadata_mutation`,
+  so lookup, inode-meta reads, and later planners see accepted journal
+  after-images before checkpoint without writing home blocks. Focused host
+  verification passed `cargo test -p tx-ext4 --lib --no-default-features --
+  --test-threads=1`, `cargo test -p tx-ext4 --test mutation_lifecycle --
+  --test-threads=1`, `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_ -- --test-threads=1`, and
+  `cargo test -p tx-ext4-format --test host_tools
+  tier1_busybox_image_can_plan_mkdir_under_musl -- --test-threads=1`. Fresh
+  QEMU `cargo xtask shell-test --target rv64-qemu --profile busybox
+  --extra-rv64-ext4 target/ext4/probe/busybox-tier1-data-probe-pending-view-20260802.img
+  --script tools/shell-tests/ext4-tier1.scn --group data` now gets
+  `tier1-data-mkdir:0` and no longer reports a nonexistent directory, but the
+  following file creation fails with `Resource busy`; the next Task 13/14 slice
+  must settle or queue ordered metadata transactions instead of exposing
+  `EBUSY` to ordinary guest namespace/data workflows.
+
+- 2026-08-01 (VM/pmap tail-latency plan aligned; first A-side seed captured).
+  Aligned `docs/progress/plans/2026-08-01-vm-pmap-tail-latency.json` and the
+  detailed operator plan with the completed waitable-prefault generation,
+  exact-source wait, Yield-guard, and writev hot-lane contracts. Captured a
+  separate no-metrics score A and metrics A for the 500-repeat
+  `pthread-minimal1` direct-init witness at 1 GiB/SMP4. The metrics receipt has
+  110299 raw records, zero loss/overwrite/framing errors, and shows one resident
+  removal per teardown but `shifted_entries` p99=14/total=7019; pmap teardown
+  p99=840us and `VmPmap::state` service p99=137us/max=2599us. Details, hashes,
+  syscall/phase/lock tables, the excluded ENOSPC attempt, and B-side matching
+  rules are in
+  `docs/progress/research/2026-08-01-vm-pmap-tail-baseline.md`. This is one
+  non-promotable seed, not the five-run matched baseline: score/metrics host
+  conditions and sdcard hashes differ, startup host load was not persisted,
+  the pthread run did not emit `debug.vm.fault.*`, and checkout HEAD advanced
+  after the recorded `1850abce...` capture. Next: freeze one candidate parent
+  and image, add matched cold-fault evidence, complete interleaved five-run A/B,
+  then land the canonical pmap contract. Platform blockers remain RV64 root/ASID reuse
+  acknowledgement, LA64 remote shootdown/activation state, and M1Dock parity.
 
 - 2026-08-01 (ext4 Task 15 Tier 1 runner scaffold).
   Landed the first `cargo xtask ext4 tier1` plumbing in `xtask/src/ext4/`:

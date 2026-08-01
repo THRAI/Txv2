@@ -11,8 +11,8 @@ pub mod ondisk;
 pub mod pager;
 
 pub use journal_replay::{
-    JournalReplayReport, RecoveryReport, clean_replayed_journal, recover_if_required,
-    replay_journal,
+    clean_replayed_journal, recover_if_required, replay_journal, JournalReplayReport,
+    RecoveryReport,
 };
 
 pub type Result<T> = core::result::Result<T, Ext4FormatError>;

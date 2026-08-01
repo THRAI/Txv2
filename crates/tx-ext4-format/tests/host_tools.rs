@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tx_ext4_format::capability::{Tier1Capabilities, Tier1Reject, Tier1Request, sha256};
+use tx_ext4_format::capability::{sha256, Tier1Capabilities, Tier1Reject, Tier1Request};
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
 use tx_ext4_format::ondisk::Ext4FormatError;
-use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, DirEntryLite, Ext4Pager, InodeNo};
+use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeNo, BLOCK_SIZE};
 
 #[test]
 fn tier1_rejects_unsupported_shape_before_mutation() {
@@ -155,11 +155,9 @@ fn generated_ext4_image_matches_host_tool_directory_and_file_observations() {
 
     let mut entries = [DirEntryLite::empty(); 8];
     let count = pager.read_dir_entries(folder_ino, &mut entries).unwrap();
-    assert!(
-        entries[..count]
-            .iter()
-            .any(|entry| entry.name() == b"hello.txt")
-    );
+    assert!(entries[..count]
+        .iter()
+        .any(|entry| entry.name() == b"hello.txt"));
 
     let mut page = [0u8; BLOCK_SIZE];
     pager.read_page(file_ino, 0, &mut page).unwrap();

@@ -8,6 +8,7 @@ use crate::ondisk::{
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -141,6 +142,7 @@ pub struct JournalGeometry {
 
 pub struct Ext4Pager<I> {
     image: I,
+    pending_metadata: BTreeMap<u64, Page4K>,
     superblock: Superblock,
     groups: Vec<GroupDesc>,
     inode_table: InodeTableLayout,
@@ -152,6 +154,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     pub fn open(image: I) -> Result<Self> {
         let mut pager = Self {
             image,
+            pending_metadata: BTreeMap::new(),
             superblock: Superblock::default(),
             groups: Vec::new(),
             inode_table: InodeTableLayout {
@@ -163,7 +166,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             next_sequence: 1,
         };
         let mut block = [0u8; BLOCK_SIZE];
-        pager.image.read_block(0, &mut block)?;
+        pager.read_block(0, &mut block)?;
         let superblock = Superblock::parse(&block[1024..2048])?;
         if superblock.block_size() != BLOCK_SIZE as u32 {
             return Err(Ext4FormatError::Unsupported);
@@ -199,7 +202,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// clear it.
     pub fn mark_recovery_required(&mut self) -> Result<()> {
         let mut page = [0; BLOCK_SIZE];
-        self.image.read_block(0, &mut page)?;
+        self.read_block(0, &mut page)?;
         let mut superblock = Superblock::parse(&page[1024..2048])?;
         superblock.feature_compat |= Superblock::FEATURE_COMPAT_HAS_JOURNAL;
         superblock.feature_incompat |= Superblock::FEATURE_INCOMPAT_RECOVER;
@@ -221,9 +224,27 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.image
     }
 
+    fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        if let Some(pending) = self.pending_metadata.get(&block) {
+            out.copy_from_slice(pending);
+            return Ok(());
+        }
+        self.image.read_block(block, out)
+    }
+
+    /// Publish metadata after-images that have been accepted by the mounted
+    /// mutation runtime but not yet checkpointed to their home blocks.
+    pub fn stage_mutation_after_images(&mut self, mutation: &Ext4MutationPlan) {
+        for metadata in &mutation.metadata {
+            self.pending_metadata.insert(metadata.home, metadata.after);
+            self.image.invalidate_block(metadata.home);
+        }
+    }
+
     /// Invalidate the image adapter's derived block cache after an L6-owned
     /// checkpoint. The format pager itself retains no metadata cache.
     pub fn settle_image_cache(&mut self) {
+        self.pending_metadata.clear();
         self.image.invalidate_all();
     }
 
@@ -247,7 +268,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             }
         }
         let mut superblock_page = [0; BLOCK_SIZE];
-        self.image.read_block(blocks[0], &mut superblock_page)?;
+        self.read_block(blocks[0], &mut superblock_page)?;
         let superblock = Jbd2Superblock::parse(&superblock_page)?;
         let max_len = superblock.max_len as usize;
         if max_len > blocks.len() {
@@ -288,7 +309,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
             BlockMapping::Data(block) => {
-                self.image.read_block(block, out)?;
+                self.read_block(block, out)?;
                 let valid_len = core::cmp::min(BLOCK_SIZE as u64, disk_inode.size - page_start);
                 out[valid_len as usize..].fill(0);
                 Ok(PageRead::Data { block })
@@ -369,7 +390,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
                 let loc = self.inode_location(inode)?;
                 let mut inode_table_before = [0u8; BLOCK_SIZE];
-                self.image.read_block(loc.block, &mut inode_table_before)?;
+                self.read_block(loc.block, &mut inode_table_before)?;
                 let mut inode_table_after = inode_table_before;
                 let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
                 inode_after.encode(inode_bytes)?;
@@ -434,7 +455,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             // writeback. The inode after-image is intentionally unchanged.
             let loc = self.inode_location(inode)?;
             let mut inode_table_before = [0u8; BLOCK_SIZE];
-            self.image.read_block(loc.block, &mut inode_table_before)?;
+            self.read_block(loc.block, &mut inode_table_before)?;
             plan.push_metadata(MetadataBlock {
                 home: loc.block,
                 role: MetaRole::InodeTable,
@@ -471,7 +492,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             Ext4MutationPlan::new(MutationOrigin::FlushPage, inode.get() as u64, fsync_stamp);
         let loc = self.inode_location(inode)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.image.read_block(loc.block, &mut inode_table_before)?;
+        self.read_block(loc.block, &mut inode_table_before)?;
         plan.push_metadata(MetadataBlock {
             home: loc.block,
             role: MetaRole::InodeTable,
@@ -678,7 +699,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 return Err(Ext4FormatError::Unsupported);
             }
             let mut bitmap_before = [0u8; BLOCK_SIZE];
-            self.image.read_block(bitmap_home, &mut bitmap_before)?;
+            self.read_block(bitmap_home, &mut bitmap_before)?;
             let mut bitmap_after = bitmap_before;
             for physical_block in freed.iter().copied() {
                 let (candidate_group, candidate_home, bit) =
@@ -816,7 +837,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let (group_index, bitmap_home, _) = self.block_group_for_physical(freed[0])?;
         let mut bitmap_before = [0u8; BLOCK_SIZE];
-        self.image.read_block(bitmap_home, &mut bitmap_before)?;
+        self.read_block(bitmap_home, &mut bitmap_before)?;
         let mut bitmap_after = bitmap_before;
         for physical_block in freed.iter().copied() {
             let (candidate_group, candidate_home, bit) =
@@ -913,7 +934,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             let group_block_count = core::cmp::min(blocks_per_group, total_blocks - group_start);
             let bitmap_home = group.block_bitmap_block();
             let mut bitmap_before = [0u8; BLOCK_SIZE];
-            self.image.read_block(bitmap_home, &mut bitmap_before)?;
+            self.read_block(bitmap_home, &mut bitmap_before)?;
             let mut bitmap_after = bitmap_before;
             let view = BitmapView::new(&bitmap_after);
             let Some(bit) = (0..group_block_count as usize).find(|bit| !view.is_set(*bit)) else {
@@ -948,7 +969,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 core::cmp::min(inodes_per_group, total_inodes - group_first_index);
             let bitmap_home = group.inode_bitmap_block();
             let mut bitmap_before = [0u8; BLOCK_SIZE];
-            self.image.read_block(bitmap_home, &mut bitmap_before)?;
+            self.read_block(bitmap_home, &mut bitmap_before)?;
             let mut bitmap_after = bitmap_before;
             let view = BitmapView::new(&bitmap_after);
             let Some(bit) = (0..group_inode_count as usize).find(|bit| !view.is_set(*bit)) else {
@@ -1018,7 +1039,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Unsupported);
         }
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(home, &mut before)?;
+        self.read_block(home, &mut before)?;
         let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
         let free = u32::from(descriptor.free_blocks_count)
             | (u32::from(descriptor.free_blocks_count_hi) << 16);
@@ -1076,7 +1097,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Unsupported);
         }
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(home, &mut before)?;
+        self.read_block(home, &mut before)?;
         let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
         let free = u32::from(descriptor.free_blocks_count)
             | (u32::from(descriptor.free_blocks_count_hi) << 16);
@@ -1135,7 +1156,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Unsupported);
         }
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(home, &mut before)?;
+        self.read_block(home, &mut before)?;
         let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
         let free = u32::from(descriptor.free_inodes_count)
             | (u32::from(descriptor.free_inodes_count_hi) << 16);
@@ -1194,7 +1215,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Unsupported);
         }
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(home, &mut before)?;
+        self.read_block(home, &mut before)?;
         let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
         let free_blocks = u32::from(descriptor.free_blocks_count)
             | (u32::from(descriptor.free_blocks_count_hi) << 16);
@@ -1278,7 +1299,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Unsupported);
         }
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(home, &mut before)?;
+        self.read_block(home, &mut before)?;
         let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
         let free_blocks = u32::from(descriptor.free_blocks_count)
             | (u32::from(descriptor.free_blocks_count_hi) << 16);
@@ -1344,7 +1365,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     fn plan_superblock_free_block_decrement(&self) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(0, &mut before)?;
+        self.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
         let next = observed
             .free_blocks_count
@@ -1364,7 +1385,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     fn plan_superblock_mkdir_counts(&self) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(0, &mut before)?;
+        self.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
         let next_free_blocks = observed
             .free_blocks_count
@@ -1390,7 +1411,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     fn plan_superblock_free_inode_decrement(&self) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(0, &mut before)?;
+        self.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
         let next = observed
             .free_inodes_count
@@ -1409,7 +1430,7 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     fn plan_superblock_free_block_increment(&self, released: u64) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(0, &mut before)?;
+        self.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
         let next = observed
             .free_blocks_count
@@ -1432,7 +1453,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         released_blocks: u64,
     ) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
-        self.image.read_block(0, &mut before)?;
+        self.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
         let next_free_blocks = observed
             .free_blocks_count
@@ -1536,7 +1557,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                     .unwrap_or(0);
                 let child = indexes[idx_pos].child;
                 let mut block = [0u8; BLOCK_SIZE];
-                self.image.read_block(child, &mut block)?;
+                self.read_block(child, &mut block)?;
                 let mut extents = match ExtentNode::parse(&block)? {
                     ExtentNode::Leaf(list) => list,
                     ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
@@ -1606,7 +1627,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         for (idx, chunk) in out.chunks_mut(BLOCK_SIZE).enumerate() {
             let mut page = [0u8; BLOCK_SIZE];
             match self.resolve_inode_block(&disk_inode, logical_block(idx as u64)?)? {
-                BlockMapping::Data(block) => self.image.read_block(block, &mut page)?,
+                BlockMapping::Data(block) => self.read_block(block, &mut page)?,
                 BlockMapping::Hole => page.fill(0),
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             }
@@ -1623,7 +1644,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         let journal_start = self.journal_start.ok_or(Ext4FormatError::Unsupported)?;
         let location = self.inode_location(inode)?;
         let mut home_block = [0u8; BLOCK_SIZE];
-        self.image.read_block(location.block, &mut home_block)?;
+        self.read_block(location.block, &mut home_block)?;
         let mut disk_inode =
             Inode::parse(&home_block[location.offset..location.offset + location.len])?;
         apply_meta(&mut disk_inode, meta);
@@ -1676,7 +1697,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             let mut page = [0u8; BLOCK_SIZE];
             match self.resolve_inode_block(&disk_inode, 0)? {
                 BlockMapping::Data(block) => {
-                    self.image.read_block(block, &mut page)?;
+                    self.read_block(block, &mut page)?;
                     Ok(page[..size.min(BLOCK_SIZE)].to_vec())
                 }
                 BlockMapping::Hole => Ok(Vec::new()),
@@ -1695,19 +1716,19 @@ impl<I: BlockImage> Ext4Pager<I> {
                 break;
             }
             let mut descriptor = [0u8; BLOCK_SIZE];
-            self.image.read_block(cursor, &mut descriptor)?;
+            self.read_block(cursor, &mut descriptor)?;
             let (header, tag) = match parse_journal_descriptor(&descriptor) {
                 Ok((header, tag)) => (header, tag),
                 _ => break,
             };
             let mut commit = [0u8; BLOCK_SIZE];
-            self.image.read_block(cursor + 2, &mut commit)?;
+            self.read_block(cursor + 2, &mut commit)?;
             let commit = CommitHeader::parse(&commit)?;
             if commit.sequence != header.sequence {
                 break;
             }
             let mut payload = [0u8; BLOCK_SIZE];
-            self.image.read_block(cursor + 1, &mut payload)?;
+            self.read_block(cursor + 1, &mut payload)?;
             self.image.write_block(tag.block as u64, &payload)?;
             blocks_replayed += 1;
             transactions += 1;
@@ -1737,7 +1758,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 core::cmp::min(inodes_per_group, total_inodes - group_first_index);
             let bitmap_block = group.inode_bitmap_block();
             let mut bitmap = [0u8; BLOCK_SIZE];
-            self.image.read_block(bitmap_block, &mut bitmap)?;
+            self.read_block(bitmap_block, &mut bitmap)?;
             let view = BitmapView::new(&bitmap);
             let Some(bit) = (0..group_inode_count as usize).find(|bit| !view.is_set(*bit)) else {
                 continue;
@@ -1754,7 +1775,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     pub fn write_inode(&mut self, inode_no: InodeNo, inode: &Inode) -> Result<()> {
         let loc = self.inode_location(inode_no)?;
         let mut block = [0u8; BLOCK_SIZE];
-        self.image.read_block(loc.block, &mut block)?;
+        self.read_block(loc.block, &mut block)?;
         inode.encode(&mut block[loc.offset..loc.offset + loc.len])?;
         self.image.write_block(loc.block, &block)?;
         Ok(())
@@ -1778,7 +1799,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             let group_block_count = core::cmp::min(blocks_per_group, total_blocks - group_start);
             let bitmap_block = group.block_bitmap_block();
             let mut bitmap = [0u8; BLOCK_SIZE];
-            self.image.read_block(bitmap_block, &mut bitmap)?;
+            self.read_block(bitmap_block, &mut bitmap)?;
             let view = BitmapView::new(&bitmap);
             let Some(bit) = (0..group_block_count as usize).find(|bit| !view.is_set(*bit)) else {
                 continue;
@@ -1830,7 +1851,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
             let mut before = [0u8; BLOCK_SIZE];
-            self.image.read_block(phys, &mut before)?;
+            self.read_block(phys, &mut before)?;
             let mut after = before;
 
             let mut off = 0usize;
@@ -1966,7 +1987,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
             let mut before = [0u8; BLOCK_SIZE];
-            self.image.read_block(phys, &mut before)?;
+            self.read_block(phys, &mut before)?;
             let mut after = before;
 
             let mut off = 0usize;
@@ -2173,7 +2194,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
             let mut before = [0u8; BLOCK_SIZE];
-            self.image.read_block(phys, &mut before)?;
+            self.read_block(phys, &mut before)?;
             let mut after = before;
             let mut prev_off: Option<usize> = None;
             let mut old_entry: Option<(usize, Option<usize>)> = None;
@@ -2409,7 +2430,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
             let mut page = [0u8; BLOCK_SIZE];
-            self.image.read_block(phys, &mut page)?;
+            self.read_block(phys, &mut page)?;
             for entry in DirEntryIter::new(&page) {
                 let entry = entry?;
                 match entry.name {
@@ -2441,7 +2462,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
             let mut before = [0u8; BLOCK_SIZE];
-            self.image.read_block(phys, &mut before)?;
+            self.read_block(phys, &mut before)?;
             let mut after = before;
 
             let mut prev_off: Option<usize> = None;
@@ -2609,7 +2630,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             self.plan_superblock_mkdir_counts()?;
 
         let mut child_dir_before = [0u8; BLOCK_SIZE];
-        self.image.read_block(data_block, &mut child_dir_before)?;
+        self.read_block(data_block, &mut child_dir_before)?;
         let mut child_dir_after = [0u8; BLOCK_SIZE];
         encode_dir_entry(new_ino.get(), 12, 2, b".", &mut child_dir_after[0..12])?;
         encode_dir_entry(
@@ -2932,7 +2953,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     fn read_inode(&mut self, inode: InodeNo) -> Result<Inode> {
         let location = self.inode_location(inode)?;
         let mut block = [0u8; BLOCK_SIZE];
-        self.image.read_block(location.block, &mut block)?;
+        self.read_block(location.block, &mut block)?;
         Inode::parse(&block[location.offset..location.offset + location.len])
     }
 
@@ -2956,7 +2977,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         for page_index in 0..page_count {
             let mut page = [0u8; BLOCK_SIZE];
             match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
-                BlockMapping::Data(block) => self.image.read_block(block, &mut page)?,
+                BlockMapping::Data(block) => self.read_block(block, &mut page)?,
                 BlockMapping::Hole => continue,
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             }
@@ -3006,7 +3027,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         while page_index < page_count {
             let mut page = [0u8; BLOCK_SIZE];
             match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
-                BlockMapping::Data(block) => self.image.read_block(block, &mut page)?,
+                BlockMapping::Data(block) => self.read_block(block, &mut page)?,
                 BlockMapping::Hole => {
                     page_index += 1;
                     offset_in_page = 0;
@@ -3110,7 +3131,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                     }
                     let child = selected.unwrap_or(indexes[0].child);
                     let mut block = [0u8; BLOCK_SIZE];
-                    self.image.read_block(child, &mut block)?;
+                    self.read_block(child, &mut block)?;
                     node = ExtentNode::parse(&block)?;
                 }
             }

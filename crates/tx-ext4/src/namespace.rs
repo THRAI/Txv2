@@ -218,7 +218,7 @@ where
             Ok(mutation) => mutation,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
@@ -251,7 +251,7 @@ where
                 Ok(mutation) => mutation,
                 Err(err) => return StepOutcome::err(err.into()),
             };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
@@ -293,7 +293,7 @@ where
             Ok(mutation) => mutation,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
@@ -330,7 +330,7 @@ where
             Ok(result) => result,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done((
@@ -389,7 +389,7 @@ where
             Ok(mutation) => mutation,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
@@ -485,7 +485,7 @@ where
             Ok(mutation) => mutation,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(old_parent_ino);
                 self.invalidate_lookup_cache_for(new_parent_ino);
@@ -539,7 +539,7 @@ where
             Ok(mutation) => mutation,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
@@ -584,7 +584,7 @@ where
             Ok(result) => result,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done((
@@ -643,7 +643,7 @@ where
             Ok(mutation) => mutation,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
@@ -688,7 +688,7 @@ where
             Ok(result) => result,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done((
@@ -776,7 +776,7 @@ where
             Ok(mutation) => mutation,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match runtime.begin_mutation(&mutation, guard) {
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
                 self.settle_metadata_caches();
                 StepOutcome::done(())

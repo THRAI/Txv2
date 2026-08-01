@@ -553,7 +553,9 @@ fn mutation_runtime_for_test_with_ring(
                     start: 0,
                     uuid: [1; 16],
                 },
-                blocks: vec![9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+                blocks: vec![
+                    9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                ],
                 superblock_page: None,
             },
             sequence,
@@ -1272,6 +1274,30 @@ fn ext4_mkdir_public_path_admits_directory_without_home_write() {
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(32)
     );
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .lookup(FsObjectId::new(2), b"newdir", &guard),
+        V3::<_, NoProgress>::done(FsObjectId::new(14))
+    );
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .load_inode_meta(FsObjectId::new(14), &guard),
+        V3::<_, NoProgress>::done(InodeMeta {
+            mode: 0o40755,
+            uid: 0,
+            gid: 0,
+            size: BLOCK_SIZE as u64,
+            atime: Default::default(),
+            mtime: Default::default(),
+            ctime: Default::default(),
+            nlinks: 2,
+            blocks: 8,
+            flags: Inode::EXTENTS_FL,
+        })
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -1946,6 +1972,30 @@ fn ext4_mkdir_public_path_admits_directory_with_ring_runtime_without_home_write(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(32)
     );
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .lookup(FsObjectId::new(2), b"newdir", &guard),
+        V3::<_, NoProgress>::done(FsObjectId::new(14))
+    );
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .load_inode_meta(FsObjectId::new(14), &guard),
+        V3::<_, NoProgress>::done(InodeMeta {
+            mode: 0o40755,
+            uid: 0,
+            gid: 0,
+            size: BLOCK_SIZE as u64,
+            atime: Default::default(),
+            mtime: Default::default(),
+            ctime: Default::default(),
+            nlinks: 2,
+            blocks: 8,
+            flags: Inode::EXTENTS_FL,
+        })
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
 }
 
 #[test]

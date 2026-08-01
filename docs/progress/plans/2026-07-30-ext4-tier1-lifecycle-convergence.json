@@ -4,7 +4,7 @@
   "title": "Converge ext4 Tier 1 lifecycle ownership",
   "status": "active",
   "created": "2026-07-30",
-  "updated": "2026-08-01",
+  "updated": "2026-08-02",
   "owner": "ext4-lifecycle-coordinator",
   "summary": "Implement the bounded ext4 Tier 1 surface through OwnedFileIoRequest, MutationHandle, and MountSettlementOp, then prove one production RW durability path with G0-G7 evidence.",
   "scope": {
@@ -461,6 +461,7 @@
     "Host contract tests and reused serial logs can be mistaken for product evidence without fresh QEMU, immutable image, e2fsck, and xfstests receipts."
   ],
   "blockers": [
+    "2026-08-02 fresh QEMU data group now passes mkdir visibility but fails the following file creation with `Resource busy`; the ring/source lifecycle still exposes the single active uncheckpointed transaction instead of settling or queueing ordered metadata mutations before the next guest-visible mutation.",
     "Current production namespace and pager paths still contain direct home writes and are not yet behind one MutationHandle.",
     "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
     "The public cargo xtask ext4 tier1 command and its immutable acceptance receipt do not yet exist."

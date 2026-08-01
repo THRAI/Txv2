@@ -3,7 +3,7 @@ use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
+use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -21,7 +21,10 @@ use tx_subsystems::page_backed::PageContainer;
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
-use crate::journal::{Ext4MutationPlanSource, JournalMutationRuntime, JournalSettlementObserver};
+use crate::journal::{
+    Ext4MutationPlanSource, JournalMutationRuntime, JournalMutationRuntimeError,
+    JournalSettlementObserver,
+};
 use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
@@ -215,6 +218,20 @@ impl<I: BlockImage> Ext4FsInstance<I> {
 
     pub(crate) fn metadata_mutation_runtime(&self) -> Option<Arc<JournalMutationRuntime>> {
         self.metadata_mutation_runtime.lock().clone()
+    }
+
+    pub(crate) fn begin_metadata_mutation(
+        &self,
+        runtime: &JournalMutationRuntime,
+        mutation: &Ext4MutationPlan,
+        guard: &Guard<'_>,
+    ) -> Result<(), JournalMutationRuntimeError> {
+        runtime.begin_mutation(mutation, guard)?;
+        let _ = self.with_pager(|pager| {
+            pager.stage_mutation_after_images(mutation);
+            Ok(())
+        });
+        Ok(())
     }
 
     pub(crate) fn reserve_buffered_write(
