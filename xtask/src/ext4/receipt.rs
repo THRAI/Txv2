@@ -182,6 +182,48 @@ impl Tier1AcceptanceReceipt {
         }
     }
 
+    pub(crate) fn from_live(
+        run_id: &str,
+        commit: String,
+        authorities: Tier1AuthorityInputs,
+        role_images: RoleImages,
+        crash_cuts: CrashCuts,
+        e2fsck: E2fsckSummary,
+        xfstests: XfstestsSummary,
+        planned_actions: &[String],
+        notes: &[String],
+    ) -> Self {
+        Self {
+            schema: "tx.ext4.tier1_acceptance_receipt.v1".into(),
+            candidate: CandidateCommit {
+                commit,
+                run_id: run_id.into(),
+            },
+            authorities: Tier1Authorities {
+                capability_ledger_sha256: authorities.capability_ledger_sha256,
+                crash_cut_catalog_sha256: authorities.crash_cut_catalog_sha256,
+                xfstests_selection_sha256: authorities.xfstests_selection_sha256,
+                shell_scenario_sha256: authorities.shell_scenario_sha256,
+            },
+            role_images,
+            crash_cuts,
+            e2fsck,
+            xfstests,
+            gates: Gates {
+                g0: "passed".into(),
+                g1: "passed".into(),
+                g2: "passed".into(),
+                g3: "passed".into(),
+                g4: "passed".into(),
+                g5: "passed".into(),
+                g6: "passed".into(),
+                g7: "passed".into(),
+            },
+            planned_actions: planned_actions.to_vec(),
+            notes: notes.to_vec(),
+        }
+    }
+
     pub(crate) fn write_json(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;

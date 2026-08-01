@@ -58,6 +58,28 @@ impl RunWorkspace {
         Ok(())
     }
 
+    pub(crate) fn stage_copy(
+        &mut self,
+        name: impl Into<String>,
+        source: &Path,
+        file_name: &str,
+    ) -> Result<PathBuf> {
+        let destination = self.temporary.join(file_name);
+        fs::copy(source, &destination).map_err(|err| {
+            format!(
+                "failed to copy {} -> {}: {err}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        self.record_artifact(name, destination.clone())?;
+        Ok(destination)
+    }
+
+    pub(crate) fn working_dir(&self) -> &Path {
+        &self.temporary
+    }
+
     pub(crate) fn spawn_test_child(&mut self, command: &str) -> Result<Child> {
         let child = Command::new("sh")
             .arg("-c")

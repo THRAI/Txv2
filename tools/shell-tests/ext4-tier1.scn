@@ -1,27 +1,60 @@
-# ext4 Tier 1 shell scenario placeholder.
-# The runner hashes this file as one of the pinned authorities and
-# later stages can replace the no-op groups with real guest commands.
+# ext4 Tier 1 shell scenario.
+#
+# Run with `cargo xtask ext4 tier1 --dry-run` to inspect the pinned
+# authority hashes and with the live tier1 runner to drive the guest
+# matrix against the mounted ext4 image.
+
+wait ":mount:sdcard:ext4:ok" within 90000
+wait "/ # " within 90000
 
 group data
-sleep 0
+sleep 250
+send "mkdir -p /musl/tier1-data; printf 'alpha\\n' > /musl/tier1-data/file; cat /musl/tier1-data/file; echo tier1-data-status:$?\n"
+expect "alpha" within 10000
+expect "tier1-data-status:0" within 10000
+expect "/ # " within 10000
 
 group setattr
-sleep 0
+sleep 250
+send "chmod 755 /musl/tier1-data/file; test -x /musl/tier1-data/file; echo tier1-setattr-status:$?\n"
+expect "tier1-setattr-status:0" within 10000
+expect "/ # " within 10000
 
 group namespace
-sleep 0
+sleep 250
+send "mkdir -p /musl/tier1-ns; printf ns > /musl/tier1-ns/a; ln /musl/tier1-ns/a /musl/tier1-ns/b; ln -s a /musl/tier1-ns/c; mv /musl/tier1-ns/a /musl/tier1-ns/d; rm /musl/tier1-ns/b /musl/tier1-ns/c /musl/tier1-ns/d; rmdir /musl/tier1-ns; echo tier1-namespace-status:$?\n"
+expect "tier1-namespace-status:0" within 10000
+expect "/ # " within 10000
 
 group orphan
-sleep 0
+sleep 250
+send "mkdir -p /musl/tier1-orphan; printf orphan > /musl/tier1-orphan/live; exec 3</musl/tier1-orphan/live; rm /musl/tier1-orphan/live; cat <&3; echo tier1-orphan-status:$?\n"
+expect "orphan" within 10000
+expect "tier1-orphan-status:0" within 10000
+expect "/ # " within 10000
 
 group durability
-sleep 0
-
-group detach
-sleep 0
+sleep 250
+send "sync; echo tier1-durability-status:$?\n"
+expect "tier1-durability-status:0" within 10000
+expect "/ # " within 10000
 
 group remount
-sleep 0
+sleep 250
+send "umount /musl; mount -t ext4 /dev/block/vda /musl; echo tier1-remount-status:$?\n"
+expect "tier1-remount-status:0" within 30000
+expect "/ # " within 30000
 
 group execute-from-scratch
-sleep 0
+sleep 250
+send "printf '#!/bin/sh\\necho tier1-exec-ok\\n' > /musl/tier1-exec.sh; chmod +x /musl/tier1-exec.sh; /musl/tier1-exec.sh; echo tier1-exec-status:$?\n"
+expect "tier1-exec-ok" within 10000
+expect "tier1-exec-status:0" within 10000
+expect "/ # " within 10000
+
+group detach
+sleep 250
+send "sync; umount /musl; echo tier1-detach-status:$?\n"
+expect "tier1-detach-status:0" within 30000
+
+quit

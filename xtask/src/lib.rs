@@ -13,6 +13,7 @@ mod full_build;
 mod image;
 mod kernel_user_layouts;
 mod lint;
+mod lint_invariants_ext4;
 mod lint_invariants_api_language;
 mod lint_invariants_checks;
 mod lint_invariants_cred_check;

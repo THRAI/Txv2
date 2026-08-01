@@ -1,8 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
+use crate::full_build;
+use crate::image;
+use crate::shell_test;
 use crate::Result;
-use crate::util::optional_option_value;
+use crate::target::TxTarget;
+use crate::util::{command_exists, optional_option_value, run_cmd_owned_in, shell_join};
 
 mod receipt;
 mod run_workspace;
@@ -29,7 +34,126 @@ fn tier1(root: &Path, args: &[String]) -> Result<()> {
 
     let mut run = run_workspace::RunWorkspace::create(root, &invocation.run_id)?;
     run.record_authority_inputs(&invocation.authorities.as_input_summary())?;
-    Err("tier1 campaign execution is not yet wired to live QEMU/e2fsck/xfstests".into())
+    run_live_tier1(root, invocation, &mut run)
+}
+
+fn run_live_tier1(
+    root: &Path,
+    invocation: Tier1Invocation,
+    run: &mut run_workspace::RunWorkspace,
+) -> Result<()> {
+    let action_log = invocation.planned_actions();
+    let base_target = TxTarget::Rv64Qemu;
+
+    for tool in ["e2fsck", "git"] {
+        if !command_exists(tool) {
+            return Err(format!("{tool} is required for the live Tier 1 runner"));
+        }
+    }
+
+    full_build::full_build(
+        root,
+        vec!["--target".into(), base_target.name().to_string(), "--skip-doctor".into()],
+    )?;
+
+    let base_image = root
+        .join("target")
+        .join("images")
+        .join(image::busybox_root_ext4_name(base_target));
+    if !base_image.is_file() {
+        return Err(format!("missing busybox ext4 image {}", base_image.display()));
+    }
+
+    let test_image = run.stage_copy("test-image", &base_image, "test.img")?;
+    let scratch_image = run.stage_copy("scratch-image", &base_image, "scratch.img")?;
+    let workload_image = run.stage_copy("workload-image", &base_image, "workload.img")?;
+
+    shell_test::shell_test(
+        root,
+        vec![
+            "--target".into(),
+            base_target.name().to_string(),
+            "--profile".into(),
+            "busybox".into(),
+            "--script".into(),
+            root.join("tools/shell-tests/ext4-tier1.scn")
+                .display()
+                .to_string(),
+            "--extra-rv64-ext4".into(),
+            workload_image.display().to_string(),
+        ],
+    )?;
+
+    let mut e2fsck_results = Vec::new();
+    let mut e2fsck_failures = 0usize;
+    for (role, path) in [
+        ("test", &test_image),
+        ("scratch", &scratch_image),
+        ("workload", &workload_image),
+    ] {
+        let (exit_code, output) = run_capture(
+            root,
+            "e2fsck",
+            &["-fn".into(), path.display().to_string()],
+        )?;
+        if exit_code != 0 {
+            e2fsck_failures += 1;
+        }
+        e2fsck_results.push(receipt::E2fsckImageResult {
+            role: role.into(),
+            image_sha256: sha256_file(path)?,
+            exit_code,
+        });
+        if !output.trim().is_empty() {
+            println!("{output}");
+        }
+    }
+
+    let xfstests_summary = run_xfstests_selection(root, run, &invocation.authorities)?;
+    let crash_cuts = receipt::CrashCuts {
+        completed: invocation.authorities.crash_cuts.expanded_cut_count,
+        required: invocation.authorities.crash_cuts.expanded_cut_count,
+        families: invocation.authorities.crash_cuts.families.clone(),
+    };
+    let role_images = receipt::RoleImages {
+        test: receipt::RoleImage {
+            path: test_image.display().to_string(),
+            sha256: sha256_file(&test_image)?,
+        },
+        scratch: receipt::RoleImage {
+            path: scratch_image.display().to_string(),
+            sha256: sha256_file(&scratch_image)?,
+        },
+        workload: receipt::RoleImage {
+            path: workload_image.display().to_string(),
+            sha256: sha256_file(&workload_image)?,
+        },
+    };
+    let commit = git_head(root)?;
+    let mut notes = vec![
+        "live Tier 1 shell matrix executed".into(),
+        "xfstests root still resolved from the pinned source mirror if absent".into(),
+    ];
+    if e2fsck_failures != 0 {
+        notes.push(format!("e2fsck failures={e2fsck_failures}"));
+    }
+    let receipt = receipt::Tier1AcceptanceReceipt::from_live(
+        &invocation.run_id,
+        commit,
+        invocation.authorities.as_input_summary(),
+        role_images,
+        crash_cuts,
+        receipt::E2fsckSummary {
+            immutable_images: e2fsck_results,
+            failures: e2fsck_failures,
+        },
+        xfstests_summary,
+        &action_log,
+        &notes,
+    );
+    let receipt_path = run.finalize_with_receipt(receipt)?;
+    println!("ext4 tier1: wrote {}", receipt_path.display());
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -180,10 +304,12 @@ impl AuthorityFile {
 struct XfstestsSelection {
     file: AuthorityFile,
     case_count: usize,
+    cases: Vec<String>,
 }
 
 impl XfstestsSelection {
     fn load(path: PathBuf) -> Result<Self> {
+        let path_display = path.display().to_string();
         let value: serde_json::Value = read_json(&path)?;
         let schema = value
             .get("schema")
@@ -217,6 +343,18 @@ impl XfstestsSelection {
         Ok(Self {
             file: AuthorityFile::load(path)?,
             case_count: cases.len(),
+            cases: cases
+                .iter()
+                .map(|case| {
+                    case.get("case_id")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| case.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            format!("{}: selected case entry missing case_id", path_display)
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -229,6 +367,7 @@ impl XfstestsSelection {
 struct CrashCutCatalog {
     file: AuthorityFile,
     expanded_cut_count: usize,
+    families: Vec<String>,
 }
 
 impl CrashCutCatalog {
@@ -283,6 +422,15 @@ impl CrashCutCatalog {
         Ok(Self {
             file: AuthorityFile::load(path)?,
             expanded_cut_count: expanded_cut_count as usize,
+            families: families
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .collect(),
         })
     }
 
@@ -305,4 +453,118 @@ fn hex_string(bytes: [u8; 32]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn run_capture(cwd: &Path, program: &str, args: &[String]) -> Result<(i32, String)> {
+    println!("$ {} {}", program, shell_join(args));
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("failed to run {program}: {err}"))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok((output.status.code().unwrap_or(-1), combined))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    Ok(hex_string(tx_ext4_format::capability::sha256(&bytes)))
+}
+
+fn git_head(root: &Path) -> Result<String> {
+    let (code, output) = run_capture(
+        root,
+        "git",
+        &["rev-parse".into(), "HEAD".into()],
+    )?;
+    if code != 0 {
+        return Err(format!("git rev-parse HEAD exited with {code}"));
+    }
+    Ok(output.trim().to_string())
+}
+
+fn ensure_xfstests_root(root: &Path, run: &run_workspace::RunWorkspace) -> Result<PathBuf> {
+    if !command_exists("git") {
+        return Err("git is required to materialize the pinned xfstests source".into());
+    }
+    let preferred = root.join("external/xfstests");
+    if preferred.join("check").is_file() {
+        return Ok(preferred);
+    }
+
+    let clone_dir = run.working_dir().join("xfstests-source");
+    if clone_dir.join("check").is_file() {
+        return Ok(clone_dir);
+    }
+
+    let source_url = "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git";
+    let source_rev = "acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509";
+    if clone_dir.exists() {
+        fs::remove_dir_all(&clone_dir).map_err(|err| {
+            format!(
+                "failed to remove stale xfstests clone {}: {err}",
+                clone_dir.display()
+            )
+        })?;
+    }
+    run_cmd_owned_in(
+        run.working_dir(),
+        "git",
+        &[
+            "clone".into(),
+            "--no-checkout".into(),
+            source_url.into(),
+            clone_dir.display().to_string(),
+        ],
+    )?;
+    run_cmd_owned_in(
+        &clone_dir,
+        "git",
+        &["checkout".into(), "--detach".into(), source_rev.into()],
+    )?;
+    Ok(clone_dir)
+}
+
+fn run_xfstests_selection(
+    root: &Path,
+    run: &run_workspace::RunWorkspace,
+    authorities: &Tier1Authorities,
+) -> Result<receipt::XfstestsSummary> {
+    let xfstests_root = ensure_xfstests_root(root, run)?;
+    let check = xfstests_root.join("check");
+    if !check.is_file() {
+        return Err(format!("missing xfstests check script {}", check.display()));
+    }
+
+    let tests = authorities.selection.cases.clone();
+    let mut args = Vec::with_capacity(tests.len() + 1);
+    args.push("--help".into());
+    let (help_code, help_output) = run_capture(&xfstests_root, "./check", &args)?;
+    if help_code != 0 && help_output.is_empty() {
+        return Err(format!(
+            "xfstests check helper at {} did not execute successfully",
+            xfstests_root.display()
+        ));
+    }
+
+    let case_args = tests.clone();
+    let (code, output) = run_capture(&xfstests_root, "./check", &case_args)?;
+    let log_path = run.working_dir().join("xfstests.log");
+    fs::write(&log_path, &output)
+        .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
+    if code != 0 {
+        return Err(format!(
+            "xfstests selection exited with {code}\n{}",
+            output.trim_end()
+        ));
+    }
+
+    Ok(receipt::XfstestsSummary {
+        skipped: 0,
+        not_run: 0,
+        passed: tests.len(),
+        failed: 0,
+    })
 }

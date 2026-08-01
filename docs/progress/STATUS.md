@@ -1,3 +1,24 @@
+- 2026-08-01 (VM/pmap tail-latency implementation plan).
+  Added the end-to-end execution plan in
+  `docs/progress/plans/2026-08-01-vm-pmap-tail-latency.json` and the detailed
+  operator-facing plan in
+  `docs/superpowers/plans/2026-08-01-vm-pmap-tail-latency.md`. The first phase
+  is attribution, not code promotion: run interleaved same-image baseline and
+  candidate measurements, correct the `lat_mmap` interpretation, and publish
+  the canonical pmap performance contract. The implementation order then
+  removes protect singleton invalidations and temporary Vec copies, eliminates
+  resident suffix movement, shortens the shadow lock, adds PT occupancy-based
+  prune, and only then enables acknowledged platform shootdown batching.
+  Structural gates are zero shifted resident entries, zero full PT empty-table
+  scans, committed-prefix retryability, and no HAL/shootdown/pin release under
+  the shadow lock. No Rust implementation or guest benchmark was changed in
+  this step. Verification passed `jq empty` for the new plan; repository-wide
+  `cargo xtask progress validate` remains blocked by the pre-existing invalid
+  `completed` status in `docs/progress/plans/2026-08-01-vm-waitable-prefault.json`.
+  Next: capture the matched baseline and then land the contract before TDD
+  implementation. Platform blockers remain RV64 root/ASID reuse acknowledgement,
+  LA64 remote shootdown/activation state, and M1Dock parity.
+
 - 2026-08-01 (ext4 Task 15 Tier 1 runner scaffold).
   Landed the first `cargo xtask ext4 tier1` plumbing in `xtask/src/ext4/`:
   the top-level xtask dispatch now recognizes `ext4 tier1`, dry-run resolves

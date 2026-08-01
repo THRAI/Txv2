@@ -181,6 +181,15 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         "subject-context" => crate::lint_invariants_subj::lint_invariants_subject_context(root),
+        "ext4-lifecycle-ownership" => {
+            crate::lint_invariants_ext4::lint_invariants_ext4_lifecycle_ownership(root)
+        }
+        "ext4-no-direct-home-write" => {
+            crate::lint_invariants_ext4::lint_invariants_ext4_no_direct_home_write(root)
+        }
+        "ext4-durability-flags" => {
+            crate::lint_invariants_ext4::lint_invariants_ext4_durability_flags(root)
+        }
         "witness-scope" => crate::lint_invariants_witness::lint_invariants_witness_scope(root),
         "signal-publish" => crate::lint_invariants_signal::lint_invariants_signal_publish(root),
         "script-boundary" => crate::lint_invariants_script::lint_invariants_script_boundary(root),
@@ -237,6 +246,18 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                 (
                     "subject-context",
                     crate::lint_invariants_subj::lint_invariants_subject_context,
+                ),
+                (
+                    "ext4-lifecycle-ownership",
+                    crate::lint_invariants_ext4::lint_invariants_ext4_lifecycle_ownership,
+                ),
+                (
+                    "ext4-no-direct-home-write",
+                    crate::lint_invariants_ext4::lint_invariants_ext4_no_direct_home_write,
+                ),
+                (
+                    "ext4-durability-flags",
+                    crate::lint_invariants_ext4::lint_invariants_ext4_durability_flags,
                 ),
                 (
                     "witness-scope",
