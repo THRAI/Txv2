@@ -1,3 +1,30 @@
+- 2026-08-01 (ext4 Task 12 regular-file create admission).
+  Advanced Task 12 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `Ext4Pager::plan_create_regular_file` now
+  builds an immutable regular-file create mutation with InodeBitmap,
+  GroupDescriptor, Superblock, InodeTable, and DirectoryBlock after-images,
+  including metadata_csum inode-bitmap and inode-table checksum refreshes,
+  without mutating the home image. `FsOps::create_inode` now admits that
+  supported regular-file create shape through
+  `JournalMutationRuntime::begin_mutation`, returns the new `FsObjectId` and
+  `InodeMeta` from the frozen plan, and keeps RO/no-runtime mounts
+  fail-closed. Verification passed `cargo test -p tx-ext4-format --test
+  pager_mock namespace_plan_creates_regular_file_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_ -- --test-threads=1` (7), `cargo test -p tx-ext4-format
+  --test pager_mock -- --test-threads=1` (30), `cargo test -p tx-ext4
+  --lib --no-default-features
+  ext4_create_public_path_admits_regular_file_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4 --lib --no-default-features --
+  --test-threads=1` (53), `cargo test -p tx-ext4 --test
+  journal_prepared_transaction -- --test-threads=1` (9), `cargo test -p
+  tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7), and
+  touched-file `rustfmt --check`. Next: continue Task 12 with mkdir or
+  symlink, then unlinked-open/orphan/destroy cleanup. Product Tier 1 still
+  requires Task 14 production cutover/G0 lints, Task 15 runner, and Task 16
+  fresh QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (ext4 Task 12 cross-directory rename admission).
   Advanced Task 12 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`

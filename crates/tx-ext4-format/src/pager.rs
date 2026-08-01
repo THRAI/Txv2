@@ -1,9 +1,10 @@
 use crate::journal::Jbd2Superblock;
 use crate::ondisk::{
     block_bitmap_csum32, crc32c, encode_dir_entry, encode_journal_commit,
-    encode_journal_descriptor, group_desc_csum16, inode_csum32, parse_journal_descriptor,
-    superblock_csum32, BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter,
-    Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
+    encode_journal_descriptor, group_desc_csum16, inode_bitmap_csum32, inode_csum32,
+    parse_journal_descriptor, superblock_csum32, BitmapMut, BitmapView, BlockMapping, CommitHeader,
+    DirEntry, DirEntryIter, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation,
+    InodeTableLayout, Superblock,
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
@@ -778,6 +779,47 @@ impl<I: BlockImage> Ext4Pager<I> {
         Err(Ext4FormatError::OutOfBounds)
     }
 
+    fn plan_inode_allocation(&self) -> Result<(InodeNo, usize, u64, Page4K, Page4K)> {
+        if self.superblock.inodes_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let inodes_per_group = self.superblock.inodes_per_group as u64;
+        let total_inodes = self.superblock.inodes_count as u64;
+
+        for (group_index, group) in self.groups.iter().copied().enumerate() {
+            let group_first_index = group_index as u64 * inodes_per_group;
+            if group_first_index >= total_inodes {
+                break;
+            }
+            let group_inode_count =
+                core::cmp::min(inodes_per_group, total_inodes - group_first_index);
+            let bitmap_home = group.inode_bitmap_block();
+            let mut bitmap_before = [0u8; BLOCK_SIZE];
+            self.image.read_block(bitmap_home, &mut bitmap_before)?;
+            let mut bitmap_after = bitmap_before;
+            let view = BitmapView::new(&bitmap_after);
+            let Some(bit) = (0..group_inode_count as usize).find(|bit| !view.is_set(*bit)) else {
+                continue;
+            };
+            BitmapMut::new(&mut bitmap_after).set(bit)?;
+            let inode_number = group_first_index
+                .checked_add(bit as u64)
+                .and_then(|index| index.checked_add(1))
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            let inode_number =
+                u32::try_from(inode_number).map_err(|_| Ext4FormatError::OutOfBounds)?;
+            return Ok((
+                InodeNo::new(inode_number),
+                group_index,
+                bitmap_home,
+                bitmap_before,
+                bitmap_after,
+            ));
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
+    }
+
     fn block_group_for_physical(&self, physical_block: u64) -> Result<(usize, u64, usize)> {
         if self.superblock.blocks_per_group == 0 {
             return Err(Ext4FormatError::Corrupt);
@@ -920,6 +962,63 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((home, before, after))
     }
 
+    fn plan_group_free_inode_decrement(
+        &self,
+        group_index: usize,
+        bitmap_after: &Page4K,
+    ) -> Result<(u64, Page4K, Page4K)> {
+        let desc_size = self.superblock.group_desc_size();
+        let byte_offset = group_index
+            .checked_mul(desc_size)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let gdt_start = if self.superblock.block_size() == 1024 {
+            2
+        } else {
+            1
+        };
+        let home = gdt_start + (byte_offset / BLOCK_SIZE) as u64;
+        let offset = byte_offset % BLOCK_SIZE;
+        if offset + desc_size > BLOCK_SIZE {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let mut before = [0u8; BLOCK_SIZE];
+        self.image.read_block(home, &mut before)?;
+        let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
+        let free = u32::from(descriptor.free_inodes_count)
+            | (u32::from(descriptor.free_inodes_count_hi) << 16);
+        let next = free.checked_sub(1).ok_or(Ext4FormatError::OutOfBounds)?;
+        if desc_size < 64 && next > u16::MAX as u32 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut after = before;
+        after[offset + 14..offset + 16].copy_from_slice(&(next as u16).to_le_bytes());
+        if desc_size >= 64 {
+            after[offset + 46..offset + 48].copy_from_slice(&((next >> 16) as u16).to_le_bytes());
+        }
+        if self.superblock.has_metadata_csum() {
+            let bitmap_checksum = inode_bitmap_csum32(
+                self.superblock.metadata_csum_seed(),
+                bitmap_after,
+                self.superblock.inodes_per_group,
+            )?;
+            after[offset + 26..offset + 28]
+                .copy_from_slice(&(bitmap_checksum as u16).to_le_bytes());
+            if desc_size >= 64 {
+                after[offset + 58..offset + 60]
+                    .copy_from_slice(&((bitmap_checksum >> 16) as u16).to_le_bytes());
+            }
+            after[offset + 30..offset + 32].fill(0);
+            let group_id = u32::try_from(group_index).map_err(|_| Ext4FormatError::OutOfBounds)?;
+            let checksum = group_desc_csum16(
+                self.superblock.metadata_csum_seed(),
+                group_id,
+                &after[offset..offset + desc_size],
+            );
+            after[offset + 30..offset + 32].copy_from_slice(&checksum.to_le_bytes());
+        }
+        Ok((home, before, after))
+    }
+
     fn plan_superblock_free_block_decrement(&self) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
         self.image.read_block(0, &mut before)?;
@@ -931,6 +1030,25 @@ impl<I: BlockImage> Ext4Pager<I> {
         let mut after = before;
         after[1024 + 12..1024 + 16].copy_from_slice(&(next as u32).to_le_bytes());
         after[1024 + 0x158..1024 + 0x15c].copy_from_slice(&((next >> 32) as u32).to_le_bytes());
+        if observed.has_metadata_csum() {
+            let superblock = &mut after[1024..2048];
+            superblock[1020..1024].fill(0);
+            let checksum = superblock_csum32(superblock)?;
+            superblock[1020..1024].copy_from_slice(&checksum.to_le_bytes());
+        }
+        Ok((0, before, after))
+    }
+
+    fn plan_superblock_free_inode_decrement(&self) -> Result<(u64, Page4K, Page4K)> {
+        let mut before = [0u8; BLOCK_SIZE];
+        self.image.read_block(0, &mut before)?;
+        let observed = Superblock::parse(&before[1024..2048])?;
+        let next = observed
+            .free_inodes_count
+            .checked_sub(1)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let mut after = before;
+        after[1024 + 16..1024 + 20].copy_from_slice(&next.to_le_bytes());
         if observed.has_metadata_csum() {
             let superblock = &mut after[1024..2048];
             superblock[1020..1024].fill(0);
@@ -1989,6 +2107,99 @@ impl<I: BlockImage> Ext4Pager<I> {
             self.plan_remove_dir_entry_after_image(dir_ino, name)?;
         self.image.write_block(phys, &after)?;
         Ok(found_ino)
+    }
+
+    /// Build the bounded regular-file create mutation.
+    ///
+    /// This records inode allocation, inode-table initialization, and parent
+    /// dirent publication as immutable after-images. Directory creation remains
+    /// separate because it also allocates and initializes a directory data block
+    /// plus parent nlink updates.
+    pub fn plan_create_regular_file(
+        &mut self,
+        parent_ino: InodeNo,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<(InodeNo, Ext4MutationPlan)> {
+        let (new_ino, group_index, bitmap_home, bitmap_before, bitmap_after) =
+            self.plan_inode_allocation()?;
+        let (group_desc_home, group_desc_before, group_desc_after) =
+            self.plan_group_free_inode_decrement(group_index, &bitmap_after)?;
+        let (superblock_home, superblock_before, superblock_after) =
+            self.plan_superblock_free_inode_decrement()?;
+
+        let mut inode = Inode::default();
+        inode.mode = Inode::S_IFREG | (mode & 0o7777);
+        inode.uid = uid;
+        inode.gid = gid;
+        inode.atime = fsync_stamp
+            .raw()
+            .try_into()
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        inode.ctime = inode.atime;
+        inode.mtime = inode.atime;
+        inode.links_count = 1;
+        inode.flags = Inode::EXTENTS_FL;
+        inode.set_extent_root(&[])?;
+
+        let location = self.inode_location(new_ino)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        inode.encode(inode_bytes)?;
+        self.refresh_inode_checksum(new_ino, &inode, inode_bytes)?;
+
+        let (dir_home, dir_before, dir_after) =
+            self.plan_append_dir_entry_after_image(parent_ino, name, new_ino, 1)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Create, new_ino.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: bitmap_home,
+            role: MetaRole::InodeBitmap,
+            before_version: crc32c(0, &bitmap_before) as u64,
+            after: bitmap_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: group_desc_home,
+            role: MetaRole::GroupDescriptor,
+            before_version: crc32c(0, &group_desc_before) as u64,
+            after: group_desc_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: superblock_home,
+            role: MetaRole::Superblock,
+            before_version: crc32c(0, &superblock_before) as u64,
+            after: superblock_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: dir_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &dir_before) as u64,
+            after: dir_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok((new_ino, plan))
     }
 
     /// Create a new regular file in `parent_ino`.  Returns the new inode.

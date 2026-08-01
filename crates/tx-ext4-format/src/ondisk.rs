@@ -1134,6 +1134,14 @@ pub fn block_bitmap_csum32(seed: u32, bitmap_bytes: &[u8], block_count: u32) -> 
     Ok(crc32c_append(seed, slice_at(bitmap_bytes, 0, byte_count)?))
 }
 
+pub fn inode_bitmap_csum32(seed: u32, bitmap_bytes: &[u8], inode_count: u32) -> Result<u32> {
+    let byte_count = (inode_count as usize)
+        .checked_add(7)
+        .ok_or(Ext4FormatError::OutOfBounds)?
+        / 8;
+    Ok(crc32c_append(seed, slice_at(bitmap_bytes, 0, byte_count)?))
+}
+
 pub fn inode_csum32(
     seed: u32,
     inode_number: u32,

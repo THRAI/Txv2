@@ -180,6 +180,13 @@ fn encode_dir(block: &mut Page4K, entries: &[(u32, u8, &[u8])]) {
     }
 }
 
+fn mark_inode_bitmap_used(image: &mut MemImage, count: usize) {
+    let mut bitmap = BitmapMut::new(image.block_mut(3));
+    for bit in 0..count {
+        bitmap.set(bit).unwrap();
+    }
+}
+
 fn build_image() -> MemImage {
     let mut image = MemImage::new(64);
 
@@ -187,6 +194,7 @@ fn build_image() -> MemImage {
         inodes_count: 64,
         blocks_count: 64,
         free_blocks_count: 32,
+        free_inodes_count: 52,
         log_block_size: 2,
         blocks_per_group: 64,
         inodes_per_group: 64,
@@ -407,6 +415,12 @@ fn build_tier1_cross_dir_rename_image() -> MemImage {
     image
 }
 
+fn build_tier1_create_image() -> MemImage {
+    let mut image = build_tier1_mount_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    image
+}
+
 fn build_two_page_mapped_image() -> MemImage {
     let mut image = build_image();
     let mut file_inode = Inode::default();
@@ -559,6 +573,27 @@ fn mounted_counting_unlink_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_create_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 5, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_create_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 create mutation ext4 image");
     (mounted, runtime, writes)
 }
 
@@ -994,6 +1029,41 @@ fn ext4_unlink_public_path_admits_namespace_mutation_without_home_write() {
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(25)
+    );
+}
+
+#[test]
+fn ext4_create_public_path_admits_regular_file_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_create_fs(31);
+
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .create_inode(FsObjectId::new(2), b"created", 0o100640, &cred, &guard,),
+        V3::<_, NoProgress>::done((
+            FsObjectId::new(14),
+            InodeMeta {
+                mode: 0o100640,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                atime: Default::default(),
+                mtime: Default::default(),
+                ctime: Default::default(),
+                nlinks: 1,
+                blocks: 0,
+                flags: Inode::EXTENTS_FL,
+            },
+        ))
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(31)
     );
 }
 
