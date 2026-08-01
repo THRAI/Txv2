@@ -111,9 +111,19 @@ fn tier1_live_rejects_placeholder_authorities_before_acceptance_receipt() {
           "status":"catalog-authority-declared",
           "expanded_cut_count":1000,
           "families":[
-            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
-            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
-            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
           ]
         }"#,
     );
@@ -160,9 +170,19 @@ fn tier1_live_rejects_acceptance_ready_crash_catalog_without_campaign_plan() {
           "status":"acceptance-ready",
           "expanded_cut_count":1000,
           "families":[
-            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
-            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
-            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
           ]
         }"#,
     );
@@ -195,6 +215,53 @@ fn tier1_rejects_crash_campaign_with_missing_script_artifact() {
             "e2fsck_mode":"immutable-copy"
           },
           "families":[
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
+          ]
+        }"#,
+    );
+
+    let error = CrashCutCatalog::load_with_root(catalog_path, &root)
+        .expect_err("campaign scripts must exist before acceptance-ready use");
+    assert!(error.contains("missing campaign.workload_script artifact"));
+}
+
+#[test]
+fn tier1_rejects_crash_campaign_without_family_phase_markers() {
+    let root = temp_root("missing-crash-phase-marker");
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
             {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
             {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
             {"id":"D10"},{"id":"D11"},{"id":"D12"}
@@ -203,8 +270,8 @@ fn tier1_rejects_crash_campaign_with_missing_script_artifact() {
     );
 
     let error = CrashCutCatalog::load_with_root(catalog_path, &root)
-        .expect_err("campaign scripts must exist before acceptance-ready use");
-    assert!(error.contains("missing campaign.workload_script artifact"));
+        .expect_err("phase-marker kill policy needs per-family markers");
+    assert!(error.contains("missing phase_marker"));
 }
 
 #[test]
@@ -444,9 +511,19 @@ fn tier1_crash_cut_campaign_writes_deterministic_manifest_before_executor_error(
             "e2fsck_mode":"immutable-copy"
           },
           "families":[
-            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
-            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
-            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
           ]
         }"#,
     );
@@ -473,7 +550,12 @@ fn tier1_crash_cut_campaign_writes_deterministic_manifest_before_executor_error(
     assert_eq!(cuts.len(), 1000);
     assert_eq!(cuts[0]["id"], "crash-cut-0000");
     assert_eq!(cuts[0]["family"], "D0");
+    assert_eq!(cuts[0]["phase_marker"], "tx.ext4.crash.phase.D0");
     assert_eq!(cuts[13]["family"], "D0");
+    assert_eq!(
+        value["families"][0]["phase_marker"],
+        "tx.ext4.crash.phase.D0"
+    );
     assert_eq!(cuts[999]["immutable_image"], "crash-cut-0999.img");
 }
 
@@ -503,9 +585,19 @@ fn tier1_crash_cut_campaign_consumes_executor_outcome_manifest() {
             "e2fsck_mode":"immutable-copy"
           },
           "families":[
-            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
-            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
-            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
           ]
         }"#,
     );

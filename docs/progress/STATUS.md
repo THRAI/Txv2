@@ -1,3 +1,20 @@
+- 2026-08-02 (ext4 Tier 1 crash phase-marker contract).
+  Advanced Task 15/16 deterministic crash-runner inputs without promoting final
+  acceptance. `tools/ext4/tier1/crash-cuts.json` now gives every D0-D12 crash
+  family a stable `phase_marker`, and campaign-backed crash catalogs fail
+  closed unless each family has a unique marker for
+  `deterministic-phase-marker-v1`. The generated
+  `crash-campaign-plan.json` now carries both per-family and per-cut
+  `phase_marker` values, so a future QEMU killer can drive cuts from the
+  immutable manifest instead of interpreting labels ad hoc. Verification passed
+  focused `tier1_crash_cut_campaign` (3), focused
+  `tier1_rejects_crash_campaign` (2), focused `xtask ext4` (33), `cargo xtask
+  ext4 tier1 --dry-run`, and the expected fail-closed live preflight
+  `task16-phase-marker-preflight-20260802073655`. Task 16 remains open: kernel
+  or runner emission of those serial markers, deterministic QEMU kill/replay,
+  real 1000-cut immutable images, per-image `e2fsck -fn`, pinned xfstests, and
+  the final G0-G7 receipt are still missing.
+
 - 2026-08-02 (ext4 Tier 1 crash outcome manifest consumed by runner).
   Advanced Task 15/16 crash executor wiring without promoting final
   acceptance. After writing `crash-campaign-plan.json`,

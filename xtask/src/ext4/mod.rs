@@ -362,10 +362,15 @@ fn write_crash_cut_execution_manifest(
     let cuts = (0..crash_cuts.expanded_cut_count)
         .map(|idx| {
             let family = &crash_cuts.families[idx % crash_cuts.families.len()];
-            serde_json::json!({
+            let phase_marker = family
+                .phase_marker
+                .as_deref()
+                .ok_or_else(|| format!("crash family {} missing phase_marker", family.id))?;
+            Ok(serde_json::json!({
                 "id": format!("crash-cut-{idx:04}"),
                 "index": idx,
-                "family": family,
+                "family": &family.id,
+                "phase_marker": phase_marker,
                 "workload_script": campaign.workload_script.display().to_string(),
                 "workload_script_sha256": &campaign.workload_script_sha256,
                 "replay_script": campaign.replay_script.display().to_string(),
@@ -373,13 +378,26 @@ fn write_crash_cut_execution_manifest(
                 "kill_policy": &campaign.kill_policy,
                 "e2fsck_mode": &campaign.e2fsck_mode,
                 "immutable_image": format!("crash-cut-{idx:04}.img")
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
+    let families = crash_cuts
+        .families
+        .iter()
+        .map(|family| {
+            Ok(serde_json::json!({
+                "id": &family.id,
+                "phase_marker": family
+                    .phase_marker
+                    .as_deref()
+                    .ok_or_else(|| format!("crash family {} missing phase_marker", family.id))?
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let manifest = serde_json::json!({
         "schema": "tx.ext4.crash_cut_execution_manifest.v1",
         "expanded_cut_count": crash_cuts.expanded_cut_count,
-        "families": &crash_cuts.families,
+        "families": families,
         "workload_script": campaign.workload_script.display().to_string(),
         "workload_script_sha256": &campaign.workload_script_sha256,
         "replay_script": campaign.replay_script.display().to_string(),
@@ -743,8 +761,14 @@ struct CrashCutCatalog {
     file: AuthorityFile,
     status: String,
     expanded_cut_count: usize,
-    families: Vec<String>,
+    families: Vec<CrashCutFamily>,
     campaign: Option<CrashCutCampaignPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct CrashCutFamily {
+    id: String,
+    phase_marker: Option<String>,
 }
 
 #[derive(Debug)]
@@ -820,20 +844,19 @@ impl CrashCutCatalog {
                 ));
             }
         }
+        let families = families
+            .iter()
+            .map(|entry| CrashCutFamily::parse(entry, &path))
+            .collect::<Result<Vec<_>>>()?;
         let campaign = CrashCutCampaignPlan::load_optional(&value, &path, root)?;
+        if campaign.is_some() {
+            validate_family_phase_markers(&families, &path)?;
+        }
         Ok(Self {
             file: AuthorityFile::load(path)?,
             status,
             expanded_cut_count: expanded_cut_count as usize,
-            families: families
-                .iter()
-                .filter_map(|entry| {
-                    entry
-                        .get("id")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                })
-                .collect(),
+            families,
             campaign,
         })
     }
@@ -854,6 +877,41 @@ impl CrashCutCatalog {
         }
         None
     }
+}
+
+impl CrashCutFamily {
+    fn parse(value: &serde_json::Value, path: &Path) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{}: crash family entries must be objects", path.display()))?;
+        let id = required_object_string(object, "id", path)?;
+        let phase_marker = object
+            .get("phase_marker")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        Ok(Self { id, phase_marker })
+    }
+}
+
+fn validate_family_phase_markers(families: &[CrashCutFamily], path: &Path) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for family in families {
+        let marker = family.phase_marker.as_deref().ok_or_else(|| {
+            format!(
+                "{}: crash family {} missing phase_marker for deterministic-phase-marker-v1",
+                path.display(),
+                family.id
+            )
+        })?;
+        if !seen.insert(marker.to_string()) {
+            return Err(format!(
+                "{}: duplicate crash phase_marker {marker}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl CrashCutCampaignPlan {
