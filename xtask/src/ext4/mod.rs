@@ -2,10 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::Result;
 use crate::full_build;
 use crate::image;
 use crate::shell_test;
-use crate::Result;
 use crate::target::TxTarget;
 use crate::util::{
     command_exists, command_or_candidates, optional_option_value, run_cmd_owned_in, shell_join,
@@ -33,6 +33,7 @@ fn tier1(root: &Path, args: &[String]) -> Result<()> {
         invocation.print_dry_run();
         return Ok(());
     }
+    invocation.authorities.ensure_live_acceptance_ready()?;
 
     let mut run = run_workspace::RunWorkspace::create(root, &invocation.run_id)?;
     run.record_authority_inputs(&invocation.authorities.as_input_summary())?;
@@ -66,7 +67,11 @@ fn run_live_tier1(
 
     full_build::full_build(
         root,
-        vec!["--target".into(), base_target.name().to_string(), "--skip-doctor".into()],
+        vec![
+            "--target".into(),
+            base_target.name().to_string(),
+            "--skip-doctor".into(),
+        ],
     )?;
     image::image(
         root,
@@ -84,7 +89,10 @@ fn run_live_tier1(
         .join("images")
         .join(image::busybox_root_ext4_name(base_target));
     if !base_image.is_file() {
-        return Err(format!("missing busybox ext4 image {}", base_image.display()));
+        return Err(format!(
+            "missing busybox ext4 image {}",
+            base_image.display()
+        ));
     }
 
     let test_image = run.stage_copy("test-image", &base_image, "test.img")?;
@@ -114,11 +122,8 @@ fn run_live_tier1(
         ("scratch", &scratch_image),
         ("workload", &workload_image),
     ] {
-        let (exit_code, output) = run_capture(
-            root,
-            &e2fsck,
-            &["-fn".into(), path.display().to_string()],
-        )?;
+        let (exit_code, output) =
+            run_capture(root, &e2fsck, &["-fn".into(), path.display().to_string()])?;
         if exit_code != 0 {
             e2fsck_failures += 1;
         }
@@ -305,6 +310,24 @@ impl Tier1Authorities {
             self.crash_cuts.expanded_cut_count,
         )
     }
+
+    fn ensure_live_acceptance_ready(&self) -> Result<()> {
+        let mut blockers = Vec::new();
+        if let Some(blocker) = self.selection.live_acceptance_blocker() {
+            blockers.push(blocker);
+        }
+        if let Some(blocker) = self.crash_cuts.live_acceptance_blocker() {
+            blockers.push(blocker);
+        }
+        if blockers.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "live ext4 Tier 1 authorities are not acceptance-ready: {}",
+                blockers.join("; ")
+            ))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -327,6 +350,7 @@ impl AuthorityFile {
 #[derive(Debug)]
 struct XfstestsSelection {
     file: AuthorityFile,
+    status: String,
     case_count: usize,
     cases: Vec<String>,
 }
@@ -357,6 +381,11 @@ impl XfstestsSelection {
         if tier != "tier1" {
             return Err(format!("{}: expected tier1, found {tier}", path.display()));
         }
+        let status = value
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unspecified")
+            .to_string();
         let cases = value
             .get("selected")
             .and_then(|value| value.as_array())
@@ -366,6 +395,7 @@ impl XfstestsSelection {
         }
         Ok(Self {
             file: AuthorityFile::load(path)?,
+            status,
             case_count: cases.len(),
             cases: cases
                 .iter()
@@ -385,11 +415,23 @@ impl XfstestsSelection {
     fn sha256(&self) -> &str {
         &self.file.sha256
     }
+
+    fn live_acceptance_blocker(&self) -> Option<String> {
+        if self.status == "acceptance-ready" {
+            None
+        } else {
+            Some(format!(
+                "xfstests selection status is `{}`; expected `acceptance-ready`",
+                self.status
+            ))
+        }
+    }
 }
 
 #[derive(Debug)]
 struct CrashCutCatalog {
     file: AuthorityFile,
+    status: String,
     expanded_cut_count: usize,
     families: Vec<String>,
 }
@@ -412,6 +454,11 @@ impl CrashCutCatalog {
                 path.display()
             ));
         }
+        let status = value
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unspecified")
+            .to_string();
         let expanded_cut_count = value
             .get("expanded_cut_count")
             .and_then(|value| value.as_u64())
@@ -445,6 +492,7 @@ impl CrashCutCatalog {
         }
         Ok(Self {
             file: AuthorityFile::load(path)?,
+            status,
             expanded_cut_count: expanded_cut_count as usize,
             families: families
                 .iter()
@@ -460,6 +508,17 @@ impl CrashCutCatalog {
 
     fn sha256(&self) -> &str {
         &self.file.sha256
+    }
+
+    fn live_acceptance_blocker(&self) -> Option<String> {
+        if self.status == "acceptance-ready" {
+            None
+        } else {
+            Some(format!(
+                "crash-cut catalog status is `{}`; expected `acceptance-ready`",
+                self.status
+            ))
+        }
     }
 }
 
@@ -493,16 +552,13 @@ fn run_capture(cwd: &Path, program: &str, args: &[String]) -> Result<(i32, Strin
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     Ok(hex_string(tx_ext4_format::capability::sha256(&bytes)))
 }
 
 fn git_head(root: &Path) -> Result<String> {
-    let (code, output) = run_capture(
-        root,
-        "git",
-        &["rev-parse".into(), "HEAD".into()],
-    )?;
+    let (code, output) = run_capture(root, "git", &["rev-parse".into(), "HEAD".into()])?;
     if code != 0 {
         return Err(format!("git rev-parse HEAD exited with {code}"));
     }

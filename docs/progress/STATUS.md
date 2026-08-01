@@ -1,3 +1,31 @@
+- 2026-08-02 (ext4 Task 14/15 G0 lint and Tier 1 live preflight corrected).
+  Replaced the over-broad ext4 G0 scanner with a scoped `Finding`-based
+  ratchet: lifecycle cleanup is only allowed in PageBacked, ext4 mutation, or
+  mount-settlement owners; direct home-write scanning is limited to production
+  `tx-ext4` pager mutation callsites instead of flagging legitimate block
+  device writes; durability scanning rejects production ext4 `.write_block`
+  use outside explicit journal/host mutation owners. The current checkout now
+  passes `cargo xtask lint invariants ext4-lifecycle-ownership`,
+  `cargo xtask lint invariants ext4-no-direct-home-write`, and
+  `cargo xtask lint invariants ext4-durability-flags`. Also added a live
+  Tier 1 authority preflight: dry-run still resolves and hashes the pinned
+  inputs, but `cargo xtask ext4 tier1 --run-id ...` fails before full-build or
+  QEMU when the xfstests selection or crash-cut catalog status is still a
+  placeholder, preventing a false G0-G7 passed receipt. Verification passed
+  `rustfmt --edition 2024 --check xtask/src/ext4/mod.rs
+  xtask/src/ext4/tests.rs xtask/src/lint_invariants_ext4.rs`,
+  `cargo test -p xtask ext4 -- --test-threads=1` (10), the three G0 lint
+  commands above, `cargo xtask ext4 tier1 --dry-run`, the expected
+  fail-closed live preflight with
+  `cargo xtask ext4 tier1 --run-id 2026-08-02-placeholder-preflight`.
+  The final gate `cargo -q xtask unit` also passed (`tx-shims` 652,
+  `tx-kernel` 114, `tx-ext4` 64, `tx-scripts` 167). During
+  verification the workspace ran out of disk; only
+  `target/debug/incremental` was cleared, raising free space from 116MiB to
+  1.7GiB. Task 16 remains open: the pinned xfstests/crash authorities must be
+  promoted from placeholder to acceptance-ready, then fresh crash cuts,
+  `e2fsck -fn`, xfstests, and immutable receipt evidence must be generated.
+
 - 2026-08-02 (ext4 close/dup3 visibility flush unblocks data plus execute slice).
   Added a PageBacked close-visibility flush that writes dirty file-cache pages
   through `FsPageBacking::flush_page` and best-effort syncs the logical file

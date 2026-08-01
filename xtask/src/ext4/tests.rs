@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{parse_tier1_args, run_workspace::RunWorkspace};
+use super::{Tier1Authorities, parse_tier1_args, run_workspace::RunWorkspace};
 
 #[test]
 fn run_workspace_finalizes_once_and_cleans_temporary_state() {
@@ -52,6 +52,50 @@ fn tier1_rejects_missing_or_stale_authority_inputs() {
     let error = parse_tier1_args(&root, &["tier1".into(), "--dry-run".into()])
         .expect_err("authority is mandatory");
     assert!(error.contains("tx.ext4.crash_cut_catalog.v1"));
+}
+
+#[test]
+fn tier1_live_rejects_placeholder_authorities_before_acceptance_receipt() {
+    let root = temp_root("placeholder-authorities");
+    write_json(
+        &root.join("tools/ext4/tier1/capability-ledger.json"),
+        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        r#"{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"selection-authority-declared",
+          "tier":"tier1",
+          "selected":[{"case_id":"generic/001"}]
+        }"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/crash-cuts.json"),
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"catalog-authority-declared",
+          "expanded_cut_count":1000,
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    write_text(
+        &root.join("tools/shell-tests/ext4-tier1.scn"),
+        "# ext4 tier1\n",
+    );
+
+    parse_tier1_args(&root, &["tier1".into(), "--dry-run".into()])
+        .expect("dry-run still resolves placeholder authority hashes");
+    let error = Tier1Authorities::load(&root)
+        .unwrap()
+        .ensure_live_acceptance_ready()
+        .expect_err("live runner must not promote placeholder authorities");
+    assert!(error.contains("xfstests selection status is `selection-authority-declared`"));
+    assert!(error.contains("crash-cut catalog status is `catalog-authority-declared`"));
 }
 
 fn temp_root(suffix: &str) -> PathBuf {
