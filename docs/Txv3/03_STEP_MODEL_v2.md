@@ -353,7 +353,7 @@ These ops benefit from the `StepOp` discipline (auditable stages, witness scopin
 
 <!-- txdoc:STEP-V2-ONE-STEP-1 -->
 
-Operations with no progressive behavior — `open`, `unlink`, `mkdir`, `rmdir`, `rename`, `fork`, `dup`, `close`, `mmap` (reservation, not population), `setsockopt` — are `StepOp`s with `Progress = NoProgress`, terminating in `Done` or `Err` on first call.
+Operations with no progressive behavior — `open`, `unlink`, `mkdir`, `rmdir`, `rename`, the **fork publication commit**, `dup`, `close`, `mmap` (reservation, not population), `setsockopt` — are `StepOp`s with `Progress = NoProgress`, terminating in `Done` or `Err` on first call. The complete fork syscall may first run a wait-capable VM preparation phase; that phase owns no process-publication reservations or side effects.
 
 ### 6.1 Example: open
 
@@ -390,7 +390,9 @@ Yields possible only in upper-half resolution (dcache miss → `OnWaitSource`; s
 
 ### 6.2 Example: fork (preserved from v1, four-variant rephrasing)
 
-Fork remains a single one-step `StepOp` despite its complexity (multiple zone signs and index commits in one step). Substrate commit primitives provide observer-safety — concurrent walkers see either no child or the fully-formed child, never an intermediate state. See v1 §5.3 for the worked example; the v2 difference is only that the outcome is `Done(Pid)` directly, with no intermediate `Advanced` state.
+Fork's **process publication** remains a single one-step `StepOp` despite its complexity (multiple zone signs and index commits in one step). Substrate commit primitives provide observer-safety — concurrent walkers see either no child or the fully-formed child, never an intermediate state.
+
+On SMP, cloning the parent's VM may conflict with another full/range VM writer. The syscall therefore has an upper preparation phase: acquire the parent full-range `ExclusiveWriter`, yielding on its wait source when contended; clone a detached child address space; release the range reservation. Only then does the one-step process publication commit snapshot fd/process state, allocate identity objects, and publish topology. No fd reference increment, pid allocation, or topology mutation occurs before a potentially yielding VM wait. If exec replaces the parent address space between preparation and commit, the detached clone is discarded and preparation restarts against the new authoritative address space.
 
 ## 7. Multi-step operations
 

@@ -4,7 +4,6 @@ use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet};
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::{
     self, register_zone_for, Cap, Dead, Entity, PayloadCap, PayloadPolicy, Zone, ZoneAllocated,
     ZoneError,
@@ -18,9 +17,8 @@ use crate::net::device::{
     EthernetAddress, NetDeviceKind, NetDeviceRegistration,
 };
 use crate::net::execution::{
-    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at_with_post,
-    step_process_network_events_in_namespace_at_with_post, ArpFlushOutcome, DeviceTxBudget,
-    DeviceTxOutcome,
+    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
+    step_process_network_events_in_namespace_at, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
 };
 use crate::net::netfilter::{
     apply_postrouting_nat_ipv4_in_namespace, apply_prerouting_nat_ipv4_in_namespace,
@@ -74,6 +72,8 @@ pub struct NetNamespacePayload {
     namespace_devices: SpinMutex<Vec<NetNamespaceDeviceLink>>,
     routes: SpinMutex<Vec<NetNamespaceRouteEntry>>,
     suppressed_connected_routes: SpinMutex<Vec<NetNamespaceConnectedRouteKey>>,
+    routes6: SpinMutex<Vec<NetNamespaceRoute6Entry>>,
+    suppressed_connected_routes6: SpinMutex<Vec<NetNamespaceConnectedRoute6Key>>,
     iface_runtime: SpinMutex<Vec<NetNamespaceIfaceRuntime>>,
     netfilter: SpinMutex<NetfilterState>,
     ipv4_forwarding: AtomicBool,
@@ -207,7 +207,6 @@ pub struct NetNamespaceRouteDecision {
 #[derive(Clone, Copy)]
 struct NetNamespaceDeviceLink {
     registration: &'static NetDeviceRegistration,
-    name_override: Option<&'static str>,
     ipv4_addr: Option<Ipv4Address>,
     ipv4_prefix_len: Option<u8>,
     ipv6_addr: Option<Ipv6Address>,
@@ -216,18 +215,15 @@ struct NetNamespaceDeviceLink {
     is_up: bool,
 }
 
-impl NetNamespaceDeviceLink {
-    fn name(&self) -> &'static str {
-        self.name_override.unwrap_or(self.registration.name)
-    }
-}
-
 #[derive(Clone, Copy)]
 struct NetNamespaceIfaceRuntime {
     registration: &'static NetDeviceRegistration,
     ipv4_addr: Ipv4Address,
     ipv4_prefix_len: u8,
     gateway: Option<Ipv4Address>,
+    ipv6_addr: Option<Ipv6Address>,
+    ipv6_prefix_len: Option<u8>,
+    ipv6_gateway: Option<Ipv6Address>,
     iface: &'static EtherIface,
 }
 
@@ -247,6 +243,80 @@ struct NetNamespaceRouteEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NetNamespaceConnectedRouteKey {
     dst: Ipv4Address,
+    prefix_len: u8,
+    oif_name: &'static str,
+    table: u8,
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 routing / FIB (management plane) — a parallel, independent table that
+// mirrors the IPv4 route types above field-for-field with `Ipv6Address`. The
+// `NetNamespaceRouteKind` enum is family-agnostic and shared. None of this
+// touches the IPv4 route path or the data path; it only stores v6 routes for
+// rtnetlink (`ip -6 route`) and `/proc/net/ipv6_route`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRoute6Info {
+    pub kind: NetNamespaceRouteKind,
+    pub dst: Ipv6Address,
+    pub prefix_len: u8,
+    pub gateway: Option<Ipv6Address>,
+    pub oif_name: Option<&'static str>,
+    pub preferred_src: Option<Ipv6Address>,
+    pub table: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub route_type: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRoute6Config {
+    pub dst: Ipv6Address,
+    pub prefix_len: u8,
+    pub gateway: Option<Ipv6Address>,
+    pub oif_name: Option<&'static str>,
+    pub preferred_src: Option<Ipv6Address>,
+    pub table: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub route_type: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRoute6Selector {
+    pub dst: Ipv6Address,
+    pub prefix_len: u8,
+    pub gateway: Option<Ipv6Address>,
+    pub oif_name: Option<&'static str>,
+    pub table: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetNamespaceRoute6Decision {
+    pub oif_name: &'static str,
+    pub next_hop: Ipv6Address,
+    pub preferred_src: Option<Ipv6Address>,
+    pub prefix_len: u8,
+    pub kind: NetNamespaceRouteKind,
+}
+
+#[derive(Clone, Copy)]
+struct NetNamespaceRoute6Entry {
+    dst: Ipv6Address,
+    prefix_len: u8,
+    gateway: Option<Ipv6Address>,
+    oif_name: Option<&'static str>,
+    preferred_src: Option<Ipv6Address>,
+    table: u8,
+    protocol: u8,
+    scope: u8,
+    route_type: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NetNamespaceConnectedRoute6Key {
+    dst: Ipv6Address,
     prefix_len: u8,
     oif_name: &'static str,
     table: u8,
@@ -325,9 +395,17 @@ impl Drop for NetNamespacePayload {
             // SAFETY: `socket_table_owned` => the table was heap-allocated by
             // `create_isolated_net_namespace_with_owner` via `alloc_zeroed` with
             // `Layout::new::<SocketTable>()` and is uniquely owned by this
-            // payload. `SocketTable`'s `Index`/`Entry` keep keys/values in
-            // `MaybeUninit` (no `Drop`), so `drop_in_place` is a no-op and there
-            // are no double-frees of committed entries.
+            // payload. `SocketTable` bundles `Index` maps whose keys and values
+            // (`Cap<SocketIdentity>`) live in `MaybeUninit`, and `Index` *does*
+            // have a real `Drop` (see `index.rs`) that `assume_init_drop`s the
+            // key/value of every committed entry — so `drop_in_place` is not a
+            // no-op; it recursively runs those `Index::drop`s. Soundness rests on
+            // the table being empty by the time the payload is reclaimed (see the
+            // prose above: the namespace is pruned only once no identity/socket
+            // holds it, so all entries have already been removed), which leaves
+            // every `Index::drop` on its empty branch. `ptr` is uniquely owned, so
+            // each drop runs at most once and the following `dealloc` frees the
+            // zeroed backing without re-running `Drop` — no double-free.
             unsafe {
                 core::ptr::drop_in_place(ptr);
                 alloc::alloc::dealloc(ptr as *mut u8, core::alloc::Layout::new::<SocketTable>());
@@ -395,6 +473,8 @@ impl NetNamespacePayload {
             namespace_devices: SpinMutex::new(Vec::new()),
             routes: SpinMutex::new(Vec::new()),
             suppressed_connected_routes: SpinMutex::new(Vec::new()),
+            routes6: SpinMutex::new(Vec::new()),
+            suppressed_connected_routes6: SpinMutex::new(Vec::new()),
             iface_runtime: SpinMutex::new(Vec::new()),
             netfilter: SpinMutex::new(NetfilterState::new()),
             ipv4_forwarding: AtomicBool::new(false),
@@ -491,50 +571,6 @@ impl NetNamespacePayload {
         target.attach_device_link_inner(link)
     }
 
-    pub fn set_device_name_by_ifindex(
-        &self,
-        _authority: NetAdminAuthority,
-        ifindex: u32,
-        name: &'static str,
-    ) -> Result<(), Errno> {
-        if ifindex == 1 {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
-        if self.has_device_name_conflict(name, Some(registration.devt)) {
-            return Err(Errno::EEXIST);
-        }
-        let old_name = self.name_for_device(registration);
-        {
-            let mut devices = self.namespace_devices.lock();
-            if let Some(link) = devices
-                .iter_mut()
-                .find(|link| link.registration.devt == registration.devt)
-            {
-                link.name_override = Some(name);
-            } else {
-                devices.push(NetNamespaceDeviceLink {
-                    registration,
-                    name_override: Some(name),
-                    ipv4_addr: None,
-                    ipv4_prefix_len: None,
-                    ipv6_addr: None,
-                    ipv6_prefix_len: None,
-                    mtu: None,
-                    is_up: true,
-                });
-            }
-        }
-        for route in self.routes.lock().iter_mut() {
-            if route.oif_name == Some(old_name) {
-                route.oif_name = Some(name);
-            }
-        }
-        self.forget_connected_route_suppressions_for_oif(old_name);
-        self.invalidate_link_snapshot_cache();
-        Ok(())
-    }
-
     pub fn detach_device_from_bridges_by_ifindex(
         &self,
         authority: NetAdminAuthority,
@@ -596,7 +632,6 @@ impl NetNamespacePayload {
 
         self.attach_device_link_inner(NetNamespaceDeviceLink {
             registration,
-            name_override: None,
             ipv4_addr,
             ipv4_prefix_len: ipv4_addr.map(|_| 32),
             ipv6_addr: None,
@@ -625,23 +660,9 @@ impl NetNamespacePayload {
         }
 
         self.namespace_devices.lock().iter().any(|link| {
-            link.name() == registration.name || link.registration.devt == registration.devt
+            link.registration.name == registration.name
+                || link.registration.devt == registration.devt
         })
-    }
-
-    fn has_device_name_conflict(&self, name: &str, except_devt: Option<DevT>) -> bool {
-        if self.host_devices_visible
-            && net_device_snapshot()
-                .into_iter()
-                .any(|reg| Some(reg.devt) != except_devt && reg.name == name)
-        {
-            return true;
-        }
-
-        self.namespace_devices
-            .lock()
-            .iter()
-            .any(|link| Some(link.registration.devt) != except_devt && link.name() == name)
     }
 
     pub fn link_snapshot(&self) -> Vec<NetNamespaceLinkInfo> {
@@ -662,7 +683,6 @@ impl NetNamespacePayload {
 
         let mut links = Vec::new();
         let devices = self.device_snapshot();
-        let device_links = self.namespace_devices.lock().clone();
         let bridges = bridge_snapshot_from_devices(&devices);
         let loopback_override = *self.loopback_ipv4_override.lock();
         let (loopback_addr, loopback_prefix_len) =
@@ -686,23 +706,15 @@ impl NetNamespacePayload {
         });
 
         for (next_ifindex, reg) in (2..).zip(devices) {
-            let link = device_links
-                .iter()
-                .find(|link| link.registration.devt == reg.devt);
-            let name = link.map(NetNamespaceDeviceLink::name).unwrap_or(reg.name);
-            let ipv4_addr = link.and_then(|link| link.ipv4_addr);
-            let ipv4_prefix_len = link.and_then(|link| link.ipv4_prefix_len);
-            let ipv6_addr = link.and_then(|link| link.ipv6_addr);
-            let ipv6_prefix_len = link.and_then(|link| link.ipv6_prefix_len);
-            let mtu = link
-                .and_then(|link| link.mtu)
-                .unwrap_or_else(|| reg.ops.mtu());
-            let is_up = link.is_none_or(|link| link.is_up);
+            let ipv4_addr = self.ipv4_for_device(reg);
+            let ipv4_prefix_len = self.ipv4_prefix_len_for_device(reg);
+            let ipv6_addr = self.ipv6_for_device(reg);
+            let ipv6_prefix_len = self.ipv6_prefix_len_for_device(reg);
             links.push(NetNamespaceLinkInfo {
                 ifindex: next_ifindex,
-                name,
+                name: reg.name,
                 kind: reg.ops.device_kind(),
-                mtu,
+                mtu: self.mtu_for_device(reg),
                 mac: Some(reg.ops.mac_addr()),
                 ipv4_addr,
                 ipv4_prefix_len,
@@ -710,7 +722,7 @@ impl NetNamespacePayload {
                 ipv6_prefix_len,
                 master: bridge_master_for(reg.name, &bridges),
                 is_loopback: false,
-                is_up,
+                is_up: self.is_device_up(reg),
             });
         }
 
@@ -808,7 +820,7 @@ impl NetNamespacePayload {
         for link in links.iter() {
             if devices
                 .iter()
-                .any(|reg| reg.name == link.name() || reg.devt == link.registration.devt)
+                .any(|reg| reg.name == link.registration.name || reg.devt == link.registration.devt)
             {
                 continue;
             }
@@ -1061,21 +1073,9 @@ impl NetNamespacePayload {
     }
 
     pub fn find_device_by_name(&self, name: &str) -> Option<&'static NetDeviceRegistration> {
-        if let Some(registration) = self
-            .namespace_devices
-            .lock()
-            .iter()
-            .find(|link| link.name() == name)
-            .map(|link| link.registration)
-        {
-            return Some(registration);
-        }
-        if self.host_devices_visible {
-            return net_device_snapshot()
-                .into_iter()
-                .find(|registration| registration.name == name);
-        }
-        None
+        self.device_snapshot()
+            .into_iter()
+            .find(|registration| registration.name == name)
     }
 
     pub fn find_device_by_ifindex(&self, ifindex: u32) -> Option<&'static NetDeviceRegistration> {
@@ -1130,6 +1130,208 @@ impl NetNamespacePayload {
             .and_then(|route| route.oif_name)
     }
 
+    // -----------------------------------------------------------------------
+    // IPv6 routing / FIB methods — a 1:1 mirror of the IPv4 methods above,
+    // operating on the independent `routes6` table. Management-plane only.
+    // -----------------------------------------------------------------------
+
+    pub fn route6_snapshot(&self) -> Vec<NetNamespaceRoute6Info> {
+        let mut routes = Vec::new();
+        let suppressed_connected_routes = self.suppressed_connected_routes6.lock().clone();
+        for link in self.link_snapshot() {
+            if link.is_loopback {
+                continue;
+            }
+            let Some(addr) = link.ipv6_addr else {
+                continue;
+            };
+            let prefix_len = link.ipv6_prefix_len.unwrap_or(64).min(128);
+            let key = NetNamespaceConnectedRoute6Key {
+                dst: ipv6_network(addr, prefix_len),
+                prefix_len,
+                oif_name: link.name,
+                table: 254,
+            };
+            if suppressed_connected_routes
+                .iter()
+                .any(|suppressed| *suppressed == key)
+            {
+                continue;
+            }
+            routes.push(NetNamespaceRoute6Info {
+                kind: NetNamespaceRouteKind::Connected,
+                dst: key.dst,
+                prefix_len,
+                gateway: None,
+                oif_name: Some(link.name),
+                preferred_src: Some(addr),
+                table: 254,
+                protocol: 2,
+                scope: 253,
+                route_type: 1,
+            });
+        }
+
+        routes.extend(
+            self.routes6
+                .lock()
+                .iter()
+                .map(NetNamespaceRoute6Entry::as_info),
+        );
+        routes.sort_by_key(|route| {
+            (
+                core::cmp::Reverse(route.prefix_len),
+                route.dst,
+                route.gateway.unwrap_or(Ipv6Address::UNSPECIFIED),
+                route.oif_name.unwrap_or(""),
+            )
+        });
+        routes
+    }
+
+    pub fn add_ipv6_route(
+        &self,
+        _authority: NetAdminAuthority,
+        mut route: NetNamespaceRoute6Config,
+    ) -> Result<(), Errno> {
+        validate_route6_config(route)?;
+        if let Some(name) = route.oif_name {
+            self.link_snapshot()
+                .into_iter()
+                .find(|link| link.name == name)
+                .ok_or(Errno::ENODEV)?;
+        } else if let Some(gateway) = route.gateway {
+            // No explicit `dev`: resolve the egress interface from the
+            // gateway's connected route (or loopback) so /proc/net/ipv6_route
+            // and `ip -6 route show` render `... via <gw> dev <oif>` like Linux.
+            route.oif_name = self.oif6_for_gateway(gateway);
+        }
+
+        let entry = NetNamespaceRoute6Entry::from_config(route);
+        let mut routes = self.routes6.lock();
+        if routes.iter().any(|existing| existing.same_key(entry)) {
+            return Err(Errno::EEXIST);
+        }
+        routes.push(entry);
+        Ok(())
+    }
+
+    pub fn delete_ipv6_route(
+        &self,
+        _authority: NetAdminAuthority,
+        selector: NetNamespaceRoute6Selector,
+    ) -> Result<(), Errno> {
+        if selector.prefix_len > 128 {
+            return Err(Errno::EINVAL);
+        }
+        let mut routes = self.routes6.lock();
+        let Some(idx) = routes
+            .iter()
+            .position(|route| route.matches_selector(selector))
+        else {
+            drop(routes);
+            return self
+                .suppress_connected_route6_for_selector(selector)
+                .ok_or(Errno::ENOENT)
+                .map(|_| ());
+        };
+        routes.remove(idx);
+        Ok(())
+    }
+
+    fn suppress_connected_route6_for_selector(
+        &self,
+        selector: NetNamespaceRoute6Selector,
+    ) -> Option<NetNamespaceConnectedRoute6Key> {
+        let key = self.connected_route6_key_matching_selector(selector)?;
+        let mut suppressed = self.suppressed_connected_routes6.lock();
+        if !suppressed.iter().any(|existing| *existing == key) {
+            suppressed.push(key);
+        }
+        Some(key)
+    }
+
+    fn connected_route6_key_matching_selector(
+        &self,
+        selector: NetNamespaceRoute6Selector,
+    ) -> Option<NetNamespaceConnectedRoute6Key> {
+        if selector.gateway.is_some() {
+            return None;
+        }
+        self.link_snapshot().into_iter().find_map(|link| {
+            if link.is_loopback {
+                return None;
+            }
+            let addr = link.ipv6_addr?;
+            let prefix_len = link.ipv6_prefix_len.unwrap_or(64).min(128);
+            let key = NetNamespaceConnectedRoute6Key {
+                dst: ipv6_network(addr, prefix_len),
+                prefix_len,
+                oif_name: link.name,
+                table: 254,
+            };
+            key.matches_selector(selector).then_some(key)
+        })
+    }
+
+    #[allow(dead_code)]
+    fn forget_connected_route6_suppressions_for_oif(&self, oif_name: &'static str) {
+        self.suppressed_connected_routes6
+            .lock()
+            .retain(|key| key.oif_name != oif_name);
+    }
+
+    pub fn best_ipv6_route(&self, dst: Ipv6Address) -> Option<NetNamespaceRoute6Decision> {
+        self.route6_snapshot()
+            .into_iter()
+            .filter(|route| route6_matches_ipv6(*route, dst))
+            .filter_map(|route| self.route6_decision_for_info(route, dst))
+            .max_by_key(|decision| decision.prefix_len)
+    }
+
+    fn route6_decision_for_info(
+        &self,
+        route: NetNamespaceRoute6Info,
+        dst: Ipv6Address,
+    ) -> Option<NetNamespaceRoute6Decision> {
+        let oif_name = route.oif_name.or_else(|| {
+            route
+                .gateway
+                .and_then(|gateway| self.oif6_for_gateway(gateway))
+        })?;
+        if !self.link_snapshot().into_iter().any(|link| {
+            link.name == oif_name && link.is_up && link.ipv6_addr.is_some() && !link.is_loopback
+        }) {
+            return None;
+        }
+        Some(NetNamespaceRoute6Decision {
+            oif_name,
+            next_hop: route.gateway.unwrap_or(dst),
+            preferred_src: route.preferred_src,
+            prefix_len: route.prefix_len,
+            kind: route.kind,
+        })
+    }
+
+    fn oif6_for_gateway(&self, gateway: Ipv6Address) -> Option<&'static str> {
+        // A loopback gateway (`::1`) is reached over the loopback device; the
+        // loopback link is intentionally absent from the connected-route
+        // snapshot, so resolve it directly here (mirrors the v4 127/8 case).
+        if gateway == Ipv6Address::LOOPBACK {
+            return self
+                .link_snapshot()
+                .into_iter()
+                .find(|link| link.is_loopback)
+                .map(|link| link.name);
+        }
+        self.route6_snapshot()
+            .into_iter()
+            .filter(|route| route.kind == NetNamespaceRouteKind::Connected)
+            .filter(|route| route6_matches_ipv6(*route, gateway))
+            .max_by_key(|route| route.prefix_len)
+            .and_then(|route| route.oif_name)
+    }
+
     fn gateway_for_device(&self, name: &'static str) -> Option<Ipv4Address> {
         let routes = self.routes.lock().clone();
         routes.iter().find_map(|route| {
@@ -1138,6 +1340,27 @@ impl NetNamespacePayload {
                 && (route.oif_name == Some(name)
                     || if route.oif_name.is_none() {
                         self.oif_for_gateway(gateway) == Some(name)
+                    } else {
+                        false
+                    })
+            {
+                Some(gateway)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// IPv6 V3b: the ::/0 default route's gateway for `name` (mirror of
+    /// [`gateway_for_device`], over the v6 `routes6` FIB).
+    fn gateway6_for_device(&self, name: &'static str) -> Option<Ipv6Address> {
+        let routes = self.routes6.lock().clone();
+        routes.iter().find_map(|route| {
+            let gateway = route.gateway?;
+            if route.prefix_len == 0
+                && (route.oif_name == Some(name)
+                    || if route.oif_name.is_none() {
+                        self.oif6_for_gateway(gateway) == Some(name)
                     } else {
                         false
                     })
@@ -1176,7 +1399,6 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
-            name_override: None,
             ipv4_addr: None,
             ipv4_prefix_len: None,
             ipv6_addr: None,
@@ -1214,7 +1436,6 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
-            name_override: None,
             ipv4_addr: None,
             ipv4_prefix_len: None,
             ipv6_addr: None,
@@ -1253,7 +1474,6 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
-            name_override: None,
             ipv4_addr,
             ipv4_prefix_len,
             ipv6_addr: None,
@@ -1544,7 +1764,6 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
-            name_override: None,
             ipv4_addr: None,
             ipv4_prefix_len: None,
             ipv6_addr,
@@ -1660,6 +1879,17 @@ impl NetNamespacePayload {
             .and_then(|link| link.ipv4_addr)
     }
 
+    fn ipv4_prefix_len_for_device(
+        &self,
+        registration: &'static NetDeviceRegistration,
+    ) -> Option<u8> {
+        self.namespace_devices
+            .lock()
+            .iter()
+            .find(|link| link.registration.devt == registration.devt)
+            .and_then(|link| link.ipv4_prefix_len)
+    }
+
     fn ipv6_for_device(&self, registration: &'static NetDeviceRegistration) -> Option<Ipv6Address> {
         self.namespace_devices
             .lock()
@@ -1668,13 +1898,24 @@ impl NetNamespacePayload {
             .and_then(|link| link.ipv6_addr)
     }
 
-    fn name_for_device(&self, registration: &'static NetDeviceRegistration) -> &'static str {
+    fn ipv6_prefix_len_for_device(
+        &self,
+        registration: &'static NetDeviceRegistration,
+    ) -> Option<u8> {
         self.namespace_devices
             .lock()
             .iter()
             .find(|link| link.registration.devt == registration.devt)
-            .map(NetNamespaceDeviceLink::name)
-            .unwrap_or(registration.name)
+            .and_then(|link| link.ipv6_prefix_len)
+    }
+
+    fn mtu_for_device(&self, registration: &'static NetDeviceRegistration) -> u16 {
+        self.namespace_devices
+            .lock()
+            .iter()
+            .find(|link| link.registration.devt == registration.devt)
+            .and_then(|link| link.mtu)
+            .unwrap_or_else(|| registration.ops.mtu())
     }
 
     fn is_device_up(&self, registration: &'static NetDeviceRegistration) -> bool {
@@ -1722,6 +1963,20 @@ impl NetNamespacePayload {
         let ipv4_addr = link.ipv4_addr?;
         let ipv4_prefix_len = link.ipv4_prefix_len.unwrap_or(32).min(32);
         let gateway = self.gateway_for_device(link.name);
+        // IPv6 V1: carry the iface's on-link v6 config into IfaceCommon so
+        // decide_ipv6_route can do the on-link prefix check; part of the
+        // rebuild cache key so a v6-addr change re-leaks the iface.
+        let ipv6_addr = link.ipv6_addr;
+        // Clamp to the v6 max (mirror the v4 `.min(32)` above). The netlink
+        // address parse (parse_ifaddrmsg) stores prefix_len as a raw byte and
+        // never bounds it, so `ip -6 addr add .../200` would otherwise reach
+        // decide_ipv6_route -> same_ipv6_prefix, which indexes a [u8;16] by
+        // plen/8 and panics the kernel out of bounds.
+        let ipv6_prefix_len = link.ipv6_prefix_len.map(|p| p.min(128));
+        // IPv6 V3b: off-link v6 next-hop from the ::/0 default route (mirror of
+        // the v4 `gateway`); part of the rebuild cache key so a v6-gateway change
+        // re-leaks the iface.
+        let ipv6_gateway = self.gateway6_for_device(link.name);
         let mut runtime = self.iface_runtime.lock();
 
         if let Some(entry) = runtime.iter().find(|entry| {
@@ -1729,6 +1984,9 @@ impl NetNamespacePayload {
                 && entry.ipv4_addr == ipv4_addr
                 && entry.ipv4_prefix_len == ipv4_prefix_len
                 && entry.gateway == gateway
+                && entry.ipv6_addr == ipv6_addr
+                && entry.ipv6_prefix_len == ipv6_prefix_len
+                && entry.ipv6_gateway == ipv6_gateway
         }) {
             return Some(entry.iface);
         }
@@ -1740,9 +1998,11 @@ impl NetNamespacePayload {
                 prefix_len_to_netmask(ipv4_prefix_len),
                 gateway,
                 registration.ops.mtu(),
-            ),
+            )
+            .with_ipv6(ipv6_addr, ipv6_prefix_len)
+            .with_ipv6_gateway(ipv6_gateway),
             registration.ops.mac_addr(),
-            link.name,
+            registration.name,
         )));
 
         if let Some(entry) = runtime
@@ -1755,6 +2015,9 @@ impl NetNamespacePayload {
                 ipv4_addr,
                 ipv4_prefix_len,
                 gateway,
+                ipv6_addr,
+                ipv6_prefix_len,
+                ipv6_gateway,
                 iface,
             };
         } else {
@@ -1763,6 +2026,9 @@ impl NetNamespacePayload {
                 ipv4_addr,
                 ipv4_prefix_len,
                 gateway,
+                ipv6_addr,
+                ipv6_prefix_len,
+                ipv6_gateway,
                 iface,
             });
         }
@@ -1864,23 +2130,10 @@ pub fn drive_all_net_namespace_runtimes_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> NetNamespaceRuntimeOutcome {
-    drive_all_net_namespace_runtimes_at_with_post(now, guard, |mailbox, event| mailbox.post(event))
-}
-
-pub fn drive_all_net_namespace_runtimes_at_with_post<F>(
-    now: Instant,
-    guard: &Guard<'_>,
-    mut post: F,
-) -> NetNamespaceRuntimeOutcome
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
     let namespaces = NET_NAMESPACE_RUNTIME_LIST.lock().clone();
     let mut outcome = NetNamespaceRuntimeOutcome::default();
     for namespace in namespaces {
-        outcome.merge(drive_net_namespace_runtime_at_with_post(
-            namespace, now, guard, &mut post,
-        ));
+        outcome.merge(drive_net_namespace_runtime_at(namespace, now, guard));
     }
     outcome
 }
@@ -1890,20 +2143,6 @@ pub fn drive_net_namespace_runtime_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> NetNamespaceRuntimeOutcome {
-    drive_net_namespace_runtime_at_with_post(net_namespace, now, guard, |mailbox, event| {
-        mailbox.post(event)
-    })
-}
-
-pub fn drive_net_namespace_runtime_at_with_post<F>(
-    net_namespace: PayloadCap<NetNamespacePayload>,
-    now: Instant,
-    guard: &Guard<'_>,
-    mut post: F,
-) -> NetNamespaceRuntimeOutcome
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
     let mut outcome = NetNamespaceRuntimeOutcome {
         namespaces_seen: 1,
         ..NetNamespaceRuntimeOutcome::default()
@@ -1915,13 +2154,9 @@ where
         outcome.ifaces_seen += 1;
 
         let source = NamespaceEtherPacketSource::new(&net_namespace, iface);
-        if let StepOutcome::Done(events) = step_process_network_events_in_namespace_at_with_post(
-            &source,
-            net_namespace.clone(),
-            now,
-            guard,
-            &mut post,
-        ) {
+        if let StepOutcome::Done(events) =
+            step_process_network_events_in_namespace_at(&source, net_namespace.clone(), now, guard)
+        {
             outcome.packets_seen += events.packets_seen;
             outcome.sockets_touched += events.sockets_touched;
             outcome.wakes_fired += events.wakes_fired;
@@ -1929,16 +2164,13 @@ where
         outcome.merge_forwarding(source.forwarding_outcome());
 
         let sink = EtherPacketTxSink { iface };
-        if let StepOutcome::Done(device_tx) =
-            step_process_device_tx_pending_in_namespace_at_with_post(
-                &sink,
-                net_namespace.clone(),
-                now,
-                DeviceTxBudget::default(),
-                guard,
-                &mut post,
-            )
-        {
+        if let StepOutcome::Done(device_tx) = step_process_device_tx_pending_in_namespace_at(
+            &sink,
+            net_namespace.clone(),
+            now,
+            DeviceTxBudget::default(),
+            guard,
+        ) {
             outcome.merge_device_tx(device_tx);
         }
 
@@ -2376,6 +2608,106 @@ impl NetNamespaceRouteEntry {
 impl NetNamespaceConnectedRouteKey {
     fn matches_selector(&self, selector: NetNamespaceRouteSelector) -> bool {
         self.dst == ipv4_network(selector.dst, selector.prefix_len)
+            && self.prefix_len == selector.prefix_len
+            && self.table == selector.table
+            && selector.gateway.is_none()
+            && selector
+                .oif_name
+                .is_none_or(|oif_name| self.oif_name == oif_name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 routing helpers — parallel to the IPv4 helpers above. Prefix math is
+// done on the 128-bit big-endian integer view of the address.
+// ---------------------------------------------------------------------------
+
+fn validate_route6_config(route: NetNamespaceRoute6Config) -> Result<(), Errno> {
+    if route.prefix_len > 128 {
+        return Err(Errno::EINVAL);
+    }
+    if route.gateway.is_none() && route.oif_name.is_none() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+fn route6_matches_ipv6(route: NetNamespaceRoute6Info, dst: Ipv6Address) -> bool {
+    ipv6_prefix_matches(dst, route.dst, route.prefix_len)
+}
+
+fn ipv6_prefix_mask(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix_len.min(128)))
+    }
+}
+
+fn ipv6_network(addr: Ipv6Address, prefix_len: u8) -> Ipv6Address {
+    let mask = ipv6_prefix_mask(prefix_len.min(128));
+    Ipv6Address::new((u128::from_be_bytes(addr.octets()) & mask).to_be_bytes())
+}
+
+fn ipv6_prefix_matches(addr: Ipv6Address, network: Ipv6Address, prefix_len: u8) -> bool {
+    let mask = ipv6_prefix_mask(prefix_len.min(128));
+    (u128::from_be_bytes(addr.octets()) & mask) == (u128::from_be_bytes(network.octets()) & mask)
+}
+
+impl NetNamespaceRoute6Entry {
+    fn from_config(config: NetNamespaceRoute6Config) -> Self {
+        Self {
+            dst: ipv6_network(config.dst, config.prefix_len),
+            prefix_len: config.prefix_len,
+            gateway: config.gateway,
+            oif_name: config.oif_name,
+            preferred_src: config.preferred_src,
+            table: config.table,
+            protocol: config.protocol,
+            scope: config.scope,
+            route_type: config.route_type,
+        }
+    }
+
+    fn as_info(&self) -> NetNamespaceRoute6Info {
+        NetNamespaceRoute6Info {
+            kind: NetNamespaceRouteKind::Static,
+            dst: self.dst,
+            prefix_len: self.prefix_len,
+            gateway: self.gateway,
+            oif_name: self.oif_name,
+            preferred_src: self.preferred_src,
+            table: self.table,
+            protocol: self.protocol,
+            scope: self.scope,
+            route_type: self.route_type,
+        }
+    }
+
+    fn same_key(&self, other: Self) -> bool {
+        self.dst == other.dst
+            && self.prefix_len == other.prefix_len
+            && self.gateway == other.gateway
+            && self.oif_name == other.oif_name
+            && self.table == other.table
+    }
+
+    fn matches_selector(&self, selector: NetNamespaceRoute6Selector) -> bool {
+        self.dst == ipv6_network(selector.dst, selector.prefix_len)
+            && self.prefix_len == selector.prefix_len
+            && self.table == selector.table
+            && selector
+                .gateway
+                .is_none_or(|gateway| self.gateway == Some(gateway))
+            && selector
+                .oif_name
+                .is_none_or(|oif_name| self.oif_name == Some(oif_name))
+    }
+}
+
+impl NetNamespaceConnectedRoute6Key {
+    fn matches_selector(&self, selector: NetNamespaceRoute6Selector) -> bool {
+        self.dst == ipv6_network(selector.dst, selector.prefix_len)
             && self.prefix_len == selector.prefix_len
             && self.table == selector.table
             && selector.gateway.is_none()

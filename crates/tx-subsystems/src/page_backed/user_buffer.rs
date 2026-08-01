@@ -191,6 +191,18 @@ fn step_range_with_user_buffer(
                     guard,
                 ) {
                     UserChunkOutcome::Copied => {
+                        if matches!(buffer, UserBuffer::Write { .. })
+                            && pc
+                                .mark_completed_write(page_index, materialized.ppn)
+                                .is_err()
+                        {
+                            emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 5);
+                            if advanced == 0 {
+                                return V3::err(step_engine::Errno::EAGAIN);
+                            }
+                            of.set_offset(offset);
+                            return V3::done(advanced);
+                        }
                         emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 3);
                         advanced += chunk;
                         offset += chunk as u64;
@@ -529,6 +541,17 @@ fn step_range_with_kernel_buffer(
                 match copy_chunk_kernel(materialized.ppn, within_page, chunk, &mut buffer, advanced)
                 {
                     Ok(()) => {
+                        if buffer.io_kind() == PageBackedIoKind::Write
+                            && pc
+                                .mark_completed_write(page_index, materialized.ppn)
+                                .is_err()
+                        {
+                            if advanced == 0 {
+                                return V3::err(step_engine::Errno::EAGAIN);
+                            }
+                            of.set_offset(offset);
+                            return V3::done(advanced);
+                        }
                         advanced += chunk;
                         offset += chunk as u64;
                     }

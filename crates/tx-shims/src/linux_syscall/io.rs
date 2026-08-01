@@ -9,18 +9,15 @@ use crate::adapter::step_engine::Cap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
-use tx_subsystems::vfs::{query_fd_ready, FdReadyMask, FdReadyQuery, FdReadyReport, FdWait};
+use tx_subsystems::vfs::FdReadyMask;
 
 const PSELECT_READY_YIELD_INTERVAL: usize = 4;
 const PSELECT_EMPTY_POLL_YIELD_INTERVAL: usize = 4;
 static PSELECT_READY_RETURNS: AtomicUsize = AtomicUsize::new(0);
 static PSELECT_EMPTY_POLL_RETURNS: AtomicUsize = AtomicUsize::new(0);
-const POLLFD_BYTES: u64 = 8;
-const POLLIN: i16 = 0x0001;
-const POLLOUT: i16 = 0x0004;
-const POLLERR: i16 = 0x0008;
-const POLLHUP: i16 = 0x0010;
-const POLLNVAL: i16 = 0x0020;
+const EVENTFD_POLL_READABLE: u64 = 0x1;
+const EVENTFD_POLL_WRITABLE: u64 = 0x2;
+const TIMERFD_POLL_READABLE: u64 = 0x1;
 
 fn raise_sigpipe(ctx: &SyscallCtx<'_>) {
     let _ = tx_subsystems::signal::step_kill_process_with_post(
@@ -40,9 +37,8 @@ fn direct_mailbox_ref_post_with_hint(
 }
 
 fn tty_readable_level(tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>) -> bool {
-    let guard =
-        tx_substrate::epoch::borrow_current_guard().unwrap_or_else(tx_substrate::epoch::guard);
-    tx_subsystems::tty::execution::tty_read_would_complete(tty, &guard)
+    use tx_subsystems::tty::execution::TTY_READABLE;
+    tty.input_readable.peek() & TTY_READABLE != 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,23 +67,6 @@ fn static_char_device(file: &Cap<OpenFile>) -> Option<StaticCharDevice> {
         ("zero", 1, 5) => Some(StaticCharDevice::Zero),
         _ => None,
     }
-}
-
-fn rtc_char_binding(
-    file: &Cap<OpenFile>,
-) -> Option<&'static tx_subsystems::device::CharDeviceBinding> {
-    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
-
-    let OpenFileBacking::Rnode { rnode } = file.backing() else {
-        return None;
-    };
-    let RNodeBacking::StructBacked {
-        payload: StructPayload::CharDevice(binding),
-    } = rnode.backing()
-    else {
-        return None;
-    };
-    binding.ops.rtc_ops().map(|_| *binding)
 }
 
 pub(super) fn dispatch_static_chardev_immediate(
@@ -200,6 +179,29 @@ fn read_pselect_timeout_ns(
     Ok(Some(ns))
 }
 
+async fn read_pselect_timeout_ns_wait(
+    aspace: &Cap<AddressSpace>,
+    timeout_ptr: u64,
+) -> Result<Option<u64>, i32> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; core::mem::size_of::<PselectTimespecLayout>()];
+    super::user_copy::bootstrap_copy_from_user_wait(aspace, &mut bytes, timeout_ptr)
+        .await
+        .map_err(errno_to_i32)?;
+    let tv_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let tv_nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 {
+        return Err(EINVAL_VALUE);
+    }
+    let ns = (tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|sec_ns| sec_ns.checked_add(tv_nsec as u64))
+        .ok_or(EINVAL_VALUE)?;
+    Ok(Some(ns))
+}
+
 fn fdset_words(nfds: u64) -> usize {
     nfds.div_ceil(FD_SET_WORD_BITS) as usize
 }
@@ -251,6 +253,11 @@ fn fdset_clear(set: Option<&mut [u64]>, fd: u64) {
     }
 }
 
+fn timerfd_readable_level<P: tx_hal::TimeIf>(tfd: &tx_subsystems::timerfd::TimerFd) -> bool {
+    let deadline = tfd.deadline_ns();
+    tfd.expiration_count() > 0 || (deadline != 0 && P::read_ns() >= deadline)
+}
+
 fn include_timerfd_deadline(deadline_slot: &mut Option<u64>, deadline_ns: u64) {
     if deadline_ns == 0 {
         return;
@@ -261,72 +268,68 @@ fn include_timerfd_deadline(deadline_slot: &mut Option<u64>, deadline_ns: u64) {
     });
 }
 
-fn poll_interest_from_events(events: i16) -> FdReadyMask {
-    let mut interest = FdReadyMask::ERR | FdReadyMask::HUP | FdReadyMask::RDHUP;
-    if events & POLLIN != 0 {
-        interest |= FdReadyMask::READ;
+fn pselect_fd_ready(
+    file: &OpenFile,
+    want_read: bool,
+    want_write: bool,
+    want_except: bool,
+) -> (bool, bool, bool) {
+    use tx_subsystems::{
+        pipe::PipeSide,
+        vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload},
+    };
+
+    let mut read_ready = false;
+    let mut write_ready = false;
+    let except_ready = false;
+
+    if let Some(efd) = file.eventfd() {
+        return (
+            want_read && efd.counter() > 0,
+            want_write && efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX,
+            false,
+        );
     }
-    if events & POLLOUT != 0 {
-        interest |= FdReadyMask::WRITE;
+
+    if let OpenFileBacking::Rnode { rnode } = file.backing() {
+        match rnode.backing() {
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Tty(tty),
+            } => {
+                if want_read {
+                    read_ready = tty_readable_level(tty);
+                }
+                if want_write {
+                    write_ready = true;
+                }
+            }
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Pipe { payload, side },
+            } => match side {
+                PipeSide::Reader => {
+                    if want_read {
+                        read_ready = payload.readable_level();
+                    }
+                }
+                PipeSide::Writer => {
+                    if want_write {
+                        write_ready = payload.writable_level();
+                    }
+                }
+            },
+            _ => {
+                read_ready = want_read;
+                write_ready = want_write;
+            }
+        }
     }
-    interest
+
+    (read_ready, write_ready, want_except && except_ready)
 }
 
-fn select_interest_from_sets(want_read: bool, want_write: bool, want_except: bool) -> FdReadyMask {
-    let mut interest = FdReadyMask::empty();
-    if want_read {
-        interest |= FdReadyMask::READ | FdReadyMask::HUP | FdReadyMask::RDHUP | FdReadyMask::ERR;
-    }
-    if want_write {
-        interest |= FdReadyMask::WRITE | FdReadyMask::ERR;
-    }
-    if want_except {
-        interest |= FdReadyMask::PRI | FdReadyMask::ERR;
-    }
-    interest
-}
-
-fn fd_ready_report_for_poll<P>(file: &Cap<OpenFile>, interest: FdReadyMask) -> FdReadyReport
-where
-    TimekeeperClock<P>: ClockRead,
-{
-    let guard = crate::adapter::step_engine::guard();
-    query_fd_ready(
-        FdReadyQuery {
-            file,
-            interest,
-            now_monotonic_ns: Some(timekeeper_clock::<P>().monotonic_now_ns()),
-        },
-        &guard,
-    )
-}
-
-fn push_fd_ready_waits(waits: &mut alloc::vec::Vec<FdWait>, report: &FdReadyReport) {
-    for wait in &report.waits {
-        push_unique_fd_wait(waits, wait.clone());
-    }
-}
-
-fn poll_revents_from_fd_report(events: i16, report: &FdReadyReport) -> i16 {
-    let mut revents = 0;
-    if events & POLLIN != 0 && report.ready.intersects(FdReadyMask::READ) {
-        revents |= POLLIN;
-    }
-    if events & POLLOUT != 0 && report.ready.intersects(FdReadyMask::WRITE) {
-        revents |= POLLOUT;
-    }
-    if report.ready.intersects(FdReadyMask::ERR) {
-        revents |= POLLERR;
-    }
-    if report
-        .ready
-        .intersects(FdReadyMask::HUP | FdReadyMask::RDHUP)
-    {
-        revents |= POLLHUP;
-    }
-    revents
-}
-
+/// Project the unified fd-ready mask into the `select(2)` read set.
+/// Linux reports errors and peer shutdown as readable so the caller can
+/// perform the final read and observe EOF/the pending socket error.
 pub(super) fn select_fd_read_ready(want_read: bool, ready: FdReadyMask) -> bool {
     want_read
         && ready.intersects(
@@ -338,6 +341,9 @@ pub(super) fn select_fd_write_ready(want_write: bool, ready: FdReadyMask) -> boo
     want_write && ready.intersects(FdReadyMask::WRITE | FdReadyMask::ERR)
 }
 
+/// Return the directions that still need wait registrations after a readiness
+/// snapshot. Read and write remain independent so readiness in one direction
+/// cannot suppress the other direction's wait registration.
 pub(super) fn select_fd_blocked_directions(
     want_read: bool,
     want_write: bool,
@@ -349,7 +355,7 @@ pub(super) fn select_fd_blocked_directions(
     )
 }
 
-async fn sleep_timeout_ns<P>(ns: u64, ctx: &SyscallCtx<'_>) -> SyscallResult
+async fn sleep_timeout_ns<P: tx_hal::TimeIf>(ns: u64, ctx: &SyscallCtx<'_>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -375,6 +381,24 @@ fn read_ppoll_sigmask(
     }
     match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
         Ok(bits) => Ok(Some(bits)),
+        Err(errno) => Err(SyscallResult::error_from(errno)),
+    }
+}
+
+async fn read_ppoll_sigmask_wait(
+    ctx: &SyscallCtx<'_>,
+    mask_ptr: u64,
+    mask_size: u64,
+) -> Result<Option<u64>, SyscallResult> {
+    if mask_ptr == 0 {
+        return Ok(None);
+    }
+    if mask_size < SIGSETSIZE_BYTES {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    let mut bytes = [0u8; core::mem::size_of::<u64>()];
+    match super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, mask_ptr).await {
+        Ok(()) => Ok(Some(u64::from_le_bytes(bytes))),
         Err(errno) => Err(SyscallResult::error_from(errno)),
     }
 }
@@ -487,20 +511,13 @@ enum PselectWaitWake {
     Signalled,
 }
 
-fn push_unique_fd_wait(waits: &mut alloc::vec::Vec<FdWait>, wait: FdWait) {
-    if !waits.contains(&wait) {
-        waits.push(wait);
+fn push_unique_wait_token(
+    tokens: &mut alloc::vec::Vec<tx_subsystems::execution::WaitToken>,
+    token: tx_subsystems::execution::WaitToken,
+) {
+    if !tokens.contains(&token) {
+        tokens.push(token);
     }
-}
-
-fn wait_on_fd_wait(wait: FdWait) -> Option<impl core::future::Future + Unpin> {
-    if let Some(endpoint) = wait.endpoint() {
-        return Some(wait_source::wait_on_registered_endpoint(
-            endpoint,
-            wait.interests.raw(),
-        ));
-    }
-    wait_source::wait_on_registered_source_id(wait.source.raw(), wait.interests.raw())
 }
 
 /// Park until one of `futures` is ready or a signal is posted. Returns `true`
@@ -508,13 +525,10 @@ fn wait_on_fd_wait(wait: FdWait) -> Option<impl core::future::Future + Unpin> {
 /// and returns EINTR). Registering on the thread mailbox is what makes a blocked
 /// ppoll/pselect interruptible — the fd futures each park on their own private
 /// wait-source mailbox, so a posted signal would otherwise never wake the task.
-async fn wait_on_any_registered_source<F>(
-    mut futures: alloc::vec::Vec<F>,
+async fn wait_on_any_token(
+    mut futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>,
     mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
-) -> bool
-where
-    F: core::future::Future + Unpin,
-{
+) -> bool {
     core::future::poll_fn(|cx| {
         if let Some(mailbox) = mailbox {
             mailbox.register_waker(cx.waker().clone());
@@ -523,10 +537,14 @@ where
                 if matches!(
                     event,
                     tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
-                        | tx_substrate::wake::mailbox::MailboxEvent::SignalTimerFired { .. }
                 ) {
                     signalled = true;
                 }
+            }
+            if mailbox.take_overflow() {
+                // The concrete event was dropped. Re-scan fd readiness and
+                // pending signals in the syscall's outer loop.
+                return core::task::Poll::Ready(false);
             }
             if signalled {
                 return core::task::Poll::Ready(true);
@@ -542,15 +560,14 @@ where
     .await
 }
 
-async fn wait_on_any_registered_source_or_pselect_deadline<P, F>(
+async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
     ctx: &SyscallCtx<'_>,
-    mut fd_futures: alloc::vec::Vec<F>,
+    mut fd_futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>,
     deadline_ns: u64,
     mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
 ) -> PselectWaitWake
 where
     TimekeeperClock<P>: ClockRead,
-    F: core::future::Future + Unpin,
 {
     if timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns {
         return PselectWaitWake::TimedOut;
@@ -567,10 +584,12 @@ where
                 if matches!(
                     event,
                     tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
-                        | tx_substrate::wake::mailbox::MailboxEvent::SignalTimerFired { .. }
                 ) {
                     signalled = true;
                 }
+            }
+            if mailbox.take_overflow() {
+                return core::task::Poll::Ready(PselectWaitWake::FdReady);
             }
             if signalled {
                 return core::task::Poll::Ready(PselectWaitWake::Signalled);
@@ -589,7 +608,7 @@ where
     .await
 }
 
-async fn wait_until_pselect_deadline<P>(ctx: &SyscallCtx<'_>, deadline_ns: u64)
+async fn wait_until_pselect_deadline<P: tx_hal::TimeIf>(ctx: &SyscallCtx<'_>, deadline_ns: u64)
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -636,167 +655,33 @@ fn fdset_write<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, words: &[u64]) -> Result<
     Ok(())
 }
 
-fn copy_tty_read_result_to_user(
-    ctx: &SyscallCtx<'_>,
-    buf_ptr: usize,
-    staging: &[u8],
-    total: usize,
-) -> SyscallResult {
-    if total > 0 {
-        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total]) {
-            return SyscallResult::error_from(errno);
-        }
-    }
-    SyscallResult::Return(total as i64)
+fn pselect_socket_write_ready(want_write: bool, mask: tx_subsystems::net::PollMask) -> bool {
+    want_write
+        && mask.intersects(tx_subsystems::net::PollMask::OUT | tx_subsystems::net::PollMask::ERR)
 }
 
-async fn wait_for_tty_read_event_or_deadline<P>(
-    tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>,
-    deadline_ns: Option<u64>,
-    ctx: &SyscallCtx<'_>,
-) -> PselectWaitWake
-where
-    TimekeeperClock<P>: ClockRead,
-{
-    use tx_subsystems::tty::execution::TTY_READABLE;
-
-    let future = wait_source::wait_on_endpoint(tty.read_endpoint(), TTY_READABLE);
-    let futures = alloc::vec![future];
-    match deadline_ns {
-        Some(deadline_ns) => {
-            wait_on_any_registered_source_or_pselect_deadline::<P, _>(
-                ctx,
-                futures,
-                deadline_ns,
-                ctx.mailbox.as_deref(),
-            )
-            .await
-        }
-        None => {
-            if wait_on_any_registered_source(futures, ctx.mailbox.as_deref()).await {
-                PselectWaitWake::Signalled
-            } else {
-                PselectWaitWake::FdReady
-            }
-        }
-    }
+pub(super) fn pselect_socket_blocked_interests(
+    want_read: bool,
+    want_write: bool,
+    mask: tx_subsystems::net::PollMask,
+) -> (bool, bool) {
+    (
+        want_read && !pselect_socket_read_ready(true, mask),
+        want_write && !pselect_socket_write_ready(true, mask),
+    )
 }
 
-async fn sys_tty_read_buffered<'a, P>(
-    tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>,
-    staging: &mut [u8],
-    buf_ptr: usize,
-    nonblocking: bool,
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult
-where
-    TimekeeperClock<P>: ClockRead,
-{
-    use tx_scripts::drive;
-    use tx_substrate::step::DriveMode;
-    use tx_subsystems::tty::adapter::step_engine::StepOutcome;
-    use tx_subsystems::tty::execution::{
-        step_read_after_vtime_for_process, step_read_for_process, tty_read_wait_plan,
-        ReadForProcessOp, TtyReadWaitPlan,
-    };
-
-    if nonblocking {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
-        let timer_registrar_handle = script_ctx.timer_registrar().cloned();
-        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        let op = ReadForProcessOp {
-            tty,
-            out: staging,
-            caller: &ctx.process,
-        };
-        return match drive(
-            op,
-            &mut script_ctx,
-            DriveMode::Nonblocking,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
+pub(super) fn pselect_socket_read_ready(
+    want_read: bool,
+    mask: tx_subsystems::net::PollMask,
+) -> bool {
+    want_read
+        && mask.intersects(
+            tx_subsystems::net::PollMask::IN
+                | tx_subsystems::net::PollMask::ERR
+                | tx_subsystems::net::PollMask::HUP
+                | tx_subsystems::net::PollMask::RDHUP,
         )
-        .await
-        {
-            Ok(total) => copy_tty_read_result_to_user(ctx, buf_ptr, staging, total),
-            Err(v3errno) => {
-                let errno: tx_subsystems::execution::Errno = v3errno.into();
-                SyscallResult::error_from(errno)
-            }
-        };
-    }
-
-    loop {
-        let plan = {
-            let guard = tx_substrate::epoch::guard();
-            tty_read_wait_plan(tty, staging.len(), &guard)
-        };
-
-        match plan {
-            TtyReadWaitPlan::Ready => {
-                let result = {
-                    let guard = tx_substrate::epoch::guard();
-                    step_read_for_process(tty, staging, &ctx.process, &guard)
-                };
-                match result {
-                    StepOutcome::Done(total) => {
-                        return copy_tty_read_result_to_user(ctx, buf_ptr, staging, total);
-                    }
-                    StepOutcome::Err(v3errno) => {
-                        let errno: tx_subsystems::execution::Errno = v3errno.into();
-                        return SyscallResult::error_from(errno);
-                    }
-                    StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                        tx_reactor::yield_now().await;
-                    }
-                }
-            }
-            TtyReadWaitPlan::WaitIndefinite => {
-                match wait_for_tty_read_event_or_deadline::<P>(tty, None, ctx).await {
-                    PselectWaitWake::FdReady => {}
-                    PselectWaitWake::TimedOut => {}
-                    PselectWaitWake::Signalled => {
-                        if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
-                            return SyscallResult::Error(EINTR_VALUE);
-                        }
-                    }
-                }
-            }
-            TtyReadWaitPlan::WaitVtime { deciseconds } => {
-                let deadline_ns = timekeeper_clock::<P>()
-                    .monotonic_now_ns()
-                    .saturating_add((deciseconds as u64).saturating_mul(100_000_000));
-                match wait_for_tty_read_event_or_deadline::<P>(tty, Some(deadline_ns), ctx).await {
-                    PselectWaitWake::FdReady => {}
-                    PselectWaitWake::Signalled => {
-                        if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
-                            return SyscallResult::Error(EINTR_VALUE);
-                        }
-                    }
-                    PselectWaitWake::TimedOut => {
-                        let result = {
-                            let guard = tx_substrate::epoch::guard();
-                            step_read_after_vtime_for_process(tty, staging, &ctx.process, &guard)
-                        };
-                        match result {
-                            StepOutcome::Done(total) => {
-                                return copy_tty_read_result_to_user(ctx, buf_ptr, staging, total);
-                            }
-                            StepOutcome::Err(v3errno) => {
-                                let errno: tx_subsystems::execution::Errno = v3errno.into();
-                                return SyscallResult::error_from(errno);
-                            }
-                            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                                return SyscallResult::Return(0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// `write(fd, buf, count)`.
@@ -968,7 +853,6 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
 
     const IOVEC_BYTES: u64 = 16;
     let mut total: i64 = 0;
-    let mut script_ctx = build_subject_script_ctx(ctx);
     for i in 0..iovcnt as u64 {
         let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
         let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
@@ -989,17 +873,26 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         emit_debug_counter(b"debug.write.pagebacked.len", len as i64);
 
         if let Some(range) = super::user_copy::covering_user_range(base, len) {
+            use crate::adapter::step_engine::StepOutcome as V3;
             use tx_subsystems::vm::UserAccessKind;
-            let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-                aspace: &ctx.aspace,
-                range,
-                kind: UserAccessKind::Read,
-            };
-            if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                if total > 0 {
-                    return Some(SyscallResult::Return(total));
+            match ctx
+                .aspace
+                .reserve_user_range_for_access(range, UserAccessKind::Read)
+            {
+                V3::Done(()) => {}
+                V3::Err(e) => {
+                    if total > 0 {
+                        return Some(SyscallResult::Return(total));
+                    }
+                    let errno: tx_subsystems::execution::Errno = e.into();
+                    return Some(SyscallResult::error_from(errno));
                 }
-                return Some(SyscallResult::error_from(errno.into()));
+                V3::Yield { .. } | V3::Continue { .. } => {
+                    if total > 0 {
+                        return Some(SyscallResult::Return(total));
+                    }
+                    return None;
+                }
             }
         }
 
@@ -1028,7 +921,11 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
                 }
                 let errno: tx_subsystems::execution::Errno = e.into();
                 if errno == tx_subsystems::execution::Errno::EPIPE {
-                    raise_sigpipe(ctx);
+                    let _ = tx_subsystems::signal::step_kill_process(
+                        &ctx.process,
+                        tx_subsystems::signal::Signum::SIGPIPE,
+                        None,
+                    );
                 }
                 return Some(SyscallResult::error_from(errno));
             }
@@ -1068,7 +965,10 @@ pub(super) fn sys_writev_pagebacked_candidate<'a>(args: [u64; 6], ctx: &SyscallC
 }
 
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
-pub(super) async fn sys_readv<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -1125,7 +1025,10 @@ where
 /// with level-triggered semantics. Socket wait interests stay split by
 /// direction so a caller that asks for both `POLLIN` and `POLLOUT` can
 /// wake on either side.
-pub(super) async fn sys_ppoll<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -1139,11 +1042,11 @@ where
     let timeout_ptr = args[2];
     let sigmask_ptr = args[3];
     let sigmask_size = args[4];
-    let timeout_ns = match read_pselect_timeout_ns(&ctx.aspace, timeout_ptr) {
+    let timeout_ns = match read_pselect_timeout_ns_wait(&ctx.aspace, timeout_ptr).await {
         Ok(value) => value,
         Err(errno) => return SyscallResult::Error(errno),
     };
-    let temporary_sigmask = match read_ppoll_sigmask(ctx, sigmask_ptr, sigmask_size) {
+    let temporary_sigmask = match read_ppoll_sigmask_wait(ctx, sigmask_ptr, sigmask_size).await {
         Ok(value) => value,
         Err(result) => return result,
     };
@@ -1168,9 +1071,9 @@ where
 
                 use tx_scripts::drive;
                 use tx_substrate::step::DriveMode;
-                let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+                let now_ns = P::read_ns();
                 let mut script_ctx = build_subject_script_ctx(ctx);
-                let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+                let timer_wheel_arc = script_ctx.timer_wheel().cloned();
                 let mailbox = ctx.mailbox.clone();
                 let op = super::NanosleepOp {
                     nanos: 5_000_000,
@@ -1183,7 +1086,7 @@ where
                     DriveMode::Waiting,
                     mailbox.as_ref(),
                     None,
-                    timer_registrar_handle.as_ref(),
+                    timer_wheel_arc.as_ref(),
                 )
                 .await
                 {
@@ -1201,24 +1104,31 @@ where
         return restore_ppoll_sigmask(ctx, saved_mask, temporary_sigmask, result);
     }
 
-    let timeout = match pselect_timeout_policy(ctx, timeout_ptr) {
-        Ok(wait) => wait,
-        Err(errno) => return SyscallResult::Error(errno),
+    const POLLFD_BYTES: u64 = 8;
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    const POLLNVAL: i16 = 0x0020;
+
+    let timeout = match (timeout_ptr, timeout_ns) {
+        (0, _) => PselectTimeout::Infinite,
+        (_, Some(0)) => PselectTimeout::Poll,
+        (_, Some(duration_ns)) => PselectTimeout::FiniteWait(duration_ns),
+        (_, None) => PselectTimeout::Infinite,
     };
     let timeout_deadline_ns = match timeout {
-        PselectTimeout::FiniteWait(duration_ns) => Some(
-            timekeeper_clock::<P>()
-                .monotonic_now_ns()
-                .saturating_add(duration_ns),
-        ),
+        PselectTimeout::FiniteWait(duration_ns) => {
+            Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(duration_ns))
+        }
         PselectTimeout::Infinite | PselectTimeout::Poll => None,
     };
 
     let mut yielded_before_wait = false;
     let ready = loop {
-        drive_loopback_pending();
+        drive_loopback_pending(ctx);
         if let Some(deadline_ns) = timeout_deadline_ns {
-            if timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns {
+            if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
                 break 0;
             }
         }
@@ -1229,7 +1139,13 @@ where
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
-            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+            if let Err(errno) = super::user_copy::bootstrap_copy_from_user_wait(
+                &ctx.aspace,
+                &mut ent_bytes,
+                ent_ptr,
+            )
+            .await
+            {
                 return restore_ppoll_sigmask(
                     ctx,
                     saved_mask,
@@ -1242,51 +1158,190 @@ where
             let mut revents: i16 = 0;
             if fd >= 0 {
                 if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
-                    let interest = poll_interest_from_events(events);
-                    let report = fd_ready_report_for_poll::<P>(&file, interest);
-                    revents |= poll_revents_from_fd_report(events, &report);
+                    let guard = tx_substrate::epoch::guard();
                     if let Some(tfd) = file.timerfd() {
-                        if events & POLLIN != 0 && !report.ready.intersects(FdReadyMask::READ) {
-                            include_timerfd_deadline(&mut effective_deadline_ns, tfd.deadline_ns());
+                        if events & POLLIN != 0 {
+                            if timerfd_readable_level::<P>(tfd) {
+                                revents |= POLLIN;
+                            } else {
+                                include_timerfd_deadline(
+                                    &mut effective_deadline_ns,
+                                    tfd.deadline_ns(),
+                                );
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        tfd.source_id(),
+                                        TIMERFD_POLL_READABLE,
+                                    ),
+                                );
+                            }
                         }
-                    }
-                    if timeout != PselectTimeout::Poll && revents == 0 {
-                        push_fd_ready_waits(&mut wait_tokens, &report);
-                    }
-                    if report.ready == FdReadyMask::empty()
-                        && report.waits.is_empty()
-                        && !report.epoll_watchable
-                    {
-                        if let Some(binding) = rtc_char_binding(&file) {
-                            if events & POLLIN != 0 {
-                                let guard = crate::adapter::step_engine::guard();
-                                let Some(rtc_ops) = binding.ops.rtc_ops() else {
-                                    unreachable!("rtc_char_binding only returns RTC devices");
-                                };
-                                match rtc_ops.poll_events(&guard) {
-                                    Ok(mask) if !mask.is_empty() => {
-                                        revents |= POLLIN;
-                                    }
-                                    Ok(_) => {
-                                        push_unique_fd_wait(
-                                            &mut wait_tokens,
-                                            FdWait::new(
-                                                tx_fs::devfs::rtc_event_source_id(),
-                                                tx_fs::devfs::RTC_EVENT_READABLE,
-                                            ),
+                    } else if let Some((rx, tx)) = file.socketpair_endpoint() {
+                        if events & POLLIN != 0 {
+                            if rx.readable_level() {
+                                revents |= POLLIN;
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        rx.reader_source_id(),
+                                        tx_subsystems::pipe::PIPE_READABLE,
+                                    ),
+                                );
+                            }
+                        }
+                        if events & POLLOUT != 0 {
+                            if tx.writable_level() {
+                                revents |= POLLOUT;
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        tx.writer_source_id(),
+                                        tx_subsystems::pipe::PIPE_WRITABLE,
+                                    ),
+                                );
+                            }
+                        }
+                    } else if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
+                        match result {
+                            Ok(mask) => {
+                                let want_read = events & POLLIN != 0;
+                                let want_write = events & POLLOUT != 0;
+                                if want_read && mask.intersects(tx_subsystems::net::PollMask::IN) {
+                                    revents |= POLLIN;
+                                }
+                                if want_write && mask.intersects(tx_subsystems::net::PollMask::OUT)
+                                {
+                                    revents |= POLLOUT;
+                                }
+                                if mask.intersects(tx_subsystems::net::PollMask::ERR) {
+                                    revents |= POLLERR;
+                                }
+                                if mask.intersects(tx_subsystems::net::PollMask::HUP) {
+                                    revents |= POLLHUP;
+                                }
+                                if timeout != PselectTimeout::Poll && revents == 0 {
+                                    let (read_blocked, write_blocked) =
+                                        pselect_socket_blocked_interests(
+                                            want_read, want_write, mask,
                                         );
+                                    if read_blocked {
+                                        match socket_poll_wait_token_from_file(
+                                            &file,
+                                            tx_subsystems::net::PollMask::IN,
+                                            &guard,
+                                        ) {
+                                            Some(Ok(Some(token))) => {
+                                                push_unique_wait_token(&mut wait_tokens, token);
+                                            }
+                                            Some(Ok(None)) | None => {}
+                                            Some(Err(errno)) => {
+                                                return restore_ppoll_sigmask(
+                                                    ctx,
+                                                    saved_mask,
+                                                    temporary_sigmask,
+                                                    SyscallResult::Error(errno_to_i32(errno)),
+                                                );
+                                            }
+                                        }
                                     }
-                                    Err(errno) => {
-                                        return restore_ppoll_sigmask(
-                                            ctx,
-                                            saved_mask,
-                                            temporary_sigmask,
-                                            SyscallResult::Error(errno_to_i32(errno.into())),
-                                        );
+                                    if write_blocked {
+                                        match socket_poll_wait_token_from_file(
+                                            &file,
+                                            tx_subsystems::net::PollMask::OUT,
+                                            &guard,
+                                        ) {
+                                            Some(Ok(Some(token))) => {
+                                                push_unique_wait_token(&mut wait_tokens, token);
+                                            }
+                                            Some(Ok(None)) | None => {}
+                                            Some(Err(errno)) => {
+                                                return restore_ppoll_sigmask(
+                                                    ctx,
+                                                    saved_mask,
+                                                    temporary_sigmask,
+                                                    SyscallResult::Error(errno_to_i32(errno)),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        } else {
+                            Err(errno) => {
+                                return restore_ppoll_sigmask(
+                                    ctx,
+                                    saved_mask,
+                                    temporary_sigmask,
+                                    SyscallResult::Error(errno_to_i32(errno)),
+                                );
+                            }
+                        }
+                    } else {
+                        let mut handled = false;
+                        match file.rnode().backing() {
+                            RNodeBacking::StructBacked {
+                                payload: StructPayload::Tty(tty),
+                            } => {
+                                handled = true;
+                                if events & POLLIN != 0 {
+                                    if tty_readable_level(tty) {
+                                        revents |= POLLIN;
+                                    } else {
+                                        push_unique_wait_token(
+                                            &mut wait_tokens,
+                                            tx_subsystems::execution::WaitToken::new(
+                                                tty.wait_source_id(),
+                                                POLLIN as u64,
+                                            ),
+                                        );
+                                    }
+                                }
+                                if events & POLLOUT != 0 {
+                                    revents |= POLLOUT;
+                                }
+                            }
+                            RNodeBacking::StructBacked {
+                                payload: StructPayload::Pipe { payload, side },
+                            } => {
+                                handled = true;
+                                match side {
+                                    PipeSide::Reader => {
+                                        if events & POLLIN != 0 {
+                                            if payload.readable_level() {
+                                                revents |= POLLIN;
+                                            } else {
+                                                push_unique_wait_token(
+                                                    &mut wait_tokens,
+                                                    tx_subsystems::execution::WaitToken::new(
+                                                        payload.reader_source_id(),
+                                                        tx_subsystems::pipe::PIPE_READABLE,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    PipeSide::Writer => {
+                                        if events & POLLOUT != 0 {
+                                            if payload.writable_level() {
+                                                revents |= POLLOUT;
+                                            } else {
+                                                push_unique_wait_token(
+                                                    &mut wait_tokens,
+                                                    tx_subsystems::execution::WaitToken::new(
+                                                        payload.writer_source_id(),
+                                                        tx_subsystems::pipe::PIPE_WRITABLE,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        if !handled {
                             if events & POLLIN != 0 {
                                 revents |= POLLIN;
                             }
@@ -1294,8 +1349,6 @@ where
                                 revents |= POLLOUT;
                             }
                         }
-                    } else {
-                        revents |= poll_revents_from_fd_report(events, &report);
                     }
                 } else {
                     revents = POLLNVAL;
@@ -1305,7 +1358,10 @@ where
                 ready += 1;
             }
             ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
+            if let Err(errno) =
+                super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, ent_ptr, &ent_bytes)
+                    .await
+            {
                 return restore_ppoll_sigmask(
                     ctx,
                     saved_mask,
@@ -1339,7 +1395,7 @@ where
 
         let futures = wait_tokens
             .into_iter()
-            .filter_map(wait_on_fd_wait)
+            .filter_map(wait_source::wait_on_token)
             .collect::<alloc::vec::Vec<_>>();
         if futures.is_empty() {
             if let Some(deadline_ns) = timeout_deadline_ns {
@@ -1351,7 +1407,7 @@ where
             break 0;
         }
         if let Some(deadline_ns) = effective_deadline_ns {
-            match wait_on_any_registered_source_or_pselect_deadline::<P, _>(
+            match wait_on_any_token_or_pselect_deadline::<P>(
                 ctx,
                 futures,
                 deadline_ns,
@@ -1372,7 +1428,7 @@ where
                     }
                 }
             }
-        } else if wait_on_any_registered_source(futures, ctx.mailbox.as_deref()).await
+        } else if wait_on_any_token(futures, ctx.mailbox.as_deref()).await
             && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
         {
             return restore_ppoll_sigmask(
@@ -1403,10 +1459,15 @@ where
 /// use the network readiness projection, timerfd/eventfd/pipe/TTY are
 /// level-polled, and socketpairs keep the current branch's pipe-backed
 /// endpoint semantics.
-pub(super) async fn sys_pselect6<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
+    use tx_subsystems::vfs::structure::{InodeKind, RNodeBacking, StructPayload};
+
     let nfds = args[0];
     let readfds = args[1];
     let writefds = args[2];
@@ -1425,19 +1486,17 @@ where
         Err(errno) => return SyscallResult::Error(errno),
     };
     let timeout_deadline_ns = match timeout {
-        PselectTimeout::FiniteWait(duration_ns) => Some(
-            timekeeper_clock::<P>()
-                .monotonic_now_ns()
-                .saturating_add(duration_ns),
-        ),
+        PselectTimeout::FiniteWait(duration_ns) => {
+            Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(duration_ns))
+        }
         PselectTimeout::Infinite | PselectTimeout::Poll => None,
     };
     let word_count = fdset_word_count(nfds);
     let mut yielded_before_wait = false;
     let (read_ready, write_ready, except_ready, ready_count) = loop {
-        drive_loopback_pending();
+        drive_loopback_pending(ctx);
         if let Some(deadline_ns) = timeout_deadline_ns {
-            if timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns {
+            if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
                 break (
                     alloc::vec![0u64; word_count as usize],
                     alloc::vec![0u64; word_count as usize],
@@ -1473,28 +1532,213 @@ where
                 return SyscallResult::Error(EBADF_VALUE);
             };
 
-            let interest = select_interest_from_sets(want_read, want_write, want_except);
-            let report = fd_ready_report_for_poll::<P>(&file, interest);
             let mut fd_ready = false;
-            if select_fd_read_ready(want_read, report.ready) {
-                fdset_set(&mut read_ready, fd);
-                fd_ready = true;
-            }
-            if select_fd_write_ready(want_write, report.ready) {
-                fdset_set(&mut write_ready, fd);
-                fd_ready = true;
-            }
-            if want_except && report.ready.intersects(FdReadyMask::PRI | FdReadyMask::ERR) {
-                fdset_set(&mut except_ready, fd);
-                fd_ready = true;
-            }
-            if let Some(tfd) = file.timerfd() {
-                if want_read && !report.ready.intersects(FdReadyMask::READ) {
-                    include_timerfd_deadline(&mut effective_deadline_ns, tfd.deadline_ns());
+            let guard = tx_substrate::epoch::guard();
+            if let Some(efd) = file.eventfd() {
+                if want_read {
+                    if efd.counter() > 0 {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                efd.reader_source_id(),
+                                EVENTFD_POLL_READABLE,
+                            ),
+                        );
+                    }
                 }
-            }
-            if !fd_ready {
-                push_fd_ready_waits(&mut wait_tokens, &report);
+                if want_write {
+                    if efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX {
+                        fdset_set(&mut write_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                efd.writer_source_id(),
+                                EVENTFD_POLL_WRITABLE,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some(tfd) = file.timerfd() {
+                if want_read {
+                    if timerfd_readable_level::<P>(tfd) {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        include_timerfd_deadline(&mut effective_deadline_ns, tfd.deadline_ns());
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                tfd.source_id(),
+                                TIMERFD_POLL_READABLE,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some((rx, tx)) = file.socketpair_endpoint() {
+                if want_read {
+                    if rx.readable_level() {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                rx.reader_source_id(),
+                                tx_subsystems::pipe::PIPE_READABLE,
+                            ),
+                        );
+                    }
+                }
+                if want_write {
+                    if tx.writable_level() {
+                        fdset_set(&mut write_ready, fd);
+                        fd_ready = true;
+                    } else {
+                        push_unique_wait_token(
+                            &mut wait_tokens,
+                            tx_subsystems::execution::WaitToken::new(
+                                tx.writer_source_id(),
+                                tx_subsystems::pipe::PIPE_WRITABLE,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
+                let mask = match result {
+                    Ok(mask) => mask,
+                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                };
+                if pselect_socket_read_ready(want_read, mask) {
+                    fdset_set(&mut read_ready, fd);
+                    fd_ready = true;
+                }
+                if pselect_socket_write_ready(want_write, mask) {
+                    fdset_set(&mut write_ready, fd);
+                    fd_ready = true;
+                }
+                if want_except && mask.intersects(tx_subsystems::net::PollMask::ERR) {
+                    fdset_set(&mut except_ready, fd);
+                    fd_ready = true;
+                }
+                let (read_blocked, write_blocked) =
+                    pselect_socket_blocked_interests(want_read, want_write, mask);
+                if read_blocked {
+                    match socket_poll_wait_token_from_file(
+                        &file,
+                        tx_subsystems::net::PollMask::IN,
+                        &guard,
+                    ) {
+                        Some(Ok(Some(token))) => {
+                            push_unique_wait_token(&mut wait_tokens, token);
+                        }
+                        Some(Ok(None)) | None => {}
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                if write_blocked {
+                    match socket_poll_wait_token_from_file(
+                        &file,
+                        tx_subsystems::net::PollMask::OUT,
+                        &guard,
+                    ) {
+                        Some(Ok(Some(token))) => {
+                            push_unique_wait_token(&mut wait_tokens, token);
+                        }
+                        Some(Ok(None)) | None => {}
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+            } else {
+                if want_read {
+                    let readable = match file.rnode().backing() {
+                        RNodeBacking::StructBacked {
+                            payload: StructPayload::Tty(tty),
+                        } => {
+                            use tx_subsystems::tty::execution::TTY_READABLE;
+                            if tty.input_readable.peek() & TTY_READABLE != 0 {
+                                true
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        tty.wait_source_id(),
+                                        TTY_READABLE,
+                                    ),
+                                );
+                                false
+                            }
+                        }
+                        RNodeBacking::StructBacked {
+                            payload:
+                                StructPayload::Pipe {
+                                    payload,
+                                    side: tx_subsystems::pipe::PipeSide::Reader,
+                                },
+                        } => {
+                            if payload.readable_level() {
+                                true
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        payload.reader_source_id(),
+                                        tx_subsystems::pipe::PIPE_READABLE,
+                                    ),
+                                );
+                                false
+                            }
+                        }
+                        // Regular files are always ready for reading in
+                        // select/poll (POSIX); FIFOs/sockets/etc. are not.
+                        RNodeBacking::PageBacked { .. } => {
+                            matches!(file.rnode().meta().kind(), InodeKind::Regular)
+                        }
+                        _ => false,
+                    };
+                    if readable {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    }
+                }
+                if want_write {
+                    let writable = match file.rnode().backing() {
+                        RNodeBacking::StructBacked {
+                            payload:
+                                StructPayload::Pipe {
+                                    payload,
+                                    side: tx_subsystems::pipe::PipeSide::Writer,
+                                },
+                        } => {
+                            if payload.writable_level() {
+                                true
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        payload.writer_source_id(),
+                                        tx_subsystems::pipe::PIPE_WRITABLE,
+                                    ),
+                                );
+                                false
+                            }
+                        }
+                        // Regular files are always ready for writing in
+                        // select/poll (POSIX).
+                        RNodeBacking::PageBacked { .. } => {
+                            matches!(file.rnode().meta().kind(), InodeKind::Regular)
+                        }
+                        _ => false,
+                    };
+                    if writable {
+                        fdset_set(&mut write_ready, fd);
+                        fd_ready = true;
+                    }
+                }
             }
 
             if fd_ready {
@@ -1521,11 +1765,11 @@ where
         };
         let futures = wait_tokens
             .into_iter()
-            .filter_map(wait_on_fd_wait)
+            .filter_map(wait_source::wait_on_token)
             .collect::<alloc::vec::Vec<_>>();
         if !futures.is_empty() {
             if let Some(deadline_ns) = effective_deadline_ns {
-                match wait_on_any_registered_source_or_pselect_deadline::<P, _>(
+                match wait_on_any_token_or_pselect_deadline::<P>(
                     ctx,
                     futures,
                     deadline_ns,
@@ -1543,7 +1787,7 @@ where
                         }
                     }
                 }
-            } else if wait_on_any_registered_source(futures, ctx.mailbox.as_deref()).await
+            } else if wait_on_any_token(futures, ctx.mailbox.as_deref()).await
                 && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
             {
                 return SyscallResult::Error(EINTR_VALUE);
@@ -1600,19 +1844,20 @@ async fn sys_write_pagebacked<'a>(
     // transferring any bytes.
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
         use tx_subsystems::vm::UserAccessKind;
-        let _guard = crate::adapter::step_engine::guard();
         emit_debug_counter(b"debug.write.pagebacked.phase", 1);
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-            aspace: &ctx.aspace,
-            range,
-            kind: UserAccessKind::Read,
-        };
-        if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            emit_debug_counter(b"debug.write.pagebacked.err", 1);
-            return SyscallResult::error_from(errno.into());
+        match ctx
+            .aspace
+            .reserve_user_range_for_access_wait(range, UserAccessKind::Read)
+            .await
+        {
+            Ok(()) => {
+                emit_debug_counter(b"debug.write.pagebacked.phase", 2);
+            }
+            Err(errno) => {
+                emit_debug_counter(b"debug.write.pagebacked.err", 1);
+                return SyscallResult::error_from(errno);
+            }
         }
-        emit_debug_counter(b"debug.write.pagebacked.phase", 2);
     } else {
         emit_debug_counter(b"debug.write.pagebacked.phase", 2);
     }
@@ -1628,7 +1873,7 @@ async fn sys_write_pagebacked<'a>(
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = OpenFileWriteFromUserOp {
         file,
@@ -1644,7 +1889,7 @@ async fn sys_write_pagebacked<'a>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_registrar_handle.as_ref(),
+        timer_wheel_arc.as_ref(),
     )
     .await
     {
@@ -1657,107 +1902,14 @@ async fn sys_write_pagebacked<'a>(
             emit_debug_counter(b"debug.write.pagebacked.err", 3);
             let errno: tx_subsystems::execution::Errno = v3errno.into();
             if errno == tx_subsystems::execution::Errno::EPIPE {
-                raise_sigpipe(ctx);
+                let _ = tx_subsystems::signal::step_kill_process(
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
+                    None,
+                );
             }
             SyscallResult::error_from(errno)
         }
-    }
-}
-
-async fn sys_direct_pagebacked<'a>(
-    file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
-    buf_ptr: usize,
-    len: usize,
-    write: bool,
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
-    use tx_subsystems::page_backed::{
-        DirectIoBuffer, DirectIoBufferError, DirectIoCompletionError, PageIndex, PageRange,
-    };
-    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
-    use tx_subsystems::vm::{UserAccessKind, USER_PAGE_SIZE};
-
-    if len == 0 {
-        return SyscallResult::Return(0);
-    }
-    let offset = file.offset();
-    if !offset.is_multiple_of(USER_PAGE_SIZE as u64)
-        || !buf_ptr.is_multiple_of(USER_PAGE_SIZE)
-        || !len.is_multiple_of(USER_PAGE_SIZE)
-    {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    let page_count = (len / USER_PAGE_SIZE) as u64;
-    let range = PageRange::new(PageIndex::new(offset / USER_PAGE_SIZE as u64), page_count);
-    let OpenFileBacking::Rnode { rnode } = file.backing() else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-    let RNodeBacking::PageBacked { pc } = rnode.backing() else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-
-    let access = if write {
-        UserAccessKind::Read
-    } else {
-        UserAccessKind::Write
-    };
-    let Some(user_range) = super::user_copy::covering_user_range(buf_ptr as u64, len) else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-        aspace: &ctx.aspace,
-        range: user_range,
-        kind: access,
-    };
-    if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        return SyscallResult::error_from(errno.into());
-    }
-    let buffer = match DirectIoBuffer::pin(&ctx.aspace, tx_hal::UserPtr::new(buf_ptr), len, access)
-    {
-        Ok(buffer) => buffer,
-        Err(DirectIoBufferError::PermissionDenied) => return SyscallResult::Error(EACCES_VALUE),
-        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
-    };
-    let submission = if write {
-        pc.submit_file_direct_write_waitable(range, buffer)
-    } else {
-        pc.submit_file_direct_read_waitable(range, buffer)
-    };
-    let submission = match submission {
-        Ok(submission) => submission,
-        Err(tx_subsystems::page_backed::DirectIoAdmissionError::Busy { .. }) => {
-            return SyscallResult::Error(EAGAIN_VALUE)
-        }
-        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
-    };
-    if pc
-        .enqueue_file_direct_submission(submission.submission())
-        .is_err()
-    {
-        return match pc.take_file_direct_submission_result(&submission) {
-            Some(Err(DirectIoCompletionError::Backend(errno))) => SyscallResult::error_from(errno),
-            _ => SyscallResult::Error(EIO_VALUE),
-        };
-    }
-    let Some(wait) = wait_source::wait_on_registered_source_id(submission.wait_source_id(), 0x1)
-    else {
-        return SyscallResult::Error(EIO_VALUE);
-    };
-    let _ = wait_on_any_registered_source(alloc::vec![wait], None).await;
-    let completion = loop {
-        if let Some(completion) = pc.take_file_direct_submission_result(&submission) {
-            break completion;
-        }
-        tx_reactor::yield_now().await;
-    };
-    match completion {
-        Ok(_) => {
-            file.advance_offset(len as u64);
-            SyscallResult::Return(len as i64)
-        }
-        Err(DirectIoCompletionError::Backend(errno)) => SyscallResult::error_from(errno),
-        Err(_) => SyscallResult::Error(EIO_VALUE),
     }
 }
 
@@ -1779,7 +1931,7 @@ async fn sys_pipe_write_buffered<'a>(
     } else {
         DriveMode::Waiting
     };
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = WriteWithHintPostOp {
         payload,
@@ -1797,7 +1949,7 @@ async fn sys_pipe_write_buffered<'a>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_registrar_handle.as_ref(),
+        timer_wheel_arc.as_ref(),
     )
     .await
     {
@@ -1812,8 +1964,10 @@ async fn sys_pipe_write_buffered<'a>(
     }
 }
 
-async fn sys_pipe_read_buffered<'a>(
+async fn sys_pipe_read_buffered<'a, P: tx_hal::ConsoleIf>(
     payload: &Cap<tx_subsystems::pipe::PipePayload>,
+    fd: i32,
+    lane: &str,
     buf_ptr: usize,
     len: usize,
     nonblocking: bool,
@@ -1831,7 +1985,7 @@ async fn sys_pipe_read_buffered<'a>(
     } else {
         DriveMode::Waiting
     };
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = ReadWithHintPostOp {
         payload,
@@ -1848,24 +2002,133 @@ async fn sys_pipe_read_buffered<'a>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_registrar_handle.as_ref(),
+        timer_wheel_arc.as_ref(),
     )
     .await
     {
         Ok(total) => {
             if total > 0 {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
+                if let Err(failure) = super::user_copy::bootstrap_copy_to_user_wait_diagnosed(
+                    &ctx.aspace,
+                    buf_ptr as u64,
+                    &staging[..total],
+                )
+                .await
                 {
-                    return SyscallResult::error_from(errno);
+                    if failure.errno == tx_subsystems::execution::Errno::EIO {
+                        report_pipe_read_eio::<P>(
+                            "copy-to-user",
+                            lane,
+                            fd,
+                            payload,
+                            buf_ptr,
+                            len,
+                            Some(total),
+                            Some(failure),
+                            ctx,
+                        );
+                    }
+                    return SyscallResult::error_from(failure.errno);
                 }
             }
             SyscallResult::Return(total as i64)
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EIO {
+                report_pipe_read_eio::<P>(
+                    "pipe-drive",
+                    lane,
+                    fd,
+                    payload,
+                    buf_ptr,
+                    len,
+                    None,
+                    None,
+                    ctx,
+                );
+            }
             SyscallResult::error_from(errno)
         }
+    }
+}
+
+fn report_pipe_read_eio<P: tx_hal::ConsoleIf>(
+    stage: &str,
+    lane: &str,
+    fd: i32,
+    payload: &Cap<tx_subsystems::pipe::PipePayload>,
+    buf_ptr: usize,
+    len: usize,
+    copied: Option<usize>,
+    copy_failure: Option<super::user_copy::UserCopyWaitFailure>,
+    ctx: &SyscallCtx<'_>,
+) {
+    use tx_subsystems::vm::{UserPage, UserVirtAddr, USER_PAGE_SIZE};
+
+    let pipe = payload.diagnostic_snapshot();
+    let pmap_stats = ctx.aspace.pmap().stats();
+    let range_locks = ctx.aspace.range_lock().diagnostic_snapshot();
+    let comm = ctx.process.comm();
+    let comm_len = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    let comm = core::str::from_utf8(&comm[..comm_len]).unwrap_or("<non-utf8>");
+    tx_hal::console_write_str::<P>(&alloc::format!(
+        "txkernel:pipe-read-eio:stage={stage}:copy_failure={copy_failure:?}:lane={lane}:pid={}:tid={}:comm={comm}:fd={fd}:buf={buf_ptr:#x}:len={len}:copied={}:aspace={}:pipe_raw={:#x}:readers={}:writers={}:bytes={}:slots={}/{}:gift_slots={}:tmp_pages={}:write_avail={}:read_source={:#x}:write_source={:#x}:pmap_mapped={}:pmap_reservations={}:pmap_commits={}:pmap_rollbacks={}:pmap_shootdowns={}:range_active={}:range_pending={}:range_source={:#x}\n",
+        ctx.process.pid.0,
+        ctx.thread.tid.0,
+        copied.map(|value| value as i64).unwrap_or(-1),
+        ctx.aspace.futex_identity(),
+        payload.raw(),
+        pipe.readers,
+        pipe.writers,
+        pipe.buffered_bytes,
+        pipe.occupied_slots,
+        pipe.max_slots,
+        pipe.reserved_gift_slots,
+        pipe.temporary_pages,
+        pipe.available_write_bytes,
+        pipe.reader_wait_source_id,
+        pipe.writer_wait_source_id,
+        pmap_stats.mapped_pages,
+        pmap_stats.reservations,
+        pmap_stats.commits,
+        pmap_stats.rollbacks,
+        pmap_stats.shootdowns,
+        range_locks.active,
+        range_locks.pending_writers,
+        range_locks.wait_source_id,
+    ));
+
+    if len == 0 {
+        return;
+    }
+    let first_page_addr = buf_ptr & !(USER_PAGE_SIZE - 1);
+    let end_addr = buf_ptr.saturating_add(len.saturating_sub(1));
+    let last_page_addr = end_addr & !(USER_PAGE_SIZE - 1);
+    let mut page_addr = first_page_addr;
+    let mut emitted = 0usize;
+    while page_addr <= last_page_addr && emitted < 4 {
+        let recipe = ctx.aspace.lookup(UserVirtAddr(page_addr));
+        let mapping = ctx
+            .aspace
+            .pmap()
+            .lookup(UserPage(page_addr / USER_PAGE_SIZE));
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:pipe-read-eio:vm-page={page_addr:#x}:recipe={recipe:?}:pmap={mapping:?}\n"
+        ));
+        emitted += 1;
+        let Some(next) = page_addr.checked_add(USER_PAGE_SIZE) else {
+            break;
+        };
+        page_addr = next;
+    }
+    if page_addr <= last_page_addr {
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:pipe-read-eio:vm-pages-truncated:first={first_page_addr:#x}:last={last_page_addr:#x}:shown={emitted}\n"
+        ));
     }
 }
 
@@ -1902,9 +2165,38 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
     }
-    if super::socket::socket_identity_from_file(&file).is_ok() {
-        return super::socket::sys_sendto([args[0], args[1], args[2], 0, 0, 0], ctx).await;
+    // Netlink `write(fd, msg)` == `sendto(fd, msg, 0, NULL, 0)`: route it to the
+    // netlink send path. The generic socket FileOps write (step_send_kernel_bytes)
+    // has no netlink handling and blocks forever waiting for send readiness that
+    // never fires — iproute2/busybox `ip` emit their RTM_GET* dump requests via
+    // write(), so this hung `ip` (and thus all v6/v4 config) entirely.
+    if let Ok(socket) = super::socket::socket_identity_from_file(&file) {
+        if super::socket::is_netlink_socket_kind(socket.kind) {
+            if !file.flags().write {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let copy_len = core::cmp::min(len, SOCKET_IO_MAX_INLINE);
+            let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; copy_len];
+            if let Err(errno) = super::user_copy::bootstrap_copy_from_user_wait(
+                &ctx.aspace,
+                &mut bytes,
+                buf_ptr as u64,
+            )
+            .await
+            {
+                return SyscallResult::error_from(errno);
+            }
+            return match super::socket::dispatch_netlink_send(ctx, &socket, &bytes) {
+                Ok(sent) => SyscallResult::Return(sent as i64),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            };
+        }
     }
+    // P3-S3 (D13): sockets no longer detour to sys_sendto here —
+    // `write(fd)` flows the generic VFS path into the socket FileOps arm
+    // (`step_write` → `FileOps::write` ≡ `send(...,0)`), blocking via the
+    // same v3 drive() loop as pipes. Loopback transfer progress rides the
+    // delegate kick inside `step_send_kernel_bytes`.
     if let Some((_rx, tx)) = file.socketpair_endpoint() {
         if !file.flags().write {
             return SyscallResult::Error(EINVAL_VALUE);
@@ -1914,7 +2206,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             return SyscallResult::Return(0);
         }
         let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, buf_ptr as u64)
+                .await
+        {
             return SyscallResult::error_from(errno);
         }
         return sys_pipe_write_buffered(&tx, &bytes, file.flags().nonblocking, false, ctx).await;
@@ -1934,6 +2229,13 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Sockets are datagram/stream fds, not the TTY line discipline: a
+        // UDP `read`/`write` must move the whole datagram in one call.
+        // Truncating to `TTY_WRITE_MAX_INLINE` (4 KiB) shreds any datagram
+        // >4 KiB into fragments (corrupting iperf3 UDP `-l 65495`); use the
+        // socket I/O size (64 KiB), matching the sendto/recvfrom staging cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
@@ -1950,7 +2252,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             return SyscallResult::Return(0);
         }
         let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, buf_ptr as u64)
+                .await
+        {
             return SyscallResult::error_from(errno);
         }
         return sys_pipe_write_buffered(
@@ -1970,9 +2275,6 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
-        if file.flags().packet {
-            return sys_direct_pagebacked(&file, buf_ptr, len, true, ctx).await;
-        }
         return sys_write_pagebacked(&file, buf_ptr, len, ctx).await;
     }
 
@@ -1985,7 +2287,10 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // `step_write`.
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
     if len > 0 {
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, buf_ptr as u64)
+                .await
+        {
             return SyscallResult::error_from(errno);
         }
     }
@@ -2000,7 +2305,6 @@ async fn sys_write_buffered<'a>(
 ) -> SyscallResult {
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
-    use tx_subsystems::tty::execution::WriteForProcessOp;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
     let mut script_ctx = build_subject_script_ctx(ctx);
     // The op acquires its own epoch guard inside `step()` per
@@ -2012,35 +2316,8 @@ async fn sys_write_buffered<'a>(
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    if let tx_subsystems::vfs::RNodeBacking::StructBacked {
-        payload: tx_subsystems::vfs::StructPayload::Tty(tty),
-    } = file.rnode().backing()
-    {
-        let op = WriteForProcessOp {
-            tty,
-            bytes,
-            caller: &ctx.process,
-        };
-        return match drive(
-            op,
-            &mut script_ctx,
-            mode,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
-        )
-        .await
-        {
-            Ok(total) => SyscallResult::Return(total as i64),
-            Err(v3errno) => {
-                let errno: tx_subsystems::execution::Errno = v3errno.into();
-                SyscallResult::error_from(errno)
-            }
-        };
-    }
-
     let op = OpenFileWriteOp {
         file,
         bytes,
@@ -2053,7 +2330,7 @@ async fn sys_write_buffered<'a>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_registrar_handle.as_ref(),
+        timer_wheel_arc.as_ref(),
     )
     .await
     {
@@ -2064,7 +2341,11 @@ async fn sys_write_buffered<'a>(
             // delivered to the calling process before returning
             // `-EPIPE` to userspace.
             if errno == tx_subsystems::execution::Errno::EPIPE {
-                raise_sigpipe(ctx);
+                let _ = tx_subsystems::signal::step_kill_process(
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
+                    None,
+                );
             }
             SyscallResult::error_from(errno)
         }
@@ -2073,7 +2354,10 @@ async fn sys_write_buffered<'a>(
 
 fn emit_debug_counter(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.debug_counter(name, value);
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -2084,15 +2368,12 @@ fn emit_debug_counter(name: &[u8], value: i64) {
 /// it), then drives `OpenFileReadToUserOp` which copies bytes directly
 /// from PC frames to user pages through the pmap, without kernel-buffer
 /// staging (PAGE_BACKED_v1 §5.1 / §3 prefault discipline).
-async fn sys_read_pagebacked<'a, P>(
+async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
     file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
     buf_ptr: usize,
     len: usize,
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult
-where
-    TimekeeperClock<P>: ClockRead,
-{
+) -> SyscallResult {
     if len == 0 {
         return SyscallResult::Return(0);
     }
@@ -2102,15 +2383,15 @@ where
     // Access is Write — we're writing data *into* the user buffer.
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
         use tx_subsystems::vm::UserAccessKind;
-        let _guard = crate::adapter::step_engine::guard();
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-            aspace: &ctx.aspace,
-            range,
-            kind: UserAccessKind::Write,
-        };
-        if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            return SyscallResult::error_from(errno.into());
+        match ctx
+            .aspace
+            .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
+            .await
+        {
+            Ok(()) => {}
+            Err(errno) => {
+                return SyscallResult::error_from(errno);
+            }
         }
     }
 
@@ -2125,7 +2406,7 @@ where
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = OpenFileReadToUserOp {
         file,
@@ -2140,7 +2421,7 @@ where
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_registrar_handle.as_ref(),
+        timer_wheel_arc.as_ref(),
     )
     .await
     {
@@ -2152,107 +2433,22 @@ where
     }
 }
 
-struct RtcReadOp<'a> {
-    binding: &'static tx_subsystems::device::CharDeviceBinding,
-    staging: &'a mut [u8],
-}
-
-impl<I: crate::adapter::step_engine::SubjectIdentity> crate::adapter::step_engine::StepOp<I>
-    for RtcReadOp<'_>
-{
-    type Output = usize;
-    type Progress = crate::adapter::step_engine::NoProgress;
-
-    fn step(
-        &mut self,
-        _ctx: &mut crate::adapter::step_engine::ScriptCtx<I>,
-    ) -> crate::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
-        let guard = crate::adapter::step_engine::guard();
-        match self.binding.ops.read(self.staging, &guard) {
-            tx_substrate::step::StepOutcome::Done(total) => {
-                crate::adapter::step_engine::StepOutcome::Done(total)
-            }
-            tx_substrate::step::StepOutcome::Err(tx_subsystems::execution::Errno::EAGAIN) => {
-                crate::adapter::step_engine::StepOutcome::Yield {
-                    progress: crate::adapter::step_engine::NoProgress,
-                    shape: crate::adapter::step_engine::YieldShape::OnWaitSource {
-                        source: crate::adapter::step_engine::WaitSourceId::new(
-                            tx_fs::devfs::rtc_event_source_id(),
-                        ),
-                        interests: crate::adapter::step_engine::InterestMask::new(
-                            tx_fs::devfs::RTC_EVENT_READABLE,
-                        ),
-                    },
-                }
-            }
-            tx_substrate::step::StepOutcome::Err(errno) => {
-                crate::adapter::step_engine::StepOutcome::Err(errno)
-            }
-            tx_substrate::step::StepOutcome::Continue { .. }
-            | tx_substrate::step::StepOutcome::Yield { .. } => {
-                crate::adapter::step_engine::StepOutcome::Err(tx_substrate::step::Errno::EIO)
-            }
-        }
-    }
-}
-
-async fn sys_rtc_read_buffered(
-    binding: &'static tx_subsystems::device::CharDeviceBinding,
-    staging: &mut [u8],
-    buf_ptr: usize,
-    nonblocking: bool,
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
-    use tx_scripts::drive;
-    use tx_substrate::step::DriveMode;
-
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mailbox_arc = script_ctx
-        .mailbox()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(tx_substrate::wake::TaskMailbox::new()));
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let mode = if nonblocking {
-        DriveMode::Nonblocking
-    } else {
-        DriveMode::Waiting
-    };
-    let op = RtcReadOp { binding, staging };
-    match drive(
-        op,
-        &mut script_ctx,
-        mode,
-        Some(&mailbox_arc),
-        delegate_registry_arc.as_deref(),
-        timer_registrar_handle.as_ref(),
-    )
-    .await
-    {
-        Ok(total) => {
-            if total > 0 {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
-                {
-                    return SyscallResult::error_from(errno);
-                }
-            }
-            SyscallResult::Return(total as i64)
-        }
-        Err(errno) => SyscallResult::error_from(errno.into()),
-    }
-}
-
 /// `read(fd, buf, count)`.
 ///
 /// Mirrors `sys_write`'s structure. For PageBacked files, delegates to
 /// `sys_read_pagebacked` (direct user-buffer path, PAGE_BACKED_v1 §5.1);
 /// for struct-backed files, uses kernel-buffer staging + copy_to_user.
-pub(super) async fn sys_read<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_read<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
     let fd = args[0] as i32;
+    let buf_ptr = args[1] as usize;
+    let len = args[2] as usize;
+
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
@@ -2261,38 +2457,6 @@ where
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-
-    if super::socket::socket_identity_from_file(&file).is_ok() {
-        if ctx.mailbox.is_none() {
-            let guard = crate::adapter::step_engine::guard();
-            if let Some(Ok(mask)) = super::socket::socket_poll_mask_from_file(&file, &guard) {
-                let readable = mask.intersects(
-                    tx_subsystems::net::PollMask::IN
-                        | tx_subsystems::net::PollMask::ERR
-                        | tx_subsystems::net::PollMask::HUP
-                        | tx_subsystems::net::PollMask::RDHUP,
-                );
-                if !readable {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
-            }
-        }
-        return super::socket::sys_recvfrom::<P>([args[0], args[1], args[2], 0, 0, 0], ctx).await;
-    }
-
-    sys_read_non_socket::<P>(args, ctx, file).await
-}
-
-pub(super) async fn sys_read_non_socket<'a, P>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-    file: Cap<OpenFile>,
-) -> SyscallResult
-where
-    TimekeeperClock<P>: ClockRead,
-{
-    let buf_ptr = args[1] as usize;
-    let len = args[2] as usize;
 
     // POSIX mq descriptors are not byte-stream fds. musl uses the
     // mq_* syscalls directly, but raw read/write on an mqd_t should
@@ -2327,6 +2491,25 @@ where
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
     }
+    // P3-S3 (D13): sockets no longer detour to sys_recvfrom here —
+    // `read(fd)` flows the generic VFS path into the socket FileOps arm
+    // (`step_read` → `FileOps::read` ≡ `recv(...,0)`). The old
+    // mailbox-less poll-gate is preserved because a bootstrap context
+    // cannot block in the drive() loop.
+    if super::socket::socket_identity_from_file(&file).is_ok() && ctx.mailbox.is_none() {
+        let guard = crate::adapter::step_engine::guard();
+        if let Some(Ok(mask)) = super::socket::socket_poll_mask_from_file(&file, &guard) {
+            let readable = mask.intersects(
+                tx_subsystems::net::PollMask::IN
+                    | tx_subsystems::net::PollMask::ERR
+                    | tx_subsystems::net::PollMask::HUP
+                    | tx_subsystems::net::PollMask::RDHUP,
+            );
+            if !readable {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+        }
+    }
     if let Some((rx, _tx)) = file.socketpair_endpoint() {
         if !file.flags().read {
             return SyscallResult::Error(EINVAL_VALUE);
@@ -2335,7 +2518,16 @@ where
         if len == 0 {
             return SyscallResult::Return(0);
         }
-        return sys_pipe_read_buffered(&rx, buf_ptr, len, file.flags().nonblocking, ctx).await;
+        return sys_pipe_read_buffered::<P>(
+            &rx,
+            fd,
+            "socketpair",
+            buf_ptr,
+            len,
+            file.flags().nonblocking,
+            ctx,
+        )
+        .await;
     }
 
     // POSIX: read(2) on a descriptor not opened for reading fails with
@@ -2352,6 +2544,13 @@ where
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Sockets are datagram/stream fds, not the TTY line discipline: a
+        // UDP `read`/`write` must move the whole datagram in one call.
+        // Truncating to `TTY_WRITE_MAX_INLINE` (4 KiB) shreds any datagram
+        // >4 KiB into fragments (corrupting iperf3 UDP `-l 65495`); use the
+        // socket I/O size (64 KiB), matching the sendto/recvfrom staging cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
@@ -2373,7 +2572,16 @@ where
     }
 
     if let Some((pipe, tx_subsystems::pipe::PipeSide::Reader)) = file.pipe_endpoint() {
-        return sys_pipe_read_buffered(&pipe, buf_ptr, len, file.flags().nonblocking, ctx).await;
+        return sys_pipe_read_buffered::<P>(
+            &pipe,
+            fd,
+            "pipe",
+            buf_ptr,
+            len,
+            file.flags().nonblocking,
+            ctx,
+        )
+        .await;
     }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
@@ -2383,28 +2591,48 @@ where
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
-        if file.flags().packet {
-            return sys_direct_pagebacked(&file, buf_ptr, len, false, ctx).await;
-        }
         return sys_read_pagebacked::<P>(&file, buf_ptr, len, ctx).await;
     }
+
+    // Non-canonical VMIN=0/VTIME>0 ("timed read", POSIX termios):
+    // return 0 after VTIME deciseconds when no byte arrives. The TTY
+    // step op itself has no deadline concept — it parks on the
+    // readable wait source indefinitely — so the timeout is imposed
+    // here by racing the drive() future against a timer, the same
+    // pattern sys_pselect6 uses. Without this, vim's terminal-response
+    // probes (write `ESC[6n`, timed-read the reply, give up on
+    // timeout) hang forever on consoles that never answer.
+    let vtime_deadline_ns: Option<u64> = if file.flags().nonblocking {
+        None
+    } else if let tx_subsystems::vfs::RNodeBacking::StructBacked {
+        payload: tx_subsystems::vfs::StructPayload::Tty(tty),
+    } = file.rnode().backing()
+    {
+        use tx_subsystems::tty::structure::termios::{ICANON, VMIN, VTIME};
+        let termios = {
+            let guard = crate::adapter::step_engine::guard();
+            match tx_subsystems::tty::execution::step_ioctl_tcgets(tty, &guard) {
+                tx_subsystems::execution::StepOutcome::Done(t) => Some(t),
+                _ => None,
+            }
+        };
+        termios.and_then(|t| {
+            if t.c_lflag & ICANON == 0 && t.c_cc[VMIN] == 0 && t.c_cc[VTIME] != 0 {
+                let vtime_ns = (t.c_cc[VTIME] as u64).saturating_mul(100_000_000);
+                Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(vtime_ns))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
 
     // Read into a kernel-side staging buffer, then copy out through
     // the canonical user-VA lane (`bootstrap_copy_to_user` bridges
     // via `aspace.copy_to_user`, falling back to the kernel-pointer
     // dance the trio's earlier exemption used).
     let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-
-    if let Some(binding) = rtc_char_binding(&file) {
-        return sys_rtc_read_buffered(
-            binding,
-            &mut staging,
-            buf_ptr,
-            file.flags().nonblocking,
-            ctx,
-        )
-        .await;
-    }
 
     // Phase A.3: drive `OpenFile::step_read` via the v3 `drive()` loop
     // (per `docs/Txv3/03_STEP_MODEL_v2.md` §8). The internal cursor
@@ -2415,20 +2643,6 @@ where
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileReadOp;
-    if let tx_subsystems::vfs::RNodeBacking::StructBacked {
-        payload: tx_subsystems::vfs::StructPayload::Tty(tty),
-    } = file.rnode().backing()
-    {
-        return sys_tty_read_buffered::<P>(
-            tty,
-            &mut staging,
-            buf_ptr,
-            file.flags().nonblocking,
-            ctx,
-        )
-        .await;
-    }
-
     let mut script_ctx = build_subject_script_ctx(ctx);
     // The op acquires its own epoch guard inside `step()` (STEP_MODEL_v2
     // §1, INVARIANTS_v5 YIELD-5 / EBR-7); no guard crosses `.await`.
@@ -2438,30 +2652,66 @@ where
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-
     let op = OpenFileReadOp {
         file: &file,
         out: &mut staging,
         caller_netns: ctx.process.net_namespace(),
         cursor: 0,
     };
-    match drive(
+    let drive_fut = drive(
         op,
         &mut script_ctx,
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_registrar_handle.as_ref(),
-    )
-    .await
-    {
+        timer_wheel_arc.as_ref(),
+    );
+    // VTIME race: whichever completes first wins. A `None` from the
+    // race means the timer expired with no byte — POSIX says return 0.
+    let driven = if let Some(deadline_ns) = vtime_deadline_ns {
+        let timer = super::deadline_timer(ctx, deadline_ns);
+        match timer {
+            Some(mut timer_fut) => {
+                let mut drive_fut = core::pin::pin!(drive_fut);
+                let raced = core::future::poll_fn(|cx| {
+                    if let core::task::Poll::Ready(r) =
+                        core::future::Future::poll(drive_fut.as_mut(), cx)
+                    {
+                        return core::task::Poll::Ready(Some(r));
+                    }
+                    if core::future::Future::poll(core::pin::Pin::new(&mut timer_fut), cx)
+                        .is_ready()
+                    {
+                        return core::task::Poll::Ready(None);
+                    }
+                    core::task::Poll::Pending
+                })
+                .await;
+                match raced {
+                    Some(result) => result,
+                    None => return SyscallResult::Return(0),
+                }
+            }
+            None => drive_fut.await,
+        }
+    } else {
+        drive_fut.await
+    };
+    match driven {
         Ok(total) => {
             if total > 0 {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
+                if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                    &ctx.aspace,
+                    buf_ptr as u64,
+                    &staging[..total],
+                )
+                .await
                 {
+                    if errno == tx_subsystems::execution::Errno::EIO {
+                        report_async_read_eio::<P>("copy-to-user", fd, buf_ptr, len);
+                    }
                     return SyscallResult::error_from(errno);
                 }
             }
@@ -2469,9 +2719,18 @@ where
         }
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EIO {
+                report_async_read_eio::<P>("file-op-drive", fd, buf_ptr, len);
+            }
             SyscallResult::error_from(errno)
         }
     }
+}
+
+fn report_async_read_eio<P: tx_hal::ConsoleIf>(stage: &str, fd: i32, buf_ptr: usize, len: usize) {
+    tx_hal::console_write_str::<P>(&alloc::format!(
+        "txkernel:read-eio:stage={stage}:fd={fd}:buf={buf_ptr:#x}:len={len}\n"
+    ));
 }
 
 /// `pread64(fd, buf, count, offset)`.
@@ -2480,7 +2739,10 @@ where
 /// snapshots the shared `OpenFile` offset, delegates to the existing
 /// `read(2)` path, then restores the original offset so callers do
 /// not observe a positioned read as a seek.
-pub(super) async fn sys_pread64<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_pread64<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -2501,7 +2763,7 @@ where
     }
     let saved = file.offset();
     file.set_offset(offset);
-    let result = sys_read_non_socket::<P>(args, ctx, file.clone()).await;
+    let result = sys_read::<P>(args, ctx).await;
     file.set_offset(saved);
     result
 }
@@ -2567,7 +2829,10 @@ fn read_iovec_entry(ctx: &SyscallCtx<'_>, iov_ptr: u64, idx: u64) -> Result<(u64
     Ok((base, len))
 }
 
-pub(super) async fn sys_preadv<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_preadv<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -2706,7 +2971,10 @@ fn preadv2_offset(args: [u64; 6]) -> Result<Option<u64>, i32> {
     Ok(Some(args[3]))
 }
 
-pub(super) async fn sys_preadv2<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_preadv2<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {

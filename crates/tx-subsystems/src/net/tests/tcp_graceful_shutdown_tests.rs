@@ -5,6 +5,7 @@ use tx_substrate::zone::Cap;
 struct GracefulShutdownDriver<'a> {
     source: &'a ScriptedPacketSource,
     iface: &'a LoopbackIface,
+    tcp_connected_budget: usize,
 }
 
 impl NetDelegateDriver for GracefulShutdownDriver<'_> {
@@ -23,7 +24,7 @@ impl NetDelegateDriver for GracefulShutdownDriver<'_> {
     fn loopback_budget(&self) -> LoopbackPollBudget {
         LoopbackPollBudget {
             tcp_connecting: 256,
-            tcp_connected: 256,
+            tcp_connected: self.tcp_connected_budget,
             udp_bound: 0,
             raw_icmp: 0,
             packet_budget: 32,
@@ -82,6 +83,7 @@ fn net_delegate_poll_drives_tcp_fin_to_peer_eof() {
     let driver = GracefulShutdownDriver {
         source: &source,
         iface: loopback_iface(),
+        tcp_connected_budget: 256,
     };
     {
         let guard = tx_substrate::epoch::guard();
@@ -112,6 +114,278 @@ fn net_delegate_poll_drives_tcp_fin_to_peer_eof() {
     ));
 }
 
+#[test]
+fn net_delegate_poll_drives_close_body_then_peer_eof() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    clear_delegate_queue();
+
+    let (client, accepted) = prepare_connected_loopback_pair(40_199, 50_199);
+    {
+        let guard = tx_substrate::epoch::guard();
+        clear_delegate_queue();
+        assert_eq!(
+            step_send_kernel_bytes(&accepted, b"hello", SendRecvFlags::empty(), &guard),
+            StepOutcome::Done(5)
+        );
+        assert!(matches!(
+            step_socket_close(&accepted, &guard),
+            StepOutcome::Done(outcome) if !outcome.payload_taken
+        ));
+    }
+
+    let source = ScriptedPacketSource::new(std::vec::Vec::new());
+    let driver = GracefulShutdownDriver {
+        source: &source,
+        iface: loopback_iface(),
+        tcp_connected_budget: 256,
+    };
+    for _ in 0..8 {
+        if crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits()
+            == 0
+        {
+            break;
+        }
+        let _ = drive_one_delegate_step(&driver);
+    }
+
+    let guard = tx_substrate::epoch::guard();
+    let mut body = [0_u8; 5];
+    assert!(matches!(
+        step_recv_kernel_bytes(
+            &client,
+            &mut body,
+            SendRecvFlags::empty(),
+            &guard
+        ),
+        StepOutcome::Done(outcome) if outcome.bytes == 5
+    ));
+    assert_eq!(&body, b"hello");
+    assert_eq!(
+        step_recv(&client, 1, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+}
+
+#[test]
+fn out_of_order_fin_does_not_publish_eof_before_missing_bytes_arrive() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    clear_delegate_queue();
+
+    let (client, accepted) = prepare_connected_loopback_pair(40_201, 50_201);
+    let accepted_payload = accepted.acquire_operational().expect("accepted payload");
+    let accepted_raw = accepted_payload.raw_tcp_socket().expect("accepted raw tcp");
+    accepted_raw.close();
+    let mut future_fin = accepted_raw
+        .dispatch_segment()
+        .expect("accepted endpoint should dispatch FIN");
+    assert_eq!(future_fin.tcp.control, smoltcp::wire::TcpControl::Fin);
+
+    // Model packet reordering: the FIN sequence number is beyond the next
+    // byte expected by the client, so smoltcp must defer it until the missing
+    // stream bytes arrive.
+    future_fin.tcp.seq_number = future_fin.tcp.seq_number + 8;
+
+    let client_payload = client.acquire_operational().expect("client payload");
+    let client_raw = client_payload.raw_tcp_socket().expect("client raw tcp");
+    assert_eq!(
+        client_raw.protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
+
+    let publish = client_raw.process_segment(&future_fin);
+
+    assert_eq!(
+        client_raw.protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
+    assert!(
+        !publish.recv_closed,
+        "an ignored out-of-order FIN must not publish EOF"
+    );
+    assert!(
+        !client_raw.is_recv_closed(),
+        "an ignored out-of-order FIN must not become sticky EOF"
+    );
+}
+
+#[test]
+fn net_delegate_timer_tick_also_drives_connected_tcp() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    clear_delegate_queue();
+
+    let (client, accepted) = prepare_connected_loopback_pair(40_200, 50_200);
+    {
+        let guard = tx_substrate::epoch::guard();
+        clear_delegate_queue();
+        assert_eq!(
+            step_send_kernel_bytes(&client, b"tick", SendRecvFlags::empty(), &guard),
+            StepOutcome::Done(4)
+        );
+    }
+
+    // Model a supervised TCP deadline. TICK maintains the backlog and also
+    // drives the established/closing lane, without touching handshakes.
+    clear_delegate_queue();
+    crate::net::delegate::net_delegate_kick_tick();
+    let source = ScriptedPacketSource::new(std::vec::Vec::new());
+    let driver = GracefulShutdownDriver {
+        source: &source,
+        iface: loopback_iface(),
+        tcp_connected_budget: 256,
+    };
+    let report = drive_one_delegate_step(&driver);
+    assert!(report.runtime.tick_seen);
+    assert!(!report.runtime.poll_seen);
+    assert!(report.runtime.loopback.tcp_transfer_attempted >= 1);
+
+    let guard = tx_substrate::epoch::guard();
+    let mut bytes = [0_u8; 4];
+    assert!(matches!(
+        step_recv_kernel_bytes(&accepted, &mut bytes, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(outcome) if outcome.bytes == 4
+    ));
+    assert_eq!(&bytes, b"tick");
+}
+
+#[test]
+fn net_delegate_budget_eventually_services_connections_after_first_window() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    clear_delegate_queue();
+
+    // Every connection pair contributes both endpoints to the snapshot. With
+    // 18 pairs, the final two pairs are beyond a 32-entry fixed scan window.
+    let mut pairs = std::vec::Vec::new();
+    for index in 0..18_u16 {
+        pairs.push(prepare_connected_loopback_pair(
+            41_000 + index,
+            51_000 + index,
+        ));
+    }
+
+    clear_delegate_queue();
+    {
+        let guard = tx_substrate::epoch::guard();
+        for (client, _) in &pairs {
+            assert_eq!(
+                step_send_kernel_bytes(client, b"x", SendRecvFlags::empty(), &guard),
+                StepOutcome::Done(1)
+            );
+        }
+    }
+
+    let source = ScriptedPacketSource::new(std::vec::Vec::new());
+    let driver = GracefulShutdownDriver {
+        source: &source,
+        iface: loopback_iface(),
+        tcp_connected_budget: 32,
+    };
+    for _ in 0..16 {
+        if crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits()
+            == 0
+        {
+            break;
+        }
+        let _ = drive_one_delegate_step(&driver);
+    }
+
+    for (index, (_, accepted)) in pairs.iter().enumerate() {
+        assert_eq!(
+            accepted
+                .acquire_operational()
+                .expect("accepted payload")
+                .io_snapshot()
+                .recv_len,
+            1,
+            "connection pair {index} was starved by the fixed scan window"
+        );
+    }
+}
+
+#[test]
+fn net_delegate_budget_delivers_concurrent_close_bodies_and_eof() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    clear_delegate_queue();
+
+    let mut pairs = std::vec::Vec::new();
+    for index in 0..40_u16 {
+        pairs.push(prepare_connected_loopback_pair(
+            42_000 + index,
+            52_000 + index,
+        ));
+    }
+
+    clear_delegate_queue();
+    {
+        let guard = tx_substrate::epoch::guard();
+        for (_, accepted) in &pairs {
+            assert_eq!(
+                step_send_kernel_bytes(accepted, b"ok", SendRecvFlags::empty(), &guard),
+                StepOutcome::Done(2)
+            );
+            assert!(matches!(
+                step_socket_close(accepted, &guard),
+                StepOutcome::Done(outcome) if !outcome.payload_taken
+            ));
+        }
+    }
+
+    let source = ScriptedPacketSource::new(std::vec::Vec::new());
+    let driver = GracefulShutdownDriver {
+        source: &source,
+        iface: loopback_iface(),
+        tcp_connected_budget: 32,
+    };
+    for _ in 0..64 {
+        if crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits()
+            == 0
+        {
+            break;
+        }
+        let _ = drive_one_delegate_step(&driver);
+    }
+
+    let guard = tx_substrate::epoch::guard();
+    for (index, (client, _)) in pairs.iter().enumerate() {
+        let mut body = [0_u8; 2];
+        assert!(
+            matches!(
+                step_recv_kernel_bytes(client, &mut body, SendRecvFlags::empty(), &guard),
+                StepOutcome::Done(outcome) if outcome.bytes == 2
+            ),
+            "connection pair {index} did not receive its response body"
+        );
+        assert_eq!(&body, b"ok");
+        assert_eq!(
+            step_recv(client, 1, SendRecvFlags::empty(), &guard),
+            StepOutcome::Done(0),
+            "connection pair {index} did not observe EOF"
+        );
+    }
+}
+
 fn prepare_connected_loopback_pair(
     server_port: u16,
     client_port: u16,
@@ -121,6 +395,7 @@ fn prepare_connected_loopback_pair(
     let driver = GracefulShutdownDriver {
         source: &source,
         iface: loopback_iface(),
+        tcp_connected_budget: 256,
     };
     drive_one_delegate_step(&driver);
     let guard = tx_substrate::epoch::guard();

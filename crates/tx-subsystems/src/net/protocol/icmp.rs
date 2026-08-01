@@ -6,6 +6,7 @@ use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpProtocol, IpRepr,
     Ipv4Address as SmoltcpIpv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address as SmoltcpIpv6Address,
+    Ipv6Repr,
 };
 
 use crate::net::packet::LoopbackIpPacket;
@@ -79,6 +80,9 @@ pub struct RawIcmpSocket {
     rx_queue: SpinMutex<VecDeque<Icmpv4EchoPacket>>,
     rx_ipv6_queue: SpinMutex<VecDeque<RawIpv6Packet>>,
     tx_queue: SpinMutex<VecDeque<Icmpv4EchoPacket>>,
+    /// External v6 echo requests bound for the device-TX lane (mirror of the
+    /// v4 `tx_queue`; loopback v6 echoes are answered inline and never queue).
+    tx6_queue: SpinMutex<VecDeque<Icmpv6EchoPacket>>,
     recv_capacity: usize,
     send_capacity: usize,
 }
@@ -113,6 +117,7 @@ impl RawIcmpSocket {
             rx_queue: SpinMutex::new(VecDeque::new()),
             rx_ipv6_queue: SpinMutex::new(VecDeque::new()),
             tx_queue: SpinMutex::new(VecDeque::new()),
+            tx6_queue: SpinMutex::new(VecDeque::new()),
             recv_capacity: options.socket.recv_buf_size,
             send_capacity: options.socket.send_buf_size,
         }
@@ -178,6 +183,33 @@ impl RawIcmpSocket {
         self.pop_tx_echo()
     }
 
+    // External v6 echo TX queue (mirror of the v4 `tx_echo` family above).
+    pub fn enqueue_tx6_echo(&self, packet: Icmpv6EchoPacket) -> Option<(usize, bool)> {
+        let bytes = icmpv6_echo_message_len(&packet);
+        let mut tx = self.tx6_queue.lock();
+        let queued: usize = tx.iter().map(icmpv6_echo_message_len).sum();
+        let available = self.send_capacity.saturating_sub(queued);
+        if bytes > available {
+            return None;
+        }
+        tx.push_back(packet);
+        let queued_after: usize = tx.iter().map(icmpv6_echo_message_len).sum();
+        Some((bytes, queued_after == self.send_capacity))
+    }
+
+    pub fn peek_tx6_echo(&self) -> Option<Icmpv6EchoPacket> {
+        self.tx6_queue.lock().front().cloned()
+    }
+
+    /// Pop the head after the sink accepted it; returns `became_available`.
+    pub fn commit_tx6_echo_sent(&self) -> Option<bool> {
+        let mut tx = self.tx6_queue.lock();
+        let had_no_space =
+            tx.iter().map(icmpv6_echo_message_len).sum::<usize>() == self.send_capacity;
+        tx.pop_front()?;
+        Some(had_no_space)
+    }
+
     pub fn ingest_rx_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
         let bytes = icmpv4_echo_raw_packet_len(&packet);
         let mut rx = self.rx_queue.lock();
@@ -215,15 +247,6 @@ impl RawIcmpSocket {
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
-        self.recv_len_with_ipv4_header(len, peek, true)
-    }
-
-    pub fn recv_len_with_ipv4_header(
-        &self,
-        len: usize,
-        peek: bool,
-        include_ipv4_header: bool,
-    ) -> Option<(usize, bool)> {
         if len == 0 {
             return Some((0, false));
         }
@@ -231,12 +254,7 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let packet_len = if include_ipv4_header {
-                    icmpv4_echo_raw_packet_len(packet)
-                } else {
-                    icmpv4_echo_message_len(packet)
-                };
-                let bytes = core::cmp::min(packet_len, len);
+                let bytes = core::cmp::min(icmpv4_echo_raw_packet_len(packet), len);
                 if !peek {
                     let _ = rx.pop_front();
                 }
@@ -260,15 +278,6 @@ impl RawIcmpSocket {
     }
 
     pub fn recv_bytes(&self, out: &mut [u8], peek: bool) -> Option<RawIcmpRecvDrain> {
-        self.recv_bytes_with_ipv4_header(out, peek, true)
-    }
-
-    pub fn recv_bytes_with_ipv4_header(
-        &self,
-        out: &mut [u8],
-        peek: bool,
-        include_ipv4_header: bool,
-    ) -> Option<RawIcmpRecvDrain> {
         if out.is_empty() {
             return Some(RawIcmpRecvDrain {
                 bytes: 0,
@@ -282,11 +291,8 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let packet_bytes = if include_ipv4_header {
-                    build_icmpv4_echo_reply(packet).as_bytes().to_vec()
-                } else {
-                    build_icmpv4_echo_reply_message(packet)
-                };
+                let raw_packet = build_icmpv4_echo_reply(packet);
+                let packet_bytes = raw_packet.as_bytes();
                 let bytes = core::cmp::min(packet_bytes.len(), out.len());
                 out[..bytes].copy_from_slice(&packet_bytes[..bytes]);
                 let source = packet.src;
@@ -467,6 +473,31 @@ pub fn parse_icmpv6_payload_unchecked(
 
 pub fn build_icmpv6_echo_request_message(packet: &Icmpv6EchoPacket) -> Vec<u8> {
     build_icmpv6_echo_message(packet, true)
+}
+
+/// Full IPv6 packet (header + ICMPv6 echo request) for the device-TX lane —
+/// mirror of [`build_icmpv4_echo_request`].
+pub fn build_icmpv6_echo_request_packet(packet: &Icmpv6EchoPacket) -> LoopbackIpPacket {
+    let icmp_bytes = build_icmpv6_echo_request_message(packet);
+    let ip_repr = IpRepr::Ipv6(Ipv6Repr {
+        src_addr: to_smoltcp_ipv6(packet.src),
+        dst_addr: to_smoltcp_ipv6(packet.dst),
+        next_header: IpProtocol::Icmpv6,
+        payload_len: icmp_bytes.len(),
+        hop_limit: 64,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let checksum = ChecksumCapabilities::default();
+    let mut bytes = vec![0u8; ip_header_len + icmp_bytes.len()];
+    ip_repr.emit(&mut bytes[..ip_header_len], &checksum);
+    bytes[ip_header_len..].copy_from_slice(&icmp_bytes);
+    LoopbackIpPacket::new(bytes)
+}
+
+/// ICMPv6 echo message length (8-byte echo header + payload) — TX-queue
+/// accounting, mirror of `icmpv4_echo_message_len`.
+fn icmpv6_echo_message_len(packet: &Icmpv6EchoPacket) -> usize {
+    8 + packet.payload.len()
 }
 
 pub fn build_icmpv6_echo_reply_message(packet: &Icmpv6EchoPacket) -> Vec<u8> {

@@ -47,6 +47,104 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
 }
 
 #[test]
+fn user_range_reserve_waits_for_materializer_and_retries() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target_range = range(0x18_0000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let holder = match aspace
+        .range_lock()
+        .acquire_step_rich(target_range, crate::vm::LockMode::Materializer)
+    {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline materializer acquire should succeed"),
+    };
+
+    let mut future = Box::pin(
+        aspace.reserve_user_range_for_access_wait(target_range, crate::vm::UserAccessKind::Write),
+    );
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(
+        matches!(future.as_mut().poll(&mut cx), Poll::Pending),
+        "overlapping page transaction must park instead of becoming EIO"
+    );
+
+    drop(holder);
+
+    assert_eq!(
+        future.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(())),
+        "reserve must retry and publish after the owner releases"
+    );
+    assert!(
+        aspace
+            .pmap()
+            .lookup(UserPage(
+                target_range.start().as_usize() / crate::vm::USER_PAGE_SIZE
+            ))
+            .expect("page published after retry")
+            .prot
+            .write
+    );
+}
+
+#[test]
+fn fault_waiter_converges_on_mapping_published_by_other_hart() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target_range = range(0x19_0000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    // Model the winner of two faults: it installs a writable private page
+    // before the read-fault waiter gets the final page transaction.
+    let winner = aspace
+        .resolve_fault(VmFault::new(target_range.start(), AccessMode::Write))
+        .expect("winner resolves");
+    let winner_page = winner
+        .materialize_pagebacked()
+        .expect("winner materializes");
+    aspace
+        .publish_fault_materialization(winner, winner_page)
+        .expect("winner publishes");
+
+    let mut waiter =
+        Box::pin(aspace.fault_script(VmFault::new(target_range.start(), AccessMode::Read)));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(
+        waiter.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(crate::vm::PmapPublishOutcome {
+            page: target_range.start().containing_page(),
+            replaced: false,
+        })),
+        "a sufficient winner mapping must complete the waiter, not SIGSEGV"
+    );
+}
+
+#[test]
 fn mmap_script_succeeds_in_one_poll_when_uncontended() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -685,6 +783,55 @@ fn fault_script_yields_on_writer_conflict_and_completes_after_release() {
 }
 
 #[test]
+fn fault_publish_retries_when_recipe_changes_after_materialization() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x1c000, 1);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let outcome = aspace
+        .resolve_fault(VmFault::new(
+            crate::vm::UserVirtAddr(0x1c000),
+            AccessMode::Write,
+        ))
+        .expect("fault resolves");
+    let materialization = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+
+    // Model the SMP race seen by rustc: a VM writer changes the VMA after
+    // resolve/materialize but before the faulting CPU publishes its PTE.
+    aspace
+        .try_mprotect(target, Prot::READ)
+        .expect("concurrent protection update");
+
+    assert!(matches!(
+        aspace
+            .try_fault_script_publish(&outcome, materialization)
+            .expect("stale publication is retryable"),
+        super::super::execution::FaultScriptPublish::Retry
+    ));
+    assert_eq!(
+        aspace
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x1c000).containing_page()),
+        None,
+        "a stale materialization must never reach the pmap"
+    );
+}
+
+#[test]
 fn fork_aspace_clones_parent_recipes_into_fresh_child() {
     setup_host_substrate();
     let parent = AddressSpace::new();
@@ -851,6 +998,33 @@ fn fork_aspace_returns_would_block_when_parent_full_user_range_already_held() {
 
     let result = crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent);
     assert!(matches!(result, Err(crate::vm::VmMapError::WouldBlock)));
+}
+
+#[test]
+fn fork_aspace_wait_parks_on_conflict_and_retries_after_release() {
+    setup_host_substrate();
+    let parent = AddressSpace::new();
+    let holder = match parent
+        .range_lock()
+        .acquire_step_rich(range(0x40000, 1), crate::vm::LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline acquire should succeed"),
+    };
+
+    let mut future = Box::pin(crate::vm::AddressSpace::fork_aspace_wait::<
+        crate::vm::pmap::TestPmap,
+    >(&parent));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+    drop(holder);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_child)) => {}
+        Poll::Ready(Err(error)) => panic!("post-release fork errored: {error:?}"),
+        Poll::Pending => panic!("fork should retry after RangeLock release"),
+    }
 }
 
 #[test]

@@ -205,7 +205,7 @@ fn blocked_reader_on_empty_ring_is_woken_when_writer_pushes_bytes() {
     let mailbox = Arc::new(TaskMailbox::new());
 
     // Reader observes empty ring, prepares + installs.
-    let (_guard, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard, gen) = register(payload.reader_endpoint(), &mailbox, PIPE_READABLE);
     assert!(mailbox.is_empty(), "no events before write");
 
     // Writer-side step pushes bytes -> reader source notifies.
@@ -247,7 +247,7 @@ fn blocked_writer_on_full_ring_is_woken_when_reader_drains_bytes() {
     drop(guard);
 
     // Writer registers against `writer_wait_source` while ring is full.
-    let (_guard_reg, gen) = register(payload.writer_wait_source(), &mailbox, PIPE_WRITABLE);
+    let (_guard_reg, gen) = register(payload.writer_endpoint(), &mailbox, PIPE_WRITABLE);
     assert!(mailbox.is_empty(), "no events before read");
 
     // Reader-side drain -> writer source notifies.
@@ -283,7 +283,7 @@ fn dropping_last_reader_cap_fires_writer_wait_source() {
     process.set_fd(11, Some(writer));
 
     // Writer registers on writer_wait_source (anticipating EPIPE).
-    let (_guard_reg, gen) = register(payload.writer_wait_source(), &mailbox, PIPE_WRITABLE);
+    let (_guard_reg, gen) = register(payload.writer_endpoint(), &mailbox, PIPE_WRITABLE);
 
     // Production-path last-reader-close.
     close_fd(&process, 10);
@@ -294,8 +294,8 @@ fn dropping_last_reader_cap_fires_writer_wait_source() {
     // resolver at `PipePayload::new` time). The substantive
     // assertion is the event delivery below.
     assert_ne!(
-        payload.reader_wait_source().id(),
-        payload.writer_wait_source().id(),
+        payload.reader_endpoint().id(),
+        payload.writer_endpoint().id(),
     );
 
     assert_source_fired(
@@ -322,7 +322,7 @@ fn dropping_last_writer_cap_fires_reader_wait_source() {
     process.set_fd(11, Some(writer));
 
     // Reader registers on reader_wait_source (anticipating EOF).
-    let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard_reg, gen) = register(payload.reader_endpoint(), &mailbox, PIPE_READABLE);
 
     close_fd(&process, 11);
     tx_test_support::drain_to_quiescence();
@@ -347,7 +347,7 @@ fn step_write_empty_bytes_does_not_fire_reader_wait_source() {
     let payload = payload_of(&reader);
     let mailbox = Arc::new(TaskMailbox::new());
 
-    let (_guard_reg, _gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard_reg, _gen) = register(payload.reader_endpoint(), &mailbox, PIPE_READABLE);
 
     let guard = ebr_guard();
     let outcome = step_write_with_post(&payload, &[], &guard, false, false, |mailbox, event| {
@@ -385,7 +385,7 @@ fn step_read_empty_buf_does_not_fire_writer_wait_source() {
     // none, so this is a no-op; kept for clarity.)
     let _ = mailbox.poll();
 
-    let (_guard_reg, _gen) = register(payload.writer_wait_source(), &mailbox, PIPE_WRITABLE);
+    let (_guard_reg, _gen) = register(payload.writer_endpoint(), &mailbox, PIPE_WRITABLE);
 
     let mut empty: [u8; 0] = [];
     let guard = ebr_guard();
@@ -421,7 +421,7 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
     // > 1 — pins the "captured at registration time" semantic.
     let _burned = mailbox.next_generation();
 
-    let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard_reg, gen) = register(payload.reader_endpoint(), &mailbox, PIPE_READABLE);
     assert!(
         gen.raw() >= 2,
         "captured generation should be monotonic past 1, got {}",
@@ -457,7 +457,7 @@ fn write_fires_reader_wait_source() {
     let mailbox = Arc::new(TaskMailbox::new());
 
     // The endpoint/source receiver.
-    let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard_reg, gen) = register(payload.reader_endpoint(), &mailbox, PIPE_READABLE);
 
     // The shared `step_write` call below is the readability publication site.
     // A missing `WaitSource::notify` would leave the mailbox empty.

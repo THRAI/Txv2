@@ -75,15 +75,9 @@ fn install_fsnotify_fd(
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let fd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
+    let Some(fd) = ctx.process.install_new_fd(open_file, cloexec) else {
         return SyscallResult::Error(EMFILE_VALUE);
-    }
-    let _ = ctx.process.install_fd(fd, open_file);
-    if cloexec {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
+    };
 
     SyscallResult::Return(fd as i64)
 }

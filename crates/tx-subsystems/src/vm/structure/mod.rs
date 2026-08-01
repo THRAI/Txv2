@@ -19,7 +19,7 @@ pub use private::{
 };
 pub use range_lock::{
     AcquirePairResult, AcquireResult, LockMode, PendingWriter, RangeGuard, RangeGuardPair,
-    RangeLock, WouldBlock, RANGE_LOCK_RELEASE_MASK,
+    RangeLock, RangeLockDiagnosticSnapshot, WouldBlock, RANGE_LOCK_RELEASE_MASK,
 };
 pub use types::{
     AccessMode, AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserPage, UserPageIter,
@@ -35,6 +35,7 @@ pub(in crate::vm) use private::{
     private_page_debug_samples, private_page_debug_totals, reset_private_page_debug_totals,
 };
 pub(in crate::vm) use recipe::{
-    recipe_debug_totals, reset_recipe_debug_totals, AddressSpaceStatsCell, RecipeIndex,
+    drain_deferred_recipe_reclaims, recipe_debug_totals, reset_recipe_debug_totals,
+    AddressSpaceStatsCell, RecipeIndex,
 };
 pub(in crate::vm) use types::AddressSpaceStatsDelta;

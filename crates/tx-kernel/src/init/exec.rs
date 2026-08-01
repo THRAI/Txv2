@@ -20,7 +20,50 @@ use super::helpers::{bootstrap_block_on, exec_error_tag};
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
 #[cfg(test)]
-use crate::adapter::step_engine::{StepOutcome, page_allocator};
+use crate::adapter::step_engine::{page_allocator, StepOutcome};
+
+/// Finals first-stage PID 1 policy. The script is executed by the Bash from
+/// the official root filesystem, so the kernel does not overwrite `/init`.
+const FINAL_TESTCODE: &[u8] = include_bytes!("final_testcode.sh");
+
+fn buildstorm_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
+    <P as tx_hal::BootInfoIf>::boot_info()
+        .cmdline
+        .is_some_and(|cmdline| {
+            cmdline
+                .split_ascii_whitespace()
+                .any(|token| token == "tx.profile=buildstorm")
+        })
+}
+
+fn cagent_diag_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
+    <P as tx_hal::BootInfoIf>::boot_info()
+        .cmdline
+        .is_some_and(|cmdline| {
+            cmdline
+                .split_ascii_whitespace()
+                .any(|token| token == "tx.profile=cagentdiag")
+        })
+}
+
+/// The judge boots a block-backed root without selecting an explicit init
+/// lane. Explicit developer profiles keep using the BootPlan path below.
+fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
+    if !ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
+        return true;
+    };
+    !cmdline.split_ascii_whitespace().any(|token| {
+        token.starts_with("init=")
+            || token.starts_with("tx.runsh=")
+            || matches!(
+                token,
+                "tx.profile=onsite" | "tx.profile=busybox" | "tx.profile=pretest"
+            )
+    })
+}
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -252,6 +295,62 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>(":cpu0-local=");
             Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
             tx_hal::console_write_str::<P>("\n");
+        }
+
+        // Finals default: keep the official block-backed ext4 image mounted
+        // at `/` and run the embedded policy through the image's Bash. This
+        // precedes the legacy OSComp sdcard lane only when no explicit
+        // developer init/profile selected another BootPlan.
+        if final_testcode_autorun_enabled::<P>() {
+            let default_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+            ];
+            let buildstorm_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+                b"TX_FINAL_MODE=buildstorm-only",
+            ];
+            let cagent_diag_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+                b"TX_FINAL_MODE=cagent-diag",
+            ];
+            let envp = if cagent_diag_profile_enabled::<P>() {
+                cagent_diag_envp
+            } else if buildstorm_profile_enabled::<P>() {
+                buildstorm_envp
+            } else {
+                default_envp
+            };
+            let argv: &[&[u8]] = &[b"bash", b"-c", FINAL_TESTCODE];
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/bin/bash",
+                argv,
+                envp,
+                &cred,
+            ));
+            Self::write_board_sentinel_prefix();
+            match outcome {
+                Ok(()) => {
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:ok\n");
+                    return;
+                }
+                Err(e) => {
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:fail:");
+                    tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                    tx_hal::console_write_str::<P>("\n");
+                    panic!("bootstrap exec for finals /bin/bash failed: {e:?}");
+                }
+            }
         }
 
         let sdcard_test_init = match boot_plan.first_userspace {
@@ -522,6 +621,7 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::deadline_timer().enable_timer_wakeups();
 
         // Enable concurrent poll on all harts (Phase 1a poll lease).
+        Self::reset_smp_stall_diagnostic();
         super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
 
         // Drive the BSP reactor loop until init zombifies. Each
@@ -531,6 +631,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // userspace trap (which is the only event that resolves the
         // thread future's pending wait).
         loop {
+            // LA64's supervisor IPI is maskable and syscall/fault paths may
+            // keep interrupts disabled. Poll the mailbox at reactor
+            // boundaries so shootdown progress never depends only on IRQ
+            // delivery. This is a no-op on platforms that do not need it.
+            P::service_pending_tlb_shootdown();
             if init.is_zombie() {
                 break;
             }
@@ -563,11 +668,11 @@ impl<P: TxPlatform> CoreInit<P> {
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
             let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-            let _ = step_engine::service_local_drain_request(64);
             let step = match Self::boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
                 None => break,
             };
+            P::service_pending_tlb_shootdown();
             let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
             let submitted_child_after_poll = Self::drain_pending_child_submits();
 
@@ -599,10 +704,13 @@ impl<P: TxPlatform> CoreInit<P> {
             // invisible to step.should_idle() computed before the drain) or
             // if there are items still pending reclamation (need more epoch
             // advances before they can be reclaimed).
-            let ebr_active = drain_stats.bag_reclaimed > 0
-                || drain_stats.bag_remaining > 0
-                || drain_stats.publication_dropped > 0
-                || drain_stats.publication_remaining > 0;
+            let vm_recipe_reclaims = if step.should_idle() {
+                tx_subsystems::vm::drain_deferred_recipe_reclaims(64)
+            } else {
+                0
+            };
+            let ebr_active =
+                drain_stats.reclaimed > 0 || drain_stats.remaining > 0 || vm_recipe_reclaims > 0;
             if step.should_idle()
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
@@ -632,7 +740,17 @@ impl<P: TxPlatform> CoreInit<P> {
                 if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
                     continue;
                 }
-                P::wait_for_interrupt_once();
+                P::service_pending_tlb_shootdown();
+                Self::note_reactor_hart_idle(loop_cpu);
+                let wait_state = P::prepare_interrupt_wait();
+                if Self::boot_reactor_has_runnable_work(boot_runtime::HartId(loop_cpu.0)) {
+                    Self::note_reactor_hart_active(loop_cpu);
+                    P::cancel_interrupt_wait(wait_state);
+                    continue;
+                }
+                P::wait_for_interrupt_prepared(wait_state);
+                P::service_pending_tlb_shootdown();
+                Self::note_reactor_hart_active(loop_cpu);
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
@@ -1885,7 +2003,8 @@ fn libctest_case_needs_cwd_dso(case: &str) -> bool {
     matches!(case, "dlopen" | "tls_get_new_dtv")
 }
 
-const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_STATIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch setjmp snprintf socket sscanf sscanf_long stat \
      strftime string string_memcpy string_memmem string_memset string_strchr string_strcspn \
@@ -1903,7 +2022,8 @@ const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_ge
      scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof statvfs strverscmp \
      syscall_sign_extend uselocale_0 wcsncpy_read_overflow wcsstr_false_negative";
 
-const LIBCTEST_DYNAMIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch sem_init setjmp snprintf socket sscanf \
      sscanf_long stat strftime string string_memcpy string_memmem string_memset string_strchr \
@@ -1945,7 +2065,9 @@ mod tests {
         assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
         assert!(cmd.contains("SKIP entry-static.exe dlopen"));
         assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
-        assert!(cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains(
+            "(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"
+        ));
     }
 
     #[test]
@@ -1977,7 +2099,9 @@ mod tests {
         append_full_libctest(&mut cmd);
 
         assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
-        assert!(cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains(
+            "(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"
+        ));
         assert!(
             cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe tls_get_new_dtv)")
         );

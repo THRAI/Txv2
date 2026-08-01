@@ -1,6 +1,6 @@
 use super::*;
-
 use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
+use tx_subsystems::net::step_process_loopback_udp_with_post;
 
 pub(super) fn connect_sockaddr_for_local_stack(
     kind: SocketKind,
@@ -37,7 +37,7 @@ pub(super) fn maybe_autobind_connect_client(
     let remote_endpoint = remote.as_ip_endpoint();
     let local_endpoint_base = connect_autobind_local_base(socket, remote_endpoint);
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in ephemeral_port_candidates() {
         let local_endpoint = IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port);
         if ephemeral_port_in_use(socket, port) {
             continue;
@@ -169,7 +169,7 @@ pub(super) fn maybe_autobind_udp_sendto(
         IpEndpoint::unspecified_for_family(family, 0)
     };
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in ephemeral_port_candidates() {
         let local =
             sockaddr_from_endpoint(IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port));
         let outcome = {
@@ -187,29 +187,6 @@ pub(super) fn maybe_autobind_udp_sendto(
     Err(Errno::EADDRINUSE)
 }
 
-pub(super) fn drive_tcp_loopback_after_connect(
-    socket: &Cap<SocketIdentity>,
-) -> Result<bool, Errno> {
-    let Some(payload) = socket.acquire_operational() else {
-        return Ok(false);
-    };
-    if !matches!(
-        payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connecting { .. })
-    ) {
-        return Ok(false);
-    }
-    let guard = tx_substrate::epoch::guard();
-    match step_tcp_loopback_handshake_with_post(socket, &guard, |mailbox, event| {
-        mailbox.post(event)
-    }) {
-        StepOutcome::Done(_) => Ok(true),
-        StepOutcome::Err(Errno::EOPNOTSUPP) => Ok(false),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(false),
-    }
-}
-
 pub(super) fn bind_with_ephemeral_port(
     socket: &Cap<SocketIdentity>,
     addr: KernelSockAddr,
@@ -223,7 +200,7 @@ pub(super) fn bind_with_ephemeral_port(
         return step_unit_result(outcome);
     }
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in ephemeral_port_candidates() {
         if ephemeral_port_in_use(socket, port) {
             continue;
         }
@@ -300,28 +277,6 @@ fn occupies_tcp_port(socket: &Cap<SocketIdentity>, family: AddressFamily, port: 
         .is_some_and(|payload| !payload.with_options(|options| options.ip.ipv6_v6only))
 }
 
-pub(super) fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) {
-    if written == 0 {
-        return;
-    }
-    let Some(payload) = socket.acquire_operational() else {
-        return;
-    };
-    if !matches!(
-        payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected { .. })
-    ) {
-        return;
-    }
-    let guard = tx_substrate::epoch::guard();
-    let _ = step_tcp_loopback_transfer_with_post(socket, written, &guard, |mailbox, event| {
-        mailbox.post(event)
-    });
-    socket
-        .readiness
-        .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
-}
-
 pub(super) fn drive_udp_loopback_after_sendto_with_post<F>(
     socket: &Cap<SocketIdentity>,
     written: usize,
@@ -345,6 +300,17 @@ where
     ) {
         return false;
     }
+    // P2-S6: only drive datagrams that are actually loopback-destined.
+    // The egress pop is destructive and routes into the lo queue; an
+    // external datagram (e.g. a DNS query to 10.0.2.3) stolen here never
+    // reaches the device-TX lane — it dies unclaimed on loopback.
+    match payload
+        .raw_udp_socket()
+        .and_then(|raw| raw.peek_tx_datagram())
+    {
+        Some(datagram) if datagram.dst.is_loopback() => {}
+        _ => return false,
+    }
     let guard = tx_substrate::epoch::guard();
     matches!(
         step_process_loopback_udp_with_post(socket, 8, &guard, post),
@@ -363,7 +329,6 @@ where
         tx_substrate::wake::mailbox::MailboxEvent,
     ) -> bool,
 {
-    drive_tcp_loopback_after_sendto(socket, written);
     drive_udp_loopback_after_sendto_with_post(socket, written, post)
 }
 
@@ -388,13 +353,39 @@ pub(super) async fn finish_sendto_progress(
     yield_after_sendto_if_needed(socket).await;
 }
 
-pub(crate) fn drive_loopback_pending() {
-    let guard = tx_substrate::epoch::guard();
-    let _ = tx_subsystems::net::execution::step_process_loopback_pending_zero(
-        tx_subsystems::net::protocol::loopback_iface(),
-        tx_subsystems::net::execution::LOOPBACK_POLL_BUDGET_DEFAULT,
-        &guard,
-    );
+pub(crate) fn drive_loopback_pending(ctx: &SyscallCtx<'_>) {
+    // recv/poll paths may ask the protocol owner to make progress, but must
+    // never become a second protocol owner themselves.  In particular this
+    // used to scan and mutate every loopback connection on the calling CPU
+    // while the network delegate was doing the same work on another CPU.
+    tx_subsystems::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| {
+        ctx.post_mailbox_ref_event(mailbox, event)
+    });
+}
+
+pub(super) fn sendto_can_drive_loopback_inline(
+    socket: &Cap<SocketIdentity>,
+    dst: Option<IpEndpoint>,
+) -> bool {
+    if socket.kind != SocketKind::Udp {
+        return false;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    match payload.protocol_snapshot() {
+        SocketProtocol::Udp(UdpInner::Bound { local }) => {
+            dst.is_some_and(|dst| local_allows_loopback_inline(local) && dst.is_loopback())
+        }
+        SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
+            local_allows_loopback_inline(local) && remote.is_loopback()
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn local_allows_loopback_inline(local: IpEndpoint) -> bool {
+    local.is_unspecified() || local.is_loopback()
 }
 
 pub(super) fn recv_ready_mask(mask: PollMask) -> bool {
@@ -429,31 +420,6 @@ pub(super) fn socket_recv_should_yield_after_success(
     bytes: usize,
 ) -> bool {
     bytes > 0 && matches!(socket.kind, SocketKind::Tcp | SocketKind::Sctp)
-}
-
-pub(super) fn sendto_can_drive_loopback_inline(
-    socket: &Cap<SocketIdentity>,
-    dst: Option<IpEndpoint>,
-) -> bool {
-    if socket.kind != SocketKind::Udp {
-        return false;
-    }
-    let Some(payload) = socket.acquire_operational() else {
-        return false;
-    };
-    match payload.protocol_snapshot() {
-        SocketProtocol::Udp(UdpInner::Bound { local }) => {
-            dst.is_some_and(|dst| local_allows_loopback_inline(local) && dst.is_loopback())
-        }
-        SocketProtocol::Udp(UdpInner::Connected { local, remote }) => {
-            local_allows_loopback_inline(local) && remote.is_loopback()
-        }
-        _ => false,
-    }
-}
-
-pub(super) fn local_allows_loopback_inline(local: IpEndpoint) -> bool {
-    local.is_unspecified() || local.is_loopback()
 }
 
 pub(super) fn tcp_effective_maxseg(socket: &Cap<SocketIdentity>) -> i32 {
@@ -532,16 +498,8 @@ pub(crate) fn socket_poll_mask_from_file(
     file: &Cap<OpenFile>,
     guard: &tx_substrate::epoch::Guard<'_>,
 ) -> Option<Result<PollMask, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_ready(&socket, guard) {
-        StepOutcome::Done(mask) => Ok(mask),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(PollMask::empty()),
-    })
+    let ops = file.file_ops()?;
+    Some(ops.poll_mask(guard))
 }
 
 pub(crate) fn socket_poll_wait_token_from_file(
@@ -549,16 +507,8 @@ pub(crate) fn socket_poll_wait_token_from_file(
     interests: PollMask,
     guard: &tx_substrate::epoch::Guard<'_>,
 ) -> Option<Result<Option<tx_subsystems::execution::WaitToken>, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_wait_token(&socket, interests, guard) {
-        StepOutcome::Done(token) => Ok(token),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(None),
-    })
+    let ops = file.file_ops()?;
+    Some(ops.poll_wait_token(interests, guard))
 }
 
 pub(super) fn read_sockaddr_in<'a>(
@@ -855,6 +805,34 @@ pub(super) fn validate_user_range<'a>(
             StepOutcome::Err(e) => Err(Errno::from(e)),
             StepOutcome::Yield { .. } => Err(Errno::EIO),
         }
+    }
+}
+
+/// Wait-capable counterpart of [`validate_user_range`].
+///
+/// Runtime async syscalls must not expose a concurrent VM materializer as
+/// `EIO`.  In particular, Rust's process launcher places the descriptor pair
+/// returned by `socketpair(2)` on its stack; another hart may briefly own that
+/// page's RangeLock while the launcher is creating a child.  Await the
+/// reservation and retry instead of treating that normal SMP conflict as an
+/// I/O failure.
+pub(super) async fn validate_user_range_wait<'a>(
+    ctx: &SyscallCtx<'a>,
+    uaddr: u64,
+    len: usize,
+    access: UserAccessKind,
+) -> Result<(), Errno> {
+    #[cfg(not(target_os = "none"))]
+    {
+        validate_user_range(ctx, uaddr, len, access)
+    }
+
+    #[cfg(target_os = "none")]
+    {
+        let range = covering_user_range(uaddr, len).ok_or(Errno::EFAULT)?;
+        ctx.aspace
+            .reserve_user_range_for_access_wait(range, access)
+            .await
     }
 }
 
@@ -1726,24 +1704,182 @@ pub(super) fn step_unit_result(outcome: StepOutcome<(), NoProgress>) -> SyscallR
     }
 }
 
-pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::RegisteredWaitFuture> {
+/// Wait-registry unification (Stage 1): a socket readiness wait that parks
+/// on the substrate `WaitSource` — the registry `epoll`/`await_wait_source`
+/// and the other fd subsystems already use — instead of the legacy
+/// subsystems `wait_on_token` registry. It mirrors the proven
+/// `RawQueueWaitFuture` shape exactly (fresh per-wait mailbox, lazy
+/// subscribe-on-first-poll, drop-safe unsubscribe, `Unpin`), so the ONLY
+/// behavioural change is WHICH registry the wait subscribes to. Socket
+/// carriers that have no substrate mirror yet (the urgent/OOB `RawPort`,
+/// which is never reached on the recv/send/accept/connect blocking paths)
+/// transparently fall back to the legacy path.
+pub(super) enum SocketReadyWait {
+    Substrate(SubstrateReadyWait),
+    Legacy(wait_source::RegisteredWaitFuture),
+}
+
+pub(super) struct SubstrateReadyWait {
+    source: alloc::sync::Arc<crate::adapter::reactor_entry::WaitSource>,
+    interests: crate::adapter::step_engine::InterestMask,
+    mailbox: alloc::sync::Arc<crate::adapter::reactor_entry::TaskMailbox>,
+    active: Option<crate::adapter::reactor_entry::ActiveWait>,
+    subscriber: Option<crate::adapter::reactor_entry::SubscriberId>,
+}
+
+impl SubstrateReadyWait {
+    fn new(
+        source: alloc::sync::Arc<crate::adapter::reactor_entry::WaitSource>,
+        interests: crate::adapter::step_engine::InterestMask,
+    ) -> Self {
+        Self {
+            source,
+            interests,
+            mailbox: alloc::sync::Arc::new(crate::adapter::reactor_entry::TaskMailbox::new()),
+            active: None,
+            subscriber: None,
+        }
+    }
+}
+
+impl core::future::Future for SubstrateReadyWait {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let this = self.get_mut();
+        this.mailbox.register_waker(cx.waker().clone());
+        if this.subscriber.is_none() {
+            // Lazy subscribe on first poll (matches `RawQueueWaitFuture`): a
+            // wait constructed but never awaited never touches the source.
+            // `register` delivers any already-pending mask to the fresh
+            // mailbox, closing the notify-before-subscribe race.
+            let generation = this.mailbox.next_generation();
+            this.active = Some(crate::adapter::reactor_entry::ActiveWait::new(
+                generation,
+                this.source.id(),
+                this.interests,
+            ));
+            let id = this.source.register(
+                alloc::sync::Arc::downgrade(&this.mailbox),
+                generation,
+                this.interests,
+            );
+            this.subscriber = Some(id);
+        }
+        while let Some(event) = this.mailbox.poll() {
+            if this
+                .active
+                .as_ref()
+                .is_some_and(|wait| wait.matches(&event))
+            {
+                return core::task::Poll::Ready(());
+            }
+        }
+        if this.mailbox.take_overflow() {
+            // Readiness is level-checked by the caller after this future
+            // resolves; overflow is therefore a safe conservative wake.
+            return core::task::Poll::Ready(());
+        }
+        core::task::Poll::Pending
+    }
+}
+
+impl Drop for SubstrateReadyWait {
+    fn drop(&mut self) {
+        if let Some(id) = self.subscriber.take() {
+            self.source.unregister(id);
+        }
+    }
+}
+
+impl core::future::Future for SocketReadyWait {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        match self.get_mut() {
+            SocketReadyWait::Substrate(future) => core::pin::Pin::new(future).poll(cx),
+            SocketReadyWait::Legacy(future) => core::pin::Pin::new(future).poll(cx).map(|_| ()),
+        }
+    }
+}
+
+/// Resolve a socket wait carrier to a [`SocketReadyWait`]: the substrate
+/// `WaitSource` when the carrier has a mirror (recv/send/accept — the
+/// common case), else the legacy `wait_on_token` registry.
+fn socket_ready_wait(source_id: u64, interest_bits: u64) -> Option<SocketReadyWait> {
+    let interests = crate::adapter::step_engine::InterestMask::new(interest_bits);
+    if let Some(source) = crate::adapter::reactor_entry::lookup_source(
+        crate::adapter::step_engine::WaitSourceId::new(source_id),
+    ) {
+        return Some(SocketReadyWait::Substrate(SubstrateReadyWait::new(
+            source, interests,
+        )));
+    }
+    let token = tx_subsystems::execution::WaitToken::new(source_id, interest_bits);
+    wait_source::wait_on_token(token).map(SocketReadyWait::Legacy)
+}
+
+pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<SocketReadyWait> {
     match shape {
         YieldShape::OnWaitSource { source, interests }
         | YieldShape::OnEdge { source, interests } => {
-            wait_source::wait_on_registered_source_id(source.raw(), interests.raw())
+            socket_ready_wait(source.raw(), interests.raw())
         }
         YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }
 }
 
+/// Build a [`SocketReadyWait`] from a raw poll wait token — the recv
+/// blocking arm that resolves its carrier via `step_poll_wait_token`.
+pub(super) fn socket_ready_wait_from_token(
+    token: tx_subsystems::execution::WaitToken,
+) -> Option<SocketReadyWait> {
+    socket_ready_wait(token.source_id(), token.interest())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SocketWaitWake {
     SocketReady,
-    ItimerExpired,
+    Interrupted,
 }
 
-pub(super) async fn wait_on_socket_or_itimer<P>(
-    mut socket_future: wait_source::RegisteredWaitFuture,
+fn socket_wait_interrupted(ctx: &SyscallCtx<'_>) -> bool {
+    tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process)
+}
+
+/// Wait for socket readiness under Linux's interruptible-sleep contract.
+///
+/// Socket readiness and POSIX signals have different publication sources, but
+/// they wake the same reactor task.  Re-check the authoritative interrupt
+/// predicate on every poll so a signal posted after wait registration aborts
+/// the slow syscall instead of leaving it parked on a socket-only mailbox.
+pub(super) async fn wait_on_socket_interruptible(
+    mut socket_future: SocketReadyWait,
+    ctx: &SyscallCtx<'_>,
+) -> SocketWaitWake {
+    if socket_wait_interrupted(ctx) {
+        return SocketWaitWake::Interrupted;
+    }
+    core::future::poll_fn(|cx| {
+        if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
+            return core::task::Poll::Ready(SocketWaitWake::SocketReady);
+        }
+        if socket_wait_interrupted(ctx) {
+            return core::task::Poll::Ready(SocketWaitWake::Interrupted);
+        }
+        core::task::Poll::Pending
+    })
+    .await
+}
+
+pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
+    mut socket_future: SocketReadyWait,
     ctx: &SyscallCtx<'_>,
 ) -> SocketWaitWake
 where
@@ -1756,36 +1892,40 @@ where
     // consumed at a syscall boundary leaves busybox ping's blocking recvfrom
     // with no armed deadline AND a pending SIGALRM: it parked until unrelated
     // traffic woke the socket (observed as a 361s stall in if-updown).
-    if tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process) {
-        return SocketWaitWake::ItimerExpired;
+    if socket_wait_interrupted(ctx) {
+        return SocketWaitWake::Interrupted;
     }
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
-        return SocketWaitWake::ItimerExpired;
+        return SocketWaitWake::Interrupted;
     }
     let Some(deadline_ns) = super::time::itimer_real_deadline_ns(pid) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
+        return wait_on_socket_interruptible(socket_future, ctx).await;
     };
     if timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns {
         super::time::fire_itimer_real_with_post::<P>(ctx);
-        return SocketWaitWake::ItimerExpired;
+        return SocketWaitWake::Interrupted;
     }
     let Some(mut timer_future) = super::deadline_timer(ctx, deadline_ns) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
+        return wait_on_socket_interruptible(socket_future, ctx).await;
     };
 
     let wake = core::future::poll_fn(|cx| {
         if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
             return core::task::Poll::Ready(SocketWaitWake::SocketReady);
         }
+        if socket_wait_interrupted(ctx) {
+            return core::task::Poll::Ready(SocketWaitWake::Interrupted);
+        }
         if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
-            return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
+            return core::task::Poll::Ready(SocketWaitWake::Interrupted);
         }
         core::task::Poll::Pending
     })
     .await;
-    if wake == SocketWaitWake::ItimerExpired {
+    if wake == SocketWaitWake::Interrupted
+        && !socket_wait_interrupted(ctx)
+        && timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns
+    {
         super::time::fire_itimer_real_with_post::<P>(ctx);
     }
     wake

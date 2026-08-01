@@ -126,7 +126,7 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
         {
             Ok(inode) => match fs.resolve_inode_block(&inode, 0).await? {
                 BlockMapping::Data(block) => Some(block),
-                BlockMapping::Hole | BlockMapping::NeedNode(_) => None,
+                BlockMapping::Hole | BlockMapping::Unwritten(_) | BlockMapping::NeedNode(_) => None,
             },
             Err(_) => None,
         };
@@ -188,7 +188,7 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
                     page,
                 })
             }
-            BlockMapping::Hole => Ok(PageFetch {
+            BlockMapping::Hole | BlockMapping::Unwritten(_) => Ok(PageFetch {
                 source: FetchSource::Hole,
                 page: [0; BLOCK_SIZE],
             }),
@@ -209,7 +209,7 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
             .await?
         {
             BlockMapping::Data(block) => block,
-            BlockMapping::Hole | BlockMapping::NeedNode(_) => {
+            BlockMapping::Unwritten(_) | BlockMapping::Hole | BlockMapping::NeedNode(_) => {
                 return Err(Ext4FormatError::Unsupported)
             }
         };
@@ -234,7 +234,7 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
                 .await?
             {
                 BlockMapping::Data(block) => block,
-                BlockMapping::Hole => continue,
+                BlockMapping::Hole | BlockMapping::Unwritten(_) => continue,
                 BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             };
             let mut page = [0u8; BLOCK_SIZE];

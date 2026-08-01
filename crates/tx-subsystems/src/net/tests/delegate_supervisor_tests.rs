@@ -43,9 +43,9 @@ fn net_delegate_supervisor_timer_wake_fires_tick_for_current_generation() {
         .refresh_deadline(Some(smoltcp::time::Instant::from_millis(3)))
         .expect("timer arm");
     let reactor = Reactor::new();
-    let timer_registrar = reactor.deadline_registrar_handle();
+    let timer_channel = reactor.channel();
     reactor.submit(async move {
-        let wake = net_delegate_wait_supervised_deadline(&timer_registrar, arm).await;
+        let wake = net_delegate_wait_supervised_deadline(timer_channel, arm).await;
         assert_eq!(wake.generation, arm.generation);
         assert_eq!(wake.outcome, WaitOutcome::TimedOut);
         assert!(wake.tick_fired);

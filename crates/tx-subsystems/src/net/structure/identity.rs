@@ -1,6 +1,9 @@
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use tx_substrate::bus::RawPort;
 use tx_substrate::zone::PayloadCap;
 
+use crate::net::adapter::wait_routing;
 use crate::sync::SpinMutex;
 use crate::wait_source;
 
@@ -21,6 +24,10 @@ pub struct SocketIdentity {
     pub readiness: SocketReadiness,
     pub wait_carriers: SocketWaitCarriers,
     pub urgent_port: RawPort,
+    /// Number of user-visible fd-table entries referring to this socket's
+    /// open-file description.  Capability clones are kernel lifetime pins,
+    /// not dup/fork descriptors, so they must not decide last-close.
+    fd_refs: AtomicU32,
     pub(crate) payload: SpinMutex<Option<PayloadCap<SocketPayload>>>,
 }
 
@@ -40,6 +47,10 @@ impl SocketIdentity {
             readiness,
             wait_carriers,
             urgent_port,
+            // A newly-created socket/open-file pair represents its first fd.
+            // dup/fork accounting is adjusted alongside the existing pipe fd
+            // accounting in ProcessPayload.
+            fd_refs: AtomicU32::new(1),
             payload: SpinMutex::new(None),
         }
     }
@@ -62,6 +73,29 @@ impl SocketIdentity {
 
     pub fn is_payload_live(&self) -> bool {
         self.live_payload().is_some()
+    }
+
+    pub(crate) fn incr_fd_ref(&self) {
+        self.fd_refs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn decr_fd_ref(&self) {
+        let mut current = self.fd_refs.load(Ordering::Acquire);
+        while current != 0 {
+            match self.fd_refs.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn fd_ref_count(&self) -> u32 {
+        self.fd_refs.load(Ordering::Acquire)
     }
 
     pub(crate) fn with_payload_for_check<R>(
@@ -88,12 +122,36 @@ const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
 }
 
 impl SocketWaitCarriers {
+    /// P3-S1 (R4a): dual-register every readiness carrier under ONE id
+    /// from the v3 notification namespace — the subsystems registry (for
+    /// `wait_on_token`: ppoll/pselect and the legacy socket park paths)
+    /// AND the substrate registry (for `await_wait_source`: epoll).
+    /// Mirrors the eventfd pattern (`eventfd/notification.rs`
+    /// `new_wait_points`). Before this, epoll looked socket carriers up
+    /// in a registry they were never in, so `epoll_wait` on a
+    /// pure-socket set returned 0 immediately instead of blocking.
     fn register(readiness: &SocketReadiness, urgent_port: &RawPort) -> Self {
+        let recv = crate::allocate_notification_source_id();
+        let send = crate::allocate_notification_source_id();
+        let accept = crate::allocate_notification_source_id();
+        let urgent = crate::allocate_notification_source_id();
+
+        wait_source::register_wait_queue_with_id(recv, readiness.recv_wq.clone());
+        wait_source::register_wait_queue_with_id(send, readiness.send_wq.clone());
+        wait_source::register_wait_queue_with_id(accept, readiness.accept_wq.clone());
+        wait_source::register_wait_port_with_id(urgent, urgent_port.clone());
+
+        readiness.install_substrate_mirrors(
+            wait_routing::new_wait_source(recv),
+            wait_routing::new_wait_source(send),
+            wait_routing::new_wait_source(accept),
+        );
+
         Self {
-            recv: wait_source::register_wait_queue(readiness.recv_wq.clone()),
-            send: wait_source::register_wait_queue(readiness.send_wq.clone()),
-            accept: wait_source::register_wait_queue(readiness.accept_wq.clone()),
-            urgent: wait_source::register_wait_port(urgent_port.clone()),
+            recv,
+            send,
+            accept,
+            urgent,
         }
     }
 
@@ -102,6 +160,9 @@ impl SocketWaitCarriers {
         wait_source::release_wait_source(self.send);
         wait_source::release_wait_source(self.accept);
         wait_source::release_wait_source(self.urgent);
+        wait_routing::unregister_source(self.recv);
+        wait_routing::unregister_source(self.send);
+        wait_routing::unregister_source(self.accept);
     }
 }
 

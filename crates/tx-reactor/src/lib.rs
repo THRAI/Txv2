@@ -54,7 +54,7 @@ pub use scheduler::{
 };
 pub use task::{
     current_deadline_registrar, current_delegate_registry, current_task_mailbox, TaskDrainRecord,
-    TaskId, TaskKey, TaskLifecycleError, TaskStatus,
+    TaskId, TaskKey, TaskLifecycleError, TaskRuntimeDiagnostic, TaskStatus,
 };
 pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};
 pub use yield_now::{yield_now, YieldNow};

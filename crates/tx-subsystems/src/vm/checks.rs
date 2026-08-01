@@ -48,6 +48,18 @@ pub fn require_fault_publication(
     if entry.private.map(|private| private.raw()) != outcome.private_identity {
         return Err(VmFaultError::StaleRecipe);
     }
+    // Resolve and final materialization are separated by optional async work.
+    // Once the final page-level Materializer is acquired, revalidate the
+    // private-page winner before publishing; an earlier observation may have
+    // gone stale while no reservation was held.
+    if let Some(private) = outcome.entry.private() {
+        let page_off = outcome.private_page_off()?;
+        if let Some(current) = private.lookup(page_off) {
+            if current.ppn != materialization.page.ppn {
+                return Err(VmFaultError::StaleRecipe);
+            }
+        }
+    }
 
     match (entry.backing, materialization.backing) {
         (VmEntryBacking::None, VmFaultMaterializationBacking::Special(special)) => {

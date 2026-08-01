@@ -1,23 +1,20 @@
-//! Generic pmap range helpers.
+//! 通用 pmap 页范围助手（契约层）。
 //!
-//! Core data structures/state maintained here:
-//! - `PmapRangeReservation<P, N>`: a stack-backed, no-allocation transaction
-//!   holding up to `N` reserved `PmapReservation`s.
-//! - caller-provided output slices for unmap/protect evidence; this module does
-//!   not allocate result buffers.
+//! 这里维护的核心数据结构/状态：
+//! - `PmapRangeReservation<P, N>`：栈上、无堆分配的事务，最多持有 `N` 个已预约的
+//!   `PmapReservation`。
+//! - unmap/protect 证据由调用方提供输出切片；本模块不分配结果缓冲区。
 //!
-//! Main data-flow functions:
-//! - `reserve_page_range()` reserves a contiguous 4 KiB range and returns the
-//!   transaction object.
-//! - `PmapRangeReservation::commit()` publishes all reserved pages.
-//! - `Drop` for `PmapRangeReservation` rolls back any uncommitted prefix.
-//! - `unmap_page_range()` and `protect_page_range()` collect per-page evidence
-//!   for later shootdown/accounting.
+//! 主要的数据流函数：
+//! - `reserve_page_range()`：预约一段连续的 4 KiB 范围并返回事务对象。
+//! - `PmapRangeReservation::commit()`：提交（发布）全部已预约的页。
+//! - `PmapRangeReservation` 的 `Drop`：回滚任何尚未提交的前缀。
+//! - `unmap_page_range()` 与 `protect_page_range()`：逐页收集证据，供后续
+//!   shootdown/计数使用。
 //!
-//! Helper logic is limited to checked page stepping, output initialization, and
-//! error normalization. Boards still own concrete page-table walks and PTE
-//! updates; VM still owns range locks and rematerialization policy. See
-//! `docs/progress/decisions/2026-04-29-hal-pmap-surface-refactor.md`.
+//! 辅助逻辑仅限于带溢出检查的翻页步进、输出初始化和错误归一化。具体的页表遍历与
+//! PTE 更新仍归板卡所有；范围锁和重物化策略仍归 VM 所有。参见
+//! `docs/progress/decisions/2026-04-29-hal-pmap-surface-refactor.md`。
 
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
@@ -27,15 +24,17 @@ use super::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, VirtAddr,
 };
 
+/// 4 KiB 页大小。
 const PAGE_SIZE_4K: usize = 4096;
 
+/// 页范围操作的错误类型。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PmapRangeError {
-    EmptyRange,
-    BufferTooSmall,
-    AddressOverflow,
-    Pmap(PmapError),
-    MissingReservation,
+    EmptyRange,         // 页数为 0。
+    BufferTooSmall,     // 页数超过 N 或输出切片容量。
+    AddressOverflow,    // 虚/物地址步进时溢出。
+    Pmap(PmapError),    // 底层 pmap 返回的错误。
+    MissingReservation, // reserve_mapping 返回 None（预期有预约却没有）。
 }
 
 impl From<PmapError> for PmapRangeError {
@@ -44,11 +43,10 @@ impl From<PmapError> for PmapRangeError {
     }
 }
 
-/// Stack-backed reservation transaction for a page range.
+/// 一段页范围的栈上预约事务。
 ///
-/// Entries are stored in `MaybeUninit` so callers can reserve up to `N` pages
-/// without heap allocation. Dropping an uncommitted value rolls back the
-/// reserved prefix through the platform pmap.
+/// 条目存放在 `MaybeUninit` 中，故调用方最多可预约 `N` 页而无需堆分配。丢弃一个
+/// 尚未提交的值会通过平台 pmap 回滚已预约的前缀。
 pub struct PmapRangeReservation<'a, P: PmapIf, const N: usize> {
     root: &'a PmapRoot,
     entries: [MaybeUninit<PmapReservation>; N],
@@ -58,6 +56,7 @@ pub struct PmapRangeReservation<'a, P: PmapIf, const N: usize> {
 }
 
 impl<'a, P: PmapIf, const N: usize> PmapRangeReservation<'a, P, N> {
+    /// 新建一个空事务，绑定到给定页表根。
     fn new(root: &'a PmapRoot) -> Self {
         Self {
             root,
@@ -68,22 +67,26 @@ impl<'a, P: PmapIf, const N: usize> PmapRangeReservation<'a, P, N> {
         }
     }
 
+    /// 当前已预约的页数。
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// 是否尚无任何预约。
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// 追加一个预约到栈上数组并递增计数。
     fn push(&mut self, reservation: PmapReservation) {
         self.entries[self.len].write(reservation);
         self.len += 1;
     }
 
+    /// 提交全部预约：先清零 len 让 Drop 不再回滚，再逐个正式建立映射。
     pub fn commit(mut self, permissions: PmapPermissions) -> usize {
         let len = self.len;
-        self.len = 0;
+        self.len = 0; // 置 0：一旦开始提交，Drop 就不应再回滚这些条目。
         for index in 0..len {
             let reservation = unsafe { self.entries[index].assume_init_read() };
             P::commit_mapping(self.root, reservation, permissions);
@@ -93,6 +96,7 @@ impl<'a, P: PmapIf, const N: usize> PmapRangeReservation<'a, P, N> {
 }
 
 impl<P: PmapIf, const N: usize> Drop for PmapRangeReservation<'_, P, N> {
+    /// RAII 回滚：未提交（commit 未消费）时，逐个撤销已预约的前缀。
     fn drop(&mut self) {
         for index in 0..self.len {
             let reservation = unsafe { self.entries[index].assume_init_read() };
@@ -102,9 +106,10 @@ impl<P: PmapIf, const N: usize> Drop for PmapRangeReservation<'_, P, N> {
     }
 }
 
-// Range operations are intentionally page-sized v1 helpers. They collect
-// unmap/protect results into caller-provided slices so substrate or VM can pair
-// invalidations with map-count release after shootdown.
+// 范围操作刻意是页大小的 v1 版助手。它们把 unmap/protect 结果收集进调用方提供的
+// 切片，以便 substrate 或 VM 在 shootdown 后将失效与 map-count 释放配对。
+
+/// 预约一段连续的 4 KiB 范围，返回可提交/可回滚的事务对象。
 pub fn reserve_page_range<'a, P: PmapIf, const N: usize>(
     root: &'a PmapRoot,
     virt: VirtAddr,
@@ -120,6 +125,7 @@ pub fn reserve_page_range<'a, P: PmapIf, const N: usize>(
 
     let mut range = PmapRangeReservation::<P, N>::new(root);
     for index in 0..pages {
+        // 逐页步进：偏移与虚/物地址均带溢出检查。
         let offset = index
             .checked_mul(PAGE_SIZE_4K)
             .ok_or(PmapRangeError::AddressOverflow)?;
@@ -133,6 +139,7 @@ pub fn reserve_page_range<'a, P: PmapIf, const N: usize>(
                 .checked_add(offset)
                 .ok_or(PmapRangeError::AddressOverflow)?,
         );
+        // 单页预约；出错时 range 的 Drop 会自动回滚已攒下的前缀。
         let reservation = P::reserve_mapping(root, page_virt, page_phys, PmapReserveKind::Page4K)?
             .ok_or(PmapRangeError::MissingReservation)?;
         range.push(reservation);
@@ -140,6 +147,7 @@ pub fn reserve_page_range<'a, P: PmapIf, const N: usize>(
     Ok(range)
 }
 
+/// 解除一段页范围的映射，逐页把 unmap 结果写入调用方的 out 切片，返回条目数。
 pub fn unmap_page_range<P: PmapIf>(
     root: &PmapRoot,
     virt: VirtAddr,
@@ -155,7 +163,7 @@ pub fn unmap_page_range<P: PmapIf>(
 
     let mut len = 0;
     for slot in out.iter_mut().take(pages) {
-        *slot = None;
+        *slot = None; // 先把输出槽清空。
     }
     for index in 0..pages {
         let offset = index
@@ -166,6 +174,7 @@ pub fn unmap_page_range<P: PmapIf>(
                 .checked_add(offset)
                 .ok_or(PmapRangeError::AddressOverflow)?,
         );
+        // 只有产生失效证据的页才紧凑写入 out（未映射页跳过）。
         if let Some(result) = P::unmap_mapping(root, page_virt, PmapReserveKind::Page4K)? {
             out[len] = Some(result);
             len += 1;
@@ -174,6 +183,7 @@ pub fn unmap_page_range<P: PmapIf>(
     Ok(len)
 }
 
+/// 修改一段页范围的权限，逐页把失效证据写入 out 切片，返回条目数。
 pub fn protect_page_range<P: PmapIf>(
     root: &PmapRoot,
     virt: VirtAddr,
@@ -190,7 +200,7 @@ pub fn protect_page_range<P: PmapIf>(
 
     let mut len = 0;
     for slot in out.iter_mut().take(pages) {
-        *slot = None;
+        *slot = None; // 先把输出槽清空。
     }
     for index in 0..pages {
         let offset = index
@@ -201,6 +211,7 @@ pub fn protect_page_range<P: PmapIf>(
                 .checked_add(offset)
                 .ok_or(PmapRangeError::AddressOverflow)?,
         );
+        // 只有真正改动权限产生失效的页才紧凑写入 out。
         if let Some(invalidation) =
             P::protect_mapping(root, page_virt, PmapReserveKind::Page4K, permissions)?
         {

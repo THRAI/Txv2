@@ -1,17 +1,7 @@
-use alloc::sync::Arc;
-use core::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
 use smoltcp::time::Instant;
-use tx_reactor::wait::WaitOutcome;
-use tx_services::time::{
-    DeadlineNs, DeadlineRegistrar, TimerGuard, TimerRole, TimerTarget, TimerToken,
-};
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
+use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 
-use super::net_delegate_kick_tick_with_post;
+use super::net_delegate_kick_tick;
 
 /// Convert a smoltcp-relative deadline into the reactor's absolute
 /// nanosecond clock domain.
@@ -29,68 +19,19 @@ pub fn smoltcp_instant_to_reactor_deadline_ns(
 }
 
 /// Arm a reactor timeout that publishes a delegate TICK when it expires.
-pub async fn net_delegate_wait_tick_deadline<R>(
-    timer_registrar: &R,
+pub async fn net_delegate_wait_tick_deadline(
+    timer_channel: Channel,
     deadline_ns: u64,
-) -> WaitOutcome
-where
-    R: DeadlineRegistrar + ?Sized,
-{
-    let outcome = NetDelegateDeadlineFuture::new(timer_registrar, deadline_ns).await;
+) -> WaitOutcome {
+    let outcome = timer_channel
+        .wait_event(
+            Mask::from_bits(0),
+            WaitProtocol::InterruptibleTimeout(deadline_ns),
+            || false,
+        )
+        .await;
     if matches!(outcome, WaitOutcome::TimedOut) {
-        net_delegate_kick_tick_with_post(|mailbox, event| mailbox.post(event));
+        net_delegate_kick_tick();
     }
     outcome
-}
-
-struct NetDelegateDeadlineFuture {
-    mailbox: Arc<TaskMailbox>,
-    guard: Option<TimerGuard>,
-    token: Option<TimerToken>,
-}
-
-impl NetDelegateDeadlineFuture {
-    fn new<R>(registrar: &R, deadline_ns: u64) -> Self
-    where
-        R: DeadlineRegistrar + ?Sized,
-    {
-        let mailbox = Arc::new(TaskMailbox::new());
-        let guard = registrar
-            .register_deadline(
-                DeadlineNs::new(deadline_ns),
-                TimerRole::DeadlineAbort,
-                TimerTarget::TaskMailbox(Arc::downgrade(&mailbox)),
-            )
-            .expect("net delegate deadline registration failed");
-        let token = guard.token();
-        Self {
-            mailbox,
-            guard: Some(guard),
-            token: Some(token),
-        }
-    }
-}
-
-impl Unpin for NetDelegateDeadlineFuture {}
-
-impl Future for NetDelegateDeadlineFuture {
-    type Output = WaitOutcome;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        this.mailbox.register_waker(cx.waker().clone());
-
-        while let Some(event) = this.mailbox.poll() {
-            if let MailboxEvent::TimerFired { token } = event {
-                if Some(token) == this.token {
-                    this.guard = None;
-                    this.token = None;
-                    this.mailbox.clear_waker();
-                    return Poll::Ready(WaitOutcome::TimedOut);
-                }
-            }
-        }
-
-        Poll::Pending
-    }
 }

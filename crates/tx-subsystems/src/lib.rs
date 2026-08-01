@@ -40,6 +40,7 @@ pub mod vdso;
 pub mod vfs;
 pub mod vm;
 pub mod wait_source;
+pub mod wall_clock;
 pub mod zones;
 
 static NEXT_NOTIFICATION_SOURCE_ID: AtomicU64 = AtomicU64::new(1 << 32);

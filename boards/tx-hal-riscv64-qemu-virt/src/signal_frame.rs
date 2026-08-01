@@ -251,10 +251,8 @@ impl SignalFrameIf for Platform {
         let frame = Rv64SignalFrame::new(&tf, &setup);
         let user_frame = UserPtr::<Rv64SignalFrame>::new(frame_addr);
 
-        // SAFETY: the stack address was selected by signal delivery policy as
-        // a user stack. `board_copy_to_user` performs the actual user copy
-        // through the SUM/fixup-table primitive and converts faults into
-        // FaultInfo.
+        // SAFETY: the selected stack is userspace memory and the board copy
+        // primitive converts access faults into FaultInfo.
         unsafe {
             let frame_ptr: *const Rv64SignalFrame = &frame;
             let bytes =
@@ -285,9 +283,8 @@ impl SignalFrameIf for Platform {
     }
 
     fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
-        // SAFETY: sigreturn supplies the current user SP.
-        // `board_copy_from_user` performs the checked copy through the
-        // SUM/fixup-table primitive and reports any bad frame pointer.
+        // SAFETY: sigreturn supplies the current userspace stack pointer and
+        // the board copy primitive validates the access.
         let mut frame = core::mem::MaybeUninit::<Rv64SignalFrame>::uninit();
         let frame = unsafe {
             let dst = core::slice::from_raw_parts_mut(
@@ -342,7 +339,11 @@ impl SignalFrameIf for Platform {
         setup: &SignalFrameWrite,
     ) -> Result<(UserTrapContext, SignalFrameBytes), FaultInfo> {
         let frame_size = size_of::<Rv64SignalFrame>();
-        let user_sp = UserPtr::<u8>::new(ctx.regs[2]); // sp = x2
+        // `thread_future` has already selected either the interrupted stack or
+        // the registered SA_ONSTACK alternate stack.  The architecture layer
+        // must honour that placement; using ctx.sp here silently ignored
+        // sigaltstack and made nested handlers overwrite unrelated frames.
+        let user_sp = setup.stack_top;
 
         let Some(unrounded) = user_sp.addr().checked_sub(frame_size) else {
             return Err(FaultInfo {

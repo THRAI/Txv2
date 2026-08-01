@@ -10,19 +10,19 @@ use alloc::vec::Vec;
 
 use crate::execution::{Errno, Guard};
 use crate::mount::MountNamespace;
-use crate::vfs::FsOps;
 use crate::vfs::adapter::step_engine::Cap;
 use crate::vfs::structure::{Credential, DEntry};
 use crate::vfs::walker;
+use crate::vfs::FsOps;
 
 use super::error::classify;
 use super::state::{
-    FinalSymlinkPolicy, IORequest, IOResult, KernelStep, PathResolution, ResumeToken, WalkCause,
-    WalkMode, WalkState, WalkingState, try_copy_path,
+    try_copy_path, FinalSymlinkPolicy, IORequest, IOResult, KernelStep, PathResolution,
+    ResumeToken, WalkCause, WalkMode, WalkState, WalkingState,
 };
 use super::step::{
-    TerminalRules, kernel_step, kernel_step_after_lookup_io, kernel_step_after_materialise_io,
-    kernel_step_after_meta_io, kernel_step_after_readlink_io,
+    kernel_step, kernel_step_after_lookup_io, kernel_step_after_materialise_io,
+    kernel_step_after_meta_io, kernel_step_after_readlink_io, TerminalRules,
 };
 
 /// Drive a walk from start to terminal, synchronously.

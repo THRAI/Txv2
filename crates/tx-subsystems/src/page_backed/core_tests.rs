@@ -3505,6 +3505,7 @@ fn vfs_fsync_op_waits_for_page_container_planner_completion() {
         2,
         planner,
     );
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7104))));
     let mut op = crate::vfs::FileFsyncOp {
         page_backing: fs,
         fs_object_id: FsObjectId::new(103),
@@ -3519,6 +3520,33 @@ fn vfs_fsync_op_waits_for_page_container_planner_completion() {
             .expect("fsync service drive");
     }
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
+}
+
+#[test]
+fn vfs_fsync_op_without_service_runtime_uses_synchronous_backing() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(104),
+        2,
+        planner,
+    );
+    assert!(!pc.has_file_io_service_runtime());
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs,
+        fs_object_id: FsObjectId::new(104),
+        page_container: Some(pc.clone()),
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(op.step(&mut ctx), V3Out::done(()));
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
 }
 
 #[test]
@@ -3685,6 +3713,22 @@ fn reclaim_clean_file_pages_drops_clean_cache_entries() {
     assert_eq!(pc.reclaim_clean_file_pages(1), 1);
     assert_eq!(pc.resident_pages(), 0);
     assert!(page_allocator::acquire_map_pin(ppn).is_err());
+}
+
+#[test]
+fn file_page_container_has_no_artificial_page_count_limit() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(57), 4);
+
+    assert_eq!(pc.page_count(), 4, "initial cache window remains unchanged");
+    assert_eq!(pc.byte_capacity(), Some(u64::MAX));
+    assert_eq!(
+        pc.check_bounds(PageIndex::new(65536)),
+        Ok(()),
+        "regular files must be able to grow beyond the former 256 MiB limit"
+    );
 }
 
 #[test]

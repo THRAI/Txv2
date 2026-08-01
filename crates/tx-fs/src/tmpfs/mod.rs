@@ -1123,6 +1123,28 @@ impl FsOps for Tmpfs {
 }
 
 impl FsPageBacking for Tmpfs {
+    fn filesystem_stats(
+        &self,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<tx_subsystems::page_backed::FilesystemStats, NoProgress> {
+        let diagnostics = match tx_substrate::page_allocator::backend_diagnostics() {
+            Ok(diagnostics) => diagnostics,
+            Err(_) => return StepOutcome::err(step_engine::Errno::EIO),
+        };
+        let inode_count = self.state.lock().inodes.len() as u64;
+        let total = diagnostics.total_count as u64;
+        let free = diagnostics.free_count as u64;
+        StepOutcome::done(tx_subsystems::page_backed::FilesystemStats {
+            block_size: tx_subsystems::vm::USER_PAGE_SIZE as u64,
+            total_blocks: total,
+            free_blocks: free,
+            available_blocks: free,
+            total_inodes: total,
+            free_inodes: total.saturating_sub(inode_count),
+            max_name_len: VFS_NAME_MAX as u64,
+        })
+    }
+
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,

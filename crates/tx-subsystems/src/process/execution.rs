@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tx_hal::{PmapIf, UserTrapContext};
 
 use crate::cred::Cred;
+use crate::page_backed::PageContainer;
 use crate::process::adapter::step_engine::{
     self, process_spin_mutex, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt,
     PayloadCap, ProcessSpinMutex, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak,
@@ -24,9 +25,7 @@ use crate::process::topology::{
 use crate::signal::{
     sync_thread_group_pending_summary, PendingSignalQueue, SigActionTable, SignalMask,
 };
-use crate::thread_runtime::execution::{
-    notify_thread_exit_userspace_in_aspace, set_thread_zombie_with_post,
-};
+use crate::thread_runtime::execution::post_signal_mailbox_with_post;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
@@ -50,6 +49,13 @@ pub(crate) const PROCESS_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
     b"debug.lock_service.process.payload.robust.pending.duration_ns",
     b"debug.lock_service.process.payload.robust.entry_count",
 ];
+
+/// Dirty file containers retained after a close-time synchronous flush could
+/// not finish.  Descriptor removal is already committed at that point, so the
+/// cache object itself must stay alive until a later close/exit retries it.
+/// The lock only protects this bounded-work retry list and is never held while
+/// filesystem or block-I/O code runs.
+static DEFERRED_PAGE_WRITEBACKS: SpinMutex<Vec<Cap<PageContainer>>> = SpinMutex::new(Vec::new());
 
 #[inline(always)]
 pub(crate) fn measure_process_lock_service<R>(name: &'static [u8], f: impl FnOnce() -> R) -> R {
@@ -91,8 +97,7 @@ pub(crate) fn emit_process_lock_service_trace(name: &'static [u8], value: i64) {
 
 use crate::process::numbers::{
     allocate_pid, register_pgrp, register_pid as ns_register_pid, register_session, register_tid,
-    resolve_pid_number_as, unregister_pid_number, unregister_tid_number, with_namespace, PidName,
-    PidNameKind,
+    resolve_pid_number_as, unregister_pid_number, with_namespace, PidName, PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -447,6 +452,50 @@ pub fn step_fork_with_options<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
     options: ForkOptions,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
+    step_fork_with_prepared_aspace::<P>(parent, options, None)
+}
+
+/// Wait-capable process-fork path used by Linux clone/fork syscalls.
+///
+/// Only the detached address-space preparation may suspend. PID allocation,
+/// fd-reference accounting, and parent/child publication remain in the
+/// one-shot commit below, so a RangeLock retry cannot publish a partial child.
+pub async fn fork_with_options_wait<P: PmapIf>(
+    parent: &Cap<ProcessIdentity>,
+    options: ForkOptions,
+) -> Result<Cap<ProcessIdentity>, ForkError> {
+    if options.clone_vm {
+        return step_fork_with_prepared_aspace::<P>(parent, options, None);
+    }
+
+    loop {
+        let parent_aspace = {
+            let payload_guard = parent.payload.lock();
+            let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+            payload.aspace_cap()
+        };
+        let child_aspace = AddressSpace::fork_aspace_wait::<P>(&parent_aspace).await?;
+        let child_aspace = step_engine::sign(child_aspace)?;
+
+        match step_fork_with_prepared_aspace::<P>(
+            parent,
+            options,
+            Some((parent_aspace, child_aspace)),
+        ) {
+            // Exec replaced the authoritative parent aspace while the
+            // detached child clone was being prepared. Nothing was published,
+            // so discard it and restart from the new parent state.
+            Err(ForkError::Busy) => continue,
+            other => return other,
+        }
+    }
+}
+
+fn step_fork_with_prepared_aspace<P: PmapIf>(
+    parent: &Cap<ProcessIdentity>,
+    options: ForkOptions,
+    prepared_aspace: Option<(Cap<AddressSpace>, Cap<AddressSpace>)>,
+) -> Result<Cap<ProcessIdentity>, ForkError> {
     // observe
     // upgrade
     // reserve
@@ -479,13 +528,21 @@ pub fn step_fork_with_options<P: PmapIf>(
     ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+        let parent_aspace = payload.aspace_cap();
+        if prepared_aspace
+            .as_ref()
+            .is_some_and(|(expected_parent, _)| expected_parent != &parent_aspace)
+        {
+            return Err(ForkError::Busy);
+        }
+        let (parent_fds, parent_fd_cloexec) = payload.clone_fd_state_for_fork();
         (
-            payload.aspace_cap(),
+            parent_aspace,
             payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd_state(),
-            payload.clone_fds_for_fork(),
-            payload.fd_cloexec_snapshot(),
+            parent_fds,
+            parent_fd_cloexec,
             payload.rlimit_nofile(),
             payload.rlimit_memlock(),
             payload.net_namespace(),
@@ -512,6 +569,8 @@ pub fn step_fork_with_options<P: PmapIf>(
     // Address space: fork (CoW clone) or share (CLONE_VM).
     let child_aspace_cap = if options.clone_vm {
         parent_aspace.clone()
+    } else if let Some((_expected_parent, child_aspace)) = prepared_aspace {
+        child_aspace
     } else {
         let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
         step_engine::sign(child_aspace)?
@@ -963,6 +1022,26 @@ pub enum ProcessExitOutcome {
     Retry,
 }
 
+pub fn group_exit_status(process: &Cap<ProcessIdentity>) -> Option<ExitStatus> {
+    let payload = process.payload.lock().as_ref().cloned()?;
+    let status = payload.group_exit.lock().as_ref().map(|state| state.status);
+    status
+}
+
+/// Complete the current thread's side of a previously published group exit.
+/// The process episode owns the status; the thread path only tears down this
+/// participant and lets the last-thread cascade finish shared resources.
+pub fn step_current_thread_group_exit(thread: &Cap<ThreadIdentity>) {
+    if thread.payload_cap().is_none() {
+        return;
+    }
+    let Some(process) = thread.upgrade_owner_proc() else {
+        return;
+    };
+    let status = group_exit_status(&process).unwrap_or(ExitStatus::Exited(0));
+    crate::thread_runtime::execution::step_thread_exit_with_status(thread.clone(), status);
+}
+
 pub fn step_exit_group_with_posts<F, G>(
     process: &Cap<ProcessIdentity>,
     status: ExitStatus,
@@ -997,80 +1076,40 @@ where
     }
     after_reserve();
     payload.notify_vfork_done();
-    // upgrade
-    // reserve
-    // commit
-    // publish
-    session_leader_hangup_cascade(process, &mut signal_post, &mut wake_post);
-    sever_children(process);
-    crate::ipc::sysv_sem::execution::step_sem_undo_with_post(process, |mailbox, event| {
-        wake_post(mailbox, event)
-    });
-
-    let mut exit_aspace = None;
-    let mut closed_fds = BTreeMap::new();
-    let mut drained: Vec<Cap<ThreadIdentity>> = Vec::new();
-    {
-        let payload_guard = process.payload.lock();
-        if let Some(payload) = payload_guard.as_ref() {
-            exit_aspace = Some(payload.aspace_cap());
-            closed_fds = measure_process_lock_service(
-                b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
-                || payload.drain_fds(),
-            );
-            drained = measure_process_lock_service(
-                b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
-                || payload.threads.drain(),
+    // Installing GroupExit and attaching a CLONE_THREAD participant share
+    // `payload.group_exit`, so this snapshot is closed: no new thread can be
+    // published after the episode starts.  Do not tear down the address space,
+    // fd table, or thread payloads from this hart.  Each thread observes the
+    // termination summary and commits its own exit; the last participant alone
+    // runs `step_process_exit` and releases process-owned resources.
+    let threads = payload.threads.snapshot();
+    for thread in &threads {
+        if let Some(thread_payload) = thread.payload_cap() {
+            thread_payload.update_summary(|summary| summary.termination = true);
+            thread_payload.wake_lifecycle_task();
+            let _ = post_signal_mailbox_with_post(
+                &thread_payload,
+                crate::signal::Signum::SIGKILL,
+                tx_substrate::wake::SignalRouting::ProcessDirected,
+                &mut signal_post,
             );
         }
     }
 
-    if let Some(aspace) = exit_aspace {
-        let _shm_detach = measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
-            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
-        );
-        close_socket_files_for_process_exit(&closed_fds);
-        measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
-            || {
-                for thread in &drained {
-                    notify_thread_exit_userspace_in_aspace(thread, &aspace);
-                    set_thread_zombie_with_post(
-                        thread,
-                        status.wait_status_word(),
-                        &mut signal_post,
-                    );
-                    if thread.tid.0 != process.pid.0 {
-                        unregister_tid_number(thread.tid.0 as u64);
-                    }
-                }
-            },
-        );
-        measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
-            || {
-                drop(closed_fds);
-                drop(drained);
-            },
-        );
+    // Host tests have no reactor tasks to consume lifecycle wakeups. Drive the
+    // same per-thread exit path synchronously so existing process tests still
+    // observe a completed zombie rather than a half-published episode.
+    #[cfg(any(test, feature = "test-support"))]
+    for thread in threads {
+        let _ = crate::thread_runtime::execution::step_thread_exit_with_status(thread, status);
     }
-    {
-        let mut payload_guard = process.payload.lock();
-        measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
-            || *payload_guard = None,
-        );
-    }
-    *process.exit_status.lock() = Some(status);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = threads;
 
-    if try_auto_reap_adopted_by_init(process) {
-        return ProcessExitOutcome::Completed;
-    }
-
-    // §7.3.3 phase 5: notify the parent. Posted after zombification so
-    // the parent observes a complete zombie when it acts on SIGCHLD.
-    post_sigchld_to_parent_with_posts(process, &mut signal_post, &mut wake_post);
+    // Keep the injected wake operation part of this API: the last-thread
+    // cascade owns child-exit wake publication, while callers that test this
+    // reserve/publish boundary still provide the same capability surface.
+    let _ = &mut wake_post;
     ProcessExitOutcome::Completed
 }
 
@@ -1131,7 +1170,7 @@ fn step_process_exit_inner<F, G>(
             b"debug.lock_service.process.payload.process_exit.shm_detach.duration_ns",
             || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
         );
-        close_socket_files_for_process_exit(&closed_fds);
+        finalize_open_files_after_fd_drain(&closed_fds);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
             || drop(closed_fds),
@@ -1176,35 +1215,145 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     );
 }
 
-fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+/// Complete the close protocol after a process fd table has been detached.
+///
+/// `ProcessPayload::drain_fds` already decrements the explicit pipe/socket
+/// descriptor counts while holding the fd-table lock.  This second phase is
+/// deliberately outside that lock: file writeback admission and network
+/// teardown can perform substantial work and may publish wakeups.
+fn finalize_open_files_after_fd_drain(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+    let _ = finalize_detached_open_files(fds.values(), &guard);
+}
+
+/// Complete the post-fd-table-removal protocol for every detached open-file
+/// description.  final-smp deliberately centralises this operation so close,
+/// close_range, dup replacement, exec CLOEXEC and process exit cannot drift
+/// into different visibility/last-close semantics.
+pub fn finalize_detached_open_files<'a>(
+    files: impl IntoIterator<Item = &'a Cap<OpenFile>>,
+    guard: &step_engine::Guard<'_>,
+) -> Result<(), step_engine::Errno> {
+    retry_deferred_page_writebacks(guard, 16);
+
     let mut seen_files = Vec::new();
-    for file in fds.values() {
+    let mut first_error = None;
+    for file in files {
         let raw_file = file.raw();
         if seen_files.contains(&raw_file) {
             continue;
         }
         seen_files.push(raw_file);
 
-        let drained_refs = fds
-            .values()
-            .filter(|candidate| candidate.raw() == raw_file)
-            .count() as u32;
-        if file.retain_count() > drained_refs {
+        if let Err(errno) = finalize_detached_open_file_without_retry(file, guard) {
+            first_error.get_or_insert(errno);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Allocation-free half of [`finalize_detached_open_files`].
+///
+/// Exec calls this after its point of no return using the descriptor vector it
+/// prepared beforehand.  It must not grow the deferred-retry queue or allocate
+/// a temporary deduplication set there.
+pub(crate) fn finalize_detached_open_file_without_retry(
+    file: &Cap<OpenFile>,
+    guard: &step_engine::Guard<'_>,
+) -> Result<(), step_engine::Errno> {
+    let flush_result = flush_page_backed_open_file_without_retry(file, guard);
+    if !file
+        .socket_identity()
+        .is_some_and(|socket| socket.fd_ref_count() != 0)
+    {
+        if let Some(ops) = file.file_ops() {
+            ops.on_last_close(guard);
+        }
+    }
+    flush_result
+}
+
+/// Make dirty regular-file data and its logical EOF visible before a detached
+/// file description can disappear.  The background service from main remains
+/// active, but it is a durability/performance mechanism rather than a
+/// substitute for final-smp's close-to-reopen visibility guarantee.
+pub fn flush_page_backed_open_file(
+    file: &Cap<OpenFile>,
+    guard: &step_engine::Guard<'_>,
+) -> Result<(), step_engine::Errno> {
+    let result = flush_page_backed_open_file_without_retry(file, guard);
+    if result.is_err() {
+        use crate::vfs::structure::RNodeBacking;
+        if let RNodeBacking::PageBacked { pc } = file.rnode().backing() {
+            retain_deferred_page_writeback(pc);
+        }
+    }
+    result
+}
+
+fn flush_page_backed_open_file_without_retry(
+    file: &Cap<OpenFile>,
+    guard: &step_engine::Guard<'_>,
+) -> Result<(), step_engine::Errno> {
+    use crate::vfs::structure::{OpenFileBacking, RNodeBacking};
+    if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
+        return Ok(());
+    }
+    let RNodeBacking::PageBacked { pc } = file.rnode().backing() else {
+        return Ok(());
+    };
+
+    // Main's IO-manager/JBD2 mount deliberately disables the legacy
+    // synchronous FsPageBacking hooks.  Close only admits background
+    // writeback there; explicit fsync owns and waits for the durability
+    // frontier through FsyncOp. Treating the expected ENOSYS from the retired
+    // hook as a failure would retain every closed file forever.
+    let _ = pc.queue_dirty_file_writeback();
+    if pc
+        .file_backend_context()
+        .is_some_and(|context| context.payload().backend_planner().is_some())
+    {
+        return Ok(());
+    }
+
+    // Legacy mounts have no owned background backend. Preserve final-smp's
+    // close-to-reopen visibility and retry failed synchronous writeback.
+    match crate::page_backed::step_fsync(pc, guard) {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Err(errno) => Err(errno),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(step_engine::Errno::EIO),
+    }
+}
+
+fn retain_deferred_page_writeback(pc: &Cap<PageContainer>) {
+    let mut deferred = DEFERRED_PAGE_WRITEBACKS.lock();
+    if !deferred.iter().any(|queued| queued == pc) {
+        deferred.push(pc.clone());
+    }
+}
+
+fn retry_deferred_page_writebacks(guard: &step_engine::Guard<'_>, budget: usize) {
+    let batch = {
+        let mut deferred = DEFERRED_PAGE_WRITEBACKS.lock();
+        let count = budget.min(deferred.len());
+        let split_at = deferred.len() - count;
+        deferred.split_off(split_at)
+    };
+
+    for pc in batch {
+        let _ = pc.queue_dirty_file_writeback();
+        if pc
+            .file_backend_context()
+            .is_some_and(|context| context.payload().backend_planner().is_some())
+        {
             continue;
         }
-
-        let crate::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() else {
-            continue;
-        };
-        let crate::vfs::structure::RNodeBacking::StructBacked {
-            payload: crate::vfs::structure::StructPayload::Socket { identity },
-        } = rnode.backing()
-        else {
-            continue;
-        };
-
-        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        let _ = crate::net::execution::step_socket_close(identity, &guard);
+        match crate::page_backed::step_fsync(&pc, guard) {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                retain_deferred_page_writeback(&pc);
+            }
+        }
     }
 }
 
@@ -1542,6 +1691,28 @@ pub fn step_waitpid_nohang(
     maintenance_after_process_reap();
 
     Ok((pid, status))
+}
+
+/// Return whether a blocking wait for `target` still has a matching live
+/// child and no matching zombie. This is a read-only predicate used to close
+/// the observe/register/recheck window in the async wait driver.
+pub fn waitpid_would_block(parent: &Cap<ProcessIdentity>, target: WaitTarget) -> bool {
+    let target = match target {
+        WaitTarget::CallerPgrp => WaitTarget::Pgrp(parent.pgrp_cap().pgid),
+        other => other,
+    };
+    let snapshot: Vec<Cap<ProcessIdentity>> = parent.children.snapshot();
+    let mut any_match = false;
+    for child in &snapshot {
+        if !target.matches(child) {
+            continue;
+        }
+        any_match = true;
+        if child.is_zombie() {
+            return false;
+        }
+    }
+    any_match
 }
 
 /// Outcome of `step_chdir`. `Replaced` is the normal path, carrying
@@ -2238,10 +2409,13 @@ impl StepOp<crate::process::ProcessIdentity> for DupOp {
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
         super::structure::incr_pipe_fd_ref(&file);
-        let newfd = self.process.allocate_fd();
-        let _ = self.process.set_fd(newfd, Some(file));
-        self.process.set_fd_cloexec(newfd, false);
-        StepOutcome::Done(newfd)
+        match self.process.install_new_fd(file.clone(), false) {
+            Some(newfd) => StepOutcome::Done(newfd),
+            None => {
+                super::structure::decr_pipe_fd_ref(&file);
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+            }
+        }
     }
 }
 
@@ -2256,12 +2430,12 @@ pub struct Dup3Op {
 }
 
 impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
-    type Output = u32;
+    type Output = (u32, Option<Cap<OpenFile>>);
     type Progress = NoProgress;
     fn step(
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
-    ) -> StepOutcome<u32, NoProgress> {
+    ) -> StepOutcome<(u32, Option<Cap<OpenFile>>), NoProgress> {
         if self.oldfd == self.newfd {
             return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EINVAL);
         }
@@ -2274,10 +2448,11 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
         super::structure::incr_pipe_fd_ref(&file);
-        let _prev = self.process.install_fd(self.newfd, file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
-        self.process.set_fd_cloexec(self.newfd, want_cloexec);
-        StepOutcome::Done(self.newfd)
+        let previous = self
+            .process
+            .install_fd_with_cloexec(self.newfd, file, want_cloexec);
+        StepOutcome::Done((self.newfd, previous))
     }
 }
 
@@ -2332,12 +2507,18 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
         if self.process.fd(self.fd).is_none() {
             return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
         }
-        let new_fd = self.process.allocate_fd_at_least(self.min);
         let file = self.process.fd(self.fd).unwrap();
         super::structure::incr_pipe_fd_ref(&file);
-        let _prev = self.process.install_fd(new_fd, file);
-        self.process.set_fd_cloexec(new_fd, self.cloexec);
-        StepOutcome::Done(new_fd)
+        match self
+            .process
+            .install_new_fd_at_least(self.min, file.clone(), self.cloexec)
+        {
+            Some(new_fd) => StepOutcome::Done(new_fd),
+            None => {
+                super::structure::decr_pipe_fd_ref(&file);
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+            }
+        }
     }
 }
 

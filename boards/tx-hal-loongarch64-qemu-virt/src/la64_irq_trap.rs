@@ -1,6 +1,8 @@
+use super::la64_percpu::la64_current_cpu_id;
+#[cfg(target_arch = "loongarch64")]
+use super::la64_pmap::deactivate_la64_user_pmap;
 use super::la64_pmap::{
-    dmw_covers_phys_range, la64_current_cpu_id, la64_fixup_lookup, la64_kernel_addr_to_phys,
-    la64_uncached_virt,
+    dmw_covers_phys_range, la64_fixup_lookup, la64_kernel_addr_to_phys, la64_uncached_virt,
 };
 use super::*;
 
@@ -366,6 +368,44 @@ pub(crate) const fn round_up_to_tcfg_ticks(ticks: u64) -> u64 {
     ticks.saturating_add(3) & mask
 }
 
+pub(crate) const fn la64_deadline_tcfg(delta_ticks: u64) -> usize {
+    // Reactor deadlines are one-shot events. Setting PERIODIC here makes QEMU
+    // re-arm the timer forever at the original (often very short) interval and
+    // turns normal kernel interrupt enablement into a timer storm.
+    round_up_to_tcfg_ticks(delta_ticks) as usize | LA64_TCFG_ENABLE
+}
+
+pub(crate) const fn la64_idle_interrupt_resume_pc(
+    interrupted_pc: usize,
+    region_start: usize,
+    region_exit: usize,
+) -> Option<usize> {
+    if interrupted_pc >= region_start && interrupted_pc < region_exit {
+        Some(region_exit)
+    } else {
+        None
+    }
+}
+
+fn redirect_la64_idle_interrupt(frame: &mut La64TrapFrame) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        unsafe extern "C" {
+            fn tx_la64_idle_irq_region_start();
+            fn tx_la64_idle_irq_region_exit();
+        }
+
+        let start = tx_la64_idle_irq_region_start as *const () as usize;
+        let exit = tx_la64_idle_irq_region_exit as *const () as usize;
+        if let Some(resume_pc) = la64_idle_interrupt_resume_pc(frame.era, start, exit) {
+            frame.era = resume_pc;
+        }
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    let _ = frame;
+}
+
 pub(crate) fn read_la64_cpucfg(index: usize) -> u32 {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -396,6 +436,18 @@ where
     let from_user = frame.previous_mode() == TrapPreviousMode::User;
     let ecode = (frame.estat >> LA64_ESTAT_ECODE_SHIFT) & LA64_ESTAT_ECODE_MASK;
 
+    if !from_user
+        && matches!(
+            class,
+            TrapClass::TimerInterrupt
+                | TrapClass::ExternalInterrupt
+                | TrapClass::InterprocessorInterrupt
+                | TrapClass::UnknownInterrupt
+        )
+    {
+        redirect_la64_idle_interrupt(frame);
+    }
+
     // LA64 lazy-FPU first-use path: when user code traps with FPU
     // unavailable/disabled, materialise a clean per-thread FP context
     // and retry the same instruction.
@@ -406,12 +458,39 @@ where
         return TrapAction::Resume;
     }
 
-    if from_user && ecode == LA64_ECODE_ALE {
-        match super::la64_unaligned::emulate_user_unaligned(frame) {
-            super::la64_unaligned::UnalignedOutcome::Emulated => return TrapAction::Resume,
-            super::la64_unaligned::UnalignedOutcome::Unsupported => {}
-            super::la64_unaligned::UnalignedOutcome::Fault(fault) => {
-                return K::on_page_fault(frame.view_mut(), fault);
+    // LSX/LASX share their low lanes with the scalar FP register file.  The
+    // first vector instruction traps while SXE/ASXE is clear; enable the
+    // requested extension and retry it.  Subsequent trap-frame capture saves
+    // the complete vector file into UserFpContext before another thread can
+    // own the CPU.
+    if from_user && (ecode == LA64_ECODE_SXD || ecode == LA64_ECODE_ASXD) {
+        let mut euen = read_la64_csr(LA64_CSR_EUEN);
+        euen |= LA64_EUEN_FPE | LA64_EUEN_SXE;
+        if ecode == LA64_ECODE_ASXD {
+            euen |= LA64_EUEN_ASXE;
+        }
+        write_la64_csr(LA64_CSR_EUEN, euen);
+        return TrapAction::Resume;
+    }
+
+    if ecode == LA64_ECODE_ALE {
+        if from_user {
+            match super::la64_unaligned::emulate_user_unaligned(frame) {
+                super::la64_unaligned::UnalignedOutcome::Emulated => return TrapAction::Resume,
+                super::la64_unaligned::UnalignedOutcome::Unsupported => {}
+                super::la64_unaligned::UnalignedOutcome::Fault(fault) => {
+                    return K::on_page_fault(frame.view_mut(), fault);
+                }
+            }
+        } else {
+            // Kernel-mode ALE: real LA264 silicon has no hardware
+            // unaligned access (QEMU emulates it silently). Emulate
+            // and resume; unsupported encodings fall through to the
+            // terminate dump so they still die loudly.
+            match super::la64_unaligned::emulate_kernel_unaligned(frame) {
+                super::la64_unaligned::UnalignedOutcome::Emulated => return TrapAction::Resume,
+                super::la64_unaligned::UnalignedOutcome::Unsupported
+                | super::la64_unaligned::UnalignedOutcome::Fault(_) => {}
             }
         }
     }
@@ -436,17 +515,19 @@ where
         }
         TrapClass::Syscall => K::on_syscall(frame.view_mut()),
         TrapClass::TimerInterrupt => {
+            let cpu = <Platform as SmpIf>::current_cpu_id();
             write_la64_csr(LA64_CSR_TICLR, LA64_TICLR_CLEAR_TIMER);
             let _irq_context = enter_la64_irq_context();
-            K::on_timer_interrupt(<Platform as SmpIf>::current_cpu_id(), frame.view_mut())
+            K::on_timer_interrupt(cpu, frame.view_mut())
         }
         TrapClass::ExternalInterrupt => {
             let _irq_context = enter_la64_irq_context();
-            K::on_external_irq(<Platform as SmpIf>::current_cpu_id())
+            K::on_external_irq(<Platform as SmpIf>::current_cpu_id(), frame.view_mut())
         }
         TrapClass::InterprocessorInterrupt => {
+            let cpu = <Platform as SmpIf>::current_cpu_id();
             let _irq_context = enter_la64_irq_context();
-            K::on_ipi(<Platform as SmpIf>::current_cpu_id())
+            K::on_ipi(cpu, frame.view_mut())
         }
         TrapClass::IllegalInstruction
         | TrapClass::Breakpoint
@@ -526,17 +607,18 @@ pub(crate) const fn classify_la64_trap(estat: usize) -> TrapClass {
             write: false,
             instruction: false,
         },
-        LA64_ECODE_ADEF => TrapClass::AlignmentFault {
-            write: false,
-            instruction: true,
-        },
-        LA64_ECODE_ADEM => TrapClass::AlignmentFault {
-            write: false,
-            instruction: false,
-        },
+        LA64_ECODE_ADE => {
+            let esubcode = (estat >> LA64_ESTAT_ESUBCODE_SHIFT) & LA64_ESTAT_ESUBCODE_MASK;
+            TrapClass::AlignmentFault {
+                write: false,
+                instruction: esubcode == LA64_ESUBCODE_ADEF,
+            }
+        }
         LA64_ECODE_SYS => TrapClass::Syscall,
         LA64_ECODE_BRK => TrapClass::Breakpoint,
-        LA64_ECODE_INE | LA64_ECODE_IPE | LA64_ECODE_FPD => TrapClass::IllegalInstruction,
+        LA64_ECODE_INE | LA64_ECODE_IPE | LA64_ECODE_FPD | LA64_ECODE_SXD | LA64_ECODE_ASXD => {
+            TrapClass::IllegalInstruction
+        }
         _ => TrapClass::UnknownSync,
     }
 }
@@ -632,6 +714,7 @@ pub(crate) fn apply_la64_trap_action(frame: &La64TrapFrame, action: TrapAction) 
         TrapAction::Reschedule if from_user => unsafe {
             let cpu = <Platform as SmpIf>::current_cpu_id();
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
+            deactivate_la64_user_pmap();
             write_la64_csr(LA64_CSR_KSAVE0, stack_top);
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu) as *const KernelResumeCtx;
             tx_la64_resume_kernel_after_reschedule(resume_ctx);
@@ -646,46 +729,52 @@ pub(crate) fn write_la64_csr(csr: usize, value: usize) {
     unsafe {
         match csr {
             LA64_CSR_CRMD => {
-                core::arch::asm!("csrwr {value}, 0x00", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x00", value = inout(reg) value => _, options(nomem, nostack));
+            }
+            LA64_CSR_EUEN => {
+                core::arch::asm!("csrwr {value}, 0x02", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_EENTRY => {
-                core::arch::asm!("csrwr {value}, 0x0c", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x0c", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_ECFG => {
-                core::arch::asm!("csrwr {value}, 0x04", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x04", value = inout(reg) value => _, options(nomem, nostack));
+            }
+            LA64_CSR_KSAVE0 => {
+                core::arch::asm!("csrwr {value}, 0x30", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_ASID => {
-                core::arch::asm!("csrwr {value}, 0x18", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x18", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_PGDL => {
-                core::arch::asm!("csrwr {value}, 0x19", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x19", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_PGDH => {
-                core::arch::asm!("csrwr {value}, 0x1a", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x1a", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_PWCL => {
-                core::arch::asm!("csrwr {value}, 0x1c", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x1c", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_PWCH => {
-                core::arch::asm!("csrwr {value}, 0x1d", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x1d", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_STLBPS => {
-                core::arch::asm!("csrwr {value}, 0x1e", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x1e", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_TLBRENTRY => {
-                core::arch::asm!("csrwr {value}, 0x88", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x88", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_TLBREHI => {
-                core::arch::asm!("csrwr {value}, 0x8e", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x8e", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_MERRENTRY => {
-                core::arch::asm!("csrwr {value}, 0x93", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x93", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_TCFG => {
-                core::arch::asm!("csrwr {value}, 0x41", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x41", value = inout(reg) value => _, options(nomem, nostack));
             }
             LA64_CSR_TICLR => {
-                core::arch::asm!("csrwr {value}, 0x44", value = in(reg) value, options(nomem, nostack));
+                core::arch::asm!("csrwr {value}, 0x44", value = inout(reg) value => _, options(nomem, nostack));
             }
             _ => {}
         }
@@ -702,6 +791,10 @@ pub(crate) fn read_la64_csr(csr: usize) -> usize {
         match csr {
             LA64_CSR_CRMD => {
                 core::arch::asm!("csrrd {value}, 0x00", value = out(reg) value, options(nomem, nostack));
+                value
+            }
+            LA64_CSR_EUEN => {
+                core::arch::asm!("csrrd {value}, 0x02", value = out(reg) value, options(nomem, nostack));
                 value
             }
             LA64_CSR_ECFG => {

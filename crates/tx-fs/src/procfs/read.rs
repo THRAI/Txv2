@@ -243,7 +243,32 @@ fn render_cmdline(pid: Pid) -> String {
     }
 }
 
+/// Boot-time mount table assembled by kernel init. Runtime mount mutation is
+/// still outside this projection, but publishing the actual boot mounts keeps
+/// `df` and mount discovery consistent with the selected root filesystem.
+static MOUNTS_PTR: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static MOUNTS_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn procfs_set_mounts(table: String) {
+    let leaked: &'static str = alloc::boxed::Box::leak(table.into_boxed_str());
+    MOUNTS_LEN.store(leaked.len(), core::sync::atomic::Ordering::Release);
+    MOUNTS_PTR.store(
+        leaked.as_ptr() as *mut u8,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 fn render_mounts() -> String {
+    let ptr = MOUNTS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if !ptr.is_null() {
+        let len = MOUNTS_LEN.load(core::sync::atomic::Ordering::Acquire);
+        // SAFETY: `procfs_set_mounts` publishes storage leaked for the kernel
+        // lifetime, and release/acquire orders the matching length.
+        let table =
+            unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) };
+        return String::from(table);
+    }
     String::from(
         "rootfs / rootfs rw 0 0\n\
 proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\

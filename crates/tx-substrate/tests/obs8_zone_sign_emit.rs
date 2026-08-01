@@ -98,7 +98,12 @@ impl ConsoleIf for TestPlatform {
 impl PmapIf for TestPlatform {}
 impl TrapIf for TestPlatform {}
 impl SignalFrameIf for TestPlatform {}
-impl IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_: usize) {}
+impl IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
+}
 impl EntropyIf for TestPlatform {}
 impl CacheIf for TestPlatform {}
 impl DmaIf for TestPlatform {}

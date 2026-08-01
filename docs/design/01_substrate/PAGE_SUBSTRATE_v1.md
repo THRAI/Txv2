@@ -162,8 +162,8 @@ tables, trace infrastructure, etc.) can use `Box`, `Vec`, and any
 
 The executable RV64 QEMU path has frame allocation, boot-memory planning,
 direct-map/MMIO pmap extension, typed PT-node allocation, kernel-only
-shootdown accounting, safe in-place kernel leaf protect, committed empty
-intermediate-table teardown for kernel mappings, final high-kernel alias
+shootdown accounting, safe in-place kernel leaf protect, committed
+intermediate-table ownership/lifetime tracking for kernel mappings, final high-kernel alias
 permissions for text/rodata/data/bss/boot-stack pages, `PmapRoot`/ASID
 create-destroy for VM-owned roots, ASID-scoped page shootdown batches,
 no-alloc VM-facing page-range reserve/commit, unmap, and protect wrappers,
@@ -175,7 +175,8 @@ RFENCE for remote pmap shootdown once APs are online. The remaining
 PAGE_SUBSTRATE_v1 exit criteria are:
 
 - superpage/multi-frame shootdown accounting beyond page-sized pins;
-- kernel-managed SMP shootdown protocol if firmware RFENCE is unavailable;
+- kernel-managed SMP shootdown on platforms other than the LA64 QEMU
+  generation-mailbox implementation when firmware RFENCE is unavailable;
 - the full trap shell/user-return path before user/VM faults are enabled.
 
 ### 2.2 Address and pointer boundary
@@ -852,6 +853,25 @@ Range unmap and protect helpers collect per-page `PmapUnmapResult` /
 `PmapInvalidation` values into caller-provided slices, so VM can combine these
 with range locks, recipes, and the substrate ASID-scoped shootdown batch without
 making the board own VM policy.
+
+### 7.4 Kernel virtually contiguous allocation
+<!-- txdoc:PAGE-SUBSTRATE-KERNEL-VMALLOC-1 -->
+
+The global allocator follows a `kvmalloc`-style policy for large Rust objects.
+Moderate requests first try the direct-map contiguous allocator and fall back
+to vmalloc when fragmentation prevents a run. Requests above the allocator's
+bounded direct-try limit go directly to vmalloc because the current bitmap
+backend has no buddy allocator's constant-time order availability test.
+
+The vmalloc window supplies contiguous virtual addresses backed by independent
+4 KiB frames. Population reserves empty leaves and uses
+`PmapIf::commit_new_kernel_mapping()`, so it does not flush the TLB once per new
+page; one range publication follows the completed PTE batch. Teardown first
+clears every leaf, chains the still-owned frames through their now-dead object
+storage without allocating metadata, issues one batched kernel shootdown, and
+only then returns the frames. This preserves the required `unmap -> shootdown
+-> physical reuse` ordering while making cost linear in PTE updates rather than
+linear in global TLB flushes.
 
 ### 7.4 Pmap's own intermediate pages
 <!-- txdoc:PAGE-SUBSTRATE-PMAP-INTEGRATION-PMAPS-OWN-INTERMEDIATE-PAGES-1 -->

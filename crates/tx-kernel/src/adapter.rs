@@ -24,8 +24,8 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub(crate) use crate::sync::{spin_mutex, SpinMutex};
     pub use tx_substrate::epoch::{
-        borrow_current_guard, cpu_summary, drain_with_budget, guard, service_local_drain_request,
-        summary, Guard,
+        self as epoch, borrow_current_guard, cpu_summary, drain_requested_with_budget,
+        drain_with_budget, guard, summary, Guard,
     };
     pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -49,7 +49,8 @@ pub mod boot_runtime {
     pub use tx_reactor::{
         ast, current_deadline_registrar, current_delegate_registry, current_task_mailbox,
         hart_loop, userspace, wait, yield_now, HartId, InitialSchedMeta, Phase1QueueKind, Reactor,
-        RescheduleSignal, SharedReactor, SliceClock, SubscriberId, TaskKey, WaitSource,
+        RescheduleSignal, SharedReactor, SliceClock, SubscriberId, TaskId, TaskKey, TaskRunOwner,
+        TaskStatus, WaitSource,
     };
     pub use tx_services::time::TimerGuard;
     pub use tx_substrate::step::{

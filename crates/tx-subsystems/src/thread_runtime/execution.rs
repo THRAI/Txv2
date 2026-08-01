@@ -200,6 +200,9 @@ where
     // last chance to observe state.
     let mut payload_guard = thread.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        // Lifecycle termination must wake the outer thread task even when a
+        // nested futex/I/O wait has replaced or cleared the mailbox waker.
+        payload.wake_lifecycle_task();
         let _ = post_signal_mailbox_with_post(
             payload,
             Signum::SIGKILL,
@@ -246,12 +249,26 @@ pub enum ThreadExitOutcome {
 }
 
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) -> ThreadExitOutcome {
-    step_thread_exit_inner(thread, status, || {}, || {})
+    step_thread_exit_inner(
+        thread,
+        status,
+        crate::process::structure::ExitStatus::Exited(status),
+        || {},
+        || {},
+    )
+}
+
+pub fn step_thread_exit_with_status(
+    thread: Cap<ThreadIdentity>,
+    status: crate::process::structure::ExitStatus,
+) -> ThreadExitOutcome {
+    step_thread_exit_inner(thread, status.wait_status_word(), status, || {}, || {})
 }
 
 fn step_thread_exit_inner<H, Z>(
     thread: Cap<ThreadIdentity>,
     status: i32,
+    process_status: crate::process::structure::ExitStatus,
     after_lane_check: H,
     after_zombify: Z,
 ) -> ThreadExitOutcome
@@ -268,15 +285,17 @@ where
         drop(guard);
         parent
     };
-    let exit_permit = if let Some(parent) = parent.as_ref() {
-        let payload_guard = parent.payload.lock();
-        if let Some(payload) = payload_guard.as_ref() {
-            match payload.prepare_thread_exit(thread.tid.0) {
-                Some(permit) => Some(permit),
-                None => return ThreadExitOutcome::Retry,
-            }
-        } else {
-            None
+    // Pin the process payload before changing thread state.  The last-thread
+    // path tears that payload (and therefore the address-space slot) down, but
+    // Linux requires clear_child_tid and robust-futex repair to complete while
+    // the old address space is still live.
+    let process_payload = parent
+        .as_ref()
+        .and_then(|parent| parent.payload.lock().as_ref().cloned());
+    let exit_permit = if let Some(payload) = process_payload.as_ref() {
+        match payload.prepare_thread_exit(thread.tid.0) {
+            Some(permit) => Some(permit),
+            None => return ThreadExitOutcome::Retry,
         }
     } else {
         None
@@ -286,18 +305,11 @@ where
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.enter", thread.tid.0 as i64);
     }
-    // Snapshot clear_child_tid and robust-list BEFORE
-    // set_thread_zombie drops the thread payload.
-    let ctid = thread
-        .payload
-        .lock()
-        .as_ref()
-        .and_then(|p| *p.clear_child_tid.lock());
-    let robust = thread.payload.lock().as_ref().and_then(|p| {
-        let head = *p.robust_list_head.lock();
-        let len = *p.robust_list_len.lock();
-        head.map(|h| (h, len))
-    });
+
+    if let Some(payload) = process_payload.as_ref() {
+        let aspace = payload.aspace_cap();
+        notify_thread_exit_userspace_in_aspace(&thread, &aspace);
+    }
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.snapshot.after", thread.tid.0 as i64);
     }
@@ -320,8 +332,7 @@ where
         emit_thread_exit_debug(b"debug.thread_exit.parent.after", thread.tid.0 as i64);
     }
 
-    let payload_guard = parent.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Some(payload) = process_payload else {
         return ThreadExitOutcome::Completed;
     };
 
@@ -357,58 +368,24 @@ where
     if let Some(permit) = exit_permit {
         let finished = crate::process::execution::measure_process_lock_service(
             b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
-            || {
-                payload.finish_thread_exit(
-                    permit,
-                    was_last,
-                    crate::process::structure::ExitStatus::Exited(status),
-                )
-            },
+            || payload.finish_thread_exit(permit, was_last, process_status),
         );
         debug_assert!(
             finished,
             "thread-exit lifecycle permit remains generation-valid"
         );
     }
-    drop(payload_guard);
-
     if was_last {
         // Thread side carries `i32` per `THREAD_RUNTIME_v1` §7.2;
         // the cascade promotes that to `ExitStatus::Exited` because
         // signal-driven termination doesn't reach this path (it goes
         // through the fatal group-exit transition which records
         // `ExitStatus::Signaled` directly before zombifying threads).
-        crate::process::execution::step_process_exit(
-            &parent,
-            crate::process::structure::ExitStatus::Exited(status),
-        );
+        crate::process::execution::step_process_exit(&parent, process_status);
     }
 
-    // clear_child_tid futex protocol (CLONE_CHILD_CLEARTID).
-    // Linux semantics: atomically write 0 to *ctid, then
-    // FUTEX_WAKE on the same address. We do both best-effort —
-    // if the userspace page is unmapped, skip the write but
-    // still fire the wake (hash-bucket wake is unconditional).
-    if let Some(ctid_ptr) = ctid {
-        let guard = crate::thread_runtime::adapter::step_engine::guard();
-        // Zero the word at *ctid_ptr in userspace.
-        if let Some(proc) = thread.owner_proc.upgrade(&guard) {
-            if let Some(payload) = proc.payload.lock().as_ref() {
-                let aspace = payload.aspace_cap();
-                clear_and_wake_child_tid(&aspace, ctid_ptr, &guard);
-            }
-        }
-        drop(guard);
-    }
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.ctid.after", thread.tid.0 as i64);
-    }
-
-    // robust-list walk: mark each robust futex as FUTEX_OWNER_DIED
-    // and issue FUTEX_WAKE. Best-effort — if the userspace pages
-    // are unmapped or the list is malformed, skip the entry.
-    if let Some((head, _len)) = robust {
-        walk_robust_list(&thread, head, 16);
     }
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.robust.after", thread.tid.0 as i64);
@@ -437,7 +414,13 @@ pub(crate) fn step_thread_exit_after_lane_check_for_test<H>(
 where
     H: FnOnce(),
 {
-    step_thread_exit_inner(thread, status, after_lane_check, || {})
+    step_thread_exit_inner(
+        thread,
+        status,
+        crate::process::structure::ExitStatus::Exited(status),
+        after_lane_check,
+        || {},
+    )
 }
 
 #[cfg(test)]
@@ -449,7 +432,13 @@ pub(crate) fn step_thread_exit_after_zombify_for_test<Z>(
 where
     Z: FnOnce(),
 {
-    step_thread_exit_inner(thread, status, || {}, after_zombify)
+    step_thread_exit_inner(
+        thread,
+        status,
+        crate::process::structure::ExitStatus::Exited(status),
+        || {},
+        after_zombify,
+    )
 }
 
 fn clear_and_wake_child_tid(
@@ -457,11 +446,38 @@ fn clear_and_wake_child_tid(
     tid_ptr: u64,
     guard: &step_engine::Guard<'_>,
 ) {
-    let _ = aspace.copy_to_user(UserPtr::<u8>::new(tid_ptr as usize), &[0u8; 4], guard);
     let trace = clear_child_tid_debug_sample();
     if trace {
         emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.uaddr", tid_ptr as i64);
     }
+
+    // `copy_to_user` can yield while another hart owns the TCB page's range
+    // transaction.  The clear-child-tid contract is synchronous: publishing
+    // the futex wake before the zero is visible loses the only wake available
+    // to pthread_join.  This mapping is the exiting thread's resident private
+    // anonymous TCB, so Yield/Continue here is transient SMP contention rather
+    // than page-backed I/O and may be retried in place.
+    loop {
+        match aspace.copy_to_user(
+            UserPtr::<u8>::new(tid_ptr as usize),
+            &[0u8; core::mem::size_of::<u32>()],
+            guard,
+        ) {
+            step_engine::StepOutcome::Done(written) if written == core::mem::size_of::<u32>() => {
+                break;
+            }
+            step_engine::StepOutcome::Yield { .. } | step_engine::StepOutcome::Continue { .. } => {
+                core::hint::spin_loop();
+            }
+            step_engine::StepOutcome::Done(_) | step_engine::StepOutcome::Err(_) => {
+                if trace {
+                    emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.err", -1);
+                }
+                return;
+            }
+        }
+    }
+
     match step_futex_lifecycle_wake_in(aspace, tid_ptr, 1, guard) {
         step_engine::StepOutcome::Done(woken) => {
             if trace {
@@ -491,74 +507,6 @@ fn clear_and_wake_child_tid(
 ///   head+8:  `futex_offset` (long)
 ///   head+16: `list_op_pending` (pointer to in-progress entry)
 ///
-/// Each `robust_list` entry:
-///   entry+0:      `next` pointer
-///   entry+offset: futex word guarded by the mutex
-///
-/// Walk the list plus `list_op_pending`. Malformed lists are bounded
-/// so a corrupt userspace pointer cannot trap the kernel in a loop.
-fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
-    let guard = step_engine::guard();
-    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
-        return;
-    };
-    let proc_guard = proc.payload.lock();
-    let Some(payload) = proc_guard.as_ref() else {
-        return;
-    };
-    let aspace = payload.aspace_cap();
-    drop(proc_guard);
-
-    let Some((first, futex_offset, pending)) =
-        crate::process::execution::measure_process_lock_service(
-            b"debug.lock_service.process.payload.robust.head_reads.duration_ns",
-            || {
-                let first = read_user_u64(&aspace, head, &guard)?;
-                let futex_offset = read_user_i64(&aspace, head + 8, &guard)?;
-                let pending = read_user_u64(&aspace, head + 16, &guard)?;
-                Some((first, futex_offset, pending))
-            },
-        )
-    else {
-        return;
-    };
-
-    let mut entry = first;
-    let mut entry_count = 0usize;
-    crate::process::execution::measure_process_lock_service(
-        b"debug.lock_service.process.payload.robust.entries.duration_ns",
-        || {
-            for _ in 0..2048 {
-                if entry == 0 || entry == head {
-                    break;
-                }
-                mark_robust_entry_owner_died(&aspace, entry, futex_offset, &guard);
-                entry_count += 1;
-                let Some(next) = read_user_u64(&aspace, entry, &guard) else {
-                    break;
-                };
-                if next == entry {
-                    break;
-                }
-                entry = next;
-            }
-        },
-    );
-    crate::process::execution::emit_process_lock_service_trace(
-        b"debug.lock_service.process.payload.robust.entry_count",
-        entry_count.min(i64::MAX as usize) as i64,
-    );
-
-    if pending != 0 {
-        crate::process::execution::measure_process_lock_service(
-            b"debug.lock_service.process.payload.robust.pending.duration_ns",
-            || mark_robust_entry_owner_died(&aspace, pending, futex_offset, &guard),
-        );
-    }
-
-    drop(guard);
-}
-
 fn walk_robust_list_in_aspace(
     aspace: &crate::vm::AddressSpace,
     head: u64,
@@ -832,6 +780,22 @@ pub fn post_signal_with_post<F>(
     let _ = post_signal_mailbox_with_post(&payload, sig, routing, &mut post);
 }
 
+/// Direct-publication counterpart retained for final-smp call sites.  The
+/// state transition remains implemented once, in `post_signal_with_post`.
+pub fn post_signal(
+    thread: &Cap<ThreadIdentity>,
+    sig: Signum,
+    routing: SignalRouting,
+    info: Option<crate::signal::SigInfo>,
+) {
+    post_signal_with_post(thread, sig, routing, info, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Userspace-entry shim (Plan B writeback discipline)
 // ---------------------------------------------------------------------------
@@ -982,6 +946,38 @@ pub struct ThreadKillWithPostOp<F> {
     pub sig: Signum,
     pub info: Option<crate::signal::SigInfo>,
     pub post: F,
+}
+
+pub struct ThreadKillOp {
+    pub thread: Cap<ThreadIdentity>,
+    pub sig: Signum,
+    pub info: Option<crate::signal::SigInfo>,
+}
+
+impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
+    crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadKillOp
+{
+    type Output = ();
+    type Progress = crate::thread_runtime::adapter::step_engine::NoProgress;
+
+    fn step(
+        &mut self,
+        _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<
+        (),
+        crate::thread_runtime::adapter::step_engine::NoProgress,
+    > {
+        let routing = SignalRouting::ThreadDirected {
+            tid: self.thread.tid.0 as u64,
+        };
+        post_signal(&self.thread, self.sig, routing, self.info);
+        crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
+    }
+}
+
+impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity> OneShotStepOp<I>
+    for ThreadKillOp
+{
 }
 
 impl<I, F> crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadKillWithPostOp<F>

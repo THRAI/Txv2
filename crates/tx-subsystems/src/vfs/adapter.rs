@@ -25,15 +25,15 @@ use tx_platform_adapter::platform_adapter;
 )]
 pub mod step_engine {
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::{Guard, borrow_current_guard, guard};
+    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
     pub use tx_substrate::step::{
-        ByteProgress, Deadline, Errno, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity,
-        ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity, TimerId,
-        WaitSourceId, YieldShape, drive_oneshot,
+        drive_oneshot, ByteProgress, Deadline, Errno, InterestMask, NoProgress, OneShotStepOp,
+        ProcessIdentity, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
+        SubjectIdentity, TimerId, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        Cap, Dead, Entity, IdentRef, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
-        register_zone_for, reserve_for, sign, sign_for,
+        register_zone_for, reserve_for, sign, sign_for, Cap, Dead, Entity, IdentRef, PayloadCap,
+        Weak, Zone, ZoneAllocated, ZoneError,
     };
 }
 

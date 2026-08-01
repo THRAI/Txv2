@@ -242,6 +242,14 @@ impl RawNetlinkNetfilterSocket {
     }
 }
 
+pub fn netlink_netfilter_send(
+    socket: &Cap<SocketIdentity>,
+    bytes: &[u8],
+    cred: Cred,
+) -> Result<usize, Errno> {
+    netlink_netfilter_send_with_post(socket, bytes, cred, |mailbox, event| mailbox.post(event))
+}
+
 pub fn netlink_netfilter_send_with_post<F>(
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
@@ -268,7 +276,6 @@ where
     if !packet.is_empty() {
         raw.queue_response(packet);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
         socket
             .readiness
@@ -298,11 +305,18 @@ pub fn netlink_netfilter_recv(
     } else {
         copied
     };
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
     Ok(reported)
+}
+
+pub fn netlink_xfrm_send(
+    socket: &Cap<SocketIdentity>,
+    bytes: &[u8],
+    cred: Cred,
+) -> Result<usize, Errno> {
+    netlink_xfrm_send_with_post(socket, bytes, cred, |mailbox, event| mailbox.post(event))
 }
 
 pub fn netlink_xfrm_send_with_post<F>(
@@ -330,7 +344,6 @@ where
     if !packet.is_empty() {
         raw.queue_response(packet);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
         socket
             .readiness
@@ -360,7 +373,6 @@ pub fn netlink_xfrm_recv(
     } else {
         copied
     };
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }

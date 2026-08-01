@@ -2,7 +2,7 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_shutdown_target;
-use crate::net::delegate::net_delegate_kick_poll_with_post;
+use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::structure::{
     ConnectionKey, RecvWireSet, SendWireSet, SockShutdownCmd, SocketIdentity, SocketProtocol,
     TcpState,
@@ -47,7 +47,6 @@ pub fn step_shutdown(
         if let Some(raw_tcp) = payload.raw_tcp_socket() {
             raw_tcp.close();
         }
-        payload.refresh_io_from_raw();
     }
 
     // SCTP: shutting down the write side tears down the (single) 1-to-1
@@ -61,8 +60,7 @@ pub fn step_shutdown(
                 .socket_table()
                 .lookup_sctp_connection(ConnectionKey::new(remote, local), guard)
             {
-                peer.readiness
-                    .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+                peer.readiness.fire_recv(RecvWireSet::BROKEN);
             }
             // If subscribed to association events, deliver SCTP_SHUTDOWN_COMP on
             // this socket once the (loopback-immediate) shutdown completes. Queued
@@ -77,34 +75,24 @@ pub fn step_shutdown(
                     .record_sctp_message(bytes, true, 0, 0, None)
                     .is_some()
                 {
-                    socket
-                        .readiness
-                        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
-                            mailbox.post(event)
-                        });
+                    socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
                 }
             }
         }
     }
 
     let recv_woken = if mark.recv {
-        witness
-            .identity
-            .readiness
-            .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event))
+        witness.identity.readiness.fire_recv(RecvWireSet::BROKEN)
     } else {
         0
     };
     let send_woken = if mark.send {
-        witness
-            .identity
-            .readiness
-            .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event))
+        witness.identity.readiness.fire_send(SendWireSet::BROKEN)
     } else {
         0
     };
     let delegate_kicked = if tcp_graceful_close {
-        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
+        net_delegate_kick_poll();
         true
     } else {
         false

@@ -249,6 +249,41 @@ pub trait CharDeviceOps: Send + Sync + 'static {
     }
 }
 
+/// Operations shared by rich file objects such as sockets.
+///
+/// This is the final-smp file-object seam: VFS read/write, readiness waits,
+/// fcntl side effects, and last-close teardown must all target the same
+/// implementation instead of redispatching by object kind in each syscall.
+pub trait FileOps: Send + Sync {
+    fn read(
+        &self,
+        out: &mut [u8],
+        nonblocking: bool,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress>;
+
+    fn write(
+        &self,
+        bytes: &[u8],
+        nonblocking: bool,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress>;
+
+    fn poll_mask(&self, guard: &Guard<'_>) -> Result<crate::net::PollMask, Errno>;
+
+    fn poll_wait_token(
+        &self,
+        interests: crate::net::PollMask,
+        guard: &Guard<'_>,
+    ) -> Result<Option<crate::execution::WaitToken>, Errno>;
+
+    fn on_set_fl_nonblock(&self) {}
+
+    fn on_last_close(&self, guard: &Guard<'_>) {
+        let _ = guard;
+    }
+}
+
 fn civil_from_days(days: i64) -> Option<(i32, u32, u32)> {
     let z = days.checked_add(719_468)?;
     let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
@@ -697,6 +732,22 @@ impl PageContainerFileIoServiceRuntime {
 
     pub fn kick(&self, service: IoServiceKind) -> usize {
         post_file_io_service_kick(&self.wake_source, ServiceKick::new(service)) as usize
+    }
+
+    pub fn diagnostic(
+        &self,
+    ) -> (
+        u64,
+        usize,
+        u64,
+        crate::page_backed::FileIoServiceDiagnostic,
+    ) {
+        (
+            self.wake_source.source_id(),
+            self.wake_source.wake_endpoint().subscriber_count(),
+            self.wake_source.wake_endpoint().pending_mask_snapshot(),
+            self.container.file_io_service_diagnostic(),
+        )
     }
 }
 

@@ -222,7 +222,7 @@ fn loopback_pending_step_drives_raw_icmp_echo() {
         .expect("net epoch test lock");
     loopback_iface().clear_for_test_or_bootstrap();
     let guard = tx_substrate::epoch::guard();
-    let valid = ValidSocketType::validate(2, 3, 1).expect("ping socket");
+    let valid = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let socket = match step_socket_create(valid, &guard) {
         StepOutcome::Done(socket) => socket,
         other => panic!("unexpected socket create outcome: {other:?}"),

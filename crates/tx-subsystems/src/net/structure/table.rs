@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use tx_substrate::epoch::Guard;
 use tx_substrate::index::{Index, IndexError};
 use tx_substrate::mutation::{self, MutationError};
@@ -127,9 +128,19 @@ pub struct SocketTable {
     unix_path_nodes: Index<UnixSocketPath, (), UNIX_PATH_NODE_SLOTS>,
     unix_bound: Index<UnixSocketPath, Cap<SocketIdentity>, UNIX_BOUND_SLOTS>,
     unix_stream_peers: Index<UnixStreamPeerKey, Cap<SocketIdentity>, UNIX_STREAM_PEER_SLOTS>,
+    tcp_loopback_poll_cursor: AtomicUsize,
 }
 
 impl SocketTable {
+    fn lookup_cap<K: Eq, const N: usize>(
+        index: &Index<K, Cap<SocketIdentity>, N>,
+        key: &K,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        let raw = index.lookup_project(key, Cap::raw)?;
+        Cap::try_clone_raw_live(raw, guard)
+    }
+
     pub const fn new() -> Self {
         Self {
             tcp_bound: Index::new(),
@@ -145,6 +156,7 @@ impl SocketTable {
             unix_path_nodes: Index::new(),
             unix_bound: Index::new(),
             unix_stream_peers: Index::new(),
+            tcp_loopback_poll_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -408,9 +420,7 @@ impl SocketTable {
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.tcp_bound
-            .lookup(&LocalEndpointKey::new(endpoint), guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.tcp_bound, &LocalEndpointKey::new(endpoint), guard)
     }
 
     pub fn lookup_sctp_bound(
@@ -418,9 +428,7 @@ impl SocketTable {
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.sctp_bound
-            .lookup(&LocalEndpointKey::new(endpoint), guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.sctp_bound, &LocalEndpointKey::new(endpoint), guard)
     }
 
     pub fn lookup_rds_bound(
@@ -428,9 +436,7 @@ impl SocketTable {
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.rds_bound
-            .lookup(&LocalEndpointKey::new(endpoint), guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.rds_bound, &LocalEndpointKey::new(endpoint), guard)
     }
 
     pub fn lookup_tcp_listener(
@@ -455,15 +461,11 @@ impl SocketTable {
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         let exact = ListenerKey::from_endpoint(endpoint);
-        if let Some(entry) = self.tcp_listeners.lookup(&exact, guard) {
-            if let Some(socket) = entry.value().try_clone_live() {
-                return Some(socket);
-            }
+        if let Some(socket) = Self::lookup_cap(&self.tcp_listeners, &exact, guard) {
+            return Some(socket);
         }
         let wildcard = ListenerKey::wildcard_for_family(endpoint.family, endpoint.port);
-        self.tcp_listeners
-            .lookup(&wildcard, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.tcp_listeners, &wildcard, guard)
     }
 
     pub fn lookup_sctp_listener_endpoint(
@@ -472,15 +474,11 @@ impl SocketTable {
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         let exact = ListenerKey::from_endpoint(endpoint);
-        if let Some(entry) = self.sctp_listeners.lookup(&exact, guard) {
-            if let Some(socket) = entry.value().try_clone_live() {
-                return Some(socket);
-            }
+        if let Some(socket) = Self::lookup_cap(&self.sctp_listeners, &exact, guard) {
+            return Some(socket);
         }
         let wildcard = ListenerKey::wildcard_for_family(endpoint.family, endpoint.port);
-        self.sctp_listeners
-            .lookup(&wildcard, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.sctp_listeners, &wildcard, guard)
     }
 
     pub fn lookup_tcp_listener_dual_stack_endpoint(
@@ -495,9 +493,7 @@ impl SocketTable {
             return None;
         }
         let wildcard6 = ListenerKey::wildcard_for_family(AddressFamily::Inet6, endpoint.port);
-        self.tcp_listeners
-            .lookup(&wildcard6, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.tcp_listeners, &wildcard6, guard)
     }
 
     pub fn lookup_sctp_listener_dual_stack_endpoint(
@@ -512,9 +508,7 @@ impl SocketTable {
             return None;
         }
         let wildcard6 = ListenerKey::wildcard_for_family(AddressFamily::Inet6, endpoint.port);
-        self.sctp_listeners
-            .lookup(&wildcard6, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.sctp_listeners, &wildcard6, guard)
     }
 
     pub fn lookup_tcp_listener_addr(
@@ -531,9 +525,7 @@ impl SocketTable {
         key: ConnectionKey,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.tcp_connections
-            .lookup(&key, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.tcp_connections, &key, guard)
     }
 
     pub fn lookup_sctp_connection(
@@ -541,9 +533,7 @@ impl SocketTable {
         key: ConnectionKey,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.sctp_connections
-            .lookup(&key, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.sctp_connections, &key, guard)
     }
 
     pub fn lookup_udp_connection(
@@ -551,9 +541,7 @@ impl SocketTable {
         key: ConnectionKey,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.udp_connections
-            .lookup(&key, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.udp_connections, &key, guard)
     }
 
     pub fn lookup_udp_ingress(
@@ -600,9 +588,7 @@ impl SocketTable {
         path: UnixSocketPath,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.unix_bound
-            .lookup(&path, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.unix_bound, &path, guard)
     }
 
     pub fn lookup_unix_path_node(&self, path: UnixSocketPath, guard: &Guard<'_>) -> bool {
@@ -622,9 +608,11 @@ impl SocketTable {
         socket_raw: u32,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.unix_stream_peers
-            .lookup(&UnixStreamPeerKey { socket_raw }, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(
+            &self.unix_stream_peers,
+            &UnixStreamPeerKey { socket_raw },
+            guard,
+        )
     }
 
     pub fn snapshot_tcp_listeners(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
@@ -655,6 +643,25 @@ impl SocketTable {
     pub fn snapshot_tcp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.tcp_connections
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
+    /// Claim the start of the next bounded loopback TCP poll window.
+    ///
+    /// The connection index is stable-slot ordered, so repeatedly taking its
+    /// first `budget` entries can permanently starve later active flows.
+    /// Advancing a per-table cursor makes consecutive delegate passes cover
+    /// every active candidate without introducing a global scheduler lock.
+    pub fn claim_tcp_loopback_poll_start(
+        &self,
+        candidate_count: usize,
+        window_len: usize,
+    ) -> usize {
+        if candidate_count == 0 {
+            return 0;
+        }
+        self.tcp_loopback_poll_cursor
+            .fetch_add(window_len.max(1), Ordering::Relaxed)
+            % candidate_count
     }
 
     pub fn snapshot_sctp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
@@ -698,17 +705,16 @@ impl SocketTable {
         port: u16,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.udp_bound
-            .lookup(
-                &LocalEndpointKey {
-                    family: AddressFamily::Inet6,
-                    addr: Ipv4Address::UNSPECIFIED,
-                    addr6: Ipv6Address::UNSPECIFIED,
-                    port,
-                },
-                guard,
-            )
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(
+            &self.udp_bound,
+            &LocalEndpointKey {
+                family: AddressFamily::Inet6,
+                addr: Ipv4Address::UNSPECIFIED,
+                addr6: Ipv6Address::UNSPECIFIED,
+                port,
+            },
+            guard,
+        )
     }
 
     pub fn lookup_udp_bound_exact(
@@ -716,9 +722,7 @@ impl SocketTable {
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.udp_bound
-            .lookup(&LocalEndpointKey::new(endpoint), guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(&self.udp_bound, &LocalEndpointKey::new(endpoint), guard)
     }
 
     pub fn lookup_udp_bound_wildcard(
@@ -726,17 +730,16 @@ impl SocketTable {
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.udp_bound
-            .lookup(
-                &LocalEndpointKey {
-                    family: endpoint.family,
-                    addr: Ipv4Address::UNSPECIFIED,
-                    addr6: Ipv6Address::UNSPECIFIED,
-                    port: endpoint.port,
-                },
-                guard,
-            )
-            .and_then(|entry| entry.value().try_clone_live())
+        Self::lookup_cap(
+            &self.udp_bound,
+            &LocalEndpointKey {
+                family: endpoint.family,
+                addr: Ipv4Address::UNSPECIFIED,
+                addr6: Ipv6Address::UNSPECIFIED,
+                port: endpoint.port,
+            },
+            guard,
+        )
     }
 
     pub fn snapshot_udp_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {

@@ -1,5 +1,9 @@
 use super::boot_smp;
 use super::la64_irq_trap::*;
+use super::la64_percpu::{
+    la64_current_cpu_id, la64_install_kernel_stack, la64_read_kernel_tls, la64_read_stable_counter,
+    la64_wait_for_interrupt_once, la64_write_kernel_tls,
+};
 use super::la64_pmap::*;
 use super::*;
 
@@ -214,6 +218,10 @@ impl PmapIf for Platform {
         commit_la64_kernel_mapping(reservation, permissions);
     }
 
+    fn commit_new_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+        commit_new_la64_kernel_mapping(reservation, permissions);
+    }
+
     fn unmap_kernel_mapping(
         virt: VirtAddr,
         kind: PmapReserveKind,
@@ -244,6 +252,9 @@ impl PmapIf for Platform {
     }
 
     fn destroy_pmap_root(root: PmapRoot) {
+        deactivate_la64_user_pmap_if_matches(root.asid(), root.phys());
+        wait_for_la64_asid_quiescence(root.asid(), root.phys());
+        invalidate_la64_asid_before_reuse();
         release_la64_user_page_table_tree(root.phys(), 3);
         free_la64_asid(root.asid());
         Self::free_pt_node(root.into_node());
@@ -289,10 +300,49 @@ impl PmapIf for Platform {
 
     fn shootdown_kernel_mapping(invalidation: PmapInvalidation) {
         la64_invtlb_global(invalidation.virt());
+        let targets = CpuMask::from_bits(
+            <Platform as SmpIf>::online_cpus().bits()
+                & !CpuMask::single(la64_current_cpu_id()).bits(),
+        );
+        la64_remote_tlb_shootdown(targets);
+    }
+
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
+        if !invalidations.is_empty() {
+            // One architecturally defined all-TLB invalidation is cheaper than
+            // issuing INVTLB op 0x6 once for every unmapped vmalloc page.
+            la64_invtlb_all();
+            let targets = CpuMask::from_bits(
+                <Platform as SmpIf>::online_cpus().bits()
+                    & !CpuMask::single(la64_current_cpu_id()).bits(),
+            );
+            la64_remote_tlb_shootdown(targets);
+        }
+    }
+
+    fn service_pending_tlb_shootdown() {
+        service_la64_pending_tlb_shootdown();
     }
 
     fn shootdown_mapping(asid: Asid, invalidation: PmapInvalidation) {
         la64_invtlb_asid(asid, invalidation.virt());
+        la64_remote_tlb_shootdown(la64_asid_residency_mask(asid));
+    }
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        if invalidations.is_empty() {
+            return;
+        }
+        for invalidation in invalidations {
+            la64_invtlb_asid(asid, invalidation.virt());
+        }
+        la64_remote_tlb_shootdown(la64_asid_residency_mask(asid));
+    }
+
+    fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            la64_invtlb_asid(asid, invalidation.virt());
+        }
     }
 }
 impl TrapIf for Platform {
@@ -302,6 +352,11 @@ impl TrapIf for Platform {
 
     fn install_kernel_trap_vector() {
         install_la64_trap_vectors();
+        // The full kernel trap vector is now live, so this hart can safely
+        // accept runtime IPIs.  This must happen here for both the BSP and
+        // APs: the generic AP entry enables IPIs again before publishing
+        // itself online, while the BSP has no later per-CPU enable step.
+        boot_smp::enable_ipi_wakeups();
     }
 
     fn install_user_trap_vector() {
@@ -313,15 +368,17 @@ impl TrapIf for Platform {
     }
 
     fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
+        assert_eq!(
+            <Platform as PercpuIf>::cpu_pin_depth(),
+            0,
+            "LA64 CPU pin escaped across a reactor/userspace boundary"
+        );
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             let cpu = <Platform as SmpIf>::current_cpu_id();
             let frame = la64_entry_trap_frame_ptr_for_cpu(cpu);
             (*frame).restore_user_context(ctx);
             let pmap_switch = prepare_la64_pmap_switch(root).expect("LA64 user pmap switch");
-            if pmap_switch.switch_required {
-                record_la64_pmap_switch(&pmap_switch);
-            }
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
             trace_la64_user_entry_probe(cpu, ctx, &*frame, &pmap_switch, stack_top);
@@ -405,48 +462,6 @@ fn trace_la64_user_entry_probe(
     console_write_literal(b"\n");
 }
 impl SignalFrameIf for Platform {
-    fn write_signal_frame(
-        mut tf: TrapFrameMut<'_>,
-        setup: SignalFrameWrite,
-    ) -> Result<SignalFramePlacement, FaultInfo> {
-        let frame_size = core::mem::size_of::<La64SignalFrame>();
-        let Some(unrounded_frame_addr) = setup.stack_top.addr().checked_sub(frame_size) else {
-            return Err(FaultInfo {
-                address: VirtAddr(setup.stack_top.addr()),
-                write: true,
-                instruction: false,
-                from_user: false,
-            });
-        };
-        let frame_addr = align_down(unrounded_frame_addr, LA64_SIGFRAME_ALIGN);
-        let frame = La64SignalFrame::new(&tf, &setup);
-
-        unsafe {
-            la64_write_user(UserPtr::<La64SignalFrame>::new(frame_addr), frame)?;
-        }
-
-        let siginfo_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, siginfo);
-        let ucontext_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, user_context);
-        let trampoline_pc = frame_addr + core::mem::offset_of!(La64SignalFrame, trampoline);
-
-        tf.set_pc(VirtAddr(setup.handler_pc.addr()));
-        tf.set_sp(VirtAddr(frame_addr));
-        tf.set_signal_handler_regs(SignalHandlerRegs {
-            return_pc: VirtAddr(trampoline_pc),
-            args: [setup.sig_no as usize, siginfo_addr, ucontext_addr],
-        });
-
-        Ok(SignalFramePlacement {
-            frame_addr: UserPtr::new(frame_addr),
-            trampoline_pc: UserPtr::new(trampoline_pc),
-        })
-    }
-
-    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
-        let frame = unsafe { la64_read_user(UserPtr::<La64SignalFrame>::new(user_sp.addr()))? };
-        decode_la64_signal_frame(user_sp, frame)
-    }
-
     fn signal_frame_size() -> usize {
         core::mem::size_of::<La64SignalFrame>()
     }
@@ -514,10 +529,6 @@ impl SignalFrameIf for Platform {
             tx_hal::SignalFrameBytes::from_slice(frame_bytes),
         ))
     }
-
-    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
-        tf.rewind_pc(4);
-    }
 }
 
 fn decode_la64_signal_frame(
@@ -565,6 +576,10 @@ impl IrqIf for Platform {
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0
+    }
+
+    fn in_trap_context() -> bool {
+        la64_current_stack_is_trap_stack()
     }
 
     fn interrupts_enabled() -> bool {
@@ -652,7 +667,10 @@ unsafe fn restore_la64_interrupts(saved: usize) {
 }
 impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
-        tx_hal::time::ticks_to_ns(la64_read_stable_counter(), Self::frequency_hz())
+        tx_hal::time::ticks_to_ns(
+            la64_read_stable_counter(),
+            <Self as MonotonicCounterIf>::frequency_hz(),
+        )
     }
 
     fn frequency_hz() -> u64 {
@@ -662,7 +680,7 @@ impl MonotonicCounterIf for Platform {
 
 impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
-        let frequency_hz = Self::frequency_hz();
+        let frequency_hz = <Self as MonotonicCounterIf>::frequency_hz();
         if frequency_hz == 0 {
             return;
         }
@@ -670,13 +688,9 @@ impl DeadlineTimerIf for Platform {
         let now = la64_read_stable_counter();
         let target = tx_hal::time::deadline_ns_to_ticks(deadline, frequency_hz);
         let delta = target.saturating_sub(now).max(1);
-        let delta = round_up_to_tcfg_ticks(delta);
 
         write_la64_csr(LA64_CSR_TICLR, LA64_TICLR_CLEAR_TIMER);
-        write_la64_csr(
-            LA64_CSR_TCFG,
-            delta as usize | LA64_TCFG_ENABLE | LA64_TCFG_PERIODIC,
-        );
+        write_la64_csr(LA64_CSR_TCFG, la64_deadline_tcfg(delta));
     }
 
     fn cancel_deadline() {
@@ -788,9 +802,25 @@ impl PercpuIf for Platform {
         la64_write_kernel_tls(value as usize);
     }
 
+    fn pin_current_cpu() -> CpuPinGuard {
+        let cpu = la64_current_cpu_id();
+        LA64_CPU_PIN_DEPTHS[cpu.0].fetch_add(1, Ordering::Relaxed);
+        CpuPinGuard::with_unpin(cpu, la64_unpin_cpu)
+    }
+
+    fn cpu_pin_depth() -> usize {
+        LA64_CPU_PIN_DEPTHS[la64_current_cpu_id().0].load(Ordering::Relaxed)
+    }
+
     unsafe fn install_kernel_stack(top: VirtAddr) {
         unsafe { la64_install_kernel_stack(top) };
     }
+}
+
+fn la64_unpin_cpu(cpu: CpuId) {
+    debug_assert_eq!(cpu, la64_current_cpu_id());
+    let previous = LA64_CPU_PIN_DEPTHS[cpu.0].fetch_sub(1, Ordering::Release);
+    assert!(previous != 0, "LA64 CPU pin nesting underflow");
 }
 impl CacheIf for Platform {
     fn fence_all() {
@@ -816,10 +846,17 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        let possible = LA64_POSSIBLE_CPU_COUNT
+        // QEMU publishes its `-smp` count through the firmware FDT. Use that
+        // topology by default and treat `tx.maxcpus=N` as an explicit upper
+        // bound. Missing firmware topology falls back to one CPU in
+        // `LA64_DEFAULT_POSSIBLE_CPUS`.
+        let discovered = LA64_POSSIBLE_CPU_COUNT
             .load(Ordering::Acquire)
             .clamp(1, LA64_MAX_BOOT_CPUS);
-        CpuMask::first(possible)
+        let requested = crate::boot_facts::max_cpus_from_cmdline()
+            .unwrap_or(discovered)
+            .clamp(1, LA64_MAX_BOOT_CPUS);
+        CpuMask::first(discovered.min(requested))
     }
 
     fn online_cpus() -> CpuMask {
@@ -828,12 +865,20 @@ impl SmpIf for Platform {
 
     fn mark_cpu_online(cpu: CpuId) {
         if Self::possible_cpus().contains(cpu) {
+            // Accept synchronous work before scheduler-visible online
+            // publication, so no observer can target a CPU that is unable to
+            // acquire a shootdown pin.
+            mark_la64_tlb_cpu_online(cpu);
             LA64_ONLINE_CPUS.fetch_or(CpuMask::single(cpu).bits(), Ordering::AcqRel);
         }
     }
 
-    fn boot_secondary_cpus(_entry: SecondaryEntry) -> usize {
-        boot_smp::boot_secondary_cpus(_entry)
+    fn prepare_cpu_offline() {
+        prepare_la64_tlb_cpu_offline();
+    }
+
+    fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
+        boot_smp::boot_secondary_cpus(Self::possible_cpus(), entry)
     }
 
     fn enable_ipi_wakeups() {
@@ -844,8 +889,61 @@ impl SmpIf for Platform {
         la64_wait_for_interrupt_once();
     }
 
+    fn prepare_interrupt_wait() -> InterruptWaitState {
+        let crmd = read_la64_csr(LA64_CSR_CRMD);
+        write_la64_csr(LA64_CSR_CRMD, crmd & !LA64_CRMD_IE);
+        InterruptWaitState::from_raw(crmd)
+    }
+
+    fn cancel_interrupt_wait(state: InterruptWaitState) {
+        let crmd = read_la64_csr(LA64_CSR_CRMD);
+        let restored = if state.raw() & LA64_CRMD_IE != 0 {
+            crmd | LA64_CRMD_IE
+        } else {
+            crmd & !LA64_CRMD_IE
+        };
+        write_la64_csr(LA64_CSR_CRMD, restored);
+    }
+
+    fn wait_for_interrupt_prepared(state: InterruptWaitState) {
+        // `prepare_interrupt_wait` left IE clear while the kernel performed
+        // its final runnable-work check. The assembly helper below enables IE
+        // adjacent to `idle`; the trap dispatcher redirects an interrupt from
+        // that tiny window to the instruction after `idle`, so the just-served
+        // wake cannot be followed by an indefinite sleep.
+        la64_wait_for_interrupt_once();
+        if state.raw() & LA64_CRMD_IE == 0 {
+            let crmd = read_la64_csr(LA64_CSR_CRMD);
+            write_la64_csr(LA64_CSR_CRMD, crmd & !LA64_CRMD_IE);
+        }
+    }
+
     fn pending_ipi(kind: IpiKind) -> bool {
         boot_smp::pending_ipi(kind)
+    }
+
+    fn quiesce_this_cpu() -> ! {
+        <Self as DeadlineTimerIf>::cancel_deadline();
+        debug_assert_eq!(
+            LA64_TLB_TARGET_USERS[la64_current_cpu_id().0].load(Ordering::Acquire),
+            0
+        );
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // Disable every local interrupt source before publishing a
+            // permanently parked AP to the shutdown coordinator.
+            write_la64_csr(LA64_CSR_ECFG, 0);
+            let crmd = read_la64_csr(LA64_CSR_CRMD) & !LA64_CRMD_IE;
+            write_la64_csr(LA64_CSR_CRMD, crmd);
+        }
+        loop {
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                core::arch::asm!("idle 0", options(nomem, nostack));
+            }
+            #[cfg(not(target_arch = "loongarch64"))]
+            core::hint::spin_loop();
+        }
     }
 
     fn send_ipi(target: CpuId, kind: IpiKind) {

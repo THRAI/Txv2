@@ -198,6 +198,16 @@ pub fn step_copy_file_range(
         unsafe {
             core::ptr::copy_nonoverlapping(in_base.add(in_within), out_base.add(out_within), chunk);
         }
+        if out_pc
+            .mark_completed_write(out_page, out_materialized.ppn)
+            .is_err()
+        {
+            if advanced == 0 {
+                return V3::err(step_engine::Errno::EAGAIN);
+            }
+            publish_progress(out_pc, out_offset, advanced);
+            return V3::done(advanced);
+        }
 
         advanced += chunk;
         in_off += chunk as u64;

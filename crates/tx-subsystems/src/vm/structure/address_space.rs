@@ -2,7 +2,7 @@
 
 use crate::vm::adapter::step_engine::{borrow_current_guard, guard, Cap, Zone, ZoneAllocated};
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tx_hal::PmapIf;
 
 #[cfg(test)]
@@ -17,6 +17,7 @@ use super::{
 use crate::vm::adapter::step_engine::{self as step_engine};
 
 static ADDRESS_SPACE_ZONE: Zone<AddressSpace> = Zone::const_new();
+static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
 
 unsafe impl ZoneAllocated for AddressSpace {
     fn zone() -> &'static Zone<Self> {
@@ -38,6 +39,14 @@ unsafe impl Send for AddressSpace {}
 unsafe impl Sync for AddressSpace {}
 
 pub struct AddressSpace {
+    /// Stable identity of this address space for object namespaces whose
+    /// keys contain user virtual addresses (notably private futexes).
+    ///
+    /// A raw `&AddressSpace` address is not a suitable identity because zone
+    /// slots may move/reuse storage, and an architecture ASID may be recycled.
+    /// This monotonically allocated id is stable for the full lifetime of the
+    /// address space and is not reused during a boot.
+    id: u64,
     pub(in crate::vm) recipes: RecipeIndex,
     pub(in crate::vm) pmap: VmPmap,
     pub(in crate::vm) range_lock: RangeLock,
@@ -58,7 +67,10 @@ impl AddressSpace {
     pub(in crate::vm) fn new_with_recipes_for_platform<P: PmapIf>(
         recipes: RecipeIndex,
     ) -> Result<Self, VmPmapError> {
+        let id = NEXT_ADDRESS_SPACE_ID.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id, 0, "address-space identity exhausted");
         Ok(Self {
+            id,
             recipes,
             pmap: VmPmap::new_for_platform::<P>()?,
             range_lock: RangeLock::new(),
@@ -88,6 +100,11 @@ impl AddressSpace {
 
     pub const fn pmap(&self) -> &VmPmap {
         &self.pmap
+    }
+
+    /// Return the stable, boot-unique identity used to scope private futexes.
+    pub const fn futex_identity(&self) -> u64 {
+        self.id
     }
 
     /// Activate the platform pmap root owned by this address space.

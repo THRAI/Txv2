@@ -30,7 +30,7 @@ pub mod step_engine {
         let mut quiet = 0u32;
         while quiet < 2 {
             let stats = tx_substrate::epoch::drain_with_budget(usize::MAX);
-            if stats.bag_reclaimed == 0 && stats.publication_dropped == 0 {
+            if stats.reclaimed == 0 {
                 quiet += 1;
             } else {
                 quiet = 0;

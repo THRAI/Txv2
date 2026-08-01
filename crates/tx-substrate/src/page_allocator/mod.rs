@@ -51,7 +51,7 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use tx_hal::{PhysAddr, Ppn, PtNode};
 
 pub use bitmap_backend::BitmapPageAllocator;
-pub use diagnostics::{AllocatorBackendKind, AllocatorDiagnostics};
+pub use diagnostics::{AllocatorBackendKind, AllocatorDiagnostics, FrameRoleDiagnostics};
 pub use frame_meta::FrameMeta;
 pub use tokens::{
     CachePin, DeviceFrame, DmaPin, FrameReservation, FrameRunReservation, GiftPin, MapPin,
@@ -498,6 +498,14 @@ unsafe fn release_page_table_node(phys: PhysAddr) {
 /// Backend diagnostics from the installed allocator.
 pub fn backend_diagnostics() -> Result<AllocatorDiagnostics, AllocError> {
     Ok(installed_bitmap_allocator()?.backend_diagnostics())
+}
+
+/// Best-effort frame-role accounting from the installed allocator.
+///
+/// This performs a full metadata scan and is intended for panic/diagnostic
+/// paths, not the allocation fast path.
+pub fn frame_role_diagnostics() -> Result<FrameRoleDiagnostics, AllocError> {
+    Ok(installed_bitmap_allocator()?.frame_role_diagnostics())
 }
 
 #[doc(hidden)]

@@ -2,30 +2,30 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::adapter::step_engine::{
-    self as step_engine, Cap, StepOutcome, guard as ebr_guard, page_allocator, reserve_for,
-    sign_for,
+    self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap,
+    StepOutcome,
 };
 use alloc::sync::Arc;
 use alloc::vec;
-use tx_fs::tmpfs::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
-use tx_subsystems::cred::{CapabilitySet, Uid, step_setresuid};
+use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
+use tx_subsystems::cred::{step_setresuid, CapabilitySet, Uid};
 use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
-    SourceLabel, mount_for,
+    mount_for, DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions,
+    MountPayload, SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::process::{
     step_chdir, step_chdir_with_mount, step_fork, step_set_mount_namespace,
 };
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
-    StructPayload,
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, StructPayload,
+    S_IFDIR,
 };
+use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_CLOSE, NR_DUP, NR_DUP3, NR_FACCESSAT, NR_MOUNT,

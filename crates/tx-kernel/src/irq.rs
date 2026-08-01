@@ -80,6 +80,11 @@ impl UartRxPending {
 static UART_RX_PENDING: SpinMutex<UartRxPending> =
     spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
 
+/// Set in IRQ context and consumed by the reactor bottom half. The line stays
+/// masked between the two so a level-triggered virtio IRQ cannot storm.
+static NET_RX_IRQ_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Register `handler` as the dispatch entry for IRQ number `irq`.
 ///
 /// Idempotent on identical handler; panics on conflict (same slot,
@@ -160,8 +165,12 @@ fn dispatch_table_static() -> &'static IrqDispatchTable {
 /// the platform. One-shot; called from `init.rs` after
 /// `register_console_hardware` has populated the `CONSOLE_TTY` slot.
 pub(crate) fn install_irq_handlers<P: TxPlatform>() {
-    let uart_irq = <P as IrqIf>::UART_IRQ;
+    let uart_irq = <P as IrqIf>::uart_irq();
     register_irq_handler(uart_irq, uart_rx_irq_handler::<P>);
+    let net_irq = <P as IrqIf>::net_irq();
+    if net_irq != 0 {
+        register_irq_handler(net_irq, net_rx_irq_handler::<P>);
+    }
     let rtc_irq = <P as IrqIf>::RTC_IRQ;
     if rtc_irq != 0 {
         tx_fs::devfs::rtc_event_source_id();
@@ -170,10 +179,45 @@ pub(crate) fn install_irq_handlers<P: TxPlatform>() {
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
     <P as IrqIf>::set_priority(uart_irq, 1);
     <P as IrqIf>::unmask(uart_irq);
+    if net_irq != 0 {
+        <P as IrqIf>::set_priority(net_irq, 1);
+        <P as IrqIf>::unmask(net_irq);
+    }
     if rtc_irq != 0 {
         <P as IrqIf>::set_priority(rtc_irq, 1);
         <P as IrqIf>::unmask(rtc_irq);
     }
+}
+
+/// Virtio-net IRQ top half. Device acknowledgement and delegate wakeup are
+/// deferred because the driver lock may be held by task context.
+pub fn net_rx_irq_handler<P: IrqIf>(irq: u32) -> IrqHandled {
+    <P as IrqIf>::mask(irq);
+    NET_RX_IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
+    IrqHandled::Wake
+}
+
+/// Reactor-context bottom half for a pending virtio-net IRQ.
+pub(crate) fn drain_net_rx_pending<P: TxPlatform>() -> bool {
+    if !NET_RX_IRQ_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    if let Some(registration) = tx_subsystems::net::net_device_by_name(b"eth0") {
+        let _ = registration
+            .ops
+            .ack_interrupt_and_fire_with_post(&mut |mailbox, event| {
+                crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(
+                    mailbox,
+                    event,
+                    MailboxSchedulerHint::Normal,
+                )
+            });
+    }
+    let irq = <P as IrqIf>::net_irq();
+    if irq != 0 {
+        <P as IrqIf>::unmask(irq);
+    }
+    true
 }
 
 /// RTC alarm IRQ handler.

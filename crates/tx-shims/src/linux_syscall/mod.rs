@@ -46,9 +46,17 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf};
-use tx_observe::SpanId;
-use tx_scripts::process::exec::ExecScriptOp;
+use tx_hal::{AuxvIf, CacheIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
+use tx_observe::encode::{
+    arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
+    syscall_exit_tag,
+};
+use tx_observe::{EventNameId, SpanId, TxTraceLevel};
+use tx_observe_types::{
+    PayloadArgValue, PayloadSyscallEnter, PayloadSyscallExit, TxPayloadTag, TxValueKind,
+};
+use tx_scripts::process::exec::{ExecError, ExecScriptOp};
+use tx_services::time::{ClockRead, RealtimeControl, TimekeeperClock};
 use tx_subsystems::cred::{
     Capability, CapabilitySet, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
     SetreuidOp, SetuidOp, Uid,
@@ -64,14 +72,14 @@ use tx_subsystems::process::{
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
-    KillProcessWithPostOp, SaFlags, SigActionEntry, SigDisposition, SigDispositionChange,
+    DeliverSignalOp, KillProcessOp, SaFlags, SigActionEntry, SigDisposition, SigDispositionChange,
     SigactionOp, SignalMask, Signum,
 };
 use tx_subsystems::thread_runtime::execution::{
     step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange, SigprocmaskOp,
 };
 use tx_subsystems::thread_runtime::{
-    step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillWithPostOp, ThreadPayload,
+    step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillOp, ThreadPayload,
 };
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
@@ -80,24 +88,21 @@ use tx_subsystems::tty::execution::{
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::composite::{
-    AccessOp, ChmodOp, ChownOp, LstatOp, LstatxOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp,
-    StatxResult,
+    AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp, StatxResult,
 };
 use tx_subsystems::vfs::structure::{
     Credential, FsNotifyInstance, FsNotifyKind, InodeKind, InodeMeta, OpenFileBacking,
     OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
 };
 use tx_subsystems::vfs::{
-    step_open, step_open_nofollow, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile,
-    OpenFileGetFlOp, OpenFileSetFlOp, OpenNoFollowOp, OpenOp,
+    step_open, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp,
+    OpenOp,
 };
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
 use tx_subsystems::wait_source;
-
-use tx_services::time::{ClockRead, RealtimeControl, TimekeeperClock};
 
 pub mod numbers;
 
@@ -134,10 +139,14 @@ mod misc;
 use misc::*;
 mod userfaultfd;
 use userfaultfd::*;
-// `clone_op` is an unfinished StepOp-shaped refactor targeting an older
-// API surface. `sys_execve` now drives the canonical
-// `tx_scripts::process::exec::ExecScriptOp`.
+// `clone_op` and `exec_op` are unfinished StepOp-shaped refactors —
+// both target an older API surface (Credential::euid/egid,
+// SegmentFlags readable/writable, UserTrapContext::set_sepc, struct-
+// variant StepOutcome::Yield(...) tuple form, etc.) that no longer
+// exists. `sys_clone` and `sys_execve` drive their underlying step
+// functions directly until these wrappers land.
 // pub mod clone_op;
+// pub mod exec_op;
 pub mod aio;
 use aio::*;
 pub mod io_uring;
@@ -176,8 +185,6 @@ mod helpers;
 pub(super) use helpers::*;
 mod wait;
 pub(super) use wait::*;
-
-pub use time::maybe_deliver_itimer_signal_with_post;
 
 #[cfg(test)]
 mod tests;
@@ -269,7 +276,7 @@ pub use numbers::{
     IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
     IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS, IPV6_UNICAST_HOPS, IPV6_V6ONLY,
     IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL, IP_MULTICAST_IF, IP_MULTICAST_LOOP,
-    IP_MULTICAST_TTL, IP_RECVERR, IP_TTL, ITIMER_REAL, MCAST_JOIN_GROUP, MCAST_LEAVE_GROUP,
+    IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL, ITIMER_REAL, MCAST_JOIN_GROUP, MCAST_LEAVE_GROUP,
     NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_XFRM, NR_CAPGET, NR_CAPSET,
     NR_FADVISE64, NR_FSOPEN, NR_FSPICK, NR_KCMP, NR_MINCORE, NR_MLOCK2, NR_MLOCKALL, NR_MUNLOCKALL,
     NR_OPEN_TREE, NR_PIDFD_GETFD, NR_REMAP_FILE_PAGES, NR_SETGROUPS, NR_SETHOSTNAME, NR_SIGNALFD,
@@ -309,16 +316,19 @@ pub const EXECVE_PATH_MAX: usize = 4096;
 
 /// Maximum total argv + envp byte budget per `execve(2)` call.
 ///
-/// Linux's `ARG_MAX` is 128 KiB but the Phase 6 plan caps the inline
-/// buffer at 8 KiB to keep the same discipline as the `write` /
-/// `sigaction` arms. Overflow returns `-E2BIG`. Could be lifted to
-/// 128 KiB now that the user-VA `copy_from_user` lane has landed.
-pub const EXECVE_ARG_MAX_INLINE: usize = 8192;
+/// Set to Linux's `ARG_MAX` (128 KiB). The Phase 6 plan originally capped the
+/// inline buffer at 8 KiB, but git spawns its remote helpers / index-pack with
+/// a large inherited environment ("cannot exec 'remote-http': Argument list too
+/// long"), so the cap is lifted to the real `ARG_MAX`. The user-VA
+/// `copy_from_user` lane makes the larger transient buffer safe; overflow still
+/// returns `-E2BIG`. (Ported from net-git e7992ef8 — git Task2.)
+pub const EXECVE_ARG_MAX_INLINE: usize = 131_072;
 
-/// Maximum number of pointer slots walked through `argv` / `envp`
-/// before we give up. The Phase 6 plan caps at 256; in practice the
-/// total-byte cap (`EXECVE_ARG_MAX_INLINE`) bounds well below this.
-pub const EXECVE_VEC_MAX: usize = 256;
+/// Maximum number of pointer slots walked through `argv` / `envp` before we
+/// give up. Raised from 256 to 1024 so a large inherited git environment (Task2
+/// remote-helper spawn) fits; the total-byte cap (`EXECVE_ARG_MAX_INLINE`) still
+/// bounds the aggregate. (Ported from net-git e7992ef8.)
+pub const EXECVE_VEC_MAX: usize = 1024;
 
 /// Linux generic ABI errno value for "function not implemented" (`ENOSYS`).
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
@@ -391,7 +401,7 @@ pub(super) const ECHILD_VALUE: i32 = 10;
 pub(super) const EACCES_VALUE: i32 = 13;
 /// Linux generic ABI errno value for "read-only file system"
 /// (`EROFS`). Used by `fchmodat` / `fchownat` against devfs (which
-/// returns `Errno::EROFS` from `chmod_inode` / `chown_inode` per the
+/// returns `Errno::EROFS` from `step_chmod` / `step_chown` per the
 /// Wave 3 slice's projection-only contract).
 pub(super) const EROFS_VALUE: i32 = 30;
 /// Linux generic ABI errno value for "I/O error" (`EIO`). Used as the
@@ -434,36 +444,24 @@ pub(super) const SIGSETSIZE_BYTES: u64 = 8;
 /// Minimum alternate signal stack size (Linux: MINSIGSTKSZ = 2048).
 pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
-/// on RV64 generic ABI.
+/// on the RV64/LA64 generic ABI.
 ///
-/// Layout decision: Linux's `arch/riscv/include/uapi/asm/signal.h`
-/// pulls in `asm-generic/signal.h`, which defines the kernel
-/// (uapi) `struct sigaction` as four 64-bit fields:
+/// Both architectures include `asm-generic/signal.h` without defining
+/// `SA_RESTORER`, so the kernel ABI contains exactly three 64-bit words:
 ///
 /// ```text
 /// struct sigaction {
 ///     __sighandler_t  sa_handler;   // 8B
 ///     unsigned long   sa_flags;     // 8B
-///     __sigrestore_t  sa_restorer;  // 8B  (present under SA_RESTORER)
 ///     sigset_t        sa_mask;      // 8B  (single u64 bitset, sigsetsize=8)
 /// };
 /// ```
 ///
-/// So the rt_sigaction syscall takes a 32-byte buffer. The plan's
-/// "16 bytes" hint applied to the legacy `__OLD_SIGACTION` shape used
-/// by the (deprecated) `sigaction()` syscall — the modern
-/// `rt_sigaction` syscall uses the 32-byte form. We pin the modern
-/// shape because (a) Linux RV64 has no `sigaction()` syscall at all
-/// (it only ships `rt_sigaction`, NR_134) and (b) `__sa_restorer` is
-/// part of the ABI even when SA_RESTORER is unset (kernel reads all
-/// four words and ignores the restorer bits unless the flag is set).
-///
-/// Citation: linux/include/uapi/asm-generic/signal.h
-/// `struct sigaction { __sighandler_t sa_handler; unsigned long
-///  sa_flags; __ARCH_HAS_SA_RESTORER ? __sigrestore_t sa_restorer;
-///  sigset_t sa_mask; };` — RV64 enables `__ARCH_HAS_SA_RESTORER`
-/// transitively (the field is always emitted at the ABI level).
-pub(super) const SIGACTION_BYTES: usize = 32;
+/// In particular this is **not** libc's public 152-byte `struct sigaction`.
+/// Glibc translates that public object to this 24-byte kernel image before
+/// issuing syscall 134. Writing a fourth word here corrupts the wrapper's
+/// stack and makes concurrent signal delivery fail nondeterministically.
+pub(super) const SIGACTION_BYTES: usize = 24;
 
 /// Per-syscall context resolved by the trap-shell wrapper: the calling
 /// process / thread, the bound address space, and the bookkeeping the
@@ -486,16 +484,21 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallResult
+pub async fn dispatch<
+    'a,
+    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf + tx_hal::ConsoleIf,
+>(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
-    P: PmapIf + EntropyIf + AuxvIf + SmpIf + tx_hal::ConsoleIf,
     TimekeeperClock<P>: ClockRead + RealtimeControl,
 {
     // L0 boundary span — `08_OBSERVATION_v1.md` §6 HOOKS-1.
     // Always opened before the inner dispatch; closed after with the
-    // result-shaped syscall exit payload. A `SpanId::NONE` short-circuit
-    // ensures we never emit a mismatched span-end when no emitter is installed
-    // (test contexts, boards with `ObserverIf` default).
+    // result-shaped `PayloadSyscallExit`. A `SpanId::NONE` short-circuit
+    // ensures we never emit a mismatched span-end when no emitter is
+    // installed (test contexts, boards with `ObserverIf` default).
     //
     // Parent-span linkage (L0 → L2 → L4) lives in a per-hart static
     // installed via [`tx_observe::set_current_parent_span`] so the L2
@@ -513,7 +516,9 @@ where
     // Without this, alarm-armed tight loops that never reach a socket wait
     // (netperf UDP_STREAM/TCP_STREAM `send` bursts) never see SIGALRM and hang.
     time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
+
     let result = dispatch_inner::<P>(req, ctx).await;
+
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
     result
@@ -549,11 +554,11 @@ pub fn dispatch_pthread_hot_oneshot(
     Some(result)
 }
 
-/// One-shot syscall lane for non-vfork `clone`.
+/// One-shot syscall lane for `CLONE_THREAD`.
 ///
-/// This keeps pthread `CLONE_THREAD` and regular non-vfork fork out of the
-/// broad async dispatcher carried by `run_thread`. `CLONE_VFORK` is excluded
-/// because it intentionally parks the parent until child exec/exit.
+/// Process fork can contend on the parent VM and therefore belongs to the
+/// boxed async dispatcher. Keeping only pthread creation here prevents the
+/// large wait-capable fork state machine from inflating every thread task.
 pub fn dispatch_clone_oneshot<P: PmapIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
@@ -564,7 +569,7 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
         return None;
     }
     let flags = req.args[0];
-    if (flags & CLONE_VFORK) != 0 && (flags & CLONE_THREAD) == 0 {
+    if (flags & CLONE_THREAD) == 0 {
         return None;
     }
     // Net/mount-namespace clones take the async fork path (namespace creation +
@@ -578,7 +583,7 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     let prev = tx_observe::set_current_parent_span(l0_span);
     let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
     let result = sys_clone_oneshot::<P>(req.args, &ctx)
-        .expect("dispatch_clone_oneshot prefilters vfork-only async clone");
+        .expect("dispatch_clone_oneshot prefilters process-fork async clone");
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
@@ -601,6 +606,9 @@ pub fn dispatch_thread_exit_oneshot(
     let l0_span = emit_syscall_enter(req);
     let result = match step_thread_exit(thread.clone(), req.args[0] as i32) {
         tx_subsystems::thread_runtime::ThreadExitOutcome::Completed => SyscallResult::NoReturn,
+        // The process lifecycle lane can temporarily belong to exec.  Do not
+        // report NoReturn until this thread has actually detached; the async
+        // kernel boundary consumes this private retry result and yields.
         tx_subsystems::thread_runtime::ThreadExitOutcome::Retry => {
             SyscallResult::Error(EAGAIN_VALUE)
         }
@@ -705,7 +713,7 @@ pub fn dispatch_vm_try_oneshot(
 /// the userspace-run wait. The caller is responsible for proving any
 /// syscall-specific safety preconditions, such as signal quiescence for
 /// `rt_sigprocmask`.
-pub fn dispatch_direct_trap_oneshot<P>(
+pub fn dispatch_direct_trap_oneshot<P: tx_hal::TimeIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -771,7 +779,7 @@ where
 
 /// Direct trap-resume lane variant for call sites that already hold the
 /// current userspace thread payload.
-pub fn dispatch_direct_trap_payload_oneshot<P>(
+pub fn dispatch_direct_trap_payload_oneshot<P: tx_hal::TimeIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -843,7 +851,7 @@ pub async fn dispatch_writev_hot(
 
 fn emit_writev_hot_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.debug_counter(name, value);
+        observer.counter(EventNameId::from_raw(tx_observe::fnv1a32(name)), value);
     }
 }
 
@@ -875,11 +883,40 @@ pub fn dispatch_writev_pagebacked_oneshot(
     Some(result)
 }
 
-async fn dispatch_inner<'a, P>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallResult
+/// Socket-family syscalls can enter smoltcp before the delegate gets a turn.
+/// Publish the platform clock on those paths so protocol timers see current
+/// monotonic time instead of the bridge's boot-time default.
+fn syscall_publishes_net_clock(nr: u64) -> bool {
+    nr == NR_CONNECT
+        || nr == NR_SENDTO
+        || nr == NR_RECVFROM
+        || nr == NR_SENDMSG
+        || nr == NR_RECVMSG
+        || nr == NR_SENDMMSG
+        || nr == NR_RECVMMSG
+        || nr == NR_ACCEPT
+        || nr == NR_ACCEPT4
+        || nr == NR_SHUTDOWN
+        || nr == NR_SETSOCKOPT
+        || nr == NR_PPOLL
+        || nr == NR_PSELECT6
+        || nr == NR_PSELECT6_TIME64
+}
+
+async fn dispatch_inner<
+    'a,
+    P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf + tx_hal::ConsoleIf,
+>(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
-    P: PmapIf + EntropyIf + AuxvIf + SmpIf + tx_hal::ConsoleIf,
     TimekeeperClock<P>: ClockRead + RealtimeControl,
 {
+    if syscall_publishes_net_clock(req.nr) {
+        tx_subsystems::net::clock::net_set_now_ns(P::read_ns());
+    }
+
     // ── Lane 1: ImmediateSyscall (pure ABI queries, never yield) ──
     // Per `docs/Txv3/04_SYSCALL_SHAPE_v1.md §6.1`: these syscalls
     // do not call drive(), do not enter StepOp, do not construct
@@ -909,7 +946,6 @@ where
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
         nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
-        nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
         nr if nr == NR_SETRLIMIT => return sys_setrlimit(req.args, ctx),
@@ -963,6 +999,7 @@ where
 
     // ── Lanes 2+3: Script-based (OneShotStepOp + Full async drive) ──
     match req.nr {
+        nr if nr == NR_GETRANDOM => sys_getrandom(req.args, ctx).await,
         nr if nr == NR_WRITE => sys_write(req.args, ctx).await,
         nr if nr == NR_WRITEV => sys_writev(req.args, ctx).await,
         nr if nr == NR_READ => sys_read::<P>(req.args, ctx).await,
@@ -983,7 +1020,7 @@ where
         nr if nr == NR_SPLICE => sys_splice::<P>(req.args, ctx).await,
         nr if nr == NR_TEE => sys_tee(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
-        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx).await,
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
@@ -1031,7 +1068,7 @@ where
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_UNSHARE => sys_unshare(req.args, ctx),
         nr if nr == NR_SETNS => sys_setns(req.args, ctx),
-        nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
+        nr if nr == NR_WAIT4 => sys_wait4::<P>(req.args, ctx).await,
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
@@ -1051,7 +1088,7 @@ where
         nr if nr == NR_SETRESGID => sys_setresgid(req.args, ctx),
         // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall
         // arms. Each wraps the FsOps surface Wave 3 Part 2 landed
-        // (`chmod_inode` / `chown_inode`) plus a walker-side `access(2)`
+        // (`step_chmod` / `step_chown`) plus a walker-side `access(2)`
         // predicate over the inode meta.
         nr if nr == NR_FCHMOD => sys_fchmod(req.args[0] as u32, req.args[1] as u32, ctx),
         nr if nr == NR_FCHMODAT => sys_fchmodat::<P>(
@@ -1117,7 +1154,7 @@ where
             ctx,
         ),
         // fd-ops Wave 3 — anonymous pipe.
-        nr if nr == NR_PIPE2 => sys_pipe2(req.args[0], req.args[1] as u32, ctx),
+        nr if nr == NR_PIPE2 => sys_pipe2(req.args[0], req.args[1] as u32, ctx).await,
         // fd-ops Wave 4 — `lseek(2)`. Non-async; pure offset compute
         // through `OpenFile::step_lseek`. ESPIPE for non-seekable
         // backings (TTY / chardev / pipe), EISDIR for directories,
@@ -1163,13 +1200,13 @@ where
         // step functions exist; the arm decodes `request` and
         // dispatches. Non-TTY fds and unknown request codes return
         // `-ENOTTY` per Linux's `man ioctl_tty`.
-        nr if nr == NR_IOCTL => sys_ioctl::<P>(req.args, ctx),
+        nr if nr == NR_IOCTL => sys_ioctl(req.args, ctx),
         // Slice 6 of the shell-prompt roadmap — stat family
         // (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir`
         // / `umask`). `fchdir` returns `-ENOSYS` (carryover; OpenFile
         // has no DEntry hint to install via step_chdir).
-        nr if nr == NR_FSTAT => sys_fstat(req.args, ctx),
-        nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
+        nr if nr == NR_FSTAT => sys_fstat::<P>(req.args, ctx),
+        nr if nr == NR_NEWFSTATAT => sys_newfstatat::<P>(req.args, ctx).await,
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
         nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,
@@ -1180,14 +1217,19 @@ where
         nr if nr == NR_FSYNC => sys_fsync::<P>(req.args, ctx).await,
         nr if nr == NR_FDATASYNC => sys_fdatasync::<P>(req.args, ctx).await,
         nr if nr == NR_FLOCK => sys_flock::<P>(req.args, ctx).await,
-        nr if nr == NR_OPEN_TREE => sys_open_tree::<P>(req.args, ctx).await,
-        nr if nr == NR_FSOPEN => sys_fsopen::<P>(req.args, ctx).await,
-        nr if nr == NR_FSPICK => sys_fspick::<P>(req.args, ctx).await,
+        // The new mount API is not exposed until its complete fd lifecycle
+        // (`fsconfig` -> `fsmount` -> `move_mount`) is implemented.  Returning
+        // ENOSYS consistently is important: util-linux then falls back to the
+        // legacy mount(2) path instead of retaining a half-backed MountApi fd
+        // that can reach ordinary VFS-only rnode dispatch.
+        nr if nr == NR_OPEN_TREE || nr == NR_FSOPEN || nr == NR_FSPICK => {
+            SyscallResult::Error(ENOSYS_VALUE)
+        }
         nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
         nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
         nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
         nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
-        nr if nr == NR_STATX => sys_statx(req.args, ctx).await,
+        nr if nr == NR_STATX => sys_statx::<P>(req.args, ctx).await,
         // Slice 7 of the shell-prompt roadmap — fcntl extension +
         // day-1 misc syscalls. None individually heavy; each unblocks
         // a specific shell-startup path.
@@ -1212,7 +1254,7 @@ where
         // `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`
         // Slice 8.
         nr if nr == NR_MKDIRAT => sys_mkdirat(req.args, ctx).await,
-        nr if nr == NR_UNLINKAT => sys_unlinkat(req.args, ctx).await,
+        nr if nr == NR_UNLINKAT => sys_unlinkat::<P>(req.args, ctx).await,
         nr if nr == NR_SYMLINKAT => sys_symlinkat(req.args, ctx).await,
         nr if nr == NR_LINKAT => sys_linkat(req.args, ctx).await,
         nr if nr == NR_TRUNCATE => sys_truncate(req.args, ctx).await,
@@ -1404,7 +1446,7 @@ where
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
 /// `flags` and `cpu_id` are currently ignored (must be 0).
-fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
+fn sys_membarrier<P: SmpIf + CacheIf + TimeIf>(args: &[u64; 6]) -> SyscallResult {
     let cmd = args[0];
     let flags = args[1] as u32;
 
@@ -1419,7 +1461,16 @@ fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
         | MEMBARRIER_CMD_GLOBAL_EXPEDITED
         | MEMBARRIER_CMD_PRIVATE_EXPEDITED
         | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
-            let targets = P::online_cpus();
+            // The issuing hart participates locally; only remote harts need
+            // an IPI and acknowledgement. Sending an SBI software interrupt
+            // to the current hart while omitting its software pending bit
+            // leaves SSIP permanently asserted and livelocks the trap entry.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            if cmd == MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE {
+                P::fence_i_all();
+            }
+
+            let targets = P::online_cpus().without(P::current_cpu_id());
             if targets.is_empty() {
                 return SyscallResult::Return(0);
             }
@@ -1429,7 +1480,19 @@ fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
             // executed the barrier and acked. The IPI handler on the
             // target hart runs `fence(SeqCst)` + ack before
             // returning to its interrupt context.
-            P::wait_for_ipi_ack_cpus(targets, IpiKind::Membarrier);
+            const MEMBARRIER_ACK_TIMEOUT_NS: u64 = 2_000_000_000;
+            let deadline = P::read_ns().saturating_add(MEMBARRIER_ACK_TIMEOUT_NS);
+            loop {
+                let acked = P::ipi_ack_cpus(IpiKind::Membarrier);
+                if (acked.bits() & targets.bits()) == targets.bits() {
+                    break;
+                }
+                if P::read_ns() >= deadline {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                core::hint::spin_loop();
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             SyscallResult::Return(0)
         }
 
@@ -1469,14 +1532,15 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::EEXIST => 17,
         Errno::EFBIG => 27,
         Errno::EIDRM => 43,
-        Errno::ELIBBAD => 80,
         Errno::EFAULT => 14,
         Errno::EINVAL => 22,
         Errno::EINPROGRESS => 115,
         Errno::EIO => 5,
         Errno::EISCONN => 106,
         Errno::EISDIR => 21,
+        Errno::ELIBBAD => 80,
         Errno::ELOOP => 40,
+        Errno::EMLINK => 31,
         Errno::ENAMETOOLONG => 36,
         Errno::ENODEV => 19,
         Errno::ENOEXEC => 8,
@@ -1499,10 +1563,9 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ESPIPE => 29,
         Errno::ESRCH => 3,
         Errno::ESTALE => 116,
+        Errno::ESOCKTNOSUPPORT => 94,
         Errno::ETIMEDOUT => 110,
         Errno::EINTR => 4,
-        Errno::EMLINK => 31,
-        Errno::ESOCKTNOSUPPORT => 94,
     }
 }
 
@@ -1515,8 +1578,9 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
 // when no emitter is installed (test contexts, boards without an
 // `ObserverIf` impl).
 //
-// OBS-2 compliance: raw register-shaped args are emitted as opaque `u64`
-// `ArgValue` continuations. No `UserPtr<T>` deref.
+// OBS-2 compliance: raw register-shaped args are emitted as opaque
+// `u64` (today: encoded only in the `argc` count; future `ArgValue`
+// continuations will carry the bits). No `UserPtr<T>` deref.
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -1524,11 +1588,63 @@ fn emit_syscall_enter(req: &SyscallRequest) -> SpanId {
     let Some(em) = tx_observe::current() else {
         return SpanId::NONE;
     };
-    // Linux RV64 = 0 today; LoongArch64 will use 1 once its shim lands.
-    // Threading the per-board ABI through the call chain is OBS follow-up
-    // work; emitting 0 is correct for the only board currently emitting.
-    em.syscall_enter(req.nr as u32, 0, &req.args)
+    let payload = PayloadSyscallEnter {
+        sysno: req.nr as u32,
+        // Linux RV64 = 0 today; LoongArch64 will use 1 once its shim lands.
+        // Threading the per-board ABI through the call chain is OBS follow-up
+        // work; emitting 0 is correct for the only board currently emitting.
+        abi: 0,
+        // argc reflects the register-shaped arg slots — `req.args` is `[u64; 6]`
+        // for the Linux generic ABI. The daemon walks `argc` `ArgValue`
+        // continuation records after this `SpanBegin`.
+        argc: 6,
+    };
+    let (enc, len) = encode_syscall_enter(&payload);
+    let syscall_span = em.span_begin(
+        TxTraceLevel::Boundary,
+        EventNameId::from_raw(req.nr as u32),
+        SpanId::NONE,
+        syscall_enter_tag(),
+        &enc[..len as usize],
+    );
+
+    // Per OBS-V1 §6 / `08_OBSERVATION_SERIALIZATION_v0.md §8.6`: emit one
+    // `ArgValue` `Instant` per register-shaped syscall arg right after
+    // `SpanBegin(SyscallEnter)`. The daemon attaches them as debug
+    // annotations on the syscall slice so each `sys_*` chip in Perfetto
+    // shows `a0`/`a1`/…/`a5` with the raw u64 the userspace process
+    // passed in. OBS-2 compliance: the wire carries the raw register
+    // bits as `TxValueKind::U64`; no `UserPtr<T>` deref. The shim's
+    // arg-parsing code later decodes individual args as `Ptr` /
+    // `ObjectId` / etc. via separate `ArgValue` records once the
+    // higher-fidelity arg-classification pass lands.
+    if syscall_span != SpanId::NONE {
+        for (i, &raw) in req.args.iter().enumerate().take(6) {
+            let arg_payload = PayloadArgValue {
+                key: tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes()),
+                value_kind: TxValueKind::U64 as u8,
+                _pad: [0; 3],
+                value0: raw,
+            };
+            let (enc, len) = encode_arg_value(&arg_payload);
+            em.instant(
+                TxTraceLevel::Boundary,
+                EventNameId::from_raw(tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes())),
+                syscall_span,
+                arg_value_tag(),
+                &enc[..len as usize],
+            );
+        }
+    }
+
+    syscall_span
 }
+
+/// Stable register-position labels used as the `key` for syscall
+/// `ArgValue` continuations. Matches the Linux ABI's call-clobbered
+/// register names (a0..a5 on rv64, $a0..$a7 on la64, %rdi..%r9 on x86_64);
+/// using the position-agnostic `aN` form keeps the names ABI-portable.
+const SYSCALL_ARG_NAMES: [&str; 6] = ["a0", "a1", "a2", "a3", "a4", "a5"];
 
 #[inline]
 fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
@@ -1554,7 +1670,14 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
         SyscallResult::SigreturnRestored => (0, 0, 4u8),
         SyscallResult::SigreturnContextRestored => (0, 0, 4u8),
     };
-    em.syscall_exit(span, ret, errno, result_kind);
+    let payload = PayloadSyscallExit {
+        ret,
+        errno,
+        result_kind,
+        _pad: [0; 3],
+    };
+    let (enc, len) = encode_syscall_exit(&payload);
+    em.span_end(span, syscall_exit_tag(), &enc[..len as usize]);
 }
 
 /// Linux generic ABI errno value for "no such file or directory"

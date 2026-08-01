@@ -14,8 +14,7 @@ fn step_recv_consumes_available_bytes_and_clears_when_empty() {
     .expect("tcp socket");
     let payload = tcp.acquire_operational().expect("payload");
     assert!(payload.record_recv_payload(endpoint(50_135), endpoint(40_135), std::vec![0u8; 128]));
-    tcp.readiness
-        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
+    tcp.readiness.fire_recv(RecvWireSet::HAS_DATA);
 
     assert_eq!(
         step_recv(&tcp, 64, SendRecvFlags::empty(), &guard),
@@ -70,8 +69,7 @@ fn step_recv_broken_without_buffered_data_returns_eof() {
         SocketOptionSet::default_tcp(),
     )
     .expect("tcp socket");
-    tcp.readiness
-        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    tcp.readiness.fire_recv(RecvWireSet::BROKEN);
 
     assert_eq!(
         step_recv(&tcp, 32, SendRecvFlags::empty(), &guard),
@@ -93,8 +91,7 @@ fn step_recv_peek_does_not_consume_or_clear() {
     .expect("tcp socket");
     let payload = tcp.acquire_operational().expect("payload");
     assert!(payload.record_recv_payload(endpoint(50_136), endpoint(40_136), std::vec![0u8; 16]));
-    tcp.readiness
-        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
+    tcp.readiness.fire_recv(RecvWireSet::HAS_DATA);
 
     assert_eq!(
         step_recv(&tcp, 8, SendRecvFlags::MSG_PEEK, &guard),
@@ -118,8 +115,7 @@ fn step_recv_errqueue_without_error_returns_eagain() {
     .expect("tcp socket");
     let payload = tcp.acquire_operational().expect("payload");
     assert!(payload.record_recv_payload(endpoint(50_137), endpoint(40_137), std::vec![0u8; 16]));
-    tcp.readiness
-        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
+    tcp.readiness.fire_recv(RecvWireSet::HAS_DATA);
 
     assert_eq!(
         step_recv(&tcp, 8, SendRecvFlags::MSG_ERRQUEUE, &guard),
@@ -141,8 +137,7 @@ fn step_send_consumes_space_and_clears_when_full() {
         .expect("udp socket");
     assert_eq!(step_bind(&udp, inet(40_136), &guard), StepOutcome::Done(()));
     let payload = udp.acquire_operational().expect("payload");
-    udp.readiness
-        .fire_send_with_post(SendWireSet::SPACE, |mailbox, event| mailbox.post(event));
+    udp.readiness.fire_send(SendWireSet::SPACE);
 
     assert_eq!(
         step_send(&udp, 32, SendRecvFlags::empty(), &guard),
@@ -240,13 +235,12 @@ fn step_send_udp_loopback_oob_is_not_supported() {
     assert_eq!(step_bind(&udp, inet(40_206), &guard), StepOutcome::Done(()));
 
     assert_eq!(
-        step_send_udp_loopback_kernel_bytes_with_post(
+        step_send_udp_loopback_kernel_bytes(
             &udp,
             Some(endpoint(50_206)),
             b"x",
             SendRecvFlags::MSG_OOB,
-            &guard,
-            |mailbox, event| mailbox.post(event),
+            &guard
         ),
         StepOutcome::Err(Errno::EOPNOTSUPP)
     );
@@ -313,6 +307,8 @@ fn raw_udp_send_queue_preserves_datagram_atomicity() {
     options.socket.send_buf_size = 8;
     let udp = RawUdpSocket::new(&options);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_138);
+    // P2-S6: the smoltcp ring is the queue; `send` needs a bound socket.
+    assert!(udp.bind_endpoint(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_240)));
 
     assert_eq!(udp.enqueue_tx_bytes_to(dst, b"12345"), Some((5, false)));
     assert_eq!(udp.send_available(), 3);
@@ -331,6 +327,8 @@ fn raw_udp_msg_more_corks_until_uncork_send() {
     options.socket.send_buf_size = 8;
     let udp = RawUdpSocket::new(&options);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_139);
+    // P2-S6: the smoltcp ring is the queue; `send` needs a bound socket.
+    assert!(udp.bind_endpoint(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_241)));
 
     assert_eq!(
         udp.enqueue_tx_bytes_to_with_more(dst, b"12345", true),
@@ -357,6 +355,8 @@ fn raw_udp_recv_queue_drops_when_datagram_would_not_fit() {
     let udp = RawUdpSocket::new(&options);
     let src = IpEndpoint::new(Ipv4Address::LOOPBACK, 50_138);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_138);
+    // P2-S6: inbound datagrams pass smoltcp `accepts`; bind the dst first.
+    assert!(udp.bind_endpoint(dst));
 
     assert!(udp.ingest_rx_datagram(src, dst, b"123456".to_vec()));
     assert!(!udp.ingest_rx_datagram(src, dst, b"abcd".to_vec()));

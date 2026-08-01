@@ -163,7 +163,7 @@ fn zone_and_epoch_summary_report_registered_state() {
 
     let cpu0 = epoch::cpu_summary(tx_hal::CpuId(0)).expect("cpu0 summary");
     assert!(cpu0.initialized);
-    assert!(cpu0.retired_count <= tx_substrate::epoch::RETIRED_NODE_POOL_CAPACITY);
+    assert_eq!(cpu0.retired_count, 0);
 
     let mut zones = [None; 8];
     let written = zone::snapshot(&mut zones);

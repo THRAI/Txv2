@@ -95,7 +95,10 @@ fn emit_clone_marker(name: &[u8]) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.debug_counter(name, NR_CLONE as i64);
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            NR_CLONE as i64,
+        );
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -127,7 +130,10 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.debug_counter(name, value as i64);
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
+        );
     }
 }
 
@@ -140,7 +146,7 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
 /// Per the trio plan's open question #6 and the doc citation in
 /// `PROCESS_v1` §7.3.1 step 3 ("If `thread_count == 0`: trigger
 /// step_process_exit"), the dispatcher therefore calls **only**
-/// `step_thread_exit`. Calling the group-exit transition here would
+/// `step_thread_exit`. Calling `step_exit_group` here would
 /// double-zombify the payload and corrupt the recorded exit status.
 /// PR-3 migration: `ThreadExitOp` is a `OneShotStepOp` — dispatched
 /// via `drive_oneshot` (no reactor, no yield).
@@ -157,8 +163,9 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     }
 }
 
-/// `exit_group(status)` — per `PROCESS_v1` §7.3.2. This path injects
-/// both task-mailbox and wait-source posts from `SyscallCtx`.
+/// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
+/// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
+/// via `drive_oneshot` (no reactor, no yield).
 /// `gettid()` — return the callers thread id.
 pub(super) fn sys_gettid(ctx: &SyscallCtx) -> SyscallResult {
     SyscallResult::Return(ctx.thread.tid.0 as i64)
@@ -262,13 +269,9 @@ pub(super) fn sys_pidfd_getfd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let newfd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if newfd >= soft_limit {
+    let Some(newfd) = ctx.process.install_new_fd(target_file, true) else {
         return SyscallResult::Error(EMFILE_VALUE);
-    }
-    let _ = ctx.process.install_fd_dup_ref(newfd, target_file);
-    ctx.process.set_fd_cloexec(newfd, true);
+    };
     SyscallResult::Return(newfd as i64)
 }
 
@@ -497,21 +500,22 @@ pub(super) fn sys_setns(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
 ///    are bounded by `EXECVE_ARG_MAX_INLINE = 8192`. Overflow →
 ///    `-E2BIG`.
 ///
-/// On `Ok(())` from the exec StepOp, return `SyscallResult::ExecCommitted`.
+/// On `Ok(())` from `exec_script`, return `SyscallResult::ExecCommitted`.
 /// The thread future MUST NOT drain `pending_syscall_return` for this
 /// iteration — the new image's `_start` reads from a fresh
 /// `saved_user_context` (entry pc / initial sp) and zero-initialised
 /// gprs (System V psABI). On `Err(_)` map to a Linux negative errno
-/// via the standard step `Errno` table.
+/// via `ExecError::to_errno_i32`.
 ///
 /// User-buffer reads (`path_uaddr`, `argv_uaddr`, `envp_uaddr`) flow
 /// through `read_user_cstr` / `read_user_cstr_vec`, which bridge via
 /// the canonical `aspace.read_user` / `aspace.read_user_cstr` lane
 /// (with a kernel-pointer fallback for test scaffolding).
 //
-// Exec is a waiting StepOp: PageBacked/VFS waits retain their source and the
-// central driver resumes reversible preparation before EXEC-PONR.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
+// PR-9 phase 3b: StepOp-driven via ExecOp (10-phase state
+// machine).  Async operations yield; the drive loop parks on I/O.
+// Remaining synchronous phases return Continue.
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -520,25 +524,20 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     let envp_uaddr = args[2];
 
     // ----- Step 1: bounded read of the path -----
-    let path_buf = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path_buf = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
-    if path_buf.is_empty() {
-        return SyscallResult::Error(ENOENT_VALUE);
-    }
 
     if is_identity_noop_helper(&path_buf) {
         ctx.process.notify_vfork_done();
-        let outcome = tx_subsystems::process::execution::step_exit_group_with_posts(
+        return match tx_subsystems::process::execution::step_exit_group_with_posts(
             &ctx.process,
             ExitStatus::Exited(0),
             |mailbox, event| ctx.post_mailbox_event(mailbox, event),
             |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
-        );
-        return match outcome {
+        ) {
             tx_subsystems::process::ProcessExitOutcome::Completed => SyscallResult::NoReturn,
             tx_subsystems::process::ProcessExitOutcome::Retry => SyscallResult::Error(EAGAIN_VALUE),
         };
@@ -626,6 +625,18 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     }
 }
 
+/// Translate `ExecError` to the dispatched `-errno` magnitude the
+/// Phase 6 syscall arm hands back through `SyscallResult::Error`.
+///
+/// `ExecError::to_errno_i32` returns the *signed* `-errno`
+/// (`-2` for `ENOENT`); `SyscallResult::Error` carries the *positive*
+/// magnitude (the userspace-entry shim negates before writing). We
+/// flip the sign here so the existing `Error(i32)` discipline is
+/// unchanged.
+pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
+    -e.to_errno_i32()
+}
+
 fn is_identity_noop_helper(path: &[u8]) -> bool {
     matches!(
         path,
@@ -691,10 +702,10 @@ fn is_identity_noop_helper(path: &[u8]) -> bool {
 ///    fresh trap frame's `a0`); the child re-enters userspace with
 ///    `a0 == 0` from the seed.
 ///
-/// Synchronous (no `.await`): `step_fork` is itself synchronous in
-/// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
-/// v1's single-thread-per-process model). The function is non-`async`
-/// to keep the seam minimal.
+/// This synchronous entry is reserved for `CLONE_THREAD`, whose
+/// address space is shared and therefore needs no COW snapshot.
+/// Process creation is routed through [`sys_clone`] so an address-space
+/// reservation conflict can park and retry without exposing `EAGAIN`.
 pub(super) fn sys_clone_oneshot<P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
@@ -715,8 +726,11 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
     // thread clones we accept any signal (including zero — musl
     // sets the lower byte to zero when CLONE_THREAD is set).
     let clone_thread = (flags & CLONE_THREAD) != 0;
-    if !clone_thread && flags & SIGCHLD == 0 {
-        return Some(SyscallResult::Error(EINVAL_VALUE));
+    // Process fork may have to wait for the parent's VM RangeLock. Route every
+    // non-thread clone through the async syscall body below; only CLONE_THREAD
+    // remains a genuinely one-shot fast path.
+    if !clone_thread {
+        return None;
     }
     let clone_vm = (flags & CLONE_VM) != 0;
     let clone_sighand = (flags & CLONE_SIGHAND) != 0;
@@ -837,21 +851,7 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
         emit_clone_marker(b"debug.clone.step_thread.after");
         let child_thread = match child_thread {
             Ok(t) => t,
-            Err(tx_subsystems::process::ForkError::ParentZombie) => {
-                return Some(SyscallResult::Error(ESRCH_VALUE));
-            }
-            Err(tx_subsystems::process::ForkError::Vm(_)) => {
-                return Some(SyscallResult::Error(EAGAIN_VALUE));
-            }
-            Err(tx_subsystems::process::ForkError::Zone(_)) => {
-                return Some(SyscallResult::Error(ENOMEM_VALUE));
-            }
-            Err(tx_subsystems::process::ForkError::Busy) => {
-                return Some(SyscallResult::Error(EAGAIN_VALUE));
-            }
-            Err(tx_subsystems::process::ForkError::PidNamespace) => {
-                return Some(SyscallResult::Error(ENOMEM_VALUE));
-            }
+            Err(_) => return Some(SyscallResult::Error(ENOMEM_VALUE)),
         };
 
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
@@ -1079,30 +1079,34 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 
     let tls = if clone_settls { tls_arg } else { 0 };
 
-    // ── Non-CLONE_THREAD (fork) path with CLONE_VFORK ─────────────
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let fork_result = {
-        let mut op = tx_subsystems::process::execution::ForkOp::<P> {
-            parent: &ctx.process,
+    // ── Non-CLONE_THREAD process fork ─────────────────────────────
+    //
+    // VM preparation is wait-capable and side-effect free until it owns the
+    // full parent address-space reservation. Process publication remains a
+    // bounded one-shot commit after that preparation completes.
+    let fork_result = tx_subsystems::process::fork_with_options_wait::<P>(
+        &ctx.process,
+        tx_subsystems::process::ForkOptions {
             clone_vm,
             clone_sighand,
             clone_newipc,
             clone_newnet,
             clone_newns,
-            _pmap: core::marker::PhantomData,
-        };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(r) => r,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
-        }
-    };
+        },
+    )
+    .await;
     let child = match fork_result {
         Ok(c) => c,
         Err(tx_subsystems::process::ForkError::ParentZombie) => {
             return SyscallResult::Error(ESRCH_VALUE);
         }
-        Err(tx_subsystems::process::ForkError::Vm(_)) => {
+        Err(tx_subsystems::process::ForkError::Vm(tx_subsystems::vm::VmMapError::WouldBlock)) => {
+            // The wait-capable path consumes ordinary lock contention. Seeing
+            // WouldBlock here means the coordination contract was violated.
             return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Vm(_)) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
         }
         Err(tx_subsystems::process::ForkError::Zone(_)) => {
             return SyscallResult::Error(ENOMEM_VALUE);
@@ -1237,7 +1241,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
 ///
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
-pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_wait4<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let pid = args[0] as i64 as i32;
     let wstatus_uaddr = args[1];
     let options = args[2] as i32;
@@ -1281,8 +1288,11 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
     }
 
-    // Blocking wait: the common driver owns registration, signal-aware
-    // parking, and re-polling after the parent exit source fires.
+    // Blocking wait: the shared driver owns the observe/install/recheck
+    // protocol, signal-aware parking, timer registration, and re-polling after
+    // the parent exit source fires. Keeping a second hand-written wait loop
+    // here would bypass that protocol and reintroduce the SMP lost-wakeup
+    // window final-smp closed.
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     use tx_subsystems::process::execution::WaitpidNohangOp;
@@ -1310,8 +1320,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             if wstatus_uaddr != 0 {
                 let word = status.wait_status_word();
-                if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
-                {
+                if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word) {
                     return SyscallResult::error_from(errno);
                 }
             }
@@ -1356,43 +1365,34 @@ pub(super) fn sys_getppid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 
 /// `setpgid(pid, pgid)`.
 ///
-/// Wraps `step_setpgid` (`process/execution.rs:721`). Supports self
-/// setpgid and the shell job-control subset where a parent moves its
-/// direct child into a fresh child-led process group before `exec`.
+/// Wraps `step_setpgid` (`process/execution.rs:721`). Day-1 only
+/// supports `pid == 0` / `pid == self.pid` (setpgid on self) and
+/// `pgid == 0` / `pgid == self.pid` (create a fresh process group
+/// rooted at the caller's pid inside the caller's session). Anything
+/// else returns `-EPERM` (matches Linux's errno for cross-pgrp
+/// setpgid). Cross-process setpgid needs a pid → `Cap<ProcessIdentity>`
+/// resolver that day-1 doesn't ship.
 pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let pid = args[0] as i32;
     let pgid = args[1] as i32;
 
-    if pid < 0 || pgid < 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    let target = if pid == 0 || (pid as u32) == ctx.process.pid.0 {
-        ctx.process.clone()
-    } else {
-        let Some(target) = process_by_pid(Pid(pid as u32)) else {
-            return SyscallResult::Error(ESRCH_VALUE);
-        };
-        if target.parent_pid() != ctx.process.pid {
-            return SyscallResult::Error(ESRCH_VALUE);
-        }
-        if target.pgrp_cap().session_cap().key() != ctx.process.pgrp_cap().session_cap().key() {
-            return SyscallResult::Error(EPERM_VALUE);
-        }
-        target
-    };
-
-    // pgid == 0 means "use target pid". The process subsystem step still
-    // only creates a fresh target-led pgrp; joining existing pgrps remains
-    // deferred until the process topology step grows that operation.
-    let new_pgid_raw = if pgid == 0 { target.pid.0 } else { pgid as u32 };
-    if new_pgid_raw != target.pid.0 {
+    // Day-1: only "self" target supported (cross-process setpgid is
+    // deferred). pid == 0 means "self" per Linux convention.
+    if pid != 0 && (pid as u32) != ctx.process.pid.0 {
         return SyscallResult::Error(EPERM_VALUE);
     }
 
+    // pgid == 0 means "use the caller's pid" — exactly what the trio's
+    // step_setpgid supports.
+    let new_pgid_raw = if pgid == 0 {
+        ctx.process.pid.0
+    } else {
+        pgid as u32
+    };
+
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = SetpgidOp {
-        target: &target,
+        target: &ctx.process,
         new_pgid: Pgid(new_pgid_raw),
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {

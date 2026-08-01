@@ -667,6 +667,40 @@ impl ProcessIdentity {
         self.set_fd(fd, Some(file))
     }
 
+    /// Atomically choose the lowest free descriptor and publish both the
+    /// file and its close-on-exec bit.  Keeping the allocation and install
+    /// under the same fd-table lock is required on SMP: a separate
+    /// `allocate_fd()` followed by `install_fd()` lets two threads choose the
+    /// same descriptor.
+    pub fn install_new_fd_at_least(
+        &self,
+        min: u32,
+        file: Cap<crate::vfs::OpenFile>,
+        cloexec: bool,
+    ) -> Option<u32> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|payload| payload.install_new_fd_at_least(min, file, cloexec))
+    }
+
+    pub fn install_new_fd(&self, file: Cap<crate::vfs::OpenFile>, cloexec: bool) -> Option<u32> {
+        self.install_new_fd_at_least(0, file, cloexec)
+    }
+
+    /// Atomically replace one descriptor and its close-on-exec state.
+    pub fn install_fd_with_cloexec(
+        &self,
+        fd: u32,
+        file: Cap<crate::vfs::OpenFile>,
+        cloexec: bool,
+    ) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|payload| payload.install_fd_with_cloexec(fd, file, cloexec))
+    }
+
     /// Read the close-on-exec bit for fd `fd` on this process's
     /// payload. Returns `false` for zombies (no payload) and for
     /// unmarked fds.
@@ -700,6 +734,10 @@ impl ProcessIdentity {
         if let Some(payload) = self.payload.lock().as_ref() {
             payload.set_fd_cloexec(fd, value);
         }
+    }
+
+    pub fn clear_fd_cloexec(&self, fd: u32) {
+        self.set_fd_cloexec(fd, false);
     }
 
     /// Snapshot the full close-on-exec set as an owned `BTreeSet<u32>`.
@@ -1586,13 +1624,74 @@ impl ProcessPayload {
     /// same accessor to preopen fds 0/1/2.
     pub fn set_fd(&self, idx: u32, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
         let mut slot = self.fds.lock();
+        let mut cloexec = self.fd_cloexec.lock();
         let previous = match file {
             Some(f) => slot.insert(idx, f),
-            None => slot.remove(&idx),
+            None => {
+                cloexec.remove(&idx);
+                slot.remove(&idx)
+            }
         };
+        drop(cloexec);
         drop(slot);
         if let Some(file) = &previous {
             decr_pipe_fd_ref(file);
+        }
+        previous
+    }
+
+    pub fn install_new_fd_at_least(
+        &self,
+        min: u32,
+        file: Cap<OpenFile>,
+        want_cloexec: bool,
+    ) -> Option<u32> {
+        let mut files = self.fds.lock();
+        let limit = self.rlimit_nofile_cur.load(Ordering::Acquire);
+        let mut fd = min;
+        for &existing in files.keys() {
+            if existing < fd {
+                continue;
+            }
+            if existing == fd {
+                fd = fd.checked_add(1)?;
+            } else {
+                break;
+            }
+        }
+        if fd >= limit {
+            return None;
+        }
+
+        let mut cloexec = self.fd_cloexec.lock();
+        debug_assert!(!files.contains_key(&fd));
+        files.insert(fd, file);
+        if want_cloexec {
+            cloexec.insert(fd);
+        } else {
+            cloexec.remove(&fd);
+        }
+        Some(fd)
+    }
+
+    pub fn install_fd_with_cloexec(
+        &self,
+        fd: u32,
+        file: Cap<OpenFile>,
+        want_cloexec: bool,
+    ) -> Option<Cap<OpenFile>> {
+        let mut files = self.fds.lock();
+        let mut cloexec = self.fd_cloexec.lock();
+        let previous = files.insert(fd, file);
+        if want_cloexec {
+            cloexec.insert(fd);
+        } else {
+            cloexec.remove(&fd);
+        }
+        drop(cloexec);
+        drop(files);
+        if let Some(previous) = &previous {
+            decr_pipe_fd_ref(previous);
         }
         previous
     }
@@ -1686,16 +1785,17 @@ impl ProcessPayload {
         self.fds.lock().clone()
     }
 
-    /// Clone the fd table for `fork`, accounting each inherited pipe
-    /// endpoint as a new fd reference. Unlike [`Self::snapshot_fds`],
-    /// this result is intended to be installed into another live
-    /// `ProcessPayload`.
-    pub(crate) fn clone_fds_for_fork(&self) -> BTreeMap<u32, Cap<OpenFile>> {
-        let cloned = self.fds.lock().clone();
+    /// Clone the complete fd state for `fork` while holding both locks in the
+    /// canonical `fds -> cloexec` order.  Taking two independent snapshots
+    /// can otherwise pair a new fd table with an older CLOEXEC set.
+    pub(crate) fn clone_fd_state_for_fork(&self) -> (BTreeMap<u32, Cap<OpenFile>>, BTreeSet<u32>) {
+        let files = self.fds.lock();
+        let cloexec = self.fd_cloexec.lock();
+        let cloned = files.clone();
         for file in cloned.values() {
             incr_pipe_fd_ref(file);
         }
-        cloned
+        (cloned, cloexec.clone())
     }
 
     /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
@@ -1861,6 +1961,16 @@ impl ProcessPayload {
                     })
                 }
             }
+            Some(current) if current.owner == GroupExitOwner::Exit => {
+                if !current.claimed_thread_exits.insert(tid) {
+                    None
+                } else {
+                    Some(ThreadExitPermit {
+                        generation: current.generation,
+                        owner: GroupExitOwner::Exit,
+                    })
+                }
+            }
             Some(_) => None,
             None => {
                 let generation = self
@@ -1921,9 +2031,19 @@ impl ProcessPayload {
                     current.owner == GroupExitOwner::ExecAborting
                         && current.remaining_threads.load(Ordering::Acquire) == 0
                 }
-                GroupExitOwner::Exit
-                | GroupExitOwner::ExecReserved
-                | GroupExitOwner::ExecAborting => return false,
+                GroupExitOwner::Exit => {
+                    if current
+                        .remaining_threads
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    false
+                }
+                GroupExitOwner::ExecReserved | GroupExitOwner::ExecAborting => return false,
             }
         };
         if clear_episode {

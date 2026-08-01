@@ -8,20 +8,8 @@ use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMute
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use tx_services::time::{
-    ClockRead, DeadlineRegistrarHandle, TimekeeperClock, TimekeeperIf, timekeeper,
-};
-use tx_subsystems::device::{RtcAlarmEmulation, RtcTime};
-use tx_subsystems::tty::execution::{
-    IoctlTcgetsOp, IoctlTcsetsOp, IoctlTiocgpgrpOp, IoctlTiocgwinszOp, IoctlTiocnottyOp,
-    IoctlTiocscttyForProcessOp, IoctlTiocspgrpForProcessOp, IoctlTiocswinszOp,
-};
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
-use tx_subsystems::vfs::{
-    CreateInParentOp, FsObjectId, FsOps, OpenInMountNamespaceOp, OpenNoFollowInMountNamespaceOp,
-    PathWalkOp, ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp, TruncateFsObjectOp,
-    UnlinkFromParentOp,
-};
+use tx_subsystems::vfs::{FsObjectId, FsOps};
 
 mod dir_sync;
 pub(super) use dir_sync::{
@@ -29,7 +17,14 @@ pub(super) use dir_sync::{
     sys_sync, sys_syncfs,
 };
 
-static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, InodeMeta>> =
+#[derive(Clone, Copy)]
+struct StatTimeOverride {
+    atime: tx_subsystems::vfs::Timespec,
+    mtime: tx_subsystems::vfs::Timespec,
+    ctime: tx_subsystems::vfs::Timespec,
+}
+
+static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, StatTimeOverride>> =
     SpinMutex::new(BTreeMap::new());
 static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
     SpinMutex::new(BTreeMap::new());
@@ -44,18 +39,28 @@ const MEMFD_FS_OBJECT_ID_BASE: u64 = 0xFFFC_0000_0000_0000;
 const MEMFD_SECRET_FS_OBJECT_ID_BASE: u64 = 0xFFFA_0000_0000_0000;
 static NEXT_MEMFD_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_FS_OBJECT_ID_BASE);
 static NEXT_MEMFD_SECRET_FS_OBJECT_ID: AtomicU64 = AtomicU64::new(MEMFD_SECRET_FS_OBJECT_ID_BASE);
-const CALLER_DEV_TTY_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7674);
 
 pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMeta) {
-    STAT_META_OVERRIDES.lock().insert(fs_object_id, meta);
+    STAT_META_OVERRIDES.lock().insert(
+        fs_object_id,
+        StatTimeOverride {
+            atime: meta.atime,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
+        },
+    );
 }
 
-pub(super) fn stat_meta_override_or(fs_object_id: FsObjectId, fallback: InodeMeta) -> InodeMeta {
-    STAT_META_OVERRIDES
-        .lock()
-        .get(&fs_object_id)
-        .copied()
-        .unwrap_or(fallback)
+pub(super) fn stat_meta_override_or(
+    fs_object_id: FsObjectId,
+    mut fallback: InodeMeta,
+) -> InodeMeta {
+    if let Some(times) = STAT_META_OVERRIDES.lock().get(&fs_object_id).copied() {
+        fallback.atime = times.atime;
+        fallback.mtime = times.mtime;
+        fallback.ctime = times.ctime;
+    }
+    fallback
 }
 
 /// Drain all stale entries from the global `STAT_META_OVERRIDES` map.
@@ -69,16 +74,6 @@ pub(crate) fn clear_stat_meta_overrides() {
 
 fn apply_stat_meta_override(fs_object_id: FsObjectId, meta: &mut InodeMeta) {
     *meta = stat_meta_override_or(fs_object_id, *meta);
-}
-
-fn allocate_fd_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult> {
-    let fd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        Err(SyscallResult::Error(EMFILE_VALUE))
-    } else {
-        Ok(fd)
-    }
 }
 
 fn ensure_fd_room_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<(), SyscallResult> {
@@ -111,81 +106,6 @@ fn procfs_root_relative_netns_pid(path: &[u8], cwd: &Cap<DEntry>) -> Option<Pid>
     }
     let pid = core::str::from_utf8(rest).ok()?.parse::<u32>().ok()?;
     Some(Pid(pid))
-}
-
-pub(super) fn is_devfs_root_dentry(dentry: &Cap<DEntry>) -> bool {
-    dentry.rnode().fs_object_id() == tx_fs::devfs::DEVFS_ROOT_OBJECT_ID
-}
-
-pub(super) fn is_caller_dev_tty_path(path: &[u8], cwd: &Cap<DEntry>) -> bool {
-    path == b"/dev/tty" || (path == b"tty" && is_devfs_root_dentry(cwd))
-}
-
-fn proc_self_fd_number(path: &[u8]) -> Option<u32> {
-    let rest = path.strip_prefix(b"/proc/self/fd/")?;
-    if rest.is_empty() || rest.contains(&b'/') {
-        return None;
-    }
-    core::str::from_utf8(rest).ok()?.parse::<u32>().ok()
-}
-
-pub(super) fn caller_dev_tty_stat_info<'a>(
-    ctx: &SyscallCtx<'a>,
-) -> Result<(InodeMeta, FsObjectId, u32, u32), SyscallResult> {
-    if ctx
-        .process
-        .pgrp_cap()
-        .session_cap()
-        .controlling_tty_cap()
-        .is_none()
-    {
-        return Err(SyscallResult::Error(ENXIO_VALUE));
-    }
-    Ok((
-        InodeMeta::new(InodeKind::CharDevice, 0o020600),
-        CALLER_DEV_TTY_OBJECT_ID,
-        5,
-        0,
-    ))
-}
-
-fn maybe_acquire_controlling_tty_on_open<'a>(
-    file: &Cap<OpenFile>,
-    raw_flags: u32,
-    want_path_only: bool,
-    ctx: &SyscallCtx<'a>,
-) {
-    if want_path_only || raw_flags & O_NOCTTY != 0 {
-        return;
-    }
-
-    let tty = match file.rnode().backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::Tty(tty),
-        } => tty.clone(),
-        _ => return,
-    };
-
-    let guard = step_engine::guard();
-    let _ = step_ioctl_tiocsctty_for_process(&tty, &ctx.process, &guard);
-}
-
-fn open_caller_dev_tty<'a>(
-    open_flags: OpenFileFlags,
-    ctx: &SyscallCtx<'a>,
-) -> Result<Cap<OpenFile>, SyscallResult> {
-    let tty = match ctx.process.pgrp_cap().session_cap().controlling_tty_cap() {
-        Some(tty) => tty,
-        None => return Err(SyscallResult::Error(ENXIO_VALUE)),
-    };
-    let guard = step_engine::guard();
-    match tx_subsystems::tty::project::open_file_for_tty_with_flags(tty, open_flags, &guard) {
-        StepOutcome::Done(file) => Ok(file),
-        StepOutcome::Err(errno) => Err(SyscallResult::error_from(errno)),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-            Err(SyscallResult::Error(EIO_VALUE))
-        }
-    }
 }
 
 fn open_procfs_projected_file(
@@ -232,19 +152,6 @@ fn procfs_projected_mount() -> Result<Cap<tx_subsystems::mount::MountPayload>, S
     .map_err(|_| SyscallResult::Error(ENOMEM_VALUE))?;
     *cached = Some(mount.clone());
     Ok(mount)
-}
-
-fn allocate_fd_at_least_under_limit<'a>(
-    ctx: &SyscallCtx<'a>,
-    min: u32,
-) -> Result<u32, SyscallResult> {
-    let fd = ctx.process.allocate_fd_at_least(min);
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        Err(SyscallResult::Error(EMFILE_VALUE))
-    } else {
-        Ok(fd)
-    }
 }
 
 fn openat_tmpfile_name(seq: u64) -> Vec<u8> {
@@ -330,14 +237,12 @@ pub(super) fn sys_memfd_create<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(fd) = ctx
+        .process
+        .install_new_fd(open_file, flags & MFD_CLOEXEC != 0)
+    else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(fd, open_file);
-    if flags & MFD_CLOEXEC != 0 {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
 
     SyscallResult::Return(fd as i64)
 }
@@ -382,11 +287,9 @@ pub(super) fn sys_memfd_secret<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(fd) = ctx.process.install_new_fd(open_file, false) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(fd, open_file);
 
     SyscallResult::Return(fd as i64)
 }
@@ -450,9 +353,6 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             let (soft_limit, _) = ctx.process.rlimit_nofile();
             if min >= soft_limit {
                 return SyscallResult::Error(EINVAL_VALUE);
-            }
-            if let Err(err) = allocate_fd_at_least_under_limit(ctx, min) {
-                return err;
             }
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = FcntlDupFdOp {
@@ -623,12 +523,6 @@ fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
     }
 }
 
-fn queue_file_close_writeback(file: &Cap<OpenFile>) {
-    if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
-        let _ = pc.queue_dirty_file_writeback();
-    }
-}
-
 fn fcntl_getlk(ctx: &SyscallCtx<'_>, file: &OpenFile, flock_uaddr: u64) -> SyscallResult {
     let mut flock = match bootstrap_read_user::<FlockLayout>(&ctx.aspace, flock_uaddr) {
         Ok(flock) => flock,
@@ -743,21 +637,27 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
+    let open_keys = ctx.process.open_fd_numbers();
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
-        let open_keys = ctx.process.open_fd_numbers();
         for fd in open_keys.range(first..=last).copied() {
             ctx.process.set_fd_cloexec(fd, true);
         }
         return SyscallResult::Return(0);
     }
 
-    for file in ctx.process.take_fds_for_close_range(first, last) {
-        queue_file_close_writeback(&file);
+    // Remove the whole range under the process fd-table lock so another hart
+    // cannot observe a half-closed range. The helper also decrements the
+    // explicit pipe/socket fd-reference counters introduced by final-smp.
+    let closed = ctx.process.take_fds_for_close_range(first, last);
+    for file in &closed {
         file.flock_release();
         fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
-        maybe_close_socket_file_after_fd_remove(&file);
     }
-    SyscallResult::Return(0)
+    let guard = step_engine::guard();
+    match tx_subsystems::process::finalize_detached_open_files(&closed, &guard) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+    }
 }
 
 /// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
@@ -802,7 +702,7 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 // goes through `FsOps::create_inode`, also free-fn. When walker /
 // open / create gain StepOp wraps, thread `&mut KernelScriptCtx`
 // here and replace the synchronous-poll dance with the wrap form.
-pub(super) async fn sys_openat<'a, P: PmapIf>(
+pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     dirfd: i32,
     path_uaddr: u64,
     flags: u32,
@@ -822,11 +722,25 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
     // walker — let it through so the lookup-side error wins.
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+        Err(ReadCStrError::Fault(errno)) => {
+            if errno == Errno::EIO {
+                let recipe = ctx
+                    .aspace
+                    .lookup(tx_subsystems::vm::UserVirtAddr(path_uaddr as usize));
+                let mapping = ctx.aspace.pmap().lookup(tx_subsystems::vm::UserPage(
+                    path_uaddr as usize / tx_subsystems::vm::USER_PAGE_SIZE,
+                ));
+                tx_hal::console_write_str::<P>(&alloc::format!(
+                    "txkernel:openat-eio:stage=path-copy:pid={}:tid={}:dirfd={dirfd}:path_ptr={path_uaddr:#x}:flags={flags:#x}:mode={mode:#x}:recipe={recipe:?}:pmap={mapping:?}\n",
+                    ctx.process.pid.0,
+                    ctx.thread.tid.0,
+                ));
+            }
+            return SyscallResult::error_from(errno);
+        }
     };
 
     // Decode the open flags. Access-mode picks the read/write pair;
@@ -845,9 +759,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     let want_trunc = !want_path_only && flags & O_TRUNC != 0;
     let want_directory = flags & O_DIRECTORY != 0;
     let want_tmpfile = flags & __O_TMPFILE != 0;
-    let want_nofollow = flags & numbers::O_NOFOLLOW != 0;
-    // O_DIRECT remains an OpenFile status bit until its PageBacked owner
-    // selects the direct-I/O submit path. Other unrecognised bits are dropped.
+    // O_NONBLOCK and other unrecognised bits: silently dropped.
 
     if flags & __O_TMPFILE != 0 && flags & O_TMPFILE != O_TMPFILE {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -862,7 +774,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         append: want_append,
         cloexec: want_cloexec,
         nonblocking: flags & O_NONBLOCK != 0,
-        packet: flags & O_DIRECT != 0,
+        packet: false,
     };
 
     if dirfd != AT_FDCWD {
@@ -882,14 +794,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             Ok(file) => file,
             Err(result) => return result,
         };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
+        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
         };
-        let _ = ctx.process.set_fd(fd, Some(openfile));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
         return SyscallResult::Return(fd as i64);
     }
 
@@ -907,14 +814,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             Ok(file) => file,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
+        let Some(fd) = ctx.process.install_new_fd(file, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
         };
-        let _ = ctx.process.set_fd(fd, Some(file));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
         return SyscallResult::Return(fd as i64);
     }
 
@@ -937,14 +839,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                     Ok(file) => file,
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                 };
-                let fd = match allocate_fd_under_limit(ctx) {
-                    Ok(fd) => fd,
-                    Err(err) => return err,
+                let Some(fd) = ctx.process.install_new_fd(file, want_cloexec) else {
+                    return SyscallResult::Error(EMFILE_VALUE);
                 };
-                let _ = ctx.process.set_fd(fd, Some(file));
-                if want_cloexec {
-                    ctx.process.set_fd_cloexec(fd, true);
-                }
                 return SyscallResult::Return(fd as i64);
             }
         }
@@ -954,17 +851,22 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
     // that directory). Invalid / non-directory fds surface as EBADF /
     // ENOTDIR.
-    let cwd: Cap<DEntry> = match dirfd_anchor_for_path(dirfd, &path, ctx) {
-        Ok(cwd) => cwd,
-        Err(result) => return result,
-    };
-    let mounted_cwd = if dirfd == AT_FDCWD {
-        match (ctx.process.cwd_binding(), ctx.process.mount_namespace_cap()) {
-            (Some(binding), Some(namespace)) => Some((binding, namespace)),
-            _ => None,
+    let cwd: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
         }
+    } else if dirfd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
     } else {
-        None
+        let open_file = match ctx.process.fd(dirfd as u32) {
+            Some(f) => f,
+            None => return SyscallResult::Error(EBADF_VALUE),
+        };
+        match open_file.opendir_dentry() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOTDIR_VALUE),
+        }
     };
 
     let walker_cred = ctx.walker_cred();
@@ -974,28 +876,18 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EINVAL_VALUE);
         }
 
-        use step_engine::DriveMode;
-        use tx_scripts::drive;
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
-        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        let timer_registrar_handle = script_ctx.timer_registrar().cloned();
-        let dir_dentry = match drive(
-            PathWalkOp {
-                rooted_at: cwd.clone(),
-                path: path.clone(),
-                cred: walker_cred.clone(),
-            },
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
-        )
-        .await
-        {
-            Ok(dentry) => dentry,
-            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        use step_engine::{Errno as V3Errno, StepOutcome as V3};
+        let dir_dentry = {
+            let guard = step_engine::guard();
+            let outcome = step_walk(cwd.clone(), &path, &walker_cred, &guard);
+            drop(guard);
+            match outcome {
+                V3::Done(d) => d,
+                V3::Continue { .. } | V3::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
+                V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            }
         };
         if dir_dentry.rnode().meta().kind() != InodeKind::Directory {
             return SyscallResult::Error(ENOTDIR_VALUE);
@@ -1012,102 +904,65 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         for _ in 0..16 {
             let seq = OPENAT_TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp_name = openat_tmpfile_name(seq);
-            let create_result = drive(
-                CreateInParentOp {
-                    fs_ops: &fs_ops,
-                    parent: parent_id,
-                    name: &tmp_name,
-                    mode: create_mode,
-                    cred: &walker_cred,
-                },
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await;
-            match create_result {
-                Ok(_) => {
+            let create_outcome = {
+                let guard = step_engine::guard();
+                fs_ops.create_inode(parent_id, &tmp_name, create_mode, &walker_cred, &guard)
+            };
+            match create_outcome {
+                V3::Done(_) => {
                     dir_dentry.remove_cached_child_by_name(&tmp_name);
                 }
-                Err(step_engine::Errno::EEXIST) => continue,
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                V3::Err(V3Errno::EEXIST) => continue,
+                V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                V3::Continue { .. } | V3::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
             }
 
-            let openfile = match drive(
-                OpenOp {
-                    rooted_at: dir_dentry.clone(),
-                    path: tmp_name.clone(),
-                    flags: open_flags,
-                    mode: mode as u16,
-                    cred: walker_cred.clone(),
-                },
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(file) => file,
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            let openfile = {
+                let guard = step_engine::guard();
+                let outcome = step_open(
+                    dir_dentry.clone(),
+                    &tmp_name,
+                    open_flags,
+                    mode as u16,
+                    &walker_cred,
+                    &guard,
+                );
+                drop(guard);
+                match outcome {
+                    V3::Done(file) => file,
+                    V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                    V3::Continue { .. } | V3::Yield { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                }
             };
 
             let target_id = openfile.rnode().fs_object_id();
-            let unlink_result = {
-                let mut op = UnlinkFromParentOp {
-                    fs_ops: &fs_ops,
-                    parent: parent_id,
-                    name: &tmp_name,
-                    target: target_id,
-                    remove_dir: false,
-                };
-                step_engine::drive_oneshot(&mut op, &mut script_ctx)
+            let unlink_outcome = {
+                let guard = step_engine::guard();
+                fs_ops.unlink(parent_id, &tmp_name, target_id, &guard)
             };
-            match unlink_result {
-                Ok(()) => {
+            match unlink_outcome {
+                V3::Done(()) => {
                     dir_dentry.remove_cached_child_by_name(&tmp_name);
-                    let guard = step_engine::guard();
-                    let _ = fs_ops.destroy_inode(target_id, &guard);
                     opened = Some(openfile);
                     break;
                 }
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+                V3::Continue { .. } | V3::Yield { .. } => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
             }
         }
 
         let Some(openfile) = opened else {
             return SyscallResult::Error(EEXIST_VALUE);
         };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
+        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
         };
-        let _ = ctx.process.set_fd(fd, Some(openfile));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
-        return SyscallResult::Return(fd as i64);
-    }
-
-    if is_caller_dev_tty_path(&path, &cwd) {
-        if want_directory {
-            return SyscallResult::Error(ENOTDIR_VALUE);
-        }
-        let openfile = match open_caller_dev_tty(open_flags, ctx) {
-            Ok(file) => file,
-            Err(result) => return result,
-        };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
-        };
-        let _ = ctx.process.set_fd(fd, Some(openfile));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
         return SyscallResult::Return(fd as i64);
     }
 
@@ -1115,113 +970,40 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // goes through `OpenOp + drive()` — no manual step loop.
     if !want_create && !want_trunc {
         use step_engine::DriveMode;
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
-        };
         use tx_scripts::drive;
         let mut script_ctx = build_subject_script_ctx(ctx);
-        let walker_cred = ctx.walker_cred();
+        let op = OpenOp {
+            rooted_at: cwd.clone(),
+            path: path.clone(),
+            flags: open_flags,
+            mode: mode as u16,
+            cred: ctx.walker_cred(),
+        };
         let mailbox_arc = script_ctx.mailbox().cloned();
-        let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
         let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        let openfile = if let Some((binding, mount_namespace)) = mounted_cwd.clone() {
-            if want_nofollow {
-                let op = OpenNoFollowInMountNamespaceOp {
-                    rooted_at: binding.dentry,
-                    origin_mount: binding.mount,
-                    mount_namespace,
-                    path: path.clone(),
-                    flags: open_flags,
-                    mode: mode as u16,
-                    cred: walker_cred,
-                };
-                match drive(
-                    op,
-                    &mut script_ctx,
-                    DriveMode::Waiting,
-                    mailbox_arc.as_ref(),
-                    delegate_registry_arc.as_deref(),
-                    timer_registrar_handle.as_ref(),
-                )
-                .await
-                {
-                    Ok(opened) => opened.open_file,
-                    Err(v3errno) => {
-                        return SyscallResult::error_from(Errno::from(v3errno));
-                    }
+        let openfile = match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(file) => file,
+            Err(v3errno) => {
+                let errno = Errno::from(v3errno);
+                if errno == Errno::EIO {
+                    let path_text = core::str::from_utf8(&path).unwrap_or("<non-utf8>");
+                    tx_hal::console_write_str::<P>(&alloc::format!(
+                        "txkernel:openat-eio:stage=open-drive:pid={}:tid={}:dirfd={dirfd}:flags={flags:#x}:mode={mode:#x}:path={path_text:?}\n",
+                        ctx.process.pid.0,
+                        ctx.thread.tid.0,
+                    ));
                 }
-            } else {
-                let op = OpenInMountNamespaceOp {
-                    rooted_at: binding.dentry,
-                    origin_mount: binding.mount,
-                    mount_namespace,
-                    path: path.clone(),
-                    flags: open_flags,
-                    mode: mode as u16,
-                    cred: walker_cred,
-                };
-                match drive(
-                    op,
-                    &mut script_ctx,
-                    DriveMode::Waiting,
-                    mailbox_arc.as_ref(),
-                    delegate_registry_arc.as_deref(),
-                    timer_registrar_handle.as_ref(),
-                )
-                .await
-                {
-                    Ok(opened) => opened.open_file,
-                    Err(v3errno) => {
-                        return SyscallResult::error_from(Errno::from(v3errno));
-                    }
-                }
-            }
-        } else if want_nofollow {
-            let op = OpenNoFollowOp {
-                rooted_at: cwd.clone(),
-                path: path.clone(),
-                flags: open_flags,
-                mode: mode as u16,
-                cred: walker_cred,
-            };
-            match drive(
-                op,
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(file) => file,
-                Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
-                }
-            }
-        } else {
-            let op = OpenOp {
-                rooted_at: cwd.clone(),
-                path: path.clone(),
-                flags: open_flags,
-                mode: mode as u16,
-                cred: walker_cred,
-            };
-            match drive(
-                op,
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(file) => file,
-                Err(v3errno) => {
-                    return SyscallResult::error_from(Errno::from(v3errno));
-                }
+                return SyscallResult::error_from(errno);
             }
         };
         if want_directory && openfile.rnode().meta().kind() != InodeKind::Directory {
@@ -1230,69 +1012,59 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         if want_write && openfile.rnode().meta().kind() == InodeKind::Directory {
             return SyscallResult::Error(EISDIR_VALUE);
         }
-        maybe_acquire_controlling_tty_on_open(&openfile, flags, want_path_only, ctx);
-        let _ = ctx.process.set_fd(fd, Some(openfile));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
+        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
+        };
         return SyscallResult::Return(fd as i64);
     }
 
-    // Resolve or create the target under the full VFS driver. We use the
-    // resulting dentry (not the OpenFile) as the truncate-anchor so
+    // Step 1: walk the path to a terminal dentry. Three outcomes:
+    //   - success: the file exists. Handle O_EXCL collision; otherwise
+    //     fall through to the open + (optional) truncate phase.
+    //   - ENOENT + O_CREAT: split into (parent_path, basename), walk
+    //     the parent, call `FsOps::create_inode`, then re-walk to
+    //     materialise the dentry over the freshly-created inode.
+    //   - other errno: forward.
+    //
+    // We use the dentry (not the OpenFile) as the truncate-anchor so
     // `fs_ops_for_dentry`'s parent-hint ascend can find the in-scope
     // mount payload (freshly-resolved child rnodes don't carry the
     // mount weak; only mount-root rnodes do, per the walker's
     // `current_fs_ops` discipline).
-    use step_engine::DriveMode;
-    use tx_scripts::drive;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
-    let create_mode = want_create.then(|| (mode as u16) & !ctx.process.umask() & 0o7777);
-    let dentry: Cap<DEntry> = if let Some((binding, mount_namespace)) = mounted_cwd.clone() {
-        match drive(
-            ResolveOpenTargetInMountNamespaceOp::new(
-                binding.dentry,
-                binding.mount,
-                mount_namespace,
-                path.clone(),
-                walker_cred.clone(),
-                create_mode,
-                want_excl,
-            ),
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
-        )
-        .await
-        {
-            Ok(resolved) => resolved.dentry,
-            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+    //
+    // Send-future discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`):
+    // `Guard` is `!Send + !Sync` so we cannot hold one across this
+    // function's `.await`s — the `dispatch` future feeds
+    // `Reactor::submit_task` which requires `Send`. Use the
+    // `poll_walker_synchronously` helper that the file-mode arms also
+    // use; every in-tree walker backend resolves immediately so the
+    // noop-waker poll always returns `Ready`.
+    use step_engine::{Errno as V3Errno, StepOutcome as V3};
+    let walk_first = {
+        let guard = step_engine::guard();
+        let outcome = step_walk(cwd.clone(), &path, &walker_cred, &guard);
+        drop(guard);
+        outcome
+    };
+
+    let dentry: Cap<DEntry> = match walk_first {
+        V3::Done(d) => {
+            if want_create && want_excl {
+                return SyscallResult::Error(EEXIST_VALUE);
+            }
+            d
         }
-    } else {
-        match drive(
-            ResolveOpenTargetOp::new(
-                cwd.clone(),
-                path.clone(),
-                walker_cred.clone(),
-                create_mode,
-                want_excl,
-            ),
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
-        )
-        .await
-        {
-            Ok(dentry) => dentry,
-            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        V3::Continue { .. } | V3::Yield { .. } => {
+            return SyscallResult::Error(EIO_VALUE);
         }
+        V3::Err(V3Errno::ENOENT) if want_create => {
+            let create_mode = (mode as u16) & !ctx.process.umask() & 0o7777;
+            match create_then_walk::<P>(&cwd, &path, create_mode, &walker_cred) {
+                Ok(d) => d,
+                Err(e) => return SyscallResult::Error(e),
+            }
+        }
+        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
     };
     let dentry_meta = dentry.rnode().meta();
     if want_directory && dentry_meta.kind() != InodeKind::Directory {
@@ -1305,21 +1077,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         return SyscallResult::Error(EISDIR_VALUE);
     }
 
-    // Authorize the terminal object before O_TRUNC mutates it. `step_open`
-    // repeats this check when materialising the OpenFile, but the truncate
-    // phase intentionally precedes that materialisation.
-    {
-        let guard = step_engine::guard();
-        if let Err(errno) = tx_subsystems::cred::checks::require_open_with_walker_cred(
-            &walker_cred,
-            &dentry_meta,
-            open_flags,
-            &guard,
-        ) {
-            return SyscallResult::error_from(Errno::from(errno));
-        }
-    }
-
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
     // any future `step_read` against the resulting fd observes the
     // truncated state. Directories → -EISDIR; backends without
@@ -1328,31 +1085,31 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         if dentry_meta.kind() == InodeKind::Directory {
             return SyscallResult::Error(EISDIR_VALUE);
         }
-        if dentry_meta.kind() == InodeKind::CharDevice {
-            // Linux treats O_TRUNC on character devices as a no-op.
-        } else {
-            let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
-                Some(b) => b,
-                None => return SyscallResult::Error(ENOSYS_VALUE),
-            };
-            let fs_object_id = dentry.rnode().fs_object_id();
-            match drive(
-                TruncateFsObjectOp {
-                    page_backing: fs_page_backing,
-                    fs_object_id,
-                    new_size: 0,
-                },
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        use StepOutcome as V3Trunc;
+        let fs_object_id = dentry.rnode().fs_object_id();
+        let guard = step_engine::guard();
+        let truncate_result: Result<(), Errno> = match dentry.rnode().backing() {
+            RNodeBacking::PageBacked { pc } => {
+                match tx_subsystems::page_backed::step_truncate(pc, 0, &guard) {
+                    V3Trunc::Done(()) => Ok(()),
+                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
+                    V3Trunc::Err(errno) => Err(Errno::from(errno)),
+                }
             }
+            _ => {
+                let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
+                    Some(b) => b,
+                    None => return SyscallResult::Error(ENOSYS_VALUE),
+                };
+                match fs_page_backing.truncate(fs_object_id, 0, &guard) {
+                    V3Trunc::Done(()) => Ok(()),
+                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
+                    V3Trunc::Err(errno) => Err(Errno::from(errno)),
+                }
+            }
+        };
+        if let Err(errno) = truncate_result {
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -1365,106 +1122,25 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // bits, and tmpfs's create_inode honoured those bits at create
     // time, so the perms apply equally to the just-created file.
     //
-    let openfile: Cap<OpenFile> = if let Some((binding, mount_namespace)) = mounted_cwd {
-        if want_nofollow {
-            match drive(
-                OpenNoFollowInMountNamespaceOp {
-                    rooted_at: binding.dentry,
-                    origin_mount: binding.mount,
-                    mount_namespace,
-                    path: path.clone(),
-                    flags: open_flags,
-                    mode: mode as u16,
-                    cred: walker_cred.clone(),
-                },
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(opened) => opened.open_file,
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+    let openfile: Cap<OpenFile> = {
+        let guard = step_engine::guard();
+        let outcome = step_open(cwd, &path, open_flags, mode as u16, &walker_cred, &guard);
+        drop(guard);
+        match outcome {
+            V3::Done(file) => file,
+            V3::Continue { .. } | V3::Yield { .. } => {
+                return SyscallResult::Error(EIO_VALUE);
             }
-        } else {
-            match drive(
-                OpenInMountNamespaceOp {
-                    rooted_at: binding.dentry,
-                    origin_mount: binding.mount,
-                    mount_namespace,
-                    path: path.clone(),
-                    flags: open_flags,
-                    mode: mode as u16,
-                    cred: walker_cred.clone(),
-                },
-                &mut script_ctx,
-                DriveMode::Waiting,
-                mailbox_arc.as_ref(),
-                delegate_registry_arc.as_deref(),
-                timer_registrar_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(opened) => opened.open_file,
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-            }
-        }
-    } else if want_nofollow {
-        match drive(
-            OpenNoFollowOp {
-                rooted_at: cwd.clone(),
-                path: path.clone(),
-                flags: open_flags,
-                mode: mode as u16,
-                cred: walker_cred.clone(),
-            },
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
-        )
-        .await
-        {
-            Ok(file) => file,
-            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-        }
-    } else {
-        match drive(
-            OpenOp {
-                rooted_at: cwd.clone(),
-                path: path.clone(),
-                flags: open_flags,
-                mode: mode as u16,
-                cred: walker_cred.clone(),
-            },
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
-        )
-        .await
-        {
-            Ok(file) => file,
-            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
 
     // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
     // the fd table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
     // `allocate_fd()` scans for the lowest unused key.
-    let fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    maybe_acquire_controlling_tty_on_open(&openfile, flags, want_path_only, ctx);
-    let _ = ctx.process.set_fd(fd, Some(openfile));
-    if want_cloexec {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
 
     SyscallResult::Return(fd as i64)
 }
@@ -1478,6 +1154,12 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// same fd number reports a clean state if it gets reused.
 ///
 /// Returns `0` on success, `-EBADF` if the fd was already closed.
+//
+// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_close` does
+// not invoke any `*Op::step(ctx)` call site; it operates directly on
+// the process fd-table via `Cap<ProcessIdentity>` accessors
+// (`fd`, `set_fd`, `set_fd_cloexec`). When fd-table mutation gains a
+// StepOp wrap, thread `&mut KernelScriptCtx` here.
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -1488,14 +1170,13 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(file) => {
-            // Close is not a durability fence. It only admits the file just
-            // removed from the fd table to L4; fsync/fdatasync own the ordered
-            // journal commit.
-            queue_file_close_writeback(&file);
             file.flock_release();
             fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
-            maybe_close_socket_file_after_fd_remove(&file);
-            SyscallResult::Return(0)
+            let guard = step_engine::guard();
+            match tx_subsystems::process::finalize_detached_open_files([&file], &guard) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+            }
         }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
@@ -1512,9 +1193,6 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
 pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     if ctx.process.fd(oldfd).is_none() {
         return SyscallResult::Error(EBADF_VALUE);
-    }
-    if let Err(err) = allocate_fd_under_limit(ctx) {
-        return err;
     }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = DupOp {
@@ -1561,7 +1239,19 @@ pub(super) fn sys_dup3<'a>(
         flags,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(fd) => SyscallResult::Return(fd as i64),
+        Ok((fd, replaced)) => {
+            if let Some(file) = replaced {
+                file.flock_release();
+                fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
+                let guard = step_engine::guard();
+                // The descriptor replacement has already committed.  Linux
+                // dup2/dup3 deliberately discards errors from closing the old
+                // newfd occupant, so never turn a successful replacement into
+                // a userspace-visible failure here.
+                let _ = tx_subsystems::process::finalize_detached_open_files([&file], &guard);
+            }
+            SyscallResult::Return(fd as i64)
+        }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
@@ -1584,7 +1274,11 @@ pub(super) fn sys_dup3<'a>(
 /// Userspace writeback: the `pipefd_uaddr` flows through
 /// `bootstrap_write_user::<[u32; 2]>` (canonical `aspace.write_user`
 /// lane with kernel-pointer fallback for test scaffolding).
-pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_pipe2<'a>(
+    pipefd_uaddr: u64,
+    flags: u32,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     // Validate flags. Recognised: O_CLOEXEC | O_NONBLOCK | O_DIRECT.
     let recognised = O_CLOEXEC | O_NONBLOCK | O_DIRECT;
     if flags & !recognised != 0 {
@@ -1621,24 +1315,16 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     // reader first so on a fresh process it lands at 0 and the
     // writer at 1, matching Linux's user-visible (3, 4) pattern
     // post-stdin/out/err.
-    let reader_fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(reader_fd) = ctx.process.install_new_fd(reader_cap, pipe_flags.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(reader_fd, reader_cap);
-    let writer_fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => {
+    let writer_fd = match ctx.process.install_new_fd(writer_cap, pipe_flags.cloexec) {
+        Some(fd) => fd,
+        None => {
             let _ = ctx.process.set_fd(reader_fd, None);
-            return err;
+            return SyscallResult::Error(EMFILE_VALUE);
         }
     };
-    let _ = ctx.process.install_fd(writer_fd, writer_cap);
-
-    if pipe_flags.cloexec {
-        ctx.process.set_fd_cloexec(reader_fd, true);
-        ctx.process.set_fd_cloexec(writer_fd, true);
-    }
 
     // Write the (reader_fd, writer_fd) pair back to userspace as the
     // Linux ABI's two adjacent little-endian `int` slots. Keep this
@@ -1647,7 +1333,12 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     let mut pipefd_bytes = [0u8; 8];
     pipefd_bytes[0..4].copy_from_slice(&reader_fd.to_le_bytes());
     pipefd_bytes[4..8].copy_from_slice(&writer_fd.to_le_bytes());
-    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, pipefd_uaddr, &pipefd_bytes) {
+    if let Err(errno) =
+        super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, pipefd_uaddr, &pipefd_bytes)
+            .await
+    {
+        let _ = ctx.process.set_fd(reader_fd, None);
+        let _ = ctx.process.set_fd(writer_fd, None);
         return SyscallResult::error_from(errno);
     }
 
@@ -1734,7 +1425,6 @@ pub(super) fn make_ioctl_caller(ctx: &SyscallCtx<'_>) -> IoctlCaller {
     let sid = session.sid.0;
     let pid = ctx.process.pid.0;
     let mut caller = IoctlCaller::new(sid, pgid);
-    caller = caller.with_pgrp_weak(pgrp.downgrade());
     if pid == sid {
         caller = caller.as_session_leader();
     }
@@ -1755,10 +1445,7 @@ pub(super) fn make_ioctl_caller(ctx: &SyscallCtx<'_>) -> IoctlCaller {
 /// arm itself is non-async; `Blocked` / `AdvancedThenBlocked` outcomes
 /// are unreachable in practice and surface as `-EIO` for symmetry with
 /// the other fd arms.
-pub(super) fn sys_ioctl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
-where
-    TimekeeperClock<P>: ClockRead,
-{
+pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let request = args[1] as u32;
     let argp = args[2];
@@ -1770,6 +1457,65 @@ where
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+
+    // Generic (non-terminal) fd ioctls: valid on ANY fd type — pipes,
+    // regular files, sockets — and must NOT fall through to the
+    // TTY-shaped `-ENOTTY` path below. Rust std's
+    // `FileDesc::set_nonblocking` is `ioctl(fd, FIONBIO, &val)`, so
+    // `Child::wait_with_output` (which sets both output pipes
+    // non-blocking to interleave stdout/stderr reads) tripped ENOTTY
+    // and panicked mid-link — observed as rustc failing to link
+    // hello-world even though the linker produced a working binary.
+    const FIONCLEX: u32 = 0x5450;
+    const FIOCLEX: u32 = 0x5451;
+    const FIONBIO: u32 = 0x5421;
+    const FIONREAD: u32 = 0x541B;
+    match request {
+        FIOCLEX => {
+            ctx.process.set_fd_cloexec(fd as u32, true);
+            return SyscallResult::Return(0);
+        }
+        FIONCLEX => {
+            ctx.process.set_fd_cloexec(fd as u32, false);
+            return SyscallResult::Return(0);
+        }
+        FIONBIO => {
+            let requested: u32 = match bootstrap_read_user::<u32>(&ctx.aspace, argp) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::error_from(errno),
+            };
+            let nonblocking = requested != 0;
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            // Preserve the current packet-mode flag; FIONBIO only
+            // toggles non-blocking.
+            let packet = {
+                let mut getop = OpenFileGetFlOp { file: &file };
+                match step_engine::drive_oneshot(&mut getop, &mut script_ctx) {
+                    Ok(flags) => flags.packet,
+                    Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+                }
+            };
+            let mut op = OpenFileSetFlOp {
+                file: &file,
+                nonblocking,
+                packet,
+            };
+            return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+            };
+        }
+        FIONREAD => {
+            // Bytes immediately readable. A best-effort 0 keeps callers
+            // that only check for success (and then read/poll) working;
+            // pipes/sockets that want a precise count use poll/read.
+            return match bootstrap_write_user::<u32>(&ctx.aspace, argp, 0) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            };
+        }
+        _ => {}
+    }
 
     // PR-10 phase 2: route userfaultfd-shape ioctls before the
     // VFS/TTY discriminator. The `OpenFile::rnode()` accessor panics
@@ -1817,88 +1563,22 @@ where
     if let RNodeBacking::StructBacked { payload } = rnode.backing() {
         match payload {
             StructPayload::Socket { .. } => {
-                return sys_socket_ioctl(request, argp, ctx);
+                // Route to the FULL socket-ioctl implementation in socket.rs
+                // (SIOCGIFNAME/SIOCSIFADDR/SIOCGIFCONF/ARP/route/...). A local
+                // 6-arm duplicate used to shadow it, silently ENOTTY-ing
+                // if_indextoname (LTP in6_02) and ifconfig address setup
+                // (if4-addr-change) — the full version was dead code.
+                return super::socket::sys_socket_ioctl(request, argp, ctx);
             }
             StructPayload::CharDevice(binding) => {
-                if request == RTC_ALM_READ {
-                    let Some(rtc_ops) = binding.ops.rtc_ops() else {
-                        return SyscallResult::error_from(Errno::ENOTTY);
-                    };
+                if binding.name == "rtc" && request == RTC_RD_TIME {
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
-                    let guard = step_engine::guard();
-                    let alarm = match rtc_ops.read_alarm(&guard) {
-                        Ok(alarm) => alarm,
-                        Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-                    };
-                    return match bootstrap_write_user::<RtcTime>(&ctx.aspace, argp, alarm.time) {
-                        Ok(()) => SyscallResult::Return(0),
-                        Err(errno) => SyscallResult::error_from(errno),
-                    };
-                }
-                if request == RTC_ALM_SET {
-                    let Some(rtc_ops) = binding.ops.rtc_ops() else {
-                        return SyscallResult::error_from(Errno::ENOTTY);
-                    };
-                    if argp == 0 {
-                        return SyscallResult::Error(EFAULT_VALUE);
-                    }
-                    let rtc_time = match bootstrap_read_user::<RtcTime>(&ctx.aspace, argp) {
-                        Ok(time) => time,
-                        Err(errno) => return SyscallResult::error_from(errno),
-                    };
-                    let guard = step_engine::guard();
-                    let alarm = tx_subsystems::device::RtcAlarm {
-                        time: rtc_time,
-                        enabled: true,
-                        pending: false,
-                    };
-                    let emulation_registrar = ctx.timer_registrar.as_ref().cloned();
-                    let emulation = match (emulation_registrar.as_ref(), rtc_time.to_unix_ns()) {
-                        (Some(registrar), Ok(realtime_ns)) => Some(RtcAlarmEmulation::new(
-                            registrar,
-                            timekeeper().monotonic_deadline_from_realtime_ns(realtime_ns),
-                        )),
-                        _ => None,
-                    };
-                    return match rtc_ops.set_alarm_with_emulation(alarm, &guard, emulation) {
-                        Ok(()) => SyscallResult::Return(0),
-                        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
-                    };
-                }
-                if request == RTC_RD_TIME {
-                    let Some(rtc_ops) = binding.ops.rtc_ops() else {
-                        return SyscallResult::error_from(Errno::ENOTTY);
-                    };
-                    if argp == 0 {
-                        return SyscallResult::Error(EFAULT_VALUE);
-                    }
-                    let guard = step_engine::guard();
-                    let rtc_time = match rtc_ops.read_time(&guard) {
-                        Ok(time) => time,
-                        Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-                    };
+                    let rtc_time = RtcTime::fixed_oscomp_time();
                     return match bootstrap_write_user::<RtcTime>(&ctx.aspace, argp, rtc_time) {
                         Ok(()) => SyscallResult::Return(0),
                         Err(errno) => SyscallResult::error_from(errno),
-                    };
-                }
-                if request == RTC_SET_TIME {
-                    let Some(rtc_ops) = binding.ops.rtc_ops() else {
-                        return SyscallResult::error_from(Errno::ENOTTY);
-                    };
-                    if argp == 0 {
-                        return SyscallResult::Error(EFAULT_VALUE);
-                    }
-                    let rtc_time = match bootstrap_read_user::<RtcTime>(&ctx.aspace, argp) {
-                        Ok(time) => time,
-                        Err(errno) => return SyscallResult::error_from(errno),
-                    };
-                    let guard = step_engine::guard();
-                    return match rtc_ops.set_time(rtc_time, &guard) {
-                        Ok(()) => SyscallResult::Return(0),
-                        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
                     };
                 }
                 return SyscallResult::error_from(Errno::ENOTTY);
@@ -1917,27 +1597,36 @@ where
         _ => return SyscallResult::error_from(Errno::ENOTTY),
     };
 
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    macro_rules! drive_tty_oneshot {
-        ($op:expr) => {{
-            let mut op = $op;
-            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                Ok(value) => value,
-                Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-            }
-        }};
+    // v3 step_ioctl_* return Done/Err only in practice; helper to
+    // collapse the four-variant catalog into a v4 Errno-or-value.
+    use StepOutcome as V3Out;
+    fn unwrap_v3<T>(v: V3Out<T, NoProgress>) -> Result<T, Errno> {
+        match v {
+            V3Out::Done(t) => Ok(t),
+            V3Out::Err(e) => Err(e.into()),
+            V3Out::Continue { .. } | V3Out::Yield { .. } => Err(Errno::EIO),
+        }
     }
 
     match request {
         TCGETS => {
-            let termios = drive_tty_oneshot!(IoctlTcgetsOp { tty: &tty });
-            if argp == 0 {
-                return SyscallResult::Error(EFAULT_VALUE);
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tcgets(&tty, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(termios) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                    SyscallResult::Return(0)
+                }
+                Err(errno) => SyscallResult::error_from(errno),
             }
-            if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios) {
-                return SyscallResult::error_from(errno);
-            }
-            SyscallResult::Return(0)
         }
         TCSETS | TCSETSW | TCSETSF => {
             if argp == 0 {
@@ -1952,21 +1641,32 @@ where
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
-            let _ = drive_tty_oneshot!(IoctlTcsetsOp {
-                tty: &tty,
-                new_termios,
-            });
-            SyscallResult::Return(0)
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tcsets(&tty, new_termios, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
         }
         TIOCGPGRP => {
-            let pgid = drive_tty_oneshot!(IoctlTiocgpgrpOp { tty: &tty });
-            if argp == 0 {
-                return SyscallResult::Error(EFAULT_VALUE);
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tiocgpgrp(&tty, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(pgid) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, argp, pgid) {
+                        return SyscallResult::error_from(errno);
+                    }
+                    SyscallResult::Return(0)
+                }
+                Err(errno) => SyscallResult::error_from(errno),
             }
-            if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, argp, pgid) {
-                return SyscallResult::error_from(errno);
-            }
-            SyscallResult::Return(0)
         }
         TIOCSPGRP => {
             if argp == 0 {
@@ -1976,26 +1676,33 @@ where
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
-            let Some(new_pgrp_cap) = tx_subsystems::process::process_group_by_pgid(Pgid(new_pgrp))
-            else {
-                return SyscallResult::Error(EINVAL_VALUE);
+            let caller = make_ioctl_caller(ctx);
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard)
             };
-            let _ = drive_tty_oneshot!(IoctlTiocspgrpForProcessOp {
-                tty: &tty,
-                caller: &ctx.process,
-                new_pgrp: &new_pgrp_cap,
-            });
-            SyscallResult::Return(0)
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
         }
         TIOCGWINSZ => {
-            let winsize = drive_tty_oneshot!(IoctlTiocgwinszOp { tty: &tty });
-            if argp == 0 {
-                return SyscallResult::Error(EFAULT_VALUE);
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tiocgwinsz(&tty, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(ws) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<Winsize>(&ctx.aspace, argp, ws) {
+                        return SyscallResult::error_from(errno);
+                    }
+                    SyscallResult::Return(0)
+                }
+                Err(errno) => SyscallResult::error_from(errno),
             }
-            if let Err(errno) = bootstrap_write_user::<Winsize>(&ctx.aspace, argp, winsize) {
-                return SyscallResult::error_from(errno);
-            }
-            SyscallResult::Return(0)
         }
         TIOCSWINSZ => {
             if argp == 0 {
@@ -2005,11 +1712,14 @@ where
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
-            let _ = drive_tty_oneshot!(IoctlTiocswinszOp {
-                tty: &tty,
-                winsize: ws
-            });
-            SyscallResult::Return(0)
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tiocswinsz(&tty, ws, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
         }
         TIOCSCTTY => {
             // The `argp` for TIOCSCTTY is a "force" bit (0 or 1) on
@@ -2020,16 +1730,25 @@ where
             // is updated; the legacy step_ioctl_tiocsctty only binds
             // the session_pgrp field and leaves has_controlling_tty()
             // false, which breaks subsequent TIOCGPGRP calls.
-            let _ = drive_tty_oneshot!(IoctlTiocscttyForProcessOp {
-                tty: &tty,
-                caller: &ctx.process,
-            });
-            SyscallResult::Return(0)
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tiocsctty_for_process(&tty, &ctx.process, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
         }
         TIOCNOTTY => {
             let caller = make_ioctl_caller(ctx);
-            let _ = drive_tty_oneshot!(IoctlTiocnottyOp { tty: &tty, caller });
-            SyscallResult::Return(0)
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tiocnotty(&tty, caller, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
         }
         // Unknown ioctl request → -ENOTTY (the POSIX `man ioctl_tty`
         // semantic). musl's `isatty(3)` resolves to TCGETS so it never
@@ -2041,12 +1760,35 @@ where
 }
 
 const RTC_RD_TIME: u32 = 0x8024_7009;
-const RTC_SET_TIME: u32 = 0x4024_700a;
-const RTC_ALM_READ: u32 = 0x8024_7008;
-const RTC_ALM_SET: u32 = 0x4024_7007;
 
-fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    super::socket::sys_socket_ioctl(request, argp, ctx)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RtcTime {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+}
+
+impl RtcTime {
+    const fn fixed_oscomp_time() -> Self {
+        Self {
+            tm_sec: 0,
+            tm_min: 0,
+            tm_hour: 0,
+            tm_mday: 23,
+            tm_mon: 4,
+            tm_year: 126,
+            tm_wday: 6,
+            tm_yday: 142,
+            tm_isdst: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -2549,51 +2291,10 @@ fn rdev_major_minor_for_open_file(file: &Cap<OpenFile>) -> (u32, u32) {
             RNodeBacking::StructBacked {
                 payload: StructPayload::BlockDevice(reg),
             } => (reg.devt.major(), reg.devt.minor()),
-            RNodeBacking::StructBacked {
-                payload: StructPayload::Tty(tty),
-            } => tx_subsystems::tty::project::devt_major_minor_for_tty(tty),
             _ => (0, 0),
         },
         _ => (0, 0),
     }
-}
-
-fn rdev_major_minor_for_fs_object_id(id: FsObjectId) -> (u32, u32) {
-    tx_fs::devfs::devt_for_object_id(id)
-        .map(|devt| (devt.major(), devt.minor()))
-        .unwrap_or((0, 0))
-}
-
-fn stat_info_for_open_file(
-    file: &Cap<OpenFile>,
-    fallback_ino: u64,
-) -> (InodeMeta, FsObjectId, u32, u32) {
-    let (rmaj, rmin) = rdev_major_minor_for_open_file(file);
-    match file.backing() {
-        OpenFileBacking::Rnode { rnode } => (
-            stat_meta_for_open_file(file),
-            rnode.fs_object_id(),
-            rmaj,
-            rmin,
-        ),
-        _ => (
-            stat_meta_for_open_file(file),
-            FsObjectId::new(fallback_ino),
-            rmaj,
-            rmin,
-        ),
-    }
-}
-
-fn proc_self_fd_stat_info<'a>(
-    ctx: &SyscallCtx<'a>,
-    path: &[u8],
-) -> Result<Option<(InodeMeta, FsObjectId, u32, u32)>, SyscallResult> {
-    let Some(fd_num) = proc_self_fd_number(path) else {
-        return Ok(None);
-    };
-    let file = resolve_fd(&ctx.process, fd_num).ok_or(SyscallResult::Error(ENOENT_VALUE))?;
-    Ok(Some(stat_info_for_open_file(&file, fd_num as u64)))
 }
 
 fn stat_rdev_for_open_file(file: &Cap<OpenFile>) -> u64 {
@@ -2716,7 +2417,10 @@ fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
 /// - Unknown / closed fd → `-EBADF`.
 /// - `statbuf == 0` (NULL) → `-EFAULT`.
 /// - All other paths return `0` after writing the buffer.
-pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_fstat<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let fd = args[0] as i32;
     let statbuf_uaddr = args[1];
 
@@ -2758,20 +2462,7 @@ pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
         Some(d) => d,
         None => return SyscallResult::Error(ENOTDIR_VALUE),
     };
-    let mount = ctx
-        .process
-        .cwd_binding()
-        .filter(|cwd| cwd.dentry.key() == dentry.key())
-        .map(|cwd| cwd.mount)
-        .or_else(|| {
-            ctx.process
-                .mount_namespace_cap()
-                .and_then(|namespace| namespace.mount_containing_dentry(&dentry))
-        });
-    let Some(mount) = mount else {
-        return SyscallResult::Error(ENOENT_VALUE);
-    };
-    match tx_subsystems::process::step_chdir_with_mount(&ctx.process, dentry, mount) {
+    match tx_subsystems::process::step_chdir(&ctx.process, dentry) {
         tx_subsystems::process::ChdirOutcome::Replaced { .. } => SyscallResult::Return(0),
         tx_subsystems::process::ChdirOutcome::ZombieIgnored => SyscallResult::Error(EACCES_VALUE),
     }
@@ -2786,7 +2477,10 @@ pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 /// inode metadata already used by `newfstatat`; unsupported sync
 /// policy bits are accepted because there is no cache coherency
 /// distinction in the current VFS layer.
-pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let flags = args[2] as u32;
@@ -2812,20 +2506,12 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
-    let cwd = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        }
-    } else {
-        match dirfd_anchor_for_path(dirfd, &path, ctx) {
-            Ok(cwd) => cwd,
-            Err(result) => return result,
-        }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     // Device nodes carry a (major, minor) rdev that glibc reads back from
     // statx — notably `daemon()` fstat()s /dev/null and rejects it with
@@ -2853,19 +2539,16 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     None => return SyscallResult::Error(EBADF_VALUE),
                 };
                 let (rmaj, rmin) = rdev_major_minor_for_open_file(&file);
+                let live_meta = stat_meta_for_open_file(&file);
                 match file.backing() {
                     OpenFileBacking::Rnode { rnode } => (
-                        StatxResult {
-                            meta: stat_meta_for_open_file(&file),
-                        },
+                        StatxResult { meta: live_meta },
                         rnode.fs_object_id(),
                         rmaj,
                         rmin,
                     ),
                     _ => (
-                        StatxResult {
-                            meta: stat_meta_for_open_file(&file),
-                        },
+                        StatxResult { meta: live_meta },
                         FsObjectId::new(fd as u64),
                         rmaj,
                         rmin,
@@ -2873,46 +2556,37 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 }
             }
         } else {
-            if let Some((meta, ino, rmaj, rmin)) = match proc_self_fd_stat_info(ctx, &path) {
-                Ok(info) => info,
-                Err(result) => return result,
-            } {
-                (StatxResult { meta }, ino, rmaj, rmin)
-            } else if is_caller_dev_tty_path(&path, &cwd) {
-                let (meta, ino, rmaj, rmin) = match caller_dev_tty_stat_info(ctx) {
-                    Ok(info) => info,
-                    Err(result) => return result,
-                };
-                (StatxResult { meta }, ino, rmaj, rmin)
+            // Match openat/mkdirat semantics for path-based metadata probes:
+            // absolute paths ignore dirfd, AT_FDCWD starts at cwd, and a real
+            // directory fd starts at the dentry retained by its OpenFile.
+            let rooted_at: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+                cwd.clone()
+            } else if dirfd < 0 {
+                return SyscallResult::Error(EBADF_VALUE);
             } else {
-                let walker_cred = ctx.walker_cred();
-                let result = {
-                    let mut script_ctx = build_subject_script_ctx(ctx);
-                    if flags & AT_SYMLINK_NOFOLLOW as u32 != 0 {
-                        let mut op = LstatxOp {
-                            rooted_at: &cwd,
-                            path: &path,
-                            cred: &walker_cred,
-                            target: None,
-                        };
-                        step_engine::drive_oneshot(&mut op, &mut script_ctx)
-                    } else {
-                        let mut op = StatxOp {
-                            rooted_at: &cwd,
-                            path: &path,
-                            cred: &walker_cred,
-                            target: None,
-                        };
-                        step_engine::drive_oneshot(&mut op, &mut script_ctx)
-                    }
+                let open_file = match ctx.process.fd(dirfd as u32) {
+                    Some(file) => file,
+                    None => return SyscallResult::Error(EBADF_VALUE),
                 };
-                match result {
-                    Ok((sr, id)) => {
-                        let (rmaj, rmin) = rdev_major_minor_for_fs_object_id(id);
-                        (sr, id, rmaj, rmin)
-                    }
-                    Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+                match open_file.opendir_dentry() {
+                    Some(dentry) => dentry,
+                    None => return SyscallResult::Error(ENOTDIR_VALUE),
                 }
+            };
+            let walker_cred = ctx.walker_cred();
+            let result = {
+                let mut script_ctx = build_subject_script_ctx(ctx);
+                let mut op = StatxOp {
+                    rooted_at: &rooted_at,
+                    path: &path,
+                    cred: &walker_cred,
+                    target: None,
+                };
+                step_engine::drive_oneshot(&mut op, &mut script_ctx)
+            };
+            match result {
+                Ok((sr, id)) => (sr, id, 0, 0),
+                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
             }
         };
 
@@ -2928,19 +2602,23 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// `__NR_newfstatat = 79`.
 ///
 /// Slice 6 surface:
-/// - `dirfd == AT_FDCWD` for path walks; non-cwd dirfds → `-EBADF`.
+/// - Path walks accept `AT_FDCWD` and real directory fds; absolute paths
+///   ignore `dirfd`, matching the other `*at` syscall arms.
 /// - `flags & AT_EMPTY_PATH` paired with empty path stats either the
 ///   cwd (`AT_FDCWD`) or the supplied fd. LA64 musl uses this fd form
 ///   to implement `fstat(fd)`.
-/// - `flags & AT_SYMLINK_NOFOLLOW` stats the terminal symlink
-///   itself instead of following it.
+/// - `flags & AT_SYMLINK_NOFOLLOW` is accepted but ignored (the
+///   walker always follows symlinks today; documented carryover).
 /// - `flags & AT_NO_AUTOMOUNT` is accepted but ignored (no
 ///   automount machinery — matches Linux's lenience).
 /// - Other flag bits → `-EINVAL`.
 ///
 /// Path resolution mirrors `resolve_path_at`'s shape (using
 /// `step_walk` from cwd with `walker_cred`).
-pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let statbuf_uaddr = args[2];
@@ -2950,7 +2628,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    // Slice 6 honours: AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW
+    // Slice 6 honours: AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW (ignored)
     // | AT_NO_AUTOMOUNT (ignored). Other bits are rejected so a
     // future caller passing an unrecognised flag (`AT_STATX_*`,
     // `AT_RECURSIVE`, etc.) sees `-EINVAL` rather than silent
@@ -2964,81 +2642,57 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
 
+    let walker_cred = ctx.walker_cred();
+
     // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
     // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
-    // drive_oneshot from cwd; directory-fd path walks remain out of
-    // scope for this slice.
-    let cwd = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        }
-    } else {
-        match dirfd_anchor_for_path(dirfd, &path, ctx) {
-            Ok(cwd) => cwd,
-            Err(result) => return result,
-        }
+    // drive_oneshot from the same cwd/dirfd anchor as openat/mkdirat.
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
-    let (mut meta, ino, rdev_major, rdev_minor) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0)
-    {
+    let (mut meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
         if dirfd == AT_FDCWD {
-            (cwd.rnode().meta(), cwd.rnode().fs_object_id(), 0, 0)
+            (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
-            return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+            return sys_fstat::<P>([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
         }
     } else {
-        if let Some(info) = match proc_self_fd_stat_info(ctx, &path) {
-            Ok(info) => info,
-            Err(result) => return result,
-        } {
-            info
-        } else if is_caller_dev_tty_path(&path, &cwd) {
-            match caller_dev_tty_stat_info(ctx) {
-                Ok(info) => info,
-                Err(result) => return result,
-            }
+        let rooted_at: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+            cwd.clone()
+        } else if dirfd < 0 {
+            return SyscallResult::Error(EBADF_VALUE);
         } else {
-            let walker_cred = ctx.walker_cred();
-            let result = {
-                let mut script_ctx = build_subject_script_ctx(ctx);
-                if flags & AT_SYMLINK_NOFOLLOW as u32 != 0 {
-                    let mut op = LstatOp {
-                        rooted_at: &cwd,
-                        path: &path,
-                        cred: &walker_cred,
-                        target: None,
-                    };
-                    step_engine::drive_oneshot(&mut op, &mut script_ctx)
-                } else {
-                    let mut op = StatOp {
-                        rooted_at: &cwd,
-                        path: &path,
-                        cred: &walker_cred,
-                        target: None,
-                    };
-                    step_engine::drive_oneshot(&mut op, &mut script_ctx)
-                }
+            let open_file = match ctx.process.fd(dirfd as u32) {
+                Some(file) => file,
+                None => return SyscallResult::Error(EBADF_VALUE),
             };
-            match result {
-                Ok((m, id)) => {
-                    let (rmaj, rmin) = rdev_major_minor_for_fs_object_id(id);
-                    (m, id, rmaj, rmin)
-                }
-                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            match open_file.opendir_dentry() {
+                Some(dentry) => dentry,
+                None => return SyscallResult::Error(ENOTDIR_VALUE),
             }
+        };
+        let result = {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = StatOp {
+                rooted_at: &rooted_at,
+                path: &path,
+                cred: &walker_cred,
+                target: None,
+            };
+            step_engine::drive_oneshot(&mut op, &mut script_ctx)
+        };
+        match result {
+            Ok((m, id)) => (m, id),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
     apply_stat_meta_override(ino, &mut meta);
-    let stat = inode_meta_to_stat(
-        &meta,
-        ino.as_u64(),
-        linux_encode_dev_t(rdev_major, rdev_minor),
-    );
+    let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::error_from(errno);

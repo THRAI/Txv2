@@ -1,3 +1,244 @@
+- 2026-07-31 (BuildStorm ext4 连续读取批处理). ext4 文件页缺页现在只读取和校验一次
+  inode，不再先取 metadata 再重复解析；常规文件数据缺页采用有界 8 块预读，RV64 MMIO
+  与 LA64 PCI VirtIO 块设备会把物理连续的 Frame 合并为一次多块请求，分配或批量请求失败
+  时仍回退原单页路径。未改变写回、fsync、调度或全局 pager 锁语义。验证：
+  tx-ext4-format 26/26、tx-ext4 12/12、tx-fs 86/86、tx-drivers 5/5 通过，RV64、LA64
+  与 M1Dock 目标编译通过；统一 `cargo -q xtask unit` 仍只受分支原有 tx-shims 测试桩
+  编译错误和 run_thread future 2112/2048 预算断言阻断。RV64 release/submit 内核已刷新；
+  QEMU 9.2.1、4 GiB、8 hart、可写官方镜像完整 `final` 流程成功，CAgent 10/10，
+  BuildStorm `ok=true cores=8 bytes=1681000 elapsed_s=1120.65`，相对同机旧基线
+  `1183.45s` 缩短 62.80 秒（约 5.3%）；日志为
+  `target/final-rv-io-batch-20260731.log`。Next：在官方 16 GiB/8 hart 平台复测，确认高
+  I/O 延迟环境中的收益；若仍超时，再用锁等待计数判断是否值得拆分全局 ext4 pager 锁。
+  Blocker：尚无官方平台新结果，不能由本机数据推断平台最终耗时。
+- 2026-07-30 (BuildStorm 文件对象与缓存生命周期闭环). ext4 的
+  `FsObjectId` 现在同时携带 inode generation，RNode、PageContainer、目录项缓存和
+  lookup/readdir 缓存都以完整对象代号区分 inode 复用前后的对象；最后一个文件对象
+  payload 释放前不再提前销毁后端 inode。移除了易失效的 decoded-inode metadata
+  缓存，目录版本与负缓存随对象 generation 一同失效。PageContainer 写回改为快照式
+  提交：脏页、文件长度与后端 fsync 全部成功后才清除对应 dirty generation，失败保留
+  状态并进入不持锁执行 I/O 的延迟重试队列。`utimensat` 只覆盖时间戳，不再用旧快照
+  覆盖当前 size/nlink/mode；路径 stat 与 fd stat 统一以 PageContainer 的当前长度为准。
+  验证：tx-ext4-format 26/26、tx-ext4 12/12、五项写回失败/重试定向测试通过，
+  `cargo check -p tx-subsystems -p tx-shims --lib` 通过，RV64 release 与 submit 内核
+  已刷新。QEMU 9.2.1、4 GiB、8 hart、可写官方镜像、`tx.profile=final` 连续两次
+  完整联合测试均通过：CAgent 均为 10/10，BuildStorm minibuild 均通过，计时编译分别为
+  `1252.93s` 和 `1183.45s`，两次均为 `ok=true cores=8 bytes=1681000`，最终均为
+  `cagent_rc=0 buildstorm_rc=0`；日志为
+  `target/final-rv-fs-cache-20260730-205136.log` 和
+  `target/final-rv-fs-cache-rerun-20260730-215126.log`。确认稳定后已删除只读 stat
+  路径中的 `txkernel:file-size-zero` 临时诊断及其额外元数据读取，不改变文件状态。
+  Next：在测评平台的
+  16 GiB/8 hart 参数下复核性能与稳定性。Blocker：无；统一 tx-shims lib-test 仍受
+  分支原有旧测试桩缺少 CacheIf/常量等编译错误影响，不影响本次生产构建和 QEMU 验证。
+- 2026-07-30 (BuildStorm socketpair SMP 预检查修复). Cargo/Rust 在启动 rustc 前使用
+  `socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC)` 建立 exec 错误通道；原同步
+  `validate_user_range` 在另一个 hart 暂时持有目标栈页 RangeLock 时，把正常的
+  `Yield` 竞争错误翻译为 `EIO`，导致子 rustc 显示 `(never executed)`。现新增等待版
+  用户区间校验，`sys_socketpair` 会等待锁释放并完整重试，真实非法地址仍返回
+  `EFAULT`；未改 TCP 数据面或其他同步 socket 调用。`cargo check -p tx-shims --lib`
+  通过，仅有分支原有 warning。Next：刷新 RV64 submit 内核并用 `-snapshot` 复跑联合
+  流程，确认不再出现 `nr=199 errno=5`。Blocker：动态 BuildStorm 复核尚未执行。
+- 2026-07-30 (CAgent 并发短连接乱序 FIN 修复). Txv2 的 TCP 包装层此前直接按
+  入站报文的 FIN 标志发布 EOF；而 smoltcp 在接收序列仍有缺口时会延迟该 FIN，导致
+  CAgent 客户端提前看到 EOF，随机得到空响应或截断 JSON。现由 smoltcp 暴露“已接受
+  in-order FIN”的权威状态，Txv2 仅在该状态发生跃迁时发布 EOF；缓冲数据仍先于 EOF
+  被 recv 消费。新增乱序 FIN 回归用例，旧实现稳定失败、修复后通过；TCP graceful
+  shutdown 模块 7/7 通过。RV64 release/submit 内核已刷新，QEMU 9.2.1、4 GiB、8 hart、
+  `-snapshot` 下连续 5 轮 CAgent 共 50/50 通过，0 reject、0 超时、0 诊断失败。统一
+  `cargo -q xtask unit` 仍被分支原有的 tx-shims 测试脚手架 9 个编译错误和
+  `run_thread` future 2112/2048 预算断言阻断；构建、tx-ext4、tx-scripts 均通过。
+  Next：在官方 16 GiB/8 hart 参数下复核 CAgent+BuildStorm 联合流程。Blocker：无。
+- 2026-07-26 (RV64 SMP 空闲核丢唤醒闭环). BuildStorm 计时构建已经完成
+  `arceos-helloworld` 和 objcopy，但外层 `timeout` 永久停在 wait4。现场确认退出子进程
+  已是 zombie、parent key 正确，而所有 AP 均睡在 `wfi`；这排除了“子进程没有退出”，并
+  将根因收敛到 check-empty 与 WFI 之间的中断竞态。原实现即使总发 reschedule IPI，IPI
+  仍可在 WFI 执行前进入内核、清除 SSIP 后返回原 PC，随后 AP 执行 WFI 并永久睡眠。现为
+  `SmpIf` 增加线性的 prepare/cancel/commit interrupt-wait 协议；RV64 prepare 在最终
+  runnable-work 检查前清除全局 `sstatus.SIE` 但保留 `sie` 本地源，竞态到达的 SSIP 会
+  保持 pending 并使 WFI 立即返回，commit 后再恢复原 SIE。AP reactor 与 BSP userspace
+  reactor 均使用该协议，最终检查覆盖本核 runnable 队列、need-resched、全局 queued wake，
+  AP 额外覆盖 stop 请求。验证：相关三 crate host check 通过；RV64 release 交叉编译通过；
+  release 反汇编确认 `csrrci sstatus,2 -> authoritative work check -> wfi -> csrsi
+  sstatus,2` 顺序；8-hart smoke 通过 AP online、IPI、dispatch、AP loop 和 AP runqueue
+  标记；`target/oscomp/submit/kernel-rv` 已刷新且与 release ELF SHA-256 一致。Next：使用
+  当前有缓存的官方 RV 镜像复跑 4-GiB/8-hart BuildStorm，确认最后三行后能继续打印
+  `BUILDSTORM_COMPILE`、测试组 END 和 PID 1 退出。Blocker：完整 BuildStorm 仍需一次约
+  20 分钟的客户机实测，未在本轮短验证中冒充完成。
+- 2026-07-25 (BuildStorm 文件时间与 SMP fork 根因修复). ext4 不再把新建文件/目录
+  的 atime/mtime/ctime 写成 1970：启动时向 wall_clock 注册平台单调时钟，文件系统从与
+  `clock_gettime(CLOCK_REALTIME)` 相同的 offset 读取时间；page-cache 写回和 truncate 在
+  同一次 inode 更新中提交 size、mtime、ctime，避免 Cargo 因本地产物旧于源码而反复重编
+  `axbuild/tg-xtask`。进程 fork 改为“可等待 VM 准备 + 一次性进程发布”：RangeLock
+  冲突在内核中等待释放并从头重试，不再直接映射为用户态 EAGAIN；fd/pipe 引用、pid 和
+  topology 发布均位于等待之后，exec 并发替换 aspace 时丢弃未发布 clone 并重做准备。
+  普通 process clone 已退出同步 one-shot 快路，CLONE_THREAD 仍保留紧凑快路。验证：
+  wall-clock、ext4 元数据原子更新、fork 冲突等待三个针对性测试通过；RV64 与 LA64
+  `cargo xtask build` 均通过。统一 `cargo -q xtask unit` 仍被分支已有的 tx-shims
+  测试桩缺失（ITIMER_REAL/NETLINK_XFRM/CLONE_NEWNS 等）和现有 SMP 线程 future
+  2112-byte 超预算测试阻断；tx-ext4 本身 11/11 通过。Next：生成新的 submit 内核后用
+  干净或可回滚镜像跑八核 BuildStorm，确认计时阶段不再重编上述 host 工具，并且
+  `core`/rustc spawn 不再出现 `Resource temporarily unavailable`。
+- 2026-07-25 (SMP 最小正确调度路径). 用户任务采用提交时按 affinity mask
+  round-robin 分配、运行后固定 CPU 的模型；生产 hart loop 暂停 work stealing 与周期
+  rebalance，避免反复扫描并弹出实际不可迁移的 pinned 用户任务。idle 判断不再扫描全局
+  TaskTable：只观察本核队列、本核 need-resched 和原子待处理 wake 数，其他 CPU 有任务时
+  本核可以正常休眠。RawWaker 用原子 wake bit 合并重复唤醒；Parked -> Runnable 的
+  scheduler metadata 转换和 queued affinity 转换都在单次 metadata 临界区完成，防止两个
+  CPU 同时把一个 future 发布到不同队列。此前已撤销 reschedule IPI 在缺少
+  `TrapFrameMut` 时直接返回 `TrapAction::Reschedule` 的错误行为；IPI 仍确认低层 pending
+  位并唤醒目标 hart，但返回 `Resume`，避免用户上下文未保存、userspace wait 未完成便跳回
+  Reactor。用户任务的 spread-on-submit 不再在全局 scheduler metadata 锁内扫描全部任务；
+  改为一个 relaxed 原子游标按 affinity mask 做 round-robin，metadata 锁只承担 O(1) 任务
+  登记。验证：`cargo test -p tx-reactor -- --test-threads=1` 全部通过，
+  `cargo check -p tx-kernel --lib` 和 `git diff --check` 通过。Next：重新构建 RV64 后进行
+  4-GiB BuildStorm 八核复跑，先确认八核均能运行且不再出现旧的空闲核抢锁/任务双重发布。
+  Blocker：本轮按要求未启动耗时 QEMU 测试；动态负载均衡需在 movable 任务队列与原子迁移
+  协议完成后再启用。
+- 2026-07-24 (LA64 BuildStorm vmalloc 激活链补齐). LA64 的 PGDH 实际已在
+  `TrapIf::enter_userspace_with_context` 中激活，但运行时绕过了原先唯一调用
+  `enable_vmalloc_after_kernel_pmap_activation` 的 `VmPmap::activate` 包装层，导致诊断长期为
+  `ready=1:initialized=0`，962880-byte 分配在碎片化后错误回退到236页连续物理内存并失败。
+  现在线程运行时从真实用户态陷回后发布 pmap 已激活事实；该通知幂等，RV64 不受影响。
+  验证：`cargo xtask build --target la64-qemu --release` 通过。Next：刷新 `kernel-la` 后复跑
+  4-GiB BuildStorm，确认诊断为 `initialized=1` 且原 OOM 不再出现。Blocker：完整 guest
+  复跑尚未完成。
+- 2026-07-23 (BuildStorm ext4 删除生命周期闭环). ext4 hard link 继续共享同一个
+  `inode -> Weak<PageContainer>` 活页缓存；unlink/rmdir/rename 覆盖只更新目录项和
+  `i_links_count`，零链接 inode 进入每挂载 orphan 集合。`unlinkat`、通用 `UnlinkOp`、
+  `O_TMPFILE` 和 rename 覆盖路径均在提交期间持有 nofollow 目标，并只提供一次后端销毁机会；
+  ext4 检测到活 PageContainer 时拒绝提前复用，最后一个 file PageContainer 经 EBR 析构后
+  再次调用 `destroy_inode`，此时才回收叶 extent、extent 索引块、数据块位图和 inode 位图。
+  truncate 缩小时同步裁剪 extent 树并释放 EOF 后数据块。rename 现处理同 inode no-op、
+  覆盖目标 nlink/orphan、目录类型校验、非空目录、跨目录 `..`/父 nlink 和祖先环检测；
+  mkdir/rmdir 父链接数也已配平。没有把重型回收塞进全局 RNode Drop，避免影响 tmpfs/FAT
+  等其他后端。验证：tx-ext4-format 19/19、tx-ext4 11/11、page_backed 91/91、tmpfs 53/53，
+  `tx-shims`/相关库 check 通过；RV64 release 与 `target/oscomp/submit/kernel-rv` 已重新构建。
+  Next：用干净官方镜像复跑 BuildStorm。
+  Blocker：ext4 metadata checksum、组/超级块空闲计数和 `INODE_UNINIT/BLOCK_UNINIT` 仍是
+  独立的磁盘一致性工作；本轮先闭合运行时 inode/块生命周期，不宣称写入式 fsck 已完全干净。
+- 2026-07-23 (BuildStorm vmalloc 失败链诊断与镜像污染隔离). 为大对象 direct-map
+  失败后的 vmalloc 回退补齐无分配诊断：记录 VA 位图使用量/最大连续区、分配阶段、物理帧
+  失败、pmap 映射错误、回滚/解除映射缺页以及被隔离的 VA 页数；OOM 汇总会输出
+  `txkernel:vmalloc:*`，用于区分 VA 耗尽、物理页申请失败、映射失败和不完整回滚。LA64
+  4 GiB 单核 BuildStorm 复跑没有触发原 962880-byte OOM，而在 `444/446: axbuild`
+  先出现对象复制 `ENOENT`，随后 Cargo 数据库 `disk I/O error`、`tee`/shell 写入失败。
+  宿主和镜像空间均充足；只读 `e2fsck -f -n` 以 rc=12 中止，确认大量 inode/目录
+  checksum 错误，并发现目录项引用 `INODE_UNINIT` 组中的已删除/未使用 inode。当前 LA
+  镜像已不适合作为内存分配器验证基线，不能用这轮结果修改 vmalloc。验证：
+  `cargo check -p tx-substrate -p tx-subsystems --lib`、`cargo test -p tx-substrate --test slab`
+  与 LA64 release/submit 构建此前均通过。Next：重新解压干净官方镜像（优先 `-snapshot`
+  复现），跑到原 OOM 并按 `txkernel:vmalloc:last_fail` 的唯一失败阶段修复。Blocker：本机
+  没有 `sdcards-final.tar.xz` 或其他干净 LA 镜像副本；当前镜像的修复会清除损坏缓存，
+  未擅自执行写入式 fsck。
+- 2026-07-21 (EBR / vmalloc 成熟路径收敛). EBR 已由临时可增长节点池改为 Crossbeam
+  形状：每 CPU 64 项本地 bag、SeqCst 封口、全局页后备 FIFO、每 128 次 guard acquisition
+  冷路径收集、每轮最多八个 bag、两 epoch 安全间隔；固定 1024 上限已删除，回调不持队列锁，
+  空 bag 页缓存上限为 64，超出部分归还页分配器。vmalloc 改为 Txv2 版 `kvmalloc` 策略：
+  64 KiB..1 MiB 先尝试便宜的连续 direct-map，失败再 vmalloc；更大对象优先 vmalloc，避免
+  bitmap 连续区全表搜索。新映射逐页写 PTE 后只做一次范围发布；释放时先清整段 PTE，通过
+  dead page 内侵入链暂存 PPN，一次 shootdown 后再归还全部物理帧，删除原逐页 TLB flush 和
+  单一长持有 vmalloc 锁热点。设计依据和边界记录在
+  `docs/progress/research/2026-07-21-ebr-vmalloc-mature-shape.md`。验证：`tx-substrate` epoch
+  4/4、page allocator 22/22、pmap 5/5、shootdown 5/5、slab 5/5；RV64/LA64 release 交叉
+  编译通过，`target/oscomp/submit/kernel-rv` 与 `kernel-la` 已刷新。Next：用官方 RV 镜像
+  重跑完整 BuildStorm，比较 tg-xtask 编译时间并确认不再出现 6 MiB 连续分配失败或 EBR
+  容量 panic。Blocker：完整 BuildStorm 尚未在本轮代码上跑完。
+- 2026-07-21 (BuildStorm Pmap 连续内存分配修复). RV64 在 tg-xtask 构建到
+  `63/446` 时仍有约 4.4 GiB 空闲页，但最大连续空闲区仅 693 页；内核申请
+  6,291,456 字节后失败。该大小精确对应 resident pmap 的
+  `131072 * 48-byte` 单体 `Vec` 扩容，并非物理页耗尽或已确认的泄漏。生产默认改用
+  已有的 64 项分块 resident 后端，使单块表项存储约 3 KiB，避免大地址空间要求
+  数 MiB 连续物理内存；`Vec` 后端仅保留给对照测试。
+- 2026-07-20 (恢复 BuildStorm-only 现场诊断). finals PID 1 默认脚本由临时评分用的
+  CAgent-only 切回只执行 `run_buildstorm`，保留 CAgent 函数但不调用；用于重新构建本地
+  LA64 内核后复现 Cargo 在 rustc 子进程退出后的阻塞。当前单核是主动限制，不作为问题处理；
+  下一步只区分 Cargo 阻塞在 `wait4`、pipe/poll 或 futex，再修复对应唤醒链。
+- 2026-07-20 (官方复提交恢复 CAgent-only). BuildStorm 的 ext4 目录扩容与 Cargo
+  子进程等待问题继续暂停排查；finals PID 1 默认脚本恢复为只执行 `run_cagent`，输出
+  `mode=cagent-only`，CAgent 完成后 `sync` 并按其状态直接退出。该版本用于尽快复提交确认
+  LA64 已通过的十项结果以及 RV64 4096-byte 信号帧载体修复，不运行 BuildStorm。
+- 2026-07-20 (RV64 finals CAgent 信号帧容量回归修复). 官方 `-m 8G -smp 8`
+  运行中，LA64 CAgent 十项全部成功并正常退出；RV64 在 Bash 安装/进入信号处理时 panic：
+  `signal frame layout (2464 bytes) exceeds SignalFrameBytes buffer (2048)`。根因是 LA64
+  LSX/LASX 支持把公共 `UserFpContext` 扩展为包含 32x256-bit 向量寄存器，RV64 私有信号帧同时
+  保存该 opaque context 和 Linux `ucontext_t`，总大小增至 2464 字节，而公共字节载体仍是旧的
+  2048 字节。现将 `SignalFrameBytes::CAPACITY` 扩为单页 4096 字节；128 KiB 内核栈可容纳，
+  且不改变两架构用户态帧布局。验证：`make oscomp-build-rv64` 与
+  `make oscomp-submit-rv64` 成功，生成的新 `target/oscomp/submit/kernel-rv` 已包含修复。
+- 2026-07-20 (BuildStorm ext4 子目录 readdir 挂载分派修复). 官方镜像 onsite 复现中，顺序
+  `mkdir/stat` 可在 `/work/tgoskits` ext4 上创建并看到四级目录，但 `find` 进入第一个子目录即报
+  `Bad file descriptor`。根因是 `sys_getdents64` 只用 descendant `RNode` 的
+  `containing_mount_weak()` 查 FsOps，而 walker 只在 mount root rnode 上携带该 weak；代码原 TODO
+  因而对所有挂载根以下目录返回 ENOSYS。现改用目录 `OpenFile` 已保存的 `opendir_dentry`，通过
+  `fs_ops_for_dentry()` 沿 parent hint 找到挂载和 FsOps。Next：重跑 BuildStorm，确认 Cargo 能创建并
+  遍历 `target/debug/.fingerprint`，再观察正式编译的下一阻塞。
+- 2026-07-20 (决赛 BuildStorm 新 mount API 安全回退). 暂停从 syscall dispatcher 暴露半成品
+  `open_tree/fsopen/fspick`，三个入口统一返回 `ENOSYS`；内部实现暂时保留，待 `fsconfig -> fsmount ->
+  move_mount` 和 mount-api FD 全生命周期闭合后再启用。此兼容策略使官方镜像的 util-linux 可以回退
+  legacy `mount(2)`，避免半成品 `MountApi` FD 进入普通 VFS `rnode()` 路径并 panic，同时不影响现有
+  legacy mount 和启动阶段已完成的 proc/sys/dev 挂载。验证：LA64 QEMU 9 + 官方 final 镜像已越过
+  三次重复 mount，`rustc 1.98.0-nightly`、`cargo 1.98.0-nightly` 正常，输出
+  `BUILDSTORM_TOOLCHAIN ok` 和 `BUILDSTORM_MINIBUILD ok`。下一阻塞已推进到 ext4 工作区：Cargo 创建
+  `/work/tgoskits/target/debug/.fingerprint/camino-*` 返回 ENOENT，预编译和正式编译均失败；同一流程在
+  tmpfs `/tmp/minibuild` 成功，初步将范围收敛到 ext4 多级目录创建/创建后路径可见性。另见
+  `cores=1`，用户态 CPU 枚举仍未反映 `-smp 8`。
+- 2026-07-20 (决赛一阶段临时 BuildStorm-only 调试版本). finals PID 1 默认入口由 CAgent-only
+  切换为只调用 `run_buildstorm`，保留 `run_cagent` 实现但当前不调用，便于隔离第二题工具链与复杂构建
+  问题。当前已知首个阻塞发生在官方脚本开头重复执行 `mount -t proc proc /proc`：Debian util-linux
+  进入未完成的新 mount API 路径并使 mount-api-backed `OpenFile` 被传给普通 `rnode()`，尚未到达
+  `rustc --version`。Next：用官方镜像复现并修复 mount API/重复挂载兼容，再逐段推进 toolchain、
+  minibuild 和 arceos-helloworld 全量构建。
+- 2026-07-20 (LA64 finals glibc LSX/LASX 上下文支持). QEMU 9 `-d int` 确认官方 LA 镜像的 glibc
+  动态加载器在 `pc=0x3e0083e7d4` 首次执行 LSX 时触发 ECODE 16（SXD）；原内核只识别到
+  FPD=15，先错误 SIGSEGV，初版处理又因通用 CSR helper 未实现 EUEN(0x02) 读写而在同一指令
+  无限重试。现补齐 SXD=16/ASXD=17、EUEN.SXE/ASXE 懒启用、每线程 32x256-bit 向量区以及
+  标量/LSX/LASX 分级汇编保存恢复，并补齐 EUEN CSR 读写。验证：`make oscomp-build-la64`、
+  `make oscomp-submit-la64` 通过；QEMU 9.2.1 + `sdcard-la-pub.img` + `-smp 8 -m 8G` 成功进入
+  `TX_FINAL_INIT start mode=cagent-only`，CAgent 十项全部 pass，测试组 END，PID 1 以 0 退出。
+- 2026-07-20 (决赛一阶段临时 CAgent-only 评分版本). 为先确认 RV64/LA64 第一题实际得分，默认 finals PID 1
+  脚本暂时只调用 `run_cagent`：打印 `TX_FINAL_INIT start mode=cagent-only`，等待官方 CAgent 十题及 END，
+  `sync` 后以 CAgent 状态退出；`run_buildstorm` 函数仍保留但当前不调用，待第二题 mount-api panic 修复后恢复。
+  该临时版本会使 BuildStorm 无输出/零分，目的是隔离验证两架构 CAgent。验证：`bash -n` 与
+  `git diff --check` 通过。Next：提交官方平台查看 RV64/LA64 CAgent 分数；LA 若仍在 `TX_FINAL_INIT start`
+  前 user-segv，则用本地 `sdcard-la-pub.img` 修首次 Bash 用户态执行。Blocker：LA64 先前仍在 Bash 入口崩溃。
+- 2026-07-20 (决赛一阶段 CAgent 结束死锁修正). 官方 `cagent_testcode.sh` 在启动常驻
+  `simple_llm_server` 和十个后台用例后执行裸 `wait`，因此清理阶段的 `kill $SERVER_PID` 不可达；原包装层
+  45 秒后执行 `killall simple_llm_server`，但 Txv2 的 `execve` 尚未刷新 `/proc/<pid>/stat` 的 `comm`，
+  BusyBox 无法按新程序名找到服务且错误被重定向，官方平台在十个结果全部输出后仍永久等待。现在 PID 1 包装层
+  用 BusyBox `sed` 生成 `/tmp/tx-cagent_testcode.sh`，在官方脚本捕获 `SERVER_PID=$!` 后插入 45 秒定时
+  `kill -9 "$SERVER_PID"`，按准确 PID 结束服务；官方原有 `wait` 随后返回并继续输出 END，再进入 BuildStorm。
+  副本生成或标记检查失败会返回 126 并输出明确诊断，不再静默死等。验证：`bash -n`、插入结果目检及
+  `git diff --check` 通过。Next：重新构建 kernel-rv，用下载后的官方 RV 镜像确认 CAgent END、
+  `TX_FINAL_INIT cagent=done` 和 BuildStorm START。Blocker：官方镜像仍在重新下载，尚未端到端复验。
+- 2026-07-20 (决赛一阶段 PID 1 自动运行两题). 默认块设备根文件系统启动不再查找官方镜像中不存在的
+  `/init`：现有 PID 1 直接 exec 镜像的 `/bin/bash`，并以 `-c` 运行内嵌的用户态
+  `crates/tx-kernel/src/init/final_testcode.sh`；脚本在镜像根布局中定位官方脚本，先跑 CAgent、再跑
+  BuildStorm，保留两者原始判分输出。CAgent 官方脚本的裸 `wait`会等待常驻 `simple_llm_server`，包装层在全部
+  用例 35 秒上限之后的 45 秒结束该服务，使官方脚本输出 END 后继续第二题。显式 `init=`、`tx.runsh=`、
+  onsite/busybox/pretest 不进入该默认路径。验证：启动脚本通过 `bash -n`，`git diff --check` 通过，RV64 和
+  LA64 release 交叉构建均成功；本地没有决赛官方 8 GiB 镜像，无法端到端确认镜像内脚本路径和 Bash/动态链接
+  运行。Next：提交官方平台确认
+  `:bootstrap-exec:final:ok`、`TX_FINAL_INIT start` 和两组官方 START/END。Blocker：缺少官方镜像。
+- 2026-07-20 (决赛一阶段 RV64 高 DTB + 8-hart 启动容量修复). 官方命令为 `-m 8G -smp 8`，OpenSBI 1.5.1
+  把 DTB 放到 `0x27fe00000`，旧引导页表只直映首个 1 GiB RAM，故 `boot_handoff` 读取 DTB header 时触发
+  load page fault；现在接管引导页表后先预置 DTB 所在的 1 GiB direct-map 叶，解析统一走具名物理→direct-map
+  地址转换，且不把这个尚不连续的叶错误发布为完整直映范围，后续 substrate 扩展会幂等接管。官方 `-smp 8`
+  还允许 0..7 任一 hart 成为 boot hart；RV64 汇编上限、per-CPU 区、kernel-resume context、trap stack 和链接器
+  启动栈由 4 扩到 8（512 KiB→1 MiB）。无 cmdline 时仍只上线 boot hart，本轮只扩容量、不改变默认单核策略。
+  验证：`cargo -q xtask unit` 通过；RV64 HAL 串行单测 84/84（新增官方高 DTB 页表槽和 hart7 回归）；debug/release
+  RV64 交叉构建通过；release 链接符号确认 1 MiB boot stack、内核仍在 32 MiB bootstrap alias 内；本地
+  `-m 8G -smp 8` 连跑覆盖 boot hart 1/2/3/4/7，全部到 `boot:ok`。Next：回到 CAgent `/init` 启动选择和官方
+  sdcard 镜像端到端验证。Blocker：本地 QEMU 1.3 把 DTB 放在 `0xbfe00000`，官方高地址布局只能靠精确页表单测
+  与下一次平台提交复验。
+- 2026-07-20 (决赛一阶段默认根挂载策略). 无 cmdline、无 initrd 的 QEMU 启动现在默认尝试把 `vda` 的 ext4
+  直接挂为 `/`，不再要求评测平台配合传入 `tx.profile=onsite`；显式 `tx.root=<设备>` 优先，`tx.root=sdcard`
+  兼容映射到 `vda`。`tx.profile=pretest`、`tx.profile=busybox` 和 initrd 启动仍保留 tmpfs 根，避免破坏旧初赛和
+  busybox 调试链路。`/tmp`、`/var/tmp` 等运行时目录改为在 ext4 根和 tmpfs 根上都初始化；现有 `/dev`、`/proc`、
+  `/sys`、`/dev/shm`、`/dev/block` 伪文件系统挂载拓扑不变。验证：根设备策略定向测试 1/1；tx-kernel 单测
+  83/83；`cargo xtask build --target rv64-qemu` 通过；全量 `cargo -q xtask unit` 在未改动的 tx-shims 测试目标
+  处有既有编译错误。Next：单独实现/验证 CAgent 用户态启动选择，并用 final-2026 生成的镜像做 QEMU 启动实测。
+  Blocker：当前尚无已生成的 CAgent 测试镜像用于端到端启动验证。
 - 2026-07-18 (merge main→final-test + 两大 post-merge 修复). main 76 提交并入:net 重构(#52,55 文件)全量取
   main;9 文本+3 语义冲突逐个核对解——rv boot_static 保 final-test 动态 MMIO 发现+补 main goldfish-rtc 静态区
   (GENERATED_MMIO_REGIONS +1→+2)、tx-hal uart_irq()+NET_IRQ 两侧都留、exec LTP 取 final-test 自洽版(main 版
@@ -17716,6 +17957,170 @@
   `identity.payload` is the highest-volume lock with rho `0.090099`,
   service p99 `97000ns`, response p99 `99000ns`, and response max
   `15209000ns`.
+- 2026-07-21 Crossbeam-style nested epoch guards: replaced the synthetic
+  no-op `borrow_current_guard()` guard with balanced per-CPU `pin_depth`.
+  Only the outermost `0 -> 1` guard publishes `local_epoch`, increments the
+  periodic 128-pinning counter, and may collect; only the final `1 -> 0` drop
+  clears `local_epoch` and decrements the active-participant summary. Existing
+  local/sealed bag and global queue reclamation remain unchanged. Updated the
+  active EBR invariant and interface/design notes accordingly. Verification:
+  `cargo fmt --check`, `cargo test -p tx-substrate --test epoch` (4 passed),
+  and `git diff --check` passed. `cargo check --workspace` reached the board
+  crates but remains blocked by pre-existing missing LoongArch
+  `LA64_CSR_EUEN`/`LA64_EUEN_*` constants. Next step: rerun the RV BuildStorm
+  workload and, if the stale-Cap panic remains, instrument its concrete Cap
+  type/key rather than changing the EBR collection cadence.
+- 2026-07-22 BuildStorm anonymous-memory reclaim fix: `MADV_DONTNEED` and the
+  current eager `MADV_FREE` path now withdraw overlapping entries from each
+  VMA's `PrivatePageSet` after PTE teardown/shootdown, releasing the retained
+  `CachePin`s instead of refaulting old anonymous/COW contents indefinitely.
+  Verification: `cargo check -p tx-subsystems --lib` passed. Next step: rebuild
+  the LA/RV submission kernels and confirm that jemalloc no longer reports a
+  non-working `MADV_DONTNEED`; file-cache watermarks remain a separate tuning
+  item for the long BuildStorm workload.
+- 2026-07-22 BuildStorm file-cache/vmalloc pressure fix: all file-backed
+  `PageContainer`s, including the ext4 containers constructed through generic
+  `new_cap`, now enter the clean-page reclaim registry. Pressure reclaim uses
+  an allocator-sized watermark capped at 512 MiB and reclaims up to 16 MiB per
+  pass instead of waiting until only 4 MiB remains. Expanded the bounded
+  vmalloc arena from 1 GiB to 4 GiB and pre-populated one guard leaf in every
+  covered 1-GiB RV64 root slot so future process roots inherit every vmalloc
+  branch; LA64 uses the same guards under its global PGDH. Verification:
+  `cargo check -p tx-substrate --lib`, `cargo check -p tx-subsystems --lib`,
+  `cargo check -p tx-ext4 --lib`, and release `cargo xtask build` for both
+  `la64-qemu` and `rv64-qemu` passed; `git diff --check` passed. The aggregate
+  `cargo -q xtask unit` gate remains blocked by five pre-existing tx-shims
+  lib-test compilation errors. Next step: rerun the cached 4-GiB BuildStorm
+  image and confirm the tg-xtask link completes without the 962880-byte kernel
+  allocation panic.
+- 2026-07-23 BuildStorm pmap-teardown bounded-memory fix: decoded the repeated
+  962880-byte allocation exactly as `20060 * size_of::<(UserPage,
+  PmapMapping)>()` (`48` bytes in the built artifact). The production chunked
+  resident store still flattened the whole `MADV_DONTNEED` teardown range into
+  one `Vec`, then grew invalidation and pin vectors with the same resident-page
+  count. `VmPmap::teardown_range` now removes mappings directly from the
+  chunked index and completes shootdown/pin release in fixed 32-page batches,
+  so reclaim no longer allocates temporary memory proportional to the address
+  space being reclaimed. Verification: `cargo check -p tx-subsystems --lib`,
+  the nine `vm::pmap::resident::tests`, and `git diff --check` passed. Next
+  step: rebuild the LA submission kernel and rerun the cached BuildStorm image.
+- 2026-07-23 BuildStorm ext4 extent/writeback fix: replaced the single-leaf
+  write path with recursive extent-node splitting and root growth through
+  depth 5, added near-goal block allocation so sequential dirty-page flushes
+  coalesce into one extent, and made data/metadata allocation transactional:
+  failed node or inode commits restore old extent blocks and return every new
+  bitmap reservation. Unwritten extents now materialize their existing
+  physical block instead of allocating a duplicate. Ordinary `write`/`writev`
+  no longer performs a full-file fsync after every syscall; `fsync` now drives
+  PageContainer dirty-page writeback, while `close` remains the persistence
+  boundary and reports writeback errors. Production writeback errors emit
+  inode/logical-block/structured-format diagnostics to the board console.
+  Verification: `cargo test -p tx-ext4-format --test pager_mock` (22 passed,
+  including forced 340-entry leaf split, depth-2 root growth, rollback fault
+  injection, contiguous allocation, and unwritten conversion),
+  `cargo test -p tx-ext4 --lib` (11 passed),
+  `cargo check -p tx-ext4 --features host-async`, release
+  `cargo xtask build --target rv64-qemu --release`, focused rustfmt checks,
+  and `git diff --check` passed. The aggregate `cargo -q xtask unit` gate still
+  stops on the pre-existing tx-shims lib-test errors for missing
+  `ITIMER_REAL`/`NETLINK_XFRM`/`CLONE_NEWNS`, two uninferred test platform
+  parameters, and missing `build_mount_api_test_root`. The RV submission
+  artifact was generated at `target/oscomp/submit/kernel-rv`; next step is to
+  rerun the cached BuildStorm image. If writeback fails, the new
+  `txkernel:ext4:writeback:error` line identifies the exact inode, logical
+  block, and structured format error.
+- 2026-07-23 BuildStorm statfs accounting and remaining ENOSPC: added the
+  backend-neutral `FilesystemStats` snapshot to `FsPageBacking`; ext4 now
+  scans every live block-group block/inode bitmap instead of trusting stale
+  superblock counters, and tmpfs reports current page-allocator capacity.
+  `statfs(path)` resolves the path's containing mount and `fstatfs(fd)` uses
+  the fd RNode's containing mount; both now return backend values rather than
+  the old fixed 1024/768-block placeholder. Verification: production crates
+  built through `cargo -q xtask unit`, all 23 tx-ext4-format tests passed, and
+  the RV release/submission artifacts were rebuilt with matching hashes.
+  Cached-image BuildStorm still failed at the final link of `tg-xtask`:
+  `/usr/bin/ld: final link failed: No space left on device`. No
+  `txkernel:ext4:writeback:error` or kernel panic preceded it. This disproves
+  the fixed statfs result as the complete direct cause. Next investigation
+  must distinguish an ld/BFD capacity decision from an actual write/close
+  errno and instrument the statfs plus final file-write/close paths before
+  changing ext4 allocation again. Serial log:
+  `target/buildstorm-rv-statfs.log`.
+- 2026-07-25 RV64 SMP ASID/pmap correctness fix: process-root activation now
+  publishes incoming residency before `satp` replacement and retains outgoing
+  residency until the hardware switch completes. Root destruction waits for
+  residency quiescence and performs an all-online-hart ASID flush before
+  releasing page-table pages or recycling the ASID, so non-resident harts
+  cannot retain translations into a reused address space. Fault publication
+  now also revalidates the page-level `PrivatePageSet` winner; a stale read
+  materialization racing a private writer retries instead of surfacing
+  `MappingMismatch` as SIGSEGV. Verification: all 87 RV64 QEMU HAL host tests,
+  the four focused VM publication tests, RV64 no-std cross-check for
+  `tx-hal-riscv64-qemu-virt` and `tx-subsystems`, formatting check, and
+  `git diff --check` passed. Next step: rebuild the RV submission kernel and
+  rerun the 8-hart BuildStorm workload; that long QEMU run was intentionally
+  not started during the focused fix.
+- 2026-07-26 finals test refresh and LA64 12-hart capacity: updated the
+  embedded finals launcher for the official fixed CAgent script by removing
+  the obsolete server-watchdog rewrite; the launcher now runs the official
+  CAgent unchanged and then BuildStorm. Raised the LA64 QEMU platform's boot,
+  trap, TLS, pmap and IPI capacity from 8 to 12 harts, changed both assembly
+  CPU-id bounds to 12, expanded the linker-owned boot-stack arena to 6 MiB
+  (12 × 512 KiB), and aligned reactor per-hart task context slots with its
+  existing 64-hart runtime capacity. Verification: shell syntax and
+  `git diff --check` passed; all 43 LA64 platform host tests and 40 reactor
+  smoke tests passed; the LA64 release kernel cross-built successfully, and
+  `readelf` confirmed a 6 MiB `.bss.stack`. Next step/blocker: obtain the
+  refreshed official images containing `ss`, then run RV with 16 GiB/8 harts
+  and LA with 36 GiB/12 harts on a host with sufficient RAM.
+- 2026-07-30 LA64 progress-safe TLB shootdown and pmap lifetime: the LA
+  BuildStorm hang after `BUILDSTORM_TOOLCHAIN ok` was decoded against the
+  submitted kernel as a synchronous shootdown cycle. One hart held
+  `VmPmap.state` while waiting for maskable board-IPIs; target harts had
+  `CRMD.IE=0` and spun for that same lock. The old global shootdown lock and
+  shared ack bit are replaced by per-hart requested/completed generations.
+  Senders service their own inbound mailbox while waiting, and contended
+  pmap/vmalloc locks run the same allocation-free, lock-free progress hook.
+  The shared hardware IPI is cleared before mailbox drain and reasserted from
+  remaining software pending bits, closing the trailing-clear lost-request
+  race. ASID/PGDL switching now uses a per-hart odd/even lifetime sequence
+  around incoming publication, CSR writes, full INVTLB, active publication,
+  and outgoing removal; teardown consumes stable snapshots rather than
+  repairing remote residency by inference. Synchronous targets are pinned
+  across request/completion, and AP shutdown withdraws acceptance then drains
+  existing senders before permanent interrupt masking. Shared kernel PGDH
+  bootstrap uses a retryable `UNINIT/BUILDING/READY` once protocol. Ordinary LA
+  unmap no longer frees empty L0/L1/L2 nodes before shootdown; user nodes live
+  until root destruction and bounded kernel nodes remain resident. The
+  committed-node registry now uses an 8192-entry open-addressed hash table
+  instead of a 4096-entry linear scan. Verification: LA HAL 52/52, RV HAL
+  87/87, tx-kernel/LA HAL checks, RV64+LA64 release builds, and an
+  8-hart/4-GiB local-QEMU-9.2.1 boot passed CPU-online, shootdown, IPI, AP
+  reactor/runqueue, zone, runtime, device, mount, and userspace-submit
+  sentinels. `cargo xtask unit` still reports this branch's pre-existing
+  tx-shims test-scaffold symbol/type failures and `run_thread` future-size
+  budget (2112/2048); unrelated ext4 and tx-scripts suites pass. The docs lint
+  still reports 20 pre-existing broken-link/anchor findings outside the files
+  changed by this decision.
+  Decision:
+  `docs/progress/decisions/2026-07-30-la64-progress-safe-tlb-shootdown.md`.
+  Next: rerun the official writable LA image for end-to-end CAgent and
+  BuildStorm validation. The system QEMU 8.2.2 binary is not a valid substitute
+  for this board test; the project's local QEMU 9.2.1 reaches the sentinels
+  above with the same kernel.
+- 2026-07-30 LA64 SMP idle lost-wakeup fix: the RV64 board already implemented
+  the reactor's two-phase interrupt wait contract, but LA64 inherited empty
+  prepare/cancel hooks and enabled interrupts immediately before `idle`.
+  An interrupt could therefore be handled after the final runnable check but
+  before `idle`, leaving the hart asleep with no pending wakeup. LA64 now masks
+  interrupts during the final check and uses a Linux-style assembly idle
+  rollback region: an interrupt taken in that region redirects ERA to the
+  instruction after `idle`. The existing periodic timer fallback remains
+  enabled because an A/B run with one-shot TCFG stalled before the CAgent
+  server started. Verification: all 45 LA64 HAL tests passed, release and
+  submission kernels rebuilt, and an LA64 8-hart/4-GiB writable-image run
+  completed CAgent 10/10 before entering BuildStorm. Runtime log:
+  `target/cagent-la-idle-final-rerun.log`.
 - Real K210 boot, linker, and hardware path are not implemented yet.
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.

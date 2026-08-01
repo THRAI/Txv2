@@ -18,6 +18,20 @@ policy-based zone substrate. Upper subsystems name role-shaped types
 identity slots, projection rows); they do not pass `Zone<T, EbrPolicy>` through
 operation code.
 
+**Executable implementation update (2026-07-21):** the `RetiredNode` /
+per-CPU linked-list pseudocode retained later in this historical detailed
+walkthrough is superseded by the active contract in
+`docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md`. The implementation now
+follows Crossbeam's collection shape: 64 callbacks per CPU-local bag, a SeqCst
+fence before sealing with the global epoch, a growable FIFO of page-backed
+sealed bags, collection every 128 pinnings, at most eight bags per periodic
+pass, and the same two-epoch safety margin. Empty bag caching is bounded; there
+is no fixed 1024-node retirement ceiling. Guard entry also follows Crossbeam's
+balanced nesting rule: a per-CPU depth counter publishes the epoch and advances
+the periodic pin counter only on `0 -> 1`, and clears the epoch only on
+`1 -> 0`. The older list snippets below explain the safety argument but are not
+the current storage algorithm.
+
 ---
 
 ## 0. Background: Why EBR Is Needed
@@ -61,6 +75,7 @@ EpochDomain
 `- cpu_states: CpuLocal<CpuLocalEpochState>
    |
    |- local_epoch: AtomicU64        <- current CPU epoch (0 = not in any epoch)
+   |- pin_depth: AtomicUsize        <- balanced same-CPU Guard nesting depth
    `- retired: RetiredList          <- this CPU's pending-reclamation list
       |- head: *mut RetiredNode
       `- count: usize
@@ -124,6 +139,10 @@ pub(crate) struct CpuLocalEpochState {
     /// reads this field from other CPUs (read-only, not written remotely).
     pub(crate) local_epoch: AtomicU64,
 
+    /// Number of guards currently nested on this CPU. The local epoch is
+    /// published only for 0 -> 1 and cleared only for 1 -> 0.
+    pub(crate) pin_depth: AtomicUsize,
+
     /// This CPU's pending-reclamation list.
     /// Only this CPU writes the list, so no lock is required.
     pub(crate) retired: RetiredList,
@@ -133,6 +152,7 @@ impl CpuLocalEpochState {
     pub(crate) const fn new() -> Self {
         Self {
             local_epoch: AtomicU64::new(0),
+            pin_depth: AtomicUsize::new(0),
             retired: RetiredList::new(),
         }
     }
@@ -240,11 +260,12 @@ retired sidecar:
 ///
 /// - !Send: cannot be sent across threads (the guard is tied to a specific CPU)
 /// - !Sync: shared references are not allowed
-/// - Cannot be nested (a CPU may hold only one Guard at a time;
-///   nesting would overwrite local_epoch)
+/// - May be nested on the same CPU; nested guards share the outermost epoch
+///   publication and are balanced by the per-CPU pin depth
 pub struct Guard {
     /// Pointer to this CPU's CpuLocalEpochState at epoch entry.
-    /// drop uses it to clear local_epoch.
+    /// drop uses it to decrement pin_depth and, on the final drop, clear
+    /// local_epoch.
     cpu_state: *mut CpuLocalEpochState,
 
     /// CPU pinned at entry, preventing migration while the guard is alive.
@@ -292,24 +313,18 @@ impl EpochDomain {
         // Step 2: get this CPU's local state.
         let cpu_state = self.cpu_states.get_mut_for(cpu_id);
 
-        // Debug check: nested guard is not allowed.
-        debug_assert_eq!(
-            cpu_state.local_epoch.load(Ordering::Relaxed), 0,
-            "Guard cannot be nested"
-        );
+        // Step 3: increase the balanced nesting depth.
+        let previous_depth = cpu_state.pin_depth.fetch_add(1, Ordering::Relaxed);
 
-        // Step 3: read the global epoch with Acquire ordering.
-        // This ensures subsequent reads on this CPU can observe all writes
-        // completed before this epoch.
-        let current_epoch = self.global_epoch.value.load(Ordering::Acquire);
-
-        // Step 4: publish this CPU's local_epoch as the current epoch using SeqCst.
-        // SeqCst is required; see the memory-ordering note below.
-        cpu_state.local_epoch.store(current_epoch, Ordering::SeqCst);
-
-        // Step 5: add a SeqCst fence to ensure subsequent reads of protected
-        // objects definitely happen after local_epoch is written.
-        fence(Ordering::SeqCst);
+        // Step 4: only the outermost 0 -> 1 transition publishes an epoch.
+        // Nested guards reuse this already-published epoch and do not advance
+        // the periodic 128-pinning counter.
+        if previous_depth == 0 {
+            let current_epoch = self.global_epoch.value.load(Ordering::Acquire);
+            cpu_state.local_epoch.store(current_epoch, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
+            cpu_state.note_outermost_pin_and_maybe_collect();
+        }
 
         Guard {
             cpu_state: cpu_state as *mut _,
@@ -350,14 +365,19 @@ SeqCst gives the write `local_epoch = 5` on CPU0 and the read of `local_epoch` o
 impl Drop for Guard {
     fn drop(&mut self) {
         unsafe {
-            // Write 0 to indicate "this CPU is not in any epoch".
-            // Release ordering ensures all reads of protected objects while
-            // the guard was alive complete before local_epoch is cleared.
-            // Therefore, when try_advance_epoch() reads local_epoch = 0,
-            // it can conclude this CPU no longer holds any raw pointers.
-            (*self.cpu_state)
-                .local_epoch
-                .store(0, Ordering::Release);
+            let previous_depth = (*self.cpu_state)
+                .pin_depth
+                .fetch_sub(1, Ordering::Relaxed);
+            assert!(previous_depth > 0, "epoch guard depth underflow");
+
+            // Only the final 1 -> 0 transition advertises quiescence. Release
+            // ordering ensures all protected reads from every nested guard
+            // complete before a collector can observe local_epoch = 0.
+            if previous_depth == 1 {
+                (*self.cpu_state)
+                    .local_epoch
+                    .store(0, Ordering::Release);
+            }
         }
         // _cpu_pin is dropped automatically here.
     }
@@ -781,7 +801,8 @@ let cap: Cap<DEntry> = ident.to_cap()?;
 
 /// Enter an epoch and return Guard.
 /// While the guard is alive, retired slab pages are guaranteed not to be freed.
-/// Nested calls are not allowed.
+/// Balanced same-CPU nesting is allowed. Nested guards reuse the epoch
+/// published by the outermost guard.
 pub fn guard() -> Guard { GLOBAL_DOMAIN.guard() }
 
 /// Submit a slot to this CPU's pending-reclamation list.
@@ -817,10 +838,10 @@ tx-kernel/substrate/epoch/
 |
 |- guard.rs
 |    struct Guard { cpu_state, _cpu_pin, _not_send }
-|    impl Drop for Guard (clears local_epoch)
+|    impl Drop for Guard (decrements pin_depth; final drop clears local_epoch)
 |
 |- local.rs
-|    struct CpuLocalEpochState { local_epoch: AtomicU64, retired: RetiredList }
+|    struct CpuLocalEpochState { local_epoch, pin_depth, local retired bag }
 |    impl CpuLocalEpochState { new() }
 |
 `- retired.rs
@@ -841,7 +862,7 @@ tx-kernel/substrate/epoch/
 | EBR-3 | Old `Weak<T>` cannot upgrade successfully after reclamation | generation++ before Free; `Weak::observe` checks generation |
 | EBR-4 | `try_drain` has bounded work | `DRAIN_BATCH` caps processed nodes |
 | EBR-5 | `retire()` cannot deadlock on semantic locks | retired lists are substrate-owned and do not call semantic code |
-| EBR-6 | `Guard` cannot be nested | debug check on `local_epoch == 0` |
+| EBR-6 | `Guard` nesting is balanced on one CPU; only the outermost guard publishes and only the final drop clears the epoch | per-CPU `pin_depth` and CPU pinning |
 | EBR-7 | `Guard` cannot be sent across threads | `PhantomData<*mut ()>` / CPU pinning |
 | EBR-8 | IRQ handlers do not create `Guard`s | IRQ handlers must not block epoch advancement |
 | EBR-9 | Split-lifetime retention is carried by `Cap<Identity>` and payload evidence, not `Weak<T>` | binding obligation derivation: addressability -> `Cap<T>`, resolution-only -> `Weak<T>` |
