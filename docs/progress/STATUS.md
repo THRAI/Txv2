@@ -1,3 +1,16 @@
+- 2026-08-02 (ext4 Tier 1 live matrix now targets SCRATCH image).
+  Corrected the public Tier 1 runner's guest matrix target without promoting
+  Task 16. `run_live_tier1` still stages TEST/SCRATCH/WORKLOAD images, but the
+  actual `tools/shell-tests/ext4-tier1.scn` QEMU run now attaches
+  `scratch.img` through `--extra-rv64-ext4` instead of accidentally running the
+  operation matrix against `workload.img`. A focused xtask test locks the shell
+  args so they include the SCRATCH path and exclude `test.img`/`workload.img`.
+  Verification passed `cargo test -p xtask ext4 -- --test-threads=1` (21).
+  Task 16 remains open: current kernel boot mounts one `vda` at `/musl`, so the
+  full TEST/SCRATCH/WORKLOAD role-consumption runner, deterministic
+  crash/replay, e2fsck on immutable outputs, pinned xfstests, and G0-G7 receipt
+  evidence still need live wiring.
+
 - 2026-08-02 (ext4 G0 direct-home-write allowlist retired).
   Retired the remaining Task 14 transitional direct-home-write allowlist entries
   for `crates/tx-ext4/src/namespace.rs` and `crates/tx-ext4/src/pager.rs`.

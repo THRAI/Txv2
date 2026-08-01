@@ -5,8 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::{
     CrashCutCatalog, Tier1Authorities, XfstestsSourceLock, parse_tier1_args,
     parse_xfstests_summary, run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file,
-    verify_xfstests_source_lock,
+    tier1_shell_test_args, verify_xfstests_source_lock,
 };
+use crate::target::TxTarget;
 
 #[test]
 fn run_workspace_finalizes_once_and_cleans_temporary_state() {
@@ -114,6 +115,22 @@ fn tier1_live_rejects_placeholder_authorities_before_acceptance_receipt() {
         .expect_err("live runner must not promote placeholder authorities");
     assert!(error.contains("xfstests selection status is `selection-authority-declared`"));
     assert!(error.contains("crash-cut catalog status is `catalog-authority-declared`"));
+}
+
+#[test]
+fn tier1_shell_matrix_runs_against_scratch_image() {
+    let root = temp_root("scratch-matrix");
+    let scenario = root.join("tools/shell-tests/ext4-tier1.scn");
+    let scratch = root.join("target/ext4/tier1/run/scratch.img");
+    let args = tier1_shell_test_args(TxTarget::Rv64Qemu, &scenario, &scratch);
+    let rendered = args.join(" ");
+
+    assert!(rendered.contains("--target rv64-qemu"));
+    assert!(rendered.contains("--profile busybox"));
+    assert!(rendered.contains("--extra-rv64-ext4"));
+    assert!(rendered.contains(&scratch.display().to_string()));
+    assert!(!rendered.contains("workload.img"));
+    assert!(!rendered.contains("test.img"));
 }
 
 #[test]

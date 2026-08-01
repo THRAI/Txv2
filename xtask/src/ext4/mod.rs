@@ -99,20 +99,10 @@ fn run_live_tier1(
     let scratch_image = run.stage_copy("scratch-image", &base_image, "scratch.img")?;
     let workload_image = run.stage_copy("workload-image", &base_image, "workload.img")?;
 
+    let scenario = root.join("tools/shell-tests/ext4-tier1.scn");
     shell_test::shell_test(
         root,
-        vec![
-            "--target".into(),
-            base_target.name().to_string(),
-            "--profile".into(),
-            "busybox".into(),
-            "--script".into(),
-            root.join("tools/shell-tests/ext4-tier1.scn")
-                .display()
-                .to_string(),
-            "--extra-rv64-ext4".into(),
-            workload_image.display().to_string(),
-        ],
+        tier1_shell_test_args(base_target, &scenario, &scratch_image),
     )?;
 
     let mut e2fsck_results = Vec::new();
@@ -178,6 +168,19 @@ fn run_live_tier1(
     let receipt_path = run.finalize_with_receipt(receipt)?;
     println!("ext4 tier1: wrote {}", receipt_path.display());
     Ok(())
+}
+
+fn tier1_shell_test_args(target: TxTarget, scenario: &Path, scratch_image: &Path) -> Vec<String> {
+    vec![
+        "--target".into(),
+        target.name().to_string(),
+        "--profile".into(),
+        "busybox".into(),
+        "--script".into(),
+        scenario.display().to_string(),
+        "--extra-rv64-ext4".into(),
+        scratch_image.display().to_string(),
+    ]
 }
 
 fn run_crash_cut_campaign(
