@@ -107,6 +107,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let list_groups = args.iter().any(|a| a == "--list-groups");
     let keep_going = args.iter().any(|a| a == "--keep-going");
     let parallel = args.iter().any(|a| a == "--parallel");
+    let stop_after_needle = optional_option_value(&args, "--stop-after-needle");
     let extra_rv64_ext4: Vec<PathBuf> = option_values(&args, "--extra-rv64-ext4")?
         .into_iter()
         .map(|path| resolve_path(root, PathBuf::from(path)))
@@ -152,6 +153,10 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    if stop_after_needle.is_some() && parallel {
+        return Err("--stop-after-needle is only supported in sequential mode".into());
     }
 
     // Validate that every name passed to --group exists in the script.
@@ -324,6 +329,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let mut anchor = 0usize;
     let mut group_results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
     let mut quit_seen = false;
+    let mut stop_triggered = false;
 
     let outer = (|| -> Result<()> {
         // Setup always runs. A failure here is fatal regardless of
@@ -335,8 +341,13 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             &script.setup,
             &mut anchor,
             true,
+            stop_after_needle.as_deref(),
+            &mut stop_triggered,
         )? {
             return Err(format!("setup: {err}"));
+        }
+        if stop_triggered {
+            return Ok(());
         }
         if directives_quit(&script.setup) {
             quit_seen = true;
@@ -353,7 +364,12 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 &group.directives,
                 &mut anchor,
                 true,
+                stop_after_needle.as_deref(),
+                &mut stop_triggered,
             )?;
+            if stop_triggered {
+                quit_seen = true;
+            }
             match outcome {
                 None => group_results.push((group.name.clone(), Ok(()))),
                 Some(err) => {
@@ -365,6 +381,9 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             }
             if directives_quit(&group.directives) {
                 quit_seen = true;
+            }
+            if stop_triggered {
+                break;
             }
         }
         Ok(())
@@ -385,6 +404,14 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
 
     match outer {
         Ok(()) => {
+            if stop_triggered {
+                println!(
+                    "shell-test: stop needle observed: {}",
+                    stop_after_needle.as_deref().unwrap_or_default()
+                );
+                println!("shell-test: ok");
+                return Ok(());
+            }
             let failed: Vec<&(String, std::result::Result<(), String>)> =
                 group_results.iter().filter(|(_, r)| r.is_err()).collect();
             if !group_results.is_empty() {
@@ -436,6 +463,8 @@ fn run_block(
     directives: &[Directive],
     script_anchor: &mut usize,
     verbose: bool,
+    stop_after_needle: Option<&str>,
+    stop_triggered: &mut bool,
 ) -> Result<Option<String>> {
     if directives.is_empty() {
         return Ok(None);
@@ -491,6 +520,17 @@ fn run_block(
                 }
                 let _ = child.kill();
                 let _ = child.wait();
+                return Ok(None);
+            }
+        }
+        if let Some(needle) = stop_after_needle {
+            if buffer.lock().unwrap().contains(needle) {
+                if let Some(stdin) = child.stdin.take() {
+                    drop(stdin);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                *stop_triggered = true;
                 return Ok(None);
             }
         }
@@ -877,9 +917,19 @@ fn run_group_isolated_inner(
     let h_err = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), false);
 
     let mut anchor = 0usize;
+    let mut stop_triggered = false;
 
     let result = (|| -> Option<String> {
-        match run_block(&mut child, &buffer, "setup", run.setup, &mut anchor, false) {
+        match run_block(
+            &mut child,
+            &buffer,
+            "setup",
+            run.setup,
+            &mut anchor,
+            false,
+            None,
+            &mut stop_triggered,
+        ) {
             Err(e) => return Some(format!("setup (harness): {e}")),
             Ok(Some(e)) => return Some(format!("setup: {e}")),
             Ok(None) => {}
@@ -891,6 +941,8 @@ fn run_group_isolated_inner(
             &run.group.directives,
             &mut anchor,
             false,
+            None,
+            &mut stop_triggered,
         ) {
             Err(e) => Some(format!("group harness: {e}")),
             Ok(v) => v,
