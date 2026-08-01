@@ -23,11 +23,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
-    self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3,
+    self as epoch, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3, page_allocator,
 };
 use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
 use tx_ext4_format::ondisk::{BitmapMut, Extent, GroupDesc, Inode, Superblock};
-use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Page4K};
+use tx_substrate::step::PageProgress;
 use tx_subsystems::fs_iface::{
     BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
     PageFrameRef,
@@ -41,13 +42,13 @@ use tx_subsystems::mount::{
     SourceLabel,
 };
 use tx_subsystems::page_backed::{
-    step_write, Frame, FsPageBacking, PageContainer, PageContainerKind, PageIndex,
-};
-use tx_subsystems::vfs::structure::{
-    DEntry, DirCursor, FsObjectId, InodeKind, InodeMeta, InlineName, OpenFile, OpenFileFlags,
-    RNode, RNodeBacking,
+    Frame, FsPageBacking, PageContainer, PageContainerKind, PageIndex, step_write,
 };
 use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::structure::{
+    DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
+    RNode, RNodeBacking,
+};
 
 use crate::planner::{Ext4BlockGeometry, Ext4FsyncPlanSource, Ext4PlannerBinding};
 use crate::read_backend::{Ext4FsInstance, Ext4PagerMutationPlanSource};
@@ -1275,6 +1276,41 @@ fn ext4_buffered_extending_write_reserves_before_dirty_and_flushes_without_home_
 }
 
 #[test]
+fn ext4_close_visibility_flush_clears_buffered_write_reservation_for_next_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_write_growth_fs(25);
+    let pc = page_container_for_mounted_file(&mounted, FsObjectId::new(12), BLOCK_SIZE as u64, 8);
+    let of = open_file_for_page_container(&pc);
+
+    of.set_offset(4 * BLOCK_SIZE as u64);
+    assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
+
+    of.set_offset(5 * BLOCK_SIZE as u64);
+    assert_eq!(
+        step_write(&pc, &of, 32, &guard),
+        V3::err(V3Errno::EBUSY),
+        "a second extending buffered write reproduces the stale reservation blocker"
+    );
+
+    assert_eq!(
+        pc.flush_dirty_pages_for_close_visibility(&guard),
+        V3::<(), PageProgress>::done(())
+    );
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 0);
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(25)
+    );
+
+    assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
+}
+
+#[test]
 fn ext4_metadata_mutation_settles_prior_ordered_data_transaction_before_admission() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
@@ -1400,8 +1436,7 @@ fn ext4_chmod_public_path_admits_new_file_after_buffered_write_settlement() {
     let cred = tx_subsystems::vfs::Credential::root();
     let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(33);
     let fs_ops = mounted.fs_ops();
-    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"tier1-data", 0o755, &cred, &guard)
-    {
+    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"tier1-data", 0o755, &cred, &guard) {
         V3::Done(created) => created,
         other => panic!("mkdir tier1-data for chmod-after-write: {other:?}"),
     };
@@ -1443,8 +1478,7 @@ fn ext4_chmod_public_path_admits_new_file_with_dirty_buffered_write() {
     let cred = tx_subsystems::vfs::Credential::root();
     let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(36);
     let fs_ops = mounted.fs_ops();
-    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"dirty-data", 0o755, &cred, &guard)
-    {
+    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"dirty-data", 0o755, &cred, &guard) {
         V3::Done(created) => created,
         other => panic!("mkdir dirty-data for chmod-dirty: {other:?}"),
     };
@@ -1475,10 +1509,8 @@ fn ext4_chmod_vfs_path_admits_new_file_with_dirty_buffered_write() {
     let cred = tx_subsystems::vfs::Credential::root();
     let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(39);
     let fs_ops = mounted.fs_ops();
-    let (root_dentry, _root_mount, mount_payload) =
-        ext4_root_dentry_for_mounted(&mounted, 39, 39);
-    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"dirty-data", 0o755, &cred, &guard)
-    {
+    let (root_dentry, _root_mount, mount_payload) = ext4_root_dentry_for_mounted(&mounted, 39, 39);
+    let (dir_id, _) = match fs_ops.mkdir(FsObjectId::new(2), b"dirty-data", 0o755, &cred, &guard) {
         V3::Done(created) => created,
         other => panic!("mkdir dirty-data for vfs chmod-dirty: {other:?}"),
     };

@@ -461,7 +461,7 @@
     "Host contract tests and reused serial logs can be mistaken for product evidence without fresh QEMU, immutable image, e2fsck, and xfstests receipts."
   ],
   "blockers": [
-    "2026-08-02 fresh QEMU data and standalone execute-from-scratch groups pass independently, but `--group data,execute-from-scratch` still fails with `sh: /musl/tier1-exec.sh: not found` and `tier1-exec-status:127`; root-cause the post-data shebang reopen/live-view gap before promoting the full Tier 1 scenario.",
+    "2026-08-02 close/dup3 visibility flush unblocked the previous `--group data,execute-from-scratch` QEMU failure, and a fresh wider QEMU run with `--group data,setattr,namespace,orphan,execute-from-scratch` passed 5 groups with 0 failures; do not promote Tier 1 until the remaining production cutover, FUA/recovery, live runner, crash-cut, e2fsck, xfstests, and immutable receipt gates close.",
     "Current production namespace and pager paths still contain direct home writes and are not yet behind one MutationHandle.",
     "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
     "The public cargo xtask ext4 tier1 command and its immutable acceptance receipt do not yet exist."

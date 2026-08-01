@@ -207,6 +207,39 @@ impl PageContainer {
     fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn) {
         self.state.lock().pages.clear_dirty_if_match(page, ppn);
     }
+
+    /// Flush dirty file-cache pages for close-time visibility without taking
+    /// an fsync durability frontier.
+    pub fn flush_dirty_pages_for_close_visibility(
+        &self,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), PageProgress> {
+        match flush_dirty_pages_to_file_backing(self, guard) {
+            StepOutcome::Done(pages) => {
+                if pages > 0 {
+                    self.sync_file_size_for_close_visibility(guard);
+                }
+                StepOutcome::done(())
+            }
+            StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+            StepOutcome::Yield { progress, shape } => StepOutcome::Yield { progress, shape },
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        }
+    }
+
+    fn sync_file_size_for_close_visibility(&self, guard: &Guard<'_>) {
+        let PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } = self.kind()
+        else {
+            return;
+        };
+        let _ = mount
+            .payload()
+            .fs_page_backing
+            .truncate(*fs_object_id, self.size_bytes(), guard);
+    }
 }
 
 /// Zero the bytes in the cached page containing the new EOF, from the
@@ -259,47 +292,12 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         return V3::done(());
     };
 
-    let mut pages_so_far: u32 = 0;
-    for (page, ppn) in pc.dirty_pages_snapshot() {
-        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
-            return V3::err(Errno::EINVAL.into());
-        };
-        match mount.payload().fs_page_backing.flush_page(
-            *fs_object_id,
-            offset,
-            &Frame::new(ppn),
-            guard,
-        ) {
-            V3::Done(()) => {
-                pc.clear_dirty_if_match(page, ppn);
-                pages_so_far = pages_so_far.saturating_add(1);
-            }
-            V3::Continue { progress: _ } => {
-                let progress = if pages_so_far == 0 {
-                    PageProgress::EMPTY
-                } else {
-                    PageProgress::new(pages_so_far)
-                };
-                return V3::continue_with(progress);
-            }
-            V3::Yield { progress: _, shape } => {
-                let Some((carrier, interests)) =
-                    crate::page_backed::notification::wait_source_parts(&shape)
-                else {
-                    return V3::err(step_engine::Errno::EIO);
-                };
-                let progress = if pages_so_far == 0 {
-                    PageProgress::EMPTY
-                } else {
-                    PageProgress::new(pages_so_far)
-                };
-                return crate::page_backed::notification::yield_on_wait_source(
-                    progress, carrier, interests,
-                );
-            }
-            V3::Err(v3_errno) => return V3::err(v3_errno),
-        }
-    }
+    let pages_so_far = match flush_dirty_pages_to_file_backing(pc, guard) {
+        StepOutcome::Done(pages) => pages,
+        StepOutcome::Continue { progress } => return StepOutcome::Continue { progress },
+        StepOutcome::Yield { progress, shape } => return StepOutcome::Yield { progress, shape },
+        StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+    };
 
     // Persist the logical size once data blocks are written back:
     // `flush_page` writes data only, so without this a fresh reopen
@@ -358,6 +356,65 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
         V3::Err(v3_errno) => V3::err(v3_errno),
     }
+}
+
+fn flush_dirty_pages_to_file_backing(
+    pc: &PageContainer,
+    guard: &Guard<'_>,
+) -> StepOutcome<u32, PageProgress> {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
+    let PageContainerKind::File {
+        mount,
+        fs_object_id,
+    } = pc.kind()
+    else {
+        return V3::done(0);
+    };
+
+    let mut pages_so_far: u32 = 0;
+    for (page, ppn) in pc.dirty_pages_snapshot() {
+        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+            return V3::err(Errno::EINVAL.into());
+        };
+        match mount.payload().fs_page_backing.flush_page(
+            *fs_object_id,
+            offset,
+            &Frame::new(ppn),
+            guard,
+        ) {
+            V3::Done(()) => {
+                pc.clear_dirty_if_match(page, ppn);
+                pages_so_far = pages_so_far.saturating_add(1);
+            }
+            V3::Continue { progress: _ } => {
+                let progress = if pages_so_far == 0 {
+                    PageProgress::EMPTY
+                } else {
+                    PageProgress::new(pages_so_far)
+                };
+                return V3::continue_with(progress);
+            }
+            V3::Yield { progress: _, shape } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    return V3::err(step_engine::Errno::EIO);
+                };
+                let progress = if pages_so_far == 0 {
+                    PageProgress::EMPTY
+                } else {
+                    PageProgress::new(pages_so_far)
+                };
+                return crate::page_backed::notification::yield_on_wait_source(
+                    progress, carrier, interests,
+                );
+            }
+            V3::Err(v3_errno) => return V3::err(v3_errno),
+        }
+    }
+
+    V3::done(pages_so_far)
 }
 
 /// `step_truncate` — v3 outcome shape over `PageProgress`.
@@ -636,8 +693,8 @@ mod v3_tests {
     use crate::execution::{Errno as V4Errno, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::page_backed::{
-        allocate_cached_frame, AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind,
-        PageIndex,
+        AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
+        allocate_cached_frame,
     };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};

@@ -631,13 +631,20 @@ fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
     }
 }
 
-fn queue_file_close_writeback(_file: &Cap<OpenFile>) {
-    // close(2) is not a durability fence.  The PageBacked background
-    // writeback admission path can leave an ext4 ordered-data mutation active
-    // after close returns, which makes an immediately-following metadata
-    // mutation (for example chmod after shell redirection) fail with EBUSY.
-    // Keep close as fd-table teardown only until fsync/sync/umount own the
-    // waitable transaction frontier for this path.
+fn queue_file_close_writeback(file: &Cap<OpenFile>) {
+    if !file.flags().write {
+        return;
+    }
+    let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) else {
+        return;
+    };
+
+    // close(2) is not a durability fence: fsync/sync/umount still own the
+    // waitable transaction frontier and durable error reporting. This is only
+    // a same-kernel visibility flush so an immediately-following open/chmod or
+    // exec does not trip over a stale buffered-write reservation.
+    let guard = step_engine::guard();
+    let _ = pc.flush_dirty_pages_for_close_visibility(&guard);
 }
 
 fn maybe_destroy_zero_link_inode_after_fd_remove(file: &Cap<OpenFile>) {
@@ -1591,8 +1598,14 @@ pub(super) fn sys_dup3<'a>(
         newfd,
         flags,
     };
+    let replaced = ctx.process.fd(newfd);
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(fd) => SyscallResult::Return(fd as i64),
+        Ok(fd) => {
+            if let Some(file) = replaced {
+                queue_file_close_writeback(&file);
+            }
+            SyscallResult::Return(fd as i64)
+        }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
