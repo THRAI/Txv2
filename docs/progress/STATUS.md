@@ -1,3 +1,22 @@
+- 2026-08-02 (ext4 Tier 1 xfstests source-lock verification).
+  Advanced Task 15 without promoting Task 16. The Tier 1 runner now parses the
+  `source_lock` in `tools/ext4/tier1/xfstests-selection.json`, rejects a
+  missing lock even for dry-run authority resolution, prints the pinned
+  xfstests path/revision/`check` sha256 in `cargo xtask ext4 tier1 --dry-run`,
+  and verifies the actual xfstests checkout revision plus `check` sha256 before
+  running the selected cases. The fallback clone path now checks out the
+  manifest-pinned revision instead of a hard-coded constant, then verifies the
+  same lock. Focused verification passed `rustfmt --edition 2024 --check
+  xtask/src/ext4/mod.rs xtask/src/ext4/tests.rs`, `cargo test -p xtask ext4 --
+  --test-threads=1` (12), `cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed placeholder preflight
+  `cargo xtask ext4 tier1 --run-id 2026-08-02-source-lock-preflight`. The final
+  host gate `cargo -q xtask unit` passed (`tx-shims` 652, `tx-kernel` 114,
+  `tx-ext4` 64, `tx-scripts` 167). This is still not a pinned xfstests
+  acceptance run: the manifest status remains
+  `selection-authority-declared`, the crash-cut catalog remains
+  `catalog-authority-declared`, and no immutable G0-G7 receipt exists.
+
 - 2026-08-02 (ext4 Task 14/15 G0 lint and Tier 1 live preflight corrected).
   Replaced the over-broad ext4 G0 scanner with a scoped `Finding`-based
   ratchet: lifecycle cleanup is only allowed in PageBacked, ext4 mutation, or

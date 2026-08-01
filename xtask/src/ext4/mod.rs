@@ -210,6 +210,12 @@ impl Tier1Invocation {
             self.authorities.selection.sha256()
         );
         println!(
+            "ext4 tier1: xfstests source {} revision {} check-sha256 {}",
+            self.authorities.selection.source_lock.path.display(),
+            self.authorities.selection.source_lock.revision,
+            self.authorities.selection.source_lock.check_sha256
+        );
+        println!(
             "ext4 tier1: crash-cuts {} sha256 {}",
             self.authorities.crash_cuts.file.path.display(),
             self.authorities.crash_cuts.sha256()
@@ -351,8 +357,16 @@ impl AuthorityFile {
 struct XfstestsSelection {
     file: AuthorityFile,
     status: String,
+    source_lock: XfstestsSourceLock,
     case_count: usize,
     cases: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct XfstestsSourceLock {
+    path: PathBuf,
+    revision: String,
+    check_sha256: String,
 }
 
 impl XfstestsSelection {
@@ -386,6 +400,7 @@ impl XfstestsSelection {
             .and_then(|value| value.as_str())
             .unwrap_or("unspecified")
             .to_string();
+        let source_lock = XfstestsSourceLock::load(&value, &path)?;
         let cases = value
             .get("selected")
             .and_then(|value| value.as_array())
@@ -396,6 +411,7 @@ impl XfstestsSelection {
         Ok(Self {
             file: AuthorityFile::load(path)?,
             status,
+            source_lock,
             case_count: cases.len(),
             cases: cases
                 .iter()
@@ -425,6 +441,59 @@ impl XfstestsSelection {
                 self.status
             ))
         }
+    }
+}
+
+impl XfstestsSourceLock {
+    fn load(value: &serde_json::Value, path: &Path) -> Result<Self> {
+        let source_lock = value
+            .get("source_lock")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| format!("{}: missing source_lock", path.display()))?;
+        let source_path = source_lock
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("{}: missing source_lock.path", path.display()))?;
+        let source_path = PathBuf::from(source_path);
+        if source_path.is_absolute()
+            || source_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "{}: source_lock.path must be repository-relative without `..`",
+                path.display()
+            ));
+        }
+        let revision = source_lock
+            .get("revision")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("{}: missing source_lock.revision", path.display()))?;
+        if revision.len() != 40 || !revision.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{}: source_lock.revision must be a 40-byte hex commit",
+                path.display()
+            ));
+        }
+        let check_sha256 = source_lock
+            .get("check_sha256")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("{}: missing source_lock.check_sha256", path.display()))?;
+        if check_sha256.len() != 64 || !check_sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{}: source_lock.check_sha256 must be a 64-byte hex digest",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            path: source_path,
+            revision: revision.to_ascii_lowercase(),
+            check_sha256: check_sha256.to_ascii_lowercase(),
+        })
+    }
+
+    fn root_path(&self, root: &Path) -> PathBuf {
+        root.join(&self.path)
     }
 }
 
@@ -565,22 +634,27 @@ fn git_head(root: &Path) -> Result<String> {
     Ok(output.trim().to_string())
 }
 
-fn ensure_xfstests_root(root: &Path, run: &run_workspace::RunWorkspace) -> Result<PathBuf> {
+fn ensure_xfstests_root(
+    root: &Path,
+    run: &run_workspace::RunWorkspace,
+    source_lock: &XfstestsSourceLock,
+) -> Result<PathBuf> {
     if !command_exists("git") {
         return Err("git is required to materialize the pinned xfstests source".into());
     }
-    let preferred = root.join("external/xfstests");
+    let preferred = source_lock.root_path(root);
     if preferred.join("check").is_file() {
+        verify_xfstests_source_lock(&preferred, source_lock)?;
         return Ok(preferred);
     }
 
     let clone_dir = run.working_dir().join("xfstests-source");
     if clone_dir.join("check").is_file() {
+        verify_xfstests_source_lock(&clone_dir, source_lock)?;
         return Ok(clone_dir);
     }
 
     let source_url = "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git";
-    let source_rev = "acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509";
     if clone_dir.exists() {
         fs::remove_dir_all(&clone_dir).map_err(|err| {
             format!(
@@ -602,9 +676,47 @@ fn ensure_xfstests_root(root: &Path, run: &run_workspace::RunWorkspace) -> Resul
     run_cmd_owned_in(
         &clone_dir,
         "git",
-        &["checkout".into(), "--detach".into(), source_rev.into()],
+        &[
+            "checkout".into(),
+            "--detach".into(),
+            source_lock.revision.clone(),
+        ],
     )?;
+    verify_xfstests_source_lock(&clone_dir, source_lock)?;
     Ok(clone_dir)
+}
+
+fn verify_xfstests_source_lock(
+    xfstests_root: &Path,
+    source_lock: &XfstestsSourceLock,
+) -> Result<()> {
+    let (code, output) = run_capture(xfstests_root, "git", &["rev-parse".into(), "HEAD".into()])?;
+    if code != 0 {
+        return Err(format!(
+            "failed to read xfstests revision at {}",
+            xfstests_root.display()
+        ));
+    }
+    let revision = output.trim().to_ascii_lowercase();
+    if revision != source_lock.revision {
+        return Err(format!(
+            "xfstests revision mismatch at {}: expected {}, found {}",
+            xfstests_root.display(),
+            source_lock.revision,
+            revision
+        ));
+    }
+    let check = xfstests_root.join("check");
+    let check_sha256 = sha256_file(&check)?;
+    if check_sha256 != source_lock.check_sha256 {
+        return Err(format!(
+            "xfstests check sha256 mismatch at {}: expected {}, found {}",
+            check.display(),
+            source_lock.check_sha256,
+            check_sha256
+        ));
+    }
+    Ok(())
 }
 
 fn run_xfstests_selection(
@@ -612,7 +724,7 @@ fn run_xfstests_selection(
     run: &run_workspace::RunWorkspace,
     authorities: &Tier1Authorities,
 ) -> Result<receipt::XfstestsSummary> {
-    let xfstests_root = ensure_xfstests_root(root, run)?;
+    let xfstests_root = ensure_xfstests_root(root, run, &authorities.selection.source_lock)?;
     let check = xfstests_root.join("check");
     if !check.is_file() {
         return Err(format!("missing xfstests check script {}", check.display()));
