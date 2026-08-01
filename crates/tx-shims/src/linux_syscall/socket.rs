@@ -7,23 +7,25 @@
 
 use super::*;
 
+use tx_services::time::{ClockRead, TimekeeperClock};
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::protocol::loopback_iface;
 use tx_subsystems::net::{
     net_namespace_payload_from_file, net_namespace_payloads_snapshot, netlink_netfilter_recv,
-    netlink_netfilter_send_with_post, netlink_route_recv, netlink_route_recv_packet,
-    netlink_route_send_with_netns_resolvers_and_post, netlink_xfrm_recv,
-    netlink_xfrm_send_with_post, require_net_raw, socket_open_file_from_identity, step_accept,
-    step_bind, step_connect, step_listen, step_poll_ready, step_poll_wait_token,
-    step_recv_kernel_bytes, step_sctp_peeloff, step_sctp_shutdown_assoc, step_send_sctp_message,
-    step_send_sctp_seqpacket, step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
-    step_send_udp_loopback_kernel_bytes_with_post, step_shutdown,
-    step_socket_open_file_in_namespace, step_unix_socketpair_connect, AddressFamily, ConnectionKey,
-    IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption,
-    NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl,
-    SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence,
-    SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
-    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    netlink_netfilter_send, netlink_route_recv, netlink_route_recv_packet,
+    netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
+    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
+    step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
+    step_sctp_peeloff, step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
+    step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
+    step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_open_file_in_namespace,
+    step_tcp_loopback_handshake, step_tcp_loopback_transfer, step_unix_socketpair_connect,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address,
+    KernelSockAddr, LingerOption, NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags,
+    SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity,
+    SocketKind, SocketOperationalEvidence, SocketProtocol, SocketType, TcpState, TcpTlsUlpState,
+    UdpInner, UnixDatagramState, UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType,
+    VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::vfs::structure::OpenFileBacking;
 use tx_subsystems::vm::UserAccessKind;
@@ -37,11 +39,8 @@ const SOCKADDR_UN_PATH_BYTES: usize = 108;
 const SOCKADDR_NL_BYTES: u32 = 12;
 const SOCKADDR_LL_BYTES: u32 = 20;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
-// Linux's default local port range is 32768..60999 (inclusive).  The previous
-// 64-port staging range was exhausted by a few concurrent/repeated CAgent HTTP
-// waves while gracefully closing TCP sockets were still in flight.
-const EPHEMERAL_PORT_START: u16 = 32_768;
-const EPHEMERAL_PORT_END: u16 = 61_000;
+const EPHEMERAL_PORT_START: u16 = 49_152;
+const EPHEMERAL_PORT_END: u16 = 49_216;
 
 /// Shared rotation offset for ephemeral-port allocation (P2-S5). Every
 /// scan (connect autobind and bind(port=0) alike) starts one slot past
@@ -168,9 +167,9 @@ pub(super) fn sys_socket<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         }
     };
 
-    let Some(fd) = ctx.process.install_new_fd(opened.file, opened.cloexec) else {
-        return SyscallResult::Error(EMFILE_VALUE);
-    };
+    let fd = ctx.process.allocate_fd();
+    let _ = ctx.process.set_fd(fd, Some(opened.file));
+    ctx.process.set_fd_cloexec(fd, opened.cloexec);
     SyscallResult::Return(fd as i64)
 }
 
@@ -183,7 +182,7 @@ fn socket_requires_net_raw(kind: SocketKind, valid: ValidSocketType) -> bool {
             ))
 }
 
-pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let domain = args[0] as i32;
     let type_ = args[1] as i32;
     let protocol = args[2] as i32;
@@ -202,7 +201,7 @@ pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if !matches!(kind, SocketKind::UnixDatagram | SocketKind::UnixStream) {
         return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
     }
-    if let Err(errno) = validate_user_range_wait(ctx, sv, 8, UserAccessKind::Write).await {
+    if let Err(errno) = validate_user_range(ctx, sv, 8, UserAccessKind::Write) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
 
@@ -246,23 +245,15 @@ pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     }
 
-    let Some(first_fd) = ctx.process.install_new_fd(first.file, first.cloexec) else {
-        return SyscallResult::Error(EMFILE_VALUE);
-    };
-    let Some(second_fd) = ctx.process.install_new_fd(second.file, second.cloexec) else {
-        ctx.process.set_fd(first_fd, None);
-        return SyscallResult::Error(EMFILE_VALUE);
-    };
-    let mut fd_bytes = [0u8; core::mem::size_of::<[i32; 2]>()];
-    fd_bytes[..4].copy_from_slice(&(first_fd as i32).to_le_bytes());
-    fd_bytes[4..].copy_from_slice(&(second_fd as i32).to_le_bytes());
-    match super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sv, &fd_bytes).await {
+    let first_fd = ctx.process.allocate_fd();
+    let _ = ctx.process.set_fd(first_fd, Some(first.file));
+    ctx.process.set_fd_cloexec(first_fd, first.cloexec);
+    let second_fd = ctx.process.allocate_fd();
+    let _ = ctx.process.set_fd(second_fd, Some(second.file));
+    ctx.process.set_fd_cloexec(second_fd, second.cloexec);
+    match bootstrap_write_user::<[i32; 2]>(&ctx.aspace, sv, [first_fd as i32, second_fd as i32]) {
         Ok(()) => SyscallResult::Return(0),
-        Err(errno) => {
-            ctx.process.set_fd(first_fd, None);
-            ctx.process.set_fd(second_fd, None);
-            SyscallResult::Error(errno_to_i32(errno))
-        }
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
 
@@ -336,7 +327,7 @@ pub(super) fn sys_listen<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     step_unit_result(outcome)
 }
 
-pub(super) fn sys_accept<'a, P: TimeIf + 'a>(
+pub(super) fn sys_accept<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
 ) -> impl core::future::Future<Output = SyscallResult> + 'a
@@ -346,14 +337,14 @@ where
     accept_entry::<P>(args, ctx)
 }
 
-async fn accept_entry<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+async fn accept_entry<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
     accept_impl::<P>(args[0] as i32, args[1], args[2], 0, ctx).await
 }
 
-pub(super) fn sys_accept4<'a, P: TimeIf + 'a>(
+pub(super) fn sys_accept4<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
 ) -> impl core::future::Future<Output = SyscallResult> + 'a
@@ -363,7 +354,7 @@ where
     accept4_entry::<P>(args, ctx)
 }
 
-async fn accept4_entry<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+async fn accept4_entry<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -374,7 +365,7 @@ where
     accept_impl::<P>(args[0] as i32, args[1], args[2], flags, ctx).await
 }
 
-async fn accept_impl<'a, P: TimeIf>(
+async fn accept_impl<'a, P>(
     fd: i32,
     addr_ptr: u64,
     addrlen_ptr: u64,
@@ -418,9 +409,9 @@ where
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
 
-                let Some(new_fd) = ctx.process.install_new_fd(opened.file, opened.cloexec) else {
-                    return SyscallResult::Error(EMFILE_VALUE);
-                };
+                let new_fd = ctx.process.allocate_fd();
+                let _ = ctx.process.set_fd(new_fd, Some(opened.file));
+                ctx.process.set_fd_cloexec(new_fd, opened.cloexec);
                 return SyscallResult::Return(new_fd as i64);
             }
             StepOutcome::Yield { shape, .. } => {
@@ -430,7 +421,7 @@ where
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::Interrupted
+                        SocketWaitWake::ItimerExpired
                     ) {
                         return SyscallResult::Error(EINTR_VALUE);
                     }
@@ -501,6 +492,10 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 return SyscallResult::Return(0);
             }
             StepOutcome::Yield { shape, .. } => {
+                let connected = match drive_tcp_loopback_after_connect(&socket) {
+                    Ok(connected) => connected || socket_is_tcp_connected(&socket),
+                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                };
                 if nonblocking {
                     let errno = if was_connecting {
                         Errno::EALREADY
@@ -509,23 +504,12 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     };
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
-                // TCP protocol progression is owned exclusively by the network
-                // delegate.  Do not run the loopback handshake from the
-                // syscall CPU as well: two drivers can otherwise both observe
-                // Connecting, one completes the handshake, and the other
-                // converts smoltcp's resulting InvalidState into a spurious
-                // ECONNREFUSED.
-                if !socket_is_tcp_connecting(&socket) {
+                if connected {
                     return SyscallResult::Return(0);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
                     waited_for_connect = true;
-                    if matches!(
-                        wait_on_socket_interruptible(future, ctx).await,
-                        SocketWaitWake::Interrupted
-                    ) {
-                        return SyscallResult::Error(EINTR_VALUE);
-                    }
+                    let _ = future.await;
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -625,11 +609,12 @@ fn sctp_connectx3(
 }
 
 mod helpers;
+pub(super) use helpers::drive_loopback_pending;
 use helpers::*;
-pub(super) use helpers::{
-    drive_loopback_pending, socket_poll_mask_from_file, socket_poll_wait_token_from_file,
+pub(crate) use helpers::{
+    socket_identity_from_file, socket_poll_mask_from_file, socket_poll_wait_token_from_file,
+    unix_pathname_key,
 };
-pub(crate) use helpers::{socket_identity_from_file, unix_pathname_key};
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let socket = match resolve_socket_fd(ctx, args[0] as i32) {
@@ -750,24 +735,15 @@ pub(super) fn dispatch_netlink_send(
         process.net_namespace()
     };
     match socket.kind {
-        SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers_and_post(
+        SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers(
             socket,
             bytes,
             ctx.cred(),
             &mut resolve_netns_fd,
             &mut resolve_netns_pid,
-            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
         ),
-        SocketKind::NetlinkXfrm => {
-            netlink_xfrm_send_with_post(socket, bytes, ctx.cred(), |mailbox, event| {
-                ctx.post_mailbox_ref_event(mailbox, event)
-            })
-        }
-        SocketKind::NetlinkNetfilter => {
-            netlink_netfilter_send_with_post(socket, bytes, ctx.cred(), |mailbox, event| {
-                ctx.post_mailbox_ref_event(mailbox, event)
-            })
-        }
+        SocketKind::NetlinkXfrm => netlink_xfrm_send(socket, bytes, ctx.cred()),
+        SocketKind::NetlinkNetfilter => netlink_netfilter_send(socket, bytes, ctx.cred()),
         _ => unreachable!(),
     }
 }
@@ -846,7 +822,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
-        maybe_queue_packet_arp_reply(&socket, &payload, &netns, sockaddr, &bytes, ctx);
+        maybe_queue_packet_arp_reply(ctx, &socket, &payload, &netns, sockaddr, &bytes);
         return SyscallResult::Return(len as i64);
     }
 
@@ -924,14 +900,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         loop {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
-                step_send_udp_loopback_kernel_bytes_with_post(
-                    &socket,
-                    dst,
-                    &bytes,
-                    flags,
-                    &guard,
-                    |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
-                )
+                step_send_udp_loopback_kernel_bytes(&socket, dst, &bytes, flags, &guard)
             };
             match outcome {
                 StepOutcome::Done(sent) => {
@@ -958,12 +927,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                         return SyscallResult::Error(EAGAIN_VALUE);
                     }
                     if let Some(future) = wait_on_yield_shape(shape) {
-                        if matches!(
-                            wait_on_socket_interruptible(future, ctx).await,
-                            SocketWaitWake::Interrupted
-                        ) {
-                            return SyscallResult::Error(EINTR_VALUE);
-                        }
+                        let _ = future.await;
                     } else {
                         return SyscallResult::Error(EIO_VALUE);
                     }
@@ -1020,12 +984,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    if matches!(
-                        wait_on_socket_interruptible(future, ctx).await,
-                        SocketWaitWake::Interrupted
-                    ) {
-                        return SyscallResult::Error(EINTR_VALUE);
-                    }
+                    let _ = future.await;
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -1042,7 +1001,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     }
 }
 
-pub(super) fn sys_recvfrom<'a, P: TimeIf + 'a>(
+pub(super) fn sys_recvfrom<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
 ) -> impl core::future::Future<Output = SyscallResult> + 'a
@@ -1052,153 +1011,7 @@ where
     recvfrom_impl::<P>(args, ctx)
 }
 
-async fn recvfrom_read_socklen_wait(
-    ctx: &SyscallCtx<'_>,
-    sockaddr_len_ptr: u64,
-) -> Result<u32, Errno> {
-    let mut bytes = [0u8; core::mem::size_of::<u32>()];
-    super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, sockaddr_len_ptr)
-        .await?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-async fn recvfrom_write_socklen_wait(
-    ctx: &SyscallCtx<'_>,
-    sockaddr_len_ptr: u64,
-    len: u32,
-) -> Result<(), Errno> {
-    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_len_ptr, &len.to_le_bytes())
-        .await
-}
-
-async fn validate_recvfrom_addrlen_wait(
-    ctx: &SyscallCtx<'_>,
-    sockaddr_len_ptr: u64,
-) -> Result<(), Errno> {
-    if sockaddr_len_ptr == 0 {
-        return Ok(());
-    }
-    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
-    if invalid_socklen(len) {
-        Err(Errno::EINVAL)
-    } else {
-        Ok(())
-    }
-}
-
-async fn write_recvfrom_sockaddr_nl_wait(
-    ctx: &SyscallCtx<'_>,
-    sockaddr_ptr: u64,
-    sockaddr_len_ptr: u64,
-) -> Result<(), Errno> {
-    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
-        return Ok(());
-    }
-    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
-        return Err(Errno::EFAULT);
-    }
-    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
-    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, SOCKADDR_NL_BYTES).await?;
-    if invalid_socklen(len) || len < SOCKADDR_NL_BYTES {
-        return Err(Errno::EINVAL);
-    }
-    let mut bytes = [0u8; SOCKADDR_NL_BYTES as usize];
-    bytes[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
-    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes).await
-}
-
-async fn write_recvfrom_sockaddr_ll_wait(
-    ctx: &SyscallCtx<'_>,
-    sockaddr_ptr: u64,
-    sockaddr_len_ptr: u64,
-    sockaddr: SockAddrLl,
-) -> Result<(), Errno> {
-    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
-        return Ok(());
-    }
-    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
-        return Err(Errno::EFAULT);
-    }
-    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
-    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, SOCKADDR_LL_BYTES).await?;
-    if invalid_socklen(len) || len < SOCKADDR_LL_BYTES {
-        return Err(Errno::EINVAL);
-    }
-    let mut bytes = [0u8; SOCKADDR_LL_BYTES as usize];
-    bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
-    bytes[2..4].copy_from_slice(&sockaddr.protocol.to_be_bytes());
-    bytes[4..8].copy_from_slice(&sockaddr.ifindex.to_le_bytes());
-    bytes[8..10].copy_from_slice(&sockaddr.hatype.to_le_bytes());
-    bytes[10] = sockaddr.pkttype;
-    bytes[11] = sockaddr.halen;
-    bytes[12..20].copy_from_slice(&sockaddr.addr);
-    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes).await
-}
-
-async fn write_recvfrom_sockaddr_un_wait(
-    ctx: &SyscallCtx<'_>,
-    sockaddr_ptr: u64,
-    sockaddr_len_ptr: u64,
-    path: Option<UnixSocketPath>,
-) -> Result<(), Errno> {
-    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
-        return Ok(());
-    }
-    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
-        return Err(Errno::EFAULT);
-    }
-    let sockaddr_len = sockaddr_un_len(path);
-    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
-    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, sockaddr_len as u32).await?;
-    if invalid_socklen(len) || len < sockaddr_len as u32 {
-        return Err(Errno::EINVAL);
-    }
-    let bytes = sockaddr_un_bytes(path);
-    super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes[..sockaddr_len])
-        .await
-}
-
-async fn write_recvfrom_sockaddr_endpoint_wait(
-    ctx: &SyscallCtx<'_>,
-    sockaddr_ptr: u64,
-    sockaddr_len_ptr: u64,
-    endpoint: IpEndpoint,
-) -> Result<(), Errno> {
-    if sockaddr_ptr == 0 && sockaddr_len_ptr == 0 {
-        return Ok(());
-    }
-    if sockaddr_ptr == 0 || sockaddr_len_ptr == 0 {
-        return Err(Errno::EFAULT);
-    }
-    let out_len = if endpoint.family == AddressFamily::Inet6 {
-        SOCKADDR_IN6_BYTES
-    } else {
-        SOCKADDR_IN_BYTES
-    };
-    let len = recvfrom_read_socklen_wait(ctx, sockaddr_len_ptr).await?;
-    recvfrom_write_socklen_wait(ctx, sockaddr_len_ptr, out_len).await?;
-    if invalid_socklen(len) {
-        return Err(Errno::EINVAL);
-    }
-    let copy_len = core::cmp::min(len, out_len) as usize;
-    if endpoint.family == AddressFamily::Inet6 {
-        let mut bytes = [0u8; SOCKADDR_IN6_BYTES as usize];
-        bytes[0..2].copy_from_slice(&AF_INET6.to_le_bytes());
-        bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
-        bytes[8..24].copy_from_slice(&endpoint.addr6.octets());
-        super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
-            .await
-    } else {
-        let mut bytes = [0u8; SOCKADDR_IN_BYTES as usize];
-        bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
-        bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
-        bytes[4..8].copy_from_slice(&endpoint.addr.octets());
-        super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
-            .await
-    }
-}
-
-async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+async fn recvfrom_impl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -1220,11 +1033,14 @@ where
         if let Some(errno) = recv_special_flags_errno(flags) {
             return SyscallResult::Error(errno);
         }
-        if let Err(errno) = validate_recvfrom_addrlen_wait(ctx, args[5]).await {
+        if let Err(errno) = validate_recvfrom_addrlen(ctx, args[5]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
     }
-    if len == 0 && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC)) {
+    if len == 0
+        && socket.kind != SocketKind::Udp
+        && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC))
+    {
         return SyscallResult::Return(0);
     }
 
@@ -1236,17 +1052,13 @@ where
             };
             let copied = core::cmp::min(len.min(NETLINK_RECVMSG_MAX), response.len());
             if copied > 0 {
-                if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
-                    &ctx.aspace,
-                    args[1],
-                    &response.as_slice()[..copied],
-                )
-                .await
+                if let Err(errno) =
+                    bootstrap_copy_to_user(&ctx.aspace, args[1], &response.as_slice()[..copied])
                 {
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
             }
-            if let Err(errno) = write_recvfrom_sockaddr_nl_wait(ctx, args[4], args[5]).await {
+            if let Err(errno) = write_sockaddr_nl(ctx, args[4], args[5]) {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             let reported = if flags.contains(SendRecvFlags::MSG_TRUNC) {
@@ -1269,17 +1081,11 @@ where
         };
         let copied = core::cmp::min(recv, staging.len());
         if copied > 0 {
-            if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
-                &ctx.aspace,
-                args[1],
-                &staging[..copied],
-            )
-            .await
-            {
+            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..copied]) {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }
-        if let Err(errno) = write_recvfrom_sockaddr_nl_wait(ctx, args[4], args[5]).await {
+        if let Err(errno) = write_sockaddr_nl(ctx, args[4], args[5]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
         return SyscallResult::Return(recv as i64);
@@ -1287,7 +1093,7 @@ where
 
     let mut yielded_before_wait = false;
     loop {
-        drive_loopback_pending(ctx);
+        drive_loopback_pending();
         if recv_queued_len(&socket) == 0 {
             let ready = {
                 let guard = tx_substrate::epoch::guard();
@@ -1325,12 +1131,15 @@ where
                 let Some(wait_token) = wait_token else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                let Some(future) = socket_ready_wait_from_token(wait_token) else {
+                let Some(future) = wait_source::wait_on_registered_source_id(
+                    wait_token.source_id(),
+                    wait_token.interest(),
+                ) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
                 if matches!(
                     wait_on_socket_or_itimer::<P>(future, ctx).await,
-                    SocketWaitWake::Interrupted
+                    SocketWaitWake::ItimerExpired
                 ) {
                     if recv_queued_len(&socket) > 0 {
                         yielded_before_wait = false;
@@ -1349,13 +1158,8 @@ where
         // message, so a bad buffer (e.g. -1) returns EFAULT without dropping the
         // queued message (a later recv must still see it).
         if staging_len > 0 && !flags.contains(SendRecvFlags::MSG_PEEK) {
-            let Some(range) = covering_user_range(args[1], staging_len) else {
-                return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
-            };
-            if let Err(errno) = ctx
-                .aspace
-                .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
-                .await
+            if let Err(errno) =
+                validate_user_range(ctx, args[1], staging_len, UserAccessKind::Write)
             {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
@@ -1368,32 +1172,22 @@ where
         match outcome {
             StepOutcome::Done(recv) => {
                 if recv.bytes > 0 {
-                    if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
-                        &ctx.aspace,
-                        args[1],
-                        &staging[..recv.bytes],
-                    )
-                    .await
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..recv.bytes])
                     {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
                 if let Some(source) = recv.source {
-                    if let Err(errno) =
-                        write_recvfrom_sockaddr_endpoint_wait(ctx, args[4], args[5], source).await
-                    {
+                    if let Err(errno) = write_sockaddr_endpoint(ctx, args[4], args[5], source) {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 } else if let Some(source) = recv.unix_source {
-                    if let Err(errno) =
-                        write_recvfrom_sockaddr_un_wait(ctx, args[4], args[5], Some(source)).await
-                    {
+                    if let Err(errno) = write_sockaddr_un(ctx, args[4], args[5], Some(source)) {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 } else if let Some(source) = recv.packet_source {
-                    if let Err(errno) =
-                        write_recvfrom_sockaddr_ll_wait(ctx, args[4], args[5], source).await
-                    {
+                    if let Err(errno) = write_sockaddr_ll(ctx, args[4], args[5], source) {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
@@ -1409,7 +1203,7 @@ where
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::Interrupted
+                        SocketWaitWake::ItimerExpired
                     ) {
                         if recv_queued_len(&socket) > 0 {
                             continue;
@@ -1427,12 +1221,12 @@ where
 }
 
 fn maybe_queue_packet_arp_reply(
+    ctx: &SyscallCtx<'_>,
     socket: &Cap<SocketIdentity>,
     payload: &SocketOperationalEvidence,
     netns: &NetNamespacePayload,
     sockaddr: SockAddrLl,
     bytes: &[u8],
-    ctx: &SyscallCtx<'_>,
 ) {
     if sockaddr.protocol != ETH_P_ARP || bytes.len() < ARP_ETH_IPV4_PACKET_BYTES {
         return;
@@ -1486,11 +1280,7 @@ fn maybe_queue_packet_arp_reply(
         target_mac.len() as u8,
     );
     if payload.record_packet_frame(source, reply).unwrap_or(false) {
-        socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
-                ctx.post_mailbox_ref_event(mailbox, event)
-            });
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
 }
 
@@ -1794,7 +1584,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         }
     }
 
-    if total_len == 0 {
+    if total_len == 0 && socket.kind != SocketKind::Udp {
         return SyscallResult::Return(0);
     }
 
@@ -1874,12 +1664,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                         return SyscallResult::Error(EAGAIN_VALUE);
                     }
                     if let Some(future) = wait_on_yield_shape(shape) {
-                        if matches!(
-                            wait_on_socket_interruptible(future, ctx).await,
-                            SocketWaitWake::Interrupted
-                        ) {
-                            return SyscallResult::Error(EINTR_VALUE);
-                        }
+                        let _ = future.await;
                     } else {
                         return SyscallResult::Error(EIO_VALUE);
                     }
@@ -1934,12 +1719,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    if matches!(
-                        wait_on_socket_interruptible(future, ctx).await,
-                        SocketWaitWake::Interrupted
-                    ) {
-                        return SyscallResult::Error(EINTR_VALUE);
-                    }
+                    let _ = future.await;
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -2086,7 +1866,7 @@ fn validate_iovec_read_ranges<'a>(ctx: &SyscallCtx<'a>, iovecs: &[UserIovec]) ->
     Ok(())
 }
 
-pub(super) fn sys_recvmsg<'a, P: TimeIf + 'a>(
+pub(super) fn sys_recvmsg<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
 ) -> impl core::future::Future<Output = SyscallResult> + 'a
@@ -2096,7 +1876,7 @@ where
     recvmsg_impl::<P>(args, ctx)
 }
 
-async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+async fn recvmsg_impl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -2141,7 +1921,10 @@ where
             return SyscallResult::Error(errno);
         }
     }
-    if total_len == 0 && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC)) {
+    if total_len == 0
+        && socket.kind != SocketKind::Udp
+        && !(is_netlink_socket && flags.contains(SendRecvFlags::MSG_TRUNC))
+    {
         return SyscallResult::Return(0);
     }
 
@@ -2261,7 +2044,7 @@ where
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::Interrupted
+                        SocketWaitWake::ItimerExpired
                     ) {
                         if recv_queued_len(&socket) > 0 {
                             continue;
@@ -2334,7 +2117,7 @@ async fn sendmmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     SyscallResult::Return(sent_messages as i64)
 }
 
-pub(super) fn sys_recvmmsg<'a, P: TimeIf + 'a>(
+pub(super) fn sys_recvmmsg<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
 ) -> impl core::future::Future<Output = SyscallResult> + 'a
@@ -2344,7 +2127,7 @@ where
     recvmmsg_impl::<P>(args, ctx)
 }
 
-async fn recvmmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+async fn recvmmsg_impl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -2445,7 +2228,7 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 Ok(on) => on,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
-            payload.with_options_mut(|opts| opts.socket.keep_alive = on);
+            payload.set_socket_keep_alive(on);
             Ok(())
         }
         (SOL_SOCKET, SO_BROADCAST) => {
@@ -2532,17 +2315,6 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
             payload.with_options_mut(|opts| opts.ip.recv_err = on);
-            Ok(())
-        }
-        (IPPROTO_IP, IP_TOS) => {
-            // DSCP/ToS QoS hint (Linux stores the low byte). We accept and
-            // record it but don't act on it; programs like ssh and curl set it
-            // and treat ENOPROTOOPT as a hard failure on some paths.
-            let tos = match read_sockopt_i32(ctx, optval, optlen) {
-                Ok(tos) => tos,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-            };
-            payload.with_options_mut(|opts| opts.ip.tos = (tos & 0xff) as u8);
             Ok(())
         }
         (IPPROTO_IP, IP_TTL) => {
@@ -2906,23 +2678,6 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
             Ok(())
         }
-        (SOL_IPV6, IPV6_TCLASS) => {
-            if payload.family() != AddressFamily::Inet6 {
-                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
-            }
-            // v6 traffic class (DSCP/ToS) — a QoS hint. Accept and validate
-            // like IP_TOS; the kernel doesn't act on it but ssh/curl set it on
-            // v6 sockets and treat ENOPROTOOPT as a failure.
-            let tclass = match read_sockopt_i32(ctx, optval, optlen) {
-                Ok(tclass) => tclass,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-            };
-            match tclass {
-                -1..=255 => {}
-                _ => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
-            }
-            Ok(())
-        }
         (SOL_IPV6 | SOL_RAW, IPV6_CHECKSUM) => {
             set_ipv6_checksum(&socket, &payload, ctx, optval, optlen)
         }
@@ -2977,12 +2732,14 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
         }
         (IPPROTO_TCP, TCP_NODELAY) => {
+            if socket.kind != SocketKind::Tcp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
-            payload.with_options_mut(|opts| opts.tcp.nodelay = on);
-            Ok(())
+            payload.set_tcp_nodelay(on)
         }
         (IPPROTO_TCP, TCP_MAXSEG) => {
             let size = match read_sockopt_positive_usize(ctx, optval, optlen) {
@@ -3340,12 +3097,9 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.socket.dont_route as i32),
         ),
-        (SOL_SOCKET, SO_KEEPALIVE) => write_sockopt_i32(
-            ctx,
-            optval,
-            optlen_ptr,
-            payload.with_options(|o| o.socket.keep_alive as i32),
-        ),
+        (SOL_SOCKET, SO_KEEPALIVE) => {
+            write_sockopt_i32(ctx, optval, optlen_ptr, payload.socket_keep_alive() as i32)
+        }
         (SOL_SOCKET, SO_BROADCAST) => write_sockopt_i32(
             ctx,
             optval,
@@ -3379,7 +3133,15 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (SOL_SOCKET, SO_TYPE) => {
             write_sockopt_i32(ctx, optval, optlen_ptr, socket_type_i32(&socket))
         }
-        (SOL_SOCKET, SO_ERROR) => write_sockopt_i32(ctx, optval, optlen_ptr, 0),
+        (SOL_SOCKET, SO_ERROR) => {
+            // Linux atomically fetches and clears sk_err before copyout.
+            // Consequently a bad userspace pointer still consumes SO_ERROR.
+            let value = payload
+                .take_socket_error(&socket.readiness)
+                .map(errno_to_i32)
+                .unwrap_or(0);
+            write_sockopt_i32(ctx, optval, optlen_ptr, value)
+        }
         (SOL_SOCKET, SO_PEERCRED) if socket.kind == SocketKind::UnixStream => {
             match payload.unix_peer_cred() {
                 Some(cred) => write_sockopt_unix_peer_cred(ctx, optval, optlen_ptr, cred),
@@ -3613,11 +3375,8 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                             },
                         ) {
                             Ok(opened) => {
-                                let Some(new_fd) =
-                                    ctx.process.install_new_fd(opened.file, opened.cloexec)
-                                else {
-                                    return SyscallResult::Error(EMFILE_VALUE);
-                                };
+                                let new_fd = ctx.process.allocate_fd();
+                                let _ = ctx.process.set_fd(new_fd, Some(opened.file));
                                 buf[4..8].copy_from_slice(&(new_fd as i32).to_le_bytes());
                                 write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
                             }
@@ -3744,12 +3503,15 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         {
             write_icmp6_filter(ctx, optval, optlen_ptr, &payload)
         }
-        (IPPROTO_TCP, TCP_NODELAY) => write_sockopt_i32(
-            ctx,
-            optval,
-            optlen_ptr,
-            payload.with_options(|o| o.tcp.nodelay as i32),
-        ),
+        (IPPROTO_TCP, TCP_NODELAY) => {
+            if socket.kind != SocketKind::Tcp {
+                Err(Errno::ENOPROTOOPT)
+            } else {
+                payload
+                    .tcp_nodelay()
+                    .and_then(|enabled| write_sockopt_i32(ctx, optval, optlen_ptr, enabled as i32))
+            }
+        }
         (IPPROTO_TCP, TCP_MAXSEG) => {
             write_sockopt_i32(ctx, optval, optlen_ptr, tcp_effective_maxseg(&socket))
         }
@@ -4002,11 +3764,23 @@ pub(super) fn sys_shutdown<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     }
 }
 
+pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
+    // `CloseOp` has already removed the fd-table entry. The `Cap` passed here
+    // is the syscall's temporary reference; if anything else still retains the
+    // same open-file description (dup, fork, or another in-kernel owner), the
+    // underlying socket must stay alive.
+    if file.retain_count() > 1 {
+        return;
+    }
+    let Some(ops) = file.file_ops() else {
+        return;
+    };
+    let guard = tx_substrate::epoch::guard();
+    ops.on_last_close(&guard);
+}
+
 pub(super) fn can_fast_close_stateless_netlink_socket(file: &Cap<OpenFile>) -> bool {
-    if file
-        .socket_identity()
-        .is_some_and(|socket| socket.fd_ref_count() != 0)
-    {
+    if file.retain_count() > 2 {
         return false;
     }
     socket_identity_from_file(file).is_ok_and(|socket| is_netlink_socket_kind(socket.kind))

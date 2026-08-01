@@ -248,8 +248,12 @@ fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
         step_accept(&listener, &guard),
         StepOutcome::Done(_)
     ));
-    let mut urgent_future =
-        crate::wait_source::wait_on_token(socket_urgent_wait_token(&tcp)).expect("urgent future");
+    let urgent_token = socket_urgent_wait_token(&tcp);
+    let mut urgent_future = crate::wait_source::wait_on_registered_source_id(
+        urgent_token.source_id(),
+        urgent_token.interest(),
+    )
+    .expect("urgent future");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(
@@ -463,4 +467,26 @@ fn open_file_read_write_delegate_to_socket_file_ops() {
         StepOutcome::Done(4) => assert_eq!(&buf[..4], b"ping"),
         other => panic!("socket-backed OpenFile read must return the payload: {other:?}"),
     }
+}
+
+#[test]
+fn open_file_tcp_byte_io_rejects_unconnected_socket() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+    let open = match crate::net::execution::step_socket_open_file(2, 1, 6, &guard) {
+        StepOutcome::Done(output) => output,
+        _ => panic!("tcp open_file failed"),
+    };
+
+    assert_eq!(
+        open.file.step_write(b"x", &guard),
+        StepOutcome::Err(Errno::EPIPE),
+        "write(fd) must match send(fd, ..., 0) on an unconnected TCP socket"
+    );
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        open.file.step_read(&mut byte, &guard),
+        StepOutcome::Err(Errno::ENOTCONN),
+        "read(fd) must not park forever on an unconnected TCP socket"
+    );
 }

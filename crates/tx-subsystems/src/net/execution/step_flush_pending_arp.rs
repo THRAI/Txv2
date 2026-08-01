@@ -19,8 +19,7 @@ pub fn step_flush_pending_arp(
     // commit
     // publish
     let mut outcome = iface.flush_pending_arp_at(now, budget, guard);
-    // A network reactor tick owns neighbour discovery for both protocol
-    // families.  Leaving NDISC out here strands queued IPv6 packets forever.
+    // IPv6 V2: one reactor tick flushes both v4 ARP and v6 NDP probes.
     outcome.absorb(iface.flush_pending_ndisc_at(now, budget, guard));
     StepOutcome::Done(outcome)
 }

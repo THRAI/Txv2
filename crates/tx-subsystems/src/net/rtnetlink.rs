@@ -14,7 +14,6 @@ use core::str;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use smoltcp::time::Instant;
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::cred::Cred;
@@ -278,13 +277,12 @@ pub fn netlink_route_send(
 ) -> Result<usize, Errno> {
     let mut no_netns_fd = |_fd: i32| None;
     let mut no_netns_pid = |_pid: u32| None;
-    netlink_route_send_with_netns_resolvers_and_post(
+    netlink_route_send_with_netns_resolvers(
         socket,
         bytes,
         cred,
         &mut no_netns_fd,
         &mut no_netns_pid,
-        |mailbox, event| mailbox.post(event),
     )
 }
 
@@ -298,13 +296,12 @@ where
     F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
 {
     let mut no_netns_pid = |_pid: u32| None;
-    netlink_route_send_with_netns_resolvers_and_post(
+    netlink_route_send_with_netns_resolvers(
         socket,
         bytes,
         cred,
         resolve_netns_fd,
         &mut no_netns_pid,
-        |mailbox, event| mailbox.post(event),
     )
 }
 
@@ -319,29 +316,6 @@ where
     F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
     G: FnMut(u32) -> Option<PayloadCap<NetNamespacePayload>>,
 {
-    netlink_route_send_with_netns_resolvers_and_post(
-        socket,
-        bytes,
-        cred,
-        resolve_netns_fd,
-        resolve_netns_pid,
-        |mailbox, event| mailbox.post(event),
-    )
-}
-
-pub fn netlink_route_send_with_netns_resolvers_and_post<F, G, P>(
-    socket: &Cap<SocketIdentity>,
-    bytes: &[u8],
-    cred: Cred,
-    resolve_netns_fd: &mut F,
-    resolve_netns_pid: &mut G,
-    mut post: P,
-) -> Result<usize, Errno>
-where
-    F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
-    G: FnMut(u32) -> Option<PayloadCap<NetNamespacePayload>>,
-    P: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
     if socket.kind != SocketKind::NetlinkRoute {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -351,9 +325,7 @@ where
         .ok_or(Errno::EOPNOTSUPP)?;
 
     if try_queue_fast_dump(raw, &payload.net_namespace(), bytes) {
-        socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
         return Ok(bytes.len());
     }
 
@@ -377,9 +349,7 @@ where
         raw.queue_response(combined);
     }
     if !raw.is_empty() {
-        socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
     Ok(bytes.len())
 }

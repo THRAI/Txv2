@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 use crate::adapter::step_engine::{
     self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
@@ -240,20 +241,11 @@ pub trait RtcDeviceOps: Send + Sync + 'static {
     }
 }
 
-pub trait CharDeviceOps: Send + Sync + 'static {
-    fn read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
-    fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
-
-    fn rtc_ops(&self) -> Option<&dyn RtcDeviceOps> {
-        None
-    }
-}
-
-/// Operations shared by rich file objects such as sockets.
-///
-/// This is the final-smp file-object seam: VFS read/write, readiness waits,
-/// fcntl side effects, and last-close teardown must all target the same
-/// implementation instead of redispatching by object kind in each syscall.
+/// P3-S2 (D13): file-object operations for `StructPayload` kinds richer
+/// than plain byte devices — the socket arm implements this so callers can
+/// delegate instead of naming kinds. Same dispatch shape as
+/// [`CharDeviceOps`]; carries `nonblocking` because these objects have
+/// O_NONBLOCK semantics. See `docs/design/07_net/REFACTOR_P3_v1.md` §3.
 pub trait FileOps: Send + Sync {
     fn read(
         &self,
@@ -261,26 +253,33 @@ pub trait FileOps: Send + Sync {
         nonblocking: bool,
         guard: &Guard<'_>,
     ) -> StepOutcome<usize, ByteProgress>;
-
     fn write(
         &self,
         bytes: &[u8],
         nonblocking: bool,
         guard: &Guard<'_>,
     ) -> StepOutcome<usize, ByteProgress>;
+    /// F_SETFL O_NONBLOCK side-effect hook (P3-S5). Sockets re-kick send
+    /// readiness so writers parked behind a formerly-blocking fd re-poll.
+    fn on_set_fl_nonblock(&self, post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool) {
+        let _ = post;
+    }
 
-    fn poll_mask(&self, guard: &Guard<'_>) -> Result<crate::net::PollMask, Errno>;
-
-    fn poll_wait_token(
-        &self,
-        interests: crate::net::PollMask,
-        guard: &Guard<'_>,
-    ) -> Result<Option<crate::execution::WaitToken>, Errno>;
-
-    fn on_set_fl_nonblock(&self) {}
-
+    /// Last-close teardown (P3-S5): the kind's close protocol, run by the
+    /// close/exit lanes once no other retainer holds the open-file
+    /// description. Sockets run `step_socket_close` (fd removal alone
+    /// does not drive the network close handshake).
     fn on_last_close(&self, guard: &Guard<'_>) {
         let _ = guard;
+    }
+}
+
+pub trait CharDeviceOps: Send + Sync + 'static {
+    fn read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
+    fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
+
+    fn rtc_ops(&self) -> Option<&dyn RtcDeviceOps> {
+        None
     }
 }
 
@@ -734,14 +733,7 @@ impl PageContainerFileIoServiceRuntime {
         post_file_io_service_kick(&self.wake_source, ServiceKick::new(service)) as usize
     }
 
-    pub fn diagnostic(
-        &self,
-    ) -> (
-        u64,
-        usize,
-        u64,
-        crate::page_backed::FileIoServiceDiagnostic,
-    ) {
+    pub fn diagnostic(&self) -> (u64, usize, u64, crate::page_backed::FileIoServiceDiagnostic) {
         (
             self.wake_source.source_id(),
             self.wake_source.wake_endpoint().subscriber_count(),

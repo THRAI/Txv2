@@ -1,18 +1,19 @@
+use tx_substrate::index::IndexError;
 use tx_substrate::zone::{Cap, PayloadCap};
 
-use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_connect_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::step_bind::table_error_to_errno;
-use crate::net::execution::yield_on_token;
+use crate::net::execution::{socket_send_wait_token, yield_on_token};
 use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     AcceptWireSet, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, RecvWireSet,
     SendWireSet, SocketAcceptEntry, SocketIdentity, SocketKind, SocketOperationalEvidence,
-    SocketProtocol, SocketType, TcpState, UdpInner, UnixDatagramState, UnixSocketPath,
-    UnixStreamState,
+    SocketProtocol, SocketType, TcpConnectAttempt, TcpConnectDisposition, TcpConnectProgress,
+    TcpFlowGenerationTry, TcpState, UdpInner, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
 
 pub fn step_connect(
@@ -29,7 +30,10 @@ pub fn step_connect(
         return StepOutcome::Err(Errno::ENOTCONN);
     };
     if matches!(remote, KernelSockAddr::Unspec) {
-        return step_connect_unspec(socket, &payload, guard);
+        return step_connect_unspec(socket, &payload);
+    }
+    if let Some(error) = payload.take_socket_error(&socket.readiness) {
+        return StepOutcome::Err(error);
     }
 
     let witness = match require_socket_connect_target(socket, remote, guard) {
@@ -55,70 +59,69 @@ pub fn step_connect(
         return StepOutcome::Err(errno);
     }
 
-    let mut advanced = false;
-    let blocked = payload.with_protocol_mut(|protocol| match protocol {
-        SocketProtocol::Tcp(TcpState::Init) => {
-            *protocol = SocketProtocol::Tcp(TcpState::Connecting {
-                local: unspecified_endpoint(),
-                remote: witness.remote,
-            });
-            advanced = true;
-            true
+    let (blocked, started_attempt) = if socket.kind == SocketKind::Tcp {
+        match payload.begin_tcp_connect(
+            unspecified_endpoint(),
+            witness.remote,
+            |local| select_tcp_connect_local(&payload, local, witness.remote),
+            || {
+                socket
+                    .readiness
+                    .clear_send(SendWireSet::SPACE | SendWireSet::CONNECT_DONE);
+            },
+        ) {
+            TcpConnectProgress::Started(attempt) => (true, Some(attempt)),
+            TcpConnectProgress::InProgress => (true, None),
+            TcpConnectProgress::NotTcp => (false, None),
         }
-        SocketProtocol::Tcp(TcpState::Bound { local }) => {
-            let selected_local = select_tcp_connect_local(&payload, *local, witness.remote);
-            *protocol = SocketProtocol::Tcp(TcpState::Connecting {
-                local: selected_local,
-                remote: witness.remote,
-            });
-            advanced = true;
-            true
-        }
-        SocketProtocol::Tcp(TcpState::Connecting { .. }) => true,
-        SocketProtocol::Udp(UdpInner::Unbound) => {
-            *protocol = SocketProtocol::Udp(UdpInner::Connected {
-                local: unspecified_endpoint(),
-                remote: witness.remote,
-            });
-            false
-        }
-        SocketProtocol::Udp(UdpInner::Bound { local }) => {
-            *protocol = SocketProtocol::Udp(UdpInner::Connected {
-                local: *local,
-                remote: witness.remote,
-            });
-            false
-        }
-        SocketProtocol::Udp(UdpInner::Connected { local, .. }) => {
-            *protocol = SocketProtocol::Udp(UdpInner::Connected {
-                local: *local,
-                remote: witness.remote,
-            });
-            false
-        }
-        SocketProtocol::RawIcmp(_) => false,
-        _ => false,
-    });
+    } else {
+        let blocked = payload.with_protocol_mut(|protocol| match protocol {
+            SocketProtocol::Udp(UdpInner::Unbound) => {
+                *protocol = SocketProtocol::Udp(UdpInner::Connected {
+                    local: unspecified_endpoint(),
+                    remote: witness.remote,
+                });
+                false
+            }
+            SocketProtocol::Udp(UdpInner::Bound { local }) => {
+                *protocol = SocketProtocol::Udp(UdpInner::Connected {
+                    local: *local,
+                    remote: witness.remote,
+                });
+                false
+            }
+            SocketProtocol::Udp(UdpInner::Connected { local, .. }) => {
+                *protocol = SocketProtocol::Udp(UdpInner::Connected {
+                    local: *local,
+                    remote: witness.remote,
+                });
+                false
+            }
+            SocketProtocol::RawIcmp(_) => false,
+            _ => false,
+        });
+        (blocked, None)
+    };
 
     if blocked {
-        if advanced {
+        if let Some(attempt) = started_attempt {
             net_delegate_kick_poll();
+            if let Some(outcome) = try_tcp_local_namespace_connect(socket, &payload, attempt, guard)
+            {
+                return outcome;
+            }
+            // No in-kernel namespace owns the remote: this is an EXTERNAL TCP
+            // connect over the real device. Emit the SYN into smoltcp and
+            // register the client in the connection table so the inbound
+            // SYN-ACK matches in process_tcp_event. Kept after the
+            // local-namespace short-circuit so loopback / intra-namespace
+            // connects are unaffected.
+            if let Err(errno) = try_tcp_external_connect(socket, &payload, attempt, guard) {
+                cancel_indexed_tcp_connect_attempt(socket, &payload, attempt);
+                return StepOutcome::Err(errno);
+            }
         }
-        if let Some(outcome) = try_tcp_local_namespace_connect(socket, &payload, guard) {
-            return outcome;
-        }
-        // No in-kernel namespace owns the remote: this is an EXTERNAL TCP
-        // connect over the real device. Emit the SYN into smoltcp and
-        // register the client in the connection table so the inbound
-        // SYN-ACK matches in process_tcp_event. Kept after the
-        // local-namespace short-circuit so loopback / intra-namespace
-        // connects are unaffected.
-        try_tcp_external_connect(socket, &payload);
-        let wait = WaitToken::new(
-            socket.wait_carriers.send,
-            SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits(),
-        );
-        yield_on_token(wait)
+        yield_on_token(socket_send_wait_token(socket))
     } else {
         net_delegate_kick_poll();
         StepOutcome::Done(())
@@ -132,46 +135,96 @@ pub fn step_connect(
 /// path in step_tcp_loopback.rs) so the device-TX scan ships the SYN, and
 /// inserts the client under `ConnectionKey::new(local, remote)` so the inbound
 /// SYN-ACK (src=remote, dst=local) matches `lookup_tcp_connection(dst, src)`
-/// in process_tcp_event. Both the smoltcp connect and the table insert are
-/// best-effort: a smoltcp Err means it is already connecting, and a table
-/// Duplicate means the client is already registered (re-entrant connect/poll)
-/// — neither is fatal, so connect() still parks on its send carrier.
-fn try_tcp_external_connect(socket: &Cap<SocketIdentity>, payload: &SocketOperationalEvidence) {
+/// in process_tcp_event. The attempt snapshot and both side effects are
+/// validated under the socket control lock, so a reset/reconnect cannot splice
+/// a new generation onto an old tuple.
+fn try_tcp_external_connect(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketOperationalEvidence,
+    attempt: TcpConnectAttempt,
+    guard: &Guard<'_>,
+) -> Result<(), Errno> {
     if socket.kind != SocketKind::Tcp {
-        return;
+        return Ok(());
     }
-    let (local, remote) = match payload.protocol_snapshot() {
-        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
-        _ => return,
-    };
+    let local = attempt.local();
+    let remote = attempt.remote();
     if remote.is_loopback() || local.is_unspecified() || local.port == 0 {
-        return;
-    }
+        return Ok(());
+    };
 
-    if let Some(raw) = payload.raw_tcp_socket() {
-        // Ignore Err: smoltcp is already in a connecting state.
-        let _ = raw.connect_endpoint(local, remote);
-    }
-    // Ignore a Duplicate: the client is already registered for this 4-tuple.
-    let _ = payload
-        .socket_table()
-        .insert_tcp_connection(ConnectionKey::new(local, remote), socket.clone());
+    let raw = payload.raw_tcp_socket().ok_or(Errno::EOPNOTSUPP)?;
+    let table = payload.socket_table();
+    let result = payload
+        .transact_tcp_connect_attempt(Some(attempt), attempt.generation(), |local, remote| {
+            let key = ConnectionKey::new(local, remote);
+            let indexed = match table.insert_tcp_connection(key, socket.clone()) {
+                Ok(()) => Ok(()),
+                Err(IndexError::Duplicate)
+                    if table
+                        .lookup_tcp_connection(key, guard)
+                        .is_some_and(|owner| owner.raw() == socket.raw()) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(table_error_to_errno(error)),
+            };
+            let result = indexed.and_then(|()| {
+                raw.connect_endpoint_for_attempt(attempt)
+                    .map_err(|_| Errno::EINVAL)
+            });
+            (result, TcpConnectDisposition::KeepConnecting)
+        })
+        .ok_or(Errno::ECANCELED)?;
+    result?;
     net_delegate_kick_poll();
+    Ok(())
+}
+
+pub(crate) fn fail_indexed_tcp_connect_attempt(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketOperationalEvidence,
+    attempt: TcpConnectAttempt,
+    error: Errno,
+) -> Option<usize> {
+    payload.fail_tcp_connect_attempt(
+        attempt,
+        error,
+        |local, remote| {
+            let _ = payload.reset_raw_tcp_socket();
+            let _ = payload
+                .socket_table()
+                .withdraw_tcp_connection_if_owner(ConnectionKey::new(local, remote), socket.raw());
+        },
+        || socket.readiness.fire_send(SendWireSet::CONNECT_DONE),
+    )
+}
+
+fn cancel_indexed_tcp_connect_attempt(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketOperationalEvidence,
+    attempt: TcpConnectAttempt,
+) {
+    payload.cancel_tcp_connect_attempt(attempt, |local, remote| {
+        let _ = payload.reset_raw_tcp_socket();
+        let _ = payload
+            .socket_table()
+            .withdraw_tcp_connection_if_owner(ConnectionKey::new(local, remote), socket.raw());
+    });
 }
 
 fn try_tcp_local_namespace_connect(
     socket: &Cap<SocketIdentity>,
     payload: &SocketOperationalEvidence,
+    attempt: TcpConnectAttempt,
     guard: &Guard<'_>,
 ) -> Option<StepOutcome<()>> {
     if socket.kind != SocketKind::Tcp {
         return None;
     }
 
-    let (local, remote) = match payload.protocol_snapshot() {
-        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
-        _ => return None,
-    };
+    let local = attempt.local();
+    let remote = attempt.remote();
     if remote.is_loopback() {
         return None;
     }
@@ -183,68 +236,90 @@ fn try_tcp_local_namespace_connect(
         return None;
     };
     let target_table = target_namespace.socket_table();
-    let Some(listener) = target_table.lookup_tcp_listener_dual_stack_endpoint(remote, guard) else {
-        return Some(StepOutcome::Err(Errno::ECONNREFUSED));
-    };
-    let Some(listener_payload) = listener.acquire_operational() else {
-        return Some(StepOutcome::Err(Errno::ECONNREFUSED));
-    };
-    let listener_local = match listener_payload.protocol_snapshot() {
-        SocketProtocol::Tcp(TcpState::Listening {
-            local: listener_local,
-            ..
-        }) if tcp_listener_accepts_local_endpoint(&listener_payload, listener_local, remote) => {
-            concrete_listener_endpoint(listener_local, remote)
-        }
-        _ => return Some(StepOutcome::Err(Errno::ECONNREFUSED)),
-    };
-
-    let child_options = listener_payload.with_options(Clone::clone);
-    let child = match registry::create_connected_stream_for_accept_in_namespace_with_family(
-        listener_local,
-        local,
-        listener_local.family,
-        child_options,
-        listener_payload.net_namespace(),
-    ) {
-        Ok(child) => child,
-        Err(_) => return Some(StepOutcome::Err(Errno::ENOMEM)),
-    };
-
-    let client_key = ConnectionKey::new(local, listener_local);
-    let server_key = ConnectionKey::new(listener_local, local);
     let client_table = payload.socket_table();
-    if let Err(error) = client_table.insert_tcp_connection(client_key, socket.clone()) {
-        return Some(StepOutcome::Err(table_error_to_errno(error)));
-    }
-    if let Err(error) = target_table.insert_tcp_connection(server_key, child.clone()) {
-        let _ = client_table.withdraw_tcp_connection(client_key);
-        return Some(StepOutcome::Err(table_error_to_errno(error)));
+    if !core::ptr::eq(client_table, target_table) {
+        // A listener owned by another network namespace is reachable only
+        // through that namespace's link topology. Creating an accept child
+        // here would bypass veth/bridge delivery and leave both smoltcp
+        // engines Closed while the syscall-facing state claimed Connected.
+        return None;
     }
 
-    let entry = SocketAcceptEntry {
-        child,
-        local: listener_local,
-        peer: local,
-        unix_peer: None,
-    };
-    let Some(accept_became_ready) = listener_payload.enqueue_accept_entry(entry) else {
-        let _ = client_table.withdraw_tcp_connection(client_key);
-        let _ = target_table.withdraw_tcp_connection(server_key);
-        return Some(StepOutcome::Err(Errno::ECONNREFUSED));
-    };
+    let outcome = payload
+        .transact_tcp_connect_attempt(Some(attempt), attempt.generation(), |local, remote| {
+            let result = (|| {
+                let listener = target_table
+                    .lookup_tcp_listener_dual_stack_endpoint(remote, guard)
+                    .ok_or(Errno::ECONNREFUSED)?;
+                let listener_payload = listener.acquire_operational().ok_or(Errno::ECONNREFUSED)?;
+                let listener_local = match listener_payload.protocol_snapshot() {
+                    SocketProtocol::Tcp(TcpState::Listening {
+                        local: listener_local,
+                        ..
+                    }) if tcp_listener_accepts_local_endpoint(
+                        &listener_payload,
+                        listener_local,
+                        remote,
+                    ) =>
+                    {
+                        concrete_listener_endpoint(listener_local, remote)
+                    }
+                    _ => return Err(Errno::ECONNREFUSED),
+                };
 
-    payload.with_protocol_mut(|protocol| {
-        *protocol = SocketProtocol::Tcp(TcpState::Connected {
-            local,
-            remote: listener_local,
-        });
-    });
-    socket.readiness.fire_send(SendWireSet::SPACE);
-    if accept_became_ready {
-        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+                let child_options = listener_payload.with_options(Clone::clone);
+                let child = registry::create_connected_stream_for_accept_in_namespace_with_family(
+                    listener_local,
+                    local,
+                    listener_local.family,
+                    child_options,
+                    listener_payload.net_namespace(),
+                )
+                .map_err(|_| Errno::ENOMEM)?;
+
+                let client_key = ConnectionKey::new(local, listener_local);
+                let server_key = ConnectionKey::new(listener_local, local);
+                client_table
+                    .insert_tcp_connection(client_key, socket.clone())
+                    .map_err(table_error_to_errno)?;
+                if let Err(error) = target_table.insert_tcp_connection(server_key, child.clone()) {
+                    let _ = client_table.withdraw_tcp_connection(client_key);
+                    return Err(table_error_to_errno(error));
+                }
+
+                let entry = SocketAcceptEntry {
+                    child,
+                    local: listener_local,
+                    peer: local,
+                    unix_peer: None,
+                };
+                let Some(accept_became_ready) = listener_payload.enqueue_accept_entry(entry) else {
+                    let _ = client_table.withdraw_tcp_connection(client_key);
+                    let _ = target_table.withdraw_tcp_connection(server_key);
+                    return Err(Errno::ECONNREFUSED);
+                };
+                Ok((listener, accept_became_ready))
+            })();
+
+            match result {
+                Ok((listener, accept_became_ready)) => {
+                    socket.readiness.fire_send(SendWireSet::SPACE);
+                    if accept_became_ready {
+                        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+                    }
+                    (StepOutcome::Done(()), TcpConnectDisposition::Connected)
+                }
+                Err(errno) => (
+                    StepOutcome::Err(errno),
+                    TcpConnectDisposition::KeepConnecting,
+                ),
+            }
+        })
+        .unwrap_or(StepOutcome::Err(Errno::ECANCELED));
+    if matches!(outcome, StepOutcome::Err(_)) {
+        cancel_indexed_tcp_connect_attempt(socket, payload, attempt);
     }
-    Some(StepOutcome::Done(()))
+    Some(outcome)
 }
 
 fn namespace_owning_endpoint(remote: IpEndpoint) -> Option<PayloadCap<NetNamespacePayload>> {
@@ -282,35 +357,76 @@ fn tcp_listener_accepts_local_endpoint(
 fn step_connect_unspec(
     socket: &Cap<SocketIdentity>,
     payload: &SocketOperationalEvidence,
-    _guard: &Guard<'_>,
 ) -> StepOutcome<()> {
     if socket.kind != SocketKind::Tcp {
         return StepOutcome::Err(Errno::EAFNOSUPPORT);
     }
 
-    let (local, remote) = match payload.protocol_snapshot() {
-        SocketProtocol::Tcp(TcpState::Connected { local, remote }) => (local, remote),
-        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
-        SocketProtocol::Tcp(_) => return StepOutcome::Err(Errno::EINVAL),
-        _ => return StepOutcome::Err(Errno::EAFNOSUPPORT),
-    };
-
     let table = payload.socket_table();
-    let _ = table.withdraw_tcp_connection(ConnectionKey::new(local, remote));
-    let _ = table.withdraw_tcp_connection(ConnectionKey::new(remote, local));
-    if let Err(errno) = payload.reset_raw_tcp_socket() {
-        return StepOutcome::Err(errno);
+    for _ in 0..4 {
+        let Some((generation, observed_local, observed_remote)) = payload.tcp_flow_snapshot()
+        else {
+            return StepOutcome::Err(Errno::EINVAL);
+        };
+        let reset = payload.reset_tcp_connection(
+            generation,
+            observed_local,
+            observed_remote,
+            |local, remote| {
+                let Ok(mut reservations) =
+                    table.reserve_tcp_disconnect_if_owners(local, remote, socket.raw())
+                else {
+                    return false;
+                };
+                if !reservations.has_owned_forward() {
+                    // Without the source-owned forward index, the reverse
+                    // entry may already belong to a peer reconnect that has
+                    // not published its accepted child yet. Preserve it: only
+                    // the reverse owner can prove that entry is stale.
+                    reservations.commit(false);
+                    return true;
+                }
+                let Some(peer) = reservations.reverse_socket() else {
+                    reservations.commit(false);
+                    return true;
+                };
+                if peer.raw() == socket.raw() {
+                    reservations.commit(true);
+                    return true;
+                }
+                let Some(peer_payload) = peer.acquire_operational() else {
+                    reservations.commit(true);
+                    return true;
+                };
+                match peer_payload.try_with_tcp_flow(remote, local, || {
+                    reservations.commit(true);
+                }) {
+                    TcpFlowGenerationTry::Busy => false,
+                    TcpFlowGenerationTry::Stale => {
+                        // The reverse key belongs to another flow. Restore it
+                        // and disconnect only this socket.
+                        reservations.commit(false);
+                        true
+                    }
+                    TcpFlowGenerationTry::Current(()) => true,
+                }
+            },
+            || {
+                socket.readiness.clear_send(
+                    SendWireSet::SPACE | SendWireSet::BROKEN | SendWireSet::CONNECT_DONE,
+                );
+                socket
+                    .readiness
+                    .clear_recv(RecvWireSet::HAS_DATA | RecvWireSet::BROKEN);
+            },
+        );
+        match reset {
+            Ok(()) => return StepOutcome::Done(()),
+            Err(Errno::ECANCELED) => continue,
+            Err(errno) => return StepOutcome::Err(errno),
+        }
     }
-    payload.with_protocol_mut(|protocol| {
-        *protocol = SocketProtocol::Tcp(TcpState::Init);
-    });
-    socket
-        .readiness
-        .clear_send(SendWireSet::SPACE | SendWireSet::BROKEN);
-    socket
-        .readiness
-        .clear_recv(crate::net::structure::RecvWireSet::HAS_DATA);
-    StepOutcome::Done(())
+    StepOutcome::Err(Errno::EAGAIN)
 }
 
 fn step_unix_connect(
@@ -785,12 +901,14 @@ fn select_routed_local(
             .best_ipv4_route(dst)
             .and_then(|route| route.preferred_src)
             .map(|src| IpEndpoint::new(src, local.port)),
-        crate::net::structure::IpAddress::V6(_) => payload
+        // V5-3: was "first up non-loopback link that has any v6 address",
+        // which ignored the FIB entirely. Now routed like the V4 arm above —
+        // and a destination with NO route yields None, so the caller keeps an
+        // unspecified local and connect() fails fast instead of parking on a
+        // SYN that `decide_ipv6_route` will refuse forever.
+        crate::net::structure::IpAddress::V6(dst) => payload
             .net_namespace()
-            .link_snapshot()
-            .into_iter()
-            .find(|link| link.is_up && !link.is_loopback && link.ipv6_addr.is_some())
-            .and_then(|link| link.ipv6_addr)
+            .preferred_ipv6_source(dst)
             .map(|src| IpEndpoint::new_v6(src, local.port)),
     }
 }

@@ -56,18 +56,14 @@ pub fn step_socket_close(
             }
         }
         SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => {
-            // A connect that has not completed owns no delivered stream data;
-            // aborting it is the normal close behaviour.
             bindings_withdrawn +=
                 withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(local, remote)));
             bindings_withdrawn += withdraw_tcp_bound_if_owner(table, socket, local, guard);
         }
         SocketProtocol::Tcp(TcpState::Connected { .. }) => {
-            // Normal TCP close is asynchronous.  Keep both the payload and its
-            // connection-table reference alive while the delegate drains the
-            // send queue and performs the FIN exchange.  The old fixed
-            // eight-pass inline flush followed by abort could publish EOF
-            // before the HTTP body reached the peer.
+            // close(2) must not destroy a stream while its HTTP response is
+            // still queued.  Keep the table-owned socket alive and let the
+            // delegate drive data plus FIN to completion.
             deferred_tcp_close = true;
             if payload.request_tcp_close() {
                 if let Some(raw_tcp) = payload.raw_tcp_socket() {
@@ -212,9 +208,8 @@ pub fn step_socket_close(
     })
 }
 
-/// Finish a delegate-owned TCP close only after smoltcp has completed the
-/// reliable byte/FIN exchange.  `TimeWait` is safe to detach for the in-kernel
-/// lossless loopback transport: the peer FIN has already been acknowledged.
+/// Release a delegate-owned connected TCP socket only after every queued byte
+/// and the FIN exchange have completed.
 pub(super) fn finalize_tcp_close_if_complete(
     socket: &Cap<SocketIdentity>,
     guard: &Guard<'_>,

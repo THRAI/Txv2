@@ -156,15 +156,21 @@ pub fn kernel_step(
     };
 
     // --- lookup / materialise, with parent-local dentry cache ---
+    //
+    // Resolution authority is the `FsOps::lookup` tier: its per-parent
+    // caches are invalidated on rename/unlink/create keyed by the parent's
+    // fs_object_id, globally. The parent-local dentry child cache is NOT
+    // reliable for (name → ino) resolution — the same directory can have
+    // several live `DEntry` instances (weak child links die and chains get
+    // rebuilt per walk), so a mutation's `remove_cached_child` may purge a
+    // different instance than the one a later walk hits. Trusting a cached
+    // child blindly served pre-rename files: git's second config rewrite
+    // read the pre-first-rewrite content and `remote add` lost the url.
+    // The cached child is used only to PRESERVE the existing DEntry/RNode
+    // (and its PageContainer) identity when the FS agrees on the ino.
     let parent_fs_object_id = current.rnode().fs_object_id();
-    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = if let Some(cached) =
-        current.cached_child(child_inline)
-    {
-        let rnode = cached.rnode().clone();
-        let fs_object_id = rnode.fs_object_id();
-        let meta = rnode.meta();
-        (cached, rnode, fs_object_id, meta)
-    } else {
+    let cached_child = current.cached_child(child_inline);
+    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = {
         let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
             StepOutcome::Done(id) => id,
             StepOutcome::Yield { .. } => {
@@ -219,22 +225,59 @@ pub fn kernel_step(
             }
         };
 
-        let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
-            StepOutcome::Done(m) => m,
-            StepOutcome::Yield { .. } => {
-                let retry_remaining = match remaining_with_component(&component, &remaining) {
-                    Ok(remaining) => remaining,
-                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                };
-                let request = IORequest::LoadInodeMeta {
-                    fs_object_id: child_fs_object_id,
-                };
-                let resume_request = match try_clone_io_request(&request) {
-                    Ok(request) => request,
-                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                };
-                let token = ResumeToken {
-                    walking: WalkingState {
+        if let Some(cached) =
+            cached_child.filter(|c| c.rnode().fs_object_id() == child_fs_object_id)
+        {
+            // FS agrees with the cached instance: keep the existing DEntry so
+            // its RNode/PageContainer identity survives the walk.
+            let rnode = cached.rnode().clone();
+            let meta = rnode.meta();
+            (cached, rnode, child_fs_object_id, meta)
+        } else {
+            // Stale or absent cached instance: drop it and materialise fresh.
+            current.remove_cached_child(child_inline);
+
+            let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
+                StepOutcome::Done(m) => m,
+                StepOutcome::Yield { .. } => {
+                    let retry_remaining = match remaining_with_component(&component, &remaining) {
+                        Ok(remaining) => remaining,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                    };
+                    let request = IORequest::LoadInodeMeta {
+                        fs_object_id: child_fs_object_id,
+                    };
+                    let resume_request = match try_clone_io_request(&request) {
+                        Ok(request) => request,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                    };
+                    let token = ResumeToken {
+                        walking: WalkingState {
+                            current,
+                            remaining: retry_remaining,
+                            hop_count,
+                            mount_root,
+                            current_mount,
+                            mount_root_mount,
+                            must_be_directory,
+                        },
+                        request: resume_request,
+                        mount_namespace: None,
+                        hop_count,
+                    };
+                    return KernelStep::NeedIO(request, token);
+                }
+                StepOutcome::Err(e) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::from(e),
+                    ));
+                }
+                StepOutcome::Continue { .. } => {
+                    let retry_remaining = match remaining_with_component(&component, &remaining) {
+                        Ok(remaining) => remaining,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
+                    };
+                    return KernelStep::Continue(WalkState::Walking(WalkingState {
                         current,
                         remaining: retry_remaining,
                         hop_count,
@@ -242,82 +285,60 @@ pub fn kernel_step(
                         current_mount,
                         mount_root_mount,
                         must_be_directory,
+                    }));
+                }
+            };
+
+            let child_rnode_cap = match materialise_child(
+                &fs_ops,
+                child_fs_object_id,
+                &child_meta,
+                mount_payload.as_ref(),
+                &WalkingState {
+                    current: current.clone(),
+                    remaining: match remaining_with_component(&component, &remaining) {
+                        Ok(remaining) => remaining,
+                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
                     },
-                    request: resume_request,
-                    mount_namespace: None,
                     hop_count,
-                };
-                return KernelStep::NeedIO(request, token);
-            }
-            StepOutcome::Err(e) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
-                    e,
-                )));
-            }
-            StepOutcome::Continue { .. } => {
-                let retry_remaining = match remaining_with_component(&component, &remaining) {
-                    Ok(remaining) => remaining,
-                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                };
-                return KernelStep::Continue(WalkState::Walking(WalkingState {
-                    current,
-                    remaining: retry_remaining,
-                    hop_count,
-                    mount_root,
-                    current_mount,
-                    mount_root_mount,
+                    mount_root: mount_root.clone(),
+                    current_mount: current_mount.clone(),
+                    mount_root_mount: mount_root_mount.clone(),
                     must_be_directory,
-                }));
-            }
-        };
-
-        let child_rnode_cap = match materialise_child(
-            &fs_ops,
-            child_fs_object_id,
-            &child_meta,
-            mount_payload.as_ref(),
-            &WalkingState {
-                current: current.clone(),
-                remaining: match remaining_with_component(&component, &remaining) {
-                    Ok(remaining) => remaining,
-                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
                 },
-                hop_count,
-                mount_root: mount_root.clone(),
-                current_mount: current_mount.clone(),
-                mount_root_mount: mount_root_mount.clone(),
-                must_be_directory,
-            },
-            guard,
-        ) {
-            Ok(rnode) => rnode,
-            Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
-            Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
-            Err(_) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EIO));
-            }
-        };
+                guard,
+            ) {
+                Ok(rnode) => rnode,
+                Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
+                Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
+                Err(_) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::EIO,
+                    ));
+                }
+            };
 
-        let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
-        child_dentry_raw.set_parent_hint(&current);
-        let child_dentry = match step_engine::sign(child_dentry_raw) {
-            Ok(cap) => cap,
-            Err(_) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(
-                    crate::execution::Errno::ENOMEM,
-                ));
-            }
-        };
-        let child_dentry = current.cache_child(child_dentry);
-        let child_rnode_cap = child_dentry.rnode().clone();
-        let child_fs_object_id = child_rnode_cap.fs_object_id();
-        let child_meta = child_rnode_cap.meta();
-        (
-            child_dentry,
-            child_rnode_cap,
-            child_fs_object_id,
-            child_meta,
-        )
+            let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
+            child_dentry_raw.set_parent_hint(&current);
+            let child_dentry = match step_engine::sign(child_dentry_raw) {
+                Ok(cap) => cap,
+                Err(_) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::ENOMEM,
+                    ));
+                }
+            };
+            let child_dentry = current.cache_child(child_dentry);
+            let child_rnode_cap = child_dentry.rnode().clone();
+            let child_fs_object_id = child_rnode_cap.fs_object_id();
+            let child_meta = child_rnode_cap.meta();
+            (
+                child_dentry,
+                child_rnode_cap,
+                child_fs_object_id,
+                child_meta,
+            )
+        }
     };
 
     // --- mid-path non-directory check ---
@@ -448,7 +469,17 @@ fn crossing_mount_for(
     guard: &Guard<'_>,
 ) -> Option<Cap<MountIdentity>> {
     if let Some(namespace) = mount_namespace {
-        return namespace.mount_for(child_dentry);
+        if let Some(mount) = namespace.mount_for(child_dentry) {
+            return Some(mount);
+        }
+        // The registered mountpoint DEntry is held weakly by its parent's
+        // child cache; a mutation invalidation on the parent (e.g. `mkdir
+        // /etc` invalidating "/") drops it, after which the walker holds a
+        // freshly materialised instance whose cap key cannot match. Fall
+        // back to object identity — still namespace-local.
+        return mount_payload.and_then(|payload| {
+            namespace.mount_for_mountpoint_object(payload, child_fs_object_id)
+        });
     }
 
     child_dentry

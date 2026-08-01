@@ -8,6 +8,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMute
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::{FsObjectId, FsOps};
 
@@ -404,16 +405,11 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => {
                     if (arg & O_NONBLOCK as u64) != 0 {
-                        if let OpenFileBacking::Rnode { rnode } = file.backing() {
-                            if let RNodeBacking::StructBacked {
-                                payload: StructPayload::Socket { identity },
-                            } = rnode.backing()
-                            {
-                                identity.readiness.fire_send_with_post(
-                                    tx_subsystems::net::structure::SendWireSet::SPACE,
-                                    |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
-                                );
-                            }
+                        if let Some(ops) = file.file_ops() {
+                            let mut post = |mailbox: &TaskMailbox, event: MailboxEvent| {
+                                ctx.post_mailbox_ref_event(mailbox, event)
+                            };
+                            ops.on_set_fl_nonblock(&mut post);
                         }
                     }
                     SyscallResult::Return(0)
@@ -980,7 +976,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
             cred: ctx.walker_cred(),
         };
         let mailbox_arc = script_ctx.mailbox().cloned();
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let timer_registrar_handle = script_ctx.timer_registrar().cloned();
         let delegate_registry_arc = script_ctx.delegate_registry().cloned();
         let openfile = match drive(
             op,
@@ -988,7 +984,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
             DriveMode::Waiting,
             mailbox_arc.as_ref(),
             delegate_registry_arc.as_deref(),
-            timer_wheel_arc.as_ref(),
+            timer_registrar_handle.as_ref(),
         )
         .await
         {
@@ -1085,31 +1081,35 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         if dentry_meta.kind() == InodeKind::Directory {
             return SyscallResult::Error(EISDIR_VALUE);
         }
-        use StepOutcome as V3Trunc;
-        let fs_object_id = dentry.rnode().fs_object_id();
-        let guard = step_engine::guard();
-        let truncate_result: Result<(), Errno> = match dentry.rnode().backing() {
-            RNodeBacking::PageBacked { pc } => {
-                match tx_subsystems::page_backed::step_truncate(pc, 0, &guard) {
-                    V3Trunc::Done(()) => Ok(()),
-                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
-                    V3Trunc::Err(errno) => Err(Errno::from(errno)),
+        if dentry_meta.kind() == InodeKind::CharDevice {
+            // Linux treats O_TRUNC on character devices as a no-op.
+        } else {
+            use StepOutcome as V3Trunc;
+            let fs_object_id = dentry.rnode().fs_object_id();
+            let guard = step_engine::guard();
+            let truncate_result: Result<(), Errno> = match dentry.rnode().backing() {
+                RNodeBacking::PageBacked { pc } => {
+                    match tx_subsystems::page_backed::step_truncate(pc, 0, &guard) {
+                        V3Trunc::Done(()) => Ok(()),
+                        V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
+                        V3Trunc::Err(errno) => Err(Errno::from(errno)),
+                    }
                 }
-            }
-            _ => {
-                let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
-                    Some(b) => b,
-                    None => return SyscallResult::Error(ENOSYS_VALUE),
-                };
-                match fs_page_backing.truncate(fs_object_id, 0, &guard) {
-                    V3Trunc::Done(()) => Ok(()),
-                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
-                    V3Trunc::Err(errno) => Err(Errno::from(errno)),
+                _ => {
+                    let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
+                        Some(b) => b,
+                        None => return SyscallResult::Error(ENOSYS_VALUE),
+                    };
+                    match fs_page_backing.truncate(fs_object_id, 0, &guard) {
+                        V3Trunc::Done(()) => Ok(()),
+                        V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
+                        V3Trunc::Err(errno) => Err(Errno::from(errno)),
+                    }
                 }
+            };
+            if let Err(errno) = truncate_result {
+                return SyscallResult::error_from(errno);
             }
-        };
-        if let Err(errno) = truncate_result {
-            return SyscallResult::error_from(errno);
         }
     }
 

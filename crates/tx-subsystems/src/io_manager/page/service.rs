@@ -872,8 +872,16 @@ impl PageService {
         block_queue: &mut BlockQueue,
         request: PageIoRequest,
     ) -> Result<PageServiceBackendSubmitOutcome, PageServiceBackendSubmitError> {
-        let PageServiceBackendOutcome::BlockGraph(graph) = outcome else {
-            return queue_backend_outcome(outcome, block_queue, request);
+        let graph = match outcome {
+            PageServiceBackendOutcome::Err(errno) => {
+                let wake = self.queue_graph_terminal_completion(request, Err(errno));
+                return Ok(PageServiceBackendSubmitOutcome::QueuedPageCompletions {
+                    queued: 1,
+                    wake: Some(wake),
+                });
+            }
+            PageServiceBackendOutcome::BlockGraph(graph) => graph,
+            outcome => return queue_backend_outcome(outcome, block_queue, request),
         };
         if self.graphs.contains_key(&request.id) {
             return Err(PageServiceBackendSubmitError::DuplicateGraph(request.id));
@@ -1737,6 +1745,14 @@ mod tests {
         }
     }
 
+    struct ErrorPlanner;
+
+    impl BackendPlanner for ErrorPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Err(Errno::EIO)
+        }
+    }
+
     struct BioPlanner;
 
     impl BackendPlanner for BioPlanner {
@@ -2275,6 +2291,49 @@ mod tests {
             service.drain_turn(ServiceBudget::new(1)),
             PageServiceTurn::Work(alloc::vec![routed_completion(id)])
         );
+    }
+
+    #[test]
+    fn page_service_submission_terminalizes_backend_planner_error() {
+        let mut service = PageService::new(4);
+        let id = demand_request(&mut service);
+        let request = match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut items) => match items.remove(0) {
+                PageServiceWork::Submission(request) => request,
+                other => panic!("expected submission, got {other:?}"),
+            },
+            other => panic!("expected submission turn, got {other:?}"),
+        };
+        let mut block_queue = BlockQueue::new(4);
+
+        let outcome = service
+            .consume_backend_submission(
+                FsObjectKey::new(55),
+                request,
+                &ErrorPlanner,
+                &mut block_queue,
+            )
+            .expect("backend error terminalization");
+
+        assert_eq!(
+            outcome,
+            PageServiceBackendSubmitOutcome::QueuedPageCompletions {
+                queued: 1,
+                wake: Some(PageServiceWake::AlreadyRunnable),
+            }
+        );
+        assert!(block_queue.is_empty());
+        match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut items) => match items.remove(0) {
+                PageServiceWork::Completion(route) => {
+                    assert_eq!(route.completion.id, id);
+                    assert_eq!(route.completion.result, PageIoResult::Err(Errno::EIO));
+                    assert_eq!(route.completion.kind, PageIoCompletionKind::ReadInstalled);
+                }
+                other => panic!("expected terminal completion, got {other:?}"),
+            },
+            other => panic!("expected completion turn, got {other:?}"),
+        }
     }
 
     #[test]

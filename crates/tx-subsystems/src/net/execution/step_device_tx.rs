@@ -2,13 +2,15 @@ use alloc::vec::Vec;
 use smoltcp::time::Instant;
 use tx_substrate::zone::{Cap, PayloadCap};
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{PacketTxReadiness, PacketTxResult, PacketTxSink};
 use crate::net::protocol::{build_icmpv4_echo_request, build_icmpv6_echo_request_packet};
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
 };
+
+use super::step_connect::fail_indexed_tcp_connect_attempt;
 
 pub const DEVICE_TX_BUDGET_DEFAULT: DeviceTxBudget = DeviceTxBudget {
     tcp_connecting: 16,
@@ -235,47 +237,89 @@ fn process_tcp_tx_socket(
     let Some(payload) = ident.acquire_operational() else {
         return;
     };
+    // Loopback and physical-device TX are distinct routing owners.  The
+    // loopback handshake/data lane consumes smoltcp egress into LoopbackIface;
+    // letting this lane consume the same socket races that lane and can put a
+    // SYN/SYN-ACK on the virtio device instead of the loopback queue.
+    if tcp_remote_endpoint(&payload.protocol_snapshot()).is_some_and(IpEndpoint::is_loopback) {
+        return;
+    }
     let Some(raw_tcp) = payload.raw_tcp_socket() else {
         return;
     };
     // P2-S4 drain loop: keep dispatching until smoltcp has nothing to send,
-    // the sink backpressures, or the per-socket budget is spent. A segment
-    // popped by `dispatch_segment` that the sink then refuses is recovered
-    // by smoltcp's RTO (same exposure as the previous single-shot shape);
-    // the readiness probe before each dispatch keeps that window small.
+    // the sink backpressures, or the per-socket budget is spent. The sink
+    // transmit runs INSIDE the dispatch closure (`dispatch_segment_via`):
+    // when the sink refuses, the closure errors out of smoltcp's dispatch
+    // and the segment stays queued for the next pass. The previous
+    // pop-then-drop shape lost the segment on every Busy — smoltcp
+    // believed it was on the wire, so each burst that outran the virtio
+    // TX queue minted a real hole, and the retransmit rewind re-blasted a
+    // full window that overran the queue again (self-sustaining loss
+    // thrash on bulk uploads).
     let mut sent = false;
     for _ in 0..TCP_TX_SOCKET_DRAIN_BUDGET {
         if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
             outcome.tcp_busy += 1;
             break;
         }
-        let Some(packet) = raw_tcp
-            .dispatch_segment()
-            .and_then(|segment| segment.emit_ipv4_packet())
-        else {
+        let mut accepted_bytes = None;
+        let mut busy = false;
+        let mut pending = false;
+        let mut failed = false;
+        let dispatch = raw_tcp.dispatch_segment_via(now, usize::from(sink.ip_mtu()), |segment| {
+            let Some(packet) = segment.emit_ipv4_packet() else {
+                // Unbuildable (e.g. no route yet): refuse so it stays
+                // queued — dropping it here would mint a wire hole.
+                failed = true;
+                return false;
+            };
+            match sink.transmit_at(packet.as_bytes(), now, guard) {
+                PacketTxResult::Accepted { frame_len } => {
+                    accepted_bytes = Some(frame_len);
+                    true
+                }
+                PacketTxResult::Busy => {
+                    busy = true;
+                    false
+                }
+                PacketTxResult::PendingResolution { .. } => {
+                    pending = true;
+                    false
+                }
+                PacketTxResult::Failed { .. } => {
+                    failed = true;
+                    false
+                }
+            }
+        });
+        if let Some(attempt) = dispatch.timed_out_connect_attempt {
+            if let Some(wakes) =
+                fail_indexed_tcp_connect_attempt(socket, &payload, attempt, Errno::ETIMEDOUT)
+            {
+                outcome.wakes_fired += wakes;
+            }
+        }
+        let Some(emitted) = dispatch.emitted else {
             break;
         };
-
         outcome.tcp_attempted += 1;
-        match sink.transmit_at(packet.as_bytes(), now, guard) {
-            PacketTxResult::Accepted { frame_len } => {
+        if emitted {
+            if let Some(frame_len) = accepted_bytes {
                 outcome.tcp_packets += 1;
                 outcome.tx_bytes += frame_len;
                 sent = true;
             }
-            PacketTxResult::Busy => {
-                outcome.tcp_busy += 1;
-                break;
-            }
-            PacketTxResult::PendingResolution { .. } => {
-                outcome.tcp_resolution_pending += 1;
-                break;
-            }
-            PacketTxResult::Failed { .. } => {
-                outcome.tcp_failed += 1;
-                break;
-            }
+            continue;
         }
+        if busy {
+            outcome.tcp_busy += 1;
+        } else if pending {
+            outcome.tcp_resolution_pending += 1;
+        } else if failed {
+            outcome.tcp_failed += 1;
+        }
+        break;
     }
     if sent {
         outcome.sockets_touched += 1;
@@ -309,8 +353,8 @@ fn process_udp_tx_socket(
     // P2-S6: pop through smoltcp dispatch so the wire source is the
     // dispatch-resolved endpoint (bound address or enqueue-time hint) —
     // sockets autobound to 0.0.0.0 must not emit src-unspecified packets.
-    // The pop is destructive; a sink refusal drops the datagram (UDP is
-    // best-effort and the readiness probe above keeps that window small).
+    // V5-1: the pop is destructive, so every non-`Accepted` sink answer must
+    // undo it via `restore_udp_tx_datagram` below.
     let Some(drain) = payload.take_udp_tx_datagram() else {
         return;
     };
@@ -333,14 +377,34 @@ fn process_udp_tx_socket(
                 outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
             }
         }
-        PacketTxResult::Busy => {
-            outcome.udp_busy += 1;
-        }
-        PacketTxResult::PendingResolution { .. } => {
-            outcome.udp_resolution_pending += 1;
-        }
-        PacketTxResult::Failed { .. } => {
-            outcome.udp_failed += 1;
+        // V5-1: a refused datagram goes BACK on the queue instead of into the
+        // void. The other two lanes never had this hole — TCP refuses from
+        // inside the dispatch closure so the segment never leaves smoltcp
+        // (01aea500, the bulk-upload wedge fix), and raw ICMPv6 is
+        // peek → transmit → commit. UDP was the last lane still losing data.
+        //
+        // The concrete failure this closes: the initial namespace is scanned
+        // by TWO device-TX sinks per delegate round — the boot lane's iface
+        // (init/net.rs, built with `IfaceCommon::with_gateway` and NO
+        // `.with_ipv6`) runs first, then the per-link namespace iface. The
+        // boot iface therefore answers `Unreachable` -> `Failed{EADDRNOTAVAIL}`
+        // for every unicast IPv6 destination, and the datagram was destroyed
+        // before the iface that could actually route it ever saw the socket.
+        // Net effect: external IPv6 UDP never reached the wire at all.
+        refused => {
+            if payload.restore_udp_tx_datagram(drain) {
+                match refused {
+                    PacketTxResult::Busy => outcome.udp_busy += 1,
+                    PacketTxResult::PendingResolution { .. } => {
+                        outcome.udp_resolution_pending += 1;
+                    }
+                    _ => outcome.udp_failed += 1,
+                }
+            } else {
+                // The tx ring filled up behind us: now it really is a
+                // best-effort drop.
+                outcome.udp_failed += 1;
+            }
         }
     }
 }
@@ -440,6 +504,15 @@ fn process_raw_icmp_tx_socket(
 
 fn is_external_ipv4(addr: Ipv4Address) -> bool {
     addr != Ipv4Address::LOOPBACK && addr != Ipv4Address::BROADCAST
+}
+
+fn tcp_remote_endpoint(protocol: &SocketProtocol) -> Option<IpEndpoint> {
+    match protocol {
+        SocketProtocol::Tcp(
+            TcpState::Connecting { remote, .. } | TcpState::Connected { remote, .. },
+        ) => Some(*remote),
+        _ => None,
+    }
 }
 
 fn is_tcp_connecting(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {

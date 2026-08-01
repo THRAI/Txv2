@@ -1572,8 +1572,8 @@ where
             K::on_page_fault(view, fault)
         }
         TrapClass::Syscall => K::on_syscall(view),
-        TrapClass::TimerInterrupt => K::on_timer_interrupt(P::current_cpu_id()),
-        TrapClass::ExternalInterrupt => K::on_external_irq(P::current_cpu_id()),
+        TrapClass::TimerInterrupt => K::on_timer_interrupt(P::current_cpu_id(), view),
+        TrapClass::ExternalInterrupt => K::on_external_irq(P::current_cpu_id(), view),
         TrapClass::InterprocessorInterrupt => K::on_ipi(P::current_cpu_id()),
         TrapClass::IllegalInstruction
         | TrapClass::AlignmentFault
@@ -1607,9 +1607,9 @@ pub trait KernelTrapSink<P: TxPlatform> {
 
     fn on_syscall(view: TrapFrameMut<'_>) -> TrapAction;
 
-    fn on_timer_interrupt(cpu: CpuId) -> TrapAction;
+    fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
-    fn on_external_irq(cpu: CpuId) -> TrapAction;
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
     /// Called when an IPI arrives. Distinct from on_external_irq
     /// because IPIs are not driven by IrqIf; they come from peer
@@ -1678,11 +1678,11 @@ impl<P: TxPlatform> KernelTrapSink<P> for Kernel {
     fn on_syscall(view: TrapFrameMut<'_>) -> TrapAction {
         syscall::dispatch::<P>(view)
     }
-    fn on_timer_interrupt(cpu: CpuId) -> TrapAction {
-        scheduler::on_timer_tick::<P>(cpu)
+    fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+        scheduler::on_timer_tick::<P>(cpu, view)
     }
-    fn on_external_irq(cpu: CpuId) -> TrapAction {
-        irq::dispatch_external::<P>(cpu)
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+        irq::dispatch_external::<P>(cpu, view)
     }
     fn on_ipi(cpu: CpuId) -> TrapAction {
         smp::dispatch_ipi::<P>(cpu)
@@ -1813,7 +1813,10 @@ pub struct SavedSignalFrame {
 
 `IrqIf` is the platform's interrupt-controller surface. It owns claim/complete cycles, masking, and per-line handler installation.
 
-**Cross-reference.** Handler registration uses an explicit `register_irq_handler(irq, fn)` call (not a linkme slice); §13.2.1 records the seven-point case. The runtime IRQ path indexes the installed `IrqDispatchTable` directly. See §21 for the broader linkme policy.
+**Cross-reference.** Handler registration uses an explicit
+`register_irq_handler(irq, fn)` call (not a linkme slice); §13.2.2 records the
+seven-point case. The runtime IRQ path indexes the installed
+`IrqDispatchTable` directly. See §21 for the broader linkme policy.
 
 ### 13.1 Trait surface
 <!-- txdoc:HAL-IRQIF-TRAIT-SURFACE-1 -->
@@ -1835,13 +1838,22 @@ pub trait IrqIf {
     /// `boards/tx-hal-riscv64-qemu-virt/src/lib.rs::Platform::UART_IRQ`).
     const UART_IRQ: u32 = 0;
 
+    /// Platform-specific persistent-clock alarm IRQ, or zero when absent.
+    const RTC_IRQ: u32 = 0;
+
+    /// Platform-specific boot network-device IRQ, or zero when no route has
+    /// been proven. RV64 QEMU `virtio1@0x1000_2000` uses PLIC IRQ 2. LA64
+    /// keeps the zero sentinel until its virtio-pci route is established.
+    const NET_IRQ: u32 = 0;
+
     /// Claim the highest-priority pending IRQ on the current hart.
     /// Called from the trap shell after classify returns
     /// TrapClass::ExternalInterrupt.
     /// Returns 0 if no IRQ is actually pending (spurious).
     fn claim() -> u32;
 
-    /// Acknowledge completion of an IRQ. Must be paired with claim.
+    /// Acknowledge completion of an IRQ. Must be paired with claim and called
+    /// from the same controller context that performed that claim.
     fn complete(irq: u32);
 
     /// Mask an IRQ at the controller level.
@@ -1877,6 +1889,9 @@ pub enum IrqHandled {
     Done,
     /// Handler woke a thread that should run; reschedule recommended.
     Wake,
+    /// Handler requested a wake and retained ownership of controller
+    /// completion. A same-context bottom half must complete exactly once.
+    DeferredWake,
     /// Handler did nothing (shared IRQ that wasn't ours).
     NotMine,
 }
@@ -1894,21 +1909,15 @@ register_irq_handler(8 /* PLIC line 8 on qemu-virt */, virtio_blk_irq_handler);
 // In tx-kernel/src/init.rs::install_irq_handlers, called once at boot
 // after register_console_hardware has populated CONSOLE_TTY:
 pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
-    let irq = <P as IrqIf>::UART_IRQ;
-    register_irq_handler(irq, uart_rx_irq_handler::<P>);
+    register_irq_handler(P::UART_IRQ, uart_rx_irq_handler::<P>);
+    if P::RTC_IRQ != 0 {
+        register_irq_handler(P::RTC_IRQ, rtc_alarm_irq_handler::<P>);
+    }
+    if P::NET_IRQ != 0 {
+        register_irq_handler(P::NET_IRQ, net_rx_irq_handler::<P>);
+    }
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
-    <P as IrqIf>::set_priority(irq, 1);
-    <P as IrqIf>::unmask(irq);
-}
-```
-
-`tx-hal` defines:
-
-```rust
-pub struct IrqHandlerRegistration {
-    pub irq: u32,
-    pub handler: IrqHandlerFn,
-    pub name: &'static str,
+    // Set priority and unmask each non-zero registered source only now.
 }
 ```
 
@@ -1916,24 +1925,22 @@ After the explicit `install_dispatch_table` call, the runtime path is:
 
 ```rust
 // In KernelTrapSink::on_external_irq:
-fn on_external_irq(cpu: CpuId) -> TrapAction {
+fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
     let irq = P::claim();
     if irq == 0 { return TrapAction::Resume; }  // spurious
 
-    let handler = INSTALLED_TABLE.entries[irq as usize];
-    let result = match handler {
-        Some(h) => h(irq),
-        None => {
-            log::warn!("unhandled IRQ {}, masking", irq);
-            P::mask(irq);
-            IrqHandled::Done
-        }
-    };
+    let result = P::dispatch_irq(irq);
 
-    P::complete(irq);
+    if !matches!(result, IrqHandled::DeferredWake) {
+        P::complete(irq);
+    }
 
     match result {
-        IrqHandled::Wake => TrapAction::Reschedule,
+        IrqHandled::Wake | IrqHandled::DeferredWake => {
+            // A user-mode interruption first records `view` in the
+            // userspace-run handoff slot, then requests reschedule.
+            reschedule_with_user_handoff_if_needed::<P>(cpu, view)
+        }
         IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
     }
 }
@@ -1941,7 +1948,34 @@ fn on_external_irq(cpu: CpuId) -> TrapAction {
 
 The runtime path indexes the installed table directly.
 
-#### 13.2.1 Why explicit registration, not linkme
+#### 13.2.1 Deferred completion
+<!-- txdoc:HAL-IRQIF-DEFERRED-COMPLETION-1 -->
+
+A level-triggered device whose acknowledgement takes locks uses
+`IrqHandled::DeferredWake`. The top half publishes the IRQ number into the
+claimant hart's atomic slot without taking a lock or creating an epoch guard.
+Both reactor runners accept a generic future-poll budget; the kernel uses a
+one-poll budget and checks device bottom halves before and after each BSP/AP
+step. This gives the claimant hart a prompt task-context completion boundary
+without introducing a reactor dependency on HAL or device code. The bottom
+half then performs:
+
+```text
+device ACK -> bounded device poll / semantic wake -> software slot idle
+           -> IrqIf::complete(original_irq)
+```
+
+The controller claim remains outstanding during the whole bottom-half delay,
+so the PLIC gateway itself throttles that source. Do not mask the PLIC source
+before completion: the PLIC specification permits a completion for a source
+that is disabled in the target context to be ignored. Do not complete before
+the device ACK: a still-asserted level source can immediately become pending
+again. See the
+[PLIC completion contract](https://docs.riscv.org/reference/plic/plic-completion.html)
+and the
+[VirtIO MMIO interrupt acknowledgement contract](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
+
+#### 13.2.2 Why explicit registration, not linkme
 
 Pre-ELF Open Q #4 (decided 2026-05-06; the planning chore commit appears
 in `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
@@ -2744,7 +2778,7 @@ pub enum InitPhase {
 
 **Not on this list:** `IRQ_HANDLERS`. IRQ handler registration is
 explicit (`tx_kernel::irq::register_irq_handler`), not linkme; see
-§13.2.1 for the seven-point case.
+§13.2.2 for the seven-point case.
 
 ### 21.3 Forbidden uses
 <!-- txdoc:HAL-LINKME-REGISTRATION-DISCIPLINE-FORBIDDEN-USES-1 -->

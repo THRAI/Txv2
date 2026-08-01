@@ -56,7 +56,7 @@ use tx_observe_types::{
     PayloadArgValue, PayloadSyscallEnter, PayloadSyscallExit, TxPayloadTag, TxValueKind,
 };
 use tx_scripts::process::exec::{ExecError, ExecScriptOp};
-use tx_services::time::{ClockRead, RealtimeControl, TimekeeperClock};
+use tx_services::time::{timekeeper_clock, ClockRead, RealtimeControl, TimekeeperClock};
 use tx_subsystems::cred::{
     Capability, CapabilitySet, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
     SetreuidOp, SetuidOp, Uid,
@@ -473,6 +473,98 @@ pub(super) const SIGACTION_BYTES: usize = 24;
 /// land without a context-shape break; the field is intentionally
 /// unused by the four current arms.
 ///
+// PROBE(proxy-push segv hunt): syscall history ring. Records (nr, ret) of
+// every main-dispatch syscall; dumped by the fatal-trap post-mortem so we can
+// see which syscall returned a bad value right before userspace faulted.
+const SYSHIST_LEN: usize = 40;
+static SYSHIST_NR: [core::sync::atomic::AtomicU64; SYSHIST_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SYSHIST_LEN];
+static SYSHIST_RET: [core::sync::atomic::AtomicI64; SYSHIST_LEN] =
+    [const { core::sync::atomic::AtomicI64::new(0) }; SYSHIST_LEN];
+// meta word: pid<<48 | (arg0 & 0xffff)<<32 | (arg2 & 0xffffffff) — for fd-shaped
+// syscalls this reads as pid/fd/count.
+static SYSHIST_META: [core::sync::atomic::AtomicU64; SYSHIST_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SYSHIST_LEN];
+static SYSHIST_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn syshist_record(nr: u64, ret: i64, pid: u64, arg0: u64, arg2: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Skip rt_sigaction: spawn children reset all 64 signals in a loop, which
+    // floods the whole ring and evicts the pre-fork VM syscalls we care about.
+    if nr == 134 {
+        return;
+    }
+    let i = SYSHIST_POS.fetch_add(1, Relaxed) % SYSHIST_LEN;
+    SYSHIST_NR[i].store(nr, Relaxed);
+    SYSHIST_RET[i].store(ret, Relaxed);
+    let meta = (pid << 48) | ((arg0 & 0xffff) << 32) | (arg2 & 0xffff_ffff);
+    SYSHIST_META[i].store(meta, Relaxed);
+}
+
+fn syshist_ret_of(r: &SyscallResult) -> i64 {
+    match r {
+        SyscallResult::Return(v) => *v,
+        SyscallResult::CloneReturn { value, .. } => *value,
+        SyscallResult::Error(e) => -(*e as i64),
+        _ => i64::MIN,
+    }
+}
+
+/// Length of the syscall-history ring (probe).
+pub const SYSCALL_HISTORY_LEN: usize = SYSHIST_LEN;
+
+/// Snapshot the syscall-history ring for the fatal-trap post-mortem.
+/// Newest entry is at `(pos - 1) % LEN`. The third array is the meta word
+/// (`pid<<48 | fd<<32 | count`) recorded per entry.
+pub fn syscall_history_snapshot() -> (
+    [u64; SYSHIST_LEN],
+    [i64; SYSHIST_LEN],
+    [u64; SYSHIST_LEN],
+    usize,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut nrs = [0u64; SYSHIST_LEN];
+    let mut rets = [0i64; SYSHIST_LEN];
+    let mut metas = [0u64; SYSHIST_LEN];
+    for i in 0..SYSHIST_LEN {
+        nrs[i] = SYSHIST_NR[i].load(Relaxed);
+        rets[i] = SYSHIST_RET[i].load(Relaxed);
+        metas[i] = SYSHIST_META[i].load(Relaxed);
+    }
+    (nrs, rets, metas, SYSHIST_POS.load(Relaxed))
+}
+
+/// PROBE(proxy-push segv hunt): read user memory for the fatal-trap
+/// post-mortem hexdump. Returns false when the range is unmapped/unreadable.
+pub fn probe_copy_from_user(
+    aspace: &tx_subsystems::vm::AddressSpace,
+    uaddr: u64,
+    dst: &mut [u8],
+) -> bool {
+    user_copy::bootstrap_copy_from_user(aspace, dst, uaddr).is_ok()
+}
+
+/// Syscalls whose lane reaches the network stack, so the non-generic net
+/// clock bridge gets a fresh monotonic reading before they run. Without
+/// this the bridge only advances on delegate ticks and smoltcp's
+/// retransmit/RTT/TIME-WAIT timers stall on the syscall path.
+fn syscall_publishes_net_clock(nr: u64) -> bool {
+    nr == NR_CONNECT
+        || nr == NR_SENDTO
+        || nr == NR_RECVFROM
+        || nr == NR_SENDMSG
+        || nr == NR_RECVMSG
+        || nr == NR_SENDMMSG
+        || nr == NR_RECVMMSG
+        || nr == NR_ACCEPT
+        || nr == NR_ACCEPT4
+        || nr == NR_SHUTDOWN
+        || nr == NR_SETSOCKOPT
+        || nr == NR_PPOLL
+        || nr == NR_PSELECT6
+        || nr == NR_PSELECT6_TIME64
+}
+
 /// Dispatch a Phase 2a syscall.
 ///
 /// This is the single entry point that maps a `SyscallRequest` to a
@@ -518,7 +610,13 @@ where
     time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
 
     let result = dispatch_inner::<P>(req, ctx).await;
-
+    syshist_record(
+        req.nr,
+        syshist_ret_of(&result),
+        ctx.process.pid.0 as u64,
+        req.args[0],
+        req.args[2],
+    );
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
     result
@@ -883,26 +981,6 @@ pub fn dispatch_writev_pagebacked_oneshot(
     Some(result)
 }
 
-/// Socket-family syscalls can enter smoltcp before the delegate gets a turn.
-/// Publish the platform clock on those paths so protocol timers see current
-/// monotonic time instead of the bridge's boot-time default.
-fn syscall_publishes_net_clock(nr: u64) -> bool {
-    nr == NR_CONNECT
-        || nr == NR_SENDTO
-        || nr == NR_RECVFROM
-        || nr == NR_SENDMSG
-        || nr == NR_RECVMSG
-        || nr == NR_SENDMMSG
-        || nr == NR_RECVMMSG
-        || nr == NR_ACCEPT
-        || nr == NR_ACCEPT4
-        || nr == NR_SHUTDOWN
-        || nr == NR_SETSOCKOPT
-        || nr == NR_PPOLL
-        || nr == NR_PSELECT6
-        || nr == NR_PSELECT6_TIME64
-}
-
 async fn dispatch_inner<
     'a,
     P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf + tx_hal::ConsoleIf,
@@ -913,8 +991,12 @@ async fn dispatch_inner<
 where
     TimekeeperClock<P>: ClockRead + RealtimeControl,
 {
+    // Publish a fresh monotonic reading to the net clock bridge before any
+    // lane that reaches the network stack. `net/clock.rs` is below the
+    // platform generic, so smoltcp's retransmit/RTT/TIME-WAIT timers would
+    // otherwise only advance on delegate ticks and stall on the syscall path.
     if syscall_publishes_net_clock(req.nr) {
-        tx_subsystems::net::clock::net_set_now_ns(P::read_ns());
+        tx_subsystems::net::clock::net_set_now_ns(timekeeper_clock::<P>().monotonic_now_ns());
     }
 
     // ── Lane 1: ImmediateSyscall (pure ABI queries, never yield) ──
@@ -1020,7 +1102,7 @@ where
         nr if nr == NR_SPLICE => sys_splice::<P>(req.args, ctx).await,
         nr if nr == NR_TEE => sys_tee(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
-        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx).await,
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),

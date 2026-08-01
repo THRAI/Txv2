@@ -247,6 +247,19 @@ impl RawIcmpSocket {
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
+        self.recv_len_with_ipv4_header(len, peek, true)
+    }
+
+    /// `SOCK_RAW` reports the whole IPv4 packet; `SOCK_DGRAM` (the Linux ping
+    /// socket) reports only the ICMP message. Callers pass
+    /// `is_raw_icmp_socket()` so the datagram flavour does not hand userspace
+    /// 20 bytes of IPv4 header it never asked for.
+    pub fn recv_len_with_ipv4_header(
+        &self,
+        len: usize,
+        peek: bool,
+        include_ipv4_header: bool,
+    ) -> Option<(usize, bool)> {
         if len == 0 {
             return Some((0, false));
         }
@@ -254,7 +267,12 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let bytes = core::cmp::min(icmpv4_echo_raw_packet_len(packet), len);
+                let packet_len = if include_ipv4_header {
+                    icmpv4_echo_raw_packet_len(packet)
+                } else {
+                    icmpv4_echo_message_len(packet)
+                };
+                let bytes = core::cmp::min(packet_len, len);
                 if !peek {
                     let _ = rx.pop_front();
                 }
@@ -278,6 +296,18 @@ impl RawIcmpSocket {
     }
 
     pub fn recv_bytes(&self, out: &mut [u8], peek: bool) -> Option<RawIcmpRecvDrain> {
+        self.recv_bytes_with_ipv4_header(out, peek, true)
+    }
+
+    /// See [`RawIcmpSocket::recv_len_with_ipv4_header`] for why the IPv4 header
+    /// is conditional. The `include_ipv4_header` arm stays zero-copy: only the
+    /// datagram arm materialises a `Vec`.
+    pub fn recv_bytes_with_ipv4_header(
+        &self,
+        out: &mut [u8],
+        peek: bool,
+        include_ipv4_header: bool,
+    ) -> Option<RawIcmpRecvDrain> {
         if out.is_empty() {
             return Some(RawIcmpRecvDrain {
                 bytes: 0,
@@ -291,8 +321,18 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let raw_packet = build_icmpv4_echo_reply(packet);
-                let packet_bytes = raw_packet.as_bytes();
+                // Both locals are declared up front so the raw arm can borrow
+                // straight out of `LoopbackIpPacket` instead of copying into a
+                // `Vec` just to unify the two branch types.
+                let raw_packet;
+                let message;
+                let packet_bytes: &[u8] = if include_ipv4_header {
+                    raw_packet = build_icmpv4_echo_reply(packet);
+                    raw_packet.as_bytes()
+                } else {
+                    message = build_icmpv4_echo_reply_message(packet);
+                    &message
+                };
                 let bytes = core::cmp::min(packet_bytes.len(), out.len());
                 out[..bytes].copy_from_slice(&packet_bytes[..bytes]);
                 let source = packet.src;

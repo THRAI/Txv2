@@ -34,8 +34,8 @@ use crate::io_manager::page::{
     service::{
         PageCompletionRoute, PageService, PageServiceBackendContext, PageServiceBackendDriven,
         PageServiceBackendOutcome, PageServiceBackendSubmitOutcome, PageServiceDrivenWork,
-        PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWork,
-        PageWaitInterest, PageWaiter,
+        PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWake,
+        PageServiceWork, PageWaitInterest, PageWaiter,
     },
     PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
     PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
@@ -584,6 +584,7 @@ pub struct FileFsyncSession<'a> {
 pub struct FileFsyncState {
     frontier: Option<FileFsyncFrontier>,
     request: Option<PageIoRequestId>,
+    wait: Option<notification::PageReadyWait>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -599,10 +600,15 @@ impl FileFsyncState {
         Self {
             frontier: None,
             request: None,
+            wait: None,
         }
     }
 
     pub fn advance(&mut self, pc: &PageContainer) -> Result<Option<Result<(), Errno>>, Errno> {
+        let wait = self
+            .wait
+            .get_or_insert_with(notification::new_page_ready_wait);
+        pc.register_file_fsync_wait(wait);
         let frontier = self.frontier.get_or_insert_with(|| {
             pc.snapshot_file_fsync_frontier()
                 .expect("file PageContainer has an fsync frontier")
@@ -611,18 +617,39 @@ impl FileFsyncState {
             FileFsyncFrontierAdvance::Submitted { .. } | FileFsyncFrontierAdvance::Waiting => {
                 return Ok(None);
             }
-            FileFsyncFrontierAdvance::Error(errno) => return Err(errno),
+            FileFsyncFrontierAdvance::Error(errno) => {
+                pc.unregister_file_fsync_wait(wait);
+                return Err(errno);
+            }
             FileFsyncFrontierAdvance::Complete => {}
         }
         let request = match self.request {
             Some(request) => request,
             None => {
-                let request = pc.submit_file_fsync().ok_or(Errno::EIO)?;
+                let Some(request) = pc.submit_file_fsync() else {
+                    pc.unregister_file_fsync_wait(wait);
+                    return Err(Errno::EIO);
+                };
                 self.request = Some(request);
                 request
             }
         };
-        Ok(pc.take_file_fsync_submission(request))
+        let result = pc.take_file_fsync_submission(request);
+        if result.is_some() {
+            pc.unregister_file_fsync_wait(wait);
+        }
+        Ok(result)
+    }
+
+    pub fn pending_outcome<P: adapter::step_engine::StepProgress>(
+        &self,
+        progress: P,
+    ) -> StepOutcome<(), P> {
+        let wait = self
+            .wait
+            .as_ref()
+            .expect("pending fsync state has a completion wait source");
+        notification::yield_on_page_ready_source(progress, notification::page_ready_endpoint(wait))
     }
 }
 
@@ -754,6 +781,9 @@ struct PageContainerState {
     range_reservations: RangeReservationTable,
     direct_io_in_flight: BTreeMap<IoDataLeaseId, direct_io::DirectIoInFlight>,
     direct_io_completed: BTreeMap<IoDataLeaseId, direct_io::DirectIoCompleted>,
+    // Per-fsync retry sources are weakly retained so completion can wake every
+    // active durability operation without extending a cancelled op's lifetime.
+    file_fsync_waits: BTreeMap<u64, notification::PageReadyWeakNotifier>,
     // Page-scoped retry sources are retained so a task that already received
     // `Yield` can still register and consume a pending wake before it retries
     // and re-observes page state.
@@ -1073,6 +1103,7 @@ impl PageContainer {
                 range_reservations: RangeReservationTable::new(),
                 direct_io_in_flight: BTreeMap::new(),
                 direct_io_completed: BTreeMap::new(),
+                file_fsync_waits: BTreeMap::new(),
                 file_page_waits: BTreeMap::new(),
                 next_file_fetch_id: 1,
             }),
@@ -1653,6 +1684,40 @@ impl PageContainer {
         }
     }
 
+    fn register_file_fsync_wait(&self, wait: &notification::PageReadyWait) {
+        let source_id = notification::page_ready_source_id(wait);
+        self.state
+            .lock()
+            .file_fsync_waits
+            .entry(source_id)
+            .or_insert_with(|| notification::page_ready_weak_notifier(wait));
+    }
+
+    fn unregister_file_fsync_wait(&self, wait: &notification::PageReadyWait) {
+        let source_id = notification::page_ready_source_id(wait);
+        self.state.lock().file_fsync_waits.remove(&source_id);
+    }
+
+    fn notify_file_fsync_progress(&self) {
+        let notifiers = {
+            let mut state = self.state.lock();
+            let mut notifiers = Vec::new();
+            state.file_fsync_waits.retain(|_, weak| {
+                let Some(notifier) = notification::upgrade_page_ready_notifier(weak) else {
+                    return false;
+                };
+                notifiers.push(notifier);
+                true
+            });
+            notifiers
+        };
+        for notifier in notifiers {
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
+    }
+
     /// Move one dirty file page into the L4 writeback queue.
     ///
     /// This is only admission: the backend planner and L6 executor own later
@@ -1675,7 +1740,7 @@ impl PageContainer {
             }
             return None;
         }
-        let result = match state.file_io_service.submit(
+        let outcome = match state.file_io_service.submit_with_wake(
             self.io_manager_key(),
             PageIoRange::new(page.as_u64(), 1),
             PageIoOp::Writeback,
@@ -1683,20 +1748,20 @@ impl PageContainer {
             PageIoFlags::WRITEBACK,
             Some(writeback.generation),
         ) {
-            Ok(id) => Some(id),
+            Ok(outcome) => outcome,
             Err(_) => {
                 let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
                 if let Some(slot) = state.file_page_slots.get(&page) {
                     let _ = slot.abort_writeback(writeback.generation);
                 }
-                None
+                return None;
             }
         };
         drop(state);
-        if result.is_some() {
+        if outcome.wake == PageServiceWake::Wake {
             self.kick_file_io_service(IoServiceKind::Page);
         }
-        result
+        Some(outcome.id)
     }
 
     /// Admit all currently dirty file pages to background L4 writeback.
@@ -1761,9 +1826,9 @@ impl PageContainer {
         }
 
         let mut state = self.state.lock();
-        let id = state
+        let outcome = state
             .file_io_service
-            .submit(
+            .submit_with_wake(
                 self.io_manager_key(),
                 PageIoRange::new(0, self.page_count),
                 PageIoOp::Fsync,
@@ -1772,12 +1837,15 @@ impl PageContainer {
                 None,
             )
             .ok()?;
+        let id = outcome.id;
         let submission = fsync_submission::FsyncSubmission::new(id);
         debug_assert_eq!(submission.id(), id);
         let previous = state.fsync_submissions.insert(id, submission);
         debug_assert!(previous.is_none(), "L4 request identifiers are unique");
         drop(state);
-        self.kick_file_io_service(IoServiceKind::Page);
+        if outcome.wake == PageServiceWake::Wake {
+            self.kick_file_io_service(IoServiceKind::Page);
+        }
         Some(id)
     }
 
@@ -1805,6 +1873,7 @@ impl PageContainer {
     ) -> FileFsyncFrontierAdvance {
         let mut submitted = 0u32;
         let mut waiting = false;
+        let mut admission_blocked = false;
         for &(page, generation) in frontier.pages() {
             let status = self
                 .state
@@ -1818,6 +1887,7 @@ impl PageContainer {
                         submitted = submitted.saturating_add(1);
                     } else {
                         waiting = true;
+                        admission_blocked = true;
                     }
                 }
                 Some(
@@ -1829,6 +1899,10 @@ impl PageContainer {
                 }
                 Some(PageSlotFsyncStatus::Clean) | None => {}
             }
+        }
+        if admission_blocked && submitted == 0 {
+            self.kick_file_io_service(IoServiceKind::Page);
+            self.notify_file_fsync_progress();
         }
         if submitted != 0 {
             FileFsyncFrontierAdvance::Submitted { pages: submitted }
@@ -2184,7 +2258,8 @@ impl PageContainer {
                 return None;
             }
             if self.terminalize_file_fsync_submission(&route.completion) {
-                self.notify_file_backend_completion(&route.completion);
+                self.notify_file_backend_completion(&route.completion, PageIoOp::Fsync);
+                self.notify_file_fsync_progress();
             }
             return None;
         }
@@ -2193,24 +2268,32 @@ impl PageContainer {
         }
         let page = PageIndex::new(route.completion.range.start_page());
         if route.completion.kind == PageIoCompletionKind::WritebackFinished {
-            let mut state = self.state.lock();
-            let lease = state.file_io_leases.remove(&route.completion.id);
-            let slot = state.file_page_slots.get(&page)?;
-            let result = slot.complete_writeback(
-                route.completion.generation,
-                match route.completion.result {
-                    PageIoResult::Done => Ok(()),
-                    PageIoResult::Err(errno) => Err(errno),
-                },
-            );
-            if let Ok(snapshot) = result {
-                let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
-                if matches!(snapshot.state, PageSlotState::Resident { .. }) {
-                    let _ = state.pages.clear_mark(page, PageCacheMark::Dirty);
+            let result = {
+                let mut state = self.state.lock();
+                let lease = state.file_io_leases.remove(&route.completion.id);
+                let result = state.file_page_slots.get(&page).map(|slot| {
+                    slot.complete_writeback(
+                        route.completion.generation,
+                        match route.completion.result {
+                            PageIoResult::Done => Ok(()),
+                            PageIoResult::Err(errno) => Err(errno),
+                        },
+                    )
+                });
+                if let Some(Ok(snapshot)) = result.as_ref() {
+                    let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+                    if matches!(snapshot.state, PageSlotState::Resident { .. }) {
+                        let _ = state.pages.clear_mark(page, PageCacheMark::Dirty);
+                    }
                 }
+                drop(lease);
+                result
+            };
+            if result.as_ref().is_some_and(Result::is_ok) {
+                self.notify_file_backend_completion(&route.completion, PageIoOp::Writeback);
             }
-            drop(lease);
-            return Some(result);
+            self.notify_file_fsync_progress();
+            return result;
         }
         if route.completion.kind != PageIoCompletionKind::ReadInstalled {
             return None;
@@ -2304,6 +2387,7 @@ impl PageContainer {
     fn notify_file_backend_completion(
         &self,
         completion: &crate::io_manager::page::PageIoCompletion,
+        op: PageIoOp,
     ) {
         let PageContainerKind::File {
             mount,
@@ -2318,10 +2402,10 @@ impl PageContainer {
         planner.complete_page_io(crate::fs_iface::BackendPageCompletion::new(
             FsObjectKey::new(fs_object_id.as_u64()),
             completion.id,
-            PageIoOp::Fsync,
+            op,
             completion.result,
         ));
-        if completion.result != PageIoResult::Done {
+        if op != PageIoOp::Fsync || completion.result != PageIoResult::Done {
             return;
         }
         let object = FsObjectKey::new(fs_object_id.as_u64());
@@ -2491,6 +2575,8 @@ impl PageContainer {
             let _ = slot.abort_writeback(generation);
         }
         drop(lease);
+        drop(state);
+        self.notify_file_fsync_progress();
     }
 
     fn apply_file_io_read_frame_completion(

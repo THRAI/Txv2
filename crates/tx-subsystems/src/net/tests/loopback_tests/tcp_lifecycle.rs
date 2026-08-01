@@ -1,6 +1,491 @@
 use super::*;
 
 #[test]
+fn tcp_loopback_connect_preserves_a_foreign_tuple_owner() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, _listener, local, remote) = prepare_loopback_connect(40_295, 50_295);
+    let guard = tx_substrate::epoch::guard();
+    let payload = client.acquire_operational().expect("client payload");
+    let foreign = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("foreign tuple owner");
+    let key = ConnectionKey::new(local, remote);
+    payload
+        .socket_table()
+        .insert_tcp_connection(key, foreign.clone())
+        .expect("install foreign tuple owner");
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Err(Errno::EADDRINUSE)
+    ));
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Bound { local })
+    );
+    assert_eq!(payload.socket_error(), Some(Errno::EADDRINUSE));
+    assert_eq!(
+        payload
+            .socket_table()
+            .lookup_tcp_connection(key, &guard)
+            .map(|owner| owner.raw()),
+        Some(foreign.raw())
+    );
+    assert!(client.readiness.send_wq.peek() & SendWireSet::CONNECT_DONE.bits() != 0);
+}
+
+#[test]
+fn tcp_inbound_promotion_rolls_back_connection_index_without_backlog_entry() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let local = endpoint(40_296);
+    let remote = endpoint(50_296);
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
+    assert_eq!(
+        step_bind(&listener, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    let child = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("untracked inbound child");
+    let payload = child.acquire_operational().expect("child payload");
+    payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::Tcp(TcpState::Connecting { local, remote });
+    });
+    let (generation, _, _) = payload.tcp_flow_snapshot().expect("child TCP flow");
+    let key = ConnectionKey::new(local, remote);
+
+    assert!(matches!(
+        promote_connected_stream_and_publish_accept(
+            payload.socket_table(),
+            &child,
+            &payload,
+            None,
+            generation,
+            &guard,
+        ),
+        TcpConnectedPromotion::Rejected
+    ));
+    assert!(
+        payload
+            .socket_table()
+            .lookup_tcp_connection(key, &guard)
+            .is_none(),
+        "failed accept promotion must withdraw the child connection key"
+    );
+    assert_eq!(
+        child.readiness.send_wq.peek() & SendWireSet::SPACE.bits(),
+        0,
+        "a rejected inbound child must not publish connect success"
+    );
+}
+
+#[test]
+fn stale_loopback_egress_cannot_dispatch_a_replacement_attempt() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, _listener, local, remote) = prepare_loopback_connect(40_297, 50_297);
+    let guard = tx_substrate::epoch::guard();
+    let payload = client.acquire_operational().expect("client payload");
+    let stale = payload
+        .active_tcp_connect_attempt()
+        .expect("first connect attempt");
+    start_raw_tcp_connect_for_active_attempt(&payload);
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(local.port), &guard),
+        StepOutcome::Done(()),
+        "AF_UNSPEC must release the old bind before the replacement attempt"
+    );
+    assert!(matches!(
+        step_connect(&client, inet(remote.port), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    let current = payload
+        .active_tcp_connect_attempt()
+        .expect("replacement connect attempt");
+    assert_ne!(stale, current);
+    start_raw_tcp_connect_for_active_attempt(&payload);
+
+    let iface = crate::net::namespace::initial_loopback_iface();
+    while iface.pop_ingress().is_some() {}
+    let mut ctx = PollContext::new_with_table(smoltcp::time::Instant::ZERO, payload.socket_table());
+    assert!(
+        ctx.poll_tcp_egress_one_for_flow(
+            &client,
+            stale.generation(),
+            local,
+            remote,
+            iface,
+            &guard,
+        )
+        .is_none(),
+        "an old handshake must not dispatch the replacement attempt's SYN"
+    );
+    assert!(iface.pop_ingress().is_none());
+    assert!(
+        ctx.poll_egress_one(&client, iface, &guard).is_some(),
+        "the replacement attempt itself remains dispatchable"
+    );
+    assert!(
+        iface.pop_ingress().is_some(),
+        "replacement SYN reaches loopback"
+    );
+    while iface.pop_ingress().is_some() {}
+
+    let cleanup_called = core::cell::Cell::new(false);
+    let clear_called = core::cell::Cell::new(false);
+    assert_eq!(
+        payload.reset_tcp_connection(
+            stale.generation(),
+            local,
+            remote,
+            |_, _| {
+                cleanup_called.set(true);
+                true
+            },
+            || clear_called.set(true),
+        ),
+        Err(Errno::ECANCELED),
+        "a stale AF_UNSPEC observation must not reset the replacement flow"
+    );
+    assert!(!cleanup_called.get());
+    assert!(!clear_called.get());
+    assert_eq!(
+        payload.active_tcp_connect_attempt(),
+        Some(current),
+        "generation rejection must leave the replacement flow intact"
+    );
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Done(())
+    );
+}
+
+#[test]
+fn tcp_unspec_disconnect_preserves_a_foreign_reverse_tuple_owner() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, local, remote) = prepare_loopback_connect(40_298, 50_298);
+    let guard = tx_substrate::epoch::guard();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert!(matches!(
+        step_accept(&listener, &guard),
+        StepOutcome::Done(_)
+    ));
+
+    let payload = client.acquire_operational().expect("client payload");
+    let reverse_key = ConnectionKey::new(remote, local);
+    payload
+        .socket_table()
+        .withdraw_tcp_connection(reverse_key)
+        .expect("remove the original reverse endpoint");
+    let foreign = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("foreign reverse tuple owner");
+    payload
+        .socket_table()
+        .insert_tcp_connection(reverse_key, foreign.clone())
+        .expect("install foreign reverse tuple owner");
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Done(())
+    );
+    assert!(payload
+        .socket_table()
+        .lookup_tcp_connection(ConnectionKey::new(local, remote), &guard)
+        .is_none());
+    assert_eq!(
+        payload
+            .socket_table()
+            .lookup_tcp_connection(reverse_key, &guard)
+            .map(|owner| owner.raw()),
+        Some(foreign.raw()),
+        "AF_UNSPEC must not delete a replacement reverse-key owner"
+    );
+}
+
+#[test]
+fn tcp_unspec_rejects_a_replacement_forward_tuple_owner() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, local, remote) = prepare_loopback_connect(40_302, 50_302);
+    let guard = tx_substrate::epoch::guard();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let peer = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    let payload = client.acquire_operational().expect("client payload");
+    let table = payload.socket_table();
+    let forward_key = ConnectionKey::new(local, remote);
+    let reverse_key = ConnectionKey::new(remote, local);
+    table
+        .withdraw_tcp_connection(forward_key)
+        .expect("remove the original forward endpoint");
+    table
+        .insert_tcp_connection(forward_key, peer.clone())
+        .expect("install a replacement forward owner");
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Err(Errno::EAGAIN),
+        "a replacement forward owner makes the observed source flow stale"
+    );
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { local, remote })
+    );
+    assert_eq!(
+        table
+            .lookup_tcp_connection(forward_key, &guard)
+            .map(|owner| owner.raw()),
+        Some(peer.raw())
+    );
+    assert_eq!(
+        table
+            .lookup_tcp_connection(reverse_key, &guard)
+            .map(|owner| owner.raw()),
+        Some(peer.raw()),
+        "the replacement's reverse endpoint must remain intact"
+    );
+    assert_eq!(
+        table
+            .lookup_tcp_bound(local, &guard)
+            .map(|owner| owner.raw()),
+        Some(client.raw()),
+        "the stale disconnect must not partially remove the old binding"
+    );
+}
+
+#[test]
+fn tcp_unspec_preserves_reverse_when_its_owned_forward_is_missing() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, local, remote) = prepare_loopback_connect(40_303, 50_303);
+    let guard = tx_substrate::epoch::guard();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let peer = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    let payload = client.acquire_operational().expect("client payload");
+    let table = payload.socket_table();
+    let forward_key = ConnectionKey::new(local, remote);
+    let reverse_key = ConnectionKey::new(remote, local);
+    table
+        .withdraw_tcp_connection(forward_key)
+        .expect("remove the source-owned forward endpoint");
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Init)
+    );
+    assert!(table.lookup_tcp_connection(forward_key, &guard).is_none());
+    assert_eq!(
+        table
+            .lookup_tcp_connection(reverse_key, &guard)
+            .map(|owner| owner.raw()),
+        Some(peer.raw()),
+        "a missing forward entry cannot authorize removing the reverse owner"
+    );
+    assert!(table.lookup_tcp_bound(local, &guard).is_none());
+}
+
+#[test]
+fn tcp_peer_generation_guard_rejects_same_identity_after_reconnect() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, _local, _remote) = prepare_loopback_connect(40_300, 50_300);
+    let guard = tx_substrate::epoch::guard();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let peer = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+    let peer_payload = peer.acquire_operational().expect("peer payload");
+    let (stale_generation, peer_local, peer_remote) = peer_payload
+        .tcp_flow_snapshot()
+        .expect("connected peer flow");
+
+    assert_eq!(
+        peer_payload.reset_tcp_connection(
+            stale_generation,
+            peer_local,
+            peer_remote,
+            |_, _| true,
+            || {},
+        ),
+        Ok(())
+    );
+    let TcpConnectProgress::Started(replacement) =
+        peer_payload.begin_tcp_connect(peer_local, peer_remote, |local| local, || {})
+    else {
+        panic!("replacement peer flow");
+    };
+    assert_ne!(replacement.generation(), stale_generation);
+
+    let stale_operation_ran = core::cell::Cell::new(false);
+    assert!(matches!(
+        peer_payload.try_with_tcp_flow_generation(
+            stale_generation,
+            peer_local,
+            peer_remote,
+            || stale_operation_ran.set(true),
+        ),
+        TcpFlowGenerationTry::Stale
+    ));
+    assert!(!stale_operation_ran.get());
+}
+
+#[test]
+fn tcp_unspec_busy_index_reservation_rolls_back_without_partial_cleanup() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, local, remote) = prepare_loopback_connect(40_301, 50_301);
+    let guard = tx_substrate::epoch::guard();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    let payload = client.acquire_operational().expect("client payload");
+    let table = payload.socket_table();
+    let forward_key = ConnectionKey::new(local, remote);
+    let reverse_key = ConnectionKey::new(remote, local);
+
+    let competing_reverse = table
+        .reserve_tcp_connection_if_owner_for_test(reverse_key, accepted.raw())
+        .expect("reserve reverse index")
+        .expect("accepted peer owns reverse index");
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Err(Errno::EAGAIN)
+    );
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { local, remote }),
+        "a Busy reverse slot must prevent the AF_UNSPEC state commit"
+    );
+    drop(competing_reverse);
+
+    assert_eq!(
+        table
+            .lookup_tcp_connection(forward_key, &guard)
+            .map(|owner| owner.raw()),
+        Some(client.raw())
+    );
+    assert_eq!(
+        table
+            .lookup_tcp_connection(reverse_key, &guard)
+            .map(|owner| owner.raw()),
+        Some(accepted.raw())
+    );
+    assert_eq!(
+        table
+            .lookup_tcp_bound(local, &guard)
+            .map(|owner| owner.raw()),
+        Some(client.raw())
+    );
+
+    let competing = table
+        .reserve_tcp_connection_if_owner_for_test(forward_key, client.raw())
+        .expect("reserve forward index")
+        .expect("client owns forward index");
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Err(Errno::EAGAIN)
+    );
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { local, remote }),
+        "Busy must prevent the AF_UNSPEC state commit"
+    );
+    drop(competing);
+
+    assert_eq!(
+        table
+            .lookup_tcp_connection(forward_key, &guard)
+            .map(|owner| owner.raw()),
+        Some(client.raw())
+    );
+    assert!(table.lookup_tcp_connection(reverse_key, &guard).is_some());
+    assert_eq!(
+        table
+            .lookup_tcp_bound(local, &guard)
+            .map(|owner| owner.raw()),
+        Some(client.raw())
+    );
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Done(())
+    );
+    assert!(table.lookup_tcp_connection(forward_key, &guard).is_none());
+    assert!(table.lookup_tcp_connection(reverse_key, &guard).is_none());
+    assert!(table.lookup_tcp_bound(local, &guard).is_none());
+}
+
+#[test]
 fn tcp_socket_close_marks_connected_peer_broken() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -66,7 +551,17 @@ fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
         StepOutcome::Done(close) => close,
         _ => panic!("unexpected socket close outcome"),
     };
-    assert_eq!(close.tcp_flushed_bytes, 1);
+    assert!(!close.payload_taken);
+
+    // close is delegate-owned: queued stream bytes and FIN must be delivered
+    // before the connection-table reference and payload are retired.
+    for _ in 0..8 {
+        let _ = step_process_loopback_pending_zero(
+            loopback_iface(),
+            LoopbackPollBudget::default(),
+            &guard,
+        );
+    }
 
     let mut out = [0u8; 1];
     assert_eq!(
@@ -90,10 +585,9 @@ fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
         step_recv(&accepted, 1, SendRecvFlags::empty(), &guard),
         StepOutcome::Done(0)
     );
-    assert_eq!(
-        step_send_kernel_bytes(&accepted, b"x", SendRecvFlags::empty(), &guard),
-        StepOutcome::Err(Errno::EPIPE)
-    );
+    // Receiving FIN is a half-close. Linux permits the peer to write until
+    // the reverse direction is closed or reset; do not require an immediate
+    // EPIPE here.
 }
 
 #[test]
@@ -162,6 +656,13 @@ fn tcp_loopback_listener_accepts_after_clients_close_without_draining() {
             step_socket_close(&client, &guard),
             StepOutcome::Done(_)
         ));
+        for _ in 0..8 {
+            let _ = step_process_loopback_pending_zero(
+                loopback_iface(),
+                LoopbackPollBudget::default(),
+                &guard,
+            );
+        }
         assert!(matches!(
             step_poll_ready(&accepted, &guard),
             StepOutcome::Done(mask) if mask.intersects(PollMask::IN | PollMask::RDHUP)
@@ -216,6 +717,28 @@ fn tcp_loopback_handshake_does_not_mark_client_readable_without_data() {
     assert!(matches!(
         step_poll_ready(&client, &guard),
         StepOutcome::Done(mask) if !mask.intersects(PollMask::IN | PollMask::RDHUP)
+    ));
+}
+
+#[test]
+fn tcp_loopback_handshake_contention_is_progress_not_refusal() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, _listener, _local, _remote) = prepare_loopback_connect(45_999, 55_999);
+    let guard = tx_substrate::epoch::guard();
+    let payload = client.acquire_operational().expect("client payload");
+
+    assert!(payload.try_claim_tcp_handshake_driver());
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Continue { .. }
+    ));
+    payload.release_tcp_handshake_driver();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
     ));
 }
 
@@ -558,6 +1081,12 @@ fn tcp_recv_kicks_loopback_after_freeing_peer_window() {
         })
     );
     assert_eq!(&out, b"abcde");
+    assert!(
+        crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits()
+            != 0,
+        "freeing the receive window must kick the network delegate"
+    );
 
     let source = ScriptedPacketSource::new(std::vec![]);
     let driver = LoopbackDelegateDriver {
@@ -565,9 +1094,26 @@ fn tcp_recv_kicks_loopback_after_freeing_peer_window() {
         source: &source,
         iface: Some(loopback_iface()),
     };
-    let outcome = net_delegate_step_once(&driver, &guard);
-    assert!(outcome.poll_seen);
-    assert_eq!(outcome.loopback.tcp_bytes_moved, 5);
+    let accepted_payload = accepted.acquire_operational().expect("accepted payload");
+    let accepted_raw = accepted_payload.raw_tcp_socket().expect("accepted raw tcp");
+    let mut delegate_steps = 0;
+    while accepted_raw.recv_available() < 5 {
+        assert!(
+            delegate_steps < 8,
+            "window update must make the blocked tail readable within a bounded number of polls"
+        );
+        let outcome = net_delegate_step_once(&driver, &guard);
+        assert!(outcome.poll_seen);
+        delegate_steps += 1;
+        if accepted_raw.recv_available() < 5 {
+            assert!(
+                crate::net::delegate::net_delegate_queue().peek()
+                    & crate::net::delegate::DelegateWireSet::POLL.bits()
+                    != 0,
+                "an intermediate progress step must keep the delegate runnable"
+            );
+        }
+    }
 
     let mut tail = [0u8; 5];
     assert_eq!(
@@ -710,8 +1256,10 @@ fn tcp_loopback_pending_moves_multiple_msg_more_streams() {
         options.socket.send_buf_size = TCP_CORK_AUTO_FLUSH_BYTES * 2;
         let client = registry::create_socket_for_test_or_bootstrap(SocketKind::Tcp, options)
             .expect("client");
+        // The test socket table is process-global; keep this five-port shard
+        // disjoint from the fixed 50_19x ports used by neighboring cases.
         assert_eq!(
-            step_bind(&client, inet(50_191 + index), &guard),
+            step_bind(&client, inet(51_191 + index), &guard),
             StepOutcome::Done(())
         );
         assert!(matches!(
@@ -773,6 +1321,48 @@ fn tcp_loopback_pending_moves_multiple_msg_more_streams() {
         );
         assert!(out.iter().all(|byte| *byte == 0x33));
     }
+}
+
+#[test]
+fn tcp_loopback_transfer_caps_total_bidirectional_egress_packets() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (client, listener, _local, _remote) =
+        prepare_loopback_connect_with_client_send_buf(40_169, 50_169, 65_536);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    let bytes = alloc::vec![0x5a; 65_536];
+    assert_eq!(
+        step_send_kernel_bytes(&client, &bytes, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(bytes.len())
+    );
+    assert_eq!(
+        step_send_kernel_bytes(&accepted, &bytes, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(bytes.len())
+    );
+
+    let transfer = match step_tcp_loopback_transfer(&client, usize::MAX, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        other => panic!("unexpected bidirectional transfer outcome: {other:?}"),
+    };
+    assert!(transfer.bytes_moved > 0);
+    assert!(
+        transfer.tx_packets <= 64,
+        "one transfer step must cap aggregate source+peer egress, got {} packets",
+        transfer.tx_packets
+    );
 }
 
 #[test]
@@ -934,6 +1524,10 @@ fn tcp_loopback_lost_data_segment_is_retransmitted_after_rto() {
 
     // 拨钟越过初始 RTO(≈700ms) → 重传 → 喂给对端 → 字节收齐
     crate::net::clock::net_set_now_ns(2_000_000_000);
+    ctx = PollContext::new_with_table(
+        smoltcp::time::Instant::from_millis(2_000),
+        client_payload.socket_table(),
+    );
     assert!(
         ctx.poll_egress_one(&client, iface, &guard).is_some(),
         "越过 RTO 应重传数据段"

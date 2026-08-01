@@ -5,10 +5,9 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use tx_hal::{PlatformInfoIf, TxPlatform};
 use tx_substrate::step::{NoProgress, StepOutcome};
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::SpinMutex;
 use tx_subsystems::execution::{Errno, Guard};
-use tx_subsystems::net::delegate::{net_delegate_kick_poll_with_post, net_delegate_wait_token};
+use tx_subsystems::net::delegate::net_delegate_wait_token;
 use tx_subsystems::net::device::{
     EthernetAddress, NetDeviceIrqOutcome, NetDeviceOps, VirtioNetStats,
 };
@@ -138,38 +137,19 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
         &self.stats
     }
 
-    pub fn poll_device_and_fire_with_post<F>(&self, post: F) -> VirtioNetPollOutcome
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
-        poll_device_and_fire_with_post(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            false,
-            QUEUE_SIZE,
-            post,
-        )
+    pub fn poll_device_and_fire(&self) -> VirtioNetPollOutcome {
+        poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE)
     }
 
-    pub fn ack_interrupt_and_fire_with_post<F>(&self, post: F) -> VirtioNetPollOutcome
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
+    pub fn ack_interrupt_and_fire(&self) -> VirtioNetPollOutcome {
         let mut inner = self.inner.lock();
         let Some(state) = inner.as_mut() else {
             return VirtioNetPollOutcome::default();
         };
         let claimed = state.raw.ack_interrupt();
         drop(inner);
-        let mut outcome = poll_device_and_fire_with_post(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            claimed,
-            QUEUE_SIZE,
-            post,
-        );
+        let mut outcome =
+            poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE);
         outcome.claimed = claimed;
         outcome
     }
@@ -216,38 +196,19 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioPciNet<P, QUEUE_SIZE> {
         &self.stats
     }
 
-    pub fn poll_device_and_fire_with_post<F>(&self, post: F) -> VirtioNetPollOutcome
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
-        poll_device_and_fire_with_post(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            false,
-            QUEUE_SIZE,
-            post,
-        )
+    pub fn poll_device_and_fire(&self) -> VirtioNetPollOutcome {
+        poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE)
     }
 
-    pub fn ack_interrupt_and_fire_with_post<F>(&self, post: F) -> VirtioNetPollOutcome
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
+    pub fn ack_interrupt_and_fire(&self) -> VirtioNetPollOutcome {
         let mut inner = self.inner.lock();
         let Some(state) = inner.as_mut() else {
             return VirtioNetPollOutcome::default();
         };
         let claimed = state.raw.ack_interrupt();
         drop(inner);
-        let mut outcome = poll_device_and_fire_with_post(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            claimed,
-            QUEUE_SIZE,
-            post,
-        );
+        let mut outcome =
+            poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE);
         outcome.claimed = claimed;
         outcome
     }
@@ -357,18 +318,15 @@ where
     Ok(())
 }
 
-fn poll_device_and_fire_with_post<P, T, F, const QUEUE_SIZE: usize>(
+fn poll_device_and_fire<P, T, const QUEUE_SIZE: usize>(
     inner: &SpinMutex<Option<VirtioNetRawState<P, T, QUEUE_SIZE>>>,
     stats: &VirtioNetStats,
     initialized: &AtomicBool,
-    suppress_interrupts_on_ready: bool,
     _rx_budget: usize,
-    mut post: F,
 ) -> VirtioNetPollOutcome
 where
     P: TxPlatform,
     T: Transport,
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
 {
     if !initialized.load(Ordering::Acquire) {
         return VirtioNetPollOutcome::default();
@@ -380,13 +338,19 @@ where
     };
     let tx_completed = complete_tx(state, stats, usize::MAX);
     let rx_ready = state.raw.poll_receive().is_some();
-    if suppress_interrupts_on_ready && (rx_ready || tx_completed != 0) {
-        state.raw.disable_interrupts();
-    }
+    // Do NOT suppress device interrupts when work is pending. An earlier
+    // NAPI-style `disable_interrupts()` here had no matching re-enable
+    // anywhere, so the FIRST net IRQ silenced the device forever (later
+    // frames sat unnoticed until an unrelated delegate poll — root cause
+    // of the P2 "server response never ACKed / read never wakes" stall).
+    // IRQ-rate throttling is already provided one level up by the outstanding
+    // controller claim: the PLIC gateway does not forward this source again
+    // until the task-context bottom half ACKs/polls the device and completes
+    // that claim. Device-level suppression is therefore unnecessary.
 
     let poll_wakes = if rx_ready || tx_completed != 0 {
         stats.irq_polls.fetch_add(1, Ordering::Relaxed);
-        net_delegate_kick_poll_with_post(&mut post)
+        tx_subsystems::net::delegate::net_delegate_kick_poll()
     } else {
         0
     };
@@ -609,13 +573,8 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> NetDeviceOps for VirtioMmioNet<P, Q
         VirtioMmioNet::enable_interrupts(self);
     }
 
-    fn ack_interrupt_and_fire_with_post(
-        &self,
-        post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    ) -> NetDeviceIrqOutcome {
-        let outcome = VirtioMmioNet::ack_interrupt_and_fire_with_post(self, |mailbox, event| {
-            post(mailbox, event)
-        });
+    fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
+        let outcome = VirtioMmioNet::ack_interrupt_and_fire(self);
         NetDeviceIrqOutcome {
             rx_ready: outcome.rx_ready,
             tx_completed: outcome.tx_completed,
@@ -659,13 +618,8 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> NetDeviceOps for VirtioPciNet<P, QU
         VirtioPciNet::enable_interrupts(self);
     }
 
-    fn ack_interrupt_and_fire_with_post(
-        &self,
-        post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    ) -> NetDeviceIrqOutcome {
-        let outcome = VirtioPciNet::ack_interrupt_and_fire_with_post(self, |mailbox, event| {
-            post(mailbox, event)
-        });
+    fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
+        let outcome = VirtioPciNet::ack_interrupt_and_fire(self);
         NetDeviceIrqOutcome {
             rx_ready: outcome.rx_ready,
             tx_completed: outcome.tx_completed,

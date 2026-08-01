@@ -5,6 +5,11 @@ const BRIDGE_MAC: EthernetAddress = EthernetAddress::new([0x02, 0, 0, 0, 0xaa, 0
 const BRIDGE_NS_A_IP: Ipv4Address = Ipv4Address::new([172, 17, 0, 2]);
 const BRIDGE_NS_B_IP: Ipv4Address = Ipv4Address::new([172, 17, 0, 3]);
 
+/// These tests all open `SOCK_RAW` ICMP sockets, which receive the whole IPv4
+/// packet — header included. `SOCK_DGRAM` (ping sockets) get the ICMP message
+/// only; that flavour is covered in `icmp_tests`.
+const IPV4_HEADER_LEN: usize = 20;
+
 #[test]
 fn bridge_floods_broadcast_and_learns_source_mac() {
     init_zones();
@@ -515,7 +520,12 @@ fn namespace_runtime_drives_container_ping_host_gateway() {
         }
     }
 
-    assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+    // SOCK_RAW ICMP hands userspace the whole IPv4 packet, header included.
+    assert_eq!(
+        received,
+        Some(IPV4_HEADER_LEN + message.len()),
+        "runtime outcome: {total:?}"
+    );
     assert!(total.ifaces_seen >= 2);
     assert!(total.bridge_frames_seen >= 2);
     assert!(total.bridge_local_delivered >= 1);
@@ -606,7 +616,11 @@ fn namespace_runtime_relearns_container_gateway_after_arp_delete() {
             }
         }
 
-        assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+        assert_eq!(
+            received,
+            Some(IPV4_HEADER_LEN + message.len()),
+            "runtime outcome: {total:?}"
+        );
         total
     };
 
@@ -755,7 +769,7 @@ fn namespace_runtime_drives_container_ping_container_through_bridge() {
 
     assert_eq!(
         received,
-        Some(message.len()),
+        Some(IPV4_HEADER_LEN + message.len()),
         "runtime outcome: {total:?}; a arp: {:?}; b arp: {:?}; learned a: {:?}; learned b: {:?}",
         ns_a.ether_ifaces_snapshot()[0].arp_snapshot(now),
         ns_b.ether_ifaces_snapshot()[0].arp_snapshot(now),
@@ -1111,7 +1125,11 @@ fn namespace_runtime_masquerades_icmp_and_conntrack_dnat_reply() {
         }
     }
 
-    assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+    assert_eq!(
+        received,
+        Some(IPV4_HEADER_LEN + message.len()),
+        "runtime outcome: {total:?}"
+    );
     assert!(total.ipv4_forwarded >= 2);
 }
 
@@ -1264,7 +1282,11 @@ fn namespace_runtime_retries_masqueraded_forward_after_uplink_arp_resolution() {
         }
     }
 
-    assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+    assert_eq!(
+        received,
+        Some(IPV4_HEADER_LEN + message.len()),
+        "runtime outcome: {total:?}"
+    );
     assert!(
         total.ipv4_forward_pending_resolution >= 1,
         "test should exercise egress ARP pending: {total:?}"

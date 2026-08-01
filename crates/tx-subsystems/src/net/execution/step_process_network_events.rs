@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use smoltcp::time::{Duration, Instant};
 use tx_substrate::zone::PayloadCap;
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{
     NetworkPublish, NetworkPublishTarget, PacketDispatch, PacketSource, TcpPacketEvent,
@@ -10,16 +10,17 @@ use crate::net::packet::{
 };
 use crate::net::protocol::{
     is_first_syn, listener_accepts_incoming, promote_connected_stream_and_publish_accept,
-    Icmpv4Event, LoopbackIface, SmoltcpTcpSegment,
+    Icmpv4Event, LoopbackIface, SmoltcpTcpSegment, TcpConnectedPromotion,
 };
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    ConnectionKey, Ipv4Address, RecvWireSet, SocketIdentity, SocketKind, SocketProtocol,
-    TcpBacklogEntry, TcpBacklogRetransmitOutcome, TcpState, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    ConnectionKey, Ipv4Address, SocketIdentity, SocketKind, SocketProtocol, TcpBacklogEntry,
+    TcpBacklogRetransmitOutcome, TcpState, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 use tx_substrate::zone::Cap;
 
+use super::step_connect::fail_indexed_tcp_connect_attempt;
 use super::step_send::deliver_raw_ipv6_packet_to_table;
 use super::step_tcp_backlog_cleanup::{cleanup_tcp_backlog_for_listener, TcpBacklogCleanupOutcome};
 use super::step_tcp_backlog_poll::poll_tcp_backlog_for_listener_loopback;
@@ -403,43 +404,81 @@ fn feed_tcp_segment(
     urgent: bool,
     guard: &Guard<'_>,
 ) -> Vec<NetworkPublishTarget> {
-    let Some(raw) = payload.raw_tcp_socket() else {
+    let Some(local) = segment.dst_endpoint() else {
         return Vec::new();
     };
-    let bits = raw.process_segment(segment);
+    let Some(remote) = segment.src_endpoint() else {
+        return Vec::new();
+    };
+    let Some((generation, (bits, recv_available))) =
+        payload.process_current_tcp_flow(local, remote, |raw| {
+            let bits = raw.process_segment(segment);
+            let recv_available = raw.recv_available();
+            (bits, recv_available)
+        })
+    else {
+        return Vec::new();
+    };
+    if let Some(attempt) = bits.failed_connect_attempt {
+        let _ = fail_indexed_tcp_connect_attempt(socket, payload, attempt, Errno::ECONNREFUSED);
+        // A connect RST is represented by pending_error + CONNECT_DONE, not by
+        // the established-stream BROKEN wires. If the generation is stale,
+        // none of its raw readiness bits may leak into the current attempt.
+        return Vec::new();
+    }
 
     let mut publishes = Vec::new();
     if bits.connected {
         // Inbound child: flip Connecting→Connected, register the
         // connection in the table, move the backlog entry to the accept
-        // queue, and publish accept-readiness to the listener. Outbound
-        // client: the enum flip still happens inside, but no listener
-        // matches its ephemeral local port, so this returns None and the
-        // SPACE publish below resumes the parked connect().
-        if let Some(accept_publish) =
-            promote_connected_stream_and_publish_accept(table, socket, payload, guard)
-        {
-            publishes.push(accept_publish);
+        // queue, and publish accept-readiness to the listener. An outbound
+        // client's attempt token selects the active-open branch directly.
+        // Both branches commit Connected and fire SPACE under the socket
+        // control lock.
+        match promote_connected_stream_and_publish_accept(
+            table,
+            socket,
+            payload,
+            bits.connected_attempt,
+            generation,
+            guard,
+        ) {
+            TcpConnectedPromotion::Applied(Some(accept_publish)) => {
+                publishes.push(accept_publish);
+            }
+            TcpConnectedPromotion::Applied(None) => {}
+            TcpConnectedPromotion::Stale | TcpConnectedPromotion::Rejected => return publishes,
         }
     }
 
-    // P2-S7 hardening: readiness is a field on the identity — read it via
-    // an observed IdentRef, not a bare Cap deref (panics on retired slots).
-    let Some(ident) = socket.downgrade().observe(guard) else {
+    // P2-S7 hardening: observe(guard) before publishing — the socket may be
+    // concurrently close-retired (bare Cap deref panics on retired slots).
+    if socket.downgrade().observe(guard).is_none() {
         return publishes;
     };
     let publish = NetworkPublish {
-        recv_has_data: bits.recv_readable
-            || ident.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
-                && raw.recv_available() > 0,
-        send_has_space: bits.connected || bits.send_writable,
+        // No wire-already-set suppression here: gating the publish on
+        // `recv_wq.peek() & HAS_DATA == 0` loses the wakeup when the feed
+        // interleaves with a reader that has just observed an empty buffer
+        // and is about to clear the wire and sleep — the data lands, the
+        // suppressed publish never fires, no further segment arrives, and
+        // the reader sleeps forever (observed: git push hung on the final
+        // report-status response that was TCP-ACKed into the rx buffer).
+        // Re-firing an already-set wire is idempotent and a spurious wake
+        // just re-checks the buffer.
+        recv_has_data: bits.recv_readable || recv_available > 0,
+        send_has_space: !bits.connected && bits.send_writable,
         recv_broken: bits.broken || bits.recv_closed,
         send_broken: bits.broken || bits.send_closed,
         urgent,
         ..NetworkPublish::none()
     };
     if publish.has_any() {
-        publishes.push(NetworkPublishTarget::new(socket.clone(), publish));
+        publishes.push(NetworkPublishTarget::new_tcp(
+            socket.clone(),
+            generation,
+            publish,
+        ));
     }
     publishes
 }

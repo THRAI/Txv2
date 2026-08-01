@@ -1,6 +1,5 @@
 use smoltcp::time::Instant;
 use tx_reactor::wait::WaitOutcome;
-use tx_substrate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Guard, StepOutcome};
@@ -19,7 +18,7 @@ use crate::net::protocol::{EtherIface, LoopbackIface};
 use crate::wait_source;
 
 use super::{
-    net_delegate_kick_poll, net_delegate_kick_tick, net_delegate_take, net_delegate_wait_token,
+    net_delegate_clear, net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token,
     DelegateWireSet,
 };
 
@@ -53,15 +52,6 @@ pub trait NetDelegateDriver {
 
     fn loopback_budget(&self) -> LoopbackPollBudget {
         LoopbackPollBudget::default()
-    }
-
-    fn post_net_mailbox_ref_event(
-        &self,
-        mailbox: &TaskMailbox,
-        event: MailboxEvent,
-        hint: MailboxSchedulerHint,
-    ) -> bool {
-        mailbox.post_with_scheduler_hint(event, hint)
     }
 }
 
@@ -141,7 +131,10 @@ where
         .max_ready_steps
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
-        let Some(wait) = wait_source::wait_on_token(net_delegate_wait_token()) else {
+        let wait_token = net_delegate_wait_token();
+        let Some(wait) =
+            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
+        else {
             report.waits_failed += 1;
             break;
         };
@@ -172,7 +165,10 @@ pub async fn net_delegate_task_loop_with_deadline_hook(
         .max_ready_steps
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
-        let Some(wait) = wait_source::wait_on_token(net_delegate_wait_token()) else {
+        let wait_token = net_delegate_wait_token();
+        let Some(wait) =
+            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
+        else {
             report.waits_failed += 1;
             break;
         };
@@ -206,12 +202,10 @@ pub fn net_delegate_step_once(
             .saturating_mul(1_000),
     );
 
-    // Claim the current request bits in one queue-lock operation. The old
-    // peek()+clear() pair could erase a POLL fired by a syscall on another CPU
-    // between the two calls, leaving connect/recv parked forever.
-    let ready = net_delegate_take(DelegateWireSet::POLL | DelegateWireSet::TICK);
+    let ready = net_delegate_queue().peek();
     let poll_seen = ready & DelegateWireSet::POLL.bits() != 0;
     let tick_seen = ready & DelegateWireSet::TICK.bits() != 0;
+    net_delegate_clear(DelegateWireSet::POLL | DelegateWireSet::TICK);
 
     let mut outcome = NetDelegateRuntimeOutcome {
         poll_seen,
@@ -227,13 +221,6 @@ pub fn net_delegate_step_once(
             driver.now(),
             guard,
         ) else {
-            // `take` consumed POLL.  A resumable/error outcome must leave a
-            // request behind; otherwise this pass silently loses the only
-            // edge that can advance blocked connect/send/recv operations.
-            outcome.wakes_fired += net_delegate_kick_poll();
-            if tick_seen {
-                outcome.wakes_fired += net_delegate_kick_tick();
-            }
             return outcome;
         };
         outcome.packets_seen += events.packets_seen;
@@ -252,19 +239,13 @@ pub fn net_delegate_step_once(
                 driver.loopback_budget(),
                 guard,
             ) else {
-                outcome.wakes_fired += net_delegate_kick_poll();
-                if tick_seen {
-                    outcome.wakes_fired += net_delegate_kick_tick();
-                }
                 return outcome;
             };
             outcome.loopback.merge(loopback);
             outcome.packets_seen += loopback.packets_seen;
             outcome.sockets_touched += loopback.sockets_touched;
             outcome.wakes_fired += loopback.wakes_fired;
-            outcome.next_deadline =
-                earliest_deadline(outcome.next_deadline, loopback.next_deadline);
-            if loopback.needs_reschedule() {
+            if loopback.made_progress() {
                 outcome.wakes_fired += net_delegate_kick_poll();
             }
         }
@@ -277,10 +258,6 @@ pub fn net_delegate_step_once(
                 driver.device_tx_budget(),
                 guard,
             ) else {
-                outcome.wakes_fired += net_delegate_kick_poll();
-                if tick_seen {
-                    outcome.wakes_fired += net_delegate_kick_tick();
-                }
                 return outcome;
             };
             outcome.device_tx.merge(device_tx);
@@ -298,10 +275,6 @@ pub fn net_delegate_step_once(
             let StepOutcome::Done(arp_flush) =
                 step_flush_pending_arp(iface, driver.now(), driver.arp_flush_budget(), guard)
             else {
-                outcome.wakes_fired += net_delegate_kick_poll();
-                if tick_seen {
-                    outcome.wakes_fired += net_delegate_kick_tick();
-                }
                 return outcome;
             };
             outcome.arp_flush = arp_flush;
@@ -323,53 +296,19 @@ pub fn net_delegate_step_once(
         let tick = match driver.loopback_iface() {
             Some(iface) => step_process_network_tick_loopback_in_namespace(
                 driver.now(),
-                net_namespace.clone(),
+                net_namespace,
                 iface,
                 guard,
             ),
-            None => {
-                step_process_network_tick_in_namespace(driver.now(), net_namespace.clone(), guard)
-            }
+            None => step_process_network_tick_in_namespace(driver.now(), net_namespace, guard),
         };
         let StepOutcome::Done(tick) = tick else {
-            outcome.wakes_fired += net_delegate_kick_tick();
             return outcome;
         };
         outcome.backlog_retransmitted += tick.half_open_retransmitted;
         outcome.backlog_expired += tick.half_open_expired;
         outcome.backlog_failed += tick.half_open_failed;
         outcome.next_deadline = earliest_deadline(outcome.next_deadline, tick.next_deadline);
-
-        // The same supervisor also carries smoltcp deadlines for established
-        // and gracefully-closing streams. Drive only that lane here: a timer
-        // tick must not restart/complete connecting handshakes while backlog
-        // maintenance is retransmitting their SYN-ACK.
-        if let Some(iface) = driver.loopback_iface() {
-            let mut budget = driver.loopback_budget();
-            budget.tcp_connecting = 0;
-            budget.udp_bound = 0;
-            budget.raw_icmp = 0;
-            budget.packet_budget = 0;
-            let StepOutcome::Done(loopback) = step_process_loopback_pending_in_namespace(
-                driver.now(),
-                net_namespace,
-                iface,
-                budget,
-                guard,
-            ) else {
-                outcome.wakes_fired += net_delegate_kick_tick();
-                return outcome;
-            };
-            outcome.loopback.merge(loopback);
-            outcome.packets_seen += loopback.packets_seen;
-            outcome.sockets_touched += loopback.sockets_touched;
-            outcome.wakes_fired += loopback.wakes_fired;
-            outcome.next_deadline =
-                earliest_deadline(outcome.next_deadline, loopback.next_deadline);
-            if loopback.needs_reschedule() {
-                outcome.wakes_fired += net_delegate_kick_poll();
-            }
-        }
     }
 
     outcome

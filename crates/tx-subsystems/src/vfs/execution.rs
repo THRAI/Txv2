@@ -399,6 +399,8 @@ impl OpenFile {
                     side: crate::pipe::PipeSide::Writer,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
+                // P3-S2 (D13): ordinary socket reads share the VFS byte
+                // path; socket-specific ABI decoding remains in the shim.
                 StructPayload::Socket { identity } => {
                     crate::device::FileOps::read(identity, out, flags.nonblocking, guard)
                 }
@@ -659,6 +661,8 @@ impl OpenFile {
                     side: crate::pipe::PipeSide::Reader,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
+                // P3-S2 (D13): ordinary socket writes share the VFS byte
+                // path; socket-specific ABI decoding remains in the shim.
                 StructPayload::Socket { identity } => {
                     crate::device::FileOps::write(identity, bytes, flags.nonblocking, guard)
                 }
@@ -1960,16 +1964,32 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
         if let Some(container) = &self.page_container {
-            if container.has_file_io_service_runtime() {
+            let has_backend_planner = match container.kind() {
+                crate::page_backed::PageContainerKind::File { mount, .. } => {
+                    mount.payload().backend_planner().is_some()
+                }
+                _ => false,
+            };
+            if has_backend_planner && container.has_file_io_service_runtime() {
                 return match self.state.advance(container) {
                     Err(errno) => V3::Err(errno.into()),
-                    Ok(None) => V3::Continue {
-                        progress: NoProgress,
-                    },
+                    Ok(None) => self.state.pending_outcome(NoProgress),
                     Ok(Some(Ok(()))) => V3::Done(()),
                     Ok(Some(Err(errno))) => V3::Err(errno.into()),
                 };
             }
+            let guard = step_engine::guard();
+            return match crate::page_backed::step_fsync(container, &guard) {
+                V3::Done(()) => V3::Done(()),
+                V3::Err(e) => V3::Err(e),
+                V3::Continue { .. } => V3::Continue {
+                    progress: NoProgress,
+                },
+                V3::Yield { shape, .. } => V3::Yield {
+                    progress: NoProgress,
+                    shape,
+                },
+            };
         }
         let guard = step_engine::guard();
         match self.page_backing.fsync_file(self.fs_object_id, &guard) {

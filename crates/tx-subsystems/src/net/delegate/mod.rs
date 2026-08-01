@@ -5,10 +5,8 @@ mod runtime;
 mod supervisor;
 mod timer;
 
-pub(crate) use queue::net_delegate_take;
 pub use queue::{
-    net_delegate_carrier_id, net_delegate_clear, net_delegate_kick_poll,
-    net_delegate_kick_poll_with_post, net_delegate_kick_tick, net_delegate_kick_tick_with_post,
+    net_delegate_carrier_id, net_delegate_clear, net_delegate_kick_poll, net_delegate_kick_tick,
     net_delegate_queue, net_delegate_wait_token, DelegateWireSet,
 };
 pub use runtime::{

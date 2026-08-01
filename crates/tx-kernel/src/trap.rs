@@ -72,10 +72,19 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         }
 
         let handled = P::dispatch_irq(irq);
-        P::complete(irq);
+        // Most handlers finish their controller transaction in the trap.
+        // A deferred handler keeps the claim outstanding so a task-context
+        // bottom half can clear a level-triggered device source first. That
+        // bottom half owns the one matching same-context completion.
+        if !matches!(handled, IrqHandled::DeferredWake) {
+            P::complete(irq);
+        }
 
         match handled {
-            IrqHandled::Wake => {
+            IrqHandled::Wake | IrqHandled::DeferredWake => {
+                // A from-user reschedule longjmps out of the board trap shell.
+                // Preserve the interrupted userspace run in its hart slot
+                // before requesting that jump, exactly as the timer path does.
                 if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
                     let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
                     if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {

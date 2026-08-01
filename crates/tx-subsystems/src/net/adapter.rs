@@ -20,7 +20,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitSource};
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(source_id);
@@ -33,6 +33,20 @@ pub mod wait_routing {
     }
 
     pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        let _ = tx_substrate::wake::notify(source, mask_bits);
+        // `wake::notify` reports how many waiters it woke; the mirror path
+        // has no use for the count.
+        let _woken = tx_substrate::wake::notify(source, mask_bits);
+    }
+
+    pub fn notify_v3_source_with_post(
+        source: &Arc<WaitSource>,
+        mask_bits: u64,
+        post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    ) {
+        source.notify_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            tx_substrate::wake::MailboxSchedulerHint::Normal,
+            |mailbox, event, _hint| post(mailbox, event),
+        );
     }
 }

@@ -83,6 +83,47 @@ fn icmpv4_parser_accepts_busybox_pattern_echo_payload() {
     );
 }
 
+/// Twin of `raw_icmp_ipv4_recv_returns_ip_header_for_raw_socket` for the
+/// `SOCK_DGRAM` flavour. Linux ping sockets — `socket(AF_INET, SOCK_DGRAM,
+/// IPPROTO_ICMP)`, which is what modern busybox `ping` opens — deliver the
+/// ICMP message only; handing them the 20-byte IPv4 header shifts every
+/// field userspace reads.
+#[test]
+fn raw_icmp_ipv4_dgram_recv_strips_ip_header() {
+    let socket = RawIcmpSocket::new(&SocketOptionSet::for_kind(SocketKind::RawIcmp));
+    let reply = Icmpv4EchoPacket {
+        src: Ipv4Address::new([10, 0, 0, 1]),
+        dst: Ipv4Address::new([10, 0, 0, 2]),
+        ident: 0x5151,
+        seq_no: 1,
+        payload: b"trace".to_vec(),
+    };
+    let message_len = icmpv4_echo_message_len(&reply);
+
+    assert!(socket.ingest_rx_echo_reply(reply.clone()));
+    assert_eq!(
+        socket.recv_len_with_ipv4_header(usize::MAX, true, false),
+        Some((message_len, false)),
+        "datagram flavour must not count the IPv4 header"
+    );
+    // The raw flavour still sees the header, from the same queued packet.
+    assert_eq!(
+        socket.recv_len_with_ipv4_header(usize::MAX, true, true),
+        Some((20 + message_len, false))
+    );
+
+    let mut out = std::vec![0u8; 20 + message_len];
+    let drain = socket
+        .recv_bytes_with_ipv4_header(&mut out, false, false)
+        .expect("dgram reply");
+    assert_eq!(drain.bytes, message_len);
+    // First byte is the ICMP type (0 = echo reply), not an IPv4 version nibble.
+    assert_eq!(out[0], 0);
+    assert_eq!(u16::from_be_bytes([out[4], out[5]]), reply.ident);
+    assert_eq!(u16::from_be_bytes([out[6], out[7]]), reply.seq_no);
+    assert_eq!(&out[8..message_len], &reply.payload[..]);
+}
+
 #[test]
 fn raw_icmp_send_accepts_busybox_pattern_echo_code() {
     init_zones();

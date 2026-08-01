@@ -65,6 +65,7 @@ pub struct NetNamespacePayload {
     /// is the shared `INITIAL_SOCKET_TABLE` static (never freed).
     socket_table_owned: bool,
     loopback_iface: &'static LoopbackIface,
+    loopback_tcp_connected_cursor: AtomicU64,
     loopback_mtu: SpinMutex<u16>,
     loopback_ipv4_override: SpinMutex<Option<(Ipv4Address, u8)>>,
     loopback_ipv6_override: SpinMutex<Option<(Ipv6Address, u8)>>,
@@ -466,6 +467,7 @@ impl NetNamespacePayload {
             socket_table,
             socket_table_owned,
             loopback_iface,
+            loopback_tcp_connected_cursor: AtomicU64::new(0),
             loopback_mtu: SpinMutex::new(loopback_iface.mtu()),
             loopback_ipv4_override: SpinMutex::new(None),
             loopback_ipv6_override: SpinMutex::new(None),
@@ -505,6 +507,11 @@ impl NetNamespacePayload {
 
     pub fn loopback_iface(&self) -> &'static LoopbackIface {
         self.loopback_iface
+    }
+
+    pub(crate) fn reserve_loopback_tcp_connected_window(&self, visits: usize) -> u64 {
+        self.loopback_tcp_connected_cursor
+            .fetch_add(visits as u64, Ordering::Relaxed)
     }
 
     pub(crate) fn netfilter_state(&self) -> &SpinMutex<NetfilterState> {
@@ -1289,6 +1296,35 @@ impl NetNamespacePayload {
             .max_by_key(|decision| decision.prefix_len)
     }
 
+    /// V5-3: FIB-driven IPv6 source-address selection — the single place that
+    /// answers "which of my addresses do I send to `dst` from?".
+    ///
+    /// Before this, three call sites (connect autobind in tx-shims,
+    /// `select_routed_local`, and the raw-ICMPv6 helper) each carried their own
+    /// copy of "take the first up non-loopback link that has any v6 address",
+    /// which ignores `preferred_src`, prefix length and the outgoing interface
+    /// — wrong the moment a host has more than one v6 prefix.
+    ///
+    /// **Returning `None` when no route covers `dst` is load-bearing**, not an
+    /// oversight: connect() relies on it to fail fast with EADDRNOTAVAIL
+    /// instead of queueing a SYN that `decide_ipv6_route` will refuse forever.
+    /// Callers that would rather send from *something* than not send at all
+    /// (raw ICMPv6) layer their own fallback on top.
+    pub fn preferred_ipv6_source(&self, dst: Ipv6Address) -> Option<Ipv6Address> {
+        let route = self.best_ipv6_route(dst)?;
+        route.preferred_src.or_else(|| {
+            self.link_snapshot()
+                .into_iter()
+                .find(|link| {
+                    link.name == route.oif_name
+                        && link.is_up
+                        && !link.is_loopback
+                        && link.ipv6_addr.is_some()
+                })
+                .and_then(|link| link.ipv6_addr)
+        })
+    }
+
     fn route6_decision_for_info(
         &self,
         route: NetNamespaceRoute6Info,
@@ -1634,8 +1670,24 @@ impl NetNamespacePayload {
         out
     }
 
-    /// Add an IPv6 address to a link; the first becomes the primary, further
-    /// distinct addresses become secondaries.
+    /// Add an IPv6 address to a link. The NEWEST address takes the primary
+    /// slot; any address it displaces is demoted to a secondary.
+    ///
+    /// **Why newest-wins and not first-wins.** Only the primary is routable:
+    /// `route6_snapshot` synthesises connected routes from `link.ipv6_addr`
+    /// alone, and `IfaceCommon` carries exactly one v6 address for
+    /// `decide_ipv6_route`'s on-link test. A secondary is therefore *stored but
+    /// unusable* — a silent black hole. That was tolerable while nothing
+    /// occupied the primary slot at boot (the user's first `ip -6 addr add`
+    /// became primary and worked), but the V5-2 boot seed now holds it, so
+    /// first-wins would make **every** explicitly configured address unroutable.
+    ///
+    /// Newest-wins dominates the old behaviour in every case: one address
+    /// behaves identically, and with several the most recently configured one
+    /// works where previously only the first did. It is still a deviation from
+    /// Linux, which routes all of them — carrying every on-link prefix into
+    /// `IfaceCommon` (and emitting connected routes for secondaries) is the
+    /// real fix and is recorded as P5 debt.
     pub fn add_device_ipv6_addr_by_ifindex(
         &self,
         authority: NetAdminAuthority,
@@ -1661,19 +1713,35 @@ impl NetNamespacePayload {
                 Some(prefix_len),
             );
         }
+        // Demote the address currently holding the primary slot, then install
+        // the new one there (see the newest-wins rationale above). Read the
+        // displaced prefix length BEFORE the overwrite, and do the fallible
+        // primary update BEFORE touching `extras`, so a failure cannot leave the
+        // link with the old primary demoted and nothing promoted.
+        let displaced = primary.map(|addr| {
+            (
+                addr,
+                self.ipv6_prefix_len_for_device(registration).unwrap_or(64),
+            )
+        });
+        self.set_device_ipv6_addr_by_ifindex(authority, ifindex, Some(addr), Some(prefix_len))?;
         {
             let mut extras = self.ipv6_extra_addrs.lock();
-            if let Some(extra) = extras
-                .iter_mut()
-                .find(|extra| extra.devt == registration.devt && extra.addr == addr)
-            {
-                extra.prefix_len = prefix_len;
-            } else {
-                extras.push(ExtraIpv6Addr {
-                    devt: registration.devt,
-                    addr,
-                    prefix_len,
-                });
+            // Whatever we are promoting must not linger as a secondary too.
+            extras.retain(|extra| !(extra.devt == registration.devt && extra.addr == addr));
+            if let Some((old_addr, old_prefix_len)) = displaced {
+                if let Some(extra) = extras
+                    .iter_mut()
+                    .find(|extra| extra.devt == registration.devt && extra.addr == old_addr)
+                {
+                    extra.prefix_len = old_prefix_len;
+                } else {
+                    extras.push(ExtraIpv6Addr {
+                        devt: registration.devt,
+                        addr: old_addr,
+                        prefix_len: old_prefix_len,
+                    });
+                }
             }
         }
         self.invalidate_link_snapshot_cache();
@@ -1712,7 +1780,31 @@ impl NetNamespacePayload {
             }
         }
         if self.ipv6_for_device(registration) == Some(addr) {
-            self.set_device_ipv6_addr_by_ifindex(authority, ifindex, None, None)?;
+            // Symmetric counterpart of the newest-wins promotion in
+            // `add_device_ipv6_addr_by_ifindex`: hand the routable primary slot
+            // to the most recently demoted secondary instead of leaving the
+            // link with no usable v6 address at all. Without this, deleting one
+            // of two configured addresses kills v6 on the link entirely even
+            // though another address is still configured.
+            let promoted = {
+                let mut extras = self.ipv6_extra_addrs.lock();
+                extras
+                    .iter()
+                    .rposition(|extra| extra.devt == registration.devt)
+                    .map(|index| {
+                        let extra = extras.remove(index);
+                        (extra.addr, extra.prefix_len)
+                    })
+            };
+            match promoted {
+                Some((next_addr, next_prefix_len)) => self.set_device_ipv6_addr_by_ifindex(
+                    authority,
+                    ifindex,
+                    Some(next_addr),
+                    Some(next_prefix_len),
+                )?,
+                None => self.set_device_ipv6_addr_by_ifindex(authority, ifindex, None, None)?,
+            }
             return Ok(true);
         }
         Ok(false)

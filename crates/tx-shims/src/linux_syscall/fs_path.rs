@@ -80,11 +80,7 @@ use tx_subsystems::vfs::structure::OpenFileBacking;
 /// (`OpenFile::opendir_dentry()` carries the dentry for fds opened
 /// with `O_DIRECTORY`). Returns `EBADF` for closed/invalid fds and
 /// `ENOTDIR` for fds that aren't directories.
-fn resolve_cwd_for_path(
-    dirfd: i32,
-    path: &[u8],
-    ctx: &SyscallCtx,
-) -> Result<Cap<DEntry>, i32> {
+fn resolve_cwd_for_path(dirfd: i32, path: &[u8], ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
     // Keep the file-mode syscall family on the same Linux *at resolver as
     // openat/statx/renameat: an absolute pathname is rooted at the process
     // root and therefore never consults dirfd.

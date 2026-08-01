@@ -15,7 +15,7 @@ BRANCH="${ALPINE_BRANCH:-latest-stable}"
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 ROOTFS_DIR="${TX_ALPINE_ROOTFS:-$REPO_ROOT/target/rootfs/alpine-rv64-qemu}"
 CACHE_DIR="${TX_ALPINE_CACHE:-$REPO_ROOT/target/images/alpine-cache}"
-PACKAGES="${TX_ALPINE_PACKAGES:-busybox openrc nftables iptables iproute2}"
+PACKAGES="${TX_ALPINE_PACKAGES:-busybox openrc nftables iptables iproute2 curl}"
 REPOS="${TX_ALPINE_REPOS:-main community}"
 MINIROOTFS_URL="${ALPINE_MINIROOTFS_URL:-}"
 
@@ -46,6 +46,33 @@ download() {
   mv "$out.tmp" "$out"
 }
 
+refresh_download() {
+  local url="$1"
+  local out="$2"
+  local tmp="$out.tmp"
+  mkdir -p "$(dirname -- "$out")"
+  log "refresh $url"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$url"; then
+      mv "$tmp" "$out"
+      return 0
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if wget -O "$tmp" "$url"; then
+      mv "$tmp" "$out"
+      return 0
+    fi
+  else
+    die "need curl or wget"
+  fi
+  rm -f -- "$tmp"
+  if [ -s "$out" ]; then
+    log "warn: metadata refresh failed; using cached $out"
+    return 0
+  fi
+  die "failed to download metadata: $url"
+}
+
 safe_reset_dir() {
   local dir="$1"
   case "$dir" in
@@ -60,7 +87,7 @@ safe_reset_dir() {
 default_minirootfs_url() {
   local latest="$CACHE_DIR/latest-releases.yaml"
   local latest_url="$MIRROR/$BRANCH/releases/$ARCH/latest-releases.yaml"
-  download "$latest_url" "$latest"
+  refresh_download "$latest_url" "$latest"
   local file
   file="$(
     awk '
@@ -80,7 +107,7 @@ fetch_index() {
   local repo="$1"
   local archive="$CACHE_DIR/$repo-APKINDEX.tar.gz"
   local text="$CACHE_DIR/$repo-APKINDEX"
-  download "$MIRROR/$BRANCH/$repo/$ARCH/APKINDEX.tar.gz" "$archive"
+  refresh_download "$MIRROR/$BRANCH/$repo/$ARCH/APKINDEX.tar.gz" "$archive"
   tar -xOzf "$archive" APKINDEX > "$text"
 }
 

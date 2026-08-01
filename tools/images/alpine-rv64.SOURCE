@@ -8,9 +8,32 @@ Default APK repositories:
   https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/riscv64
   https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/riscv64
 
+Default package set:
+  busybox openrc nftables iptables iproute2 curl
+
 Generated files stay under:
   target/rootfs/alpine-rv64-qemu
   target/images/alpine-cache
 
 Regenerate with:
   tools/images/fetch-alpine-rv64.sh
+
+Mutable latest-stable release and APK index metadata is refreshed on each run;
+downloaded minirootfs and APK payloads remain cached.
+
+Build with:
+  cargo xtask image cpio --profile alpine --target rv64-qemu
+
+In a host terminal:
+  mkdir -p /tmp/tx-curl-www
+  printf 'TX_CURL_HOST_OK\n' > /tmp/tx-curl-www/index.html
+  python3 -m http.server 18080 --bind 127.0.0.1 --directory /tmp/tx-curl-www
+
+In another host terminal:
+  cargo xtask qemu --target rv64-qemu --profile alpine --net user --interactive
+
+In the guest shell:
+  ip link set eth0 up
+  ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || true
+  ip route add default via 10.0.2.2 2>/dev/null || true
+  curl -fsS --max-time 10 http://10.0.2.2:18080/index.html

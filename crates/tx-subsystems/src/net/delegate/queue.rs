@@ -1,5 +1,4 @@
 use tx_substrate::bus::{RawQueue, StaticRawQueue};
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 use crate::execution::WaitToken;
 use crate::sync::SpinMutex;
@@ -38,36 +37,13 @@ pub fn net_delegate_wait_token() -> WaitToken {
 }
 
 pub fn net_delegate_kick_poll() -> usize {
-    net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event))
+    net_delegate_queue().fire(DelegateWireSet::POLL.bits())
 }
 
 pub fn net_delegate_kick_tick() -> usize {
-    net_delegate_kick_tick_with_post(|mailbox, event| mailbox.post(event))
-}
-
-pub fn net_delegate_kick_poll_with_post<F>(post: F) -> usize
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
-    net_delegate_queue().fire_with_post(DelegateWireSet::POLL.bits(), post)
-}
-
-pub fn net_delegate_kick_tick_with_post<F>(post: F) -> usize
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
-    net_delegate_queue().fire_with_post(DelegateWireSet::TICK.bits(), post)
+    net_delegate_queue().fire(DelegateWireSet::TICK.bits())
 }
 
 pub fn net_delegate_clear(bits: DelegateWireSet) {
     net_delegate_queue().clear(bits.bits());
-}
-
-/// Atomically claim pending delegate work.
-///
-/// Keeping this separate from `net_delegate_clear` preserves the latter's
-/// reset/test semantics while preventing the runtime's old peek-then-clear
-/// lost-wakeup window.
-pub(crate) fn net_delegate_take(bits: DelegateWireSet) -> u64 {
-    net_delegate_queue().take(bits.bits())
 }

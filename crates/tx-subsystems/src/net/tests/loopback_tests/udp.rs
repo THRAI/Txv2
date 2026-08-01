@@ -143,6 +143,116 @@ fn udp_loopback_connected_send_reaches_bound_receiver() {
 }
 
 #[test]
+fn udp_loopback_zero_length_datagram_reaches_bound_receiver() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+    let iface = LoopbackIface::new(IfaceCommon::new(
+        Ipv4Address::LOOPBACK,
+        Ipv4Address::new([255, 0, 0, 0]),
+        1500,
+    ));
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, inet(40_187), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(50_187), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_connect(&client, inet(40_187), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+
+    let transfer = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("unexpected zero-length udp loopback outcome"),
+    };
+    assert_eq!(transfer.tx_packets, 1);
+    assert_eq!(transfer.packets_seen, 1);
+    assert_eq!(transfer.bytes_moved, 0);
+    assert!(transfer.peer_wake_fired);
+    assert!(server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
+    assert_eq!(
+        step_recv(&server, 1, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+    assert_eq!(
+        server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits(),
+        0
+    );
+}
+
+#[test]
+fn udp_inline_loopback_zero_length_datagram_reaches_bound_receiver() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+    let iface = LoopbackIface::new(IfaceCommon::new(
+        Ipv4Address::LOOPBACK,
+        Ipv4Address::new([255, 0, 0, 0]),
+        1500,
+    ));
+    let server = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("server udp");
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("client udp");
+
+    assert_eq!(
+        step_bind(&server, inet(40_188), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet(50_188), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_connect(&client, inet(40_188), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_udp_loopback_kernel_bytes_on_iface(
+            &client,
+            None,
+            b"",
+            SendRecvFlags::empty(),
+            &iface,
+            &guard,
+        ),
+        StepOutcome::Done(0)
+    );
+    assert!(server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
+    assert_eq!(
+        step_recv(&server, 1, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+    assert_eq!(
+        server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits(),
+        0
+    );
+}
+
+#[test]
 fn udp_loopback_sendto_reaches_wildcard_bound_receiver() {
     let _lock = setup();
     let guard = tx_substrate::epoch::guard();

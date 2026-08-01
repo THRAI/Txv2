@@ -1,12 +1,14 @@
 use alloc::vec::Vec;
-use smoltcp::socket::PollAt;
 use smoltcp::time::Instant;
 use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::protocol::LoopbackIface;
-use crate::net::structure::{Ipv4Address, SocketIdentity, SocketProtocol, TcpState, UdpInner};
+use crate::net::structure::table::SocketTable;
+use crate::net::structure::{
+    ConnectionKey, Ipv4Address, SocketIdentity, SocketProtocol, TcpState, UdpInner,
+};
 
 use super::{
     step_process_loopback_icmp_on_iface, step_process_loopback_tcp,
@@ -41,6 +43,7 @@ pub struct LoopbackPendingOutcome {
     pub tcp_transfer_attempted: usize,
     pub tcp_bytes_moved: usize,
     pub tcp_transfer_failed: usize,
+    pub tcp_immediate_work_remaining: bool,
     pub udp_transfer_attempted: usize,
     pub udp_bytes_moved: usize,
     pub udp_transfer_failed: usize,
@@ -51,8 +54,6 @@ pub struct LoopbackPendingOutcome {
     pub packets_seen: usize,
     pub sockets_touched: usize,
     pub wakes_fired: usize,
-    pub tcp_work_remaining: bool,
-    pub next_deadline: Option<Instant>,
 }
 
 impl Default for LoopbackPollBudget {
@@ -69,10 +70,7 @@ impl LoopbackPendingOutcome {
             || self.icmp_bytes_moved != 0
             || self.tx_packets != 0
             || self.packets_seen != 0
-    }
-
-    pub fn needs_reschedule(&self) -> bool {
-        self.made_progress() || self.tcp_work_remaining
+            || self.tcp_immediate_work_remaining
     }
 
     pub fn merge(&mut self, other: Self) {
@@ -82,6 +80,7 @@ impl LoopbackPendingOutcome {
         self.tcp_transfer_attempted += other.tcp_transfer_attempted;
         self.tcp_bytes_moved += other.tcp_bytes_moved;
         self.tcp_transfer_failed += other.tcp_transfer_failed;
+        self.tcp_immediate_work_remaining |= other.tcp_immediate_work_remaining;
         self.udp_transfer_attempted += other.udp_transfer_attempted;
         self.udp_bytes_moved += other.udp_bytes_moved;
         self.udp_transfer_failed += other.udp_transfer_failed;
@@ -92,8 +91,6 @@ impl LoopbackPendingOutcome {
         self.packets_seen += other.packets_seen;
         self.sockets_touched += other.sockets_touched;
         self.wakes_fired += other.wakes_fired;
-        self.tcp_work_remaining |= other.tcp_work_remaining;
-        self.next_deadline = earliest_deadline(self.next_deadline, other.next_deadline);
     }
 }
 
@@ -148,47 +145,42 @@ pub fn step_process_loopback_pending_in_namespace(
                 outcome.wakes_fired += connect.wakes_fired;
             }
             StepOutcome::Err(_) => outcome.tcp_connect_failed += 1,
-            // A TCP handshake is an incremental protocol state machine.
-            // Continue/Yield means the tuple remains reserved and the next
-            // delegate pass resumes it; it is not a refused connection.
+            // Another CPU may own this flow's short handshake drive. It will
+            // publish CONNECT_DONE; contention is progress-in-flight, not a
+            // refused connection.
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {}
         }
     }
 
-    let mut tcp_connections_seen = Vec::new();
-    let tcp_connections = table
-        .snapshot_tcp_connections(guard)
-        .into_iter()
-        .filter(is_tcp_connected)
-        .filter(|socket| remember_socket(&mut tcp_connections_seen, socket))
-        .collect::<Vec<_>>();
-
-    // Finalization is part of close ownership, not an optional side effect of
-    // finding immediate protocol work. A socket in Closed/TimeWait may report
-    // no due-now work and would otherwise remain in the connection table
-    // forever.
+    // One TCP flow owns two connection-table entries, one for each endpoint.
+    // Build an undirected flow list before applying the budget so a single
+    // transfer (which already drives both raw sockets) consumes one slot.
+    let tcp_connections = table.snapshot_tcp_connections(guard);
+    // Closed/TimeWait sockets may have no immediate transport work.  Finalize
+    // them before filtering flows so deferred close cannot leak indefinitely.
     for socket in &tcp_connections {
         let _ = finalize_tcp_close_if_complete(socket, guard);
     }
 
-    let mut tcp_candidates = tcp_connections
-        .iter()
-        .filter(|socket| has_tcp_loopback_work(socket, iface, now))
-        .cloned()
-        .collect::<Vec<_>>();
-    let tcp_window_len = budget.tcp_connected.min(tcp_candidates.len());
-    outcome.tcp_work_remaining = tcp_candidates.len() > tcp_window_len;
-    if tcp_window_len != 0 {
-        let start = table.claim_tcp_loopback_poll_start(tcp_candidates.len(), tcp_window_len);
-        tcp_candidates.rotate_left(start);
+    let mut tcp_flows_seen = Vec::new();
+    let mut tcp_flows = Vec::new();
+    for socket in tcp_connections {
+        let Some((local, remote)) = in_kernel_tcp_flow(&socket, table, guard) else {
+            continue;
+        };
+        if remember_tcp_flow(&mut tcp_flows_seen, local, remote) {
+            tcp_flows.push(socket);
+        }
     }
 
-    for socket in tcp_candidates.into_iter().take(tcp_window_len) {
-        if finalize_tcp_close_if_complete(&socket, guard) {
-            continue;
-        }
+    let visits = tcp_flows.len().min(budget.tcp_connected);
+    let ticket = net_namespace.reserve_loopback_tcp_connected_window(visits);
+    let start = loopback_round_robin_start(ticket, tcp_flows.len());
+    for offset in 0..visits {
+        let socket = &tcp_flows[(start + offset) % tcp_flows.len()];
+
         outcome.tcp_transfer_attempted += 1;
-        match step_process_loopback_tcp(&socket, budget.tcp_transfer_bytes, iface, guard) {
+        match step_process_loopback_tcp(socket, budget.tcp_transfer_bytes, iface, guard) {
             StepOutcome::Done(transfer) => {
                 outcome.tcp_bytes_moved += transfer.bytes_moved;
                 outcome.tx_packets += transfer.tx_packets;
@@ -200,44 +192,30 @@ pub fn step_process_loopback_pending_in_namespace(
                     + usize::from(transfer.source_send_broken)
                     + usize::from(transfer.peer_recv_broken)
                     + usize::from(transfer.peer_send_broken);
-                let _ = finalize_tcp_close_if_complete(&socket, guard);
             }
             StepOutcome::Err(_) => outcome.tcp_transfer_failed += 1,
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 outcome.tcp_transfer_failed += 1
             }
         }
+        // Processing either endpoint advances both raw TCP state machines.
+        // Recheck every table entry below as the closing endpoint need not be
+        // the representative selected for this undirected flow.
     }
-
-    // Processing a flow changes both endpoints' smoltcp states. Re-read every
-    // connection after the bounded pass so a newly-created FIN/ACK/data action
-    // cannot be lost merely because it was absent from the pre-pass snapshot.
-    // Future protocol timers are returned to the delegate supervisor instead
-    // of waiting for an unrelated syscall to kick POLL.
-    for socket in &tcp_connections {
-        if finalize_tcp_close_if_complete(socket, guard) {
-            continue;
-        }
-        let Some(payload) = socket.acquire_operational() else {
-            continue;
-        };
-        let Some(raw) = payload.raw_tcp_socket() else {
-            continue;
-        };
-        match raw.poll_at() {
-            PollAt::Now => outcome.tcp_work_remaining = true,
-            PollAt::Time(deadline) if deadline <= now => {
-                outcome.tcp_work_remaining = true;
-            }
-            PollAt::Time(deadline) => {
-                outcome.next_deadline = earliest_deadline(outcome.next_deadline, Some(deadline));
-            }
-            PollAt::Ingress => {}
-        }
-        if has_tcp_loopback_ingress(socket, iface) {
-            outcome.tcp_work_remaining = true;
-        }
+    for socket in table.snapshot_tcp_connections(guard) {
+        let _ = finalize_tcp_close_if_complete(&socket, guard);
     }
+    // A window can contain only idle flows while a later flow needs an ACK,
+    // window update, retransmit, FIN, keepalive, or queued-data dispatch. Use
+    // smoltcp's authoritative read-only poll hint to decide whether another
+    // immediate delegate pass is needed. Merely having more candidates than
+    // the budget is not enough: that would busy-loop with many idle sockets.
+    outcome.tcp_immediate_work_remaining = budget.tcp_connected != 0
+        && budget.tcp_transfer_bytes != 0
+        && table
+            .snapshot_tcp_connections(guard)
+            .iter()
+            .any(|socket| tcp_socket_needs_immediate_poll(socket, table, now, guard));
 
     let mut udp_bound_seen = Vec::new();
     for socket in table
@@ -325,64 +303,57 @@ fn is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
     })
 }
 
-fn is_tcp_connected(socket: &Cap<SocketIdentity>) -> bool {
-    socket.acquire_operational().is_some_and(|payload| {
-        matches!(
-            payload.protocol_snapshot(),
-            SocketProtocol::Tcp(TcpState::Connected { .. })
-        )
-    })
-}
-
-fn has_tcp_loopback_work(
+fn in_kernel_tcp_flow(
     socket: &Cap<SocketIdentity>,
-    iface: &LoopbackIface,
-    now: Instant,
-) -> bool {
-    let Some(payload) = socket.acquire_operational() else {
-        return false;
-    };
-    if !matches!(
-        payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected { .. })
-    ) {
-        return false;
-    }
-    if let Some(raw) = payload.raw_tcp_socket() {
-        match raw.poll_at() {
-            PollAt::Now => return true,
-            PollAt::Time(deadline) if deadline <= now => return true,
-            PollAt::Time(_) | PollAt::Ingress => {}
-        }
-    }
-
-    has_tcp_loopback_ingress(socket, iface)
-}
-
-fn has_tcp_loopback_ingress(socket: &Cap<SocketIdentity>, iface: &LoopbackIface) -> bool {
-    let Some(payload) = socket.acquire_operational() else {
-        return false;
-    };
+    table: &SocketTable,
+    guard: &Guard<'_>,
+) -> Option<(
+    crate::net::structure::IpEndpoint,
+    crate::net::structure::IpEndpoint,
+)> {
+    let payload = socket.acquire_operational()?;
     let SocketProtocol::Tcp(TcpState::Connected { local, remote }) = payload.protocol_snapshot()
     else {
-        return false;
+        return None;
     };
-    iface.has_ingress_matching(|packet| {
-        crate::net::protocol::SmoltcpTcpSegment::packet_endpoints(packet).is_some_and(
-            |(packet_src, packet_dst)| {
-                (packet_src == local && packet_dst == remote)
-                    || (packet_src == remote && packet_dst == local)
-            },
-        )
-    })
+    let peer = table.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)?;
+    if peer.raw() == socket.raw() {
+        return None;
+    }
+    let peer_payload = peer.acquire_operational()?;
+    matches!(
+        peer_payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected {
+            local: peer_local,
+            remote: peer_remote,
+        }) if peer_local == remote && peer_remote == local
+    )
+    .then_some((local, remote))
 }
 
-fn earliest_deadline(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => Some(current.min(candidate)),
-        (Some(current), None) => Some(current),
-        (None, Some(candidate)) => Some(candidate),
-        (None, None) => None,
+fn tcp_socket_needs_immediate_poll(
+    socket: &Cap<SocketIdentity>,
+    table: &SocketTable,
+    now: Instant,
+    guard: &Guard<'_>,
+) -> bool {
+    // The loopback lane can make progress only when the reverse in-kernel
+    // endpoint is still present. An external or orphaned Connected socket may
+    // legitimately report PollAt::Now, but repeatedly scheduling this lane
+    // cannot consume that work and would spin the delegate.
+    if in_kernel_tcp_flow(socket, table, guard).is_none() {
+        return false;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    let Some(raw) = payload.raw_tcp_socket() else {
+        return false;
+    };
+    match raw.poll_at(now) {
+        smoltcp::socket::PollAt::Now => true,
+        smoltcp::socket::PollAt::Time(deadline) => deadline <= now,
+        smoltcp::socket::PollAt::Ingress => false,
     }
 }
 
@@ -414,4 +385,53 @@ fn remember_socket(seen: &mut Vec<u32>, socket: &Cap<SocketIdentity>) -> bool {
     }
     seen.push(raw);
     true
+}
+
+fn remember_tcp_flow(
+    seen: &mut Vec<(
+        crate::net::structure::IpEndpoint,
+        crate::net::structure::IpEndpoint,
+    )>,
+    local: crate::net::structure::IpEndpoint,
+    remote: crate::net::structure::IpEndpoint,
+) -> bool {
+    if seen.iter().any(|(seen_local, seen_remote)| {
+        (*seen_local == local && *seen_remote == remote)
+            || (*seen_local == remote && *seen_remote == local)
+    }) {
+        return false;
+    }
+    seen.push((local, remote));
+    true
+}
+
+fn loopback_round_robin_start(ticket: u64, candidate_count: usize) -> usize {
+    if candidate_count == 0 {
+        0
+    } else {
+        (ticket % candidate_count as u64) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loopback_round_robin_start;
+
+    #[test]
+    fn loopback_round_robin_visits_candidates_beyond_the_first_budget_window() {
+        let candidate_count = 5;
+        let visits = 2;
+        let mut ticket = 0u64;
+        let mut seen = [false; 5];
+
+        for _ in 0..3 {
+            let start = loopback_round_robin_start(ticket, candidate_count);
+            for offset in 0..visits {
+                seen[(start + offset) % candidate_count] = true;
+            }
+            ticket = ticket.wrapping_add(visits as u64);
+        }
+
+        assert!(seen.into_iter().all(|visited| visited));
+    }
 }

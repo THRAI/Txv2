@@ -87,6 +87,16 @@ pub(super) fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'
         E::OutOfMemory => "out-of-memory",
         E::Busy => "busy",
         E::IoError => "io-error",
+        // Variants main's exec rewrite added. Without these the merge's
+        // `tx.runsh` failure reported as the catch-all "other", which hides
+        // exactly the interesting cases (a dynamic binary whose interpreter
+        // cannot be resolved reports ELIBBAD, not ENOENT).
+        E::InterpreterMalformed => "interp-malformed",
+        E::InterpreterNested => "interp-nested",
+        E::Layout(_) => "layout",
+        E::Again => "again",
+        E::Retry => "retry",
+        E::Deferred(_) => "deferred",
         // Forward-compat: ExecError may grow new variants. Avoid a
         // build break if a future variant lands without a label here.
         #[allow(unreachable_patterns)]

@@ -2,7 +2,6 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 use crate::device::DevT;
 use crate::execution::{Errno, Guard, StepOutcome};
@@ -112,13 +111,6 @@ pub trait NetDeviceOps: Send + Sync + 'static {
 
     fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
         NetDeviceIrqOutcome::default()
-    }
-
-    fn ack_interrupt_and_fire_with_post(
-        &self,
-        _post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    ) -> NetDeviceIrqOutcome {
-        self.ack_interrupt_and_fire()
     }
 }
 

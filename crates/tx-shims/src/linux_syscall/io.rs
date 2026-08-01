@@ -1073,7 +1073,7 @@ where
                 use tx_substrate::step::DriveMode;
                 let now_ns = P::read_ns();
                 let mut script_ctx = build_subject_script_ctx(ctx);
-                let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+                let timer_registrar_handle = script_ctx.timer_registrar().cloned();
                 let mailbox = ctx.mailbox.clone();
                 let op = super::NanosleepOp {
                     nanos: 5_000_000,
@@ -1086,7 +1086,7 @@ where
                     DriveMode::Waiting,
                     mailbox.as_ref(),
                     None,
-                    timer_wheel_arc.as_ref(),
+                    timer_registrar_handle.as_ref(),
                 )
                 .await
                 {
@@ -1126,7 +1126,7 @@ where
 
     let mut yielded_before_wait = false;
     let ready = loop {
-        drive_loopback_pending(ctx);
+        drive_loopback_pending();
         if let Some(deadline_ns) = timeout_deadline_ns {
             if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
                 break 0;
@@ -1494,7 +1494,7 @@ where
     let word_count = fdset_word_count(nfds);
     let mut yielded_before_wait = false;
     let (read_ready, write_ready, except_ready, ready_count) = loop {
-        drive_loopback_pending(ctx);
+        drive_loopback_pending();
         if let Some(deadline_ns) = timeout_deadline_ns {
             if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
                 break (
@@ -1873,7 +1873,7 @@ async fn sys_write_pagebacked<'a>(
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = OpenFileWriteFromUserOp {
         file,
@@ -1889,7 +1889,7 @@ async fn sys_write_pagebacked<'a>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -1931,7 +1931,7 @@ async fn sys_pipe_write_buffered<'a>(
     } else {
         DriveMode::Waiting
     };
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = WriteWithHintPostOp {
         payload,
@@ -1949,7 +1949,7 @@ async fn sys_pipe_write_buffered<'a>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -1985,7 +1985,7 @@ async fn sys_pipe_read_buffered<'a, P: tx_hal::ConsoleIf>(
     } else {
         DriveMode::Waiting
     };
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = ReadWithHintPostOp {
         payload,
@@ -2002,7 +2002,7 @@ async fn sys_pipe_read_buffered<'a, P: tx_hal::ConsoleIf>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -2316,7 +2316,7 @@ async fn sys_write_buffered<'a>(
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = OpenFileWriteOp {
         file,
@@ -2330,7 +2330,7 @@ async fn sys_write_buffered<'a>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -2406,7 +2406,7 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = OpenFileReadToUserOp {
         file,
@@ -2421,7 +2421,7 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -2457,6 +2457,14 @@ where
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+
+    // Give queued loopback work one bounded chance before a bootstrap read.
+    // The generic driver below uses Nonblocking mode when there is no mailbox,
+    // so immediate FileOps results (including semantic errors) still win over
+    // EAGAIN while a genuine Yield cannot park forever.
+    if super::socket::socket_identity_from_file(&file).is_ok() && ctx.mailbox.is_none() {
+        super::socket::drive_loopback_pending();
+    }
 
     // POSIX mq descriptors are not byte-stream fds. musl uses the
     // mq_* syscalls directly, but raw read/write on an mqd_t should
@@ -2646,13 +2654,13 @@ where
     let mut script_ctx = build_subject_script_ctx(ctx);
     // The op acquires its own epoch guard inside `step()` (STEP_MODEL_v2
     // §1, INVARIANTS_v5 YIELD-5 / EBR-7); no guard crosses `.await`.
-    let mode = if file.flags().nonblocking {
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let mode = if file.flags().nonblocking || mailbox_arc.is_none() {
         DriveMode::Nonblocking
     } else {
         DriveMode::Waiting
     };
-    let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = OpenFileReadOp {
         file: &file,
@@ -2666,7 +2674,7 @@ where
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     );
     // VTIME race: whichever completes first wins. A `None` from the
     // race means the timer expired with no byte — POSIX says return 0.

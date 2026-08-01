@@ -15,7 +15,7 @@
 use crate::{
     dispatch::{RescheduleSignal, WakeDispatchReport},
     preempt::PreemptMarkers,
-    runtime::{HartRuntimeView, Reactor, RunStats},
+    runtime::{HartPollBudget, HartRuntimeView, Reactor, RunStats},
     scheduler::HartId,
 };
 pub use tx_time::driver::CurrentHartDeadlineAction as HartLoopDeadlineAction;
@@ -141,7 +141,12 @@ pub trait HartLoopRuntime {
 
     fn consume_hart_loop_markers(&mut self, hart: HartId) -> PreemptMarkers;
 
-    fn run_hart_loop_ready<S>(&mut self, hart: HartId, signal: &mut S) -> RunStats
+    fn run_hart_loop_ready<S>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+        poll_budget: HartPollBudget,
+    ) -> RunStats
     where
         S: RescheduleSignal;
 }
@@ -186,12 +191,32 @@ where
     R: HartLoopRuntime,
     S: RescheduleSignal,
 {
+    step_hart_loop_at_with_poll_budget(runtime, hart, now_ns, signal, HartPollBudget::UNTIL_IDLE)
+}
+
+/// Step one hart with a caller-selected future-poll budget.
+///
+/// Time advancement and wake dispatch still happen once per step.  If the
+/// budget is exhausted while runnable work remains, the returned decision is
+/// [`HartLoopDecision::Continue`] and the owner can perform maintenance before
+/// calling again.
+pub fn step_hart_loop_at_with_poll_budget<R, S>(
+    runtime: &mut R,
+    hart: HartId,
+    now_ns: u64,
+    signal: &mut S,
+    poll_budget: HartPollBudget,
+) -> HartLoopStep
+where
+    R: HartLoopRuntime,
+    S: RescheduleSignal,
+{
     let (timer_wakes, mut wake_dispatch) =
         runtime.advance_hart_loop_time_with_reschedule(hart, now_ns, signal);
     wake_dispatch.merge(runtime.drain_hart_loop_wakes(hart, signal));
     let deadline_changed = runtime.hart_loop_deadline_change_pending();
     let consumed_markers = runtime.consume_hart_loop_markers(hart);
-    let stats = runtime.run_hart_loop_ready(hart, signal);
+    let stats = runtime.run_hart_loop_ready(hart, signal, poll_budget);
     let next_deadline_ns = runtime.hart_loop_next_deadline_ns();
 
     HartLoopStep::new(
@@ -246,11 +271,16 @@ impl HartLoopRuntime for Reactor {
         self.consume_dispatch_markers(hart)
     }
 
-    fn run_hart_loop_ready<S>(&mut self, hart: HartId, signal: &mut S) -> RunStats
+    fn run_hart_loop_ready<S>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+        poll_budget: HartPollBudget,
+    ) -> RunStats
     where
         S: RescheduleSignal,
     {
-        self.run_until_idle_on_hart_with_reschedule(hart, signal)
+        self.run_ready_on_hart_with_reschedule(hart, signal, poll_budget)
     }
 }
 
@@ -294,11 +324,16 @@ impl HartLoopRuntime for HartRuntimeView<'_> {
         self.consume_dispatch_markers(hart)
     }
 
-    fn run_hart_loop_ready<S>(&mut self, hart: HartId, signal: &mut S) -> RunStats
+    fn run_hart_loop_ready<S>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+        poll_budget: HartPollBudget,
+    ) -> RunStats
     where
         S: RescheduleSignal,
     {
-        self.run_until_idle_on_hart_with_reschedule(hart, signal)
+        self.run_ready_on_hart_with_reschedule(hart, signal, poll_budget)
     }
 }
 
@@ -441,7 +476,12 @@ mod step_op_wraps {
             self.markers
         }
 
-        fn run_hart_loop_ready<S>(&mut self, _hart: HartId, _signal: &mut S) -> RunStats
+        fn run_hart_loop_ready<S>(
+            &mut self,
+            _hart: HartId,
+            _signal: &mut S,
+            _poll_budget: HartPollBudget,
+        ) -> RunStats
         where
             S: RescheduleSignal,
         {

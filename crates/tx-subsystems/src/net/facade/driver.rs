@@ -49,8 +49,7 @@ fn wait_on_yield_shape(shape: YieldShape) -> Option<crate::wait_source::Register
     match shape {
         YieldShape::OnWaitSource { source, interests }
         | YieldShape::OnEdge { source, interests } => {
-            let token = crate::execution::WaitToken::new(source.raw(), interests.raw());
-            crate::wait_source::wait_on_token(token)
+            crate::wait_source::wait_on_registered_source_id(source.raw(), interests.raw())
         }
         YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }

@@ -16,7 +16,8 @@ pub mod wall_clock;
 #[cfg(feature = "test-support")]
 pub use tx_time::reset_for_test;
 pub use tx_time::{
-    install_realtime_timer_notifier, install_vvar_publish_hook, timekeeper, timekeeper_clock,
+    install_monotonic_ns_source, install_realtime_timer_notifier, install_vvar_publish_hook,
+    realtime_now_ns_hooked, timekeeper, timekeeper_clock,
     ClockId, ClockRead, CurrentHartDeadlineTimer, DeadlineDomain, DeadlineNs, DeadlineRegistrar,
     DeadlineRegistrarHandle, DeviceTimerCallback, RealtimeControl, RealtimeSeedError,
     RealtimeSetPolicy, RealtimeSetReport, RealtimeTimerNotifier, RealtimeWritebackPolicy,

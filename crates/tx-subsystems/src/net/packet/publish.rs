@@ -1,7 +1,8 @@
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::Cap;
 
-use crate::net::structure::{AcceptWireSet, RecvWireSet, SendWireSet, SocketIdentity, UrgentEvent};
+use crate::net::structure::{
+    AcceptWireSet, RecvWireSet, SendWireSet, SocketIdentity, TcpStateGeneration, UrgentEvent,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NetworkPublish {
@@ -48,44 +49,6 @@ impl NetworkPublish {
         wakes
     }
 
-    pub fn publish_to_with_post<F>(self, socket: &SocketIdentity, mut post: F) -> usize
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
-        let mut wakes = 0;
-        if self.recv_has_data {
-            wakes += socket
-                .readiness
-                .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
-        }
-        if self.send_has_space {
-            wakes += socket
-                .readiness
-                .fire_send_with_post(SendWireSet::SPACE, &mut post);
-        }
-        if self.accept_has_pending {
-            wakes += socket
-                .readiness
-                .fire_accept_with_post(AcceptWireSet::HAS_PENDING, &mut post);
-        }
-        if self.recv_broken {
-            wakes += socket
-                .readiness
-                .fire_recv_with_post(RecvWireSet::BROKEN, &mut post);
-        }
-        if self.send_broken {
-            wakes += socket
-                .readiness
-                .fire_send_with_post(SendWireSet::BROKEN, &mut post);
-        }
-        if self.urgent {
-            wakes += socket
-                .urgent_port
-                .fire_with_post(UrgentEvent::URGENT.bits(), post);
-        }
-        wakes
-    }
-
     pub const fn has_any(self) -> bool {
         self.recv_has_data
             || self.send_has_space
@@ -100,11 +63,28 @@ impl NetworkPublish {
 pub struct NetworkPublishTarget {
     pub socket: Cap<SocketIdentity>,
     pub publish: NetworkPublish,
+    tcp_generation: Option<TcpStateGeneration>,
 }
 
 impl NetworkPublishTarget {
     pub fn new(socket: Cap<SocketIdentity>, publish: NetworkPublish) -> Self {
-        Self { socket, publish }
+        Self {
+            socket,
+            publish,
+            tcp_generation: None,
+        }
+    }
+
+    pub(crate) fn new_tcp(
+        socket: Cap<SocketIdentity>,
+        generation: TcpStateGeneration,
+        publish: NetworkPublish,
+    ) -> Self {
+        Self {
+            socket,
+            publish,
+            tcp_generation: Some(generation),
+        }
     }
 
     pub fn publish(self) -> usize {
@@ -117,18 +97,14 @@ impl NetworkPublishTarget {
         let Some(socket) = self.socket.downgrade().observe(&guard) else {
             return 0;
         };
-        self.publish.publish_to(&socket)
-    }
-
-    pub fn publish_with_post<F>(self, post: F) -> usize
-    where
-        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    {
-        let guard =
-            tx_substrate::epoch::borrow_current_guard().unwrap_or_else(tx_substrate::epoch::guard);
-        let Some(socket) = self.socket.downgrade().observe(&guard) else {
+        let Some(generation) = self.tcp_generation else {
+            return self.publish.publish_to(&socket);
+        };
+        let Some(payload) = socket.acquire_operational() else {
             return 0;
         };
-        self.publish.publish_to_with_post(&socket, post)
+        payload
+            .publish_current_tcp_flow(generation, || self.publish.publish_to(&socket))
+            .unwrap_or(0)
     }
 }

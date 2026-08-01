@@ -11,7 +11,6 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::Cap;
 
 use crate::cred::Cred;
@@ -247,18 +246,6 @@ pub fn netlink_netfilter_send(
     bytes: &[u8],
     cred: Cred,
 ) -> Result<usize, Errno> {
-    netlink_netfilter_send_with_post(socket, bytes, cred, |mailbox, event| mailbox.post(event))
-}
-
-pub fn netlink_netfilter_send_with_post<F>(
-    socket: &Cap<SocketIdentity>,
-    bytes: &[u8],
-    cred: Cred,
-    mut post: F,
-) -> Result<usize, Errno>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
     if socket.kind != SocketKind::NetlinkNetfilter {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -277,9 +264,7 @@ where
         raw.queue_response(packet);
     }
     if !raw.is_empty() {
-        socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
     Ok(bytes.len())
 }
@@ -316,18 +301,6 @@ pub fn netlink_xfrm_send(
     bytes: &[u8],
     cred: Cred,
 ) -> Result<usize, Errno> {
-    netlink_xfrm_send_with_post(socket, bytes, cred, |mailbox, event| mailbox.post(event))
-}
-
-pub fn netlink_xfrm_send_with_post<F>(
-    socket: &Cap<SocketIdentity>,
-    bytes: &[u8],
-    cred: Cred,
-    mut post: F,
-) -> Result<usize, Errno>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
     if socket.kind != SocketKind::NetlinkXfrm {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -345,9 +318,7 @@ where
         raw.queue_response(packet);
     }
     if !raw.is_empty() {
-        socket
-            .readiness
-            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
     Ok(bytes.len())
 }

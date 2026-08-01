@@ -11,12 +11,12 @@ use crate::net::protocol::{
     parse_raw_icmpv4_echo_payload_unchecked, Icmpv4Event, Icmpv6Event, RawIpv6Packet,
     UDP_IPV4_MAX_PAYLOAD_BYTES,
 };
-use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv6Address, ProtocolNumber, RdsState,
     RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
     SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
+use crate::net::structure::table::SocketTable;
 use crate::net::NetAdminAuthority;
 use tx_substrate::zone::PayloadCap;
 
@@ -53,25 +53,25 @@ pub fn step_send(
     if let Some(errno) = tcp_connected_peer_error(&payload, guard) {
         return StepOutcome::Err(errno);
     }
-    if len == 0 {
+    if len == 0 && socket.kind != SocketKind::Udp {
         return StepOutcome::Done(0);
     }
 
     let Some(reserve) = payload.reserve_send_space(len) else {
-        clear_send_space_if_full(socket, &payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
 
-    if reserve.bytes == 0 {
+    if reserve.bytes == 0 && !(socket.kind == SocketKind::Udp && len == 0) {
         if reserve.needs_poll_kick {
             net_delegate_kick_poll();
         }
-        clear_send_space_if_full(socket, &payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
 
     if reserve.became_full {
-        clear_send_space_if_full(socket, &payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
@@ -107,6 +107,9 @@ pub fn step_send_kernel_bytes(
     if payload.shutdown_wr() {
         return StepOutcome::Err(Errno::EPIPE);
     }
+    if let Some(errno) = stream_send_state_error(socket, &payload) {
+        return StepOutcome::Err(errno);
+    }
     if let Some(errno) =
         udp_payload_len_error(socket.kind, payload.udp_corked_send_len() + bytes.len())
     {
@@ -115,7 +118,7 @@ pub fn step_send_kernel_bytes(
     if let Some(errno) = tcp_connected_peer_error(&payload, guard) {
         return StepOutcome::Err(errno);
     }
-    if bytes.is_empty() {
+    if bytes.is_empty() && socket.kind != SocketKind::Udp {
         return StepOutcome::Done(0);
     }
     if socket.kind == SocketKind::UnixStream {
@@ -131,22 +134,22 @@ pub fn step_send_kernel_bytes(
     let reserve = match payload.reserve_send_bytes_with_flags(bytes, flags) {
         Ok(Some(reserve)) => reserve,
         Ok(None) => {
-            clear_send_space_if_full(socket, &payload);
+            socket.readiness.clear_send(SendWireSet::SPACE);
             return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
         }
         Err(errno) => return StepOutcome::Err(errno),
     };
 
-    if reserve.bytes == 0 {
+    if reserve.bytes == 0 && !(socket.kind == SocketKind::Udp && bytes.is_empty()) {
         if reserve.needs_poll_kick {
             net_delegate_kick_poll();
         }
-        clear_send_space_if_full(socket, &payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
 
     if reserve.became_full {
-        clear_send_space_if_full(socket, &payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
@@ -246,7 +249,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     {
         return StepOutcome::Err(errno);
     }
-    if bytes.is_empty() {
+    if bytes.is_empty() && socket.kind != SocketKind::Udp {
         return StepOutcome::Done(0);
     }
     if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet {
@@ -287,43 +290,28 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     let reserve = match payload.reserve_send_bytes_to_with_flags(dst, bytes, flags) {
         Ok(Some(reserve)) => reserve,
         Ok(None) => {
-            clear_send_space_if_full(socket, &payload);
+            socket.readiness.clear_send(SendWireSet::SPACE);
             return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
         }
         Err(errno) => return StepOutcome::Err(errno),
     };
 
-    if reserve.bytes == 0 {
+    if reserve.bytes == 0 && !(socket.kind == SocketKind::Udp && bytes.is_empty()) {
         if kick_poll && reserve.needs_poll_kick {
             net_delegate_kick_poll();
         }
-        clear_send_space_if_full(socket, &payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
 
     if reserve.became_full {
-        clear_send_space_if_full(socket, &payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
     }
 
     if kick_poll && (!flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick) {
         net_delegate_kick_poll();
     }
     StepOutcome::Done(reserve.bytes)
-}
-
-/// Clear the cached writable level without erasing a concurrent producer wake.
-///
-/// Reserving send space and updating the readiness queue cannot share one lock:
-/// the former is owned by the protocol-specific socket while the latter is a
-/// bus queue.  Consequently another CPU may drain/ACK bytes and publish SPACE
-/// after the reserve observed a full ring but before this CPU clears SPACE.
-/// Clear first and then re-read the authoritative ring; if space reopened, put
-/// the level back so both already-registered and later waiters observe it.
-pub(super) fn clear_send_space_if_full(socket: &Cap<SocketIdentity>, payload: &SocketPayload) {
-    socket.readiness.clear_send(SendWireSet::SPACE);
-    if payload.io_snapshot().send_space != 0 {
-        socket.readiness.fire_send(SendWireSet::SPACE);
-    }
 }
 
 pub(super) fn send_flags_error(flags: SendRecvFlags) -> Option<Errno> {
@@ -651,9 +639,7 @@ fn send_raw_ipv6(
 
     if !destination.is_loopback() && !destination.is_unspecified() {
         if ipv6_addr_is_configured(dst_addr) {
-            return send_configured_icmpv6_echo(
-                payload, protocol, src_addr, dst_addr, bytes, guard,
-            );
+            return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
         }
         // Real external v6 destination: queue for the device-TX lane (mirror
         // of the v4 external echo flow). Replies come back through the wire
@@ -700,7 +686,7 @@ fn send_external_icmpv6_echo(
         }
     };
     if payload.enqueue_icmp6_tx_echo(request).is_none() {
-        clear_send_space_if_full(socket, payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     }
     net_delegate_kick_poll();
@@ -827,10 +813,21 @@ fn icmp6_filter_accepts(filter: [u32; 8], packet_type: Option<u8>) -> bool {
         .is_none_or(|word| (word & (1u32 << shift)) == 0)
 }
 
+/// Source address for an outgoing raw ICMPv6 packet.
+///
+/// V5-3: consult the FIB first (same answer the TCP/UDP paths now get), but
+/// unlike them keep the old on-link/first-address heuristic as a fallback.
+/// `ping6` to a destination with no route should still put a packet on the
+/// wire from a real local address — returning None here would make
+/// `send_raw_ipv6` fall back to `::1`, which is strictly worse than a
+/// best-guess source.
 fn preferred_ipv6_source_for(
     net_namespace: &PayloadCap<NetNamespacePayload>,
     dst: Ipv6Address,
 ) -> Option<Ipv6Address> {
+    if let Some(routed) = net_namespace.preferred_ipv6_source(dst) {
+        return Some(routed);
+    }
     let mut fallback = None;
     for link in net_namespace.link_snapshot() {
         if !link.is_up {

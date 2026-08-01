@@ -1,18 +1,27 @@
+use tx_substrate::index::IndexError;
+use tx_substrate::step::NoProgress;
 use tx_substrate::zone::Cap;
-use tx_substrate::{index::IndexError, step::NoProgress};
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::net::delegate::net_delegate_kick_poll;
+use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::namespace::initial_loopback_iface;
-use crate::net::packet::{NetworkPublish, NetworkPublishTarget};
-use crate::net::protocol::{
-    promote_connected_stream_and_publish_accept, LoopbackIface, PollContext,
+use crate::net::packet::NetworkPublishTarget;
+use crate::net::protocol::{LoopbackIface, PollContext};
+use crate::net::structure::{
+    ConnectionKey, IpEndpoint, SocketIdentity, SocketProtocol, TcpConnectDisposition, TcpState,
 };
-use crate::net::structure::table::SocketTable;
-use crate::net::structure::{ConnectionKey, IpEndpoint, SocketIdentity, SocketProtocol, TcpState};
+
+use super::step_connect::fail_indexed_tcp_connect_attempt;
+
+struct TcpHandshakeDriver<'a>(&'a crate::net::structure::SocketOperationalEvidence);
+
+impl Drop for TcpHandshakeDriver<'_> {
+    fn drop(&mut self) {
+        self.0.release_tcp_handshake_driver();
+    }
+}
 
 const TCP_LOOPBACK_TRANSFER_PACKET_PASSES: usize = 64;
-const TCP_LOOPBACK_HANDSHAKE_PACKET_PASSES: usize = 8;
 
 #[derive(Clone)]
 pub struct LoopbackTcpConnectOutcome {
@@ -30,10 +39,7 @@ pub struct LoopbackTcpHandshakeStats {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LoopbackTcpTransferOutcome {
-    /// Payload bytes admitted in either direction while driving the pair.
     pub bytes_moved: usize,
-    /// Subset of `bytes_moved` delivered from the requested source to its peer.
-    pub source_bytes_moved: usize,
     pub packets_seen: usize,
     pub tx_packets: usize,
     pub sockets_touched: usize,
@@ -70,104 +76,51 @@ pub fn step_tcp_loopback_handshake_on_iface(
     let Some(client_payload) = client.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
-    let (local, remote) = match connecting_endpoints(&client_payload.protocol_snapshot()) {
-        Ok(endpoints) => endpoints,
-        Err(errno) => return StepOutcome::Err(errno),
+    let Some(attempt) = client_payload.active_tcp_connect_attempt() else {
+        return StepOutcome::Err(Errno::EINVAL);
     };
-    if local.is_unspecified() || local.port == 0 {
-        return StepOutcome::Err(Errno::EADDRNOTAVAIL);
-    }
+    let local = attempt.local();
+    let remote = attempt.remote();
     if !remote.is_loopback() {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
-
-    let table = client_payload.socket_table();
-    let Some(listener) = table.lookup_tcp_listener_dual_stack_endpoint(remote, guard) else {
-        return StepOutcome::Err(Errno::ECONNREFUSED);
+    let fail = |error| {
+        let _ = fail_indexed_tcp_connect_attempt(client, &client_payload, attempt, error);
+        StepOutcome::Err(error)
     };
-    let Some(listener_payload) = listener.acquire_operational() else {
-        return StepOutcome::Err(Errno::ECONNREFUSED);
-    };
-    if !listener_accepts_incoming(&listener_payload, remote) {
-        return StepOutcome::Err(Errno::ECONNREFUSED);
+    if local.is_unspecified() || local.port == 0 {
+        return fail(Errno::EADDRNOTAVAIL);
     }
 
-    let client_key = ConnectionKey::new(local, remote);
-    let inserted_client = match ensure_connection_entry(table, client_key, client, guard) {
-        Ok(inserted) => inserted,
-        Err(errno) => return StepOutcome::Err(errno),
-    };
-
-    let drive = establish_smoltcp_loopback_on_iface(client, local, remote, iface, guard);
-    let (child, handshake, mut publish_targets) = match drive {
-        LoopbackHandshakeDrive::Complete {
-            child,
-            stats,
-            publishes,
-        } => (child, stats, publishes),
-        LoopbackHandshakeDrive::Pending { publishes } => {
-            for target in publishes {
-                target.publish();
-            }
-            // Keep the reserved client tuple and protocol state: the next
-            // delegate pass resumes from SynSent/SynReceived instead of
-            // restarting connect() and converting InvalidState to refusal.
-            net_delegate_kick_poll();
-            return StepOutcome::Continue {
-                progress: NoProgress,
-            };
-        }
-        LoopbackHandshakeDrive::Failed => {
-            if inserted_client {
-                let _ = table.withdraw_tcp_connection(client_key);
-            }
-            return StepOutcome::Err(Errno::ECONNREFUSED);
-        }
-    };
-
-    let Some(child_payload) = child.acquire_operational() else {
-        if inserted_client {
-            let _ = table.withdraw_tcp_connection(client_key);
-        }
-        return StepOutcome::Err(Errno::ECONNREFUSED);
-    };
-    if let Some(accept_publish) =
-        promote_connected_stream_and_publish_accept(table, &child, &child_payload, guard)
-    {
-        publish_targets.push(accept_publish);
-    }
-    // The client tuple was installed before driving packets, so this commits
-    // only its public protocol state and is idempotent.
-    let Some(client_payload) = client.acquire_operational() else {
-        return StepOutcome::Err(Errno::ECONNREFUSED);
-    };
-    let _ = promote_connected_stream_and_publish_accept(table, client, &client_payload, guard);
-    if !matches!(
-        client_payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected {
-            local: current_local,
-            remote: current_remote,
-        }) if current_local == local && current_remote == remote
-    ) || !matches!(
-        child_payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected {
-            local: current_local,
-            remote: current_remote,
-        }) if current_local == remote && current_remote == local
-    ) {
-        net_delegate_kick_poll();
+    // step_connect wakes the delegate and the blocking syscall also attempts
+    // an inline loopback drive. On SMP those are two legitimate callers, but
+    // smoltcp egress is consumptive: without per-flow ownership one CPU can
+    // consume SYN-ACK/ACK and make the other report a false refusal.
+    if !client_payload.try_claim_tcp_handshake_driver() {
         return StepOutcome::Continue {
             progress: NoProgress,
         };
     }
+    let _driver = TcpHandshakeDriver(&client_payload);
 
-    publish_targets.push(NetworkPublishTarget::new(
-        client.clone(),
-        NetworkPublish {
-            send_has_space: true,
-            ..NetworkPublish::none()
-        },
-    ));
+    let table = client_payload.socket_table();
+    let Some(listener) = table.lookup_tcp_listener_dual_stack_endpoint(remote, guard) else {
+        return fail(Errno::ECONNREFUSED);
+    };
+    let Some(listener_payload) = listener.acquire_operational() else {
+        return fail(Errno::ECONNREFUSED);
+    };
+    if !listener_accepts_incoming(&listener_payload, remote) {
+        return fail(Errno::ECONNREFUSED);
+    }
+
+    let (child, handshake, publish_targets) =
+        match establish_smoltcp_loopback_on_iface(client, attempt, iface, guard) {
+            Ok(established) => established,
+            Err(error) => {
+                return fail(error);
+            }
+        };
 
     let wakes_fired = publish_targets
         .into_iter()
@@ -236,15 +189,21 @@ pub fn step_process_loopback_tcp(
         return StepOutcome::Err(Errno::ENOTCONN);
     }
 
-    if peer_payload.raw_tcp_socket().is_none() {
-        return StepOutcome::Err(Errno::EOPNOTSUPP);
-    }
     // Flow control is smoltcp's job now: the peer's advertised window
     // derives from its rx ring, so dispatch stops by itself when full.
     let transfer_limit = max_bytes;
-    let source_had_no_send_space = source_payload
-        .raw_tcp_socket()
-        .is_some_and(|raw| raw.send_available() == 0);
+    let Some((source_generation, (source_had_no_send_space, source_recv_before))) = source_payload
+        .process_current_tcp_flow(local, remote, |raw| {
+            (raw.send_available() == 0, raw.recv_available())
+        })
+    else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+    let Some((peer_generation, peer_recv_before)) =
+        peer_payload.process_current_tcp_flow(remote, local, |raw| raw.recv_available())
+    else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
 
     let mut ctx = PollContext::new_with_table(
         crate::net::clock::net_now_instant(),
@@ -252,62 +211,57 @@ pub fn step_process_loopback_tcp(
     );
     let mut publish_targets = alloc::vec::Vec::new();
     let mut bytes_moved = 0;
-    let mut source_bytes_moved = 0;
     let mut peer_wake_fired = false;
     let mut egress_packets = 0;
-    let mut packets_seen = 0;
-    for _ in 0..TCP_LOOPBACK_TRANSFER_PACKET_PASSES {
-        let mut cycle_progress = false;
-
-        // A delegate running on another CPU may already have dispatched this
-        // flow's segment into the shared loopback queue. Drain that exact flow
-        // before asking smoltcp for more egress. Generic queue-head polling is
-        // incorrect here: under concurrent flows it can consume an unrelated
-        // connection's packet and falsely account that progress to `source`.
-        let ingress = ctx.poll_ingress_to_socket(iface, &peer, guard, 1);
-        cycle_progress |= ingress.packets_seen > packets_seen;
-        packets_seen = ingress.packets_seen;
-        bytes_moved += ingress.bytes_moved;
-        source_bytes_moved += ingress.bytes_moved;
-        peer_wake_fired |= publishes_recv_data_for(&ingress.publishes, &peer);
-        publish_targets.extend(ingress.publishes);
-
-        if source_bytes_moved >= transfer_limit {
-            break;
-        }
-
-        if let Some(source_publish) = ctx.poll_egress_one(source, iface, guard) {
-            cycle_progress = true;
+    while egress_packets < TCP_LOOPBACK_TRANSFER_PACKET_PASSES {
+        let mut dispatched = false;
+        if let Some(source_publish) =
+            ctx.poll_tcp_egress_one_for_flow(source, source_generation, local, remote, iface, guard)
+        {
+            dispatched = true;
             egress_packets += 1;
             publish_targets.push(source_publish);
 
             let ingress = ctx.poll_ingress_to_socket(iface, &peer, guard, 1);
-            cycle_progress |= ingress.packets_seen > packets_seen;
-            packets_seen = ingress.packets_seen;
             bytes_moved += ingress.bytes_moved;
-            source_bytes_moved += ingress.bytes_moved;
             peer_wake_fired |= publishes_recv_data_for(&ingress.publishes, &peer);
             publish_targets.extend(ingress.publishes);
         }
-
-        if let Some(peer_publish) = ctx.poll_egress_one(&peer, iface, guard) {
-            cycle_progress = true;
-            egress_packets += 1;
-            publish_targets.push(peer_publish);
-            let ack_ingress = ctx.poll_ingress_to_socket(iface, source, guard, 1);
-            cycle_progress |= ack_ingress.packets_seen > packets_seen;
-            packets_seen = ack_ingress.packets_seen;
-            bytes_moved += ack_ingress.bytes_moved;
-            publish_targets.extend(ack_ingress.publishes);
-        }
-
-        if source_bytes_moved >= transfer_limit {
+        // max_bytes is a packet-granular soft limit because smoltcp chooses
+        // segment size. Check it before polling the reverse endpoint so one
+        // iteration cannot add a second segment after the budget is reached.
+        if bytes_moved >= transfer_limit || egress_packets >= TCP_LOOPBACK_TRANSFER_PACKET_PASSES {
             break;
         }
-        if !cycle_progress {
+        if let Some(peer_publish) =
+            ctx.poll_tcp_egress_one_for_flow(&peer, peer_generation, remote, local, iface, guard)
+        {
+            dispatched = true;
+            egress_packets += 1;
+            publish_targets.push(peer_publish);
+            let peer_ingress = ctx.poll_ingress_to_socket(iface, source, guard, 1);
+            bytes_moved += peer_ingress.bytes_moved;
+            publish_targets.extend(peer_ingress.publishes);
+        }
+        if !dispatched || bytes_moved >= transfer_limit {
             break;
         }
     }
+
+    // smoltcp may promote bytes already held by its assembler into the recv
+    // ring while dispatching a window update. Such progress is not attributable
+    // to the payload length of the packet currently being ingressed, so retain
+    // the stronger whole-step ring delta as a floor for transfer accounting.
+    let source_recv_after = source_payload
+        .with_tcp_flow_generation(source_generation, local, remote, |raw| raw.recv_available())
+        .unwrap_or(source_recv_before);
+    let peer_recv_after = peer_payload
+        .with_tcp_flow_generation(peer_generation, remote, local, |raw| raw.recv_available())
+        .unwrap_or(peer_recv_before);
+    let buffered_progress = source_recv_after
+        .saturating_sub(source_recv_before)
+        .saturating_add(peer_recv_after.saturating_sub(peer_recv_before));
+    bytes_moved = bytes_moved.max(buffered_progress);
 
     let source_recv_broken = publishes_recv_broken_for(&publish_targets, source);
     let source_send_broken = publishes_send_broken_for(&publish_targets, source);
@@ -321,18 +275,25 @@ pub fn step_process_loopback_tcp(
     // bytes — derive the wake from the ring, no shadow drain to account.
     let source_wake_fired = source_had_no_send_space
         && source_payload
-            .raw_tcp_socket()
-            .is_some_and(|raw| raw.send_available() > 0);
-    publish_targets.extend(send_space_publish_for_drain(source, source_wake_fired));
+            .with_tcp_flow_generation(source_generation, local, remote, |raw| {
+                raw.send_available() > 0
+            })
+            .unwrap_or(false);
+    publish_targets.extend(send_space_publish_for_drain(
+        source,
+        source_generation,
+        source_wake_fired,
+    ));
     for target in publish_targets {
         target.publish();
     }
+    let stats = ctx.poll_ingress_to_socket(iface, source, guard, 0);
+
     StepOutcome::Done(LoopbackTcpTransferOutcome {
         bytes_moved,
-        source_bytes_moved,
-        packets_seen,
-        tx_packets: egress_packets,
-        sockets_touched: ctx.sockets_touched(),
+        packets_seen: stats.packets_seen,
+        tx_packets: stats.tx_packets.max(egress_packets),
+        sockets_touched: stats.sockets_touched,
         source_recv_broken,
         source_send_broken,
         peer_recv_broken,
@@ -375,11 +336,13 @@ fn publish_targets_have_work(publishes: &[NetworkPublishTarget]) -> bool {
 
 fn send_space_publish_for_drain(
     socket: &Cap<SocketIdentity>,
+    generation: crate::net::structure::TcpStateGeneration,
     became_available: bool,
 ) -> Option<NetworkPublishTarget> {
     if became_available {
-        Some(NetworkPublishTarget::new(
+        Some(NetworkPublishTarget::new_tcp(
             socket.clone(),
+            generation,
             crate::net::packet::NetworkPublish {
                 send_has_space: true,
                 ..crate::net::packet::NetworkPublish::none()
@@ -392,164 +355,119 @@ fn send_space_publish_for_drain(
 
 fn establish_smoltcp_loopback_on_iface(
     client: &Cap<SocketIdentity>,
-    local: IpEndpoint,
-    remote: IpEndpoint,
+    attempt: crate::net::structure::TcpConnectAttempt,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> LoopbackHandshakeDrive {
-    let Some(client_payload) = client.acquire_operational() else {
-        return LoopbackHandshakeDrive::Failed;
-    };
-    let Some(client_raw) = client_payload.raw_tcp_socket() else {
-        return LoopbackHandshakeDrive::Failed;
-    };
-
-    match client_raw.protocol_state() {
-        smoltcp::socket::tcp::State::Closed => {
-            if client_raw.connect_endpoint(local, remote).is_err() {
-                return LoopbackHandshakeDrive::Failed;
-            }
-        }
-        smoltcp::socket::tcp::State::SynSent
-        | smoltcp::socket::tcp::State::SynReceived
-        | smoltcp::socket::tcp::State::Established => {}
-        _ => return LoopbackHandshakeDrive::Failed,
-    }
+) -> Result<
+    (
+        Cap<SocketIdentity>,
+        LoopbackTcpHandshakeStats,
+        alloc::vec::Vec<NetworkPublishTarget>,
+    ),
+    Errno,
+> {
+    let client_payload = client.acquire_operational().ok_or(Errno::ENOTCONN)?;
+    let client_raw = client_payload.raw_tcp_socket().ok_or(Errno::EOPNOTSUPP)?;
+    let table = client_payload.socket_table();
+    client_payload
+        .transact_tcp_connect_attempt(Some(attempt), attempt.generation(), |local, remote| {
+            let key = ConnectionKey::new(local, remote);
+            let indexed = match table.insert_tcp_connection(key, client.clone()) {
+                Ok(()) => Ok(()),
+                Err(IndexError::Duplicate)
+                    if table
+                        .lookup_tcp_connection(key, guard)
+                        .is_some_and(|owner| owner.raw() == client.raw()) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(table_error_to_errno(error)),
+            };
+            let result = indexed.and_then(|()| {
+                client_raw
+                    .connect_endpoint_for_attempt(attempt)
+                    .map_err(|_| Errno::EINVAL)
+            });
+            (result, TcpConnectDisposition::KeepConnecting)
+        })
+        .ok_or(Errno::ECANCELED)??;
 
     let mut ctx = PollContext::new_with_table(
         crate::net::clock::net_now_instant(),
         client_payload.socket_table(),
     );
     let mut publishes = alloc::vec::Vec::new();
-    let table = client_payload.socket_table();
-    let listener = table.lookup_tcp_listener_dual_stack_endpoint(remote, guard);
-    let mut child = listener
-        .as_ref()
-        .and_then(|listener| listener.acquire_operational())
-        .and_then(|payload| payload.connecting_child(remote, local));
+    let generation = attempt.generation();
+    let local = attempt.local();
+    let remote = attempt.remote();
 
-    for _ in 0..TCP_LOOPBACK_HANDSHAKE_PACKET_PASSES {
-        let mut progressed = false;
+    let Some(client_syn) =
+        ctx.poll_tcp_egress_one_for_flow(client, generation, local, remote, iface, guard)
+    else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    publishes.push(client_syn);
+    let syn_ingress = ctx.poll_tcp_ingress_for_flow(iface, local, remote, guard, 1);
+    publishes.extend(syn_ingress.publishes);
+    let Some(child) = syn_ingress.created_children.into_iter().next() else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    let Some(child_payload) = child.acquire_operational() else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    let Some(child_raw) = child_payload.raw_tcp_socket() else {
+        return Err(Errno::ECONNREFUSED);
+    };
 
-        if let Some(publish) = ctx.poll_egress_one(client, iface, guard) {
-            publishes.push(publish);
-            progressed = true;
-        }
-        let before_packets = ctx_packets_seen(&ctx);
-        let syn_ingress = ctx.poll_tcp_ingress_for_flow(iface, local, remote, guard, 1);
-        progressed |= syn_ingress.packets_seen > before_packets;
-        publishes.extend(syn_ingress.publishes);
-        if child.is_none() {
-            child = syn_ingress.created_children.into_iter().next().or_else(|| {
-                listener
-                    .as_ref()
-                    .and_then(|listener| listener.acquire_operational())
-                    .and_then(|payload| payload.connecting_child(remote, local))
-            });
-        }
-
-        let Some(server_child) = child.as_ref() else {
-            if !progressed {
-                break;
-            }
-            continue;
-        };
-        let Some(server_payload) = server_child.acquire_operational() else {
-            return LoopbackHandshakeDrive::Failed;
-        };
-        let Some(server_raw) = server_payload.raw_tcp_socket() else {
-            return LoopbackHandshakeDrive::Failed;
-        };
-
-        if let Some(publish) = ctx.poll_egress_one(server_child, iface, guard) {
-            publishes.push(publish);
-            progressed = true;
-        }
-        let before_packets = ctx_packets_seen(&ctx);
-        let client_ingress = ctx.poll_ingress_to_socket(iface, client, guard, 1);
-        progressed |= client_ingress.packets_seen > before_packets;
-        publishes.extend(client_ingress.publishes);
-
-        if let Some(publish) = ctx.poll_egress_one(client, iface, guard) {
-            publishes.push(publish);
-            progressed = true;
-        }
-        let before_packets = ctx_packets_seen(&ctx);
-        let child_ingress = ctx.poll_ingress_to_socket(iface, server_child, guard, 1);
-        progressed |= child_ingress.packets_seen > before_packets;
-        publishes.extend(child_ingress.publishes);
-
-        if client_raw.protocol_state() == smoltcp::socket::tcp::State::Established
-            && server_raw.protocol_state() == smoltcp::socket::tcp::State::Established
-        {
-            return LoopbackHandshakeDrive::Complete {
-                child: server_child.clone(),
-                stats: LoopbackTcpHandshakeStats {
-                    packets_seen: child_ingress.packets_seen,
-                    tx_packets: child_ingress.tx_packets,
-                    sockets_touched: child_ingress.sockets_touched,
-                },
-                publishes,
-            };
-        }
-        if !progressed {
-            break;
-        }
+    if drive_loopback_packet_to_socket(&mut ctx, &child, client, iface, guard, &mut publishes)
+        .is_none()
+    {
+        return Err(Errno::ECONNREFUSED);
     }
 
-    LoopbackHandshakeDrive::Pending { publishes }
+    let Some(client_ack) =
+        ctx.poll_tcp_egress_one_for_flow(client, generation, local, remote, iface, guard)
+    else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    publishes.push(client_ack);
+    let ack_ingress = ctx.poll_ingress_to_socket(iface, &child, guard, 1);
+    publishes.extend(ack_ingress.publishes);
+
+    if client_payload
+        .with_tcp_flow_generation(generation, local, remote, |raw| raw.protocol_state())
+        != Some(smoltcp::socket::tcp::State::Established)
+    {
+        return Err(Errno::ECONNREFUSED);
+    }
+    if child_raw.protocol_state() != smoltcp::socket::tcp::State::Established {
+        return Err(Errno::ECONNREFUSED);
+    }
+
+    let outcome = ctx.poll_ingress_to_socket(iface, &child, guard, 0);
+    Ok((
+        child,
+        LoopbackTcpHandshakeStats {
+            packets_seen: outcome.packets_seen,
+            tx_packets: outcome.tx_packets,
+            sockets_touched: outcome.sockets_touched,
+        },
+        publishes,
+    ))
 }
 
-enum LoopbackHandshakeDrive {
-    Complete {
-        child: Cap<SocketIdentity>,
-        stats: LoopbackTcpHandshakeStats,
-        publishes: alloc::vec::Vec<NetworkPublishTarget>,
-    },
-    Pending {
-        publishes: alloc::vec::Vec<NetworkPublishTarget>,
-    },
-    Failed,
-}
-
-fn ensure_connection_entry(
-    table: &SocketTable,
-    key: ConnectionKey,
-    socket: &Cap<SocketIdentity>,
+fn drive_loopback_packet_to_socket(
+    ctx: &mut PollContext,
+    source: &Cap<SocketIdentity>,
+    target: &Cap<SocketIdentity>,
+    iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> Result<bool, Errno> {
-    match table.insert_tcp_connection(key, socket.clone()) {
-        Ok(()) => Ok(true),
-        Err(IndexError::Duplicate) => table
-            .lookup_tcp_connection(key, guard)
-            .filter(|existing| existing.raw() == socket.raw())
-            .map(|_| false)
-            .ok_or(Errno::EADDRINUSE),
-        Err(IndexError::Full) => Err(Errno::ENOMEM),
-        Err(IndexError::Busy) => Err(Errno::EAGAIN),
-        Err(IndexError::Missing) => Err(Errno::EINVAL),
-    }
-}
-
-fn ctx_packets_seen(ctx: &PollContext) -> usize {
-    ctx.packets_seen()
-}
-
-fn connecting_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndpoint), Errno> {
-    match protocol {
-        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => Ok((*local, *remote)),
-        SocketProtocol::Tcp(TcpState::Connected { .. }) => Err(Errno::EISCONN),
-        SocketProtocol::Tcp(_) => Err(Errno::EINVAL),
-        SocketProtocol::UnixDatagram(_)
-        | SocketProtocol::UnixStream(_)
-        | SocketProtocol::Udp(_)
-        | SocketProtocol::Sctp(_)
-        | SocketProtocol::Rds(_)
-        | SocketProtocol::RawIcmp(_)
-        | SocketProtocol::NetlinkRoute(_)
-        | SocketProtocol::NetlinkNetfilter(_)
-        | SocketProtocol::Packet(_) => Err(Errno::EOPNOTSUPP),
-    }
+    publishes: &mut alloc::vec::Vec<NetworkPublishTarget>,
+) -> Option<()> {
+    publishes.push(ctx.poll_egress_one(source, iface, guard)?);
+    let outcome = ctx.poll_ingress_to_socket(iface, target, guard, 1);
+    publishes.extend(outcome.publishes);
+    Some(())
 }
 
 fn connected_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndpoint), Errno> {

@@ -633,3 +633,82 @@ fn dispatch_epoll_ctl_add_mod_del_enforce_registration_state() {
         SyscallResult::Error(E_NOENT)
     );
 }
+
+// R4a control experiment (2026-07-27): same test as the one that FAILS on main.
+#[test]
+fn dispatch_epoll_pwait_blocks_until_socket_becomes_readable() {
+    const AF_INET: u64 = 2;
+    const SOCK_DGRAM: u64 = 2;
+
+    let (_setup, proc_cap, thread) = epoll_setup();
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
+    let epfd = create_epoll(&ctx);
+
+    let sockfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            crate::linux_syscall::NR_SOCKET,
+            [AF_INET, SOCK_DGRAM, 0, 0, 0, 0],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) if fd >= 0 => fd,
+        other => panic!("socket(AF_INET, SOCK_DGRAM) failed: {other:?}"),
+    };
+
+    // bind(127.0.0.1:24601) so the socket has a live protocol engine + carriers.
+    let mut addr = [0u8; 16];
+    addr[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+    addr[2..4].copy_from_slice(&24601u16.to_be_bytes());
+    addr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                crate::linux_syscall::NR_BIND,
+                [sockfd as u64, addr.as_ptr() as u64, 16, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0),
+        "bind(127.0.0.1:24601) should succeed"
+    );
+
+    let mut event = TestEpollEvent {
+        events: EPOLLIN,
+        _padding: 0,
+        data: 0x5555_6666_7777_8888,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_EPOLL_CTL,
+                [
+                    epfd as u64,
+                    EPOLL_CTL_ADD as u64,
+                    sockfd as u64,
+                    &mut event as *mut TestEpollEvent as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0),
+        "epoll_ctl(ADD) on a socket fd should succeed"
+    );
+
+    let mut out = [TestEpollEvent::default(); 1];
+    let req = SyscallRequest::new(
+        NR_EPOLL_PWAIT,
+        [epfd as u64, out.as_mut_ptr() as u64, 1, -1i32 as u64, 0, 0],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    let first = pinned.as_mut().poll(&mut cx);
+    assert!(
+        matches!(first, Poll::Pending),
+        "epoll_pwait(timeout=-1) on an unreadable socket must park; got {first:?}"
+    );
+}

@@ -336,6 +336,22 @@ pub(crate) struct CommittedReservation<'i, K, V, const N: usize> {
 }
 
 impl<K, V, const N: usize> CommittedReservation<'_, K, V, N> {
+    pub(crate) fn value(&self) -> &V {
+        let entry = &self.index.entries[self.slot_index];
+        debug_assert_eq!(unsafe { *entry.state.get() }, RESERVED_COMMITTED);
+        unsafe { (*entry.value.get()).assume_init_ref() }
+    }
+
+    pub(crate) fn value_matches(&self, predicate: impl FnOnce(&V) -> bool) -> bool {
+        // reserve_committed changed this slot to RESERVED_COMMITTED before
+        // constructing the reservation. That state excludes every competing
+        // lookup/mutation until this guard is withdrawn or dropped, so the
+        // initialized value is stable without retaining the index spinlock
+        // across arbitrary caller code. A predicate that re-enters the same
+        // index now observes Busy instead of self-deadlocking.
+        predicate(self.value())
+    }
+
     pub(crate) fn withdraw(mut self) -> V {
         let _guard = self.index.lock.lock();
         let entry = &self.index.entries[self.slot_index];

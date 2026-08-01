@@ -656,12 +656,11 @@ impl IrqIf for Platform {
             .unwrap_or(Self::UART_IRQ)
     }
 
-    /// QEMU virtio-mmio slot 1 is PLIC IRQ 2. Boards without that slot do not
-    /// create or enable the corresponding device, so the handler remains idle.
-    const NET_IRQ: u32 = 2;
-
     /// QEMU `virt` machine's goldfish RTC is wired at PLIC IRQ 11.
     const RTC_IRQ: u32 = GOLDFISH_RTC_IRQ;
+    /// `virtio1@0x1000_2000` is MMIO slot 1; QEMU wires slot N to
+    /// `VIRTIO_IRQ + N`, so the boot network device uses PLIC IRQ 2.
+    const NET_IRQ: u32 = 2;
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0

@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::marker::PhantomData;
 
 use crate::adapter::step_engine::{NoProgress, StepOutcome};
-use tx_hal::{Arch, DeviceInfo, DeviceKind, MmioRegion, PlatformInfoIf, TxPlatform};
+use tx_hal::{Arch, DeviceInfo, DeviceKind, IrqIf, MmioRegion, PlatformInfoIf, TxPlatform};
 use tx_subsystems::device::{
     register_block_devices, BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT,
     PhysicalBlockNumber,
@@ -217,12 +217,18 @@ impl<P: TxPlatform> KernelNetDevices<P> {
         let Some(net) = Self::probe_virtio_mmio_net() else {
             return StepOutcome::Done(());
         };
-        // RX is interrupt-driven (PLIC NET_IRQ → net_rx_irq_handler →
-        // drain_net_rx_pending kicks the delegate); without this the device
-        // never raises the line and inbound frames sit until a poll kick.
-        net.enable_interrupts();
-
-        self.register_eth0(net)
+        // Publish `eth0` before allowing the device to assert its line. The
+        // controller handler is installed earlier in boot, while virtio
+        // notifications remain disabled throughout `init()`.
+        match self.register_eth0(net) {
+            StepOutcome::Done(()) => {
+                if <P as IrqIf>::NET_IRQ != 0 {
+                    net.enable_interrupts();
+                }
+                StepOutcome::Done(())
+            }
+            other => other,
+        }
     }
 
     /// Same slot-probing as the block path: the net device sits on

@@ -416,10 +416,7 @@ fn tcp_loopback_first_syn_uses_listener_connecting_backlog() {
     ));
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    let client_raw = client_payload.raw_tcp_socket().expect("client raw tcp");
-    client_raw
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
@@ -464,12 +461,70 @@ fn tcp_loopback_first_syn_uses_listener_connecting_backlog() {
 }
 
 #[test]
+fn tcp_loopback_flow_poll_does_not_consume_another_connections_syn() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client_a, _listener_a, local_a, remote_a) = prepare_loopback_connect(45_997, 55_997);
+    let (client_b, _listener_b, local_b, remote_b) = prepare_loopback_connect(45_998, 55_998);
+    let guard = tx_substrate::epoch::guard();
+    let iface = LoopbackIface::new(IfaceCommon::new(
+        Ipv4Address::LOOPBACK,
+        Ipv4Address::new([255, 0, 0, 0]),
+        1500,
+    ));
+
+    start_raw_tcp_connect_for_active_attempt(
+        &client_a.acquire_operational().expect("client A payload"),
+    );
+    start_raw_tcp_connect_for_active_attempt(
+        &client_b.acquire_operational().expect("client B payload"),
+    );
+
+    let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
+    assert!(ctx.poll_egress_one(&client_a, &iface, &guard).is_some());
+    assert!(ctx.poll_egress_one(&client_b, &iface, &guard).is_some());
+    assert_eq!(iface.pending_packets(), 2);
+
+    // Deliberately request B while A is at the queue head. The old merged
+    // implementation popped A and handed it to B's handshake.
+    let syn_b = ctx.poll_tcp_ingress_for_flow(&iface, local_b, remote_b, &guard, 1);
+    assert_eq!(syn_b.created_children.len(), 1);
+    assert_eq!(iface.pending_packets(), 1);
+    assert_eq!(
+        syn_b.created_children[0]
+            .acquire_operational()
+            .expect("B child payload")
+            .protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connecting {
+            local: remote_b,
+            remote: local_b,
+        })
+    );
+
+    let syn_a = ctx.poll_tcp_ingress_for_flow(&iface, local_a, remote_a, &guard, 1);
+    assert_eq!(syn_a.created_children.len(), 1);
+    assert_eq!(iface.pending_packets(), 0);
+    assert_eq!(
+        syn_a.created_children[0]
+            .acquire_operational()
+            .expect("A child payload")
+            .protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connecting {
+            local: remote_a,
+            remote: local_a,
+        })
+    );
+}
+
+#[test]
 fn tcp_backlog_next_deadline_tracks_connecting_child() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    let (client, listener, local, remote) = prepare_loopback_connect(41_172, 51_172);
+    let (client, listener, _local, _remote) = prepare_loopback_connect(41_172, 51_172);
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -479,11 +534,7 @@ fn tcp_backlog_next_deadline_tracks_connecting_child() {
     let start = smoltcp::time::Instant::from_millis(7);
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    client_payload
-        .raw_tcp_socket()
-        .expect("client raw tcp")
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(start);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
@@ -505,7 +556,7 @@ fn tcp_backlog_cleanup_removes_expired_half_open_child() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    let (client, listener, local, remote) = prepare_loopback_connect(41_173, 51_173);
+    let (client, listener, _local, _remote) = prepare_loopback_connect(41_173, 51_173);
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -514,11 +565,7 @@ fn tcp_backlog_cleanup_removes_expired_half_open_child() {
     ));
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    client_payload
-        .raw_tcp_socket()
-        .expect("client raw tcp")
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
@@ -551,7 +598,7 @@ fn tcp_backlog_cleanup_removes_failed_half_open_child() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    let (client, listener, local, remote) = prepare_loopback_connect(41_174, 51_174);
+    let (client, listener, _local, _remote) = prepare_loopback_connect(41_174, 51_174);
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -560,11 +607,7 @@ fn tcp_backlog_cleanup_removes_failed_half_open_child() {
     ));
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    client_payload
-        .raw_tcp_socket()
-        .expect("client raw tcp")
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
@@ -633,7 +676,7 @@ fn network_tick_cleans_expired_tcp_backlog_without_direct_listener_cleanup() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    let (client, listener, local, remote) = prepare_loopback_connect(41_176, 51_176);
+    let (client, listener, _local, _remote) = prepare_loopback_connect(41_176, 51_176);
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -642,11 +685,7 @@ fn network_tick_cleans_expired_tcp_backlog_without_direct_listener_cleanup() {
     ));
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    client_payload
-        .raw_tcp_socket()
-        .expect("client raw tcp")
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
@@ -676,7 +715,7 @@ fn network_tick_reports_next_tcp_backlog_deadline() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    let (client, listener, local, remote) = prepare_loopback_connect(41_177, 51_177);
+    let (client, listener, _local, _remote) = prepare_loopback_connect(41_177, 51_177);
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -688,11 +727,7 @@ fn network_tick_reports_next_tcp_backlog_deadline() {
         start + smoltcp::time::Duration::from_millis(TCP_BACKLOG_TIMEOUT_STAGING_MILLIS as u64);
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    client_payload
-        .raw_tcp_socket()
-        .expect("client raw tcp")
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(start);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
@@ -731,11 +766,7 @@ fn network_tick_loopback_retransmits_syn_ack_before_cleanup_limit() {
     ));
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    client_payload
-        .raw_tcp_socket()
-        .expect("client raw tcp")
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
@@ -776,7 +807,7 @@ fn network_tick_loopback_expires_backlog_after_retransmit_limit() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
-    let (client, listener, local, remote) = prepare_loopback_connect(41_179, 51_179);
+    let (client, listener, _local, _remote) = prepare_loopback_connect(41_179, 51_179);
     let guard = tx_substrate::epoch::guard();
     let iface = LoopbackIface::new(IfaceCommon::new(
         Ipv4Address::LOOPBACK,
@@ -785,11 +816,7 @@ fn network_tick_loopback_expires_backlog_after_retransmit_limit() {
     ));
     let listener_payload = listener.acquire_operational().expect("listener payload");
     let client_payload = client.acquire_operational().expect("client payload");
-    client_payload
-        .raw_tcp_socket()
-        .expect("client raw tcp")
-        .connect_endpoint(local, remote)
-        .expect("client raw connect");
+    start_raw_tcp_connect_for_active_attempt(&client_payload);
 
     let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
     assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());

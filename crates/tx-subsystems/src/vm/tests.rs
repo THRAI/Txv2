@@ -336,6 +336,43 @@ fn vm_entry_split_for_protect_rewrites_middle_only() {
 }
 
 #[test]
+fn vm_entry_full_range_protect_to_writable_attaches_private_set() {
+    // PROT_NONE→RW mprotect covering the whole entry takes the full-range
+    // fast path; it must attach a PrivatePageSet (the entry was created
+    // non-writable, so none was ever attached). Without one, CoW
+    // materialization records nothing and the first post-fork write
+    // refaults live pages as fresh zero frames — this silently zeroed
+    // mallocng meta pages in git-remote-https (slow HTTPS push SIGSEGV).
+    setup_host_substrate();
+    let entry = VmEntry::new(
+        range(0x1000, 1),
+        Prot::NONE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    assert!(entry.private().is_none());
+
+    let rewrite = entry
+        .split_for_protect(range(0x1000, 1), Prot::READ_WRITE)
+        .expect("full-range protect");
+    assert!(rewrite.before.is_none() && rewrite.after.is_none());
+    let target = rewrite.target.expect("target");
+    assert_eq!(target.prot, Prot::READ_WRITE);
+    assert!(
+        target.private().is_some(),
+        "writable MAP_PRIVATE entry must carry a PrivatePageSet"
+    );
+
+    // A full-range protect to a non-writable prot still needs no set.
+    let ro = entry
+        .split_for_protect(range(0x1000, 1), Prot::READ)
+        .expect("full-range protect")
+        .target
+        .expect("target");
+    assert!(ro.private().is_none());
+}
+
+#[test]
 fn vm_entry_split_without_private_pages_reuses_owner_bundle() {
     let entry = VmEntry::new(
         range(0x1000, 3),

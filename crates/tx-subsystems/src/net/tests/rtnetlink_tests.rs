@@ -1677,3 +1677,80 @@ fn unprivileged_cred() -> crate::cred::Cred {
         permitted_caps: crate::cred::CapabilitySet::EMPTY,
     }
 }
+
+/// V5-2 follow-up, exercised through the REAL netlink message path (the earlier
+/// version of this check called the namespace API directly and therefore missed
+/// what the guest actually does): with a boot-seeded primary in place, `ip -6
+/// addr add` must demote it rather than lose it, and `ip -6 addr del` must hand
+/// the routable slot back.
+#[test]
+fn rtnetlink_ipv6_addr_add_demotes_then_del_promotes_back() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-ipv6-demote")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let dummy_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        60,
+        &newlink_payload("dummy6d", dummy_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &dummy_req)[0]);
+    let ifindex = ifindex_for(&ns.link_snapshot(), "dummy6d");
+
+    // Stand in for the V5-2 boot seed.
+    let seeded = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15];
+    let configured = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+    ];
+    let seed = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        61,
+        &newaddr6_payload(ifindex, 64, seeded),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &seed)[0]);
+
+    let add = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        62,
+        &newaddr6_payload(ifindex, 64, configured),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &add)[0]);
+    assert_eq!(
+        ns.link_snapshot()
+            .iter()
+            .find(|link| link.name == "dummy6d")
+            .and_then(|link| link.ipv6_addr),
+        Some(Ipv6Address::new(configured)),
+        "the newly configured address must hold the routable primary slot"
+    );
+    assert!(
+        ns.owns_ipv6_addr(Ipv6Address::new(seeded)),
+        "the displaced address must be demoted, not lost"
+    );
+
+    let del = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        63,
+        &newaddr6_payload(ifindex, 64, configured),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del)[0]);
+    assert_eq!(
+        ns.link_snapshot()
+            .iter()
+            .find(|link| link.name == "dummy6d")
+            .and_then(|link| link.ipv6_addr),
+        Some(Ipv6Address::new(seeded)),
+        "deleting the primary must promote the demoted address back"
+    );
+}

@@ -114,6 +114,10 @@ impl PacketTxSink for MockPacketTxSink<'_> {
         }
     }
 
+    fn ip_mtu(&self) -> u16 {
+        self.device.mtu()
+    }
+
     fn transmit(&self, frame: &[u8], guard: &Guard<'_>) -> crate::net::packet::PacketTxResult {
         self.inner.transmit(frame, guard)
     }
@@ -256,6 +260,77 @@ fn net_delegate_poll_transmits_socket_udp_to_mock_device() {
             if event.src == endpoint(50_231)
                 && event.dst == endpoint(40_231)
                 && event.payload == b"hello"
+    ));
+}
+
+#[test]
+fn physical_device_tx_does_not_consume_loopback_tcp_handshake_packets() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    clear_delegate_queue();
+
+    let device = leak_mock_device();
+    let registration = leak_registration(device, 34);
+    let adapter = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: device.mac_addr(),
+        local_ipv4: Ipv4Address::LOOPBACK,
+        mtu: device.mtu(),
+    });
+    let sink = SmoltcpPacketTxSink {
+        adapter: &adapter,
+        device: registration,
+    };
+    let guard = tx_substrate::epoch::guard();
+
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
+    assert_eq!(step_bind(&listener, inet(40_234), &guard), StepOutcome::Done(()));
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("client");
+    assert_eq!(step_bind(&client, inet(50_234), &guard), StepOutcome::Done(()));
+    assert!(matches!(
+        step_connect(&client, inet(40_234), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    let payload = client.acquire_operational().expect("client payload");
+    let attempt = payload
+        .active_tcp_connect_attempt()
+        .expect("active connect attempt");
+    payload
+        .raw_tcp_socket()
+        .expect("raw TCP")
+        .connect_endpoint_for_attempt(attempt)
+        .expect("start raw handshake");
+
+    let tx = match crate::net::execution::step_process_device_tx_pending_at(
+        &sink,
+        smoltcp::time::Instant::ZERO,
+        DeviceTxBudget {
+            tcp_connecting: 8,
+            tcp_connected: 8,
+            udp_bound: 0,
+            raw_icmp: 0,
+        },
+        &guard,
+    ) {
+        StepOutcome::Done(tx) => tx,
+        other => panic!("unexpected device TX outcome: {other:?}"),
+    };
+    assert_eq!(tx.tcp_packets, 0);
+    assert!(device.tx_frames().is_empty());
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
     ));
 }
 

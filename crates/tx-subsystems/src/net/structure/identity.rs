@@ -1,6 +1,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use tx_substrate::bus::RawPort;
+use tx_substrate::step::WaitSourceId;
 use tx_substrate::zone::PayloadCap;
 
 use crate::net::adapter::wait_routing;
@@ -24,9 +25,8 @@ pub struct SocketIdentity {
     pub readiness: SocketReadiness,
     pub wait_carriers: SocketWaitCarriers,
     pub urgent_port: RawPort,
-    /// Number of user-visible fd-table entries referring to this socket's
-    /// open-file description.  Capability clones are kernel lifetime pins,
-    /// not dup/fork descriptors, so they must not decide last-close.
+    /// User-visible fd-table entries referring to this socket's open-file
+    /// description. Capability clones are lifetime pins, not dup/fork fds.
     fd_refs: AtomicU32,
     pub(crate) payload: SpinMutex<Option<PayloadCap<SocketPayload>>>,
 }
@@ -47,9 +47,6 @@ impl SocketIdentity {
             readiness,
             wait_carriers,
             urgent_port,
-            // A newly-created socket/open-file pair represents its first fd.
-            // dup/fork accounting is adjusted alongside the existing pipe fd
-            // accounting in ProcessPayload.
             fd_refs: AtomicU32::new(1),
             payload: SpinMutex::new(None),
         }
@@ -136,10 +133,19 @@ impl SocketWaitCarriers {
         let accept = crate::allocate_notification_source_id();
         let urgent = crate::allocate_notification_source_id();
 
-        wait_source::register_wait_queue_with_id(recv, readiness.recv_wq.clone());
-        wait_source::register_wait_queue_with_id(send, readiness.send_wq.clone());
-        wait_source::register_wait_queue_with_id(accept, readiness.accept_wq.clone());
-        wait_source::register_wait_port_with_id(urgent, urgent_port.clone());
+        // `register_wait_queue`/`register_wait_port` honour an id the carrier
+        // already carries and only allocate when it is still 0, so stamping the
+        // notification id first pins the registration to that id. The two id
+        // spaces do not overlap: notification ids start at 1 << 32, the
+        // registry's own allocator starts at 1.
+        readiness.recv_wq.set_source_id(WaitSourceId::new(recv));
+        readiness.send_wq.set_source_id(WaitSourceId::new(send));
+        readiness.accept_wq.set_source_id(WaitSourceId::new(accept));
+        urgent_port.set_source_id(WaitSourceId::new(urgent));
+        wait_source::register_wait_queue(readiness.recv_wq.clone());
+        wait_source::register_wait_queue(readiness.send_wq.clone());
+        wait_source::register_wait_queue(readiness.accept_wq.clone());
+        wait_source::register_wait_port(urgent_port.clone());
 
         readiness.install_substrate_mirrors(
             wait_routing::new_wait_source(recv),

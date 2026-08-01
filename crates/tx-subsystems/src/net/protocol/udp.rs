@@ -170,10 +170,6 @@ impl RawUdpSocket {
     }
 
     pub fn ingest_rx_datagram(&self, src: IpEndpoint, dst: IpEndpoint, payload: Vec<u8>) -> bool {
-        if payload.is_empty() {
-            return false;
-        }
-
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
             let socket = &mut inner.socket;
@@ -199,10 +195,6 @@ impl RawUdpSocket {
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
-        if len == 0 {
-            return Some((0, false));
-        }
-
         let inner = &mut *self.inner.lock();
         let socket = &mut inner.socket;
         if peek {
@@ -216,16 +208,6 @@ impl RawUdpSocket {
     }
 
     pub fn recv_datagram_bytes(&self, out: &mut [u8], peek: bool) -> Option<UdpRecvDrain> {
-        if out.is_empty() {
-            return Some(UdpRecvDrain {
-                bytes: 0,
-                source: unspecified_endpoint(),
-                destination: unspecified_endpoint(),
-                truncated: false,
-                became_empty: false,
-            });
-        }
-
         let inner = &mut *self.inner.lock();
         let socket = &mut inner.socket;
         let bound_port = socket.endpoint().port;
@@ -312,10 +294,6 @@ impl RawUdpSocket {
         payload: Vec<u8>,
         more: bool,
     ) -> Option<(usize, bool)> {
-        if payload.is_empty() {
-            return Some((0, false));
-        }
-
         // D4 composite atomic: capacity check, corking and the actual
         // send_slice all under one lock acquisition.
         let inner = &mut *self.inner.lock();
@@ -372,10 +350,31 @@ impl RawUdpSocket {
         self.enqueue_tx_datagram_with_more(dst, bytes.to_vec(), more)
     }
 
+    /// V5-1: put a dispatch-popped datagram BACK into the tx ring after the
+    /// device sink refused it. `src` is the source smoltcp already resolved
+    /// for it, so the retry emits a byte-identical packet instead of
+    /// re-running source selection against a different iface.
+    ///
+    /// Returns false only when the ring has filled up behind us — then the
+    /// datagram really is dropped (UDP is best-effort).
+    ///
+    /// Ordering note: the datagram goes back at the TAIL, so a requeue can
+    /// reorder it against datagrams enqueued in between. UDP has no ordering
+    /// guarantee, and losing the packet outright is strictly worse.
+    pub fn requeue_tx_datagram(&self, datagram: UdpTxDatagram, src: IpEndpoint) -> bool {
+        let inner = &mut *self.inner.lock();
+        let local_address = if src.is_unspecified() {
+            None
+        } else {
+            Some(to_smol_ip(&src))
+        };
+        push_datagram_with_source(inner, datagram, local_address).is_some()
+    }
+
     pub fn pop_tx_datagram(&self) -> Option<UdpTxDatagramDrain> {
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
-            let socket = &mut inner.socket;
+        let socket = &mut inner.socket;
             let mut out = None;
             let result: Result<(), ()> =
                 socket.dispatch(cx, |_cx, _meta, (ip_repr, udp_repr, payload)| {
@@ -428,7 +427,7 @@ impl RawUdpSocket {
         // `close` cleared the VecDeques; smoltcp `close` only unbinds).
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
-            let socket = &mut inner.socket;
+        let socket = &mut inner.socket;
             while socket.recv().is_ok() {}
             loop {
                 let mut popped = false;
@@ -492,7 +491,7 @@ impl UdpRxDatagram {
 impl UdpTxDatagram {
     // 名字沿革:同 parse——按 dst 家族分派 v4/v6。
     pub fn emit_ipv4_packet(&self, src: IpEndpoint) -> Option<LoopbackIpPacket> {
-        if src.port == 0 || self.dst.port == 0 || self.payload.is_empty() {
+        if src.port == 0 || self.dst.port == 0 {
             return None;
         }
         if self.dst.family == AddressFamily::Inet6 {
@@ -630,12 +629,21 @@ fn udp_send_available_inner(inner: &UdpInnerState, send_capacity: usize) -> usiz
 /// an unaddressable destination is accepted and dropped (legacy queue
 /// behaviour: it would sit until the drain failed to emit it).
 fn push_datagram_inner(inner: &mut UdpInnerState, datagram: UdpTxDatagram) -> Option<()> {
+    let local_address = inner.tx_src_hint;
+    push_datagram_with_source(inner, datagram, local_address)
+}
+
+fn push_datagram_with_source(
+    inner: &mut UdpInnerState,
+    datagram: UdpTxDatagram,
+    local_address: Option<IpAddress>,
+) -> Option<()> {
     if datagram.dst.port == 0 || datagram.dst.is_unspecified() {
         return Some(());
     }
     let meta = udp::UdpMetadata {
         endpoint: to_smol_endpoint(&datagram.dst),
-        local_address: inner.tx_src_hint,
+        local_address,
         meta: PacketMeta::default(),
     };
     inner

@@ -10,7 +10,9 @@
 //! connect/handshake assertions.
 
 use super::*;
+use crate::net::packet::{NetworkPublish, NetworkPublishTarget};
 use crate::net::protocol::SmoltcpTcpSegment;
+use crate::net::step_poll_wait_token;
 use std::boxed::Box;
 
 const LOCAL_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 2]);
@@ -232,6 +234,504 @@ fn external_tcp_connect_completes_handshake_from_injected_syn_ack() {
         SocketProtocol::Tcp(TcpState::Connected { local, remote })
     );
     assert!(client.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0);
+
+    // The active-open timeout is connection setup policy, not a dead clock
+    // attached to the established socket. Advancing beyond the production
+    // 127-second deadline must not close a successful connection.
+    let late = client_raw.dispatch_segment_via(
+        smoltcp::time::Instant::ZERO + crate::net::protocol::TCP_CONNECT_TIMEOUT,
+        1500,
+        |_| true,
+    );
+    assert_eq!(late.timed_out_connect_attempt, None);
+    assert_eq!(
+        client_raw.protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
+
+    // Queued external TCP data is immediate device-TX work, not loopback
+    // work. A Connected socket without the reverse in-kernel endpoint must
+    // therefore neither consume loopback budget nor keep that lane spinning.
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"x", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(1)
+    );
+    assert_eq!(
+        client_raw.poll_at(smoltcp::time::Instant::ZERO),
+        smoltcp::socket::PollAt::Now
+    );
+    let loopback = match step_process_loopback_pending(
+        smoltcp::time::Instant::ZERO,
+        loopback_iface(),
+        LoopbackPollBudget {
+            tcp_connecting: 0,
+            tcp_connected: 8,
+            udp_bound: 0,
+            raw_icmp: 0,
+            packet_budget: 8,
+            tcp_transfer_bytes: 64,
+        },
+        &guard,
+    ) {
+        StepOutcome::Done(outcome) => outcome,
+        other => panic!("unexpected loopback pending outcome: {other:?}"),
+    };
+    assert_eq!(loopback.tcp_transfer_attempted, 0);
+    assert!(!loopback.tcp_immediate_work_remaining);
+}
+
+#[test]
+fn external_tcp_connect_rst_records_one_shot_refused_error() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 91);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let local = IpEndpoint::new(LOCAL_IP, 51_291);
+    let remote = IpEndpoint::new(REMOTE_IP, 41_291);
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+
+    let payload = client.acquire_operational().expect("client payload");
+    let raw = payload.raw_tcp_socket().expect("client TCP engine");
+    assert!(matches!(
+        step_poll_wait_token(&client, PollMask::OUT, &guard),
+        StepOutcome::Done(Some(_))
+    ));
+    let syn = raw.dispatch_segment().expect("client SYN");
+    let rst_frame = ethernet_tcp_frame(
+        remote,
+        local,
+        smoltcp::wire::TcpControl::Rst,
+        0x2929,
+        Some(syn.tcp.seq_number.0.wrapping_add(1)),
+    );
+    let segment =
+        SmoltcpTcpSegment::parse_ipv4_packet(&LoopbackIpPacket::new(rst_frame[14..].to_vec()))
+            .expect("parsed RST");
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(
+        TcpPacketEvent::new(
+            remote,
+            local,
+            TcpPacketFlags {
+                syn: false,
+                ack: true,
+                rst: true,
+            },
+            std::vec::Vec::new(),
+            false,
+        )
+        .with_segment(Some(segment)),
+    )]);
+    assert!(matches!(
+        step_process_network_events(&source, &guard),
+        StepOutcome::Done(_)
+    ));
+
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Bound { local })
+    );
+    assert!(payload
+        .socket_table()
+        .lookup_tcp_connection(ConnectionKey::new(local, remote), &guard)
+        .is_none());
+    assert_eq!(payload.socket_error(), Some(Errno::ECONNREFUSED));
+    assert!(client.readiness.send_wq.peek() & SendWireSet::CONNECT_DONE.bits() != 0);
+    assert!(matches!(
+        step_poll_ready(&client, &guard),
+        StepOutcome::Done(mask)
+            if mask.contains(PollMask::OUT) && mask.contains(PollMask::ERR)
+    ));
+
+    assert_eq!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Err(Errno::ECONNREFUSED)
+    );
+    assert_eq!(payload.socket_error(), None);
+    assert!(matches!(
+        step_poll_ready(&client, &guard),
+        StepOutcome::Done(mask) if !mask.contains(PollMask::ERR)
+    ));
+
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote })
+    );
+    assert_eq!(raw.protocol_state(), smoltcp::socket::tcp::State::SynSent);
+    assert_eq!(
+        client.readiness.send_wq.peek() & SendWireSet::CONNECT_DONE.bits(),
+        0
+    );
+    assert_eq!(
+        client.readiness.recv_wq.peek() & RecvWireSet::BROKEN.bits(),
+        0
+    );
+}
+
+#[test]
+fn external_tcp_connect_dispatch_timeout_records_one_shot_timeout() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 92);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let local = IpEndpoint::new(LOCAL_IP, 51_292);
+    let remote = IpEndpoint::new(REMOTE_IP, 41_292);
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+
+    let payload = client.acquire_operational().expect("client payload");
+    let sink = ScriptedSink::new(0);
+    let StepOutcome::Done(first) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::ZERO,
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("initial SYN dispatch should complete");
+    };
+    assert_eq!(first.tcp_packets, 1);
+
+    let StepOutcome::Done(timeout) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::ZERO + crate::net::protocol::TCP_CONNECT_TIMEOUT,
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("timeout dispatch should complete");
+    };
+    assert_eq!(timeout.tcp_packets, 1, "timeout emits the terminal RST");
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Bound { local })
+    );
+    assert_eq!(payload.socket_error(), Some(Errno::ETIMEDOUT));
+    assert!(client.readiness.send_wq.peek() & SendWireSet::CONNECT_DONE.bits() != 0);
+    assert_eq!(
+        client.readiness.recv_wq.peek() & RecvWireSet::BROKEN.bits(),
+        0
+    );
+
+    assert_eq!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Err(Errno::ETIMEDOUT)
+    );
+    assert_eq!(payload.socket_error(), None);
+}
+
+#[test]
+fn stale_tcp_connect_attempt_cannot_finish_a_reconnected_socket() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 93);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let local = IpEndpoint::new(LOCAL_IP, 51_293);
+    let remote = IpEndpoint::new(REMOTE_IP, 41_293);
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    let payload = client.acquire_operational().expect("client payload");
+    let stale = payload
+        .active_tcp_connect_attempt()
+        .expect("first connect attempt");
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(()),
+        "AF_UNSPEC must release the old bind before a same-tuple reconnect"
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    let current = payload
+        .active_tcp_connect_attempt()
+        .expect("second connect attempt");
+    assert_ne!(stale, current);
+
+    let cleanup_called = core::cell::Cell::new(false);
+    let publish_called = core::cell::Cell::new(false);
+    assert_eq!(
+        payload.fail_tcp_connect_attempt(
+            stale,
+            Errno::ECONNREFUSED,
+            |_, _| cleanup_called.set(true),
+            || {
+                publish_called.set(true);
+                0
+            },
+        ),
+        None
+    );
+    assert!(!cleanup_called.get());
+    assert!(!publish_called.get());
+    let completion_called = core::cell::Cell::new(false);
+    assert_eq!(
+        payload.transact_tcp_connect_attempt(Some(stale), stale.generation(), |_, _| {
+            completion_called.set(true);
+            ((), TcpConnectDisposition::Connected)
+        }),
+        None
+    );
+    assert!(!completion_called.get());
+    assert_eq!(payload.active_tcp_connect_attempt(), Some(current));
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote })
+    );
+    assert_eq!(payload.socket_error(), None);
+    assert_eq!(
+        client.readiness.send_wq.peek() & SendWireSet::CONNECT_DONE.bits(),
+        0
+    );
+}
+
+#[test]
+fn tcp_poll_keeps_wait_source_across_connect_failure_transition() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 95);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let local = IpEndpoint::new(LOCAL_IP, 51_295);
+    let remote = IpEndpoint::new(REMOTE_IP, 41_295);
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    let payload = client.acquire_operational().expect("client payload");
+    let attempt = payload
+        .active_tcp_connect_attempt()
+        .expect("active connect attempt");
+
+    let ready_before_failure = match step_poll_ready(&client, &guard) {
+        StepOutcome::Done(mask) => mask,
+        other => panic!("unexpected poll result: {other:?}"),
+    };
+    assert!(!ready_before_failure.intersects(PollMask::OUT | PollMask::ERR));
+
+    assert!(payload
+        .fail_tcp_connect_attempt(
+            attempt,
+            Errno::ECONNREFUSED,
+            |local, remote| {
+                let _ = payload.reset_raw_tcp_socket();
+                let _ = payload.socket_table().withdraw_tcp_connection_if_owner(
+                    ConnectionKey::new(local, remote),
+                    client.raw(),
+                );
+            },
+            || client.readiness.fire_send(SendWireSet::CONNECT_DONE),
+        )
+        .is_some());
+
+    let wait = match step_poll_wait_token(&client, PollMask::OUT | PollMask::ERR, &guard) {
+        StepOutcome::Done(Some(wait)) => wait,
+        other => panic!("failed connect must remain watchable: {other:?}"),
+    };
+    assert_eq!(wait.source_id(), client.wait_carriers.send);
+    assert!(wait.interest() & SendWireSet::CONNECT_DONE.bits() != 0);
+    assert!(client.readiness.send_wq.peek() & SendWireSet::CONNECT_DONE.bits() != 0);
+}
+
+#[test]
+fn stale_tcp_publish_cannot_repollute_a_reconnected_socket() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 96);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let local = IpEndpoint::new(LOCAL_IP, 51_296);
+    let remote = IpEndpoint::new(REMOTE_IP, 41_296);
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    let payload = client.acquire_operational().expect("client payload");
+    let stale = payload
+        .active_tcp_connect_attempt()
+        .expect("first connect attempt");
+    let stale_publish = NetworkPublishTarget::new_tcp(
+        client.clone(),
+        stale.generation(),
+        NetworkPublish {
+            recv_has_data: true,
+            recv_broken: true,
+            send_broken: true,
+            ..NetworkPublish::none()
+        },
+    );
+
+    assert_eq!(
+        step_connect(&client, KernelSockAddr::Unspec, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(()),
+        "AF_UNSPEC must release the old bind before a same-tuple reconnect"
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Yield { .. }
+    ));
+    assert_ne!(
+        payload.active_tcp_connect_attempt(),
+        Some(stale),
+        "reconnect must allocate a new flow generation"
+    );
+
+    assert_eq!(stale_publish.publish(), 0);
+    assert_eq!(
+        client.readiness.recv_wq.peek() & (RecvWireSet::HAS_DATA | RecvWireSet::BROKEN).bits(),
+        0
+    );
+    assert_eq!(
+        client.readiness.send_wq.peek() & SendWireSet::BROKEN.bits(),
+        0
+    );
+}
+
+#[test]
+fn external_tcp_connect_does_not_ignore_foreign_tuple_owner() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 94);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let local = IpEndpoint::new(LOCAL_IP, 51_294);
+    let remote = IpEndpoint::new(REMOTE_IP, 41_294);
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    let foreign = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("foreign tuple owner");
+    assert_eq!(
+        step_bind(&client, inet_addr(local.port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    let table = client
+        .acquire_operational()
+        .expect("client payload")
+        .socket_table();
+    table
+        .insert_tcp_connection(ConnectionKey::new(local, remote), foreign.clone())
+        .expect("install foreign tuple owner");
+
+    assert_eq!(
+        step_connect(&client, inet_addr(remote.port, REMOTE_IP), &guard),
+        StepOutcome::Err(Errno::EADDRINUSE)
+    );
+    let payload = client.acquire_operational().expect("client payload");
+    assert_eq!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Bound { local })
+    );
+    assert_eq!(
+        payload
+            .raw_tcp_socket()
+            .expect("client raw TCP")
+            .protocol_state(),
+        smoltcp::socket::tcp::State::Closed
+    );
+    assert_eq!(
+        table
+            .lookup_tcp_connection(ConnectionKey::new(local, remote), &guard)
+            .expect("foreign owner preserved")
+            .raw(),
+        foreign.raw()
+    );
 }
 
 /// Focused check of the new active-client branch in process_tcp_event: a
@@ -419,6 +919,10 @@ fn device_tx_single_pass_drains_multiple_segments() {
         frames: core::sync::atomic::AtomicUsize,
     }
     impl PacketTxSink for CountingSink {
+        fn ip_mtu(&self) -> u16 {
+            1500
+        }
+
         fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
             self.frames
                 .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -517,6 +1021,17 @@ fn external_udp_sendto_reaches_device_tx() {
     assert_eq!(step_bind(&udp, inet(49_180), &guard), StepOutcome::Done(()));
 
     let dst = IpEndpoint::new(REMOTE_IP, 53);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &udp,
+            Some(dst),
+            b"",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(0),
+        "an empty UDP payload must still enqueue one wire datagram"
+    );
     let outcome = step_send_to_kernel_bytes(
         &udp,
         Some(dst),
@@ -535,6 +1050,10 @@ fn external_udp_sendto_reaches_device_tx() {
         frames: core::sync::atomic::AtomicUsize,
     }
     impl PacketTxSink for CountingSink {
+        fn ip_mtu(&self) -> u16 {
+            1500
+        }
+
         fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
             self.frames
                 .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -558,9 +1077,342 @@ fn external_udp_sendto_reaches_device_tx() {
     assert_eq!(tx.udp_failed, 0, "udp lane must not fail");
     assert!(
         tx.udp_packets >= 1,
-        "udp datagram must reach the sink (attempted={}, busy={}, pending={})",
+        "the bounded first TX pass must emit one UDP datagram (attempted={}, busy={}, pending={})",
         tx.udp_attempted,
         tx.udp_busy,
         tx.udp_resolution_pending
+    );
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::from_millis(6),
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("second device tx pass should complete");
+    };
+    assert_eq!(tx.udp_failed, 0, "second udp lane must not fail");
+    assert!(
+        tx.udp_packets >= 1,
+        "the bounded second TX pass must emit the other UDP datagram"
+    );
+    assert_eq!(
+        sink.frames.load(core::sync::atomic::Ordering::Acquire),
+        2,
+        "both the empty and non-empty UDP datagrams must reach the sink"
+    );
+}
+
+const LOCAL_IP6: Ipv6Address =
+    Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15]);
+const REMOTE_IP6: Ipv6Address =
+    Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+
+fn inet6_at(addr: Ipv6Address, port: u16) -> KernelSockAddr {
+    KernelSockAddr::V6(SockAddrIn6::new(port, addr))
+}
+
+/// Attach the virtio test device with both a v4 and a v6 address (the v4 one
+/// is what `ensure_ether_iface_for_link` keys off; the v6 one is what the
+/// route/source-selection code needs).
+fn attach_dual_stack_device(minor: u32) -> &'static NetDeviceRegistration {
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, minor);
+    let namespace = crate::net::initial_net_namespace_payload();
+    namespace
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+    let ifindex = namespace
+        .link_snapshot()
+        .iter()
+        .find(|link| link.name == registration.name)
+        .expect("virtio test link")
+        .ifindex;
+    namespace
+        .set_device_ipv6_addr_by_ifindex(
+            NetAdminAuthority::for_test_or_bootstrap(),
+            ifindex,
+            Some(LOCAL_IP6),
+            Some(64),
+        )
+        .expect("set virtio test device ipv6 address");
+    registration
+}
+
+/// Capture what the device-TX lane actually hands the wire, and let the test
+/// decide how many passes must fail before the sink accepts.
+struct ScriptedSink {
+    refusals_left: core::sync::atomic::AtomicUsize,
+    frames: std::sync::Mutex<std::vec::Vec<std::vec::Vec<u8>>>,
+}
+
+impl ScriptedSink {
+    fn new(refusals: usize) -> Self {
+        Self {
+            refusals_left: core::sync::atomic::AtomicUsize::new(refusals),
+            frames: std::sync::Mutex::new(std::vec::Vec::new()),
+        }
+    }
+
+    fn accepted(&self) -> std::vec::Vec<std::vec::Vec<u8>> {
+        self.frames.lock().expect("scripted sink frames").clone()
+    }
+}
+
+impl PacketTxSink for ScriptedSink {
+    fn ip_mtu(&self) -> u16 {
+        1500
+    }
+
+    fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
+        let left = self
+            .refusals_left
+            .load(core::sync::atomic::Ordering::Acquire);
+        if left > 0 {
+            self.refusals_left
+                .store(left - 1, core::sync::atomic::Ordering::Release);
+            // Exactly what the boot lane's v4-only iface answers for a unicast
+            // IPv6 destination: `decide_ipv6_route` -> Unreachable.
+            return PacketTxResult::Failed {
+                errno: Errno::EADDRNOTAVAIL,
+            };
+        }
+        self.frames
+            .lock()
+            .expect("scripted sink frames")
+            .push(frame.to_vec());
+        PacketTxResult::Accepted {
+            frame_len: frame.len(),
+        }
+    }
+}
+
+/// V5-1 regression (G1a): the UDP device-TX pop is destructive, so a sink that
+/// refuses the packet must NOT destroy it. Before the fix the first refusal
+/// dropped the datagram permanently — and because the initial namespace is
+/// scanned by TWO sinks per delegate round (the boot lane's v4-only iface
+/// first), every external IPv6 UDP datagram died before the iface that could
+/// route it ever ran.
+///
+/// Deliberately uses IPv4 so this pins the LANE, not anything v6-specific.
+#[test]
+fn refused_udp_datagram_is_requeued_for_the_next_pass() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 76);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    assert_eq!(
+        step_bind(&udp, inet_addr(49_182, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &udp,
+            Some(IpEndpoint::new(REMOTE_IP, 53)),
+            b"requeue-me",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(10)
+    );
+
+    let sink = ScriptedSink::new(1);
+    let pass = |now_ms: i32| {
+        let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+            &sink,
+            crate::net::initial_net_namespace_payload(),
+            smoltcp::time::Instant::from_millis(now_ms as i64),
+            DeviceTxBudget::default(),
+            &guard,
+        ) else {
+            panic!("device tx pass should complete");
+        };
+        tx
+    };
+
+    let first = pass(5);
+    assert_eq!(first.udp_packets, 0, "first pass must be refused");
+    assert_eq!(
+        first.udp_failed, 1,
+        "a sink error is still counted as a failure"
+    );
+
+    let second = pass(10);
+    assert_eq!(
+        second.udp_packets, 1,
+        "the refused datagram must survive into the next pass \
+         (attempted={}, busy={}, pending={}, failed={})",
+        second.udp_attempted, second.udp_busy, second.udp_resolution_pending, second.udp_failed
+    );
+    let frames = sink.accepted();
+    assert_eq!(frames.len(), 1, "exactly one packet reaches the wire");
+    assert!(
+        frames[0].ends_with(b"requeue-me"),
+        "the requeued datagram must carry the original payload"
+    );
+}
+
+/// V5-1 regression (G1c): an external IPv6 UDP datagram must leave with the
+/// interface's v6 address as source. Before the fix `udp_tx_src_hint`'s V6 arm
+/// was a hard `None`, smoltcp's address-less context iface fell back to
+/// `Ipv6Address::LOCALHOST`, and the wire packet carried src=`::1` — which no
+/// peer can answer.
+#[test]
+fn external_udp6_sendto_uses_the_interface_source_address() {
+    let _lock = setup();
+
+    let _registration = attach_dual_stack_device(77);
+    let guard = tx_substrate::epoch::guard();
+
+    let udp = registry::create_socket_in_namespace_with_family(
+        SocketKind::Udp,
+        AddressFamily::Inet6,
+        SocketOptionSet::default_udp(),
+        crate::net::initial_net_namespace_payload(),
+    )
+    .expect("udp6 socket");
+    // Mirror maybe_autobind_udp_sendto for AF_INET6: bind [::]:ephemeral, i.e.
+    // the socket does NOT know its own source address.
+    assert_eq!(
+        step_bind(&udp, inet6_at(Ipv6Address::UNSPECIFIED, 49_181), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &udp,
+            Some(IpEndpoint::new_v6(REMOTE_IP6, 53)),
+            b"dns6-query",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(10)
+    );
+
+    let sink = ScriptedSink::new(0);
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::from_millis(5),
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("device tx pass should complete");
+    };
+    assert_eq!(
+        tx.udp_packets, 1,
+        "the v6 datagram must reach the sink (attempted={}, busy={}, pending={}, failed={})",
+        tx.udp_attempted, tx.udp_busy, tx.udp_resolution_pending, tx.udp_failed
+    );
+
+    let frames = sink.accepted();
+    assert_eq!(frames.len(), 1);
+    let packet = &frames[0];
+    assert_eq!(packet[0] >> 4, 6, "must be an IPv6 packet");
+    assert_eq!(
+        &packet[8..24],
+        &LOCAL_IP6.octets(),
+        "source must be the interface address, not ::1"
+    );
+    assert_eq!(&packet[24..40], &REMOTE_IP6.octets(), "destination");
+}
+
+/// V5-2 follow-up regression: the boot seed occupies the primary v6 slot, so an
+/// explicitly configured address must DISPLACE it rather than land in the
+/// unroutable secondary list. Before the newest-wins change this asserted
+/// `None` in practice — `route6_snapshot` only emits connected routes for the
+/// primary, so a secondary could be bound but never sourced or routed.
+#[test]
+fn user_added_ipv6_address_displaces_the_boot_seeded_primary() {
+    let _lock = setup();
+    let _registration = attach_dual_stack_device(90);
+    let namespace = crate::net::initial_net_namespace_payload();
+    let ifindex = namespace
+        .link_snapshot()
+        .iter()
+        .find(|link| link.name == "virtio-net-test")
+        .expect("virtio test link")
+        .ifindex;
+
+    // LOCAL_IP6 (fec0::15/64) stands in for the boot seed here.
+    let configured = Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+    ]);
+    let peer = Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ]);
+    assert_eq!(
+        namespace.preferred_ipv6_source(peer),
+        None,
+        "sanity: nothing routes to the new prefix before it is configured"
+    );
+
+    namespace
+        .add_device_ipv6_addr_by_ifindex(
+            NetAdminAuthority::for_test_or_bootstrap(),
+            ifindex,
+            configured,
+            64,
+        )
+        .expect("ip -6 addr add");
+
+    assert_eq!(
+        namespace.preferred_ipv6_source(peer),
+        Some(configured),
+        "the configured address must be routable, not a stored-but-unusable secondary"
+    );
+    assert_eq!(
+        namespace
+            .link_snapshot()
+            .iter()
+            .find(|link| link.name == "virtio-net-test")
+            .and_then(|link| link.ipv6_addr),
+        Some(configured),
+        "the configured address must hold the primary slot"
+    );
+    // The displaced address is demoted, not dropped: still owned (bindable),
+    // just no longer the routable one.
+    assert!(
+        namespace.owns_ipv6_addr(LOCAL_IP6),
+        "the displaced boot address must survive as a secondary"
+    );
+    assert_eq!(
+        namespace.preferred_ipv6_source(LOCAL_IP6),
+        None,
+        "documented limitation: a secondary has no connected route (P5 debt)"
+    );
+
+    // Symmetric half: deleting the primary must hand the slot back to a
+    // secondary, not leave the link with no usable v6 address at all.
+    assert_eq!(
+        namespace.del_device_ipv6_addr_by_ifindex(
+            NetAdminAuthority::for_test_or_bootstrap(),
+            ifindex,
+            configured,
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        namespace
+            .link_snapshot()
+            .iter()
+            .find(|link| link.name == "virtio-net-test")
+            .and_then(|link| link.ipv6_addr),
+        Some(LOCAL_IP6),
+        "the demoted address must be promoted back when the primary goes away"
+    );
+    assert_eq!(
+        namespace.preferred_ipv6_source(LOCAL_IP6),
+        Some(LOCAL_IP6),
+        "and it must be routable again"
     );
 }

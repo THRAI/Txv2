@@ -1945,6 +1945,20 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(out)
     }
 
+    /// Apply `meta` to the inode and write it back **in place** (no
+    /// journal). Backs `FsOps::serialize_inode_meta`: metadata updates
+    /// (chmod/chown/utimensat, write-time mtime stamping) must be
+    /// immediately visible to `read_inode`, which reads the home inode
+    /// table. The journaled variant below records a jbd2 transaction
+    /// without checkpointing the home block, so readers never observe
+    /// those updates until replay — and its journal area is bounded, so
+    /// it cannot carry per-close mtime traffic.
+    pub fn write_inode_meta(&mut self, inode: InodeNo, meta: InodeMetaLite) -> Result<()> {
+        let mut disk_inode = self.read_inode(inode)?;
+        apply_meta(&mut disk_inode, meta);
+        self.write_inode(inode, &disk_inode)
+    }
+
     pub fn write_inode_meta_journaled(
         &mut self,
         inode: InodeNo,

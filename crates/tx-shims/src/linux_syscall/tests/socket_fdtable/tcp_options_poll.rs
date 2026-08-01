@@ -1,9 +1,31 @@
 use super::*;
+use crate::linux_syscall::{SO_KEEPALIVE, TCP_NODELAY};
+use tx_subsystems::net::{IpEndpoint, RecvWireSet, SendWireSet, SocketProtocol, TcpState};
 
 #[repr(C)]
 struct TestTlsCryptoInfo {
     version: u16,
     cipher_type: u16,
+}
+
+struct TcpConnectCountWake {
+    wakes: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+}
+
+impl alloc::task::Wake for TcpConnectCountWake {
+    fn wake(self: alloc::sync::Arc<Self>) {
+        self.wakes
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &alloc::sync::Arc<Self>) {
+        self.wakes
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn tcp_connect_counting_waker(wakes: alloc::sync::Arc<core::sync::atomic::AtomicUsize>) -> Waker {
+    Waker::from(alloc::sync::Arc::new(TcpConnectCountWake { wakes }))
 }
 
 fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
@@ -793,6 +815,58 @@ fn dispatch_tcp_read_write_allows_socket_sized_inline_batch() {
         SyscallResult::Return(read_back.len() as i64)
     );
     assert_eq!(read_back, payload);
+
+    let mut empty = [0u8; 1];
+    assert_eq!(
+        socket_req(
+            NR_READ,
+            [
+                accepted_fd as u64,
+                empty.as_mut_ptr() as u64,
+                empty.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(EAGAIN_VALUE),
+        "a mailbox-less bootstrap read must not park after the queue is drained"
+    );
+}
+
+#[test]
+fn dispatch_tcp_read_write_rejects_unconnected_socket() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+    let byte = [0x5au8; 1];
+
+    assert_eq!(
+        socket_req(
+            NR_WRITE,
+            [fd as u64, byte.as_ptr() as u64, byte.len() as u64, 0, 0, 0],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EPIPE))
+    );
+
+    let mut out = [0u8; 1];
+    assert_eq!(
+        socket_req(
+            NR_READ,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENOTCONN))
+    );
 }
 
 #[test]
@@ -1307,6 +1381,116 @@ fn dispatch_setsockopt_getsockopt_round_trips_dontroute() {
 }
 
 #[test]
+fn dispatch_tcp_dynamic_nodelay_and_keepalive_update_live_engine() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+    let file = process.fd(fd as u32).expect("resolve TCP file");
+    let socket =
+        crate::linux_syscall::socket::socket_identity_from_file(&file).expect("resolve TCP socket");
+    let payload = socket.acquire_operational().expect("TCP payload");
+    let raw = payload.raw_tcp_socket().expect("raw TCP engine");
+    assert!(!raw.nodelay());
+    assert!(!raw.keep_alive_enabled());
+
+    let one: i32 = 1;
+    for (level, option) in [(IPPROTO_TCP, TCP_NODELAY), (SOL_SOCKET, SO_KEEPALIVE)] {
+        assert_eq!(
+            socket_req(
+                NR_SETSOCKOPT,
+                [
+                    fd as u64,
+                    level as u64,
+                    option as u64,
+                    (&one as *const i32) as u64,
+                    core::mem::size_of::<i32>() as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+    }
+    assert!(raw.nodelay(), "TCP_NODELAY must update the existing engine");
+    assert!(
+        raw.keep_alive_enabled(),
+        "SO_KEEPALIVE must update the existing engine"
+    );
+    for (level, option) in [(IPPROTO_TCP, TCP_NODELAY), (SOL_SOCKET, SO_KEEPALIVE)] {
+        let mut value = 0i32;
+        let mut value_len = core::mem::size_of::<i32>() as u32;
+        assert_eq!(
+            socket_req(
+                NR_GETSOCKOPT,
+                [
+                    fd as u64,
+                    level as u64,
+                    option as u64,
+                    (&mut value as *mut i32) as u64,
+                    (&mut value_len as *mut u32) as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+        assert_eq!(value, 1);
+    }
+
+    let zero: i32 = 0;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_KEEPALIVE as u64,
+                (&zero as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(!raw.keep_alive_enabled());
+
+    let udp_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                udp_fd as u64,
+                IPPROTO_TCP as u64,
+                TCP_NODELAY as u64,
+                (&one as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT))
+    );
+    let mut value = 0i32;
+    let mut value_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                udp_fd as u64,
+                IPPROTO_TCP as u64,
+                TCP_NODELAY as u64,
+                (&mut value as *mut i32) as u64,
+                (&mut value_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT))
+    );
+}
+
+#[test]
 fn dispatch_setsockopt_getsockopt_round_trips_ip_recverr() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
@@ -1530,6 +1714,308 @@ fn dispatch_iptables_legacy_sockopt_reports_empty_tables() {
             &ctx,
         ),
         SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP))
+    );
+}
+
+fn tcp_rst_frame(
+    src: IpEndpoint,
+    dst: IpEndpoint,
+    ack_number: i32,
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+) -> Vec<u8> {
+    let src_addr = smoltcp::wire::Ipv4Address::new(
+        src.addr.octets()[0],
+        src.addr.octets()[1],
+        src.addr.octets()[2],
+        src.addr.octets()[3],
+    );
+    let dst_addr = smoltcp::wire::Ipv4Address::new(
+        dst.addr.octets()[0],
+        dst.addr.octets()[1],
+        dst.addr.octets()[2],
+        dst.addr.octets()[3],
+    );
+    let tcp_repr = smoltcp::wire::TcpRepr {
+        src_port: src.port,
+        dst_port: dst.port,
+        control: smoltcp::wire::TcpControl::Rst,
+        seq_number: smoltcp::wire::TcpSeqNumber(0x2929),
+        ack_number: Some(smoltcp::wire::TcpSeqNumber(ack_number)),
+        window_len: 4096,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let tcp_len = tcp_repr.buffer_len();
+    let ip_repr = smoltcp::wire::IpRepr::Ipv4(smoltcp::wire::Ipv4Repr {
+        src_addr,
+        dst_addr,
+        next_header: smoltcp::wire::IpProtocol::Tcp,
+        payload_len: tcp_len,
+        hop_limit: 64,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let mut ip_bytes = vec![0u8; ip_header_len + tcp_len];
+    let checksum_caps = smoltcp::phy::ChecksumCapabilities::default();
+    ip_repr.emit(&mut ip_bytes[..ip_header_len], &checksum_caps);
+    let mut tcp_packet = smoltcp::wire::TcpPacket::new_unchecked(&mut ip_bytes[ip_header_len..]);
+    tcp_repr.emit(
+        &mut tcp_packet,
+        &smoltcp::wire::IpAddress::Ipv4(src_addr),
+        &smoltcp::wire::IpAddress::Ipv4(dst_addr),
+        &checksum_caps,
+    );
+
+    let mut frame = Vec::with_capacity(14 + ip_bytes.len());
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&[0x08, 0x00]);
+    frame.extend_from_slice(&ip_bytes);
+    frame
+}
+
+#[test]
+fn dispatch_getsockopt_so_error_consumes_pending_error() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+    let file = process.fd(fd as u32).expect("resolve TCP file");
+    let socket =
+        crate::linux_syscall::socket::socket_identity_from_file(&file).expect("resolve TCP socket");
+    let payload = socket.acquire_operational().expect("TCP payload");
+    payload.set_socket_error(Errno::ECONNREFUSED);
+    socket.readiness.fire_send(SendWireSet::CONNECT_DONE);
+
+    let mut invalid_len = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_ERROR as u64,
+                0,
+                (&mut invalid_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EFAULT))
+    );
+    assert_eq!(
+        payload.socket_error(),
+        None,
+        "Linux consumes SO_ERROR before a failing copyout"
+    );
+
+    payload.set_socket_error(Errno::ECONNREFUSED);
+    for expected in [errno_to_i32(Errno::ECONNREFUSED), 0] {
+        let mut out = -1i32;
+        let mut out_len = core::mem::size_of::<i32>() as u32;
+        assert_eq!(
+            socket_req(
+                NR_GETSOCKOPT,
+                [
+                    fd as u64,
+                    SOL_SOCKET as u64,
+                    SO_ERROR as u64,
+                    (&mut out as *mut i32) as u64,
+                    (&mut out_len as *mut u32) as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+        assert_eq!(out, expected);
+        assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+    }
+    assert_eq!(
+        socket.readiness.send_wq.peek() & SendWireSet::CONNECT_DONE.bits(),
+        0
+    );
+}
+
+#[test]
+fn dispatch_nonblocking_tcp_connect_exposes_a_poll_wait_source() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "nb-connect-left",
+            devt: tx_subsystems::device::DevT::new(91, 250),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 2, 50]),
+        },
+        right: VethEndpointConfig {
+            name: "nb-connect-right",
+            devt: tx_subsystems::device::DevT::new(91, 251),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 2, 51]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    tx_subsystems::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(pair.left, Some(Ipv4Address::new([192, 0, 2, 2])))
+        .expect("attach outbound veth");
+    let fd = socket_stream(&ctx, SOCK_STREAM | O_NONBLOCK as u64);
+    let local = sockaddr_in([192, 0, 2, 2], 0);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                local.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let remote = sockaddr_in([192, 0, 2, 1], 49_177);
+
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                fd as u64,
+                remote.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EINPROGRESS))
+    );
+
+    let file = process.fd(fd as u32).expect("resolve TCP file");
+    let socket =
+        crate::linux_syscall::socket::socket_identity_from_file(&file).expect("resolve TCP socket");
+    let guard = tx_substrate::epoch::guard();
+    assert!(matches!(
+        tx_subsystems::net::step_poll_wait_token(&socket, PollMask::OUT, &guard),
+        StepOutcome::Done(Some(_))
+    ));
+    drop(guard);
+
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                fd as u64,
+                remote.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EALREADY))
+    );
+}
+
+#[test]
+fn dispatch_blocking_tcp_connect_returns_refused_after_rst_wakeup() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    const LEFT_MAC: [u8; 6] = [0x02, 0, 0, 0, 2, 60];
+    const RIGHT_MAC: [u8; 6] = [0x02, 0, 0, 0, 2, 61];
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "blocking-connect-left",
+            devt: tx_subsystems::device::DevT::new(91, 252),
+            mac: EthernetAddress::new(LEFT_MAC),
+        },
+        right: VethEndpointConfig {
+            name: "blocking-connect-right",
+            devt: tx_subsystems::device::DevT::new(91, 253),
+            mac: EthernetAddress::new(RIGHT_MAC),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    let namespace = tx_subsystems::net::initial_net_namespace_payload();
+    namespace
+        .attach_device_for_test_or_bootstrap(pair.left, Some(Ipv4Address::new([192, 0, 2, 2])))
+        .expect("attach outbound veth");
+
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+    let local_addr = sockaddr_in([192, 0, 2, 2], 0);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                local_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let remote_addr = sockaddr_in([192, 0, 2, 1], 49_178);
+    let request = SyscallRequest::new(
+        NR_CONNECT,
+        [
+            fd as u64,
+            remote_addr.as_ptr() as u64,
+            SOCKADDR_IN_BYTES as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let mut connect = Box::pin(dispatch::<ShimsTestPmap>(request, &ctx));
+    let wake_count = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let waker = tcp_connect_counting_waker(alloc::sync::Arc::clone(&wake_count));
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(connect.as_mut().poll(&mut cx), Poll::Pending));
+
+    let file = process.fd(fd as u32).expect("resolve TCP file");
+    let socket =
+        crate::linux_syscall::socket::socket_identity_from_file(&file).expect("resolve TCP socket");
+    let payload = socket.acquire_operational().expect("TCP payload");
+    let (local, remote) = match payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
+        state => panic!("blocking connect should be in progress, got {state:?}"),
+    };
+    let raw = payload.raw_tcp_socket().expect("raw TCP");
+    let syn = raw.dispatch_segment().expect("initial SYN");
+    let rst = tcp_rst_frame(
+        remote,
+        local,
+        syn.tcp.seq_number.0.wrapping_add(1),
+        LEFT_MAC,
+        RIGHT_MAC,
+    );
+
+    let guard = tx_substrate::epoch::guard();
+    assert_eq!(pair.right.ops.transmit(&rst, &guard), StepOutcome::Done(()));
+    let runtime = tx_subsystems::net::drive_net_namespace_runtime_at(
+        namespace,
+        smoltcp::time::Instant::ZERO,
+        &guard,
+    );
+    assert_eq!(runtime.packets_seen, 1);
+    drop(guard);
+    assert!(
+        wake_count.load(core::sync::atomic::Ordering::SeqCst) > 0,
+        "RST CONNECT_DONE must wake the parked blocking connect"
+    );
+
+    assert_eq!(
+        connect.as_mut().poll(&mut cx),
+        Poll::Ready(SyscallResult::Error(errno_to_i32(Errno::ECONNREFUSED)))
     );
 }
 

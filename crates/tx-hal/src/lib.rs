@@ -1374,6 +1374,10 @@ pub type IrqHandlerFn = fn(irq: u32) -> IrqHandled;
 pub enum IrqHandled {
     Done,
     Wake,
+    /// The handler requested a reactor wake and retained ownership of the
+    /// controller completion. It must later call [`IrqIf::complete`] exactly
+    /// once from the same controller context that performed the claim.
+    DeferredWake,
     NotMine,
 }
 

@@ -1215,6 +1215,69 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
 }
 
 #[test]
+fn fork_aspace_cow_from_pmap_only_private_resident_preserves_bytes() {
+    setup_host_substrate();
+
+    let parent = AddressSpace::new();
+    let private_range = range(0x42000, 1);
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            private_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("private anon map");
+
+    let user_addr = 0x42080usize;
+    let original = [0xABu8; 64];
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        parent.copy_to_user(tx_hal::UserPtr::new(user_addr), &original, &guard),
+        crate::vm::adapter::step_engine::StepOutcome::Done(original.len())
+    );
+
+    // Simulate the pmap-only state that exec/user-access construction can
+    // leave behind: the resident PTE is authoritative, but the recipe's
+    // private set has no row for this page.
+    let entry = parent
+        .lookup(crate::vm::UserVirtAddr(user_addr))
+        .expect("private recipe");
+    let private = entry.private().expect("private page set");
+    private.drain_range(crate::vm::VmPageOff(0), crate::vm::VmPageOff(1));
+    assert!(private.is_empty());
+    drop(guard);
+
+    let child =
+        crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
+    let guard = crate::vm::adapter::step_engine::guard();
+    let patch = [0xCDu8];
+    assert_eq!(
+        child.copy_to_user(tx_hal::UserPtr::new(user_addr + 17), &patch, &guard,),
+        crate::vm::adapter::step_engine::StepOutcome::Done(patch.len())
+    );
+
+    let mut child_bytes = [0u8; 64];
+    assert_eq!(
+        child.copy_from_user(&mut child_bytes, tx_hal::UserPtr::new(user_addr), &guard,),
+        crate::vm::adapter::step_engine::StepOutcome::Done(child_bytes.len())
+    );
+    let mut expected_child = original;
+    expected_child[17] = patch[0];
+    assert_eq!(child_bytes, expected_child);
+
+    let mut parent_bytes = [0u8; 64];
+    assert_eq!(
+        parent.copy_from_user(&mut parent_bytes, tx_hal::UserPtr::new(user_addr), &guard,),
+        crate::vm::adapter::step_engine::StepOutcome::Done(parent_bytes.len())
+    );
+    assert_eq!(parent_bytes, original);
+}
+
+#[test]
 fn range_lock_release_fires_registered_wait_source_for_external_subscribers() {
     let aspace = AddressSpace::new();
     let range = range(0x4000, 1);

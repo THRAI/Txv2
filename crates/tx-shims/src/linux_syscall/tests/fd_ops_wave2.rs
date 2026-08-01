@@ -7,6 +7,7 @@ use crate::adapter::step_engine::{
 };
 use alloc::sync::Arc;
 use alloc::vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cred::{step_setresuid, CapabilitySet, Uid};
 use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
@@ -139,6 +140,88 @@ fn build_tmpfs_root_with_mount() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<MountIdentity>
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let (root_dentry, tmpfs, _mount) = build_tmpfs_root_with_mount();
     (root_dentry, tmpfs)
+}
+
+#[derive(Default)]
+struct RecordingFsyncBacking {
+    fsyncs: AtomicUsize,
+}
+
+impl FsPageBacking for RecordingFsyncBacking {
+    fn fetch_page(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<tx_subsystems::page_backed::Frame, step_engine::NoProgress> {
+        unreachable!("dup3 flush test has no resident pages")
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _offset: u64,
+        _frame: &tx_subsystems::page_backed::Frame,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.fsyncs.fetch_add(1, Ordering::AcqRel);
+        StepOutcome::done(())
+    }
+}
+
+fn recording_page_backed_open_file(
+    fs_ops: Arc<Tmpfs>,
+) -> (
+    Cap<tx_subsystems::vfs::OpenFile>,
+    Arc<RecordingFsyncBacking>,
+) {
+    use tx_subsystems::mount::MountPayloadPin;
+    use tx_subsystems::page_backed::PageContainer;
+    use tx_subsystems::vfs::OpenFileFlags;
+
+    let backing = Arc::new(RecordingFsyncBacking::default());
+    let mount = MountPayload::new_cap(
+        fs_ops,
+        backing.clone(),
+        None,
+        DevId::new(204),
+        MountOptions::default(),
+        "recording-fsync",
+        SourceLabel::Static("recording-fsync"),
+    )
+    .expect("recording fsync mount payload");
+    let pc = PageContainer::new_file_cap(
+        MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
+        tx_subsystems::vfs::FsObjectId::new(2),
+        0,
+    )
+    .expect("recording file page container");
+    let rnode = RNode::new_cap(
+        tx_subsystems::vfs::FsObjectId::new(2),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::PageBacked { pc },
+    )
+    .expect("recording file rnode");
+    let file = tx_subsystems::vfs::OpenFile::new_cap(rnode, OpenFileFlags::default())
+        .expect("recording open file");
+    (file, backing)
 }
 
 fn build_devfs_root() -> Cap<DEntry> {
@@ -2141,6 +2224,53 @@ fn dispatch_dup3_at_specific_fd_replaces_existing() {
     assert!(proc_cap.fd(fd_a).is_some());
     drop(path_a);
     drop(path_b);
+}
+
+#[test]
+fn dispatch_dup3_flushes_replaced_page_backed_file() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let path_a = nul_terminate(b"/a");
+    let oldfd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path_a.as_ptr() as u64,
+                O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat /a: {other:?}"),
+    };
+    let newfd = 100;
+    let (replaced, backing) = recording_page_backed_open_file(tmpfs);
+    assert!(proc_cap.install_fd(newfd, replaced).is_none());
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_DUP3, [oldfd as u64, newfd as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(newfd as i64));
+    assert_eq!(backing.fsyncs.load(Ordering::Acquire), 1);
+    drop(path_a);
 }
 
 /// `dup3(oldfd, newfd, O_CLOEXEC)` sets the cloexec bit on the

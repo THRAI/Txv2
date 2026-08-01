@@ -86,10 +86,8 @@ pub use step_tcp_loopback::{
 };
 pub use step_udp_loopback::{
     step_process_loopback_udp, step_process_loopback_udp_on_iface,
-    step_process_loopback_udp_on_iface_with_post, step_process_loopback_udp_with_post,
     step_send_udp_loopback_kernel_bytes, step_send_udp_loopback_kernel_bytes_on_iface,
-    step_send_udp_loopback_kernel_bytes_on_iface_with_post,
-    step_send_udp_loopback_kernel_bytes_with_post, LoopbackUdpTransferOutcome,
+    LoopbackUdpTransferOutcome,
 };
 
 pub const SOMAXCONN_STAGING: usize = 128;
@@ -117,7 +115,7 @@ pub fn socket_recv_wait_token(socket: &SocketIdentity) -> WaitToken {
 pub fn socket_send_wait_token(socket: &SocketIdentity) -> WaitToken {
     WaitToken::new(
         socket.wait_carriers.send,
-        SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits(),
+        SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits() | SendWireSet::CONNECT_DONE.bits(),
     )
 }
 

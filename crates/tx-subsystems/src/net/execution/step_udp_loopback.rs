@@ -1,17 +1,15 @@
-use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_write_target;
 use crate::net::namespace::initial_loopback_iface;
 use crate::net::protocol::{LoopbackIface, PollContext, UDP_IPV4_MAX_PAYLOAD_BYTES};
-use crate::net::structure::{IpEndpoint, SendRecvFlags, SocketIdentity, SocketProtocol, UdpInner};
+use crate::net::structure::{
+    IpEndpoint, SendRecvFlags, SendWireSet, SocketIdentity, SocketProtocol, UdpInner,
+};
 
 use super::step_send::send_flags_error;
-use super::{
-    socket_send_wait_token, step_send::clear_send_space_if_full, yield_bytes_on_token,
-    ByteStepOutcome,
-};
+use super::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LoopbackUdpTransferOutcome {
@@ -33,25 +31,7 @@ pub fn step_process_loopback_udp(
     // reserve
     // commit
     // publish
-    step_process_loopback_udp_with_post(source, budget, guard, |mailbox, event| mailbox.post(event))
-}
-
-pub fn step_process_loopback_udp_with_post<F>(
-    source: &Cap<SocketIdentity>,
-    budget: usize,
-    guard: &Guard<'_>,
-    post: F,
-) -> StepOutcome<LoopbackUdpTransferOutcome>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
-    step_process_loopback_udp_on_iface_with_post(
-        source,
-        budget,
-        initial_loopback_iface(),
-        guard,
-        post,
-    )
+    step_process_loopback_udp_on_iface(source, budget, initial_loopback_iface(), guard)
 }
 
 pub fn step_process_loopback_udp_on_iface(
@@ -60,21 +40,6 @@ pub fn step_process_loopback_udp_on_iface(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackUdpTransferOutcome> {
-    step_process_loopback_udp_on_iface_with_post(source, budget, iface, guard, |mailbox, event| {
-        mailbox.post(event)
-    })
-}
-
-pub fn step_process_loopback_udp_on_iface_with_post<F>(
-    source: &Cap<SocketIdentity>,
-    budget: usize,
-    iface: &LoopbackIface,
-    guard: &Guard<'_>,
-    mut post: F,
-) -> StepOutcome<LoopbackUdpTransferOutcome>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
     // observe
     // upgrade
     // reserve
@@ -94,14 +59,14 @@ where
 
     if let Some(publish) = ctx.poll_udp_egress_one(source, iface, guard) {
         source_wake_fired = publish.publish.send_has_space;
-        publish.publish_with_post(&mut post);
+        publish.publish();
     }
 
     let ingress = ctx.poll_udp_ingress(iface, guard, budget);
     let mut peer_wake_fired = false;
     for publish in ingress.publishes {
         peer_wake_fired |= publish.publish.recv_has_data;
-        publish.publish_with_post(&mut post);
+        publish.publish();
     }
 
     StepOutcome::Done(LoopbackUdpTransferOutcome {
@@ -126,35 +91,13 @@ pub fn step_send_udp_loopback_kernel_bytes(
     // reserve
     // commit
     // publish
-    step_send_udp_loopback_kernel_bytes_with_post(
-        socket,
-        dst,
-        bytes,
-        flags,
-        guard,
-        |mailbox, event| mailbox.post(event),
-    )
-}
-
-pub fn step_send_udp_loopback_kernel_bytes_with_post<F>(
-    socket: &Cap<SocketIdentity>,
-    dst: Option<IpEndpoint>,
-    bytes: &[u8],
-    flags: SendRecvFlags,
-    guard: &Guard<'_>,
-    post: F,
-) -> ByteStepOutcome<usize>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
-    step_send_udp_loopback_kernel_bytes_on_iface_with_post(
+    step_send_udp_loopback_kernel_bytes_on_iface(
         socket,
         dst,
         bytes,
         flags,
         initial_loopback_iface(),
         guard,
-        post,
     )
 }
 
@@ -166,29 +109,6 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     iface: &LoopbackIface,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
-    step_send_udp_loopback_kernel_bytes_on_iface_with_post(
-        socket,
-        dst,
-        bytes,
-        flags,
-        iface,
-        guard,
-        |mailbox, event| mailbox.post(event),
-    )
-}
-
-pub fn step_send_udp_loopback_kernel_bytes_on_iface_with_post<F>(
-    socket: &Cap<SocketIdentity>,
-    dst: Option<IpEndpoint>,
-    bytes: &[u8],
-    flags: SendRecvFlags,
-    iface: &LoopbackIface,
-    guard: &Guard<'_>,
-    mut post: F,
-) -> ByteStepOutcome<usize>
-where
-    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
-{
     // observe
     // upgrade
     // reserve
@@ -213,10 +133,6 @@ where
     if total_payload_len > UDP_IPV4_MAX_PAYLOAD_BYTES {
         return tx_substrate::step::StepOutcome::Err(Errno::EMSGSIZE);
     }
-    if bytes.is_empty() {
-        return tx_substrate::step::StepOutcome::Done(0);
-    }
-
     let (local, destination) =
         match udp_loopback_endpoints(&source_payload.protocol_snapshot(), dst) {
             Some(endpoints) => endpoints,
@@ -234,7 +150,7 @@ where
         match source_payload.reserve_send_bytes_to_with_flags(Some(destination), bytes, flags) {
             Ok(Some(reserve)) => reserve,
             Ok(None) => {
-                clear_send_space_if_full(socket, &source_payload);
+                socket.readiness.clear_send(SendWireSet::SPACE);
                 return yield_bytes_on_token(
                     tx_substrate::step::ByteProgress::EMPTY,
                     socket_send_wait_token(socket),
@@ -243,7 +159,7 @@ where
             Err(errno) => return tx_substrate::step::StepOutcome::Err(errno),
         };
     if reserve.became_full {
-        clear_send_space_if_full(socket, &source_payload);
+        socket.readiness.clear_send(SendWireSet::SPACE);
     }
     if flags.contains(SendRecvFlags::MSG_MORE) {
         return tx_substrate::step::StepOutcome::Done(reserve.bytes);
@@ -261,11 +177,11 @@ where
         source_payload.socket_table(),
     );
     if let Some(publish) = ctx.poll_udp_egress_one(socket, iface, guard) {
-        publish.publish_with_post(&mut post);
+        publish.publish();
     }
     let ingress = ctx.poll_udp_ingress(iface, guard, 1);
     for publish in ingress.publishes {
-        publish.publish_with_post(&mut post);
+        publish.publish();
     }
     tx_substrate::step::StepOutcome::Done(reserve.bytes)
 }
