@@ -34,7 +34,7 @@ pub fn require_fault_recipe(
     fault: VmFault,
 ) -> Result<VmFaultOutcome, VmFaultError> {
     let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
-    let guard = step_engine::guard();
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
     let (entry, recipe_generation) = aspace
         .recipes
         .lookup_stamped(fault.addr, &guard)
@@ -60,7 +60,7 @@ pub fn require_fault_publication(
 ) -> Result<(), VmFaultError> {
     require_fault_materialization(outcome, materialization)?;
 
-    let guard = step_engine::guard();
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
     if outcome.recipe_generation.is_some()
         && aspace.recipes.stable_generation(&guard) == outcome.recipe_generation
     {
@@ -140,7 +140,7 @@ pub fn require_map_admission(
     entry: &VmEntry,
     placement: MapPlacement,
 ) -> Result<(), VmMapError> {
-    let guard = step_engine::guard();
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
     aspace.recipes.validate_map(entry, placement, &guard)
 }
 

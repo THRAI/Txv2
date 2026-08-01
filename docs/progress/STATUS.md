@@ -1,3 +1,16 @@
+- 2026-08-01 (VM recipe-generation guard compatibility).
+  Fixed the previous recipe-generation follow-up so VM checks reuse an active
+  epoch guard with `borrow_current_guard().unwrap_or_else(guard)` instead of
+  unconditionally opening a nested guard. This restores active-epoch user-copy
+  and positioned vector I/O paths while preserving the generation fast path.
+  Verification passed `cargo test -p tx-shims --lib
+  bootstrap_copy_to_user_reuses_active_epoch_guard -- --test-threads=1`,
+  `cargo test -p tx-shims --lib
+  dispatch_positioned_write_and_vector_io_restore_original_offset --
+  --test-threads=1`, `cargo test -p tx-subsystems --lib
+  vm_checks_require_fault_publication -- --test-threads=1`, touched-file
+  `rustfmt --check`, and `cargo -q xtask unit` (646 + 114 + 56 + 166).
+
 - 2026-08-01 (ext4 Task 12 fast-symlink admission).
   Advanced Task 12 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
