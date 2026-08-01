@@ -485,26 +485,44 @@ where
         &self,
         parent: FsObjectId,
         name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
+        target: FsObjectId,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        if let Err(err) = self.require_mutation_owner() {
-            return StepOutcome::err(err.into());
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
         }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        // Remove the directory entry from the parent.  The directory
-        // itself is assumed empty (the VFS layer should have checked);
-        // we do not attempt to free the inode or its `.`/`..` entries —
-        // good enough for the busybox-musl `rmdir test` test case.
-        match self.with_pager(|pager| pager.remove_dir_entry(parent_ino, name)) {
-            Ok(_) => {
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let current = match self.inode_meta_cached(target_ino) {
+            Ok(meta) => meta,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_rmdir_dir_entry(
+                parent_ino,
+                name,
+                target_ino,
+                FsyncStamp::new(current.ctime as u64),
+            )
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match runtime.begin_mutation(&mutation, guard) {
+            Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 

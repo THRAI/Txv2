@@ -1,3 +1,31 @@
+- 2026-08-01 (ext4 Task 12 empty-directory rmdir admission).
+  Advanced Task 12 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `Ext4Pager::plan_rmdir_dir_entry` now builds an
+  immutable empty-directory namespace mutation that removes the parent dirent,
+  checks the target directory contains only `.`/`..`, decrements the parent
+  directory link count, clears the target directory link count, refreshes inode
+  checksums, and emits DirectoryBlock plus InodeTable after-images without
+  mutating the home image. `FsOps::rmdir` now admits that plan through
+  `JournalMutationRuntime::begin_mutation`; RO and no-runtime mounts remain
+  fail-closed, and inode/data storage reclamation stays deferred to the
+  orphan/destroy lifecycle. Verification passed `cargo test -p tx-ext4-format
+  --test pager_mock namespace_plan_rmdirs_empty_directory_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_ -- --test-threads=1` (3), `cargo test -p
+  tx-ext4-format --test pager_mock -- --test-threads=1` (26), `cargo test -p
+  tx-ext4 --lib --no-default-features
+  ext4_rmdir_public_path_admits_namespace_mutation_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4 --lib --no-default-features
+  namespace -- --test-threads=1` (4), `cargo test -p tx-ext4 --lib
+  --no-default-features -- --test-threads=1` (49), `cargo test -p tx-ext4
+  --test journal_prepared_transaction -- --test-threads=1` (9), `cargo test
+  -p tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7), and touched
+  file `rustfmt --check`. Next: continue Task 12 with create/mkdir or
+  overwrite/cross-directory rename, then classic orphan/destroy cleanup.
+  Product Tier 1 still requires Task 14 production cutover/G0 lints, Task 15
+  runner, and Task 16 fresh QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (ext4 Task 11 public flush mutation admission).
   Advanced Task 11 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`

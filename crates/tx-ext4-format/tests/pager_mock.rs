@@ -883,6 +883,67 @@ fn namespace_plan_renames_regular_file_in_place_without_home_write() {
 }
 
 #[test]
+fn namespace_plan_rmdirs_empty_directory_without_home_write() {
+    let mut image = mock_image();
+    encode_directory(
+        image.block_mut(17),
+        &[(13, 2, b".".as_slice()), (2, 2, b"..".as_slice())],
+    );
+    let dir_before = *image.block(16);
+    let nested_before = *image.block(17);
+    let inode_before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_rmdir_dir_entry(
+            InodeNo::new(2),
+            b"nested",
+            InodeNo::new(13),
+            FsyncStamp::new(22),
+        )
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Unlink);
+    assert_eq!(plan.object, 13);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 2);
+
+    let dir_block = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::DirectoryBlock)
+        .unwrap();
+    assert_eq!(dir_block.home, 16);
+    let names: Vec<_> = DirEntryIter::new(&dir_block.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert!(!names.iter().any(|name| *name == b"nested"));
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert_eq!(inode_table.home, 4);
+    let root_inode = Inode::parse(&inode_table.after[1 * 256..2 * 256]).unwrap();
+    let nested_inode = Inode::parse(&inode_table.after[12 * 256..13 * 256]).unwrap();
+    assert_eq!(root_inode.links_count, 2);
+    assert_eq!(root_inode.ctime, 22);
+    assert_eq!(nested_inode.links_count, 0);
+    assert_eq!(nested_inode.ctime, 22);
+
+    assert_eq!(pager.image().block(16), &dir_before);
+    assert_eq!(pager.image().block(17), &nested_before);
+    assert_eq!(pager.image().block(4), &inode_before);
+}
+
+#[test]
 fn pager_writeback_and_journal_replay_on_mock_image() {
     let image = mock_image();
     let mut pager = Ext4Pager::open(image).unwrap();

@@ -1513,6 +1513,142 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(plan)
     }
 
+    /// Build the bounded namespace mutation for removing an empty directory.
+    /// The plan removes the parent dirent and adjusts link counts, but leaves
+    /// inode/data block reclamation to the later orphan/destroy lifecycle.
+    pub fn plan_rmdir_dir_entry(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+        target_ino: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        let (found_ino, dir_home, dir_before, dir_after) =
+            self.plan_remove_dir_entry_after_image(dir_ino, name)?;
+        if found_ino != target_ino {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        let parent_location = self.inode_location(dir_ino)?;
+        let target_location = self.inode_location(target_ino)?;
+        let mut parent_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(parent_location.block, &mut parent_table_before)?;
+        let mut parent_table_after = parent_table_before;
+        let mut target_table_before = parent_table_before;
+        let mut target_table_after = parent_table_after;
+        if target_location.block != parent_location.block {
+            self.image
+                .read_block(target_location.block, &mut target_table_before)?;
+            target_table_after = target_table_before;
+        }
+
+        {
+            let target_inode_bytes = &mut target_table_after
+                [target_location.offset..target_location.offset + target_location.len];
+            let mut target_inode = Inode::parse(target_inode_bytes)?;
+            if !target_inode.is_dir() {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            self.require_empty_directory(target_ino, &target_inode, dir_ino)?;
+            target_inode.links_count = 0;
+            target_inode.ctime = fsync_stamp
+                .raw()
+                .try_into()
+                .map_err(|_| Ext4FormatError::OutOfBounds)?;
+            target_inode.encode_preserving_unknown(target_inode_bytes)?;
+            self.refresh_inode_checksum(target_ino, &target_inode, target_inode_bytes)?;
+        }
+
+        if target_location.block == parent_location.block {
+            parent_table_after = target_table_after;
+        }
+        {
+            let parent_inode_bytes = &mut parent_table_after
+                [parent_location.offset..parent_location.offset + parent_location.len];
+            let mut parent_inode = Inode::parse(parent_inode_bytes)?;
+            if !parent_inode.is_dir() {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            parent_inode.links_count = parent_inode
+                .links_count
+                .checked_sub(1)
+                .ok_or(Ext4FormatError::Corrupt)?;
+            parent_inode.ctime = fsync_stamp
+                .raw()
+                .try_into()
+                .map_err(|_| Ext4FormatError::OutOfBounds)?;
+            parent_inode.encode_preserving_unknown(parent_inode_bytes)?;
+            self.refresh_inode_checksum(dir_ino, &parent_inode, parent_inode_bytes)?;
+        }
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Unlink, target_ino.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: dir_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &dir_before) as u64,
+            after: dir_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: parent_location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &parent_table_before) as u64,
+            after: parent_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        if target_location.block != parent_location.block {
+            plan.push_metadata(MetadataBlock {
+                home: target_location.block,
+                role: MetaRole::InodeTable,
+                before_version: crc32c(0, &target_table_before) as u64,
+                after: target_table_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
+        Ok(plan)
+    }
+
+    fn require_empty_directory(
+        &mut self,
+        dir_ino: InodeNo,
+        disk_inode: &Inode,
+        parent_ino: InodeNo,
+    ) -> Result<()> {
+        if !disk_inode.is_dir() || disk_inode.is_htree_indexed() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let mut seen_dot = false;
+        let mut seen_dotdot = false;
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+        for page_index in 0..page_count {
+            let phys = match self.resolve_inode_block(disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(block) => block,
+                BlockMapping::Hole => continue,
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            };
+            let mut page = [0u8; BLOCK_SIZE];
+            self.image.read_block(phys, &mut page)?;
+            for entry in DirEntryIter::new(&page) {
+                let entry = entry?;
+                match entry.name {
+                    b"." if entry.inode == dir_ino.get() => seen_dot = true,
+                    b".." if entry.inode == parent_ino.get() => seen_dotdot = true,
+                    _ => return Err(Ext4FormatError::Unsupported),
+                }
+            }
+        }
+        if seen_dot && seen_dotdot {
+            Ok(())
+        } else {
+            Err(Ext4FormatError::Corrupt)
+        }
+    }
+
     fn plan_remove_dir_entry_after_image(
         &mut self,
         dir_ino: InodeNo,
