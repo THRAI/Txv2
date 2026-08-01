@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tx_ext4_format::capability::{Tier1Capabilities, Tier1Reject, Tier1Request, sha256};
+use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
 use tx_ext4_format::ondisk::Ext4FormatError;
 use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, DirEntryLite, Ext4Pager, InodeNo};
 
@@ -166,6 +167,64 @@ fn generated_ext4_image_matches_host_tool_directory_and_file_observations() {
     assert!(page[payload_bytes.len()..].iter().all(|byte| *byte == 0));
 }
 
+#[test]
+fn tier1_busybox_image_can_plan_mkdir_under_musl() {
+    let missing = missing_tools(&["mkfs.ext4", "e2fsck"]);
+    if !missing.is_empty() {
+        eprintln!("skipping tier1 image mkdir planner verification; missing: {missing:?}");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let image = fixture.path("busybox.ext4");
+    let layout = fixture.path("layout");
+    fs::create_dir_all(layout.join("musl")).expect("create tier1 root layout");
+    fs::write(layout.join("musl").join("busybox"), b"busybox fixture\n")
+        .expect("write busybox fixture");
+
+    let file = File::create(&image).expect("create ext4 image");
+    file.set_len(64 * 1024 * 1024).expect("size ext4 image");
+
+    run(
+        &command_or_candidates("mkfs.ext4").expect("mkfs.ext4 tool"),
+        [
+            "-q",
+            "-F",
+            "-b",
+            "4096",
+            "-I",
+            "256",
+            "-O",
+            "^orphan_file,^metadata_csum_seed",
+            "-E",
+            "lazy_itable_init=0,lazy_journal_init=0",
+            "-L",
+            "TXROOT",
+            "-d",
+            layout.to_str().unwrap(),
+            image.to_str().unwrap(),
+        ],
+    );
+    run(
+        &command_or_candidates("e2fsck").expect("e2fsck tool"),
+        ["-fn", image.to_str().unwrap()],
+    );
+
+    let mut pager = Ext4Pager::open(VecImage::open(&image)).expect("open tier1 image");
+    let musl = pager
+        .lookup(InodeNo::new(2), b"musl")
+        .expect("lookup /musl")
+        .expect("/musl exists");
+    let (new_ino, data_block, plan) = pager
+        .plan_create_directory(musl, b"tier1-data", 0o755, 0, 0, FsyncStamp::new(0))
+        .expect("plan mkdir under /musl");
+
+    assert!(new_ino.get() > 2);
+    assert!(data_block > 0);
+    assert_eq!(plan.origin, MutationOrigin::Create);
+    assert!(plan.metadata.len() >= 7);
+}
+
 fn debugfs_stat(image: &Path, path: &str) -> String {
     let command = format!("stat {path}");
     let output = run("debugfs", ["-R", command.as_str(), image.to_str().unwrap()]);
@@ -196,12 +255,43 @@ fn missing_tools(tools: &[&str]) -> Vec<String> {
     tools
         .iter()
         .copied()
-        .filter(|tool| !command_exists(tool))
+        .filter(|tool| command_or_candidates(tool).is_none())
         .map(str::to_owned)
         .collect()
 }
 
+fn command_or_candidates(tool: &str) -> Option<String> {
+    if command_exists(tool) {
+        return Some(tool.to_string());
+    }
+    let candidates: &[&str] = match tool {
+        "mkfs.ext4" => &[
+            "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/opt/homebrew/sbin/mkfs.ext4",
+            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/mkfs.ext4",
+            "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/usr/local/sbin/mkfs.ext4",
+        ],
+        "e2fsck" => &[
+            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
+            "/opt/homebrew/sbin/e2fsck",
+            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/e2fsck",
+            "/usr/local/opt/e2fsprogs/sbin/e2fsck",
+            "/usr/local/sbin/e2fsck",
+        ],
+        _ => &[],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| command_exists(candidate))
+        .map(str::to_string)
+}
+
 fn command_exists(tool: &str) -> bool {
+    if Path::new(tool).is_file() {
+        return true;
+    }
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };

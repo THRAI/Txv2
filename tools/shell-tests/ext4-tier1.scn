@@ -9,58 +9,58 @@ wait "/ # " within 90000
 
 group data
 sleep 250
-send "mkdir -p /musl/tier1-data; echo tier1-data-mkdir:$?\n"
+send "/bin/busybox mkdir -p /musl/tier1-data; echo tier1-data-mkdir:$?\n"
 expect "tier1-data-mkdir:0" within 10000
 expect "/ # " within 10000
 send "printf 'alpha\\n' > /musl/tier1-data/file; echo tier1-data-write:$?\n"
 expect "tier1-data-write:0" within 10000
 expect "/ # " within 10000
-send "cat /musl/tier1-data/file; echo tier1-data-read:$?\n"
+send "/bin/busybox cat /musl/tier1-data/file; echo tier1-data-read:$?\n"
 expect "alpha" within 10000
 expect "tier1-data-read:0" within 10000
 expect "/ # " within 10000
 
 group setattr
 sleep 250
-send "chmod 755 /musl/tier1-data/file; test -x /musl/tier1-data/file; echo tier1-setattr-status:$?\n"
+send "/bin/busybox chmod 755 /musl/tier1-data/file; /bin/busybox test -x /musl/tier1-data/file; echo tier1-setattr-status:$?\n"
 expect "tier1-setattr-status:0" within 10000
 expect "/ # " within 10000
 
 group namespace
 sleep 250
-send "mkdir -p /musl/tier1-ns; printf ns > /musl/tier1-ns/a; ln /musl/tier1-ns/a /musl/tier1-ns/b; ln -s a /musl/tier1-ns/c; mv /musl/tier1-ns/a /musl/tier1-ns/d; rm /musl/tier1-ns/b /musl/tier1-ns/c /musl/tier1-ns/d; rmdir /musl/tier1-ns; echo tier1-namespace-status:$?\n"
+send "/bin/busybox mkdir -p /musl/tier1-ns; printf ns > /musl/tier1-ns/a; /bin/busybox ln /musl/tier1-ns/a /musl/tier1-ns/b; /bin/busybox ln -s a /musl/tier1-ns/c; /bin/busybox mv /musl/tier1-ns/a /musl/tier1-ns/d; /bin/busybox rm /musl/tier1-ns/b /musl/tier1-ns/c /musl/tier1-ns/d; /bin/busybox rmdir /musl/tier1-ns; echo tier1-namespace-status:$?\n"
 expect "tier1-namespace-status:0" within 10000
 expect "/ # " within 10000
 
 group orphan
 sleep 250
-send "mkdir -p /musl/tier1-orphan; printf orphan > /musl/tier1-orphan/live; exec 3</musl/tier1-orphan/live; rm /musl/tier1-orphan/live; cat <&3; echo tier1-orphan-status:$?\n"
+send "/bin/busybox mkdir -p /musl/tier1-orphan; printf orphan > /musl/tier1-orphan/live; exec 3</musl/tier1-orphan/live; /bin/busybox rm /musl/tier1-orphan/live; /bin/busybox cat <&3; echo tier1-orphan-status:$?\n"
 expect "orphan" within 10000
 expect "tier1-orphan-status:0" within 10000
 expect "/ # " within 10000
 
 group durability
 sleep 250
-send "sync; echo tier1-durability-status:$?\n"
+send "/bin/busybox sync; echo tier1-durability-status:$?\n"
 expect "tier1-durability-status:0" within 10000
 expect "/ # " within 10000
 
 group remount
 sleep 250
-send "umount /musl; mount -t ext4 /dev/block/vda /musl; echo tier1-remount-status:$?\n"
+send "/bin/busybox umount /musl; /bin/busybox mount -t ext4 /dev/block/vda /musl; echo tier1-remount-status:$?\n"
 expect "tier1-remount-status:0" within 30000
 expect "/ # " within 30000
 
 group execute-from-scratch
 sleep 250
-send "printf '#!/bin/sh\\necho tier1-exec-ok\\n' > /musl/tier1-exec.sh; chmod +x /musl/tier1-exec.sh; /musl/tier1-exec.sh; echo tier1-exec-status:$?\n"
+send "printf '#!/bin/sh\\necho tier1-exec-ok\\n' > /musl/tier1-exec.sh; /bin/busybox chmod +x /musl/tier1-exec.sh; /musl/tier1-exec.sh; echo tier1-exec-status:$?\n"
 expect "tier1-exec-ok" within 10000
 expect "tier1-exec-status:0" within 10000
 expect "/ # " within 10000
 
 group detach
 sleep 250
-send "sync; umount /musl; echo tier1-detach-status:$?\n"
+send "/bin/busybox sync; /bin/busybox umount /musl; echo tier1-detach-status:$?\n"
 expect "tier1-detach-status:0" within 30000
 
 quit

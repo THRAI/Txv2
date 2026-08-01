@@ -18,12 +18,14 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
     self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
 };
+use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
 use tx_ext4_format::ondisk::{BitmapMut, Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::fs_iface::{
@@ -528,6 +530,38 @@ fn mutation_runtime_for_test_with_metadata(
     ))
 }
 
+fn mutation_runtime_for_test_with_ring(
+    sequence: u32,
+    metadata_slots: u64,
+    with_revoke: bool,
+) -> Arc<JournalMutationRuntime> {
+    let _ = metadata_slots;
+    let _ = with_revoke;
+    Arc::new(
+        JournalMutationRuntime::from_geometry_with_sequence(
+            Arc::new(JournalFsyncSource::new()),
+            JournalPagePool::new(16).expect("journal pool"),
+            DeviceKey::new(7),
+            8,
+            tx_ext4_format::pager::JournalGeometry {
+                superblock: tx_ext4_format::journal::Jbd2Superblock {
+                    block_type: 4,
+                    block_size: JBD2_BLOCK_SIZE as u32,
+                    max_len: 16,
+                    first: 1,
+                    sequence,
+                    start: 0,
+                    uuid: [1; 16],
+                },
+                blocks: vec![9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+                superblock_page: None,
+            },
+            sequence,
+        )
+        .expect("runtime with ring"),
+    )
+}
+
 fn mounted_counting_mutation_fs(
     sequence: u32,
 ) -> (
@@ -672,6 +706,27 @@ fn mounted_counting_mkdir_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 mkdir mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_mkdir_fs_with_ring(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_ring(sequence, 7, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_mkdir_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 mkdir mutation ext4 image with ring");
     (mounted, runtime, writes)
 }
 
@@ -1856,6 +1911,41 @@ fn production_namespace_without_mutation_owner_writes_nothing() {
         V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP),
     );
     assert_eq!(writes.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn ext4_mkdir_public_path_admits_directory_with_ring_runtime_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(32);
+
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .mkdir(FsObjectId::new(2), b"newdir", 0o755, &cred, &guard,),
+        V3::<_, NoProgress>::done((
+            FsObjectId::new(14),
+            InodeMeta {
+                mode: 0o40755,
+                uid: 0,
+                gid: 0,
+                size: BLOCK_SIZE as u64,
+                atime: Default::default(),
+                mtime: Default::default(),
+                ctime: Default::default(),
+                nlinks: 2,
+                blocks: 8,
+                flags: Inode::EXTENTS_FL,
+            },
+        ))
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(32)
+    );
 }
 
 #[test]
