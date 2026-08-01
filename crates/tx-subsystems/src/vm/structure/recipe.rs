@@ -1,7 +1,7 @@
 //! Authoritative recipe range index, published lock-free under EBR.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tx_substrate::Published;
 
 use crate::vm::adapter::step_engine::{borrow_current_guard, guard as epoch_guard};
@@ -10,6 +10,7 @@ use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 use crate::execution::Guard;
 
 use super::recipe_tree::{RecipeTree, VmEntryView};
+use super::types::RecipeGeneration;
 use super::{
     AddressSpaceStats, AddressSpaceStatsDelta, MapPlacement, Prot, UfdRegistration, UserRange,
     UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
@@ -83,6 +84,7 @@ struct RecipeRewriteResult {
 /// can replace a newer one.
 pub(in crate::vm) struct RecipeIndex {
     current: Published<RecipeTree>,
+    publication_sequence: AtomicU64,
     mutation: VmSpinMutex<()>,
     #[cfg(test)]
     last_publish_touched_entries: AtomicUsize,
@@ -112,6 +114,7 @@ impl RecipeIndex {
         Self {
             current: Published::try_new(RecipeTree::new())
                 .expect("initial RecipeIndex publication allocation"),
+            publication_sequence: AtomicU64::new(0),
             mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
@@ -196,6 +199,7 @@ impl RecipeIndex {
         Self {
             current: Published::try_new(self.pinned(guard).clone())
                 .expect("cloned RecipeIndex publication allocation"),
+            publication_sequence: AtomicU64::new(0),
             mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
@@ -228,6 +232,27 @@ impl RecipeIndex {
 
     pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr, guard: &Guard<'_>) -> Option<VmEntry> {
         self.pinned(guard).lookup(addr)
+    }
+
+    /// Perform one bounded owned lookup and capture a stable even publication
+    /// sequence when no writer overlapped the observation.
+    pub(in crate::vm) fn lookup_stamped(
+        &self,
+        addr: UserVirtAddr,
+        guard: &Guard<'_>,
+    ) -> Option<(VmEntry, Option<RecipeGeneration>)> {
+        let before = self.publication_sequence.load(Ordering::Acquire);
+        let entry = self.pinned(guard).lookup(addr);
+        let after = self.publication_sequence.load(Ordering::Acquire);
+        let generation =
+            (before == after && after.is_multiple_of(2)).then(|| RecipeGeneration::new(after));
+        entry.map(|entry| (entry, generation))
+    }
+
+    pub(in crate::vm) fn stable_generation(&self, _guard: &Guard<'_>) -> Option<RecipeGeneration> {
+        let before = self.publication_sequence.load(Ordering::Acquire);
+        let after = self.publication_sequence.load(Ordering::Acquire);
+        (before == after && after.is_multiple_of(2)).then(|| RecipeGeneration::new(after))
     }
 
     #[allow(dead_code)]
@@ -285,6 +310,16 @@ impl RecipeIndex {
             emit_recipe_phase_count(b"debug.vm.recipe.phase.publish_alloc_error", 1);
             VmMapError::NoFreeRange
         })?;
+        let current_sequence = self.publication_sequence.load(Ordering::Relaxed);
+        let publishing_sequence = current_sequence
+            .checked_add(1)
+            .expect("RecipeIndex publication sequence exhausted");
+        let committed_sequence = publishing_sequence
+            .checked_add(1)
+            .expect("RecipeIndex publication sequence exhausted");
+        debug_assert!(current_sequence.is_multiple_of(2));
+        self.publication_sequence
+            .store(publishing_sequence, Ordering::Release);
         #[cfg(test)]
         self.last_publish_touched_entries
             .store(touched_entries, Ordering::Release);
@@ -296,6 +331,8 @@ impl RecipeIndex {
         #[cfg(not(test))]
         let _ = node_allocs;
         replacement.commit();
+        self.publication_sequence
+            .store(committed_sequence, Ordering::Release);
         Ok(())
     }
 

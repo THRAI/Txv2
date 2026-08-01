@@ -1,0 +1,216 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-01-vm-waitable-prefault",
+  "title": "VM waitable reserve and cold file-backed prefault",
+  "status": "proposed",
+  "created": "2026-08-01",
+  "updated": "2026-08-01",
+  "owner": "codex/root",
+  "summary": "Convert ReserveUserRangeOp from a one-shot adapter into a waitable PageProgress StepOp, preserve RangeLock and file-page wait sources through syscall drivers, continue fault materialization after exact-source wake through a recipe-generation fast path, and add cold file-backed VMA regressions.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/vm",
+      "crates/tx-subsystems/src/page_backed/core_tests.rs",
+      "crates/tx-shims/src/linux_syscall/io.rs",
+      "crates/tx-shims/src/linux_syscall/mod.rs",
+      "crates/tx-shims/src/linux_syscall/tests",
+      "xtask/src/lint_invariants_syscall.rs",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/progress/STATUS.md",
+      "docs/progress/research"
+    ],
+    "out": [
+      "deferred/generic-file-readahead",
+      "deferred/adjacent-pte-prefault-policy",
+      "deferred/user-page-remap-loan-abi",
+      "deferred/ordinary-buffered-io-zero-copy",
+      "deferred/bootstrap-user-copy-outside-reserve-writev",
+      "deferred/map-private-cow-redesign",
+      "deferred/ext4-pager-io-manager-changes"
+    ],
+    "write_sets": []
+  },
+  "context": {
+    "design_docs": [
+      "docs/Txv3/03_STEP_MODEL_v2.md",
+      "docs/Txv3/02_INVARIANTS_v5.md",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/research/2026-05-30-pagebacked-ext4-readahead-policy.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "recipe-generation-revalidation",
+      "title": "Add monotonic recipe-generation fast and slow revalidation",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-subsystems/src/vm/structure/recipe.rs",
+        "crates/tx-subsystems/src/vm/structure/types.rs",
+        "crates/tx-subsystems/src/vm/checks.rs",
+        "crates/tx-subsystems/src/vm/tests.rs",
+        "docs/design/03_memory-vm/VM_v1_2.md"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems vm_checks_require_fault_publication -- --test-threads=1",
+        "cargo test -p tx-subsystems vm_recipe -- --test-threads=1"
+      ],
+      "notes": "Use an AtomicU64 even/odd publication sequence, bounded stamped lookup with no reader spin, no-wrap admission, one-word post-wake fast comparison, and the existing target-field slow path on mismatch or an unstamped observation. Keep local backing/page-index validation on both paths; never use a one-bit or root-pointer token."
+    },
+    {
+      "id": "reserve-stepop-red-green",
+      "title": "Make ReserveUserRangeOp waitable and publication-safe",
+      "status": "pending",
+      "depends_on": [
+        "recipe-generation-revalidation"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/vm/step_ops.rs",
+        "crates/tx-subsystems/src/vm/user_access.rs",
+        "crates/tx-subsystems/src/page_backed/core_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems page_container_reserve_user_range -- --test-threads=1"
+      ],
+      "notes": "TDD: first pin file-fetch Yield, RangeLock Yield, retry completion, PageProgress, and terminal EFAULT; then remove OneShotStepOp, retain only an owned stamped VmFaultOutcome across Yield, and route publish through fresh RangeLock plus generation revalidation."
+    },
+    {
+      "id": "syscall-driver-migration",
+      "title": "Drive async prefaults and make writev hot path fall through",
+      "status": "pending",
+      "depends_on": [
+        "reserve-stepop-red-green"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/io.rs",
+        "crates/tx-shims/src/linux_syscall/mod.rs",
+        "crates/tx-shims/src/linux_syscall/tests/fd_ops_wave3.rs",
+        "xtask/src/lint_invariants_syscall.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-shims writev_pagebacked -- --test-threads=1",
+        "cargo test -p xtask lint_invariants_syscall -- --test-threads=1",
+        "cargo xtask lint invariants no-adhoc-drive"
+      ],
+      "notes": "Buffered read/write and O_DIRECT use drive Waiting. The synchronous writev optimization claims only hot user PTEs and returns None for cold inputs or pre-progress destination Yield so dispatch_full_syscall falls back to async writev."
+    },
+    {
+      "id": "fault-exact-wait-routing",
+      "title": "Wait on the exact fault token source",
+      "status": "pending",
+      "depends_on": [
+        "reserve-stepop-red-green"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/vm/adapter.rs",
+        "crates/tx-subsystems/src/vm/execution.rs",
+        "crates/tx-subsystems/src/page_backed/core_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems fault_script_cold_file -- --test-threads=1",
+        "cargo test -p tx-subsystems fault_script_yields_on_writer_conflict -- --test-threads=1"
+      ],
+      "notes": "RangeLock waits retain their owned endpoint fast path; file/backend tokens resolve their exact registered source id. Unknown ids fail closed and never substitute RangeLock. After wake the inner loop retries materialization from the owned stamped outcome; generation mismatch takes full target revalidation, and only incompatible target change restarts recipe resolution."
+    },
+    {
+      "id": "full-verification-catchup",
+      "title": "Run VM and step gates and catch up progress",
+      "status": "pending",
+      "depends_on": [
+        "syscall-driver-migration",
+        "fault-exact-wait-routing"
+      ],
+      "paths": [
+        "docs/progress/plans/2026-08-01-vm-waitable-prefault.json",
+        "docs/progress/STATUS.md",
+        "docs/progress/research/2026-08-01-vm-copy-zero-copy-boundary.md"
+      ],
+      "verification": [
+        "cargo fmt --check",
+        "cargo test -p tx-subsystems vm -- --test-threads=1",
+        "cargo test -p tx-subsystems page_backed -- --test-threads=1",
+        "cargo test -p tx-shims writev_pagebacked -- --test-threads=1",
+        "cargo test -p tx-kernel thread_future -- --test-threads=1",
+        "cargo test -p tx-scripts -- --test-threads=1",
+        "cargo xtask lint invariants step",
+        "cargo xtask lint invariants no-adhoc-drive",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate",
+        "git diff --check"
+      ],
+      "notes": "Mark the plan complete only after all focused gates pass or inherited unrelated failures are recorded precisely. The research note records why buffered copy is not a generic zero-copy candidate."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-subsystems vm_checks_require_fault_publication -- --test-threads=1",
+      "status": "not-run",
+      "notes": "Required after implementation; covers unchanged fast path, unrelated slow acceptance, target stale rejection, and two-rewrite ABA history."
+    },
+    {
+      "command": "cargo test -p tx-subsystems fault_script_recipe_generation -- --test-threads=1",
+      "status": "not-run",
+      "notes": "Required after implementation; proves exact-source wake continues from the stamped outcome and restarts only for incompatible target change."
+    },
+    {
+      "command": "cargo test -p tx-subsystems vm -- --test-threads=1",
+      "status": "not-run",
+      "notes": "Required after implementation."
+    },
+    {
+      "command": "cargo test -p tx-subsystems page_backed -- --test-threads=1",
+      "status": "not-run",
+      "notes": "Required after implementation."
+    },
+    {
+      "command": "cargo test -p tx-shims writev_pagebacked -- --test-threads=1",
+      "status": "not-run",
+      "notes": "Required after implementation."
+    },
+    {
+      "command": "cargo xtask lint invariants step",
+      "status": "not-run",
+      "notes": "Required after implementation."
+    },
+    {
+      "command": "cargo xtask lint invariants no-adhoc-drive",
+      "status": "not-run",
+      "notes": "Required after implementation."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Planning artifacts passed on 2026-08-01; seven active-doc stale-vocabulary discussion warnings were non-fatal. Run again after implementation and research/status catch-up."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Planning record passed on 2026-08-01 across 40 progress files. Run again whenever this record changes."
+    }
+  ],
+  "risks": [
+    "A cursor must advance only after an adequate PTE exists or publication commits; advancing before Yield would skip the blocked page.",
+    "A one-bit dirty/toggle stamp or a root-pointer token is ABA-unsafe; the sequence must be a monotonic full word and must fail before wrap.",
+    "The recipe sequence must become odd before the root swap and publish the next even value after it; changing this ordering can pair a stale recipe with a falsely current stamp.",
+    "A reader that overlaps an odd or changing sequence must retain an unstamped owned outcome and force slow revalidation; it must not spin unboundedly inside StepOp::step.",
+    "Generation equality may skip only the recipe-tree lookup; backing kind and materialization page index still require local validation.",
+    "A global sequence mismatch may come from an unrelated VMA rewrite, so mismatch must enter the existing field-level slow path rather than force an outer-loop restart.",
+    "DriveMode::Nonblocking would expose EAGAIN for user-memory page faults; prefault drivers must use Waiting independently of file O_NONBLOCK.",
+    "The writev hot lane must not fall back after bytes were committed or it could duplicate writes; partial progress returns the byte count.",
+    "A materialized frame must be dropped if publication revalidation blocks or detects a stale recipe, releasing its MapPin safely.",
+    "Fault wait routing must cover substrate WaitSource and registered raw-wire sources without waiting on an unrelated carrier."
+  ],
+  "blockers": [
+    "Before implementation claims a write set, coordinate with or close the active docs/progress/plans/2026-05-26-ltp-network-remaining-blockers.json claims over crates/tx-subsystems/src/vm, crates/tx-shims/src/linux_syscall/mod.rs, and docs/progress/STATUS.md."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

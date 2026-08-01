@@ -26,6 +26,22 @@
   production cutover/G0 lints, Task 15 runner, and Task 16 fresh
   QEMU/e2fsck/xfstests receipt.
 
+- 2026-08-01 (VM chunked resident / protect batch audit).
+  Current checkout still defaults to `VecPmapResidentStore`; the 64-entry
+  `ChunkedPmapResidentStore` is implemented and equivalence-tested but remains
+  selected only by `tx_vm_pmap_chunked_resident`. No lossless guest A/B was
+  found after the June 5 promotion gate; a July 21 production-default change
+  exists only on the separate `origin/final-smp` lineage and did not carry the
+  requested resident A/B receipt. `protect_range` is also confirmed to defeat
+  the existing RV64 batch path by calling `shootdown_mappings` with a singleton
+  slice per resident page. This is a historical scoped omission: the May 31
+  change batched `teardown_range` but only changed protect to resident-page
+  enumeration. Recommended next step is a TDD protect collector that flushes
+  once on success and flushes the modified prefix on error, followed by an
+  isomorphic Vec/chunked pthread map-path A/B before default promotion. No Rust
+  source or runtime benchmark changed in this audit. Details:
+  `docs/progress/research/2026-08-01-vm-chunked-resident-protect-batch.md`.
+
 - 2026-08-01 (ext4 Task 12 mkdir admission).
   Advanced Task 12 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
@@ -54,6 +70,42 @@
   cleanup, and crash-truncate/e2fsck evidence. Product Tier 1 still requires
   Task 14 production cutover/G0 lints, Task 15 runner, and Task 16 fresh
   QEMU/e2fsck/xfstests receipt.
+
+- 2026-08-01 (procfs caller-guard propagation).
+  Procfs projected reads now pass the `OpenFileReadOp` step-local caller guard
+  through `FsOps::read_projected*` into `render`/`render_with_netns` and the
+  `stat`, `status`, `maps`, and `smaps` fanout. VM recipe snapshots and process
+  parent weak upgrades expose explicit `*_with_guard` entry points, so the
+  production procfs render path no longer depends on ambient
+  `borrow_current_guard().unwrap_or_else(guard)` fallback. Procfs tests now
+  create guards only after lookup/readdir helpers finish, and a process-renderer
+  regression reuses one caller guard across all four guarded projections.
+  Verification passed `cargo test -p tx-fs procfs -- --test-threads=1` (7),
+  `cargo test -p tx-fs --lib -- --test-threads=1` (102), four-file `rustfmt
+  --check`, scoped `git diff --check`, and `cargo -q xtask unit` (646 + 114 +
+  53 + 166). Next: keep the broader `readv` family redesign deferred until the
+  independent `IoSubmissionManager` and correct multi-page/SG completion
+  ownership are available; then resume from
+  `docs/progress/decisions/2026-08-01-procfs-guard-before-vectored-io.md`.
+
+- 2026-08-01 (VM waitable reserve/prefault plan proposed).
+  Approved the design and recorded the executable plan at
+  `docs/progress/plans/2026-08-01-vm-waitable-prefault.json` with the detailed
+  TDD sequence in `docs/superpowers/plans/2026-08-01-vm-waitable-prefault.md`.
+  Planned scope converts `ReserveUserRangeOp` from one-shot to waitable
+  `PageProgress`, preserves RangeLock and cold file-fetch wait sources through
+  central drivers, makes the writev hot lane fall through, fixes fault-script
+  exact-source waiting, and adds cold file-backed VMA tests. The approved
+  revalidation refinement keeps the owned stamped fault outcome after file
+  wake: an unchanged monotonic `AtomicU64` recipe sequence continues with one
+  word comparison, mismatch runs the existing target-field slow path, and only
+  incompatible target change restarts recipe resolution. A one-bit or
+  root-pointer stamp is explicitly rejected as ABA-unsafe. Planning validation
+  passed `cargo xtask progress validate` (40 records), `cargo xtask lint docs`
+  (seven non-fatal retired-vocabulary warnings), and scoped `git diff --check`;
+  no implementation tests have run. Next: coordinate the overlapping active
+  `2026-05-26-ltp-network-remaining-blockers` write claims, then execute Task 1
+  RED tests. Existing unrelated tx-ext4 test edits remain outside this plan.
 
 - 2026-08-01 (ext4 Task 12 regular-file create admission).
   Advanced Task 12 of

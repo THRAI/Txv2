@@ -681,6 +681,7 @@ fn resolve_user_page(
                 page_range,
                 private_identity: entry.private_identity(),
                 entry: entry.clone(),
+                recipe_generation: None,
                 access: kind.required_prot(),
                 pmap_materialization_deferred: true,
             };

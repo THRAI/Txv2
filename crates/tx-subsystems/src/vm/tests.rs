@@ -646,10 +646,7 @@ fn vm_recipe_ordered_coverage_walk_rejects_first_gap_without_partial_tagging() {
             .commit()
             .expect("sparse recipe map");
     }
-    let tag = UfdRegistration {
-        ufd_id: 7,
-        mode: 1,
-    };
+    let tag = UfdRegistration { ufd_id: 7, mode: 1 };
 
     assert_eq!(
         aspace.tag_ufd_registration(range(0x10_0000, 5), tag),
@@ -1729,6 +1726,184 @@ fn vm_checks_require_fault_publication_rejects_replaced_private_set_identity() {
         super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Err(VmFaultError::StaleRecipe)
     );
+}
+
+#[test]
+fn vm_checks_require_fault_publication_uses_generation_fast_path_without_publication() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x6000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x6000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+    assert!(outcome.recipe_generation.is_some());
+
+    super::checks::reset_fault_publication_full_revalidate_count();
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Ok(())
+    );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 0);
+}
+
+#[test]
+fn vm_checks_require_fault_publication_revalidates_after_unrelated_recipe_publish() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x8000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("target map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x8000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x20_0000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("unrelated map publish");
+
+    super::checks::reset_fault_publication_full_revalidate_count();
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Ok(())
+    );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 1);
+}
+
+#[test]
+fn vm_checks_require_fault_publication_rejects_target_rewrite_generation_mismatch() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0xa000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xa000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+
+    aspace
+        .try_mprotect(range(0xa000, 1), Prot::NONE)
+        .expect("target rewrite");
+
+    super::checks::reset_fault_publication_full_revalidate_count();
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Err(VmFaultError::StaleRecipe)
+    );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 1);
+}
+
+#[test]
+fn vm_recipe_generation_is_monotonic_across_two_rewrites() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0xc000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("target map");
+    let before = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xc000), AccessMode::Read))
+        .expect("fault before rewrites")
+        .recipe_generation
+        .expect("stable generation");
+
+    aspace
+        .try_mprotect(range(0xc000, 1), Prot::READ)
+        .expect("first rewrite");
+    aspace
+        .try_mprotect(range(0xc000, 1), Prot::READ_WRITE)
+        .expect("second rewrite");
+
+    let after = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xc000), AccessMode::Read))
+        .expect("fault after rewrites")
+        .recipe_generation
+        .expect("stable generation");
+    assert_ne!(
+        after, before,
+        "two rewrites must not return to an old token"
+    );
+    assert!(after.raw() > before.raw());
+}
+
+#[test]
+fn vm_checks_require_fault_publication_rejects_bad_materialization_at_same_generation() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0xe000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xe000), AccessMode::Read))
+        .expect("fault resolves");
+    let mut materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+    materialized.page_index = crate::page_backed::PageIndex::new(7);
+
+    super::checks::reset_fault_publication_full_revalidate_count();
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Err(VmFaultError::StaleRecipe)
+    );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 0);
 }
 
 #[test]

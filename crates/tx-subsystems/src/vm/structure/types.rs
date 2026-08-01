@@ -1025,11 +1025,28 @@ impl VmFault {
     }
 }
 
+/// Stable even publication sequence captured with an owned recipe lookup.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RecipeGeneration(u64);
+
+impl RecipeGeneration {
+    pub(in crate::vm) const fn new(sequence: u64) -> Self {
+        debug_assert!(sequence.is_multiple_of(2));
+        Self(sequence)
+    }
+
+    #[cfg(test)]
+    pub(in crate::vm) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmFaultOutcome {
     pub page_range: UserRange,
     pub entry: VmEntry,
     pub private_identity: Option<u32>,
+    pub recipe_generation: Option<RecipeGeneration>,
     pub access: AccessMode,
     pub pmap_materialization_deferred: bool,
 }
