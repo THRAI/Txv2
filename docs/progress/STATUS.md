@@ -1,3 +1,14 @@
+- 2026-08-02 (ext4 G0 direct-home-write allowlist retired).
+  Retired the remaining Task 14 transitional direct-home-write allowlist entries
+  for `crates/tx-ext4/src/namespace.rs` and `crates/tx-ext4/src/pager.rs`.
+  Current production namespace/pager mutation entries now stay under the same
+  `ext4-no-direct-home-write` ratchet as new tx-ext4 files; only explicit
+  mutation/journal/settlement owners remain allowlisted. Focused verification
+  passed `cargo xtask lint invariants ext4-no-direct-home-write` with 0
+  findings, `cargo test -p xtask ext4_ -- --test-threads=1` (5), and scoped
+  rustfmt. This advances Task 14/G0 but does not finish production cutover or
+  Task 16 acceptance.
+
 - 2026-08-02 (ext4 Tier 1 e2fsck coverage gate tightened).
   Closed a receipt-level false-acceptance gap without promoting Task 16.
   `Tier1AcceptanceReceipt::from_live` now requires the evidence-derived product

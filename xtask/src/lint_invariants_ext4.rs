@@ -192,11 +192,6 @@ fn direct_home_write_allowed(path: &str) -> bool {
             | "crates/tx-ext4/src/journal.rs"
             | "crates/tx-ext4/src/settlement.rs"
             | "crates/tx-ext4/src/read_backend.rs"
-            // Transitional Task 14 allowlist: these are the only remaining
-            // production direct-pager mutation files, and each public mutation
-            // entry is currently guarded by `require_mutation_owner()`.
-            | "crates/tx-ext4/src/namespace.rs"
-            | "crates/tx-ext4/src/pager.rs"
     )
 }
 
@@ -272,7 +267,10 @@ mod tests {
         assert!(direct_home_write_allowed(
             "crates/tx-ext4/src/mutation_lifecycle.rs"
         ));
-        assert!(direct_home_write_allowed("crates/tx-ext4/src/namespace.rs"));
+        assert!(!direct_home_write_allowed(
+            "crates/tx-ext4/src/namespace.rs"
+        ));
+        assert!(!direct_home_write_allowed("crates/tx-ext4/src/pager.rs"));
         assert!(!direct_home_write_allowed(
             "crates/tx-ext4/src/new_namespace.rs"
         ));

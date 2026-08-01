@@ -368,7 +368,8 @@
         "crates/tx-ext4-format/src/pager.rs",
         "crates/tx-fs/src/tx_ext4_bridge.rs",
         "crates/tx-kernel/src/init.rs",
-        "xtask/src/lint.rs"
+        "xtask/src/lint.rs",
+        "xtask/src/lint_invariants_ext4.rs"
       ],
       "verification": [
         "cargo xtask lint invariants ext4-lifecycle-ownership",
@@ -377,7 +378,7 @@
         "cargo xtask lint arch",
         "cargo -q xtask unit"
       ],
-      "notes": "In progress: production init uses the discovered-journal mount path, and the three current-checkout G0 lints now run as scoped ratchets instead of misclassifying block-driver writes as ext4 home writes. Verified `cargo xtask lint invariants ext4-lifecycle-ownership`, `cargo xtask lint invariants ext4-no-direct-home-write`, `cargo xtask lint invariants ext4-durability-flags`, and `cargo -q xtask unit` (652 + 114 + 64 + 167), all with 0 failures. This does not finish production cutover: `namespace.rs` and `pager.rs` remain transitional allowlisted direct-pager mutation files until their public mutation entries are fully behind MutationHandle without the allowlist."
+      "notes": "In progress: production init uses the discovered-journal mount path, and the three current-checkout G0 lints now run as scoped ratchets instead of misclassifying block-driver writes as ext4 home writes. The remaining transitional direct-home-write allowlist for `crates/tx-ext4/src/namespace.rs` and `crates/tx-ext4/src/pager.rs` has been retired; current production namespace/pager mutation entries now stay under the same `ext4-no-direct-home-write` ratchet as new tx-ext4 files, while only explicit mutation/journal/settlement owners remain allowlisted. Verified `cargo xtask lint invariants ext4-lifecycle-ownership`, `cargo xtask lint invariants ext4-no-direct-home-write`, `cargo xtask lint invariants ext4-durability-flags`, and `cargo -q xtask unit` (652 + 114 + 64 + 167), all with 0 failures. This advances Task 14/G0 but does not finish production cutover: FUA/recovery, real Tier 1 runner authorities, deterministic crash/replay, e2fsck, xfstests, and immutable G0-G7 receipt evidence remain open."
     },
     {
       "id": "task-15-tier1-runner",
@@ -462,7 +463,7 @@
   ],
   "blockers": [
     "2026-08-02 close/dup3 visibility flush unblocked the previous `--group data,execute-from-scratch` QEMU failure, and a fresh wider QEMU run with `--group data,setattr,namespace,orphan,execute-from-scratch` passed 5 groups with 0 failures; do not promote Tier 1 until the remaining production cutover, FUA/recovery, live runner, crash-cut, e2fsck, xfstests, and immutable receipt gates close.",
-    "Task 14 G0 lints now pass in the current checkout, but `namespace.rs` and `pager.rs` are still transitional allowlisted direct-pager mutation files; remove that allowlist only after the remaining public mutation entries are fully behind MutationHandle.",
+    "Task 14 G0 lints now pass in the current checkout and the former `namespace.rs`/`pager.rs` direct-home-write allowlist has been retired, but production cutover still lacks FUA/recovery product gates and the final live Tier 1 acceptance evidence.",
     "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
     "The public `cargo xtask ext4 tier1` command exists, verifies the manifest-pinned xfstests source lock, parses xfstests output fail-closed, and refuses to synthesize crash-cut completion or unconditional passed gates, but live execution correctly fails closed while xfstests/crash authorities remain placeholder statuses and deterministic crash/replay execution is unwired; no immutable G0-G7 receipt has been produced."
   ],
