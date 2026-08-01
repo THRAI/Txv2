@@ -355,6 +355,58 @@ fn build_tier1_rename_overwrite_image() -> MemImage {
     image
 }
 
+fn build_tier1_cross_dir_rename_image() -> MemImage {
+    let mut image = build_tier1_mount_image();
+
+    let mut root_inode = Inode::default();
+    root_inode.mode = 0x4000 | 0o755;
+    root_inode.size = BLOCK_SIZE as u64;
+    root_inode.blocks_512 = 8;
+    root_inode.links_count = 3;
+    root_inode.flags = Inode::EXTENTS_FL;
+    root_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 16,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 2, &root_inode);
+
+    let mut dir_inode = Inode::default();
+    dir_inode.mode = 0x4000 | 0o755;
+    dir_inode.uid = 1000;
+    dir_inode.gid = 1000;
+    dir_inode.size = BLOCK_SIZE as u64;
+    dir_inode.blocks_512 = 8;
+    dir_inode.links_count = 2;
+    dir_inode.flags = Inode::EXTENTS_FL;
+    dir_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 21,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 13, &dir_inode);
+
+    encode_dir(
+        image.block_mut(16),
+        &[
+            (2, 2, b".".as_slice()),
+            (2, 2, b"..".as_slice()),
+            (12, 1, b"hello".as_slice()),
+            (13, 2, b"target".as_slice()),
+        ],
+    );
+    encode_dir(
+        image.block_mut(21),
+        &[(13, 2, b".".as_slice()), (2, 2, b"..".as_slice())],
+    );
+    BitmapMut::new(image.block_mut(2)).set(21).unwrap();
+    image
+}
+
 fn build_two_page_mapped_image() -> MemImage {
     let mut image = build_image();
     let mut file_inode = Inode::default();
@@ -570,6 +622,27 @@ fn mounted_counting_rename_overwrite_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 rename-overwrite mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_cross_dir_rename_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 2, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_cross_dir_rename_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 cross-dir rename mutation ext4 image");
     (mounted, runtime, writes)
 }
 
@@ -989,6 +1062,30 @@ fn ext4_rename_public_path_admits_same_dir_overwrite_without_home_write() {
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(29)
+    );
+}
+
+#[test]
+fn ext4_rename_public_path_admits_cross_dir_regular_file_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_cross_dir_rename_fs(30);
+
+    assert_eq!(
+        mounted.fs_ops().rename(
+            FsObjectId::new(2),
+            b"hello",
+            FsObjectId::new(13),
+            b"moved",
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(30)
     );
 }
 

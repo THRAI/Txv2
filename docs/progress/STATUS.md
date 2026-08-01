@@ -1,3 +1,34 @@
+- 2026-08-01 (ext4 Task 12 cross-directory rename admission).
+  Advanced Task 12 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `Ext4Pager::plan_cross_dir_rename_dir_entry`
+  now builds a bounded absent-destination cross-directory regular-file rename
+  mutation by composing old-parent dirent removal and new-parent dirent append
+  as two DirectoryBlock after-images, rejecting directory targets and
+  same-home ambiguity, and leaving the home image untouched. `FsOps::rename`
+  now looks up old and new parents separately, admits that supported
+  cross-parent regular-file no-overwrite shape through
+  `JournalMutationRuntime::begin_mutation`, and invalidates both parent lookup
+  caches after admission; cross-directory overwrite, directory rename,
+  directory-block allocation, and orphan/storage reclamation remain
+  fail-closed or deferred. Verification passed `cargo test -p tx-ext4-format
+  --test pager_mock
+  namespace_plan_cross_dir_renames_regular_file_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_ -- --test-threads=1` (6), `cargo test -p
+  tx-ext4-format --test pager_mock -- --test-threads=1` (29), `cargo test -p
+  tx-ext4 --lib --no-default-features
+  ext4_rename_public_path_admits_cross_dir_regular_file_without_home_write --
+  --test-threads=1`, `cargo test -p tx-ext4 --lib --no-default-features
+  rename_public_path -- --test-threads=1` (3), `cargo test -p tx-ext4 --lib
+  --no-default-features -- --test-threads=1` (52), `cargo test -p tx-ext4
+  --test journal_prepared_transaction -- --test-threads=1` (9), `cargo test
+  -p tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7), and touched
+  file `rustfmt --check`. Next: continue Task 12 with create/mkdir or symlink,
+  then unlinked-open/orphan/destroy cleanup. Product Tier 1 still requires
+  Task 14 production cutover/G0 lints, Task 15 runner, and Task 16 fresh
+  QEMU/e2fsck/xfstests receipt.
+
 - 2026-08-01 (ext4 Task 12 rename-overwrite admission).
   Advanced Task 12 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`

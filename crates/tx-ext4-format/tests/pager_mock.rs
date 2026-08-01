@@ -934,6 +934,59 @@ fn namespace_plan_renames_regular_file_in_place_without_home_write() {
 }
 
 #[test]
+fn namespace_plan_cross_dir_renames_regular_file_without_home_write() {
+    let image = mock_image();
+    let old_dir_before = *image.block(16);
+    let new_dir_before = *image.block(17);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_cross_dir_rename_dir_entry(
+            InodeNo::new(2),
+            b"hello",
+            InodeNo::new(13),
+            b"moved",
+            InodeNo::new(12),
+            FsyncStamp::new(25),
+        )
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Rename);
+    assert_eq!(plan.object, 12);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
+    assert!(plan.revokes.is_empty());
+    assert!(plan.deferred_frees.is_empty());
+    assert_eq!(plan.metadata.len(), 2);
+
+    let old_dir = plan.metadata.iter().find(|block| block.home == 16).unwrap();
+    assert_eq!(
+        old_dir.role,
+        tx_ext4_format::mutation::MetaRole::DirectoryBlock
+    );
+    let old_entries: Vec<_> = DirEntryIter::new(&old_dir.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!old_entries.iter().any(|entry| entry.name == b"hello"));
+
+    let new_dir = plan.metadata.iter().find(|block| block.home == 17).unwrap();
+    assert_eq!(
+        new_dir.role,
+        tx_ext4_format::mutation::MetaRole::DirectoryBlock
+    );
+    let new_entries: Vec<_> = DirEntryIter::new(&new_dir.after)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(new_entries
+        .iter()
+        .any(|entry| entry.name == b"moved" && entry.inode == 12));
+    assert!(!new_entries.iter().any(|entry| entry.name == b"hello"));
+
+    assert_eq!(pager.image().block(16), &old_dir_before);
+    assert_eq!(pager.image().block(17), &new_dir_before);
+}
+
+#[test]
 fn namespace_plan_rename_overwrites_regular_file_without_home_write() {
     let mut image = mock_image();
     let mut other_inode = Inode::default();

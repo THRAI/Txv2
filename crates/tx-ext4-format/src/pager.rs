@@ -1531,6 +1531,61 @@ impl<I: BlockImage> Ext4Pager<I> {
         Err(Ext4FormatError::OutOfBounds)
     }
 
+    /// Build the bounded cross-directory regular-file rename mutation.
+    ///
+    /// This Tier 1 slice supports only absent destinations and directories with
+    /// existing slack space. Directory moves and overwrite across parents stay
+    /// fail-closed until their nlink, `..`, and orphan lifecycles are admitted.
+    pub fn plan_cross_dir_rename_dir_entry(
+        &mut self,
+        old_dir_ino: InodeNo,
+        old_name: &[u8],
+        new_dir_ino: InodeNo,
+        new_name: &[u8],
+        target_ino: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        if old_dir_ino == new_dir_ino {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        let target_inode = self.read_inode(target_ino)?;
+        if !target_inode.is_file() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        let (found_ino, old_home, old_before, old_after) =
+            self.plan_remove_dir_entry_after_image(old_dir_ino, old_name)?;
+        if found_ino != target_ino {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let (new_home, new_before, new_after) =
+            self.plan_append_dir_entry_after_image(new_dir_ino, new_name, target_ino, 1)?;
+        if old_home == new_home {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Rename, target_ino.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: old_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &old_before) as u64,
+            after: old_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        plan.push_metadata(MetadataBlock {
+            home: new_home,
+            role: MetaRole::DirectoryBlock,
+            before_version: crc32c(0, &new_before) as u64,
+            after: new_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok(plan)
+    }
+
     /// Build the bounded same-directory regular-file rename-overwrite
     /// mutation. The overwritten inode's storage is deliberately not freed;
     /// later orphan/destroy owns that lifecycle.

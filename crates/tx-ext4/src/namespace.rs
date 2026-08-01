@@ -387,13 +387,14 @@ where
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         };
-        if old_parent != new_parent {
-            return StepOutcome::err(Errno::EOPNOTSUPP.into());
-        }
-        if old_name == new_name {
+        if old_parent == new_parent && old_name == new_name {
             return StepOutcome::done(());
         }
         let old_parent_ino = match inode_no(old_parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let new_parent_ino = match inode_no(new_parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
@@ -403,7 +404,7 @@ where
             Ok(None) => return StepOutcome::err(Errno::ENOENT.into()),
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let overwritten_ino = match self.lookup_cached(old_parent_ino, new_name) {
+        let overwritten_ino = match self.lookup_cached(new_parent_ino, new_name) {
             Ok(Some(ino)) => Some(ino),
             Ok(None) => None,
             Err(e) => return StepOutcome::err(e.into()),
@@ -428,22 +429,33 @@ where
         {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         }
-        let mutation = match self.with_pager(|pager| match overwritten_ino {
-            Some(ino) => pager.plan_rename_overwrite_dir_entry(
-                old_parent_ino,
-                old_name,
-                new_name,
-                old_ino,
-                ino,
-                FsyncStamp::new(current.ctime as u64),
-            ),
-            None => pager.plan_rename_dir_entry(
-                old_parent_ino,
-                old_name,
-                new_name,
-                old_ino,
-                FsyncStamp::new(current.ctime as u64),
-            ),
+        let mutation = match self.with_pager(|pager| {
+            match (old_parent_ino == new_parent_ino, overwritten_ino) {
+                (true, Some(ino)) => pager.plan_rename_overwrite_dir_entry(
+                    old_parent_ino,
+                    old_name,
+                    new_name,
+                    old_ino,
+                    ino,
+                    FsyncStamp::new(current.ctime as u64),
+                ),
+                (true, None) => pager.plan_rename_dir_entry(
+                    old_parent_ino,
+                    old_name,
+                    new_name,
+                    old_ino,
+                    FsyncStamp::new(current.ctime as u64),
+                ),
+                (false, Some(_)) => Err(tx_ext4_format::Ext4FormatError::Unsupported),
+                (false, None) => pager.plan_cross_dir_rename_dir_entry(
+                    old_parent_ino,
+                    old_name,
+                    new_parent_ino,
+                    new_name,
+                    old_ino,
+                    FsyncStamp::new(current.ctime as u64),
+                ),
+            }
         }) {
             Ok(mutation) => mutation,
             Err(e) => return StepOutcome::err(e.into()),
@@ -451,6 +463,7 @@ where
         match runtime.begin_mutation(&mutation, guard) {
             Ok(()) => {
                 self.invalidate_lookup_cache_for(old_parent_ino);
+                self.invalidate_lookup_cache_for(new_parent_ino);
                 StepOutcome::done(())
             }
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
