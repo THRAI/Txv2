@@ -2,7 +2,7 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-08-01-vm-waitable-prefault",
   "title": "VM waitable reserve and cold file-backed prefault",
-  "status": "completed",
+  "status": "complete",
   "created": "2026-08-01",
   "updated": "2026-08-01",
   "owner": "codex/root",
@@ -48,7 +48,7 @@
     {
       "id": "recipe-generation-revalidation",
       "title": "Add monotonic recipe-generation fast and slow revalidation",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [],
       "paths": [
         "crates/tx-subsystems/src/vm/structure/recipe.rs",
@@ -66,7 +66,7 @@
     {
       "id": "reserve-stepop-red-green",
       "title": "Make ReserveUserRangeOp waitable and publication-safe",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "recipe-generation-revalidation"
       ],
@@ -83,7 +83,7 @@
     {
       "id": "syscall-driver-migration",
       "title": "Drive async prefaults and make writev hot path fall through",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "reserve-stepop-red-green"
       ],
@@ -103,7 +103,7 @@
     {
       "id": "fault-exact-wait-routing",
       "title": "Wait on the exact fault token source",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "reserve-stepop-red-green"
       ],
@@ -121,7 +121,7 @@
     {
       "id": "full-verification-catchup",
       "title": "Run VM and step gates and catch up progress",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "syscall-driver-migration",
         "fault-exact-wait-routing"
