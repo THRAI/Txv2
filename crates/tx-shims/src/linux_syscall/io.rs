@@ -1013,11 +1013,13 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
             tx_substrate::step::StepOutcome::Done(n) => {
                 total += n as i64;
                 if n < len {
+                    publish_pagebacked_size_after_write(&file);
                     return Some(SyscallResult::Return(total));
                 }
             }
             tx_substrate::step::StepOutcome::Continue { progress } => {
                 total += progress.bytes() as i64;
+                publish_pagebacked_size_after_write(&file);
                 return Some(SyscallResult::Return(total));
             }
             tx_substrate::step::StepOutcome::Err(e) => {
@@ -1041,6 +1043,9 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         drop(step_engine::guard());
     }
 
+    if total > 0 {
+        publish_pagebacked_size_after_write(&file);
+    }
     Some(SyscallResult::Return(total))
 }
 

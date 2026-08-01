@@ -22,11 +22,16 @@ use tx_subsystems::vfs::structure::{
     RNodeBacking, S_IFDIR,
 };
 use tx_subsystems::vfs::{DirEntry, FsOps};
+use tx_subsystems::vm::{
+    MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest,
+};
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_CLOSE, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT,
     NR_MOUNT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT,
-    NR_UTIMENSAT, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
+    NR_UTIMENSAT, NR_WRITEV, O_CREAT, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE,
+    SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -351,6 +356,28 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
     v.extend_from_slice(path);
     v.push(0);
     v
+}
+
+fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) -> u64 {
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), USER_PAGE_SIZE)
+        .expect("aligned user test range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(request).expect("map user bytes");
+    if !bytes.is_empty() {
+        let guard = guard();
+        let copied = ctx
+            .aspace
+            .copy_to_user(tx_hal::UserPtr::<u8>::new(uaddr), bytes, &guard);
+        drop(guard);
+        assert_eq!(copied, StepOutcome::Done(bytes.len()));
+    }
+    uaddr as u64
 }
 
 fn root_cred() -> Credential {
@@ -1113,6 +1140,59 @@ fn dispatch_truncate_pagebacked_returns_zero() {
     let req = SyscallRequest::new(NR_TRUNCATE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
+    drop(path);
+}
+
+#[test]
+fn writev_pagebacked_oneshot_publishes_live_size() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/wv");
+    let open = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_CREAT | O_RDWR) as u64,
+            0o755,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat(O_CREAT): {other:?}"),
+    };
+
+    let first = b"#!/bin/sh\n";
+    let second = b"echo tier1-exec-ok\n";
+    let first_ptr = map_user_bytes(&ctx, 0x5300_0000, first);
+    let second_ptr = map_user_bytes(&ctx, 0x5300_1000, second);
+    let mut iov = [0u8; 32];
+    iov[0..8].copy_from_slice(&first_ptr.to_le_bytes());
+    iov[8..16].copy_from_slice(&(first.len() as u64).to_le_bytes());
+    iov[16..24].copy_from_slice(&second_ptr.to_le_bytes());
+    iov[24..32].copy_from_slice(&(second.len() as u64).to_le_bytes());
+    let iov_ptr = map_user_bytes(&ctx, 0x5300_2000, &iov);
+    let writev = SyscallRequest::new(NR_WRITEV, [fd, iov_ptr, 2, 0, 0, 0]);
+    assert_eq!(
+        crate::linux_syscall::dispatch_writev_pagebacked_oneshot(&writev, &ctx),
+        Some(SyscallResult::Return((first.len() + second.len()) as i64))
+    );
+
+    let guard = guard();
+    let file_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"wv", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup /wv: {other:?}"),
+    };
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load_inode_meta /wv: {other:?}"),
+    };
+    assert_eq!(meta.size, (first.len() + second.len()) as u64);
     drop(path);
 }
 
