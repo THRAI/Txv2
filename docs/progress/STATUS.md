@@ -3,12 +3,17 @@
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
   from pending to in-progress. `Ext4Pager::plan_truncate_size` now produces a
   pure inode-table after-image for regular-file size changes that do not need
-  block reclamation, preserves unknown inode bytes, refreshes metadata_csum,
-  and rejects cross-block shrink until the revoke/deferred-free truncate path
-  is wired. `FsPageBacking::truncate` on mutation-journal mounts now admits the
-  plan through `JournalMutationRuntime::begin_mutation`, leaves the home image
-  untouched, and exposes the mount transaction frontier; RO and no-runtime
-  mounts remain fail-closed. PageBacked now has a retained multi-page
+  block reclamation, preserves unknown inode bytes, and refreshes
+  metadata_csum. It now also supports the first bounded reclaim shape:
+  inline extent-leaf truncation that releases complete tail blocks in one
+  block group, updates the inode extent root and block count, clears the block
+  bitmap, increments group/superblock free counters, and emits paired JBD2
+  revoke plus deferred-free claims. Indexed extents, multi-group frees, and
+  non-tail surgery remain fail-closed. `FsPageBacking::truncate` on
+  mutation-journal mounts now admits the plan through
+  `JournalMutationRuntime::begin_mutation`, leaves the home image untouched,
+  and exposes the mount transaction frontier; RO and no-runtime mounts remain
+  fail-closed. PageBacked now has a retained multi-page
   `PageDataLease` constructor that projects a multi-page payload as neutral
   `IoDataSource::Direct` vecs, while preserving the single-page PageCache
   projection for existing writeback, and `FileFsyncFrontier` can derive stable
@@ -26,12 +31,14 @@
   -- --test-threads=1` (158), `cargo test -p
   tx-ext4-format --test pager_mock truncate -- --test-threads=1` (2), `cargo
   test -p tx-ext4 --lib --no-default-features truncate -- --test-threads=1`
-  (3), `cargo test -p tx-ext4 --lib --no-default-features --
+  (3), including the new tail-block revoke/deferred-free admission path,
+  `cargo test -p tx-ext4 --lib --no-default-features --
   --test-threads=1` (41), `cargo test -p tx-ext4 --test mutation_lifecycle --
-  --test-threads=1` (7), and scoped `rustfmt`. Next: teach the ext4 L5
-  writeback mutation planner to accept multi-page Direct sources, add bounded
-  extent growth with claim/PageSlot transition, and wire real truncate
-  free/revoke settlement. Blockers for product Tier 1 remain Task 12
+  --test-threads=1` (7), `cargo xtask progress validate`, `cargo xtask lint
+  docs`, `cargo -q xtask unit` (646 + 114 + 41 + 166), scoped `rustfmt`, and
+  scoped `git diff --check`. Next: add bounded extent growth with
+  claim/PageSlot transition and broaden truncate beyond the inline same-group
+  tail-free shape. Blockers for product Tier 1 remain Task 12
   namespace/orphan, Task 14 production cutover, Task 15 runner, and Task 16
   fresh QEMU/e2fsck/xfstests receipt.
 

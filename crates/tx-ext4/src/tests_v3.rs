@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::adapter::step_engine::{
     self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
 };
-use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
+use tx_ext4_format::ondisk::{BitmapMut, Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::fs_iface::{
     BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
@@ -249,6 +249,7 @@ fn build_image() -> MemImage {
         ],
     );
     *image.block_mut(20) = [0x20; BLOCK_SIZE];
+    BitmapMut::new(image.block_mut(2)).set(20).unwrap();
 
     image
 }
@@ -285,21 +286,30 @@ fn open_fs_with_io_manager_binding() -> (Arc<Ext4FsInstance<MemImage>>, Ext4Plan
 }
 
 fn mutation_runtime_for_test(sequence: u32) -> Arc<JournalMutationRuntime> {
+    mutation_runtime_for_test_with_metadata(sequence, 1, false)
+}
+
+fn mutation_runtime_for_test_with_metadata(
+    sequence: u32,
+    metadata_slots: u64,
+    with_revoke: bool,
+) -> Arc<JournalMutationRuntime> {
     let fsync = Arc::new(JournalFsyncSource::new());
+    let metadata = (0..metadata_slots)
+        .map(|slot| tx_subsystems::io_manager::block::LbaRange::new(88 + slot * 8, 8))
+        .collect();
+    let mut records = JournalRecordLayout::new(
+        tx_subsystems::io_manager::block::LbaRange::new(80, 8),
+        metadata,
+        tx_subsystems::io_manager::block::LbaRange::new(120, 8),
+    );
+    if with_revoke {
+        records = records.with_revoke(tx_subsystems::io_manager::block::LbaRange::new(128, 8));
+    }
     Arc::new(JournalMutationRuntime::new(
         fsync,
-        JournalPagePool::new(10).expect("journal pool"),
-        MutationJournalLayout::new(
-            DeviceKey::new(7),
-            8,
-            [1; 16],
-            sequence,
-            JournalRecordLayout::new(
-                tx_subsystems::io_manager::block::LbaRange::new(80, 8),
-                alloc::vec![tx_subsystems::io_manager::block::LbaRange::new(88, 8)],
-                tx_subsystems::io_manager::block::LbaRange::new(120, 8),
-            ),
-        ),
+        JournalPagePool::new(16).expect("journal pool"),
+        MutationJournalLayout::new(DeviceKey::new(7), 8, [1; 16], sequence, records),
     ))
 }
 
@@ -312,6 +322,27 @@ fn mounted_counting_mutation_fs(
 ) {
     let writes = Arc::new(AtomicUsize::new(0));
     let runtime = mutation_runtime_for_test(sequence);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_mount_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_truncate_free_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 4, true);
     let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
         CountingImage {
             image: build_tier1_mount_image(),
@@ -444,21 +475,21 @@ fn ext4_truncate_public_path_admits_metadata_mutation_without_home_write() {
 }
 
 #[test]
-fn ext4_truncate_rejects_cross_block_shrink_until_free_path_exists() {
+fn ext4_truncate_cross_block_shrink_admits_free_revoke_mutation() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let guard = epoch::guard();
-    let (mounted, runtime, writes) = mounted_counting_mutation_fs(21);
+    let (mounted, runtime, writes) = mounted_counting_truncate_free_fs(21);
     let backing = mounted.fs_page_backing();
 
     assert_eq!(
         backing.truncate(FsObjectId::new(12), 0, &guard),
-        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+        V3::<(), NoProgress>::done(())
     );
     assert_eq!(writes.load(Ordering::Acquire), 0);
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::default()
+        tx_subsystems::mount::MountTransactionFrontier::new(21)
     );
 }
 

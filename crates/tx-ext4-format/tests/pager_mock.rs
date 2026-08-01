@@ -714,14 +714,79 @@ fn truncate_plan_updates_size_without_mutating_home_inode() {
 }
 
 #[test]
-fn truncate_plan_rejects_cross_block_shrink_until_free_path_exists() {
-    let image = mock_image();
+fn truncate_plan_releases_complete_tail_blocks_with_revoke_claims() {
+    let mut image = mock_image();
+    BitmapMut::new(image.block_mut(2)).set(20).unwrap();
+    BitmapMut::new(image.block_mut(2)).set(21).unwrap();
+    BitmapMut::new(image.block_mut(2)).set(30).unwrap();
     let before = *image.block(4);
     let mut pager = Ext4Pager::open(image).unwrap();
 
+    let plan = pager
+        .plan_truncate_size(InodeNo::new(12), BLOCK_SIZE as u64, FsyncStamp::new(17))
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::Truncate);
+    assert!(plan.data.is_empty());
+    assert!(plan.allocations.is_empty());
     assert_eq!(
-        pager.plan_truncate_size(InodeNo::new(12), BLOCK_SIZE as u64, FsyncStamp::new(17)),
-        Err(tx_ext4_format::Ext4FormatError::Unsupported)
+        plan.revokes,
+        vec![
+            tx_ext4_format::mutation::RevokeRecord { physical_block: 21 },
+            tx_ext4_format::mutation::RevokeRecord { physical_block: 30 }
+        ]
+    );
+    assert_eq!(
+        plan.deferred_frees,
+        vec![
+            tx_ext4_format::mutation::DeferredFreeClaim { physical_block: 21 },
+            tx_ext4_format::mutation::DeferredFreeClaim { physical_block: 30 }
+        ]
+    );
+    assert_eq!(plan.metadata.len(), 4);
+
+    let bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    assert_eq!(bitmap.home, 2);
+    assert!(BitmapView::new(&bitmap.after).is_set(20));
+    assert!(!BitmapView::new(&bitmap.after).is_set(21));
+    assert!(!BitmapView::new(&bitmap.after).is_set(30));
+
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    let parsed_group = GroupDesc::parse(&group_desc.after[..64]).unwrap();
+    assert_eq!(parsed_group.free_blocks_count, 34);
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let parsed_superblock = Superblock::parse(&superblock.after[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.free_blocks_count, 34);
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let inode_bytes = &inode_table.after[11 * 256..12 * 256];
+    let after_inode = Inode::parse(inode_bytes).unwrap();
+    assert_eq!(after_inode.size, BLOCK_SIZE as u64);
+    assert_eq!(after_inode.blocks_512, 8);
+    assert_eq!(
+        Extent::parse_all(after_inode.extent_root_bytes()).unwrap(),
+        vec![Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: 20
+        }]
     );
     assert_eq!(pager.image().block(4), &before);
 }
