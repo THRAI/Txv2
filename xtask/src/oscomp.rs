@@ -326,10 +326,10 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
                     data.join("sdcard-la.img").display()
                 ),
                 "-device".into(),
-                "virtio-blk-pci,drive=x0".into(),
+                "virtio-blk-pci,drive=x0,addr=1".into(),
                 "-no-reboot".into(),
                 "-device".into(),
-                "virtio-net-pci,netdev=net0".into(),
+                "virtio-net-pci,netdev=net0,addr=2".into(),
                 "-netdev".into(),
                 "user,id=net0".into(),
                 "-rtc".into(),

@@ -78,9 +78,10 @@ The local implementation confirms the two sides of that contract:
    that a cold idle virtio-mmio RX frame can occasionally appear without a
    usable interrupt. Restoring the real IRQ chain does not yet justify removing
    that correctness backstop.
-9. **LA64 remains poll-backed.** Its current virtio-pci interrupt routing has no
-   proven platform IRQ number. `NET_IRQ = 0` remains the unsupported sentinel
-   there instead of inventing a GSI.
+9. **LA64 was initially kept poll-backed.** At the time of this RV64 decision,
+   its virtio-pci route had no proven platform IRQ number. The route was later
+   established and implemented by the 2026-08-01 follow-up documented in
+   `2026-08-01-la64-virtio-net-irq-route.md`.
 
 ## API shape
 
@@ -151,7 +152,9 @@ The local implementation confirms the two sides of that contract:
 
 ## Scope boundaries
 
-- This change does not add a guessed LA64 virtio-pci IRQ route.
+- This RV64 change did not add a guessed LA64 virtio-pci IRQ route. The later
+  LA64 route is evidence-backed and recorded separately in
+  `2026-08-01-la64-virtio-net-irq-route.md`.
 - It does not remove the periodic network watchdog.
 - It does not introduce NAPI or device-level interrupt suppression.
 - It does not move semantic network work into HAL or IRQ context.

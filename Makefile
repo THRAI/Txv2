@@ -365,9 +365,9 @@ oscomp-qemu-la64:
 		-kernel $(OSCOMP_SUBMIT)/kernel-la \
 		-m 1G -nographic -smp 1 \
 		-drive file=$(OSCOMP_DATA)/sdcard-la.img,if=none,format=raw,id=x0,file.locking=off \
-		-device virtio-blk-pci,drive=x0 \
+		-device virtio-blk-pci,drive=x0,addr=1 \
 		-no-reboot \
-		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0,addr=2 -netdev user,id=net0 \
 		-rtc base=utc \
 		$(OSCOMP_APPEND_LA) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA) | $(OSCOMP_CONSOLE_FILTER)
@@ -380,9 +380,9 @@ oscomp-qemu-la64-smp4:
 		-kernel $(OSCOMP_SUBMIT)/kernel-la \
 		-m 1G -nographic -smp 4 \
 		-drive file=$(OSCOMP_DATA)/sdcard-la.img,if=none,format=raw,id=x0,file.locking=off \
-		-device virtio-blk-pci,drive=x0 \
+		-device virtio-blk-pci,drive=x0,addr=1 \
 		-no-reboot \
-		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0,addr=2 -netdev user,id=net0 \
 		-rtc base=utc \
 		$(OSCOMP_APPEND_LA) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA_SMP4) | $(OSCOMP_CONSOLE_FILTER)

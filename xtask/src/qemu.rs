@@ -423,7 +423,7 @@ fn qemu_command(
                 args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
             }
             TxTarget::La64Qemu => {
-                args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0".into());
+                args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0,addr=1".into());
             }
             TxTarget::Rv64Qemu => {
                 // Pin the block device to virtio-mmio-bus.0 (-> "virtio0" @
@@ -519,7 +519,7 @@ fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
             args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1".into());
         }
         TxTarget::La64Qemu => {
-            args.push("virtio-net-pci,netdev=net0".into());
+            args.push("virtio-net-pci,netdev=net0,addr=2".into());
         }
     }
 }
@@ -1112,7 +1112,8 @@ mod tests {
         .unwrap();
         let rendered = command.join(" ");
 
-        assert!(rendered.contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0"));
+        assert!(rendered
+            .contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0,addr=1"));
         assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
         assert!(rendered.contains(
             "-fw_cfg name=opt/tx.cmdline,string=tx.profile=busybox tx.boot.mode=busybox console=ttyS0"
@@ -1159,7 +1160,7 @@ mod tests {
         .unwrap()
         .join(" ");
         assert!(la64.contains("-netdev user,id=net0"));
-        assert!(la64.contains("-device virtio-net-pci,netdev=net0"));
+        assert!(la64.contains("-device virtio-net-pci,netdev=net0,addr=2"));
     }
 
     #[test]

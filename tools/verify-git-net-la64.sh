@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify-git-net.sh — independent, end-to-end verification of git on Txv2 (rv64-qemu).
+# verify-git-net-la64.sh — independent, end-to-end verification of git on Txv2 (la64-qemu).
 #
 # Sets up a real git server on the host, boots the guest kernel under QEMU, runs
 # the full git pipeline inside the guest, and prints PASS/FAIL per check with the
@@ -8,6 +8,7 @@
 #
 # Usage:   bash tools/verify-git-net-la64.sh
 #          TX_GIT_NET_TIMEOUT=360 bash tools/verify-git-net-la64.sh
+#          TX_REQUIRE_NET_IRQ=1 bash tools/verify-git-net-la64.sh
 # Needs:   python3, openssl, git, qemu-system-loongarch64, debugfs (e2fsprogs) on the host.
 set -u
 
@@ -22,8 +23,17 @@ PUSHMARK="PUSH-MARKER-$$"
 SERIAL="$WORK/serial.log"
 HTTP_PID=""; HTTPS_PID=""
 QEMU_TIMEOUT="${TX_GIT_NET_TIMEOUT:-300}"
+REQUIRE_NET_IRQ="${TX_REQUIRE_NET_IRQ:-0}"
+EXTRA_CMDLINE="${TX_EXTRA_CMDLINE:-}"
+if [ "$REQUIRE_NET_IRQ" = "1" ]; then
+  EXTRA_CMDLINE="${EXTRA_CMDLINE:+$EXTRA_CMDLINE }tx.net.irq_report=1"
+fi
 
-cleanup() { [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null; [ -n "$HTTPS_PID" ] && kill "$HTTPS_PID" 2>/dev/null; }
+cleanup() {
+  [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null
+  [ -n "$HTTPS_PID" ] && kill "$HTTPS_PID" 2>/dev/null
+  rm -f "$WORK/disk.img"
+}
 trap cleanup EXIT
 
 say()  { printf '%s\n' "$*"; }
@@ -109,8 +119,8 @@ GIT_SSL_NO_VERIFY=1 git ls-remote "https://127.0.0.1:$HTTPS_PORT/test.git" >/dev
 cat > "$WORK/tx-run.sh" <<'GUESTEOF'
 BB=/musl/bin/busybox
 export GIT_PAGER=cat HOME=/musl/root GIT_EXEC_PATH=/musl/usr/libexec/git-core GIT_TEMPLATE_DIR= \
-       GIT_SSL_NO_VERIFY=true GIT_CURL_VERBOSE=1 PATH=/musl/usr/bin:/musl/bin:/usr/bin:/bin
-G="git -c gc.auto=0 -c maintenance.auto=false -c http.sslVerify=false -c user.email=g@g -c user.name=guest"
+       GIT_CURL_VERBOSE=1 PATH=/musl/usr/bin:/musl/bin:/usr/bin:/bin
+G="git -c gc.auto=0 -c maintenance.auto=false -c user.email=g@g -c user.name=guest"
 $BB mkdir -p /etc 2>/dev/null
 echo "nameserver 10.0.2.3" > /etc/resolv.conf
 echo "10.0.2.2 txverify.test" >> /etc/hosts
@@ -124,14 +134,14 @@ echo "VG:local_content:[$($G cat-file -p HEAD:tracked.txt 2>&1)]"
 cd /musl/root
 echo "VG:http_clone_out:[$($BB timeout 60 $G clone http://txverify.test:__HTTP_PORT__/test.git H 2>&1 | $BB tail -1)]"
 echo "VG:http_readme:[$($G -C /musl/root/H cat-file -p HEAD:README 2>&1)]"
-echo "VG:https_clone_out:[$($BB timeout 90 $G clone https://txverify.test:__HTTPS_PORT__/test.git S 2>&1 | $BB tail -1)]"
+echo "VG:https_clone_out:[$($BB timeout 90 $G -c http.sslVerify=true -c http.sslCAInfo=/musl/txverify-cert.pem clone https://txverify.test:__HTTPS_PORT__/test.git S 2>&1 | $BB tail -1)]"
 echo "VG:https_readme:[$($G -C /musl/root/S cat-file -p HEAD:README 2>&1)]"
 # push (empty commit avoids the shell ext4-write-content bug; tests push transport)
 cd /musl/root/H
 $G commit -q --allow-empty -m "__PUSHMARK__" >/dev/null 2>&1
 echo "VG:push_out:[$($BB timeout 60 $G push origin master 2>&1 | $BB tail -1)]"
 # pull: S was cloned before the push above → pulling must fast-forward to the pushed commit
-echo "VG:pull_out:[$($BB timeout 60 $G -C /musl/root/S -c pull.ff=only pull 2>&1 | $BB tail -1)]"
+echo "VG:pull_out:[$($BB timeout 60 $G -C /musl/root/S -c pull.ff=only -c http.sslVerify=true -c http.sslCAInfo=/musl/txverify-cert.pem pull 2>&1 | $BB tail -1)]"
 echo "VG:pull_log:[$($G -C /musl/root/S log --oneline 2>&1 | $BB head -1)]"
 # DNS: query the SLIRP DNS directly. Do not couple this witness to whether an
 # unrelated public host accepts or rejects a random high TCP port.
@@ -143,16 +153,18 @@ GUESTEOF
 sed -i "s/__HTTP_PORT__/$HTTP_PORT/g; s/__HTTPS_PORT__/$HTTPS_PORT/g; s/__PUSHMARK__/$PUSHMARK/g" "$WORK/tx-run.sh"
 
 # --- boot the guest ---
-cp -f "$IMG" "$WORK/disk.img"
+cp -f "$IMG" "$WORK/disk.img" \
+  || { say "FATAL: cannot create temporary guest disk: $WORK/disk.img"; exit 2; }
 debugfs -w -R "write $WORK/tx-run.sh /tx-run.sh" "$WORK/disk.img" >/dev/null 2>&1
+debugfs -w -R "write $SH/cert.pem /txverify-cert.pem" "$WORK/disk.img" >/dev/null 2>&1
 say "booting guest under QEMU (≈60-120s)..."
 timeout "$QEMU_TIMEOUT" qemu-system-loongarch64 -machine virt -cpu la464 -kernel "$K" -m 1152M -nographic -smp 1 \
   -drive "file=$WORK/disk.img,if=none,format=raw,id=x0,file.locking=off" \
-  -device virtio-blk-pci-non-transitional,drive=x0 \
-  -device virtio-net-pci,netdev=net -netdev user,id=net \
+  -device virtio-blk-pci-non-transitional,drive=x0,addr=1 \
+  -device virtio-net-pci,netdev=net,addr=2 -netdev user,id=net \
   -no-reboot -rtc base=utc \
-  -fw_cfg "name=opt/tx.cmdline,string=tx.runsh=/musl/tx-run.sh console=ttyS0" \
-  -append "tx.runsh=/musl/tx-run.sh console=ttyS0" > "$SERIAL" 2>&1
+  -fw_cfg "name=opt/tx.cmdline,string=tx.runsh=/musl/tx-run.sh console=ttyS0${EXTRA_CMDLINE:+ $EXTRA_CMDLINE}" \
+  -append "tx.runsh=/musl/tx-run.sh console=ttyS0${EXTRA_CMDLINE:+ $EXTRA_CMDLINE}" > "$SERIAL" 2>&1
 say ""
 
 g() { grep -a "^VG:$1:" "$SERIAL" 2>/dev/null | sed "s/^VG:$1://" | head -1; }
@@ -170,6 +182,20 @@ else
 fi
 v=$(g pull_log);      case "$v" in *$PUSHMARK*) check "Task2 pull" 0 "$v";; *) check "Task2 pull" 1 "pull_out=$(g pull_out)";; esac
 v=$(g dns);           case "$v" in *rc=0*github.com*) check "DNS resolution" 0 "$v";; *) check "DNS resolution" 1 "${v:-<no resolve line>}";; esac
+if [ "$REQUIRE_NET_IRQ" = "1" ]; then
+  irq_line=$(grep -a '^txkernel:.*:irq:net:' "$SERIAL" 2>/dev/null | tail -1)
+  if printf '%s\n' "$irq_line" | awk -F: '
+      NF >= 12 && $5 == "claims" && ($6 + 0) > 0 &&
+      $7 == "completions" && $6 == $8 &&
+      $9 == "wrong-hart" && ($10 + 0) == 0 &&
+      $11 == "missing-device" && ($12 + 0) == 0 { ok = 1 }
+      END { exit(ok ? 0 : 1) }
+    '; then
+    check "NET_IRQ claim/complete" 0 "$irq_line"
+  else
+    check "NET_IRQ claim/complete" 1 "${irq_line:-<no irq report>}"
+  fi
+fi
 
 say ""
 say "== summary: $pass passed, $fail failed =="

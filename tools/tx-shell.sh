@@ -91,8 +91,8 @@ if [ "$ARCH" = rv64 ]; then
 else
   exec qemu-system-loongarch64 -machine virt -cpu la464 -kernel "$K" -m 1152M -nographic -smp 1 \
     -drive "file=$WORK/disk.img,if=none,format=raw,id=x0,file.locking=off" \
-    -device virtio-blk-pci-non-transitional,drive=x0 \
-    -device virtio-net-pci,netdev=net -netdev user,id=net \
+    -device virtio-blk-pci-non-transitional,drive=x0,addr=1 \
+    -device virtio-net-pci,netdev=net,addr=2 -netdev user,id=net \
     -rtc base=utc \
     -fw_cfg "name=opt/tx.cmdline,string=tx.runsh=/musl/tx-run.sh console=ttyS0" \
     -append "tx.runsh=/musl/tx-run.sh console=ttyS0"

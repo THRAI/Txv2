@@ -44,10 +44,19 @@ pub(crate) fn la64_unmask_external_irq(irq: u32) {
     let Some(ext_irq) = la64_extioi_irq_from_public_irq(irq) else {
         return;
     };
+    la64_eiointc_set_bit(LA64_EIOINTC_ENABLE_START, ext_irq);
     if let Some(pin) = la64_pch_pic_pin_from_public_irq(irq) {
+        // QEMU resets every PCH-PIC HTMSI vector entry to zero. Program the
+        // pin-to-ExtIOI route before exposing a pending PCH source; otherwise
+        // all uninitialised pins are delivered as ExtIOI 0 even though the HAL
+        // enables and claims the same-numbered ExtIOI line.
+        la64_pch_pic_write_u8(
+            LA64_PCH_PIC_HTMSI_VECTOR_START + pin as usize,
+            ext_irq as u8,
+        );
+        la64_dbar();
         la64_pch_pic_clear_bit(LA64_PCH_PIC_MASK_START, pin);
     }
-    la64_eiointc_set_bit(LA64_EIOINTC_ENABLE_START, ext_irq);
 }
 
 pub(crate) const fn la64_public_irq_from_extioi(ext_irq: u32) -> u32 {
@@ -294,6 +303,23 @@ pub(crate) fn la64_pch_pic_write_u32(offset: usize, value: u32) {
         }
         _ => {
             let _ = value;
+        }
+    }
+}
+
+pub(crate) fn la64_pch_pic_write_u8(offset: usize, value: u8) {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::ptr::write_volatile(
+            la64_uncached_virt(QEMU_LA64_PCH_PIC_BASE + offset) as *mut u8,
+            value,
+        );
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    if let Some(pin) = offset.checked_sub(LA64_PCH_PIC_HTMSI_VECTOR_START) {
+        if let Some(vector) = LA64_HOST_PCH_PIC_HTMSI_VECTOR.get(pin) {
+            vector.store(value, Ordering::Release);
         }
     }
 }

@@ -28,6 +28,8 @@ use la64_pmap::{la64_cached_virt, la64_uncached_virt, uart_put_byte, uart_try_ge
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
+#[cfg(not(target_arch = "loongarch64"))]
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "loongarch64")]
@@ -106,7 +108,17 @@ const QEMU_LA64_GSI_BASE: u32 = 64;
 const QEMU_LA64_PCH_PIC_IRQS: u32 = 64;
 #[cfg_attr(not(test), allow(dead_code))]
 const QEMU_LA64_UART0_IRQ: u32 = 66;
-const QEMU_LA64_RTC_IRQ: u32 = QEMU_LA64_GSI_BASE + 3;
+const QEMU_LA64_RTC_IRQ: u32 = QEMU_LA64_GSI_BASE + 6;
+// QEMU's LoongArch `virt` GPEX host routes PCI INTx outputs to PCH-PIC
+// inputs 16..19. The board profile pins virtio-net-pci at slot 2 and the
+// device uses INTA (pin index 0), so the standard PCI swizzle selects input
+// 16 + ((0 + 2) % 4) = 18. Public PCH-PIC IRQs carry the GSI base.
+const QEMU_LA64_PCI_INTX_BASE: u32 = 16;
+const QEMU_LA64_VIRTIO_NET_PCI_SLOT: u32 = 2;
+const QEMU_LA64_VIRTIO_NET_PCI_PIN: u32 = 0;
+const QEMU_LA64_NET_IRQ: u32 = QEMU_LA64_GSI_BASE
+    + QEMU_LA64_PCI_INTX_BASE
+    + ((QEMU_LA64_VIRTIO_NET_PCI_PIN + QEMU_LA64_VIRTIO_NET_PCI_SLOT) % 4);
 const QEMU_LA64_PCIE_ECAM_BASE: usize = 0x2000_0000;
 const QEMU_LA64_PCIE_ECAM_SIZE: usize = 0x0800_0000;
 const QEMU_LA64_PCIE_MMIO32_BASE: usize = 0x4000_0000;
@@ -222,6 +234,7 @@ const LA64_EIOINTC_COREISR_START: usize = 0x400;
 const LA64_EIOINTC_IRQS: u32 = 256;
 const LA64_PCH_PIC_MASK_START: usize = 0x20;
 const LA64_PCH_PIC_CLEAR_START: usize = 0x80;
+const LA64_PCH_PIC_HTMSI_VECTOR_START: usize = 0x200;
 const LS7A_RTC_TOYWRITE0: usize = 0x24;
 const LS7A_RTC_TOYWRITE1: usize = 0x28;
 const LS7A_RTC_TOYREAD0: usize = 0x2c;
@@ -282,6 +295,9 @@ static LA64_HOST_EIOINTC_ENABLE0: AtomicU64 = AtomicU64::new(0);
 static LA64_HOST_EIOINTC_COREISR0: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_PCH_PIC_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(not(target_arch = "loongarch64"))]
+static LA64_HOST_PCH_PIC_HTMSI_VECTOR: [AtomicU8; QEMU_LA64_PCH_PIC_IRQS as usize] =
+    [const { AtomicU8::new(0) }; QEMU_LA64_PCH_PIC_IRQS as usize];
 
 #[cfg(all(not(target_arch = "loongarch64"), test))]
 struct HostLs7aRtcState {
@@ -308,12 +324,6 @@ impl HostLs7aRtcState {
 
     fn reset(&mut self) {
         *self = Self::new();
-    }
-
-    fn set_toy_time(&mut self, ns: u64) {
-        let (toy0, toy1) = ls7a_toy_registers_from_unix_ns(ns).expect("valid toy time");
-        self.registers[LS7A_RTC_TOYREAD0 / core::mem::size_of::<u32>()] = toy0;
-        self.registers[LS7A_RTC_TOYREAD1 / core::mem::size_of::<u32>()] = toy1;
     }
 
     fn read_u32(&mut self, offset: usize) -> u32 {

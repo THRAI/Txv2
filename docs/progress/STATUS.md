@@ -18399,3 +18399,57 @@
   增大 bag/table/port 容量掩盖。**Blocker**：尚未定位是谁把
   `epoch=0` 与非空 publication head 组合出来，也尚未获授权实现该修复；恢复
   计划继续 blocked。
+- 2026-08-01 (**当前 HEAD 的 LA64 Git 路径复验通过**). **Changed**：未修改
+  内核代码；在 `feature-network-refactor-recovery` 的 `067381d145c8` 上重建
+  LA64 debug ELF，并使用本地 hostname Git HTTP/HTTPS 服务器执行独立
+  guest 验证。**Verification**：`cargo xtask build --target la64-qemu` 通过；
+  `TX_GIT_NET_TIMEOUT=360 bash tools/verify-git-net-la64.sh` 为 8/8（Git
+  binary、init/add/commit、file content、HTTP clone、HTTPS/TLS clone、push、
+  pull、DNS），串口证据为 `/tmp/verifygit-usuZCv/serial.log`。**Next**：PR 可将
+  LA64 Git 列为当前 HEAD 已验证能力；如需声称整个 LA64 网络栈全面通过，
+  仍应分别引用 netperf/iperf 等专项证据。**Blocker**：Git 路径无阻塞。
+- 2026-08-01 (**本地 Git 交互启动脚本切换到 LA64**). **Changed**：将被
+  `.gitignore` 排除的 `local-images/git/boot.sh` 改为使用 LA64 debug ELF、
+  LoongArch64 Alpine 镜像、`qemu-system-loongarch64 -cpu la464` 和 PCI
+  VirtIO block/net；原 RV64 参数与 QEMU 命令均保留为注释，方便人工切回。
+  **Verification**：`bash -n local-images/git/boot.sh` 通过；QEMU、`debugfs`、
+  LA64 内核 ELF 和镜像路径均存在。**Next**：由用户手动执行
+  `bash local-images/git/boot.sh` 完成交互启动。**Blocker**：无；按要求未在本次
+  任务中启动 QEMU。
+- 2026-08-01 (**LA64 GitHub TLS 证书“尚未生效”的墙钟根因已修复**).
+  `dd9435f3` 将 persistent-clock seed 移到
+  `tx_subsystems::vdso::init_vdso()?` 之后；LA64 使用 vDSO stub 并在 `?`
+  处提前返回，所以 RTC 根本未读，而 RV64 有 vDSO 镜像不受影响。
+  **Changed**：persistent-clock seed 改为先于可失败的 vDSO 镜像初始化；
+  LA64 QEMU RTC IRQ 从错误的 GSI 67 对齐官方 QEMU 9.2.1 的 GSI 70；
+  RTC host 测试改用原始 QEMU TOY 位域；增加 `clock` 探针；LA64 Git
+  gate 不再关闭 SSL，而是注入本地证书作为显式 CA。**Verification**：修复后
+  host/guest epoch 为 `1785579416/1785579417`，只差一秒，且仍然输出
+  `vdso:init:fail:stub`；LA64 HAL 53/53，timekeeper seed 1/1，LA64 build 通过，
+  `clock` 探针通过，开启 CA/证书日期校验的 LA64 Git gate 8/8，日志
+  `/tmp/verifygit-lEqnUu/serial.log`。全仓 unit 仍只被已记录的三个无关
+  tx-shims 失败与八个 tx-ext4 `with_target` 编译错误阻塞；arch/docs/
+  progress 全局门仍分别受已记录的 92 项 ratchet、23 个断链和一个非法
+  `completed` 状态阻塞，均未指向本次改动。**Next**：
+  用已重建的 LA64 debug ELF 重启后直接重试原 GitHub clone，无需手工
+  `date -s` 或关闭 SSL。**Blocker**：该 RTC/TLS 路径无阻塞；详情见
+  `msp/debug-logs/2026-08-01-la64-github-tls-clock.md`。
+- 2026-08-01 (**LA64 GitHub clone 卡死的 PCH-PIC/ExtIOI 根因已修复**).
+  外部 `ls-remote` 在 DNS、代理 CONNECT、TLS 与请求发送之后卡住；QEMU
+  事件证明 virtio-net 已拉起 PCH pin 18，但 PCH HTMSI vector 复位为 0，
+  因而错误投递到 ExtIOI 0，而 HAL 解屏蔽的是 ExtIOI 18。**Changed**：
+  LA64 发布经 QEMU GPEX slot-2 INTA swizzle 证明的 `NET_IRQ=82`；PCH source
+  解屏蔽前写入 `vector[pin]=ext_irq`；`eth0` 发布后启用设备通知；维护中的
+  LA64 QEMU 启动面固定 block/net PCI slot 1/2；Git gate 增加真实 IRQ
+  claim/complete 检查，诊断脚本增加外部 `ls-remote`/完整 clone witness，
+  两个脚本都自动回收临时磁盘并在复制失败时立即退出。**Verification**：
+  LA64 HAL 55/55；LA64 build；默认协议 GitHub `ls-remote` rc 0；完整 xv6
+  clone 收取 7780 objects/17.46 MiB、解析 4127 deltas 后 rc 0；LA64 本地
+  Git/IRQ gate 9/9，`claims=79=completions`、wrong-hart/missing-device 均 0；
+  xtask qemu 33/33、oscomp 2/2。`cargo xtask lint docs` 仍只报告既有 23 个
+  断链与 6 个 stale-vocabulary warning，本次两个文档不在失败清单。**Next**：
+  用户可用重建后的 LA64 debug ELF
+  直接复跑交互式 clone；之前记录的 LA64 TCP_CRR publication/EBR 问题仍是
+  独立事项。**Blocker**：本次 clone/IRQ 路径无阻塞。详细证据见
+  `docs/progress/research/2026-08-01-la64-virtio-net-irq-route.md` 与本地总账
+  `msp/debug-logs/2026-08-01-la64-xv6-clone-operation-ledger.md`。

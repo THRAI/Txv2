@@ -1788,8 +1788,10 @@ pub trait IrqIf {
     const RTC_IRQ: u32 = 0;
 
     /// Platform-specific boot network-device IRQ, or zero when no route has
-    /// been proven. RV64 QEMU `virtio1@0x1000_2000` uses PLIC IRQ 2. LA64
-    /// keeps the zero sentinel until its virtio-pci route is established.
+    /// been proven. RV64 QEMU `virtio1@0x1000_2000` uses PLIC IRQ 2. The LA64
+    /// board profile pins virtio-net-pci at PCI slot 2; INTA swizzles through
+    /// GPEX to PCH-PIC input 18 and is published as GSI 82. LA64 must program
+    /// PCH-PIC HTMSI vector 18 to ExtIOI 18 before unmasking that source.
     const NET_IRQ: u32 = 0;
 
     /// Claim the highest-priority pending IRQ on the current hart.

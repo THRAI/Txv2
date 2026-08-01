@@ -562,6 +562,7 @@ impl IrqIf for Platform {
     const MAX_IRQ: u32 = QEMU_LA64_GSI_BASE + QEMU_LA64_PCH_PIC_IRQS;
     const UART_IRQ: u32 = QEMU_LA64_UART0_IRQ;
     const RTC_IRQ: u32 = QEMU_LA64_RTC_IRQ;
+    const NET_IRQ: u32 = QEMU_LA64_NET_IRQ;
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0

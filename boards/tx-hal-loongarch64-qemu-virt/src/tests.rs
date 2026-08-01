@@ -1166,6 +1166,31 @@ fn la64_platform_overrides_uart_irq_constant() {
 #[test]
 fn la64_platform_overrides_rtc_irq_constant() {
     assert_eq!(<Platform as IrqIf>::RTC_IRQ, QEMU_LA64_RTC_IRQ);
+    assert_eq!(QEMU_LA64_RTC_IRQ, 70);
+}
+
+#[test]
+fn la64_platform_routes_slot_two_inta_to_pch_pic_input_eighteen() {
+    assert_eq!(QEMU_LA64_NET_IRQ, 82);
+    assert_eq!(<Platform as IrqIf>::NET_IRQ, QEMU_LA64_NET_IRQ);
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_net_irq_unmask_programs_pch_vector_eighteen() {
+    let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
+    reset_la64_host_irq_controller_for_test();
+    let ext_irq = QEMU_LA64_NET_IRQ - QEMU_LA64_GSI_BASE;
+    let bit = 1u64 << ext_irq;
+
+    <Platform as IrqIf>::unmask(QEMU_LA64_NET_IRQ);
+
+    assert_eq!(LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire), bit);
+    assert_eq!(LA64_HOST_PCH_PIC_MASK.load(Ordering::Acquire) & bit, 0);
+    assert_eq!(
+        LA64_HOST_PCH_PIC_HTMSI_VECTOR[ext_irq as usize].load(Ordering::Acquire),
+        ext_irq as u8
+    );
 }
 
 #[test]
@@ -1182,6 +1207,10 @@ fn la64_irq_claim_masks_and_completes_qemu_uart_gsi() {
     <Platform as IrqIf>::unmask(QEMU_LA64_UART0_IRQ);
     assert_eq!(LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire), bit);
     assert_eq!(LA64_HOST_PCH_PIC_MASK.load(Ordering::Acquire) & bit, 0);
+    assert_eq!(
+        LA64_HOST_PCH_PIC_HTMSI_VECTOR[ext_irq as usize].load(Ordering::Acquire),
+        ext_irq as u8
+    );
     assert_eq!(<Platform as IrqIf>::claim(), QEMU_LA64_UART0_IRQ);
 
     <Platform as IrqIf>::complete(QEMU_LA64_UART0_IRQ);
@@ -1196,7 +1225,7 @@ fn la64_irq_claim_masks_and_completes_qemu_uart_gsi() {
 
 #[test]
 #[cfg(not(target_arch = "loongarch64"))]
-fn ls7a_persistent_clock_reads_toy_registers() {
+fn ls7a_persistent_clock_reads_qemu_toy_register_layout() {
     let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
     reset_la64_host_irq_controller_for_test();
     {
@@ -1204,7 +1233,13 @@ fn ls7a_persistent_clock_reads_toy_registers() {
             .lock()
             .expect("host ls7a rtc state");
         state.reset();
-        state.set_toy_time(1_704_067_200 * NANOS_PER_SEC);
+        // QEMU `hw/rtc/ls7a_rtc.c` exposes 2024-01-01 00:00:00 as
+        // TOYREAD0 calendar fields plus `struct tm::tm_year` (124) in
+        // TOYREAD1. Use raw device values here instead of the production
+        // encoder so an encoder/decoder pair cannot pass while sharing the
+        // same wrong assumption.
+        state.registers[LS7A_RTC_TOYREAD0 / core::mem::size_of::<u32>()] = 0x0420_0000;
+        state.registers[LS7A_RTC_TOYREAD1 / core::mem::size_of::<u32>()] = 124;
     }
 
     assert_eq!(
@@ -1526,4 +1561,7 @@ fn reset_la64_host_irq_controller_for_test() {
     LA64_HOST_EIOINTC_ENABLE0.store(0, Ordering::Release);
     LA64_HOST_EIOINTC_COREISR0.store(0, Ordering::Release);
     LA64_HOST_PCH_PIC_MASK.store(u64::MAX, Ordering::Release);
+    for vector in &LA64_HOST_PCH_PIC_HTMSI_VECTOR {
+        vector.store(0, Ordering::Release);
+    }
 }

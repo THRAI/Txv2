@@ -183,7 +183,15 @@ impl<P: TxPlatform> KernelNetDevices<P> {
             return StepOutcome::Done(());
         }
 
-        self.register_eth0(net)
+        match self.register_eth0(net) {
+            StepOutcome::Done(()) => {
+                if <P as IrqIf>::NET_IRQ != 0 {
+                    net.enable_interrupts();
+                }
+                StepOutcome::Done(())
+            }
+            other => other,
+        }
     }
 
     fn register_eth0(
