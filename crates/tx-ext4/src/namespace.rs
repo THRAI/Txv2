@@ -5,7 +5,7 @@ use tx_ext4_format::ondisk::Inode;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{MountPayload, MountTransactionFrontier};
-use tx_subsystems::page_backed::{FileFsyncFrontier, PageContainer, PageContainerKind};
+use tx_subsystems::page_backed::FileFsyncFrontier;
 use tx_subsystems::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking, Timespec,
@@ -832,18 +832,16 @@ where
         // O_APPEND writes compute `offset = size_bytes = PAGE_SIZE`, which
         // immediately exceeds `capacity = PAGE_SIZE`, yielding EINVAL.
         let page_count = meta.size.div_ceil(PAGE_SIZE).max(EXT4_FILE_PAGE_CAP);
-        let pc = match PageContainer::new_cap(
-            PageContainerKind::File {
-                mount: pin,
-                fs_object_id,
-            },
+        let pc = match self.file_page_container_for_materialized_inode(
+            fs_object_id,
             page_count,
+            meta.size,
+            pin,
+            _guard,
         ) {
             Ok(pc) => pc,
-            Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
-        pc.set_size_bytes(meta.size);
-        self.bind_file_page_container(pc.clone());
 
         match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),

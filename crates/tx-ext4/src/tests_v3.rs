@@ -922,6 +922,53 @@ fn open_file_for_page_container(pc: &PageContainer) -> OpenFile {
 }
 
 #[test]
+fn ext4_materialise_regular_file_reuses_live_page_container_for_same_inode() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let mount = MountPayload::new_cap(
+        fs.clone().fs_ops_arc(),
+        fs.clone().fs_page_backing_arc(),
+        None,
+        DevId::new(8),
+        MountOptions::default(),
+        "ext4",
+        SourceLabel::Static("ext4"),
+    )
+    .expect("ext4 mount payload");
+    fs.bind_mount_payload(&mount);
+    let guard = epoch::guard();
+    let fs_ops = fs.clone().fs_ops_arc();
+    let file_id = FsObjectId::new(12);
+    let meta = match fs_ops.load_inode_meta(file_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load inode meta for materialise reuse test: {other:?}"),
+    };
+
+    let first = match fs_ops.materialise_rnode(file_id, meta, &mount, &guard) {
+        V3::Done(rnode) => rnode,
+        other => panic!("first materialise: {other:?}"),
+    };
+    let first_pc = match first.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        other => panic!("first materialise returned non-page-backed rnode: {other:?}"),
+    };
+    first_pc.set_size_bytes(meta.size + 7);
+
+    let second = match fs_ops.materialise_rnode(file_id, meta, &mount, &guard) {
+        V3::Done(rnode) => rnode,
+        other => panic!("second materialise: {other:?}"),
+    };
+    let second_pc = match second.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        other => panic!("second materialise returned non-page-backed rnode: {other:?}"),
+    };
+
+    assert_eq!(second_pc, first_pc);
+    assert_eq!(second_pc.size_bytes(), meta.size + 7);
+}
+
+#[test]
 fn ext4_mutation_mount_rejects_a_non_tier1_fixture() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
@@ -1160,6 +1207,36 @@ fn ext4_buffered_extending_write_reserves_before_dirty_and_flushes_without_home_
 }
 
 #[test]
+fn ext4_metadata_mutation_settles_prior_ordered_data_transaction_before_admission() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_mutation_fs(29);
+    let backing = mounted.fs_page_backing();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let frame = tx_subsystems::page_backed::Frame::new(
+        page_allocator::zero_frame_ppn().expect("zero frame"),
+    );
+
+    assert_eq!(
+        backing.flush_page(FsObjectId::new(12), 0, &frame, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(29)
+    );
+
+    assert_eq!(
+        mounted
+            .fs_ops()
+            .chmod_inode(FsObjectId::new(12), 0o755, &cred, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
 fn ext4_unlink_public_path_admits_namespace_mutation_without_home_write() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
@@ -1216,6 +1293,33 @@ fn ext4_create_public_path_admits_regular_file_without_home_write() {
                 flags: Inode::EXTENTS_FL,
             },
         ))
+    );
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_chmod_public_path_admits_regular_file_after_create_settlement() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_create_fs(32);
+    let fs_ops = mounted.fs_ops();
+    let (file_id, _) =
+        match fs_ops.create_inode(FsObjectId::new(2), b"chmod-new", 0o644, &cred, &guard) {
+            V3::Done(created) => created,
+            other => panic!("create file for chmod: {other:?}"),
+        };
+    assert_metadata_settled(&runtime, &writes);
+    let meta_after_create = match fs_ops.load_inode_meta(file_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load meta after create settlement: {other:?}"),
+    };
+    assert_eq!(meta_after_create.mode & 0o777, 0o644);
+
+    assert_eq!(
+        fs_ops.chmod_inode(file_id, 0o755, &cred, &guard),
+        V3::<(), NoProgress>::done(())
     );
     assert_metadata_settled(&runtime, &writes);
 }

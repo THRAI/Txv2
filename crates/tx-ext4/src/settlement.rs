@@ -28,6 +28,14 @@ where
         let request = metadata_fsync_request();
         let commit = match source.plan_fsync(&request) {
             BackendPlan::SubmitGraph(graph) => graph,
+            BackendPlan::Err(Errno::EAGAIN) => {
+                self.settle_ordered_data(source.as_ref())?;
+                match source.plan_fsync(&request) {
+                    BackendPlan::SubmitGraph(graph) => graph,
+                    BackendPlan::Err(errno) => return Err(errno),
+                    _ => return Err(Errno::EIO),
+                }
+            }
             BackendPlan::Err(errno) => return Err(errno),
             _ => return Err(Errno::EIO),
         };
@@ -58,6 +66,34 @@ where
         source
             .complete_checkpoint_result(Ok(()))
             .map_err(|_| Errno::EIO)
+    }
+
+    fn settle_ordered_data(
+        &self,
+        source: &crate::journal::JournalFsyncSource,
+    ) -> Result<(), Errno> {
+        let request = metadata_writeback_request();
+        let graph = match source.plan_data(&request) {
+            BackendPlan::SubmitGraph(graph) => graph,
+            BackendPlan::Err(errno) => return Err(errno),
+            _ => return Err(Errno::EIO),
+        };
+        if let Err(errno) = self.execute_bio_graph(graph) {
+            source.complete_data(BackendPageCompletion::new(
+                request.object,
+                request.id,
+                request.op,
+                PageIoResult::Err(errno),
+            ));
+            return Err(errno);
+        }
+        source.complete_data(BackendPageCompletion::new(
+            request.object,
+            request.id,
+            request.op,
+            PageIoResult::Done,
+        ));
+        Ok(())
     }
 
     pub(crate) fn shutdown_mount(&self) -> Result<(), Errno> {
@@ -116,6 +152,17 @@ fn metadata_fsync_request() -> BackendPageRequest {
         PageIoRange::new(0, 1),
         PageIoOp::Fsync,
         PageIoFlags::BARRIER,
+        None,
+    )
+}
+
+fn metadata_writeback_request() -> BackendPageRequest {
+    BackendPageRequest::new(
+        FsObjectKey::new(0),
+        PageIoRequestId::new(2),
+        PageIoRange::new(0, 1),
+        PageIoOp::Writeback,
+        PageIoFlags::WRITEBACK,
         None,
     )
 }

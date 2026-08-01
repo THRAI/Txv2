@@ -3,9 +3,9 @@ use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex};
+use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak as ZoneWeak};
 use alloc::collections::BTreeMap;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec;
 use alloc::vec::Vec;
 use tx_ext4_format::capability::CapabilityProfileHash;
@@ -17,7 +17,7 @@ use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner, IoDataSource};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
-use tx_subsystems::page_backed::PageContainer;
+use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -38,7 +38,7 @@ pub trait FilePageContainerBinder: Send + Sync {
 /// planner. It intentionally has no access to page-cache frames; L4 supplies
 /// those separately to `JournalMutationRuntime` during admission.
 pub(crate) struct Ext4PagerMutationPlanSource<I> {
-    backend: Arc<SpinMutex<Option<Weak<Ext4FsInstance<I>>>>>,
+    backend: Arc<SpinMutex<Option<ArcWeak<Ext4FsInstance<I>>>>>,
 }
 
 impl<I> Clone for Ext4PagerMutationPlanSource<I> {
@@ -77,7 +77,7 @@ where
             .backend
             .lock()
             .as_ref()
-            .and_then(Weak::upgrade)
+            .and_then(ArcWeak::upgrade)
             .ok_or(Errno::EIO)?;
         let inode = inode_no(FsObjectId::new(request.object.raw()))?;
         if backend.is_read_only() {
@@ -138,6 +138,7 @@ pub(crate) struct Ext4FsInstance<I> {
     inode_meta_cache: SpinMutex<InodeMetaCache>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
+    file_page_containers: SpinMutex<BTreeMap<FsObjectId, ZoneWeak<PageContainer>>>,
     metadata_mutation_runtime: SpinMutex<Option<Arc<JournalMutationRuntime>>>,
     buffered_write_reservations: SpinMutex<BTreeMap<(u32, u64), Ext4MutationPlan>>,
     /// Per-mount read-only flag. When `true`, every mutating
@@ -182,6 +183,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
             mount_pin: SpinMutex::new(None),
             file_page_container_binder: SpinMutex::new(None),
+            file_page_containers: SpinMutex::new(BTreeMap::new()),
             metadata_mutation_runtime: SpinMutex::new(None),
             buffered_write_reservations: SpinMutex::new(BTreeMap::new()),
             read_only: AtomicBool::new(read_only),
@@ -212,6 +214,55 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         }
     }
 
+    pub(crate) fn file_page_container_for_materialized_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        page_count: u64,
+        size_bytes: u64,
+        mount: MountPayloadPin,
+        guard: &Guard<'_>,
+    ) -> Result<Cap<PageContainer>, Errno> {
+        {
+            let mut index = self.file_page_containers.lock();
+            if let Some(weak) = index.get(&fs_object_id) {
+                if let Some(container) = weak.upgrade(guard) {
+                    if container.size_bytes() < size_bytes {
+                        container.set_size_bytes(size_bytes);
+                    }
+                    return Ok(container);
+                }
+                index.remove(&fs_object_id);
+            }
+        }
+
+        let container = PageContainer::new_cap(
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            },
+            page_count,
+        )
+        .map_err(|_| Errno::ENOMEM)?;
+        container.set_size_bytes(size_bytes);
+
+        {
+            let mut index = self.file_page_containers.lock();
+            if let Some(weak) = index.get(&fs_object_id) {
+                if let Some(existing) = weak.upgrade(guard) {
+                    if existing.size_bytes() < size_bytes {
+                        existing.set_size_bytes(size_bytes);
+                    }
+                    return Ok(existing);
+                }
+                index.remove(&fs_object_id);
+            }
+            index.insert(fs_object_id, container.downgrade());
+        }
+
+        self.bind_file_page_container(container.clone());
+        Ok(container)
+    }
+
     pub(crate) fn bind_metadata_mutation_runtime(&self, runtime: Arc<JournalMutationRuntime>) {
         *self.metadata_mutation_runtime.lock() = Some(runtime);
     }
@@ -229,7 +280,15 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     where
         I: Send + 'static,
     {
-        runtime.begin_mutation(mutation, guard)?;
+        match runtime.begin_mutation(mutation, guard) {
+            Ok(()) => {}
+            Err(JournalMutationRuntimeError::Busy(_)) => {
+                self.settle_metadata_mutation(runtime)
+                    .map_err(JournalMutationRuntimeError::Settlement)?;
+                runtime.begin_mutation(mutation, guard)?;
+            }
+            Err(error) => return Err(error),
+        }
         let _ = self.with_pager(|pager| {
             pager.stage_mutation_after_images(mutation);
             Ok(())
