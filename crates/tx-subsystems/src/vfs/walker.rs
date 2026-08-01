@@ -417,7 +417,13 @@ fn open_resolved_dentry<'g>(
     };
 
     let rnode = dentry.rnode().clone();
-    match OpenFile::new_cap_with_dentry(rnode, flags, dentry) {
+    let open = match mount_payload_for(&dentry, guard) {
+        Some(payload) => {
+            OpenFile::new_cap_with_dentry_and_mount_payload(rnode, flags, dentry, &payload)
+        }
+        None => OpenFile::new_cap_with_dentry(rnode, flags, dentry),
+    };
+    match open {
         Ok(open) => V3::done(open),
         Err(_) => V3::err(step_engine::Errno::EIO),
     }

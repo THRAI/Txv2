@@ -4,7 +4,11 @@
 //! discovered [`JournalGeometry`]. It has no mount, page-cache, or scheduling
 //! state, so callers can replay the image before exposing the filesystem.
 
-use crate::journal::{Jbd2Commit, Jbd2Descriptor, Jbd2Header, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC};
+use crate::journal::{
+    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR,
+    JBD2_BLOCK_REVOKE, JBD2_MAGIC,
+};
+use crate::ondisk::Superblock;
 use crate::pager::{BlockImage, JournalGeometry, Page4K};
 use crate::{Ext4FormatError, Result};
 
@@ -20,13 +24,36 @@ pub struct JournalReplayReport {
     pub next_sequence: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryReport {
+    NotRequired,
+    Replayed(JournalReplayReport),
+}
+
+/// Replay and clean a discovered journal only when ext4's recovery-required
+/// bit says that the mount did not complete a clean detach.
+pub fn recover_if_required<I: BlockImage>(
+    image: &mut I,
+    superblock: &Superblock,
+    geometry: &JournalGeometry,
+) -> Result<RecoveryReport> {
+    if !superblock.needs_recovery() {
+        return Ok(RecoveryReport::NotRequired);
+    }
+    let replay = replay_journal(image, geometry)?;
+    clean_replayed_journal(image, geometry, replay.next_sequence)?;
+    Ok(RecoveryReport::Replayed(replay))
+}
+
 /// Replay consecutive, committed legacy JBD2 transactions from `geometry`.
 ///
 /// A descriptor is never applied until every tagged metadata page and its
 /// matching commit record have been read. An incomplete tail is normal after a
 /// power loss and terminates the scan without modifying home blocks for that
-/// transaction. This first recovery slice intentionally rejects delete/revoke
-/// tags: free/reuse safety is not yet part of the supported write surface.
+/// transaction. The bounded profile supports one optional revoke page between
+/// the metadata copies and commit record. Its revokes suppress matching stale
+/// after-images from that transaction; allocator reuse remains a higher-layer
+/// lifecycle responsibility.
 pub fn replay_journal<I: BlockImage>(
     image: &mut I,
     geometry: &JournalGeometry,
@@ -59,7 +86,7 @@ pub fn replay_journal<I: BlockImage>(
         }
         let descriptor = Jbd2Descriptor::parse_legacy(&descriptor_page)?;
         validate_tags(&descriptor, geometry)?;
-        let record_blocks = descriptor
+        let mut record_blocks = descriptor
             .tags
             .len()
             .checked_add(2)
@@ -74,7 +101,40 @@ pub fn replay_journal<I: BlockImage>(
             payloads.push(read_log_page(image, geometry, payload_cursor)?);
             payload_cursor = advance(geometry, payload_cursor);
         }
-        let commit_page = read_log_page(image, geometry, payload_cursor)?;
+        let mut commit_cursor = payload_cursor;
+        let record_page = read_log_page(image, geometry, payload_cursor)?;
+        let header = match Jbd2Header::parse(&record_page) {
+            Ok(header) => header,
+            Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break,
+            Err(error) => return Err(error),
+        };
+        let revokes = match header.block_type {
+            JBD2_BLOCK_COMMIT => None,
+            JBD2_BLOCK_REVOKE => {
+                record_blocks = record_blocks
+                    .checked_add(1)
+                    .ok_or(Ext4FormatError::OutOfBounds)?;
+                if record_blocks > limit - scanned {
+                    break;
+                }
+                let revoke = match Jbd2Revoke::parse(&record_page) {
+                    Ok(revoke) => revoke,
+                    Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break,
+                    Err(error) => return Err(error),
+                };
+                if revoke.header.sequence != descriptor.header.sequence {
+                    break;
+                }
+                commit_cursor = advance(geometry, payload_cursor);
+                Some(revoke)
+            }
+            _ => break,
+        };
+        let commit_page = if revokes.is_some() {
+            read_log_page(image, geometry, commit_cursor)?
+        } else {
+            record_page
+        };
         let commit = match Jbd2Commit::parse(&commit_page) {
             Ok(commit) => commit,
             Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break,
@@ -83,12 +143,20 @@ pub fn replay_journal<I: BlockImage>(
         if commit.header.sequence != descriptor.header.sequence {
             break;
         }
+        validate_commit_checksum(&commit)?;
 
         for (tag, mut payload) in descriptor.tags.iter().zip(payloads) {
+            if revokes
+                .as_ref()
+                .is_some_and(|revoke| revoke.blocks.contains(&tag.target_block))
+            {
+                continue;
+            }
             if tag.escaped {
                 payload[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
             }
             image.write_block(tag.target_block as u64, &payload)?;
+            image.invalidate_block(tag.target_block as u64);
             blocks_replayed = blocks_replayed
                 .checked_add(1)
                 .ok_or(Ext4FormatError::OutOfBounds)?;
@@ -98,7 +166,7 @@ pub fn replay_journal<I: BlockImage>(
             .checked_add(1)
             .ok_or(Ext4FormatError::OutOfBounds)?;
         expected_sequence = expected_sequence.wrapping_add(1).max(1);
-        cursor = advance(geometry, payload_cursor);
+        cursor = advance(geometry, commit_cursor);
         scanned = scanned
             .checked_add(record_blocks)
             .ok_or(Ext4FormatError::OutOfBounds)?;
@@ -109,6 +177,19 @@ pub fn replay_journal<I: BlockImage>(
         blocks_replayed,
         next_sequence: expected_sequence,
     })
+}
+
+/// The bounded legacy journal profile has no transaction checksum fields. A
+/// journal that declares checksums uses a different record layout and cannot
+/// be accepted until that format and its CRC contract are implemented.
+fn validate_commit_checksum(commit: &Jbd2Commit) -> Result<()> {
+    if commit.checksum_type == 0
+        && commit.checksum_size == 0
+        && commit.checksums.iter().all(|checksum| *checksum == 0)
+    {
+        return Ok(());
+    }
+    Err(Ext4FormatError::Unsupported)
 }
 
 /// Publish the clean journal state after replay has made recovered home blocks
@@ -128,6 +209,7 @@ pub fn clean_replayed_journal<I: BlockImage>(
         .write_state(&mut page, next_sequence.max(1), 0)?;
     let superblock_block = *geometry.blocks.first().ok_or(Ext4FormatError::Corrupt)?;
     image.write_block(superblock_block, &page)?;
+    image.invalidate_block(superblock_block);
     image.barrier()
 }
 

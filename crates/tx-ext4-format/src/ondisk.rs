@@ -38,6 +38,8 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    pub const FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+    pub const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
     pub const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
     pub const FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
     pub const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
@@ -138,6 +140,12 @@ impl Superblock {
 
     pub fn has_metadata_csum(&self) -> bool {
         self.feature_ro_compat & Self::FEATURE_RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    /// Ext4 sets this incompatibility bit before a read-write journalled mount
+    /// admits mutations and clears it only after clean detach.
+    pub const fn needs_recovery(&self) -> bool {
+        self.feature_incompat & Self::FEATURE_INCOMPAT_RECOVER != 0
     }
 
     pub fn metadata_csum_seed(&self) -> u32 {
@@ -386,6 +394,15 @@ impl Inode {
     pub fn encode(&self, bytes: &mut [u8]) -> Result<()> {
         require_len(bytes, 128)?;
         bytes.fill(0);
+        self.encode_preserving_unknown(bytes)
+    }
+
+    /// Encode modeled inode fields without clearing bytes owned by a newer
+    /// ext4 revision or an unsupported feature. Metadata after-image planning
+    /// starts from the complete on-disk inode and uses this method so an
+    /// unrelated field cannot be lost during a bounded update.
+    pub fn encode_preserving_unknown(&self, bytes: &mut [u8]) -> Result<()> {
+        require_len(bytes, 128)?;
         write_u16_le(bytes, 0, self.mode)?;
         write_u16_le(bytes, 2, self.uid as u16)?;
         write_u32_le(bytes, 4, self.size as u32)?;

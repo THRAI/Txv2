@@ -22,10 +22,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
-    self as epoch, Errno as V3Errno, NoProgress, StepOutcome as V3, page_allocator,
+    self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
 };
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
-use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Page4K};
+use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::fs_iface::{
     BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
     PageFrameRef,
@@ -34,11 +34,12 @@ use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::io_manager::page::{
     PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
 };
+use tx_subsystems::mount::{DevId, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, InodeMeta};
+use tx_subsystems::vfs::FsOps;
 
-use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
+use crate::planner::{Ext4BlockGeometry, Ext4FsyncPlanSource, Ext4PlannerBinding};
 use crate::read_backend::{Ext4FsInstance, Ext4PagerMutationPlanSource};
 use crate::{
     journal::{
@@ -105,6 +106,10 @@ impl BlockImage for MemImage {
         dst.copy_from_slice(data);
         Ok(())
     }
+
+    fn barrier(&mut self) -> tx_ext4_format::Result<()> {
+        Ok(())
+    }
 }
 
 struct CountingImage {
@@ -124,6 +129,10 @@ impl BlockImage for CountingImage {
     fn write_block(&mut self, block: u64, data: &Page4K) -> tx_ext4_format::Result<()> {
         self.writes.fetch_add(1, Ordering::AcqRel);
         self.image.write_block(block, data)
+    }
+
+    fn barrier(&mut self) -> tx_ext4_format::Result<()> {
+        self.image.barrier()
     }
 }
 
@@ -275,6 +284,46 @@ fn open_fs_with_io_manager_binding() -> (Arc<Ext4FsInstance<MemImage>>, Ext4Plan
     (fs, binding)
 }
 
+fn mutation_runtime_for_test(sequence: u32) -> Arc<JournalMutationRuntime> {
+    let fsync = Arc::new(JournalFsyncSource::new());
+    Arc::new(JournalMutationRuntime::new(
+        fsync,
+        JournalPagePool::new(10).expect("journal pool"),
+        MutationJournalLayout::new(
+            DeviceKey::new(7),
+            8,
+            [1; 16],
+            sequence,
+            JournalRecordLayout::new(
+                tx_subsystems::io_manager::block::LbaRange::new(80, 8),
+                alloc::vec![tx_subsystems::io_manager::block::LbaRange::new(88, 8)],
+                tx_subsystems::io_manager::block::LbaRange::new(120, 8),
+            ),
+        ),
+    ))
+}
+
+fn mounted_counting_mutation_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test(sequence);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_mount_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
 #[test]
 fn ext4_mutation_mount_rejects_a_non_tier1_fixture() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -306,6 +355,73 @@ fn ext4_mutation_mount_rejects_a_non_tier1_fixture() {
         runtime,
     );
     assert!(matches!(result, Err(V3Errno::EOPNOTSUPP)));
+}
+
+#[test]
+fn ext4_metadata_serialize_admits_a_journal_mutation_without_home_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let (mounted, runtime, writes) = mounted_counting_mutation_fs(17);
+    let guard = epoch::guard();
+    let fs_ops = mounted.fs_ops();
+    let mut meta = match fs_ops.load_inode_meta(FsObjectId::new(12), &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load meta for setattr admission: {other:?}"),
+    };
+    meta.mode = 0o100600;
+
+    assert_eq!(
+        fs_ops.serialize_inode_meta(FsObjectId::new(12), &meta, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(17)
+    );
+    assert!(matches!(
+        runtime.source().plan_fsync(&BackendPageRequest::new(
+            FsObjectKey::new(12),
+            PageIoRequestId::new(91),
+            PageIoRange::new(0, 1),
+            PageIoOp::Fsync,
+            PageIoFlags::BARRIER,
+            None,
+        )),
+        BackendPlan::SubmitGraph(_)
+    ));
+}
+
+#[test]
+fn ext4_chmod_and_chown_public_paths_admit_metadata_mutations() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    let (chmod_mount, chmod_runtime, chmod_writes) = mounted_counting_mutation_fs(18);
+    let chmod_ops = chmod_mount.fs_ops();
+    assert_eq!(
+        chmod_ops.chmod_inode(FsObjectId::new(12), 0o600, &cred, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(chmod_writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        chmod_runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(18)
+    );
+
+    let (chown_mount, chown_runtime, chown_writes) = mounted_counting_mutation_fs(19);
+    let chown_ops = chown_mount.fs_ops();
+    assert_eq!(
+        chown_ops.chown_inode(FsObjectId::new(12), Some(1000), Some(1000), &cred, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(chown_writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        chown_runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(19)
+    );
 }
 
 #[test]
@@ -403,6 +519,124 @@ fn ext4_inode_metadata_seeds_l5_extent_root_for_page_planning() {
         panic!("seeded inline extent root must plan the file-data bio");
     };
     assert_eq!(bios.as_slice()[0].lba.start_lba(), 20 * 8);
+}
+
+#[test]
+fn checkpoint_settlement_clears_mount_mapping_and_namespace_caches() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let (fs, binding) = open_fs_with_io_manager_binding();
+    let guard = epoch::guard();
+
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard),
+        V3::Done(_)
+    ));
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, FsObjectId::new(12), &guard),
+        V3::Done(_)
+    ));
+    binding
+        .mapping()
+        .insert(12, 0, crate::planner::Ext4ReadMapping::Hole);
+
+    assert!(binding.mapping().len() > 0);
+    assert_ne!(fs.cache_entry_counts(), (0, 0, 0));
+
+    fs.settle_metadata_caches();
+
+    assert_eq!(binding.mapping().len(), 0);
+    assert_eq!(fs.cache_entry_counts(), (0, 0, 0));
+}
+
+#[test]
+fn ext4_file_and_mount_settlement_hooks_clear_mount_caches() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let (fs, binding) = open_fs_with_io_manager_binding();
+    let guard = epoch::guard();
+
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard),
+        V3::Done(_)
+    ));
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, FsObjectId::new(12), &guard),
+        V3::Done(_)
+    ));
+    binding
+        .mapping()
+        .insert(12, 0, crate::planner::Ext4ReadMapping::Hole);
+    assert!(binding.mapping().len() > 0);
+    assert_ne!(fs.cache_entry_counts(), (0, 0, 0));
+
+    let generation_frontier = tx_subsystems::page_backed::FileFsyncFrontier::empty();
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::settle_file(
+            &*fs,
+            FsObjectId::new(12),
+            &generation_frontier,
+            &guard
+        ),
+        V3::done(())
+    );
+    assert_eq!(binding.mapping().len(), 0);
+    assert_eq!(fs.cache_entry_counts(), (0, 0, 0));
+
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard),
+        V3::Done(_)
+    ));
+    binding
+        .mapping()
+        .insert(12, 0, crate::planner::Ext4ReadMapping::Hole);
+    assert!(binding.mapping().len() > 0);
+
+    let transaction_frontier = tx_subsystems::mount::MountTransactionFrontier::new(0);
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::settle_mount(&*fs, transaction_frontier, &guard),
+        V3::done(())
+    );
+    assert_eq!(binding.mapping().len(), 0);
+    assert_eq!(fs.cache_entry_counts(), (0, 0, 0));
+}
+
+#[test]
+fn ext4_shutdown_settles_mount_caches_and_releases_mount_pin() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let payload = MountPayload::new_cap(
+        fs.clone() as Arc<dyn FsOps>,
+        fs.clone() as Arc<dyn FsPageBacking>,
+        None,
+        DevId::new(90),
+        MountOptions::default(),
+        "ext4",
+        SourceLabel::Static("test"),
+    )
+    .expect("mount payload");
+    fs.bind_mount_payload(&payload);
+    assert_eq!(payload.payload_pin_count(), 1);
+
+    let guard = epoch::guard();
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard),
+        V3::Done(_)
+    ));
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, FsObjectId::new(12), &guard),
+        V3::Done(_)
+    ));
+    assert_ne!(fs.cache_entry_counts(), (0, 0, 0));
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::shutdown(&*fs, &guard),
+        V3::done(())
+    );
+
+    assert_eq!(payload.payload_pin_count(), 0);
+    assert_eq!(fs.cache_entry_counts(), (0, 0, 0));
 }
 
 #[test]

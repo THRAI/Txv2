@@ -6,12 +6,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use tx_ext4_format::Ext4FormatError;
 use tx_ext4_format::capability::CapabilityProfileHash;
 use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
 use tx_ext4_format::pager::{
-    BLOCK_SIZE, BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo,
+    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, BLOCK_SIZE,
 };
+use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
@@ -19,7 +19,7 @@ use tx_subsystems::page_backed::PageContainer;
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
-use crate::journal::Ext4MutationPlanSource;
+use crate::journal::{Ext4MutationPlanSource, JournalMutationRuntime, JournalSettlementObserver};
 use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
@@ -99,6 +99,7 @@ pub(crate) struct Ext4FsInstance<I> {
     inode_meta_cache: SpinMutex<InodeMetaCache>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
+    metadata_mutation_runtime: SpinMutex<Option<Arc<JournalMutationRuntime>>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
     /// every page-cache writeback rejects with `EROFS`. The flag is
@@ -141,6 +142,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
             mount_pin: SpinMutex::new(None),
             file_page_container_binder: SpinMutex::new(None),
+            metadata_mutation_runtime: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
             legacy_writeback_enabled: AtomicBool::new(true),
             capability_profile_hash: SpinMutex::new(None),
@@ -167,6 +169,14 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         if let Some(binder) = self.file_page_container_binder.lock().clone() {
             binder.bind_file_page_container(container);
         }
+    }
+
+    pub(crate) fn bind_metadata_mutation_runtime(&self, runtime: Arc<JournalMutationRuntime>) {
+        *self.metadata_mutation_runtime.lock() = Some(runtime);
+    }
+
+    pub(crate) fn metadata_mutation_runtime(&self) -> Option<Arc<JournalMutationRuntime>> {
+        self.metadata_mutation_runtime.lock().clone()
     }
 
     /// Returns `true` when this mount was opened with `MS_RDONLY`
@@ -301,6 +311,55 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         self.lookup_cache.lock().invalidate_parent(parent);
         self.dir_cache.lock().invalidate(parent);
         self.inode_meta_cache.lock().invalidate(parent);
+    }
+
+    /// Rebuild every mount-local derived view after durable journal settlement.
+    ///
+    /// The pager and BlockImage have already made the home writes durable. The
+    /// remaining mapping and namespace caches are only accelerators and must
+    /// not survive a checkpoint that can change inode, directory, or extent
+    /// metadata.
+    pub(crate) fn settle_metadata_caches(&self) {
+        let _ = self.with_pager(|pager| {
+            pager.settle_image_cache();
+            Ok(())
+        });
+        if let Some(mapping) = self.extent_mapping.as_ref() {
+            mapping.clear();
+        }
+        *self.lookup_cache.lock() = LookupCache::empty();
+        *self.dir_cache.lock() = DirCache::empty();
+        *self.inode_meta_cache.lock() = InodeMetaCache::empty();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_entry_counts(&self) -> (usize, usize, usize) {
+        (
+            self.lookup_cache
+                .lock()
+                .entries
+                .iter()
+                .filter(|entry| entry.valid)
+                .count(),
+            self.dir_cache
+                .lock()
+                .entries
+                .iter()
+                .filter(|entry| entry.valid)
+                .count(),
+            self.inode_meta_cache
+                .lock()
+                .entries
+                .iter()
+                .filter(|entry| entry.valid)
+                .count(),
+        )
+    }
+}
+
+impl<I: BlockImage + Send + 'static> JournalSettlementObserver for Ext4FsInstance<I> {
+    fn settle_after_checkpoint(&self) {
+        self.settle_metadata_caches();
     }
 }
 

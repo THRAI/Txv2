@@ -21,13 +21,15 @@ use tx_subsystems::fs_iface::{
     PageFrameRef,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
-use tx_subsystems::io_manager::page::{PageIoOp, PageIoRequestId, PageIoResult};
+use tx_subsystems::io_manager::page::PageIoOp;
+use tx_subsystems::mount::MountTransactionFrontier;
 use tx_subsystems::page_backed::{
     AnonSwapPolicy, MaterializeAccess, PageCacheError, PageContainer, PageContainerKind, PageIndex,
     PageLease,
 };
 
-use crate::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
+pub use crate::mutation_lifecycle::{JournalFsyncSource, JournalSettlementObserver};
+use crate::planner::Ext4WritePlanSource;
 use crate::sync::SpinMutex;
 
 /// One L5-owned write buffer retained until its L6 completion.
@@ -62,8 +64,9 @@ impl From<BackendBioGraphError> for JournalTransactionPlanError {
 /// A closed ordered-mode transaction before it is submitted to L6.
 ///
 /// The caller owns every supplied `JournalBio` lease. `commit_graph` consumes
-/// none of those leases and makes the commit write FUA-backed. A checkpoint is
-/// intentionally emitted as a separate graph after durable commit completion.
+/// none of those leases and emits explicit device flushes around the commit.
+/// A checkpoint is intentionally emitted as a separate graph after durable
+/// commit completion.
 #[derive(Debug)]
 pub struct JournalTransactionPlan {
     sequence: u32,
@@ -71,6 +74,7 @@ pub struct JournalTransactionPlan {
     data_writes: Vec<JournalBio>,
     descriptor: JournalBio,
     metadata_writes: Vec<JournalBio>,
+    revoke: Option<JournalBio>,
     commit: JournalBio,
     checkpoint_writes: Vec<JournalBio>,
     activation: Option<JournalBio>,
@@ -86,6 +90,26 @@ impl JournalTransactionPlan {
         commit: JournalBio,
         checkpoint_writes: Vec<JournalBio>,
     ) -> Result<Self, JournalTransactionPlanError> {
+        Self::with_revoke(
+            sequence,
+            data_writes,
+            descriptor,
+            metadata_writes,
+            None,
+            commit,
+            checkpoint_writes,
+        )
+    }
+
+    pub fn with_revoke(
+        sequence: u32,
+        data_writes: Vec<JournalBio>,
+        descriptor: JournalBio,
+        metadata_writes: Vec<JournalBio>,
+        revoke: Option<JournalBio>,
+        commit: JournalBio,
+        checkpoint_writes: Vec<JournalBio>,
+    ) -> Result<Self, JournalTransactionPlanError> {
         if metadata_writes.is_empty() {
             return Err(JournalTransactionPlanError::EmptyMetadata);
         }
@@ -96,6 +120,7 @@ impl JournalTransactionPlan {
             data_writes,
             descriptor,
             metadata_writes,
+            revoke,
             commit,
             checkpoint_writes,
             activation: None,
@@ -113,6 +138,10 @@ impl JournalTransactionPlan {
 
     pub const fn sequence(&self) -> u32 {
         self.sequence
+    }
+
+    pub fn contains_data_writes(&self) -> bool {
+        !self.data_writes.is_empty()
     }
 
     pub const fn device(&self) -> DeviceKey {
@@ -133,8 +162,10 @@ impl JournalTransactionPlan {
         builder.finish()
     }
 
-    /// Submit journal descriptor, metadata after-images, and FUA commit only
-    /// after [`Self::data_graph`] has completed successfully.
+    /// Submit journal descriptor, metadata after-images, and an explicit-flush
+    /// commit sequence only after [`Self::data_graph`] has completed
+    /// successfully. The mount has not yet admitted a device that proves FUA,
+    /// so the graph deliberately uses the flush fallback.
     pub fn commit_graph_after_data(&self) -> Result<BackendBioGraph, JournalTransactionPlanError> {
         let mut builder = GraphBuilder::new();
         let activation_fence = self
@@ -156,14 +187,17 @@ impl JournalTransactionPlan {
         for write in &self.metadata_writes {
             journal_ids.push(builder.push(write.clone())?);
         }
+        if let Some(revoke) = &self.revoke {
+            journal_ids.push(builder.push(revoke.clone())?);
+        }
         let journal_fence = builder.push(fence(self.device))?;
         for journal in journal_ids {
             builder.depends_on(journal, journal_fence);
         }
-        let mut commit = self.commit.clone();
-        commit.plan.flags = commit.plan.flags.union(BlockFlags::FUA);
-        let commit = builder.push(commit)?;
+        let commit = builder.push(self.commit.clone())?;
         builder.depends_on(journal_fence, commit);
+        let commit_flush = builder.push(fence(self.device))?;
+        builder.depends_on(commit, commit_flush);
         builder.finish()
     }
 
@@ -200,16 +234,21 @@ impl JournalTransactionPlan {
             builder.depends_on(data_fence, node);
             journal_ids.push(node);
         }
+        if let Some(revoke) = &self.revoke {
+            let node = builder.push(revoke.clone())?;
+            builder.depends_on(data_fence, node);
+            journal_ids.push(node);
+        }
 
         let journal_fence = builder.push(fence(self.device))?;
         for journal in journal_ids {
             builder.depends_on(journal, journal_fence);
         }
 
-        let mut commit = self.commit.clone();
-        commit.plan.flags = commit.plan.flags.union(BlockFlags::FUA);
-        let commit = builder.push(commit)?;
+        let commit = builder.push(self.commit.clone())?;
         builder.depends_on(journal_fence, commit);
+        let commit_flush = builder.push(fence(self.device))?;
+        builder.depends_on(commit, commit_flush);
         builder.finish()
     }
 
@@ -229,15 +268,15 @@ impl JournalTransactionPlan {
         for write in &self.checkpoint_writes {
             home_ids.push(builder.push(write.clone())?);
         }
-        let fence = builder.push(fence(self.device))?;
+        let checkpoint_fence = builder.push(fence(self.device))?;
         for home in home_ids {
-            builder.depends_on(home, fence);
+            builder.depends_on(home, checkpoint_fence);
         }
         if let Some(clean) = &self.clean {
-            let mut clean = clean.clone();
-            clean.plan.flags = clean.plan.flags.union(BlockFlags::FUA);
-            let clean = builder.push(clean)?;
-            builder.depends_on(fence, clean);
+            let clean = builder.push(clean.clone())?;
+            builder.depends_on(checkpoint_fence, clean);
+            let clean_flush = builder.push(fence(self.device))?;
+            builder.depends_on(clean, clean_flush);
         }
         builder.finish().map(Some)
     }
@@ -248,6 +287,7 @@ impl JournalTransactionPlan {
             .iter()
             .chain(core::iter::once(&self.descriptor))
             .chain(self.metadata_writes.iter())
+            .chain(self.revoke.iter())
             .chain(core::iter::once(&self.commit))
             .chain(self.checkpoint_writes.iter())
         {
@@ -483,6 +523,7 @@ impl JournalPagePool {
 pub struct JournalRecordLayout {
     pub descriptor: LbaRange,
     pub metadata: Vec<LbaRange>,
+    pub revoke: Option<LbaRange>,
     pub commit: LbaRange,
 }
 
@@ -491,8 +532,14 @@ impl JournalRecordLayout {
         Self {
             descriptor,
             metadata,
+            revoke: None,
             commit,
         }
+    }
+
+    pub fn with_revoke(mut self, revoke: LbaRange) -> Self {
+        self.revoke = Some(revoke);
+        self
     }
 }
 
@@ -648,11 +695,19 @@ impl JournalRing {
         &self,
         metadata_blocks: usize,
     ) -> Result<JournalRingReservation, JournalRingError> {
+        self.reserve_for(metadata_blocks, false)
+    }
+
+    pub fn reserve_for(
+        &self,
+        metadata_blocks: usize,
+        has_revoke: bool,
+    ) -> Result<JournalRingReservation, JournalRingError> {
         if metadata_blocks == 0 {
             return Err(JournalRingError::EmptyMetadata);
         }
         let record_blocks = metadata_blocks
-            .checked_add(2)
+            .checked_add(2 + usize::from(has_revoke))
             .ok_or(JournalRingError::TooLarge)?;
         if record_blocks > self.blocks.len() - self.first {
             return Err(JournalRingError::TooLarge);
@@ -669,15 +724,22 @@ impl JournalRing {
         let end = cursor + record_blocks;
         let descriptor = self.lba_for(cursor)?;
         let mut metadata = Vec::new();
-        for index in cursor + 1..end - 1 {
+        let metadata_end = end - 1 - usize::from(has_revoke);
+        for index in cursor + 1..metadata_end {
             metadata.push(self.lba_for(index)?);
         }
+        let revoke = has_revoke.then(|| self.lba_for(metadata_end)).transpose()?;
         let mut layout = MutationJournalLayout::new(
             self.device,
             self.sectors_per_block,
             self.journal_uuid,
             state.sequence,
-            JournalRecordLayout::new(descriptor, metadata, self.lba_for(end - 1)?),
+            JournalRecordLayout {
+                descriptor,
+                metadata,
+                revoke,
+                commit: self.lba_for(end - 1)?,
+            },
         );
         if let (Some(page), Some(lba)) = (self.superblock_page, self.superblock_lba) {
             let mut activate = page;
@@ -816,11 +878,20 @@ impl MutationJournalImage {
             });
         }
 
+        let revoked_blocks = mutation
+            .revokes
+            .iter()
+            .map(|revoke| {
+                u32::try_from(revoke.physical_block)
+                    .map_err(|_| MutationJournalImageError::MetadataHomeOutOfRange)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            image: Jbd2TransactionImage::encode_legacy(
+            image: Jbd2TransactionImage::encode_legacy_with_revokes(
                 layout.sequence,
                 layout.journal_uuid,
                 updates,
+                revoked_blocks,
             )?,
             layout,
             data_writes,
@@ -947,6 +1018,14 @@ impl<T> Default for JournalTransactionState<T> {
 }
 
 impl PreparedJournalTransaction {
+    pub fn sequence(&self) -> u32 {
+        self.plan.sequence()
+    }
+
+    pub fn contains_data_writes(&self) -> bool {
+        self.plan.contains_data_writes()
+    }
+
     pub fn stage_mutation_with_data_sources(
         pool: &JournalPagePool,
         mutation: MutationJournalImage,
@@ -955,6 +1034,7 @@ impl PreparedJournalTransaction {
     ) -> Result<Self, PreparedJournalTransactionError> {
         if mutation.data_writes.len() != data_sources.len()
             || mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len()
+            || mutation.layout.records.revoke.is_some() != mutation.image.revoke.is_some()
         {
             return Err(PreparedJournalTransactionError::Layout);
         }
@@ -991,6 +1071,14 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
+        let revoke = stage_revoke_record(
+            pool,
+            device,
+            mutation.image.revoke.as_ref(),
+            mutation.layout.records.revoke,
+            guard,
+            &mut records,
+        )?;
         let commit = pool
             .stage(&mutation.image.commit, guard)
             .map_err(PreparedJournalTransactionError::Pool)?;
@@ -1015,11 +1103,12 @@ impl PreparedJournalTransaction {
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let mut plan = JournalTransactionPlan::new(
+        let mut plan = JournalTransactionPlan::with_revoke(
             sequence,
             data_writes,
             descriptor_bio,
             metadata_writes,
+            revoke,
             commit_bio,
             checkpoint_writes,
         )
@@ -1040,7 +1129,9 @@ impl PreparedJournalTransaction {
         mutation: MutationJournalImage,
         guard: &Guard<'_>,
     ) -> Result<Self, PreparedJournalTransactionError> {
-        if mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len() {
+        if mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len()
+            || mutation.layout.records.revoke.is_some() != mutation.image.revoke.is_some()
+        {
             return Err(PreparedJournalTransactionError::Layout);
         }
         let required_pages = JournalPagePool::required_pages(
@@ -1082,6 +1173,14 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
+        let revoke = stage_revoke_record(
+            pool,
+            device,
+            mutation.image.revoke.as_ref(),
+            mutation.layout.records.revoke,
+            guard,
+            &mut records,
+        )?;
 
         let commit = pool
             .stage(&mutation.image.commit, guard)
@@ -1109,11 +1208,12 @@ impl PreparedJournalTransaction {
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let mut plan = JournalTransactionPlan::new(
+        let mut plan = JournalTransactionPlan::with_revoke(
             sequence,
             data_writes,
             descriptor_bio,
             metadata_writes,
+            revoke,
             commit_bio,
             checkpoint_writes,
         )
@@ -1133,7 +1233,9 @@ impl PreparedJournalTransaction {
         checkpoint_writes: Vec<JournalBio>,
         guard: &Guard<'_>,
     ) -> Result<Self, PreparedJournalTransactionError> {
-        if layout.metadata.len() != image.metadata_blocks.len() {
+        if layout.metadata.len() != image.metadata_blocks.len()
+            || layout.revoke.is_some() != image.revoke.is_some()
+        {
             return Err(PreparedJournalTransactionError::Layout);
         }
         let descriptor = pool
@@ -1152,13 +1254,21 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
+        let revoke = stage_revoke_record(
+            pool,
+            device,
+            image.revoke.as_ref(),
+            layout.revoke,
+            guard,
+            &mut records,
+        )?;
         let commit = pool
             .stage(&image.commit, guard)
             .map_err(PreparedJournalTransactionError::Pool)?;
         let descriptor_bio = records[0].as_journal_bio(device, layout.descriptor);
         let commit_bio = commit.as_journal_bio(device, layout.commit);
         records.push(commit);
-        let plan = JournalTransactionPlan::new(
+        let plan = JournalTransactionPlan::with_revoke(
             tx_ext4_format::journal::Jbd2Commit::parse(&image.commit)
                 .map_err(|_| PreparedJournalTransactionError::Layout)?
                 .header
@@ -1166,6 +1276,7 @@ impl PreparedJournalTransaction {
             data_writes,
             descriptor_bio,
             metadata_writes,
+            revoke,
             commit_bio,
             checkpoint_writes,
         )
@@ -1205,6 +1316,28 @@ fn stage_superblock_state(
     Ok(Some((activate_bio, clean_bio)))
 }
 
+fn stage_revoke_record(
+    pool: &JournalPagePool,
+    device: DeviceKey,
+    bytes: Option<&Page4K>,
+    lba: Option<LbaRange>,
+    guard: &Guard<'_>,
+    records: &mut Vec<JournalRecordLease>,
+) -> Result<Option<JournalBio>, PreparedJournalTransactionError> {
+    match (bytes, lba) {
+        (Some(bytes), Some(lba)) => {
+            let record = pool
+                .stage(bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            let bio = record.as_journal_bio(device, lba);
+            records.push(record);
+            Ok(Some(bio))
+        }
+        (None, None) => Ok(None),
+        _ => Err(PreparedJournalTransactionError::Layout),
+    }
+}
+
 fn journal_bio_from_l4_source(
     device: DeviceKey,
     lba: LbaRange,
@@ -1220,159 +1353,13 @@ fn journal_bio_from_l4_source(
         _ => {
             return Err(PreparedJournalTransactionError::Plan(
                 JournalTransactionPlanError::EmptyWrite,
-            ))
+            ));
         }
     };
     Ok(JournalBio::new(
         BioPlan::new(device, BlockOp::Write, lba, vecs, BlockFlags::EMPTY),
         source,
     ))
-}
-
-/// Ext4 mount-owned bridge from fsync requests to retained JBD2 transactions.
-///
-/// The source owns the prepared transaction and hence every journal-record
-/// lease until the matching L4 graph completion makes the commit durable.
-pub struct JournalFsyncSource {
-    state: SpinMutex<JournalFsyncSourceState>,
-}
-
-struct JournalFsyncSourceState {
-    transaction: JournalTransactionState<PreparedJournalTransaction>,
-    data_submitted: Option<PageIoRequestId>,
-    commit_submitted: Option<PageIoRequestId>,
-    checkpoint_submitted: bool,
-    ring_reservation: Option<(Arc<JournalRing>, JournalRingReservation)>,
-}
-
-impl JournalFsyncSource {
-    pub const fn new() -> Self {
-        Self {
-            state: SpinMutex::new(JournalFsyncSourceState {
-                transaction: JournalTransactionState::new(),
-                data_submitted: None,
-                commit_submitted: None,
-                checkpoint_submitted: false,
-                ring_reservation: None,
-            }),
-        }
-    }
-
-    pub fn begin(
-        &self,
-        transaction: PreparedJournalTransaction,
-    ) -> Result<(), JournalTransactionStateError> {
-        self.state.lock().transaction.begin(transaction)
-    }
-
-    pub fn begin_with_ring(
-        &self,
-        transaction: PreparedJournalTransaction,
-        ring: Arc<JournalRing>,
-        reservation: JournalRingReservation,
-    ) -> Result<(), JournalTransactionStateError> {
-        let mut state = self.state.lock();
-        state.transaction.begin(transaction)?;
-        state.ring_reservation = Some((ring, reservation));
-        Ok(())
-    }
-
-    pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
-        if request.op != PageIoOp::Writeback {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EINVAL);
-        }
-        let mut state = self.state.lock();
-        if state.data_submitted.is_some() || state.commit_submitted.is_some() {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
-        }
-        let Some(transaction) = state.transaction.active() else {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EAGAIN);
-        };
-        let graph = match transaction.plan().data_graph() {
-            Ok(graph) => graph,
-            Err(_) => return BackendPlan::Err(tx_subsystems::execution::Errno::EIO),
-        };
-        state.data_submitted = Some(request.id);
-        BackendPlan::SubmitGraph(graph)
-    }
-
-    pub fn complete_data(&self, completion: BackendPageCompletion) {
-        if completion.op != PageIoOp::Writeback {
-            return;
-        }
-        let mut state = self.state.lock();
-        if state.data_submitted != Some(completion.id) {
-            return;
-        }
-        state.data_submitted = None;
-        match completion.result {
-            PageIoResult::Done => {
-                let _ = state.transaction.mark_data_durable();
-            }
-            PageIoResult::Err(_) => {
-                let _ = state.transaction.discard();
-            }
-        }
-    }
-
-    /// Build the post-commit checkpoint graph while retaining transaction leases.
-    pub fn take_checkpoint_graph(
-        &self,
-    ) -> Result<Option<BackendBioGraph>, JournalTransactionStateError> {
-        let mut state = self.state.lock();
-        if state.checkpoint_submitted {
-            return Err(JournalTransactionStateError::Busy);
-        }
-        let Some(transaction) = state.transaction.checkpoint_ready()? else {
-            return Ok(None);
-        };
-        let graph = transaction
-            .plan()
-            .checkpoint_graph_after_commit()
-            .map_err(|_| JournalTransactionStateError::NotCommitted)?;
-        state.checkpoint_submitted = graph.is_some();
-        Ok(graph)
-    }
-
-    /// Record one checkpoint graph terminal result.
-    ///
-    /// An I/O error leaves the committed transaction and its record leases
-    /// intact for a later checkpoint retry. Only a successful home-write graph
-    /// releases journal space.
-    pub fn complete_checkpoint_result(
-        &self,
-        result: Result<(), Errno>,
-    ) -> Result<(), JournalTransactionStateError> {
-        let mut state = self.state.lock();
-        if !state.checkpoint_submitted {
-            return Err(JournalTransactionStateError::NotCommitted);
-        }
-        state.checkpoint_submitted = false;
-        if result.is_err() {
-            return Ok(());
-        }
-        let _ = state.transaction.complete_checkpoint()?;
-        let ring_reservation = state.ring_reservation.take();
-        state.data_submitted = None;
-        state.commit_submitted = None;
-        drop(state);
-        if let Some((ring, reservation)) = ring_reservation {
-            ring.complete(&reservation, true)
-                .map_err(|_| JournalTransactionStateError::NotCommitted)?;
-        }
-        Ok(())
-    }
-
-    /// Release retained transaction leases only after checkpoint I/O completes.
-    pub fn complete_checkpoint(&self) -> Result<(), JournalTransactionStateError> {
-        self.complete_checkpoint_result(Ok(()))
-    }
-}
-
-impl Default for JournalFsyncSource {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Mount-owned admission path from immutable ext4 mutations into JBD2 state.
@@ -1525,6 +1512,10 @@ impl JournalMutationRuntime {
         Arc::clone(&self.source)
     }
 
+    pub fn snapshot_transaction_frontier(&self) -> MountTransactionFrontier {
+        self.source.active_transaction_frontier()
+    }
+
     pub fn begin_mutation(
         &self,
         mutation: &Ext4MutationPlan,
@@ -1535,7 +1526,7 @@ impl JournalMutationRuntime {
             Ok(image) => image,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)));
             }
         };
         let transaction = match PreparedJournalTransaction::stage_mutation(&self.pool, image, guard)
@@ -1543,10 +1534,10 @@ impl JournalMutationRuntime {
             Ok(transaction) => transaction,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)));
             }
         };
-        self.begin_transaction(transaction, reservation)
+        self.begin_transaction(transaction, reservation, mutation.deferred_frees.clone())
     }
 
     pub fn begin_mutation_with_data_sources(
@@ -1560,7 +1551,7 @@ impl JournalMutationRuntime {
             Ok(image) => image,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)));
             }
         };
         let transaction = match PreparedJournalTransaction::stage_mutation_with_data_sources(
@@ -1572,10 +1563,10 @@ impl JournalMutationRuntime {
             Ok(transaction) => transaction,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)));
             }
         };
-        self.begin_transaction(transaction, reservation)
+        self.begin_transaction(transaction, reservation, mutation.deferred_frees.clone())
     }
 
     pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
@@ -1601,7 +1592,7 @@ impl JournalMutationRuntime {
         }
         let ring = self.ring.as_ref().expect("runtime has layout or ring");
         let reservation = ring
-            .reserve(mutation.metadata.len())
+            .reserve_for(mutation.metadata.len(), !mutation.revokes.is_empty())
             .map_err(|_| JournalMutationRuntimeError::Busy(JournalTransactionStateError::Busy))?;
         Ok((
             reservation.layout.clone(),
@@ -1613,12 +1604,14 @@ impl JournalMutationRuntime {
         &self,
         transaction: PreparedJournalTransaction,
         reservation: Option<(Arc<JournalRing>, JournalRingReservation)>,
+        deferred_frees: Vec<tx_ext4_format::mutation::DeferredFreeClaim>,
     ) -> Result<(), JournalMutationRuntimeError> {
         match reservation {
             Some((ring, reservation)) => match self.source.begin_with_ring(
                 transaction,
                 Arc::clone(&ring),
                 reservation.clone(),
+                deferred_frees,
             ) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -1626,7 +1619,9 @@ impl JournalMutationRuntime {
                     Err(error)
                 }
             },
-            None => self.source.begin(transaction),
+            None => self
+                .source
+                .begin_with_deferred_frees(transaction, deferred_frees),
         }
         .map_err(JournalMutationRuntimeError::Busy)
     }
@@ -1640,78 +1635,6 @@ impl JournalMutationRuntime {
             let _ = ring.complete(&reservation, false);
         }
         error
-    }
-}
-
-impl Ext4FsyncPlanSource for JournalFsyncSource {
-    fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan {
-        if request.op != PageIoOp::Fsync {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EINVAL);
-        }
-        let mut state = self.state.lock();
-        if state.data_submitted.is_some() || state.commit_submitted.is_some() {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
-        }
-        let Some(transaction) = state.transaction.active() else {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EAGAIN);
-        };
-        let graph = match transaction.plan().commit_graph_after_data() {
-            Ok(graph) => graph,
-            Err(_) => return BackendPlan::Err(tx_subsystems::execution::Errno::EIO),
-        };
-        if state.transaction.mark_commit_submitted().is_err() {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
-        }
-        state.commit_submitted = Some(request.id);
-        BackendPlan::SubmitGraph(graph)
-    }
-
-    fn complete_fsync(&self, completion: BackendPageCompletion) {
-        if completion.op != PageIoOp::Fsync {
-            return;
-        }
-        let mut state = self.state.lock();
-        if state.commit_submitted != Some(completion.id) {
-            return;
-        }
-        state.commit_submitted = None;
-        match completion.result {
-            PageIoResult::Done => {
-                let _ = state.transaction.mark_commit_durable();
-            }
-            PageIoResult::Err(_) => {
-                let _ = state.transaction.discard();
-            }
-        }
-    }
-
-    fn take_background_graph(&self) -> Result<Option<BackendBioGraph>, Errno> {
-        self.take_checkpoint_graph().map_err(|error| match error {
-            JournalTransactionStateError::Busy => Errno::EBUSY,
-            _ => Errno::EIO,
-        })
-    }
-
-    fn complete_background_graph(&self, result: Result<(), Errno>) {
-        let _ = self.complete_checkpoint_result(result);
-    }
-}
-
-impl Ext4FsyncPlanSource for Arc<JournalFsyncSource> {
-    fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan {
-        self.as_ref().plan_fsync(request)
-    }
-
-    fn complete_fsync(&self, completion: BackendPageCompletion) {
-        self.as_ref().complete_fsync(completion);
-    }
-
-    fn take_background_graph(&self) -> Result<Option<BackendBioGraph>, Errno> {
-        self.as_ref().take_background_graph()
-    }
-
-    fn complete_background_graph(&self, result: Result<(), Errno>) {
-        self.as_ref().complete_background_graph(result);
     }
 }
 

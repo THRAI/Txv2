@@ -23,7 +23,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod runtime {
     pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::zone::{
-        register_zone_for, sign, Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap,
-        PayloadPolicy, SlotKey, Zone, ZoneAllocated, ZoneError,
+        Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap, PayloadPolicy, SlotKey, Zone,
+        ZoneAllocated, ZoneError, register_zone_for, sign,
     };
 }

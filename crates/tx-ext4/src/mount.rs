@@ -12,8 +12,8 @@ use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
+use tx_subsystems::vfs::FsOps;
 
 use crate::journal::{
     JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool,
@@ -21,9 +21,9 @@ use crate::journal::{
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
 pub use crate::read_backend::FilePageContainerBinder;
 use crate::read_backend::{
-    EXT4_ROOT_INODE, Ext4FsInstance, Ext4PagerMutationPlanSource, map_inode_meta,
+    map_inode_meta, Ext4FsInstance, Ext4PagerMutationPlanSource, EXT4_ROOT_INODE,
 };
-use tx_ext4_format::{clean_replayed_journal, replay_journal};
+use tx_ext4_format::recover_if_required;
 
 pub struct MountedExt4<I> {
     backend: Arc<Ext4FsInstance<I>>,
@@ -174,14 +174,20 @@ where
     I: BlockImage + Send + 'static,
 {
     let mutation_provider = Ext4PagerMutationPlanSource::new();
+    let source = runtime.source();
+    let metadata_runtime = Arc::clone(&runtime);
     let binding = Ext4PlannerBinding::with_plan_sources(
         geometry,
-        runtime.source(),
+        source.clone(),
         JournalMutationWriteSource::new(mutation_provider.clone(), runtime),
     );
     let mounted = open_ext4_with_planner_binding(image, false, binding)?;
     mounted.backend.disable_legacy_writeback();
     mutation_provider.bind(&mounted.backend);
+    mounted
+        .backend
+        .bind_metadata_mutation_runtime(metadata_runtime);
+    source.bind_settlement_observer(mounted.backend.clone());
     Ok(mounted)
 }
 
@@ -197,11 +203,16 @@ where
 {
     validate_tier1_rw_profile(&image)?;
     let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    let superblock = pager.superblock();
     let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
     let mut image = pager.into_inner();
-    let replay = replay_journal(&mut image, &journal_geometry).map_err(|_| Errno::EIO)?;
-    clean_replayed_journal(&mut image, &journal_geometry, replay.next_sequence)
-        .map_err(|_| Errno::EIO)?;
+    let _recovery =
+        recover_if_required(&mut image, &superblock, &journal_geometry).map_err(|_| Errno::EIO)?;
+    let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    pager.mark_recovery_required().map_err(|_| Errno::EIO)?;
+    let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
+    let next_sequence = journal_geometry.superblock.sequence;
+    let image = pager.into_inner();
     let source = Arc::new(JournalFsyncSource::new());
     let runtime = Arc::new(
         JournalMutationRuntime::from_geometry_with_sequence(
@@ -210,7 +221,7 @@ where
             device,
             geometry.sectors_per_block,
             journal_geometry,
-            replay.next_sequence,
+            next_sequence,
         )
         .map_err(|_| Errno::EIO)?,
     );

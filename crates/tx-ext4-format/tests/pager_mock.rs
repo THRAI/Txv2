@@ -1,4 +1,4 @@
-use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
+use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin, SetAttr};
 use tx_ext4_format::ondisk::{
     block_bitmap_csum32, crc32c, crc32c_append, group_desc_csum16, inode_csum32, metadata_csum32,
     superblock_csum32, BitmapMut, BitmapView, CommitHeader, DirEntryIter, DxCountLimit, DxEntry,
@@ -238,6 +238,22 @@ fn pager_reads_inode_meta_and_4k_pages() {
         PageRead::Data { block: 30 }
     );
     assert_eq!(page, filled_page(0x30));
+}
+
+#[test]
+fn read_write_admission_persists_recovery_required_before_mutation() {
+    let image = mock_image();
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    pager.mark_recovery_required().unwrap();
+
+    let superblock = Superblock::parse(&pager.image().block(0)[1024..2048]).unwrap();
+    assert!(superblock.needs_recovery());
+    assert_ne!(
+        superblock.feature_compat & Superblock::FEATURE_COMPAT_HAS_JOURNAL,
+        0
+    );
+    assert_eq!(pager.image().barriers, 1);
 }
 
 #[test]
@@ -506,6 +522,100 @@ fn pager_plans_metadata_checksum_after_images_for_hole_write() {
         u32::from_le_bytes(bytes[1020..1024].try_into().unwrap()),
         superblock_csum32(bytes).unwrap()
     );
+}
+
+#[test]
+fn setattr_plan_preserves_unknown_inode_bytes_and_updates_checksum() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    let inode_offset = 11 * 256;
+    image.block_mut(4)[inode_offset + 200] = 0xA5;
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_setattr_mode(InodeNo::new(12), 0o755, FsyncStamp::new(13))
+        .unwrap();
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let inode_bytes = &inode_table.after[inode_offset..inode_offset + 256];
+
+    assert_eq!(
+        Inode::parse(inode_bytes).unwrap().mode,
+        Inode::S_IFREG | 0o755
+    );
+    assert_eq!(inode_bytes[200], 0xA5);
+    let stored_checksum = u32::from(u16::from_le_bytes(
+        inode_bytes[124..126].try_into().unwrap(),
+    )) | (u32::from(u16::from_le_bytes(
+        inode_bytes[130..132].try_into().unwrap(),
+    )) << 16);
+    assert_eq!(
+        stored_checksum,
+        inode_csum32(
+            crc32c_append(0xFFFF_FFFF, &superblock.uuid),
+            12,
+            u32::from_le_bytes(inode_bytes[100..104].try_into().unwrap()),
+            inode_bytes
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn setattr_plan_updates_owner_and_times_without_mutating_home_inode() {
+    let image = mock_image();
+    let before = *image.block(4);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let owner = pager
+        .plan_setattr(
+            InodeNo::new(12),
+            SetAttr::Owner {
+                uid: Some(0x1_0002),
+                gid: Some(0x3_0004),
+            },
+            FsyncStamp::new(14),
+        )
+        .unwrap();
+    let owner_inode = owner
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let owner_inode = Inode::parse(&owner_inode.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(owner_inode.uid, 0x1_0002);
+    assert_eq!(owner_inode.gid, 0x3_0004);
+    assert!(owner_inode.is_file());
+
+    let times = pager
+        .plan_setattr(
+            InodeNo::new(12),
+            SetAttr::Times {
+                atime_ns: Some(5_000_000_123),
+                mtime_ns: Some(8_000_000_999),
+                ctime_ns: 13_000_000_001,
+            },
+            FsyncStamp::new(15),
+        )
+        .unwrap();
+    let times_inode = times
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let times_inode = Inode::parse(&times_inode.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(
+        (times_inode.atime, times_inode.mtime, times_inode.ctime),
+        (5, 8, 13)
+    );
+    assert_eq!(pager.image().block(4), &before);
 }
 
 #[test]

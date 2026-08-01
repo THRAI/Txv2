@@ -1,3 +1,91 @@
+- 2026-08-01 (origin/main merge readiness plan).
+  Added `docs/superpowers/plans/2026-08-01-merge-origin-main.md` after
+  checking the refreshed `origin/main` merge surface from
+  `codex/test-remote-network`. Current facts: `origin/main` is 102 commits
+  ahead, the branch is 149 commits ahead, `git merge-tree --write-tree
+  --messages HEAD origin/main` reports 46 merge conflicts, and 31 currently
+  dirty tracked files overlap remote changes. The plan requires preserving the
+  dirty ext4/page-backed state first, then resolving the merge in an isolated
+  worktree by conflict domain. Verification for this planning step: plan
+  self-review plus scoped diff/placeholder checks. Next: choose stash vs WIP
+  commit for the dirty state, then execute the isolated merge plan. Blocker:
+  direct merge in the current dirty checkout is unsafe.
+
+- 2026-07-31 (ext4 Task 13 file generation frontier settlement).
+  Advanced Task 13 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `FileFsyncState` can now be initialized from a
+  captured `FileFsyncFrontier`; `sys_fsync` snapshots the file PageBacked
+  generation frontier once, drives `FileFsyncOp` with that same frontier, and
+  passes it into `SettlementScope::File`. `FsOps::settle_file` receives the
+  `FsObjectId` plus borrowed generation frontier, and the mount settlement
+  lifecycle test records the exact frontier delivered to the backend hook.
+  Existing Task 13 work remains in place: backend file/mount/detach hooks,
+  ext4 cache settlement hooks, per-open errseq cursors, namespace
+  `sync`/`syncfs`/`fsync`/`fdatasync` routing, and lazy-detach background
+  settlement queue/retry. Verification passed `cargo test -p tx-subsystems
+  --lib settlement_lifecycle_tests -- --test-threads=1` (11), `cargo test -p
+  tx-subsystems --lib page_backed -- --test-threads=1` (154), `cargo test -p
+  tx-shims --lib fd_ops_wave2 -- --test-threads=1` (52), `cargo test -p
+  tx-ext4 --lib --no-default-features` (37), and `cargo -q xtask unit` (646 +
+  114 + 37 + 166), with scoped `rustfmt`. Remaining blockers: mount
+  transaction frontier capture, public setattr admission, production cutover,
+  and G0-G7 QEMU/e2fsck/xfstests evidence.
+
+- 2026-07-31 (ext4 mount settlement op and shutdown hook).
+  Advanced Task 13 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  without marking it complete. `FsOps` now has a default no-op `shutdown`,
+  `MountSettlementOp` owns a `MountPayloadPin` while driving detach-scope
+  settlement, records backend shutdown errors through the mount `ErrorSeq`, and
+  moves successful detach to `Detached` or failed detach to `RecoveryOnly`.
+  Ext4 now has `crates/tx-ext4/src/settlement.rs`; its shutdown hook settles
+  pager/mapping/lookup/directory/inode caches and releases the backend-held
+  mount pin. Verification passed `cargo test -p tx-subsystems --lib
+  settlement_lifecycle_tests -- --test-threads=1`, `cargo test -p tx-ext4
+  --lib --no-default-features`, scoped `rustfmt`, and scoped `git diff
+  --check`. Remaining blockers: syscall routing for fsync/fdatasync/syncfs/
+  sync/umount, lazy-detach queue ownership, open-file error cursors, public
+  setattr admission through the mutation owner, and G0-G7 QEMU/e2fsck/xfstests
+  evidence.
+
+- 2026-07-30 (ext4 Tier 1 failure settlement).
+  Completed Task 6 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  `MutationHandle` now transitions known pre-commit data/commit failure through
+  `AbortRequested -> AbortDraining -> RolledBack` before releasing its journal
+  extent. An explicit unknown-commit path preserves the handle and extent,
+  records `EIO`, and rejects new writeback/fsync plans through the local
+  `RecoveryOnly` gate. A checkpoint failure likewise records `EIO` but retains
+  its transaction and extent for retry. Verification passed `cargo test -p
+  tx-ext4 --test mutation_lifecycle` (4), `cargo test -p tx-ext4 --test
+  journal_prepared_transaction` (8), and `cargo test -p tx-ext4 --lib
+  --no-default-features` (34), and `cargo -q xtask unit` (639 + 114 + 34 +
+  166), with scoped formatting and diff checks. This is source-local lifecycle
+  state only: Task 7 must still
+  wire actual FUA/flush ordering, while Task 13 must project errors through
+  mounted-instance errseq and syscall cursors.
+
+- 2026-07-30 (ext4 Tier 1 MutationHandle foundation).
+  Completed Task 5 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  Private `crates/tx-ext4/src/mutation_lifecycle.rs` now owns each prepared
+  journal transaction, optional journal-ring extent, data/commit request IDs,
+  phase-local error state, and checkpoint retry state; it retains no epoch
+  guard or L4 `PageDataLease` bundle. `JournalFsyncSource` remains a compatible
+  `journal` re-export while its lifecycle callbacks moved into that module.
+  Data I/O failure now consumes the handle and releases its extent instead of
+  leaving the ring permanently busy; successful checkpoint still releases it
+  only after completion. Verification passed `cargo test -p tx-ext4 --test
+  mutation_lifecycle` (1), `cargo test -p tx-ext4 --test
+  journal_prepared_transaction` (8), `cargo test -p tx-ext4 --lib
+  --no-default-features` (34), and `cargo -q xtask unit` (639 + 114 + 34 +
+  166), plus scoped `rustfmt` and `git diff --check`. `cargo xtask lint arch`
+  reduced the existing total from 91 to 90 by removing the `journal.rs` length
+  finding; its remaining output is unrelated pre-existing debt. Task 6 remains
+  required for AbortDraining, CommitUnknown/RecoveryOnly, and mount error
+  policy; Task 7 remains required for actual FUA/flush durability.
+
 - 2026-07-30 (ext4 Tier 1 PageBacked lifecycle migration).
   Completed Task 4 of
   `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json` in
@@ -61,6 +149,3036 @@
   acceptance remains blocked by the current
   direct home-write paths, ignored FUA/recovery gaps, and absent live QEMU /
   e2fsck / xfstests receipt. Next: execute Task 1 in an isolated worktree.
+
+- 2026-07-28 (memory/I/O ext4 V2 Alpine xfstests real ledger fixture).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `a983551b test(ext4): use real alpine xfstests selection ledger
+  fixture`, correcting the Alpine xfstests build-plan test helper that still
+  wrote fake `{"fixture":"selection-ledger"}` JSON on a path consumed by
+  `tools/ext4/build_alpine_xfstests.py` through the shared
+  `load_selection_manifest()` authority boundary. The helper now writes a real
+  `tx.ext4.xfstests_selection_ledger.v1` DTO with status, source-lock path/hash,
+  revision, selected entries and an active ext4 txdoc authority anchor. The
+  residual fake-fixture audit found only deliberate negative source-lock
+  coverage in `test_ext4_xfstests_manifest_authority.py` and a guest-runner
+  local manifest payload that does not call the Python shared loader.
+  Verification passed `tools.tests.test_ext4_build_alpine_xfstests` 5/5,
+  build-alpine plus manifest-authority tests 10/10, full xfstests Python
+  collection 153/153, `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, Python compile
+  for touched files, `git diff --check`, `git diff --cached --check`, and
+  `git show --check --stat HEAD`; coordinator spot-check reran the 10 focused
+  Python tests and `cargo test -p xtask ext4 -- --test-threads=1` 80/80. This
+  is fixture/contract cleanup only; live QEMU xfstests, post-run `e2fsck`,
+  upstream-lock and product acceptance evidence remain absent.
+
+- 2026-07-28 (memory/I/O ext4 V2 source-lock content authority gate).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `52157858 fix(ext4): validate xfstests source lock authority
+  early`, closing a remaining shared-loader bypass: a selected manifest could
+  carry a hash-correct `source_lock` file reference whose referenced file still
+  contained fake or stale source-lock content. `tools/ext4/xfstests_manifest_authority.py`
+  now validates the referenced `tx.ext4.xfstests_source_lock.v1` object itself
+  before any shared manifest-authority consumer continues, including schema,
+  `source-pinned-only` status, HTTPS `.git` source URL, 40-hex revision and
+  64-hex `check_sha256`. The xfstests test fixtures were upgraded away from
+  fixture-only source-lock/selection-ledger JSON where they cross that loader.
+  Verification passed the new shared-loader source-lock RED/GREEN test,
+  shared-loader tests 5/5, full xfstests Python collection 153/153,
+  `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, Python compile
+  for touched files, `git diff --check`, `git diff --cached --check`, and
+  `git show --check --stat HEAD`; coordinator spot-check reran shared-loader
+  tests 5/5 and `cargo test -p xtask ext4 -- --test-threads=1` 80/80. This is
+  host-contract hardening only; live QEMU xfstests, post-run `e2fsck`,
+  upstream-lock and product acceptance evidence remain absent.
+
+- 2026-07-28 (memory/I/O ext4 V2 shared manifest projection gate).
+  The coordinator committed `430ccbc5 fix(ext4): validate xfstests manifest
+  projections early` in the `ext4-journal-settlement` worktree. The previous
+  early authority loader validated ledger shape and authority references, but
+  selected manifests with `tests`/`exclusions` fields could still drift from
+  the referenced selection ledger unless a later entrypoint called the final
+  verifier's projection check. `xfstests_manifest_authority.load_selection_manifest`
+  now rejects selected/excluded projection drift whenever those fields are
+  present, so guest-bundle, guest-availability, guest-shell-env, guest-payload,
+  prepared-run, shell-test, executor, metadata and image-building paths all get
+  the same early fail-closed behavior. Verification passed the new shared-loader
+  RED/GREEN projection tests, shared-loader tests 4/4, full xfstests Python
+  collection 152/152, `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, Python compile
+  for touched files, `git diff --check`, `git diff --cached --check`, and
+  `git show --check --stat HEAD`. This is host-contract hardening only; live
+  xfstests/e2fsck/product acceptance evidence remains absent.
+
+- 2026-07-28 (memory/I/O ext4 V2 early manifest authority validation).
+  The coordinator continued the same V2 host-side contract lane in the
+  `ext4-journal-settlement` worktree and committed `66037ff8 fix(ext4):
+  validate xfstests manifest authority early`. The gap was that early
+  side-effect boundaries using `xfstests_manifest_authority.load_selection_manifest`
+  only checked manifest file-reference hashes and did not parse the referenced
+  selection ledger's source-lock binding, revision, entry/exclusion shape,
+  Tier-1/Tier-2 inclusion rule, or auditable authority references. The shared
+  loader now validates those ledger properties before guest-bundle,
+  guest-availability, guest-shell-env, guest-payload, prepared-run,
+  shell-test, executor, metadata and image-building paths consume the selected
+  manifest authority. Verification passed the new shared-loader RED/GREEN
+  tests, full xfstests Python collection 150/150, `cargo test -p xtask ext4
+  -- --test-threads=1` 80/80, `cargo -q xtask unit`,
+  `cargo fmt --check --package xtask`, Python compile for touched files,
+  `git diff --check`, `git diff --cached --check`, and `git show --check
+  --stat HEAD`. This moves the fake-authority rejection earlier in the V2 run
+  chain; it still does not create the actual Tier selection ledger, selected
+  manifests, QEMU xfstests receipt, post-run e2fsck, upstream-lock or product
+  evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 shell-test manifest selection drift gate).
+  The coordinator committed `5b6055e9 fix(ext4): reject xfstests manifest
+  selection drift early` in the same `ext4-journal-settlement` worktree. This
+  closes a shell-test planning bypass left after shared authority validation:
+  a selected manifest could keep a valid ledger reference/hash but mutate its
+  concrete `tests`/`exclusions` projection, and the final verifier would reject
+  it only after later artifacts existed. `run_xfstests_shell_test.py` now
+  invokes the manifest-vs-selection-ledger projection check before writing a
+  shell-test plan or launching the shell-test bridge. Verification passed the
+  new shell-test RED/GREEN test, shell-test planner tests 19/19, full xfstests
+  Python collection 150/150, `git diff --check`, `git diff --cached --check`,
+  and `git show --check --stat HEAD`; the same working diff had already passed
+  `cargo test -p xtask ext4 -- --test-threads=1`, `cargo -q xtask unit`,
+  `cargo fmt --check --package xtask`, and Python compile in the preceding
+  shared-loader gate. This is still host-contract hardening only, not live
+  xfstests/e2fsck/product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 selection authority reference resolution).
+  The coordinator completed a follow-up contract slice in the
+  `ext4-journal-settlement` worktree and committed `566e8684 fix(ext4):
+  resolve xfstests selection authority refs`. The prior `47525295` slice
+  required authority strings to look auditable, but it still accepted a
+  syntactically valid active-doc reference whose txdoc anchor did not exist, or
+  a `docs/progress/` reference to a missing artifact. Manifest preparation and
+  final result verification now resolve active ext4 txdoc authority anchors
+  against `docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md` and require
+  `docs/progress/` authority paths to exist. Verification passed the new
+  missing-anchor RED/GREEN tests, selection-ledger plus result-verifier Python
+  tests 33/33, full xfstests Python collection 147/147, `cargo test -p xtask
+  ext4 -- --test-threads=1` 80/80, `cargo -q xtask unit`,
+  `cargo fmt --check --package xtask`, Python compile for touched files,
+  `git diff --check`, `git diff --cached --check`, and `git show --check
+  --stat HEAD`. This further prevents fake Tier authority references; it still
+  does not create the actual Tier selection ledger, selected manifests, QEMU
+  xfstests receipt, post-run e2fsck, upstream-lock or product acceptance
+  evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 auditable selection authority).
+  The coordinator completed the next host-side contract slice in the
+  `ext4-journal-settlement` worktree and committed `47525295 fix(ext4):
+  require auditable xfstests selection authority`. The gap was that
+  `tx.ext4.xfstests_selection_ledger.v1` accepted arbitrary non-empty
+  `selection_authority` and exclusion `authority` strings, so a future Tier
+  manifest could be promoted from a ledger whose case/exclusion authority was
+  only prose such as a local spreadsheet. Manifest preparation and final result
+  verification now require selection/exclusion authority strings to reference
+  an active ext4 txdoc anchor or a `docs/progress/` artifact, and exclusion
+  `tracking_ref` must use `TXEXT4-<number>`. Verification passed the new
+  RED/GREEN selection-ledger and result-verifier tests, full selection-ledger
+  plus result-verifier tests 31/31, full xfstests Python collection 145/145,
+  `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, Python compile
+  for touched files, `git diff --check`, `git diff --cached --check`, and
+  `git show --check --stat HEAD`. This prevents fake Tier authority in host
+  contracts; it still does not create the actual Tier selection ledger, selected
+  manifests, QEMU xfstests receipt, post-run e2fsck, upstream-lock or product
+  evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 pinned xfstests source materialized).
+  After `3c351020`, the coordinator audited the live V2 inputs in the
+  `ext4-journal-settlement` worktree. `external/xfstests` was absent even
+  though `tools/ext4/xfstests-source.lock.json` carried a real official
+  xfstests-dev lock. The coordinator cloned
+  `https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git` into
+  `external/xfstests`, checked out
+  `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509`, and verified the lock's
+  `check` SHA-256
+  `104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642`.
+  The local xfstests worktree is detached at the locked revision, origin-bound
+  to the official URL, and clean. This removes the missing local source mirror
+  input only; it does not create a Tier selection ledger, selected-case
+  manifest, prepared TEST/SCRATCH images, guest payload, QEMU xfstests receipt,
+  post-run e2fsck evidence, upstream-lock or product acceptance evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 shell-env request binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `3c351020 fix(ext4): bind shell-env ancestry to executor request`,
+  closing the same request-drift class one step earlier in the shell-test
+  execution path: `execute_xfstests_run.py` could validate a guest-shell-env
+  ancestry chain without proving it belonged to the current executor
+  `--request`, and the shell-test planner/execute-plan validation did not pass
+  that expected request through. The executor now requires the guest-shell-env
+  ancestry request to match the current request before launching the runner;
+  shell-test planning and execute-plan payload checks pass that expected
+  request through as well. Lane verification reported the new RED/GREEN
+  mismatch test, adjacent executor checks, full executor Python tests 31/31,
+  full xfstests Python collection 142/142, `cargo test -p xtask ext4
+  -- --test-threads=1` 80/80, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask` and `git diff --check`. Coordinator verification passed
+  `git show --check --stat HEAD`, confirmed the only dirty file in the journal
+  worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, reran the focused mismatch
+  test, reran executor Python tests 31/31, and reran `cargo test -p xtask ext4
+  -- --test-threads=1` 80/80. This is protocol/plumbing repair only; no live
+  QEMU was run, so no real xfstests result, post-run image collection, real
+  Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace or product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 metadata request binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `c6a8f881 fix(ext4): bind metadata ancestry to request`, closing a
+  second metadata assembly ancestry bypass after `f02e90c9`: the assembler
+  required `--guest-shell-env`, but accepted a valid guest-shell-env ancestry
+  from a different xfstests executor request. The shared ancestry helper now
+  returns the resolved executor request path, and
+  `assemble_xfstests_run_metadata.py` rejects guest-shell-env ancestry whose
+  request does not match the current `--request`. Lane verification reported
+  the new mismatch RED/GREEN test, positive metadata assembly, related
+  ancestry/executor Python tests 56/56, full xfstests Python collection
+  141/141, `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask` and `git diff
+  --check`. Coordinator verification passed `git show --check --stat HEAD`,
+  confirmed the only dirty file in the journal worktree is the pre-existing
+  unrelated `xtask/src/lint_invariants_api_language.rs`, reran
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_run_prepare` 15/15 and reran
+  `cargo test -p xtask ext4 -- --test-threads=1` 80/80. This is
+  protocol/plumbing repair only; no live QEMU was run, so no real xfstests
+  result, post-run image collection, real Linux/e2fsprogs `e2fsck -fn`,
+  upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 metadata ancestry requirement).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `f02e90c9 fix(ext4): require xfstests metadata ancestry`, closing
+  an independent metadata assembly bypass: `assemble_xfstests_run_metadata.py`
+  could validate guest-shell-env ancestry when given `--guest-shell-env`, but
+  that input was optional, and `cargo xtask ext4 xfstests run metadata` did
+  not forward it. Standalone metadata assembly could therefore bypass the
+  guest-shell-env/bootstrap ancestry chain and generate run metadata from only
+  executor artifacts. The assembler now requires `--guest-shell-env`, and the
+  xtask metadata entrypoint requires and forwards it. Coordinator verification
+  passed `git show --check --stat HEAD`, confirmed the only dirty file in the
+  journal worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, focused run-prepare Python
+  tests 14/14, focused xtask metadata delegation 1/1, full xfstests Python
+  collection 140/140, `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask` and `git diff
+  --check`. This is protocol/plumbing repair only; no live QEMU was run, so no
+  real xfstests result, post-run image collection, real Linux/e2fsprogs
+  `e2fsck -fn`, upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 duplicate shell-test option rejection).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `3f0443bd fix(ext4): reject duplicate xfstests shell-test
+  options`, closing another host/consumer ambiguity in the shell-test evidence
+  chain: `command_value()` previously returned the first instance of an option,
+  so a plan or receipt could include a valid first `--append-cmdline` and a
+  second conflicting `--append-cmdline` that host validation ignored. Both
+  `run_xfstests_shell_test.py` and `execute_xfstests_run.py` now require each
+  validated shell-test option to appear exactly once before accepting an
+  execute-plan or shell-test execution receipt. Coordinator verification passed
+  `git show --check --stat HEAD`, confirmed the only dirty file in the journal
+  worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, focused duplicate-option RED
+  tests 2/2, focused shell-test/executor Python tests 47/47, full xfstests
+  Python collection 139/139, `cargo test -p xtask ext4 -- --test-threads=1`
+  80/80, `cargo -q xtask unit`, `cargo fmt --check --package xtask`, Python
+  compile for touched files, `git diff --check`, cached diff check and commit
+  check. This is protocol/plumbing repair only; no live QEMU was run, so no
+  real xfstests result, post-run image collection, real Linux/e2fsprogs
+  `e2fsck -fn`, upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 duplicate payload cmdline token rejection).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `f5e86cbe fix(ext4): reject duplicate xfstests payload cmdline
+  tokens`, closing a host/guest parser mismatch in the shell-test receipt
+  chain: the host verifier only required the expected payload cmdline token to
+  exist, while the guest bridge reads the first token for a key. A command line
+  containing `tx.xfstests.payload.sha256=<bad>` before
+  `tx.xfstests.payload.sha256=<expected>` could therefore pass host
+  validation while the guest consumed the bad value. The shared
+  `require_cmdline_token()` path now extracts all tokens for a key and requires
+  the match list to be exactly `[expected]`, rejecting missing, suffix,
+  conflicting duplicate and duplicate-expected tokens. Coordinator verification
+  passed `git show --check --stat HEAD`, confirmed the only dirty file in the
+  journal worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, focused shell-test/executor
+  Python tests 45/45, full xfstests Python collection 137/137, `cargo test -p
+  xtask ext4 -- --test-threads=1` 80/80, `cargo -q xtask unit`, `cargo fmt
+  --check --package xtask` and `git diff --check`. This is
+  protocol/plumbing repair only; no live QEMU was run, so no real xfstests
+  result, post-run image collection, real Linux/e2fsprogs `e2fsck -fn`,
+  upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 exact payload sha cmdline binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `8079cf62 fix(ext4): require exact xfstests payload sha cmdline`,
+  closing a remaining token-shape drift in the shell-test receipt chain:
+  earlier checks already required a payload SHA token, but they matched it as a
+  substring, so `tx.xfstests.payload.sha256=<sha>suffix` could still pass.
+  `run_xfstests_shell_test.py` and `execute_xfstests_run.py` now require the
+  SHA cmdline token to match exactly alongside the payload device basename and
+  success sentinel, removing that drift from both execute-plan validation and
+  receipt promotion. Coordinator verification passed `git show --check --stat
+  HEAD`, confirmed the only dirty file in the journal worktree is the
+  pre-existing unrelated `xtask/src/lint_invariants_api_language.rs`, focused
+  shell-test/executor Python tests 43/43, full xfstests Python collection
+  135/135, `cargo test -p xtask ext4 -- --test-threads=1` 80/80, `cargo -q
+  xtask unit`, `cargo fmt --check --package xtask`, Python compile for touched
+  files and `git diff --check`. This is protocol/plumbing repair only; no live
+  QEMU was run, so no real xfstests result, post-run image collection, real
+  Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace or product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 post-run e2fsck target binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `516185fe fix(ext4): bind post-run e2fsck targets to images`,
+  closing the final independent verifier drift in the current host-side
+  receipt/result chain: `verify_xfstests_results.py` now requires each
+  `post_run_e2fsck[*].args` list to bind exactly to the corresponding TEST or
+  SCRATCH private image, rather than only checking that `-fn` exists. This
+  prevents a verifier from accepting a drifted post-run e2fsck target while
+  the rest of the shell-test receipt still looks canonical. Coordinator
+  verification passed `git show --check --stat HEAD`, confirmed the only dirty
+  file in the journal worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, focused result verifier Python
+  tests 1/1, full xfstests Python collection 133/133, `cargo test -p xtask
+  ext4 -- --test-threads=1` 80/80, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, Python compile for touched files and `git diff --check`.
+  This is protocol/plumbing repair only; no live QEMU was run, so no real
+  xfstests result, post-run image collection, real Linux/e2fsprogs
+  `e2fsck -fn`, upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 receipt transport drift rejection).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `3183f760 fix(ext4): reject xfstests receipt transport drift`,
+  closing an independent receipt-promotion bypass left after `27a39ea2`:
+  `run_xfstests_shell_test --execute-plan` recomputed the canonical payload
+  transport, but `execute_xfstests_run --shell-test-execution` still trusted
+  the `payload_transport` embedded in the receipt plan. A receipt could keep
+  the payload image path/hash correct and make cmdline tokens match the
+  tampered plan transport while drifting the transport device itself. Receipt
+  promotion now requires canonical transport fields
+  `/dev/block/vdc`, `tx-xfstests-payload`, read-only transport, and
+  `/tmp/tx-xfstests/payload-installed` before accepting the shell-test receipt;
+  resolved file-reference checks still handle image path/hash separately.
+  Coordinator verification passed `git show --check --stat HEAD`, confirmed
+  the only dirty file in the journal worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, focused executor Python tests
+  27/27, full xfstests Python collection 132/132, `cargo test -p xtask ext4
+  -- --test-threads=1` 80/80, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, Python compile for touched files and `git diff --check`.
+  This is protocol/plumbing repair only; no live QEMU was run, so no real
+  xfstests result, post-run image collection, real Linux/e2fsprogs
+  `e2fsck -fn`, upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 payload cmdline transport binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `27a39ea2 fix(ext4): bind xfstests payload cmdline transport`,
+  closing another shell-test receipt drift: final `--execute-plan` and
+  `--shell-test-execution` promotion already checked the payload image path
+  and SHA token, but did not re-bind the `--append-cmdline` transport tokens
+  to `payload_transport`. A plan/receipt could therefore keep the correct
+  payload image and `tx.xfstests.payload.sha256` while drifting
+  `tx.xfstests.payload=<device>` or the success sentinel path, leaving failure
+  to the real guest install step. `run_xfstests_shell_test.py` and
+  `execute_xfstests_run.py` now require the append cmdline to carry the exact
+  payload device basename, payload SHA-256 and success sentinel from the
+  staged payload transport before shell-test execution or receipt promotion.
+  Coordinator verification passed `git show --check --stat HEAD`, confirmed
+  the only dirty file in the journal worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, focused shell-test/executor
+  Python tests 40/40, full xfstests Python collection 131/131, `cargo test -p
+  xtask ext4 -- --test-threads=1` 80/80, `cargo -q xtask unit`, `cargo fmt
+  --check --package xtask`, Python compile for touched files and `git diff
+  --check`. This is protocol/plumbing repair only; no live QEMU was run, so no
+  real xfstests result, post-run image collection, real Linux/e2fsprogs
+  `e2fsck -fn`, upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 metadata prepared-run image binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `e0194dff fix(ext4): bind xfstests metadata to prepared run
+  images`, closing the independent metadata/result promotion entrypoint gap:
+  after `750d42ed`, `execute_xfstests_run.py` and shell-test planning bound
+  `run.json.images.*` to the executor request, but
+  `assemble_xfstests_run_metadata.py` and `verify_xfstests_results.py` could
+  still be invoked as independent entrypoints and only checked request/run
+  hashes plus manifest ancestry. They now revalidate the prepared-run schema
+  and status, require `run_dir` to match the `run.json` parent, require
+  TEST/SCRATCH private image path/hash to match the executor request, and keep
+  `source_sha256 == private_sha256` before metadata assembly or final result
+  verification. Coordinator verification passed `git show --check --stat
+  HEAD`, confirmed the only dirty file in the journal worktree is the
+  pre-existing unrelated `xtask/src/lint_invariants_api_language.rs`, focused
+  run-prepare/result Python tests 34/34, full xfstests Python collection
+  129/129, `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, and
+  `git diff --check`. This is protocol/plumbing repair only; no live QEMU was
+  run, so no real xfstests result, post-run image collection, real
+  Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace or product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 prepared-run image binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `750d42ed fix(ext4): bind xfstests requests to prepared run
+  images`, closing another host-side evidence-chain drift: final planning and
+  execution already checked `executor-request.json` TEST/SCRATCH image
+  path/hash, but did not re-bind `run.json` `run_dir`,
+  `images.test.private_path/private_sha256` and
+  `images.scratch.private_path/private_sha256` to that request. A prepared-run
+  record could therefore drift while the request still passed. The executor
+  now validates prepared-run `run_dir` and private TEST/SCRATCH image
+  path/hash exactly against the request before runner/receipt promotion, and
+  `run_xfstests_shell_test.py` performs the same binding during final planning
+  and `--execute-plan` validation. Coordinator verification passed `git show
+  --check --stat HEAD`, confirmed the only dirty file in the journal worktree
+  is the pre-existing unrelated `xtask/src/lint_invariants_api_language.rs`,
+  focused executor/shell-test plan Python tests 38/38, full xfstests Python
+  collection 127/127, `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, and
+  `git diff --check`. This is protocol/plumbing repair only; no live QEMU was
+  run, so no real xfstests result, post-run image collection, real
+  Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace or product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 payload script binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `917b1f08 fix(ext4): bind xfstests payloads to shell-test script`,
+  tightening the final shell-test and receipt promotion boundary: final
+  `tools/ext4/run_xfstests_shell_test.py` planning now checks that the staged
+  guest payload's `guest_shell_env.shell_test` matches the current `--script`,
+  `--execute-plan` revalidates that the script has not drifted, and
+  `tools/ext4/execute_xfstests_run.py` rejects receipt promotion when the
+  shell-test receipt/command points at a different script from the payload
+  ancestry. Coordinator verification passed `git show --check --stat HEAD`,
+  confirmed the only dirty file in the journal worktree is the pre-existing
+  unrelated `xtask/src/lint_invariants_api_language.rs`, full xfstests Python
+  collection 125/125, `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, and
+  `git diff --check`. This is protocol/plumbing repair only; no live QEMU was
+  run, so no real xfstests result, post-run image collection, real
+  Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace or product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 bootstrap ancestry acceptance).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `934afd5b fix(ext4): accept bootstrap xfstests plan ancestry`,
+  fixing the next bootstrap-chain blocker after `abbdee44`: shell-test
+  bootstrap plans now carry `execution=disabled-provisioning-bootstrap-only`
+  plus `provisioning_bootstrap=true`, but shared ancestry validation in
+  `tools/ext4/xfstests_plan_ancestry.py` still accepted only
+  `disabled-plan-only`. That allowed `guest-provision` to succeed while later
+  `guest-bundle` / `guest-availability` / `guest-shell-env` /
+  `guest-payload` ancestry checks would reject the same bootstrap shell plan.
+  The shared ancestry validator now accepts and validates explicit bootstrap
+  shell-test plans. Coordinator verification passed `git show --check --stat
+  HEAD`, confirmed the only dirty file in the journal worktree is the
+  pre-existing unrelated `xtask/src/lint_invariants_api_language.rs`, Python
+  compile for the touched ancestry/test files, focused guest ancestry tests
+  22/22, full xfstests Python collection 123/123, `cargo test -p xtask ext4
+  -- --test-threads=1` 80/80, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, and `git diff --check`. This is protocol/plumbing repair
+  only; no live QEMU was run, so no real xfstests result, post-run image
+  collection, real Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace
+  or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 shell-test bootstrap split).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `abbdee44 fix(ext4): split xfstests shell-test bootstrap plans`,
+  fixing a bootstrap/execution-chain cycle introduced by the stricter payload
+  requirement: final executable shell-test plans must include `guest_payload`,
+  but producing that payload depends on the chain
+  `guest-shell-env -> guest-availability -> guest-bundle -> guest-provision ->
+  shell-test-plan`. Shell-test planning now has two explicit modes: a
+  bootstrap provisioning plan without payload that remains non-executable, and
+  a final executable plan that requires payload. Guest provisioning accepts
+  only the explicit bootstrap plan, while unmarked no-payload plans still fail
+  closed. Coordinator verification passed `git show --check --stat HEAD`,
+  confirmed the only dirty file in the journal worktree is the pre-existing
+  unrelated `xtask/src/lint_invariants_api_language.rs`, Python compile for
+  the touched planner/provision/test files, focused shell-test plan plus
+  guest-provision Python tests 18/18, full xfstests Python collection 122/122,
+  `cargo test -p xtask ext4 -- --test-threads=1` 80/80,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, and
+  `git diff --check`. This is protocol/plumbing repair only; no live QEMU was
+  run, so no real xfstests result, post-run image collection, real
+  Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace or product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 dirty xfstests bundle gate).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `c71e9911 fix(ext4): reject dirty xfstests guest bundles`, closing
+  a real chain inconsistency: `prepare_xfstests_guest_bundle.py` could write a
+  guest bundle from a dirty git xfstests source tree, but the later
+  `prepare_xfstests_guest_payload.py` rejects that same dirty source before
+  staging payload, so real guest-payload/receipt execution could pass one
+  stage and fail at the next. Guest-bundle planning now rejects dirty source
+  before writing the bundle. Coordinator verification passed `git show --check
+  --stat HEAD`, confirmed the only dirty file in the journal worktree is the
+  pre-existing unrelated `xtask/src/lint_invariants_api_language.rs`, Python
+  compile for the touched bundle/test files, `PYTHONDONTWRITEBYTECODE=1
+  python3 -m unittest tools.tests.test_ext4_xfstests_guest_bundle` 5/5, full
+  xfstests Python collection 120/120, `cargo test -p xtask ext4 --
+  --test-threads=1` 79/79, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, and `git diff --check`. This is protocol/plumbing repair
+  only; no live QEMU was run, so no real xfstests result, post-run image
+  collection, real Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace
+  or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 shell-test plan payload gate).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `9c4ff6b2 fix(ext4): require payload for xfstests shell-test plans`,
+  closing the next real entrance blocker after `216798a5`: direct
+  `tools/ext4/run_xfstests_shell_test.py` planning could still emit a
+  shell-test plan without `guest_payload`, while the later `--execute-plan`
+  path rejects such plans before receipt execution. The planner now fails
+  closed before writing an unexecutable plan unless the staged guest payload is
+  present. Coordinator verification passed `git show --check --stat HEAD`,
+  confirmed the only dirty file in the journal worktree is the pre-existing
+  unrelated `xtask/src/lint_invariants_api_language.rs`, Python compile for
+  the touched planner/test files, `PYTHONDONTWRITEBYTECODE=1 python3 -m
+  unittest tools.tests.test_ext4_xfstests_shell_test_plan` 10/10, full
+  xfstests Python collection 119/119, `cargo test -p xtask ext4 --
+  --test-threads=1` 79/79, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, and `git diff --check`. This is protocol/plumbing repair
+  only; no live QEMU was run, so no real xfstests result, post-run image
+  collection, real Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace
+  or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 shell-test payload forwarding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  first checked whether the receipt bridge could be run with real inputs and
+  found the checkout still lacks a complete live xfstests input set: local
+  xfstests source/selection ledger, prepared run request/manifest/shell-test
+  plan, guest payload and shell-test execution receipt are absent; host
+  `e2fsck` was also not found on PATH or common Homebrew/local paths. The lane
+  then committed `216798a5 fix(ext4): pass xfstests guest payload to shell-test
+  plan`, closing a real entrance blocker: `cargo xtask ext4 xfstests run
+  shell-test` now requires and forwards `--guest-payload`, so xtask-generated
+  shell-test plans can carry the staged payload contract required by
+  `--execute-plan` and receipt execution. Coordinator verification passed
+  `git show --check --stat HEAD`, confirmed the only dirty file in the journal
+  worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, full xfstests Python collection
+  118/118, `cargo test -p xtask ext4 -- --test-threads=1` 79/79,
+  `cargo -q xtask unit`, `cargo fmt --check --package xtask`, and
+  `git diff --check`. This is protocol/plumbing repair only; no live QEMU was
+  run, so no real xfstests result, post-run image collection, real
+  Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay, trace or product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 shell-test receipt promotion).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `78183511 feat(ext4): promote shell-test execution receipts`,
+  connecting a successful generated shell-test execution receipt back into the
+  existing xfstests metadata/result promotion chain. `tools/ext4/execute_xfstests_run.py`
+  now accepts exactly one execution source, either `--runner` or
+  `--shell-test-execution RECEIPT`; receipt mode revalidates the receipt
+  schema/status/returncode, serial log path and SHA-256, referenced shell-test
+  plan, executor request, selected manifest, prepared run, staged guest payload
+  contract, payload transport image path/hash, and shell-test argv before
+  materializing serial-bundle results, assembling metadata and verifying
+  results. `cargo xtask ext4 xfstests run execute` forwards
+  `--shell-test-execution` and rejects combining it with `--runner`.
+  Coordinator verification passed `git show --check --stat HEAD`, confirmed the
+  only dirty file in the journal worktree is the pre-existing unrelated
+  `xtask/src/lint_invariants_api_language.rs`, `PYTHONDONTWRITEBYTECODE=1
+  python3 -m py_compile tools/ext4/execute_xfstests_run.py
+  tools/ext4/run_xfstests_shell_test.py tools/tests/test_ext4_xfstests_executor.py
+  tools/tests/test_ext4_xfstests_shell_test_plan.py`, `bash -n
+  tools/ext4/guest/run-xfstests.sh tools/shell-tests/alpine-ext4-xfstests.txt`,
+  full xfstests Python collection 118/118, `cargo test -p xtask ext4 --
+  --test-threads=1` 78/78, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, and `git diff --check`. This is a receipt-to-verification
+  host bridge only; no live QEMU was run, so no real xfstests result, post-run
+  image collection, real Linux/e2fsprogs `e2fsck -fn`, upstream-lock, replay,
+  trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 shell-plan execution bridge).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `18523d86 feat(ext4): execute staged xfstests shell plan`, adding
+  an execution mode to the shell-test bridge instead of leaving the generated
+  QEMU command permanently plan-only. `tools/ext4/run_xfstests_shell_test.py`
+  now accepts `--execute-plan PLAN --out OUT`, revalidates the plan, executor
+  request, selected manifest, prepared run, private TEST/SCRATCH image hashes,
+  staged guest payload contract, payload tar hash and exact shell-test argv
+  before side effects, then invokes the plan's `cargo xtask shell-test ...`
+  command. It writes a success receipt only after shell-test exits 0 and the
+  predeclared serial log exists; shell-test failure preserves any serial log
+  but writes no success receipt, and payload drift fails before fake or real
+  cargo is invoked. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/run_xfstests_shell_test.py tools/ext4/execute_xfstests_run.py`,
+  full xfstests Python collection 116/116, `cargo test -p xtask ext4 --
+  --test-threads=1` 77/77, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, `git diff --check`, `bash -n
+  tools/ext4/guest/run-xfstests.sh tools/shell-tests/alpine-ext4-xfstests.txt`,
+  and `git show --check --stat HEAD`. This is a real host-side execution
+  bridge for the shell-test plan, but no live QEMU was run in this turn, so no
+  real xfstests result, post-run image collection, real Linux/e2fsprogs
+  `e2fsck -fn`, upstream-lock, replay, trace or product evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 readonly payload transport).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `620547f9 feat(ext4): attach staged xfstests payload transport`,
+  adding the first explicit host-to-guest payload transport for the V2
+  xfstests path. `run_xfstests_shell_test.py` now accepts `--guest-payload`,
+  reuses the staged payload contract validation, and emits a shell-test command
+  with `--xfstests-payload-image` plus cmdline tokens for payload device,
+  SHA-256 and install sentinel. `xtask shell-test` can attach that image as a
+  readonly raw virtio-blk device on the reserved xfstests payload slot (`vdc`)
+  and rejects combining it with WORKLOAD, which also owns `vdc`.
+  `tools/shell-tests/alpine-ext4-xfstests.txt` now reads the payload cmdline,
+  verifies the device SHA-256 in the guest, safely extracts the tar payload,
+  rejects symlinks, installs xfstests/runner/manifest under `/opt/tx-ext4`,
+  writes a success sentinel, and makes tier1/tier2 fail closed unless that
+  sentinel exists before the runner starts. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_shell_test_plan`, `cargo test -p xtask
+  shell_test -- --test-threads=1` 20/20, the two updated guest-command
+  regressions, full xfstests Python collection 113/113, Python compile for the
+  touched planner/tests, `bash -n tools/ext4/guest/run-xfstests.sh
+  tools/shell-tests/alpine-ext4-xfstests.txt`, `cargo test -p xtask ext4 --
+  --test-threads=1` 77/77, `cargo -q xtask unit`, `cargo fmt --check
+  --package xtask`, `git diff --check`, and `git show --check --stat HEAD`.
+  This is transport and guest bootstrap plumbing only; no actual QEMU
+  xfstests run, post-run collected TEST/SCRATCH images, real Linux/e2fsprogs
+  `e2fsck -fn`, upstream-lock, replay, trace or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 payload transport blocker).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane made
+  no code changes and found that the current shell-test/QEMU surface cannot
+  safely inject the staged xfstests guest payload into a live guest: shell-test
+  only sends DSL text to QEMU stdin, QEMU currently attaches initramfs plus
+  TEST/SCRATCH/WORKLOAD role drives but no payload tar/shared-directory/readonly
+  payload transport, the xfstests shell-test planner remains
+  `execution=disabled-plan-only`, and `tools/shell-tests/alpine-ext4-xfstests.txt`
+  still treats guest provisioning as an external prerequisite under
+  `/opt/tx-ext4`. The lane explicitly rejected base64-pasting a full tar over
+  console `send` because it lacks size bounds, chunk acknowledgement, flow
+  control, atomic writeout and a guest-side digest witness. This is a blocker
+  inventory only; no files changed and no QEMU/xfstests/e2fsck/product evidence
+  was generated. The next V2 implementation slice is an explicit artifact
+  transport owned by shell-test/QEMU plumbing: a constrained readonly payload
+  block device or initramfs overlay with guest SHA-256 verification, controlled
+  unpack/install, and an installation-success sentinel before the xfstests
+  runner starts.
+
+- 2026-07-28 (memory/I/O ext4 V2 staged guest payload consumption).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `09cbb638 feat(ext4): require staged xfstests guest payload`,
+  making the xfstests explicit-runner side-effect boundary consume the staged
+  guest payload contract from `d0c59234`. `cargo xtask ext4 xfstests run
+  execute` now requires `--guest-payload`, forwards it to
+  `tools/ext4/execute_xfstests_run.py`, and the executor validates
+  `tx.ext4.xfstests_guest_payload.v1` schema/status/execution, guest-shell-env
+  path/hash binding, selected-manifest authority, manifest/runner/source
+  references, destination mapping, tar member safety and payload SHA-256 before
+  launching the runner. The runner receives controlled
+  `TX_XFSTESTS_GUEST_PAYLOAD`, `TX_XFSTESTS_GUEST_PAYLOAD_SHA256` and
+  `TX_XFSTESTS_GUEST_PAYLOAD_CONTRACT` variables. Coordinator verification
+  passed the 3 new focused payload executor tests, focused xtask
+  `xfstests_run_execute` 4/4, full xfstests Python collection 112/112, Python
+  compile for the touched executor/test files, `bash -n
+  tools/ext4/guest/run-xfstests.sh`, `cargo test -p xtask ext4 --
+  --test-threads=1` 77/77, `cargo -q xtask unit`,
+  `cargo fmt --check --package xtask`, `git diff --check`, and `git show
+  --check --stat HEAD`. This consumes a staged payload at the host executor
+  boundary only; it still does not install files into a guest image/session,
+  run QEMU, execute xfstests, run real Linux/e2fsprogs `e2fsck -fn`, or produce
+  upstream-lock/replay/trace/product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 immutable guest payload staging).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `d0c59234 feat(ext4): stage immutable xfstests guest payloads`,
+  adding `tools/ext4/prepare_xfstests_guest_payload.py` and
+  `cargo xtask ext4 xfstests run guest-payload --guest-shell-env ... --payload
+  ... --out ...`. The new artifact schema is
+  `tx.ext4.xfstests_guest_payload.v1` with `payload-staged-only` status: it
+  builds a hash-bound tar payload for the guest destination mapping and rejects
+  source drift, source/manifest/runner symlinks, pre-existing output and dirty
+  Git source before publication. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 109/109, Python compile for the payload script
+  and test, `bash -n tools/ext4/guest/run-xfstests.sh`, `cargo test -p xtask
+  ext4 -- --test-threads=1` 76/76, `cargo -q xtask unit`,
+  `cargo fmt --check --package xtask`, `git diff --check`, and `git show
+  --check --stat HEAD`. This is immutable guest-payload staging only; no real
+  QEMU session, xfstests run, Linux/e2fsprogs `e2fsck -fn`, upstream-lock,
+  replay, trace or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 host e2fsck executor).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `43f41483 feat(ext4): run host e2fsck for xfstests`, adding a
+  host-owned post-run `e2fsck -fn` execution path to the xfstests executor.
+  `cargo xtask ext4 xfstests run execute` now accepts `--e2fsck-command PATH`;
+  in that mode `tools/ext4/execute_xfstests_run.py` runs fixed argv
+  `PATH -fn <private image>` for TEST and SCRATCH, writes the actual
+  stdout/stderr logs to the predeclared evidence paths, propagates the real
+  exit codes into metadata assembly, rejects non-executable or nonzero
+  commands, and rejects runner/serial-bundle-provided e2fsck logs so host mode
+  remains the e2fsck authority. The legacy externally supplied exit-code/log
+  mode remains for compatibility. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 104/104, Python compile for the touched executor
+  test files, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 75/75,
+  `cargo fmt --check --package xtask`, `git diff --check`, and `git show
+  --check --stat HEAD`. This is executor protocol hardening only; tests used a
+  fake e2fsck command and no real QEMU, xfstests, Linux/e2fsprogs authority,
+  replay, trace or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 guest serial bundle emission).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `c5d02e0b feat(ext4): emit xfstests serial bundles`, completing
+  the guest-side half of the serial session/result protocol. The Alpine
+  xfstests tier groups now fail closed unless the runner succeeds, collect
+  guest runner output, mount facts and TEST/SCRATCH `e2fsck -fn` logs, package
+  the generated results/evidence as a SHA-256-bound base64 tar frame on UART,
+  and emit no bundle when the runner fails. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 100/100, Python compile for the touched
+  xfstests executor/shell-bridge tests, `bash -n
+  tools/ext4/guest/run-xfstests.sh`, `cargo test -p xtask ext4 --
+  --test-threads=1` 74/74, `cargo fmt --check --package xtask`, `git diff
+  --check`, and `git show --check --stat HEAD`. This is still protocol
+  plumbing only: no real QEMU, xfstests, `e2fsck -fn`, Linux baseline, replay,
+  trace or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 serial bundle materialization).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `7359ed26 feat(ext4): materialize xfstests serial bundles`,
+  adding the first concrete V2 live-executor session/result protocol slice:
+  after a successful runner returns and before metadata assembly,
+  `tools/ext4/execute_xfstests_run.py` can parse an optional framed serial
+  artifact bundle, validate BEGIN/END framing, SHA-256, base64 payload,
+  plain-tar member types, exact predeclared result/evidence paths and
+  run-directory symlink ancestry, then materialize only allowed
+  `results/summary.tsv`, `results/NNNN.{result,log}` and non-serial evidence
+  files. Without a bundle, existing runner-direct artifact behavior is
+  preserved. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 97/97, Python compile for the touched executor
+  and xfstests verifier/metadata/test files, `bash -n
+  tools/ext4/guest/run-xfstests.sh`, `cargo test -p xtask ext4 --
+  --test-threads=1` 74/74, `cargo fmt --check --package xtask`, `git diff
+  --check`, and `git show --check --stat HEAD`. This is session/result
+  protocol plumbing only; no real QEMU, xfstests, `e2fsck -fn`, Linux
+  baseline, replay, trace or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 lane boundary re-audit).
+  Reused `foundation_lane`, `journal_lane` and `pressure_lane`; no new worker
+  was spawned. No lane changed files. `foundation_lane` revalidated the
+  sparse retained-lease settlement slice at `f5526b52`: the explicit sparse
+  pager-row regression, canonical ext4 sparse retained-lease regression, and
+  PageBacked retained-batch/vector settlement regression all passed; the only
+  dirty file in that worktree remains the unrelated user-owned
+  `xtask/src/lint_invariants_api_language.rs`. `pressure_lane` confirmed V3
+  still has no pressure-only code/test slice: `tx-services` has no
+  `tx-observe` emitter path, current service/refault/dirty values are policy
+  inputs rather than monotonic trace counters, the memory-pressure observe
+  schema/report family is absent, V3 workload/guest/perf files are absent in
+  that worktree, and coordinator/gateway production integration is not wired.
+  `journal_lane` audited the proposed V2 live executor path and found that
+  shell-test can own one sequential QEMU session with UART serial, but cannot
+  provision immutable guest payloads or collect guest xfstests results/mount
+  facts/evidence; the current Alpine xfstests shell script remains
+  `*_ENTRYPOINT_READY_NO_EVIDENCE`, guest availability/shell-env DTOs remain
+  not-provisioned/not-injected plan-only, and the explicit executor only runs a
+  supplied host runner over predeclared artifact paths. The next V2 step is
+  therefore cross-owner: immutable guest payload staging, a session/result
+  protocol, post-run image sealing/collection and host `e2fsck -fn`
+  execution. This turn produced no real QEMU, xfstests, `e2fsck -fn`, Linux
+  baseline, replay, trace or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 no-safe-static-slice audit).
+  Reused the existing `journal_lane`; no new worker was spawned and no files
+  were changed in the lane. After `ed8846f0`, the xfstests execution boundary
+  already validates and freezes the executor request plus guest ancestry before
+  runner side effects, and assembly/result promotion now fail closed on path,
+  hash and symlink containment for runner artifacts and evidence links. The
+  lane found no additional safe static DTO/verifier-only slice that can produce
+  legitimate evidence. V2 now needs a real live guest executor owning guest
+  lifecycle, block attachment, runner invocation, post-mutation image
+  collection, actual `e2fsck -fn` exit/log capture and result promotion. No
+  real QEMU, xfstests, `e2fsck -fn`, Linux baseline, replay or product
+  evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests evidence symlink rejection).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `ed8846f0`, closing the next xfstests evidence containment gap:
+  the metadata assembler now rejects symlinked runner evidence links, and the
+  result verifier independently rejects symlinked serial log, guest output,
+  mount facts and TEST/SCRATCH `e2fsck -fn` evidence links before promotion.
+  Coordinator verification passed `PYTHONDONTWRITEBYTECODE=1 python3 -m
+  unittest discover -s tools/tests -p 'test_ext4_xfstests_*.py'` 90/90,
+  Python compile for the touched xfstests metadata/verifier/test files, `bash
+  -n tools/ext4/guest/run-xfstests.sh`, `cargo test -p xtask ext4 --
+  --test-threads=1` 74/74, `cargo fmt --check --package xtask`, `git diff
+  HEAD --check`, and `git show --check --stat HEAD`. This is V2 evidence-link
+  containment hardening only; no real QEMU, xfstests, `e2fsck -fn`, Linux
+  replay, Linux baseline or product evidence was generated. Main checkout
+  catch-up validation passed JSON parsing for the repair plan, scoped `git
+  diff --check`, `cargo xtask progress validate` for 38 records, and `cargo
+  xtask lint docs` with only the existing 7 stale-vocabulary warnings.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests symlink artifact rejection).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `5552cf2c`, closing another result-artifact containment gap:
+  `tools/ext4/verify_xfstests_results.py` previously used file checks and
+  resolved log paths in a way that could follow symlinks to external stale
+  output. Summary, `.result`, and `.log` artifacts are now rejected when they
+  are symlinks, and the regression covers an external log target. Coordinator
+  verification passed `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover
+  -s tools/tests -p 'test_ext4_xfstests_*.py'` 89/89, Python compile for the
+  touched verifier and test, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 74/74,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is V2 result-artifact containment
+  hardening only; no real QEMU, xfstests, `e2fsck -fn`, Linux replay, Linux
+  baseline or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests result log path binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `9d39cf4a`, closing a result-log artifact binding gap in
+  `tools/ext4/verify_xfstests_results.py`: the verifier previously accepted a
+  `.result` record whose `log` field used path traversal such as
+  `../0001.log` as long as the basename matched. The verifier now resolves the
+  log path and requires it to point exactly at the run-local
+  `results/NNNN.log`, while preserving absolute-path compatibility for valid
+  run-local logs. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 88/88, Python compile for the touched verifier
+  and test, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 74/74,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is V2 result-artifact provenance
+  hardening only; no real QEMU, xfstests, `e2fsck -fn`, Linux replay, Linux
+  baseline or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests post-run preflight binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `7c4c65aa`, closing a post-run contract replacement gap: before
+  this fix the executor validated request/guest ancestry before launching the
+  runner, but metadata assembly could reread a runner-rewritten executor
+  request after the subprocess returned. `tools/ext4/execute_xfstests_run.py`
+  now freezes preflight executor-request and guest-shell-env SHA-256 values,
+  rechecks both before metadata promotion, and passes the frozen hashes into
+  `tools/ext4/assemble_xfstests_run_metadata.py`; the assembler rejects changed
+  inputs and revalidates guest ancestry before emitting metadata. Coordinator
+  verification passed `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover
+  -s tools/tests -p 'test_ext4_xfstests_*.py'` 87/87, Python compile for the
+  touched executor/metadata/ancestry/test files, `bash -n
+  tools/ext4/guest/run-xfstests.sh`, `cargo test -p xtask ext4 --
+  --test-threads=1` 74/74, `cargo fmt --check --package xtask`, `git diff
+  HEAD --check`, and `git show --check --stat HEAD`. This is V2 post-run
+  provenance hardening only; no real QEMU, xfstests, `e2fsck -fn`, Linux
+  replay, Linux baseline or product evidence was generated.
+
+- 2026-07-28 (memory-pressure lane recheck).
+  Reused the existing `pressure_lane`; no new worker was spawned. The lane made
+  no code changes and reported that no self-contained pressure-only edit is
+  currently eligible: existing `tx-services` memory-pressure seams and
+  PageBacked reclaim/writeback unit seams pass focused tests, but closing M3/M4
+  needs kernel-owned coordinator lifetime, managed allocation callsites and
+  VFS/ext4/Zone providers under their respective owners. V3 remains blocked by
+  missing cross-owner attribution schema/workload/guest/xtask producers rather
+  than a local pressure policy gap. This is a read-only lane result, not
+  product performance evidence.
+
+- 2026-07-28 (foundation lane recheck).
+  Reused the existing `foundation_lane`; no new worker was spawned. The lane
+  made no code changes and reran the narrow retained-batch/vector settlement
+  regression (`page_backed::core_tests::multi_page_fsync_submits_one_retained_batch_then_vector_cleans_pages`,
+  1 passed). It also confirmed that the current journal worktree head does not
+  contain the final foundation sparse retained-lease repair as an ancestor, so
+  this check cannot substitute for full sparse retained-lease closure or for
+  V1/V2 QEMU/Linux/e2fsck/xfstests evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests runner guest-ancestry gate).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `d8512998`, making `--guest-shell-env` mandatory for
+  `cargo xtask ext4 xfstests run execute` and validating the complete guest
+  ancestry chain before any runner process starts:
+  guest shell -> availability -> bundle -> provision -> shell plan ->
+  executor request -> prepared run -> selected manifest. The ancestry check
+  verifies manifest path/hash plus source-lock and selection-ledger authority,
+  while the existing executor preflight continues to retain TEST/SCRATCH and
+  output-artifact checks. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 86/86, Python compile for the touched executor,
+  ancestry helper and test, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 74/74,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is execution-boundary provenance
+  hardening only; no real xfstests, QEMU run, Linux replay, `e2fsck -fn`
+  campaign, Linux baseline or product evidence was generated.
+
+- 2026-07-28 (memory/I/O ext4 V1 fault campaign run isolation).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `4c3db80c`, closing the next stale-artifact hole after
+  campaign-plan hash binding: regenerating a campaign plan at the same path
+  could still produce byte-identical plan bytes, so old complete results could
+  remain valid. `tools/ext4/fault_harness.py` now emits a fresh 128-bit
+  `campaign_id` for each generated campaign plan, which changes the frozen
+  plan SHA-256 per replan and makes the verifier reject artifacts from an
+  earlier campaign instance. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_fault*.py'` 64/64, Python compile for the fault scripts/tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is V1 fault-campaign artifact
+  isolation only; no authorized Linux RW replay, QEMU crash campaign,
+  per-replay `e2fsck -fn`, xfstests, Linux baseline or product evidence was
+  generated.
+
+- 2026-07-28 (memory/I/O ext4 V1 fault campaign plan-hash binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `c4568fcb`, closing a stale-result reuse hole in the V1 fault
+  campaign verifier. `tools/ext4/fault_harness.py` now freezes the SHA-256 of
+  the campaign plan into each executor request, `fault_qemu_executor.py`
+  preserves that value in the executor plan/result path, and the verifier
+  recomputes the current campaign-plan SHA-256 before accepting result
+  manifests. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness
+  tools.tests.test_ext4_fault_qemu_executor` 50/50,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_fault*.py'` 64/64, Python compile for the touched fault scripts
+  and tests, `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is V1 fault-campaign provenance
+  hardening only; no authorized Linux RW replay, QEMU crash campaign,
+  per-replay `e2fsck -fn`, xfstests, Linux baseline or product evidence was
+  generated.
+
+- 2026-07-28 (memory/I/O ext4 V2 live guest executor boundary audit).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane made
+  no code changes after auditing the next V2 blocker: no live guest provision
+  or shell-injection executor exists yet, and `cargo xtask ext4 xfstests`
+  currently wires guest-provision, guest-bundle, guest-availability and
+  guest-shell-env only to offline planners. Coordinator spot-check confirmed
+  the only path that launches a runner is `tools/ext4/execute_xfstests_run.py`,
+  which already validates the executor request, prepared run, selected
+  manifest and authority before subprocess launch. Adding an unconsumed
+  preflight DTO would not create a verifiable execution/evidence loop. The next
+  real V2 implementation step is an owned live executor contract covering guest
+  session ownership, file/device transfer, shell injection, artifact
+  collection, same ancestry validation immediately before side effects, and
+  separate real xfstests/`e2fsck -fn` evidence. No tests were rerun because no
+  code changed.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests full guest-plan ancestry).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `4d2d757d`, binding the remaining guest plan-only chain to full
+  xfstests ancestry. `guest-bundle`, `guest-availability` and `guest-shell-env`
+  now recursively validate
+  availability -> bundle -> provision -> shell plan -> executor request ->
+  prepared run -> selected manifest; each hop checks its hash-bound file
+  reference, schema/status, manifest path/hash and source-lock/selection-ledger
+  authority. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 85/85, Python compile for the touched planners,
+  shared ancestry helper and tests, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is guest-plan provenance hardening
+  only; all stages remain plan-only/disabled/not-provisioned/not-injected and
+  no guest image, QEMU/xfstests result, `e2fsck -fn`, Linux baseline or product
+  evidence was created.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests shell/guest prepared-run ancestry).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `5170fecf`, binding the shell-test plan and guest-provision plan
+  to the prepared run ancestry instead of trusting only projected
+  `manifest_authority`. `tools/ext4/run_xfstests_shell_test.py` now validates
+  the executor request's run hash, `prepared-run-only` schema/status, manifest
+  path/hash and selected manifest authority; `prepare_xfstests_guest_provision.py`
+  revalidates the shell plan's hash-bound request reference and repeats the
+  request/run ancestry checks before producing its offline plan-only contract.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 82/82, Python compile for the touched scripts and
+  tests, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is shell/guest plan provenance
+  hardening only; it does not create a real Tier ledger, guest image,
+  QEMU/xfstests result, `e2fsck -fn`, Linux baseline or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests execution prepared-run validation).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `4055b451`, closing an execution-boundary gap where the explicit
+  xfstests runner could be launched with a hash-matching but invalid prepared
+  run. `tools/ext4/execute_xfstests_run.py` now validates the prepared run
+  hash, schema, `prepared-run-only` status, manifest path/hash and selected
+  manifest authority before starting the subprocess. Coordinator verification
+  passed `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s
+  tools/tests -p 'test_ext4_xfstests_*.py'` 80/80, Python compile for the
+  touched executor/test, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is execution-boundary provenance
+  hardening only; it does not create a real Tier ledger, guest image,
+  QEMU/xfstests result, `e2fsck -fn`, Linux baseline or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests result prepared-run binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `29caade2`, closing a result-verification provenance gap by
+  requiring a hashed `prepared-run-only` plan whose manifest and
+  `manifest_authority` match the supplied selected-case manifest before
+  contract result promotion. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 79/79, Python compile for the touched verifier
+  and tests, `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is result-provenance hardening only; it
+  does not create a real Tier ledger, guest image, QEMU/xfstests result,
+  `e2fsck -fn`, Linux baseline or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests result-ledger case binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `dbe7d11d`, closing a result-promotion bypass where a manifest
+  could reuse a real selection-ledger reference while substituting a different
+  selected case set. `tools/ext4/verify_xfstests_results.py` now parses the
+  fixed ledger, validates schema/status/source-lock/revision, and requires the
+  manifest's selected cases plus exclusion-authority projection to match the
+  corresponding Tier ledger exactly before producing a verified contract
+  result. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 78/78, Python compile for the touched verifier
+  and tests, `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is result-promotion provenance
+  hardening only; it does not create a real Tier ledger, guest image,
+  QEMU/xfstests result, `e2fsck -fn`, Linux baseline or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests execution-boundary authority).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `04c4b80c`, requiring selected-case authority at the top-level
+  xfstests execution boundary and in the guest selected-test runner. `cargo
+  xtask ext4 xfstests` and `tools/ext4/guest/run-xfstests.sh` now reject
+  source-pin-only or generic manifests and require
+  `manifest-selection-preparation-only` provenance with Tier, source-lock,
+  selection-ledger and exclusion authority; guest-provision also rejects
+  shell-test plan authority drift. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 77/77, Python compile for the touched Python
+  scripts/tests, `bash -n tools/ext4/guest/run-xfstests.sh`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 73/73,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is execution-boundary authority
+  hardening only; it does not create a real Tier ledger, guest image,
+  QEMU/xfstests result, `e2fsck -fn`, Linux baseline or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 execution-chain selection authority).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `6b527fc6`, preserving selected-manifest authority from prepared
+  run through executor request, shell-test plan, explicit executor, run
+  metadata and result verification. Each stage now carries or revalidates
+  `manifest_authority` for Tier, source-lock and selection-ledger provenance;
+  shell-test planning binds the supplied manifest to the executor request; the
+  explicit executor and metadata assembler reject authority drift before
+  starting the runner or writing metadata; and result verification checks both
+  run metadata and executor request authority against the selected manifest.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 75/75, Python compile for the touched
+  execution-chain scripts/tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 72/72,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is execution-chain provenance
+  hardening only; it does not create a real Tier ledger, guest run,
+  QEMU/xfstests result, `e2fsck -fn`, Linux baseline or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 Alpine xfstests selection authority binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `e52b03c2`, binding the Alpine xfstests image-build plan and
+  private-run preparation chain to selected-case authority. The Alpine builder
+  now requires a `manifest-selection-preparation-only` manifest with valid
+  Tier, source-lock and selection-ledger references and emits
+  `manifest_authority`; the private-run preparer revalidates the manifest and
+  rejects authority drift before writing `tx.ext4.xfstests_run_plan.v1`.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 71/71,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_build_alpine_xfstests
+  tools.tests.test_ext4_xfstests_run_prepare` 16/16, Python compile for the
+  Alpine builder, run preparer and manifest-authority helper,
+  `cargo test -p xtask ext4 -- --test-threads=1` 72/72,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is image/run-preparation provenance
+  hardening only; it does not build a real guest image, run QEMU or xfstests,
+  run `e2fsck -fn`, or produce Tier/upstream-lock/product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 guest xfstests selection authority binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `a34cab6f`, adding `tools/ext4/xfstests_manifest_authority.py` and
+  binding the guest xfstests planning chain to selected-case authority.
+  `guest-provision`, `guest-bundle`, `guest-availability` and
+  `guest-shell-env` now all revalidate the real
+  `manifest-selection-preparation-only` manifest, require valid Tier,
+  source-lock and selection-ledger path/SHA-256 references, preserve a
+  `manifest_authority` object, and fail closed if an upstream plan's authority
+  drifts from the current manifest. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 70/70, Python compile for the shared authority
+  helper and four guest planners/tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 72/72,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is guest planning provenance only; it
+  does not copy files into a guest image, inject a shell session, run QEMU or
+  xfstests, run `e2fsck -fn`, or produce Tier/upstream-lock/product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests run artifact manifest binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `1ca34d2a`, binding the xfstests run artifact chain to one
+  manifest reference across prepared run, executor request, run metadata,
+  explicit runner execution and result verification. The run and executor
+  request now preserve and validate the manifest path/SHA-256; metadata
+  assembly rejects a request whose manifest differs from the supplied manifest;
+  the executor rejects a mismatched manifest before starting the runner; and
+  result verification cross-checks run metadata against the executor request's
+  manifest reference. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p
+  'test_ext4_xfstests_*.py'` 66/66, Python compile for the run/executor/
+  metadata/result scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 72/72,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This is provenance-chain hardening only; no
+  real Tier manifest, xfstests run, Linux/e2fsck evidence, upstream-lock
+  evidence or product evidence was created.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests result selection provenance).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `ae027545`, updating `tools/ext4/verify_xfstests_results.py` so
+  xfstests result verification accepts only
+  `manifest-selection-preparation-only` manifests that bind `tier`,
+  `tx.ext4.xfstests_source_lock.v1` and
+  `tx.ext4.xfstests_selection_ledger.v1` path/hash provenance before reading
+  result files. The verifier output records `verification_scope=contract-only`
+  and carries the Tier, source-lock and selection-ledger references forward.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_results
+  tools.tests.test_ext4_xfstests_selection_ledger
+  tools.tests.test_ext4_xfstests_manifest
+  tools.tests.test_ext4_xfstests_source_lock` 31/31, Python compile for the
+  result/manifest/source-lock scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 72/72,
+  `cargo fmt --check --package xtask`, scoped `git diff HEAD --check`,
+  `git show --check --stat HEAD`, `cargo xtask progress validate`, and
+  `cargo xtask lint docs`. This does not create real Tier manifests, xfstests
+  runs, Linux/e2fsck evidence, upstream-lock evidence or product evidence; it
+  only prevents result promotion from bypassing selection-ledger provenance.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests selection ledger contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `2f5ff556`, adding the explicit case-level
+  `tx.ext4.xfstests_selection_ledger.v1` contract to
+  `tools/ext4/prepare_xfstests_manifest.py` and `cargo xtask ext4 xfstests
+  manifest prepare`. Tier output now requires `--selection-ledger` plus
+  `--tier`; CLI `--test`/`--exclude` inputs cannot be mixed into ledger mode.
+  The ledger binds the committed source lock path/hash and revision, validates
+  selected/excluded case files and SHA-256 values under locked `tests/`,
+  requires exclusions to carry `authority`, `missing_surface`, `tracking_ref`
+  and `revisit_gate`, and enforces Tier 2 selected-set inclusion of Tier 1.
+  Output remains `manifest-selection-preparation-only` with a ledger hash
+  reference. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_selection_ledger
+  tools.tests.test_ext4_xfstests_manifest
+  tools.tests.test_ext4_xfstests_source_lock` 18/18, Python compile for the
+  manifest/source-lock scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 72/72,
+  `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`,
+  `git diff HEAD --check`, and `git show --check --stat HEAD`. This is only
+  the authority-input contract; no real ledger, Tier manifest, case selection,
+  QEMU xfstests result, post-run `e2fsck`, upstream-lock or product evidence
+  was created.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests Tier manifest authority gate).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `aea2cfc4`, adding a fail-closed boundary to
+  `tools/ext4/prepare_xfstests_manifest.py`: output paths named
+  `tier1-xfstests.json` or `tier2-xfstests.json` are now rejected unless a
+  future authoritative selected-case manifest path exists, because source-lock
+  preparation alone cannot claim a Tier profile. Coordinator spot-check
+  confirmed the active acceptance plan says Tier selected cases must be derived
+  from the capability ledger, while current checkout/progress state still lacks
+  that per-case authority. Verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_manifest
+  tools.tests.test_ext4_xfstests_source_lock` 12/12, Python compile for the
+  manifest/source-lock scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 70/70,
+  `cargo fmt --check --package xtask`, `git diff HEAD --check`, and
+  `git show --check --stat HEAD`. This produces no Tier manifest, guest image,
+  QEMU xfstests result, post-run `e2fsck`, upstream-lock or product evidence;
+  V2 remains blocked on real selected-case authority and execution evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests manifest source-lock binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `80552536`, updating
+  `tools/ext4/prepare_xfstests_manifest.py` and
+  `cargo xtask ext4 xfstests manifest prepare` to require
+  `--xfstests-source-lock`. Manifest preparation now validates
+  `tx.ext4.xfstests_source_lock.v1` schema/status, HTTPS git source URL,
+  concrete revision and `check` hash, verifies the local xfstests worktree is
+  clean and matches the lock origin/HEAD/`check` SHA-256, rejects selected test
+  IDs that do not resolve below `tests/` as existing files, and writes
+  `evidence_status=manifest-source-pin-only` plus a SHA-256 `source_lock`
+  reference. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_manifest
+  tools.tests.test_ext4_xfstests_source_lock` 11/11, Python compile for the
+  manifest/source-lock scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 70/70,
+  `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`, scoped
+  `git diff --check`, and `git show --check --stat HEAD`. This is
+  source-lock-bound manifest preparation only; it does not create an accepted
+  Tier manifest, provisioned Alpine guest image, QEMU xfstests run, post-run
+  `e2fsck`, upstream-lock or product evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests source lock).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `0d05c625`, adding
+  `tools/ext4/prepare_xfstests_source_lock.py`,
+  `tools/ext4/xfstests-source.lock.json`, and
+  `cargo xtask ext4 xfstests source lock`. The locker requires an HTTPS `.git`
+  source URL, a non-bare clean local xfstests worktree, origin URL equality, a
+  full 40-hex HEAD and an existing `check` file, then writes
+  `tx.ext4.xfstests_source_lock.v1` with
+  `evidence_status=source-pinned-only`. The committed lock pins the official
+  xfstests-dev origin at revision
+  `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509` and `check` SHA-256
+  `104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642`.
+  Coordinator verification shallow-fetched that exact commit from the official
+  remote into `/tmp/tx-xfstests-lock-verify.EPs2el` and verified the `check`
+  hash, then passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_source_lock
+  tools.tests.test_ext4_xfstests_guest_shell_env
+  tools.tests.test_ext4_xfstests_guest_bundle` 8/8, Python compile for the
+  source-lock script/test, `cargo test -p xtask ext4 -- --test-threads=1`
+  70/70, `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`,
+  scoped `git diff --check`, and `git show --check --stat HEAD`. This removes
+  the missing xfstests source-revision part of V2, but it is source pin
+  evidence only: no selected-case manifest, TEST/SCRATCH image, guest
+  provisioning, QEMU/xfstests/e2fsck, Tier/upstream-lock or product evidence
+  was produced.
+
+- 2026-07-28 (memory/I/O ext4 V3 pressure lane re-check).
+  Reused the existing `pressure_lane`; no new worker was spawned. The lane
+  made no code changes after re-checking V3 because there is no safe
+  pressure-only implementation slice left: current pressure policy work is
+  already limited to pure value-row selection, while V3 product attribution
+  requires cross-owner inputs under workload tooling, guest execution,
+  `xtask/src/ext4`, observe schema/counters, PageBacked, I/O-manager, ext4,
+  reporting and same-run Linux/Tx evidence. Coordinator keeps V3 pending
+  because the native RV64 rustc workload, Linux baseline image, complete Tx
+  observe trace, attribution backend and `target/ext4` seeds/runs are still
+  missing. No tests were rerun because there was no eligible edit.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests plan-only boundary).
+  Reused the existing `journal_lane`; no new worker was spawned. After
+  `b7d00074`, the lane found no further safe pure-tooling slice inside V2: the
+  shell-env planner still writes `injection_status=not-injected-plan-only` and
+  `execution=disabled-plan-only`, while `xtask` shell-test only supports static
+  `send` directives to QEMU stdin. Coordinator spot-check confirmed
+  `external/xfstests` is absent, no xfstests/upstream-lock artifacts exist under
+  `target/ext4`, and the only profile artifacts present are fault-profile
+  inputs. Therefore the next V2 step is no longer another planner DTO; it needs
+  real pinned xfstests source/manifest inputs, provisioned guest files or image
+  staging, QEMU shell-test execution, xfstests result capture and post-run
+  `e2fsck -fn` evidence. V2 remains pending and no Tier/upstream-lock/product
+  evidence was produced.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests guest shell environment contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `b7d00074`, adding
+  `tools/ext4/prepare_xfstests_guest_shell_env.py` and
+  `cargo xtask ext4 xfstests run guest-shell-env`. The planner consumes only
+  `tx.ext4.xfstests_guest_availability_plan.v1` with
+  `evidence_status=plan-only`, `availability_status=not-provisioned-plan-only`
+  and `execution=disabled-plan-only`, revalidates the referenced bundle hash,
+  requires the shell-test script to define `tier1`/`tier2` groups plus
+  `send "... export TX_XFSTESTS_*=..."` statements for root, runner, manifest,
+  TEST, SCRATCH and results, and writes
+  `tx.ext4.xfstests_guest_shell_env_plan.v1` with
+  `injection_status=not-injected-plan-only` plus the guest-session export
+  mapping. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_guest_shell_env
+  tools.tests.test_ext4_xfstests_guest_availability
+  tools.tests.test_ext4_xfstests_guest_bundle` 9/9, Python compile for the
+  shell-env/availability/bundle scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 68/68,
+  `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`, scoped
+  `git diff --check`, `git show --check --stat HEAD`, and confirmed the
+  journal worktree still only has unrelated dirty
+  `xtask/src/lint_invariants_api_language.rs`. This remains shell environment
+  injection planning evidence only; it does not inject into a guest shell,
+  execute shell-test/QEMU/xfstests, run e2fsck, or produce
+  Tier/upstream-lock/product evidence. V2 stays pending on real pinned inputs,
+  provisioning, guest execution, xfstests results and post-run fsck evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests guest availability contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `b307b7a9`, adding
+  `tools/ext4/prepare_xfstests_guest_availability.py` and
+  `cargo xtask ext4 xfstests run guest-availability`. The planner consumes
+  only `tx.ext4.xfstests_guest_bundle_plan.v1` with
+  `evidence_status=plan-only` and `execution=disabled-plan-only`, revalidates
+  the referenced guest-provision plan, manifest, runner and xfstests `check`
+  hashes, requires the runner executable bit, carries forward absolute guest
+  paths, and writes `tx.ext4.xfstests_guest_availability_plan.v1` with
+  `availability_status=not-provisioned-plan-only` plus an installation mapping
+  for the xfstests tree, runner, manifest, results directory and TEST/SCRATCH
+  devices. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_guest_availability
+  tools.tests.test_ext4_xfstests_guest_bundle
+  tools.tests.test_ext4_xfstests_guest_provision` 8/8, Python compile for the
+  availability/bundle/provision scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 66/66,
+  `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`, scoped
+  `git diff --check`, `git show --check --stat HEAD`, and confirmed the
+  journal worktree still only has unrelated dirty
+  `xtask/src/lint_invariants_api_language.rs`. This remains availability
+  mapping evidence only; it does not copy files, install into a guest image,
+  execute QEMU or xfstests, run e2fsck, or produce
+  Tier/upstream-lock/product evidence. V2 stays pending on real pinned inputs,
+  provisioning, QEMU xfstests results and post-run fsck evidence.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests guest bundle contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `f144bae2`, adding
+  `tools/ext4/prepare_xfstests_guest_bundle.py`, then committed review
+  follow-up `b81f9ae8`, adding
+  `cargo xtask ext4 xfstests run guest-bundle`. The planner consumes only
+  `tx.ext4.xfstests_guest_provision_plan.v1` with
+  `evidence_status=plan-only` and `execution=disabled-plan-only`, binds the
+  supplied manifest and executable runner to the guest-provision plan SHA-256
+  references, requires an xfstests source containing `check`, carries forward
+  absolute guest xfstests/runner/manifest/TEST/SCRATCH/results paths, rejects
+  equal guest TEST/SCRATCH devices and existing outputs, and writes
+  `tx.ext4.xfstests_guest_bundle_plan.v1`. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_guest_bundle
+  tools.tests.test_ext4_xfstests_guest_provision
+  tools.tests.test_ext4_xfstests_shell_test_plan` 8/8, Python compile for the
+  guest bundle/provision/shell-test-plan scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 64/64,
+  `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`, scoped
+  `git diff --check`, `git show --check --stat HEAD`, and confirmed the
+  journal worktree still only has unrelated dirty
+  `xtask/src/lint_invariants_api_language.rs`. This remains guest bundle
+  planning evidence only; it does not copy files, provision a guest image,
+  execute QEMU or xfstests, run e2fsck, or produce
+  Tier/upstream-lock/product evidence. Next V2 step is a fail-closed bundle
+  installation or shell-test environment injection contract; V2 stays pending.
+
+- 2026-07-28 (memory/I/O ext4 V2 xfstests guest provisioning contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `e274bcb0`, adding
+  `tools/ext4/prepare_xfstests_guest_provision.py` and
+  `cargo xtask ext4 xfstests run guest-provision`, then committed review
+  follow-up `dd47fda5`. The planner consumes a plan-only shell-test plan,
+  binds its manifest source plus an executable guest runner source, and writes
+  `tx.ext4.xfstests_guest_provision_plan.v1` with absolute guest paths for
+  xfstests root, runner, manifest, TEST/SCRATCH devices and results. The
+  review fix rejects shell-test plans whose execution is not
+  `disabled-plan-only` and lists `run guest-provision` in `cargo xtask ext4
+  --help`. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_guest_provision
+  tools.tests.test_ext4_xfstests_shell_test_plan
+  tools.tests.test_ext4_xfstests_executor` 8/8, Python compile for the guest
+  provision, shell-test-plan and executor scripts/tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 62/62,
+  `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`, scoped
+  `git diff --check`, and `git show --check --stat HEAD`. This is guest
+  provisioning contract evidence only; it does not copy guest files, execute
+  QEMU/xfstests/e2fsck, or produce Tier/upstream-lock/product evidence.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests shell-test plan bridge).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `319711c5`, adding
+  `tools/ext4/run_xfstests_shell_test.py` and
+  `cargo xtask ext4 xfstests run shell-test`, then committed review follow-up
+  `7901fa3a`. The planner writes only
+  `tx.ext4.xfstests_shell_test_plan.v1` with
+  `evidence_status=plan-only`: it records the concrete
+  `cargo xtask shell-test` command shape for Alpine `tier1`/`tier2`, private
+  TEST/SCRATCH images, declared serial/results artifact paths, and required
+  guest environment, but execution remains disabled. The review fix requires
+  the selected tier group to exist in the script and rejects plan output under
+  `results/`, `evidence/` or any declared executor artifact path.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_shell_test_plan` 3/3, Python compile for the
+  planner/test, `cargo test -p xtask ext4 -- --test-threads=1` 61/61,
+  `cargo fmt --check --package xtask`, scoped `git diff --check`,
+  `cargo xtask ext4 --help`, and `git show --check --stat HEAD`. This remains
+  shell-test planning evidence only; no QEMU/xfstests/e2fsck run, Tier result,
+  upstream lock or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests explicit executor runner).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `21f8001c`, adding
+  `tools/ext4/execute_xfstests_run.py` and
+  `cargo xtask ext4 xfstests run execute`. The executor consumes an
+  `executor-contract-only` request, revalidates the private TEST/SCRATCH image
+  hashes and declared artifact paths, runs only an explicit `--runner` under
+  controlled `TX_XFSTESTS_*` variables, rejects runner failure before metadata
+  or verification, then calls the run metadata assembler and result verifier.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_executor
+  tools.tests.test_ext4_xfstests_run_prepare
+  tools.tests.test_ext4_xfstests_results` 22/22, Python compile for the
+  executor/preparer/metadata/result scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 61/61,
+  `cargo fmt --check --package xtask`, scoped `git diff --check`, and
+  `git show --check --stat HEAD`. This remains an explicit-runner tooling
+  backend only; the mock runner is tooling-only, and no real QEMU xfstests run,
+  real e2fsck execution, Tier evidence, upstream lock or product evidence was
+  produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests metadata and result-chain binding).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `980e1d33`, adding
+  `tools/ext4/assemble_xfstests_run_metadata.py` and
+  `cargo xtask ext4 xfstests run metadata`. The assembler consumes an
+  `executor-contract-only` request plus already-existing run artifacts,
+  requires `run-metadata.json` to match the request-declared artifact path,
+  verifies private TEST/SCRATCH image hashes, consumes existing `summary.tsv`,
+  serial log, guest output, mount facts and TEST/SCRATCH e2fsck logs, and
+  requires explicit zero TEST/SCRATCH e2fsck exit codes before writing
+  `tx.ext4.xfstests_run_metadata.v1`. Review follow-up `003e503c` added
+  metadata image references and verifier-side manifest image hash checks.
+  Review follow-up `e6ba82b5` then made
+  `tools/ext4/verify_xfstests_results.py` parse the executor request instead
+  of treating it as a plain hash reference: result verification now checks the
+  request schema/status, TEST/SCRATCH private image paths and SHA-256 values,
+  and the request-declared `run_metadata`, `results_dir`, serial, guest
+  output, mount facts and both e2fsck artifact paths against metadata/results.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_run_prepare
+  tools.tests.test_ext4_xfstests_results` 20/20, Python compile for the
+  preparer/executor/metadata/result scripts and tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` 60/60,
+  `cargo fmt --check --package xtask`, scoped `git diff --check`, and
+  `git show --check --stat HEAD`. This remains metadata/result-contract
+  evidence only; no QEMU xfstests run, real e2fsck execution, Tier evidence,
+  upstream lock or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests executor contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `6529896b`, adding
+  `tools/ext4/prepare_xfstests_executor.py` and
+  `cargo xtask ext4 xfstests run contract --run RUN_JSON --out REQUEST_JSON`.
+  The contract preparer consumes `tx.ext4.xfstests_run_plan.v1`
+  `prepared-run-only`, re-hashes the private TEST/SCRATCH images, requires the
+  private hashes to match the source hashes, and writes
+  `tx.ext4.xfstests_executor_request.v1` with
+  `evidence_status=executor-contract-only` plus future paths for results,
+  run metadata, serial log, guest output, mount facts, and TEST/SCRATCH
+  `e2fsck -fn` logs. Coordinator review found that `--out` could collide with
+  those future evidence paths; the lane fixed this in `edf670b2`, rejecting an
+  output equal to or nested under `results/`, `evidence/`, run metadata,
+  serial, guest-output, mount-facts, or either e2fsck log path before creating
+  anything. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_run_prepare` 7/7,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/prepare_xfstests_run.py
+  tools/ext4/prepare_xfstests_executor.py
+  tools/tests/test_ext4_xfstests_run_prepare.py`,
+  `cargo test -p xtask ext4 -- --test-threads=1` 58/58,
+  `cargo fmt --check --package xtask`, scoped `git diff --check`, and
+  `git show --check --stat HEAD`. This remains executor-contract evidence
+  only; no QEMU xfstests run, xfstests result, post-run `e2fsck -fn`, Tier
+  evidence, upstream lock or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests run staging contract).
+  Reused the existing `journal_lane`; no new worker was spawned. Coordinator
+  finished and committed `9d3e2170`, adding
+  `tools/ext4/prepare_xfstests_run.py`,
+  `tools/tests/test_ext4_xfstests_run_prepare.py`, and
+  `cargo xtask ext4 xfstests run prepare`. The preparer consumes only a
+  `tx.ext4.alpine_xfstests_plan.v1` `plan-only` DTO, validates TEST/SCRATCH
+  source image existence, distinctness and SHA-256 values, refuses an existing
+  run directory or output nested under a source image, copies TEST/SCRATCH into
+  a private run directory through a temporary staging directory, verifies the
+  private-copy hashes, and writes `tx.ext4.xfstests_run_plan.v1` with
+  `evidence_status=prepared-run-only` plus the source-plan hash. Coordinator
+  verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_run_prepare` 5/5, Python compile for the
+  preparer/test, `cargo test -p xtask ext4 -- --test-threads=1` 56/56,
+  `cargo xtask ext4 --help`, `cargo fmt --check --package xtask`, scoped
+  `git diff --check` and `git show --check --stat HEAD`. This is staging
+  evidence only; no QEMU xfstests run, xfstests result, post-run `e2fsck -fn`,
+  Tier evidence, upstream lock or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests result verifier evidence binding).
+  Reused the existing `journal_lane`; no new worker was spawned.
+  `journal_lane` first committed `6260d86d`, adding
+  `tools/ext4/verify_xfstests_results.py`,
+  `tools/tests/test_ext4_xfstests_results.py`, and
+  `cargo xtask ext4 xfstests result verify`. Coordinator review rejected the
+  first shape as too narrow because it only covered `pass/fail` summary/result
+  consistency and did not bind serial, guest output, mount facts or post-run
+  `e2fsck -fn` evidence required by the roadmap. The corrected follow-up
+  commit `2125314d` extends the verifier to accept the full selected-case
+  status vocabulary (`pass`, `fail`, `timeout`, `crash`, `not-run`), reject
+  promotion unless every selected case is `pass`, require
+  `tx.ext4.xfstests_run_metadata.v1`, bind manifest and summary SHA-256 values,
+  require serial log, guest output and mount-facts file references, and require
+  one successful `e2fsck -fn` file-hash-bound check each for TEST and SCRATCH.
+  Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_results` 9/9,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_runner
+  tools.tests.test_ext4_xfstests_results` 13/13,
+  `cargo test -p xtask ext4 -- --test-threads=1` 53/53,
+  Python compile for the verifier/test, `cargo fmt --check --package xtask`,
+  scoped `git diff --check`, and `git show --check --stat HEAD`. This is
+  result-contract verification only; no Alpine provisioning, QEMU xfstests,
+  real e2fsck output, Tier result, upstream lock, or product evidence was
+  produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 Alpine xfstests image-prepare xtask wrapper).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `a894c41d`, wiring
+  `cargo xtask ext4 xfstests image prepare` to
+  `tools/ext4/build_alpine_xfstests.py`. The wrapper forwards the pinned
+  xfstests root, manifest, guest runner, TEST/SCRATCH image paths, Alpine
+  rootfs path, Alpine rootfs SHA-256 and output path; successful preparation
+  returns after writing a `plan-only` DTO instead of falling through to the
+  acceptance-backend-not-implemented path. Coordinator verification passed
+  `cargo test -p xtask ext4 -- --test-threads=1` 49/49,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_build_alpine_xfstests` 4/4,
+  `cargo fmt --check --package xtask`, `cargo xtask ext4 --help`, scoped
+  `git diff --check -- xtask/src/ext4.rs`, and `git show --check --stat HEAD`.
+  This is command wiring only; no Alpine image build, QEMU run, e2fsck,
+  xfstests result, Tier evidence, upstream lock, or product evidence was
+  produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 Alpine xfstests build-plan contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `23cd5fc6`, adding `tools/ext4/build_alpine_xfstests.py` and
+  `tools/tests/test_ext4_build_alpine_xfstests.py`. The builder requires a
+  clean pinned xfstests worktree, prepared manifest, matching manifest
+  revision plus TEST/SCRATCH image hashes, executable guest runner, distinct
+  TEST/SCRATCH images, a verified Alpine rootfs SHA-256, and a non-existing
+  output path. It rejects placeholder identities, fixture-non-evidence
+  manifests, dirty sources, equal images, mismatched hashes and output
+  overwrite; success writes only a `tx.ext4.alpine_xfstests_plan.v1`
+  `plan-only` DTO. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_build_alpine_xfstests`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/build_alpine_xfstests.py
+  tools/tests/test_ext4_build_alpine_xfstests.py`,
+  executable-bit check, scoped `git diff --check`, and
+  `git show --check --stat HEAD`. This is build-plan input validation only; no
+  Alpine rootfs staging, provisioned guest image, QEMU run, xfstests result,
+  Tier evidence, upstream lock, or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests shell-test bridge).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `25159c1c`, adding
+  `tools/shell-tests/alpine-ext4-xfstests.txt` and
+  `tools/tests/test_ext4_xfstests_shell_test_bridge.py`. The bridge exposes
+  `setup`, `contract`, `tier1`, and `tier2` groups for the Alpine shell-test
+  harness; it fixes the `TX_XFSTESTS_*` entrypoint shape, requires provisioned
+  runner, manifest, xfstests root, separate TEST/SCRATCH devices and a results
+  parent, and emits explicit `NO_EVIDENCE` markers instead of invoking
+  xfstests. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_shell_test_bridge`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/tests/test_ext4_xfstests_shell_test_bridge.py`,
+  `cargo xtask shell-test --target rv64-qemu --list-groups --script
+  tools/shell-tests/alpine-ext4-xfstests.txt`,
+  `cargo test -p xtask shell_test -- --test-threads=1`, and
+  `git show --check --stat HEAD` in the journal worktree. This is shell-test
+  entrypoint readiness only; no QEMU run, real xfstests result, Tier evidence,
+  upstream lock, or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests guest runner contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `9d4b090d`, adding `tools/ext4/guest/run-xfstests.sh` and
+  `tools/tests/test_ext4_xfstests_runner.py`. The runner requires
+  `TX_XFSTESTS_ROOT`, `TX_XFSTESTS_MANIFEST`, `TX_XFSTESTS_TEST`,
+  `TX_XFSTESTS_SCRATCH`, and `TX_XFSTESTS_RESULTS`, defaults
+  `TX_XFSTESTS_CHECK` to `$TX_XFSTESTS_ROOT/check`, parses ordered manifest
+  tests plus optional exclusions, invokes only selected tests with TEST/SCRATCH
+  device env, and writes per-test `.result`/`.log` plus `summary.tsv` under the
+  results directory. It fail-closes on missing inputs, equal TEST/SCRATCH paths,
+  missing results parent, results under TEST/SCRATCH, invalid manifest, or a
+  non-executable check command. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_runner` 4/4, `bash -n
+  tools/ext4/guest/run-xfstests.sh`, Python compile for the runner test,
+  `git diff --check`, `git show --check --stat HEAD`, and a fake-check smoke
+  proving selected tests and exclusions are written to `summary.tsv`. This is a
+  guest-runner contract only; no real xfstests, QEMU, Tier result,
+  upstream-lock publication, or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 xfstests manifest xtask wrapper).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `40331341`, wiring `cargo xtask ext4 xfstests manifest prepare` to
+  `tools/ext4/prepare_xfstests_manifest.py`. The wrapper forwards
+  `--xfstests-root`, `--xfstests-revision`, TEST/SCRATCH image paths, repeated
+  `--test`, repeated `--exclude TEST=REASON`, and `--out`; missing repeated
+  tests or output fail during parsing, Python preparer failures preserve
+  stdout/stderr, and the wrapper exits after manifest preparation instead of
+  reaching the acceptance-backend-not-implemented path. Coordinator
+  verification passed `cargo test -p xtask ext4 -- --test-threads=1` 46/46,
+  `cargo fmt --check --package xtask`, `git diff --check`, `git show --check
+  --stat HEAD`, and a temporary clean-git CLI smoke where `cargo xtask ext4
+  xfstests manifest prepare` generated a JSON-valid manifest and ordinary
+  `cargo xtask ext4 xfstests` then consumed that generated manifest/images/mirror
+  before stopping at the existing backend-not-implemented gate. This is command
+  wiring only; no real xfstests, QEMU, Tier result, upstream-lock publication,
+  or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V2 pinned xfstests manifest preparer).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `7337951b`, adding `tools/ext4/prepare_xfstests_manifest.py` and
+  `tools/tests/test_ext4_xfstests_manifest.py`. The preparer accepts only a
+  non-bare, clean local xfstests Git worktree whose `HEAD` exactly matches the
+  supplied 40-hex revision, computes TEST/SCRATCH image SHA-256 values, requires
+  non-empty unique test IDs, encodes exclusions as explicit `TEST=REASON`
+  entries, rejects placeholder revision values, dirty/bare sources, missing
+  images and existing outputs, and writes the manifest shape consumed by
+  `cargo xtask ext4 xfstests`. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_xfstests_manifest` 7/7, Python compile for the new
+  script/test, `git diff --check`, `git show --check --stat HEAD`, and a
+  temporary clean-git smoke that generated a manifest, JSON-validated it, and
+  proved `cargo xtask ext4 xfstests` reads the generated manifest/images/mirror
+  before stopping at the existing `ext4 acceptance backend is not implemented
+  yet` gate. This is pinned manifest-preparation tooling only; no real
+  xfstests, QEMU, Tier result, upstream-lock publication, or product evidence
+  was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 default replay matrix runners).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `a6a58c87`, changing `tools/ext4/fault_qemu_executor.py` so
+  `TX_EXT4_FAULT_LINUX_REPLAY_COMMAND` and
+  `TX_EXT4_FAULT_TX_REMOUNT_COMMAND` remain explicit overrides, while missing
+  overrides resolve to repository-owned replay/remount runners. The Tx remount
+  default uses executable `tools/ext4/fault_tx_remount.py`; the Linux RW replay
+  default only resolves when the repository runner is executable and the host is
+  Linux root with mount/umount/e2fsck available, so this Darwin host still
+  fail-closes before the primary runner with `Linux RW replay requires a Linux
+  host`. Coordinator verification passed the full Python fault set 64/64,
+  `cargo test -p xtask ext4 -- --test-threads=1` 43/43, Python compile for
+  changed replay/remount/executor/semantic files and tests, `git diff --check`,
+  and `git show --check --stat HEAD`. Coordinator follow-up `c8e3f48e` aligned
+  the executor scaffold header comment with the new default-runner behavior;
+  focused executor tests 27/27, Python compile, `git diff --check`, and `git
+  show --check --stat HEAD` passed. The ignored
+  `target/ext4/fault-registered-20260727-9pairs/campaign-plan.json` remains
+  `plan-only` with nine semantic-oracle jobs and zero crash/replay/result or
+  semantic-debugfs image artifacts. This is replay/remount command-resolution
+  wiring only; no real QEMU hard-kill campaign, Linux RW replay, Tx remount
+  semantic witness, xfstests, or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 default e2fsck command).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `6022de93`, changing `tools/ext4/fault_qemu_executor.py` so replay
+  e2fsck uses explicit `TX_EXT4_FAULT_E2FSCK_COMMAND`, then `e2fsck` on `PATH`,
+  then executable Homebrew e2fsprogs `e2fsck`. Empty overrides and
+  missing/non-executable defaults fail closed. Coordinator verification passed
+  the full Python fault set 61/61, `cargo test -p xtask ext4 --
+  --test-threads=1` 43/43, Python compile for changed executor and
+  semantic-oracle files/tests, `git diff --check`, and `git show --check --stat
+  HEAD`. The ignored
+  `target/ext4/fault-registered-20260727-9pairs/campaign-plan.json` remains
+  `plan-only` with nine semantic-oracle jobs and zero crash/replay/result or
+  semantic-debugfs image artifacts. This is e2fsck command-resolution wiring
+  only; no real QEMU hard-kill campaign, Linux RW replay, Tx remount semantic
+  witness, xfstests, or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 default debugfs command).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `0a8be223`, changing `tools/ext4/fault_semantic_oracle.py` so the
+  semantic oracle uses `TX_EXT4_FAULT_DEBUGFS_COMMAND` when explicitly set, then
+  falls back to `debugfs` on `PATH`, then to executable Homebrew e2fsprogs
+  `debugfs`. Empty overrides and missing/non-executable defaults fail closed
+  before semantic observation. Coordinator verification passed the full Python
+  fault set 56/56, `cargo test -p xtask ext4 -- --test-threads=1` 43/43,
+  Python compile for changed executor/semantic-oracle files and tests,
+  `git diff --check`, and `git show --check --stat HEAD`. The ignored
+  `target/ext4/fault-registered-20260727-9pairs/campaign-plan.json` remains
+  `plan-only` with nine semantic-oracle jobs and zero crash/replay/result or
+  semantic-debugfs image artifacts. This is debugfs command-resolution wiring
+  only; no real QEMU hard-kill campaign, Linux RW replay, Tx remount semantic
+  witness, xfstests, or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 default semantic oracle runner).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `46f1184f`, changing `tools/ext4/fault_qemu_executor.py` so
+  semantic-oracle campaign jobs default to the repository executable
+  `tools/ext4/fault_semantic_oracle.py` when
+  `TX_EXT4_FAULT_SEMANTIC_ORACLE_COMMAND` is unset, while explicit environment
+  overrides still win. Missing/non-executable repository defaults and explicit
+  empty overrides still fail closed before the primary runner, and preflight
+  records both `command_source` and the resolved command. Coordinator
+  verification passed the full Python fault set 51/51, `cargo test -p xtask
+  ext4 -- --test-threads=1` 43/43, Python compile for changed executor and
+  semantic-oracle files/tests, `git diff --check`, and `git show --check --stat
+  HEAD`. The ignored
+  `target/ext4/fault-registered-20260727-9pairs/campaign-plan.json` remains
+  `plan-only` with nine semantic-oracle jobs and zero crash/replay/result or
+  semantic-debugfs image artifacts. This is default runner wiring only; no real
+  QEMU hard-kill campaign, Linux RW replay, Tx remount semantic witness,
+  xfstests, or product evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 semantic fault oracle runner).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `bfcac360`, adding executable
+  `tools/ext4/fault_semantic_oracle.py` plus executor plumbing in
+  `tools/ext4/fault_qemu_executor.py`. The semantic runner consumes
+  `tx.ext4.fault_semantic_oracle_request.v1`, uses a debugfs-compatible
+  command to check declared present/absent paths, file sizes and SHA-256
+  payloads, and writes the declared log so the verifier can bind observations
+  by log hash. The executor now preflights
+  `TX_EXT4_FAULT_SEMANTIC_ORACLE_COMMAND`, copies the replay image to a
+  separate per-oracle image, writes semantic request artifacts, invokes the
+  command, and records successful observations in `result.json` after the
+  existing hard-kill, replay e2fsck and replay/remount matrix gates. Coordinator
+  verification passed the full Python fault set 47/47, `cargo test -p xtask
+  ext4 -- --test-threads=1` 43/43, the existing pinned one-cut `cargo xtask ext4
+  fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`,
+  Python compile for changed Python files, executable-bit check for
+  `tools/ext4/fault_semantic_oracle.py`, focused executor+semantic-runner
+  success-path tests, `rustfmt --edition 2021 --check xtask/src/ext4.rs`, `git
+  diff --check`, and `git show --check --stat HEAD`. The ignored
+  `target/ext4/fault-registered-20260727-9pairs/campaign-plan.json` remains
+  `plan-only` with nine semantic-oracle jobs and zero crash/replay/result
+  artifacts. This is host oracle runner plumbing only; no real QEMU hard-kill,
+  Linux RW replay, Tx remount semantic witness, or e2fsck acceptance matrix was
+  produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 semantic fault oracle contract).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `daefdbce`, adding per-job `semantic_oracles` to
+  `tools/ext4/fault_harness.py` campaign plans and making
+  `tools/ext4/fault_harness.py --verify-plan` reject result manifests that lack
+  the declared semantic observations. `tools/ext4/fault_qemu_executor.py` now
+  refuses to write `result.json` when semantic oracles are declared but no real
+  oracle execution path exists, so future V1 campaigns cannot promote e2fsck
+  and replay evidence without debugfs/file-hash/namespace outcome evidence. The
+  regenerated ignored artifact
+  `target/ext4/fault-registered-20260727-9pairs/campaign-plan.json` remains
+  `plan-only`, contains exactly nine registered jobs, and has one
+  `debugfs-file-hash-namespace` semantic oracle per job with no crash/result
+  artifacts. Coordinator verification passed the full Python fault set 42/42,
+  `cargo test -p xtask ext4 -- --test-threads=1` 43/43,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` for changed Python files,
+  the existing pinned one-cut `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`, an
+  executor fail-closed spot check proving semantic-oracle jobs do not write
+  `result.json` without an oracle runner, `rustfmt --edition 2021 --check
+  xtask/src/ext4.rs`, `git diff --check`, and `git show --check --stat HEAD`.
+  This is fail-closed oracle contract coverage only; no real debugfs oracle,
+  QEMU hard-kill campaign, Linux RW replay matrix result, Tx remount semantic
+  result, or e2fsck acceptance matrix was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 registered-pair fault planning).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `79cdc6f4`, changing `tools/ext4/fault_harness.py` so campaign
+  planning expands only profile-allowed case/cut pairs that are actually
+  registered in the repository script registry. A full profile containing both
+  `after-commit` and `after-clean-superblock` no longer produces invalid
+  cross-product jobs such as `write_fsync/after-clean-superblock`; concrete
+  unregistered selections fail closed before check-only planning. The lane also
+  generated ignored authoritative input artifacts under the journal worktree:
+  `target/ext4/profiles/tier1-registered-fault-inputs-authority.json` and
+  `target/ext4/fault-registered-20260727-9pairs/campaign-plan.json`. The plan
+  is `plan-only` with exactly nine registered jobs and no result/crash
+  artifacts. Coordinator verification passed the full Python fault set 39/39,
+  `cargo test -p xtask ext4 -- --test-threads=1` 43/43, Python compile for the
+  changed files, the existing pinned one-cut
+  `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`,
+  explicit fail-closed and clean-unmount selection spot checks, `git
+  diff --check`, and `git show --check --stat HEAD`. This is deterministic
+  plan/input coverage only; no QEMU hard-kill, Linux RW replay, Tx remount
+  semantic result, matrix result, or e2fsck acceptance evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 independent namespace fault inputs).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `6ec42101`, adding repository-owned
+  `tools/shell-tests/ext4-fault-create-after-commit.txt`,
+  `tools/shell-tests/ext4-fault-unlink-after-commit.txt`,
+  `tools/shell-tests/ext4-fault-rename-same-dir-after-commit.txt`, and
+  `tools/shell-tests/ext4-fault-rename-cross-dir-after-commit.txt`, then
+  registering `create/after-commit`, `unlink/after-commit`,
+  `rename_same_dir/after-commit`, and `rename_cross_dir/after-commit` in
+  `tools/ext4/fault_harness.py`. The xtask temporary-root fixture copier now
+  carries these canonical scripts, so executor smokes cannot pass with missing
+  independent namespace inputs. Coordinator verification passed the full Python
+  fault set 37/37, `cargo test -p xtask ext4 -- --test-threads=1` 43/43,
+  `rustfmt --edition 2021 --check xtask/src/ext4.rs`, `git diff --check`,
+  `git show --check --stat HEAD`, and the existing pinned one-cut
+  `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`. This
+  is deterministic workload input coverage only; no QEMU crash/replay, Linux RW
+  replay, replay/remount matrix, Tx remount semantic result, or e2fsck
+  acceptance evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 clean-unmount fault input).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `c34fa81c`, adding repository-owned
+  `tools/shell-tests/ext4-fault-clean-unmount-after-clean-superblock.txt` for
+  `clean_unmount/after-clean-superblock` and registering that case/cut in
+  `tools/ext4/fault_harness.py`. The script writes SCRATCH data, syncs, and
+  emits the deterministic marker only after `/bin/busybox umount ... && echo`,
+  so the input is bound to a successful clean unmount rather than an earlier
+  write marker. Coordinator verification passed the full Python fault set
+  36/36, `cargo test -p xtask ext4 -- --test-threads=1` 43/43,
+  `rustfmt --edition 2021 --check xtask/src/ext4.rs`, `git diff --check`,
+  `git show --check --stat HEAD`, and the existing pinned one-cut
+  `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`. This
+  is deterministic workload input coverage only; no QEMU crash/replay, Linux RW
+  replay, replay/remount matrix, or e2fsck acceptance evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 namespace fault workloads).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `67756fa9`, adding repository-owned
+  `tools/shell-tests/ext4-fault-create-unlink-after-commit.txt` and
+  `tools/shell-tests/ext4-fault-truncate-after-commit.txt`, then registering
+  `create_unlink/after-commit` and `truncate/after-commit` in
+  `tools/ext4/fault_harness.py`. The xtask temporary-root fixture copier now
+  carries these canonical scripts, so executor smokes cannot pass with missing
+  namespace fault inputs. Coordinator verification passed the full Python fault
+  set 35/35, `cargo test -p xtask ext4 -- --test-threads=1` 43/43,
+  `rustfmt --edition 2021 --check xtask/src/ext4.rs`, `git diff --check`,
+  `git show --check --stat HEAD`, and the existing pinned one-cut
+  `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`. This
+  is deterministic workload input coverage only; no new QEMU crash/replay,
+  Linux RW replay, matrix, or e2fsck acceptance evidence was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 expanded pinned fault inputs).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane made
+  no tracked-file commit in this slice; it generated ignored authoritative
+  inputs under the journal worktree:
+  `target/ext4/profiles/tier1-write-fsync-rename-replace-authority.json` and
+  `target/ext4/fault-expanded-20260727/campaign-plan.json`. Coordinator
+  spot-check confirmed the profile is pinned to clean Linux
+  `f5098b6bae761e346ebcd9da7f95622c04733cff`, clean e2fsprogs
+  `43643a57fb2d3368fbacd181a8cd713102d52a1a`, source-seed SHA-256
+  `f0a09ff7634ed03c35a6e95b6cc2aa1936591c8c1c92e98d6e3ab836669322f8`, cases
+  `write_fsync` and `rename_replace`, and cut `after-commit`. The check-only
+  plan contains exactly two `plan-only` jobs and no result manifests. Fresh
+  verification passed Python fault tests 34/34, `cargo test -p xtask ext4 --
+  --test-threads=1` 43/43, and `git diff --check` in the journal worktree.
+  This is expanded pinned-input coverage only; no QEMU crash, Linux RW replay,
+  replay/remount matrix, or e2fsck acceptance artifact was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 rename fault input).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `a630993b`, adding the repository-owned
+  `tools/shell-tests/ext4-fault-rename-replace-after-commit.txt` workload for
+  `rename_replace/after-commit` and binding the harness to an explicit
+  case/cut-to-script registry. The harness now rejects wrong-script execution
+  for a registered case/cut and rejects `all` execution through a single script,
+  so deterministic campaigns cannot accidentally run the write-fsync script for
+  rename replacement. Coordinator verification passed the full Python fault set
+  34/34, `cargo test -p xtask ext4 -- --test-threads=1` 43/43,
+  `rustfmt --edition 2021 --check xtask/src/ext4.rs`, `git diff --check`, and
+  the existing pinned one-cut `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`. This
+  is input-contract progress only; no new QEMU crash/replay/Linux matrix
+  artifact was produced.
+
+- 2026-07-27 (memory/I/O ext4 V1 replay-matrix runner commands).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `1a5d93ce`, adding replay-matrix runner preflight before the
+  primary fault QEMU run: missing or non-executable Linux RW replay, post-replay
+  fsck, or Tx remount commands now record
+  `replay_matrix_preflight.status=blocked` in the executor plan and do not
+  create serial/crash/result evidence. The lane then committed `5880b287`,
+  adding repository-owned runner commands:
+  `tools/ext4/fault_linux_rw_replay.py` for a Linux root loop-mount RW replay,
+  `tools/ext4/fault_tx_remount.py` for a Tx SCRATCH-role remount/readback run,
+  and `tools/shell-tests/ext4-fault-tx-remount.txt` as the Tx witness script.
+  Coordinator verification passed the full Python fault runner set 30/30,
+  `cargo test -p xtask ext4 -- --test-threads=1` 43/43,
+  `cargo fmt --check --package xtask`, `py_compile` for changed Python files,
+  `git diff --check`, and the existing pinned one-cut
+  `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`.
+  This still does not produce matrix acceptance evidence: the Linux RW runner
+  intentionally fails closed on Darwin, so a pinned/authorized Linux replay
+  environment is still required before a real matrix campaign can count.
+
+- 2026-07-27 (memory/I/O ext4 V1 replay/remount matrix gate).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  committed `cd471c2a`, making fault campaign plans declare replay/remount
+  matrix artifacts and making `cargo xtask ext4 fault verify --plan` reject
+  result manifests that lack the declared Linux RW replay, post-replay
+  `e2fsck -fn`, and Tx remount observations. The same lane then committed
+  `97107c21`, adding executor plumbing for explicit
+  `TX_EXT4_FAULT_LINUX_REPLAY_COMMAND` and
+  `TX_EXT4_FAULT_TX_REMOUNT_COMMAND` runners, with independent replay image/log
+  paths and log SHA-256/exit-code binding in `result.json`. Coordinator
+  verification passed Python fault tests 25/25, `cargo test -p xtask ext4 --
+  --test-threads=1` 43/43, and the existing pinned one-cut
+  `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`.
+  This is fail-closed matrix infrastructure only: no real Linux RW replay or Tx
+  remount command was provided, so no matrix artifact or V1 closure exists yet.
+
+- 2026-07-27 (memory/I/O ext4 V1 pinned-source one-cut witness).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  preserved the `983e87a9` provenance binding, then created ignored authority
+  inputs under `target/ext4/source-authority/`: clean Linux
+  `f5098b6bae761e346ebcd9da7f95622c04733cff`, clean e2fsprogs
+  `43643a57fb2d3368fbacd181a8cd713102d52a1a`, and immutable source-seed
+  SHA-256 `f0a09ff7634ed03c35a6e95b6cc2aa1936591c8c1c92e98d6e3ab836669322f8`.
+  The bound profile is
+  `target/ext4/profiles/tier1-write-fsync-authority.json`. A real
+  `write_fsync/after-commit` job under
+  `target/ext4/fault-real-20260727-1831-pinned-profile/` recorded an observed
+  hard kill, replay, and `e2fsck -fn` exit 0; `cargo xtask ext4 fault verify
+  --plan target/ext4/fault-real-20260727-1831-pinned-profile/campaign-plan.json`
+  passed. Commit `fdc5fe26` also normalizes campaign artifact paths to absolute
+  paths so plan, executor request and `result.json` bind the same replay/log
+  identity. Coordinator verification passed Python fault tests 22/22,
+  `cargo test -p xtask ext4 -- --test-threads=1` 43/43, profile/source
+  revision/status spot-checks, result log SHA-256 recomputation, and
+  `cargo xtask progress validate` in the journal worktree. This is V1 pinned
+  input plus one-cut evidence only, not V1 closure; next steps are the full
+  deterministic case/cut campaign, replay/remount matrix, xfstests and product
+  gates.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, source-authority preflight).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  checked whether the current machine could advance from runtime-only one-cut
+  evidence to an authoritative pinned fault profile and found no usable local
+  clean Linux/e2fsprogs Git source checkout in the bounded probe roots
+  (`/tmp`, `/Users/3y/Downloads`, `target/ext4`, and `external`). Coordinator
+  spot-check confirmed `tools/ext4/prepare_fault_profile.py` requires each
+  source path to be a clean Git worktree whose `HEAD` exactly equals the
+  supplied 40-hex revision, and confirmed Homebrew e2fsprogs 1.47.4 provides a
+  runtime `e2fsck` binary but not the required verifiable source checkout. No
+  pinned profile was generated, and no additional campaign was run, to avoid
+  fabricating Linux/e2fsprogs authority. Next V1 action is to provide or fetch
+  real clean Linux and e2fsprogs source checkouts plus immutable source-seed
+  material, then run `cargo xtask ext4 fault profile prepare` and rerun the
+  campaign under that pinned profile.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, provenance one-cut rerun).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane ran a
+  real `write_fsync/after-commit` one-cut QEMU fault job under commit
+  `983e87a9`, using the repository shell-test script and Homebrew e2fsprogs
+  1.47.4, and wrote
+  `target/ext4/fault-real-20260727-1817-provenance/`. The job directory contains
+  `serial.log`, `crash.img`, `replay.img`, `e2fsck-fn.log`, `job-request.json`,
+  `executor-plan.json`, and `result.json`. The result manifest now uses the
+  strengthened provenance schema: `e2fsck_checks[0].args` is `-fn` against the
+  preserved `replay.img`, `e2fsck_checks[0].log` points to the preserved log,
+  and the declared log SHA-256
+  `e8b5bfc4c1424de91bc7e2b2f7b3e696a55286bca759da8b2d7e113a194149ca` matches a
+  coordinator recomputation from the log bytes. `cargo xtask ext4 fault verify
+  --plan target/ext4/fault-real-20260727-1817-provenance/campaign-plan.json`
+  returned 0. This is current one-cut runtime evidence for the artifact
+  provenance gate only; the profile used for the run was a temporary
+  non-placeholder runtime profile, not an authoritative pinned
+  Linux/e2fsprogs profile. V1 still needs real authoritative source inputs,
+  pinned profile/upstream lock, full deterministic campaign, replay/remount
+  matrix, xfstests, and product gates.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, fault e2fsck provenance).
+  Reused the existing `journal_lane`; no new worker was spawned. The worker
+  identified a V1 gate gap that did not require external source authority:
+  `tx.ext4.fault_job_result.v1` recorded only the e2fsck exit summary while the
+  verifier checked only that the declared e2fsck log existed. The coordinator
+  committed `983e87a9` in the `codex/ext4-journal-settlement` worktree, making
+  the QEMU fault executor record each executed e2fsck check's tool, args, log
+  path, log SHA-256 and exit code in `result.json`, and making
+  `tools/ext4/fault_harness.py --verify-plan` match those fields against the
+  campaign job plus the actual log bytes. The RED tests first failed with
+  missing `e2fsck_checks` and accepted mismatched log digest; after the fix,
+  verification passed `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_qemu_executor tools.tests.test_ext4_fault_harness`
+  (21/21), `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` for the changed
+  Python files/tests, `cargo test -p xtask ext4 -- --test-threads=1` (43/43),
+  `cargo fmt --check --package xtask`, scoped `git diff --check`, and
+  `git show --check --stat HEAD`. Existing one-cut artifacts from earlier
+  slices remain useful historical evidence, but they must be regenerated or
+  reverified under the new result provenance schema before being used as current
+  V1 campaign evidence. V1 still needs real authoritative Linux/e2fsprogs source
+  inputs, pinned profile/upstream lock, full deterministic campaign,
+  replay/remount matrix, xfstests, and product gates.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, xtask verified profile command).
+  Reused the existing `journal_lane`; no new worker was spawned. The worker
+  committed `28c3c03e`, wiring
+  `cargo xtask ext4 fault profile prepare` to
+  `tools/ext4/prepare_fault_profile.py` so verified fault profiles must be
+  prepared from explicit clean Linux/e2fsprogs source trees, supplied revisions,
+  immutable source-seed path and SHA-256, explicit case ID, explicit fault-cut
+  ID, and explicit output path. The command rejects missing required arguments
+  during parsing and propagates the preparer's failing status/stderr instead of
+  papering over source-authority errors. Coordinator verification passed a real
+  xtask smoke using temporary clean Git source trees and seed, whose generated
+  profile was accepted by `tools/ext4/fault_harness.py --check-only`;
+  `cargo fmt --check --package xtask`; `cargo test -p xtask ext4 --
+  --test-threads=1` (43/43);
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_profile tools.tests.test_ext4_fault_harness`
+  (15/15); `git show --check --stat HEAD`; and worktree `git diff --check`.
+  The existing unrelated dirty file
+  `xtask/src/lint_invariants_api_language.rs` in the journal worktree was
+  preserved. V1 remains open: real authoritative Linux/e2fsprogs source inputs,
+  a pinned profile/upstream lock, full deterministic campaign, replay/remount
+  matrix, xfstests, and product gates are still missing.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, verified fault profile preparer).
+  Reused the existing `journal_lane`; no new worker was spawned. The worker
+  committed `e1526b6e`, adding `tools/ext4/prepare_fault_profile.py` and
+  `tools/tests/test_ext4_fault_profile.py`. The preparer writes the existing
+  fault-profile JSON shape only after supplied Linux and e2fsprogs source paths
+  are local clean Git worktrees at the supplied 40-hex commits, the immutable
+  source-seed file matches its supplied SHA-256, and case/cut IDs are explicit.
+  It refuses placeholder repeated-hex authority values and refuses to overwrite
+  an existing output file. Coordinator verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_profile tools.tests.test_ext4_fault_harness`
+  (15/15), `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` for the profile
+  preparer/harness files, `cargo test -p xtask ext4 -- --test-threads=1`
+  (40/40), scoped `git diff --check`, and `git show --check --stat HEAD`.
+  This closes the hand-written fake-profile escape hatch but does not supply a
+  real pinned Linux/e2fsprogs source lock; V1 still needs authoritative source
+  inputs, full deterministic campaign, replay/remount matrix, xfstests, and
+  product gates.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, repository fault script).
+  Reused the existing `journal_lane`; no new worker was spawned. The worker
+  committed `e85fdfe2`, adding
+  `tools/shell-tests/ext4-fault-write-fsync-after-commit.txt` as a
+  repository-owned single-cut `write_fsync/after-commit` script. Review found
+  the accompanying profile used fake repeated-hex authority values, which would
+  violate the no-fabricated Linux/e2fsprogs/hash rule. The coordinator
+  committed `ccdebdc5`, deleting that fake profile and making both Python
+  `tools/ext4/fault_harness.py` and Rust `xtask/src/ext4/profile.rs` reject
+  repeated-character placeholder hex in `linux_revision`,
+  `e2fsprogs_revision`, and `sha256`. Verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness tools.tests.test_ext4_fault_qemu_executor`
+  (20/20), `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` for changed
+  Python files, `cargo test -p xtask ext4 -- --test-threads=1` (40/40),
+  `cargo test -p xtask shell_test -- --test-threads=1` (17/17),
+  `cargo fmt --check --package xtask`, scoped `git diff --check`, and
+  `git show --check --stat HEAD`. A real QEMU single-job run using the
+  repository script plus a temporary non-placeholder profile returned 0 and
+  `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1740/campaign-plan.json` returned 0; its
+  result manifest records hard kill observed, replay attempted, and Homebrew
+  e2fsprogs 1.47.4 `e2fsck -fn` exit 0 on replay.img. V1 remains open because
+  the authoritative pinned profile/upstream lock, full deterministic campaign,
+  replay/remount matrix, xfstests, and product gates are still missing.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, replay e2fsck result path).
+  Reused the existing `journal_lane`; no new worker was spawned. The worker
+  produced commit `1a2b6c31`, allowing the fault executor to write
+  `tx.ext4.fault_job_result.v1` only after the default shell-test command source
+  observes its hard-kill path, preserves crash/replay images, and replay
+  `e2fsck -fn` exits 0. The coordinator then committed `277be7cb`, binding the
+  harness and executor contract to `replay.img`: campaign plans now list
+  `e2fsck -fn <replay.img>`, and the executor refuses result manifests if a
+  requested e2fsck check targets anything else. Verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_qemu_executor tools.tests.test_ext4_fault_harness`
+  (17/17), `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` for the changed
+  Python files, `cargo test -p xtask ext4 -- --test-threads=1` (39/39),
+  `cargo test -p xtask shell_test -- --test-threads=1` (17/17), scoped
+  `git diff --check`, `git show --check --stat HEAD`, and a synthetic CLI smoke
+  that used fake `cargo shell-test` plus fake `e2fsck` to exercise
+  harness→executor→result→verify end to end. A follow-up real single-job QEMU
+  attempt first failed closed because the executor closed runner stdout after
+  the cut marker, causing shell-test to exit before writing its serial log. The
+  coordinator committed `f89fee61`, keeping runner stdout open and draining it
+  until shell-test exits. The same single-job command then returned 0 and wrote
+  `target/ext4/fault-real-20260727-1717/write_fsync/after-commit/0001/` with
+  `serial.log`, `crash.img`, `replay.img`, `e2fsck-fn.log`, `result.json`, and
+  `executor-plan.json`; Homebrew e2fsprogs 1.47.4 `e2fsck -fn` exited 0 on the
+  replay image, and `cargo xtask ext4 fault verify --plan
+  target/ext4/fault-real-20260727-1717/campaign-plan.json` returned 0. This is
+  real one-cut runner/e2fsck evidence, but still not accepted V1 closure because
+  it is not the full deterministic campaign, replay/remount matrix,
+  xfstests/upstream-lock evidence, or product gate.
+
+- 2026-07-27 (memory/I/O ext4 lane continuation, default fault runner).
+  Reused the existing `journal_lane`; no new worker was spawned. The journal
+  worktree committed `cc64f06b`, changing `tools/ext4/fault_qemu_executor.py`
+  from opt-in execution to default runner execution. `cargo xtask ext4 fault
+  --executor tools/ext4/fault_qemu_executor.py ...` now runs the planned
+  shell-test command by default; `TX_EXT4_FAULT_PLAN_ONLY=1` is the explicit
+  plan-only escape hatch. For environment override runners, the executor still
+  terminates the mock/override after the cut marker and marks
+  `hard_kill.status = not-observed`; for the real `shell-test-command` source,
+  it waits for `shell-test --fault-cut-marker` to exit after its own QEMU kill
+  path and records `hard_kill.status = observed-by-shell-test`. Both paths still
+  preserve SCRATCH crash/replay copies and refuse to write `result.json`.
+  Verification passed: RED showed the default mock-runner test stayed
+  `prepared-not-run`; after the fix,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_qemu_executor tools.tests.test_ext4_fault_harness`
+  passed 15/15, `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` passed for
+  changed Python files, `cargo test -p xtask ext4 -- --test-threads=1` passed
+  39/39, `cargo test -p xtask shell_test -- --test-threads=1` passed 17/17,
+  scoped `git diff --check` passed, default-execute and plan-only CLI smokes
+  behaved as expected, and `git show --check --stat HEAD` passed. This is still
+  not V1 crash evidence: no real QEMU run, replay mount, e2fsck log, or
+  `tx.ext4.fault_job_result.v1` was produced in this slice.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, shell-test fault cut runner).
+  Reused the existing `journal_lane`; no new worker was spawned. The worker
+  committed `ba290926`, adding opt-in executor execution through
+  `TX_EXT4_FAULT_EXECUTE=1`: the executor can launch a runner until the cut
+  marker appears, terminate it, preserve SCRATCH crash/replay copies, and still
+  fail closed without writing `result.json`. The coordinator then committed
+  `d24b1734`, adding `cargo xtask shell-test --fault-cut-marker TEXT`; in
+  sequential mode, `shell-test` kills QEMU immediately after an expect/wait sees
+  the marker and reports the observed cut. The executor's planned shell-test
+  command now includes `--fault-cut-marker <marker>`. Verification passed:
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_qemu_executor tools.tests.test_ext4_fault_harness`
+  (14/14), `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` for the changed
+  Python files, `cargo test -p xtask shell_test -- --test-threads=1` (17/17),
+  `cargo test -p xtask ext4 -- --test-threads=1` (39/39),
+  `rustfmt --edition 2021 --check xtask/src/shell_test.rs xtask/src/lib.rs`,
+  scoped `git diff --check`, a normal CLI smoke that still generated
+  `executor-plan.json` and no `result.json`, a mock-execute xtask/harness smoke
+  that produced crash/replay copies while keeping `hard_kill.status =
+  not-observed`, and `git show --check --stat HEAD`. This is still not real QEMU
+  deterministic hard-kill or e2fsck crash-image evidence; next step is replacing
+  the mock runner path with actual `shell-test --fault-cut-marker` execution and
+  then adding replay/e2fsck result production.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 fault cut-marker contract).
+  Reused the existing `journal_lane` worker context; no new worker was spawned.
+  The worker committed `882538b5`, recording the prepared runner DTO and stale
+  `result.json` refusal, and the coordinator committed `b659a520`, making every
+  fault job request carry a deterministic `tx-ext4-fault-cut:<case>:<cut>`
+  marker. `tools/ext4/fault_qemu_executor.py` now refuses a shell-test script
+  that does not contain that marker, and writes it into `runner.cut_marker` and
+  `hard_kill.marker` in `tx.ext4.fault_qemu_executor_plan.v1`. Verification
+  passed after RED/GREEN: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_qemu_executor tools.tests.test_ext4_fault_harness`
+  (13/13), `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` for changed
+  Python files, `cargo test -p xtask ext4 -- --test-threads=1` (39/39),
+  scoped `git diff --check`, a real `cargo run -p xtask -- ext4 fault ...
+  --executor tools/ext4/fault_qemu_executor.py ...` smoke that intentionally
+  returned non-zero while producing an `executor-plan.json` with the expected
+  marker and no `result.json`, and `git show --check --stat HEAD`. This is still
+  not QEMU hard-kill/replay/e2fsck crash evidence.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 fault QEMU executor scaffold).
+  Reused existing workers; no new worker was spawned. The coordinator
+  continued in the existing journal worktree and committed `2ef452cf`, adding
+  repository-owned `tools/ext4/fault_qemu_executor.py` plus tests. The executor
+  reads `tx.ext4.fault_job_request.v1`, stages private TEST/SCRATCH/WORKLOAD
+  image copies under the job directory, writes
+  `tx.ext4.fault_qemu_executor_plan.v1` with the exact `cargo xtask
+  shell-test` command shape, serial log path, staged role images and requested
+  hard-kill cut, then exits non-zero before writing any result manifest because
+  deterministic hard-kill execution is not implemented. Verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_qemu_executor`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/fault_qemu_executor.py
+  tools/tests/test_ext4_fault_qemu_executor.py`, scoped `git diff --check`, a
+  real `cargo run -p xtask -- ext4 fault ... --executor
+  tools/ext4/fault_qemu_executor.py ...` smoke that intentionally returned
+  non-zero while generating `executor-plan.json` and no `result.json`, and
+  `git show --check --stat HEAD`. This is still not crash evidence; the next
+  slice must implement deterministic cut observation/hard-kill and offline
+  e2fsck replay preservation.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 fault runner role inputs).
+  Reused existing workers; no new worker was spawned. The coordinator
+  continued in the existing journal worktree and committed `6937d3f9`, making
+  the fault executor contract carry the concrete QEMU role inputs needed by a
+  real runner. `tools/ext4/fault_harness.py --executor` now requires
+  `--test-image`, `--scratch-image`, `--workload-image`, `--target`,
+  `--qemu-profile`, `--script`, and `--timeout-ms`, validates those files
+  fail-closed, and writes them into each `tx.ext4.fault_job_request.v1` as
+  `role_images` plus `qemu`. `cargo xtask ext4 fault ... --executor` now parses,
+  validates and passes the same inputs through. Verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness` (10 tests),
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/fault_harness.py tools/tests/test_ext4_fault_harness.py`,
+  `cargo test -p xtask ext4 -- --test-threads=1` (39 tests),
+  `cargo fmt --check --package xtask`, scoped `git diff --check`, a real
+  synthetic `cargo run -p xtask -- ext4 fault ... --executor ... --test-image
+  ... --scratch-image ... --workload-image ... --target rv64-qemu
+  --qemu-profile alpine --script ... --timeout-ms 60000` smoke that verified
+  the generated request fields, and `git show --check --stat HEAD`. This is
+  still a runner input contract only; the actual QEMU hard-kill executor and
+  Homebrew `e2fsck -fn` crash-image campaign remain pending.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 fault executor contract).
+  Reused existing workers; no new worker was spawned. The coordinator
+  continued in the existing journal worktree and committed `221ac5dc`, adding
+  an explicit `--executor` contract for deterministic fault campaigns.
+  `tools/ext4/fault_harness.py` now writes a per-job
+  `tx.ext4.fault_job_request.v1` `job-request.json`, invokes the supplied
+  executor once per campaign job, requires the executor to preserve
+  crash/replay images plus `e2fsck -fn` logs and result manifests, then reuses
+  the `--verify-plan` gate before accepting the run. `cargo xtask ext4 fault`
+  now passes `--executor` through when provided; without it, the command still
+  writes the campaign plan and stops at the absent backend. Verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness` (9 tests),
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/fault_harness.py tools/tests/test_ext4_fault_harness.py`,
+  `cargo test -p xtask ext4 -- --test-threads=1` (39 tests),
+  `cargo fmt --check --package xtask`, scoped `git diff --check`, a real
+  synthetic `cargo run -p xtask -- ext4 fault ... --executor /tmp/.../executor.py`
+  smoke, and `git show --check --stat HEAD`. This is an executor contract and
+  synthetic smoke only; the real QEMU hard-kill executor, preserved crash
+  images from Tx, and per-cut Homebrew e2fsprogs checks remain pending.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 xtask fault verify).
+  Reused existing workers; no new worker was spawned. The coordinator
+  continued in the existing journal worktree and committed `f6ecdef8`, exposing
+  the result gate through `cargo xtask ext4 fault verify --plan
+  <campaign-plan.json>`. The new xtask request validates the plan file, calls
+  `tools/ext4/fault_harness.py --verify-plan`, returns success only for
+  complete crash/replay/e2fsck/result artifacts, and leaves ordinary `ext4
+  fault` execution fail-closed at the absent backend. Verification passed the
+  RED/GREEN focused `cargo test -p xtask
+  ext4::tests::fault_verify_accepts_complete_campaign_artifacts -- --exact
+  --test-threads=1`, full `cargo test -p xtask ext4 -- --test-threads=1`,
+  `cargo fmt --check --package xtask`, `git diff --check`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness`, and a real synthetic
+  `cargo run -p xtask -- ext4 fault verify --plan /tmp/.../campaign-plan.json`
+  smoke. This is still a verification entrypoint, not QEMU power-cut execution
+  or crash evidence.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 fault result gate).
+  Reused existing workers; no new worker was spawned. The coordinator
+  continued in the existing journal worktree and committed `4e874c92`, adding
+  `tools/ext4/fault_harness.py --verify-plan <campaign-plan.json>`. The
+  verifier now fail-closes unless every planned job has a preserved crash
+  image, replay image, `e2fsck -fn` log and matching
+  `tx.ext4.fault_job_result.v1` manifest with hard-kill observed, replay
+  attempted and `e2fsck_exit=0`. Verification passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/fault_harness.py tools/tests/test_ext4_fault_harness.py`,
+  `cargo test -p xtask ext4 -- --test-threads=1`, scoped `rustfmt --check`
+  and `git diff --check`. This is still a result-validation gate only: the
+  QEMU hard-kill backend, real preserved crash/replay images, executed
+  per-cut `e2fsck -fn`, xfstests and product evidence remain pending.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 fault campaign plan).
+  Reused existing workers; no new worker was spawned. The coordinator continued
+  in the existing journal worktree because agent follow-up messaging remained
+  unreliable. Commit `99fef629` advances the V1 deterministic fault campaign
+  from input preflight to artifact planning: `tools/ext4/fault_harness.py
+  --check-only` now writes `campaign-plan.json` with schema
+  `tx.ext4.fault_campaign_plan.v1`, `evidence_status=plan-only`, expanded
+  case/cut/iteration jobs, preserved crash/replay image paths, serial-log paths
+  and the required per-job `e2fsck -fn` log command. `cargo xtask ext4 fault`
+  invokes that preflight before the intentional backend-not-implemented stop;
+  `--out` is optional and defaults to `target/ext4/fault`, preserving the
+  roadmap command shape. Verification passed `cargo test -p xtask ext4 --
+  --test-threads=1`, `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/fault_harness.py tools/tests/test_ext4_fault_harness.py`, scoped
+  `rustfmt --check`, `git diff --check`, a real `cargo run -p xtask -- ext4
+  fault ...` preflight that generated a 4-job plan while returning rc=1 for the
+  absent backend, and `git show --check --stat HEAD`. This is still plan-only:
+  real QEMU hard-kill execution, preserved crash images, replay results and
+  executed `e2fsck -fn` remain pending.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, V1 fault preflight gate).
+  Reused existing workers; no new worker was spawned. A short follow-up sent
+  to `foundation_lane` was corrupted by the agent messaging layer and the
+  worker was interrupted before it could act, so the coordinator continued in
+  the existing journal worktree. Commit `46247a4a` adds the first V1
+  deterministic fault-campaign input gate: `xtask ext4 fault` now validates
+  selected case/cut against the pinned profile before reaching the intentionally
+  absent backend, the shared profile schema accepts `fault_cut_ids`, and
+  `tools/ext4/fault_harness.py` provides a fail-closed `--check-only`
+  preflight entry instead of fabricating crash evidence. Verification passed
+  the RED/GREEN `cargo test -p xtask fault_ -- --test-threads=1`, then
+  `cargo test -p xtask ext4 -- --test-threads=1`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_fault_harness`,
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile
+  tools/ext4/fault_harness.py tools/tests/test_ext4_fault_harness.py`,
+  scoped `rustfmt --check`, `git diff --check`, and `git show --check --stat
+  HEAD`. This is still input-gate evidence only: real QEMU power-cut execution,
+  preserved crash images, per-cut `e2fsck -fn`, and replay/fault reports remain
+  pending.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, fresh SCRATCH e2fsck-clean).
+  Reused the existing `foundation_lane`, `journal_lane`, and `pressure_lane`;
+  no new worker was spawned. `foundation_lane` remains complete at
+  `f5526b52` and `pressure_lane` remains complete at `54ee90ba`; after
+  `journal_lane` input corruption, the coordinator finished and committed the
+  journal slice at `555e4a40` in
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`.
+  The root cause of the repeated SCRATCH corruption was mount-time replay of
+  stale JBD2 records when the ext4 superblock `needs_recovery` bit was clear
+  but JBD2 `s_start` was non-zero. The fix gates replay and replay cleanup on
+  ext4 `needs_recovery`, refreshes ext4 pager/read cache after externally
+  committed metadata, keeps namespace pending metadata visible before publish,
+  preserves namespace checkpoint completion through PageBacked, and removes
+  the temporary virtio LBA debug prints. Verification passed
+  `cargo test -p tx-ext4-format --test jbd2_recovery -- --test-threads=1`,
+  `cargo test -p tx-ext4 --lib journal::tests -- --test-threads=1`,
+  `cargo test -p tx-ext4 --test journal_prepared_transaction --
+  --test-threads=1`, `cargo test -p tx-ext4 --test
+  journal_transaction_state -- --test-threads=1`, `cargo test -p tx-ext4
+  --lib tests_v3:: -- --test-threads=1`, `cargo test -p tx-fs
+  tx_ext4_bridge -- --test-threads=1`, `cargo test -p tx-subsystems --lib
+  block_device_dispatch_adapter_preserves -- --test-threads=1`, scoped
+  `rustfmt --check`, `git diff --check`, and
+  `cargo xtask full-build --target rv64-qemu --skip-doctor`. Fresh acceptance
+  artifact
+  `target/ext4/v1-role-witness-20260727-151259-needs-recovery-gate/` restored
+  clean TEST/SCRATCH/WORKLOAD before images, ran Alpine `scratch-rw`
+  successfully, and Homebrew e2fsprogs 1.47.4 `e2fsck -fn` exited `0` for
+  TEST/SCRATCH/WORKLOAD before and after. SCRATCH changed blocks under 80 now
+  include `0`, `1`, `6`, `21`, and `40`, proving superblock/GDT/directory,
+  inode bitmap and inode table homes all persisted. V1 is not complete yet:
+  deterministic fault/crash preservation, pinned xfstests, upstream locks and
+  product performance evidence remain pending.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, disk cleanup candidates).
+  No new worker was spawned. The coordinator did a read-only disk preflight
+  before the required checkpoint-boundary trace QEMU gate. `/System/Volumes/Data`
+  still has only about 422 MiB free. Regenerable build-output candidates were
+  identified but not deleted: in the journal worktree,
+  `target/debug/incremental` is about 945 MiB and
+  `target/riscv64gc-unknown-none-elf/debug/incremental` is about 1.0 GiB; in
+  the main checkout, `target/riscv64gc-unknown-none-elf/debug/incremental` is
+  about 2.0 GiB, `target/codex-vdso/debug/incremental` is about 1.3 GiB, and
+  `target/loongarch64-unknown-none-softfloat/debug/incremental` is about
+  1.4 GiB. These are narrower deletion candidates than `deps` or whole
+  `target` directories, but cleanup was not performed without explicit
+  authorization.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, journal boundary triage parked).
+  Reused the existing `journal_lane`; no new worker was spawned. The lane
+  found no defensible production patch yet: the SCRATCH V1 failure still shows
+  inode 13 bitmap/table persistence missing after QEMU, but the currently
+  suspected host boundaries now pass. Fresh regressions passed
+  `journal::tests::namespace_checkpoint_keeps_each_home_after_image_in_its_frozen_frame`,
+  `device::tests::block_device_dispatch_adapter_preserves_each_write_frame_and_payload`,
+  and
+  `page_backed::core_tests::file_fsync_checkpoint_graph_self_kicks_until_every_independent_home_completes`.
+  The lane also checked that LBA units and runtime registration are not the
+  current root cause: virtio writes a 4 KiB frame as eight 512-byte sectors and
+  dynamic RW ext4 mounts bind `Ext4FileIoRuntimeBinder`. Next required step is
+  not a speculative checkpoint rewrite; it is a fresh QEMU/e2fsck run with
+  checkpoint-boundary trace at the `PageService -> BlockDeviceDispatchAdapter
+  -> completion` path. That gate is currently constrained by disk space:
+  `/System/Volumes/Data` has about 422 MiB available and the journal worktree
+  target directory is about 9.1 GiB.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, frozen payload boundary narrowed).
+  Reused the existing `foundation_lane`, `journal_lane`, and `pressure_lane`;
+  no new worker was spawned. `journal_lane` added host-only coverage that rules
+  out two suspected loss points for the SCRATCH zero-mode inode failure:
+  `journal::tests::namespace_checkpoint_keeps_each_home_after_image_in_its_frozen_frame`
+  shows namespace checkpoint homes 6, 21 and 37 keep distinct frozen PPNs and
+  full 4 KiB after-image bytes, and
+  `device::tests::block_device_dispatch_adapter_preserves_each_write_frame_and_payload`
+  shows the generic block-device dispatch adapter preserves LBA, PPN and byte
+  payload through `BlockDeviceOps`. No production fix or fresh e2fsck-clean V1
+  witness exists yet. The remaining journal slice is the real namespace plan or
+  guest runtime execution/settle path that still leaves inode-table home 37
+  absent from the post-QEMU SCRATCH image.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, namespace pending retry fix).
+  Reused the existing `foundation_lane`, `journal_lane`, and `pressure_lane`;
+  no new worker was spawned. `pressure_lane` committed
+  `54ee90ba feat(memory): add second-chance policy` after its focused test and
+  scoped formatting/diff checks passed. `foundation_lane` committed
+  `f5526b52 fix(ext4): settle sparse retained lease wiring` after its sparse
+  retained-lease test, scoped formatting/diff checks and clean commit-object
+  check passed; its unrelated `xtask/src/lint_invariants_api_language.rs`
+  dirty file was preserved. In the journal worktree, the coordinator fixed the
+  host namespace fixture after the post-`1cee426a` allocation-accounting path
+  exposed a missing `free_inodes_count`/bitmap setup, then fixed namespace
+  retry semantics: pending create/unit mutations now distinguish `Absent`,
+  `Waiting`, and `Durable`, so a retry after commit but before checkpoint yields
+  on the namespace wait source instead of replanning/admitting and surfacing
+  `EIO`. Verification passed `tx-ext4` `tests_v3::` 19/19,
+  `journal::tests` 6/6, `journal_prepared_transaction` 11/11,
+  `journal_transaction_state` 3/3,
+  `page_backed::core_tests::file_namespace_checkpoint_successor_wakes_service_task`,
+  scoped `rustfmt --check`, scoped `git diff --check`, and
+  `cargo xtask full-build --target rv64-qemu --skip-doctor`. A fresh bounded
+  SCRATCH shell-test at
+  `target/ext4/v1-role-witness-20260727-034121-pending-fix/` no longer hangs
+  on create, but post-QEMU Homebrew e2fsprogs 1.47.4 `e2fsck -fn` still exits
+  4: `tx-role-witness.txt` points at unused zero-mode inode 13 and inode bitmap
+  bit 13 is absent. V1 remains blocked on multi-home checkpoint execution:
+  directory home reaches disk, but inode bitmap/table home writes still do not.
+  Next journal slice: host RED/GREEN for owned L6 multi-node checkpoint graph
+  drain/settlement before namespace publication, then rerun the same fresh
+  QEMU/e2fsck gate.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation, checkpoint wake and pressure policy).
+  Reused existing `foundation_lane`, `journal_lane`, and `pressure_lane`; no
+  new worker was spawned. Pressure added the pure `SecondChancePolicy` slice
+  and its focused test passed. Foundation resumed the storage-recovery ladder:
+  pager_mock sparse-row, `journal_prepared_transaction`, `journal_transaction_state`,
+  sparse retained-lease, and PageBacked multi-page fsync vector tests passed
+  after two small compile-fix patches. Journal fixed the SCRATCH create hang by
+  releasing `PageContainerState` before namespace checkpoint follow-up and by
+  kicking Block service for the successor graph; PageBacked `file_` tests
+  passed 46/46, `full-build --target rv64-qemu --skip-doctor` passed, and
+  bounded SCRATCH create no longer hangs. V1 is still blocked: post-QEMU
+  `e2fsck -fn` exits 4 because the new directory entry points at an unused
+  zero-mode inode; a 3s settle delay did not change it. Next journal slice:
+  prove/fix that namespace create checkpoint dispatches inode bitmap/table and
+  directory home writes before namespace publication. Disk is critically low.
+
+- 2026-07-27 (memory/I-O ext4 fresh post-1cee426a role gate).
+  Authorized cleanup removed only the regenerable `target/debug/incremental`
+  contents in the main checkout and `ext4-journal-settlement` lane. Both were
+  verified empty; host free space rose from about 219 MiB to 2.9 GiB, while
+  `target/debug/deps` was preserved. In the journal lane, fresh staged copies
+  were created under
+  `target/ext4/role-witness/fresh-1cee426a/`, then
+  `cargo xtask full-build --target rv64-qemu --skip-doctor` passed after
+  `1cee426a`. The combined Alpine QEMU role witness passed all three groups:
+  `net-user`, `scratch-rw`, and `workload-ro`; serial evidence is in
+  `target/ext4/role-witness/fresh-1cee426a/serial-alpine-net-role-consumption-all.log`.
+  Read-only Homebrew e2fsprogs 1.47.4 checks passed for TEST and WORKLOAD
+  (exit 0), but SCRATCH exited 4: `tx-role-witness.txt` references unused
+  inode 58, the root directory checksum fails, and inode bitmap/free-inode
+  counts disagree. No repair flags were used. V1 remains blocked on SCRATCH
+  persistence/checkpoint or unmount settlement; next step is to debug that
+  fresh-image failure, not to reuse the old failed role artifacts.
+
+- 2026-07-27 (memory/I-O ext4 blocked-gate preparation).
+  Reused the existing `foundation_lane`, `journal_lane`, and `pressure_lane`;
+  no new worker was spawned and no lane changed files. `journal_lane`
+  confirmed the fresh V1 gate must rebuild post-`1cee426a` kernel artifacts:
+  `shell-test` itself does not run `full-build`, and current RV64 artifacts
+  cannot prove the metadata checksum fix. The gate should keep default
+  sequential mode because only `--parallel` copies TEST/SCRATCH images; with
+  about 235-264 MiB free, the known lower bound is still unsafe for fresh
+  staging plus `cargo xtask full-build --target rv64-qemu --skip-doctor` and
+  QEMU. `foundation_lane` produced the storage-recovery verification ladder:
+  first
+  `cargo test -p tx-ext4-format --test pager_mock
+  pager_plans_discontiguous_write_rows_as_one_frontier -- --exact`, then
+  `cargo test -p tx-ext4 --test journal_prepared_transaction --
+  --test-threads=1`, followed by `journal_transaction_state`, the sparse
+  retained-lease ext4 lib test, and the PageBacked vector settlement test.
+  `pressure_lane` produced the exact RED shape for
+  `second_chance_policy_prefers_cold_provider_over_rapid_refault_provider`:
+  add a pure `SecondChancePolicy` test in `tx-services` that protects a
+  provider with fast refault feedback and emits one `Scan` action for the cold
+  provider only. That slice remains TDD-blocked because no `tx-services` test
+  binary exists and the pressure worktree has no target directory.
+
+- 2026-07-27 (memory/I-O ext4 low-disk lane preflight).
+  Reused the existing `foundation_lane`, `journal_lane`, and `pressure_lane`;
+  no new worker was spawned. No worker changed files. `journal_lane` performed
+  the low-disk-safe V1 role-image preflight: current source images
+  `target/ext4/test.img`, `target/ext4/scratch.img`, and
+  `target/ext4/workload.img` are distinct 32 MiB images and read-only
+  `e2fsck -fn` exits `0` for all three (`TXTEST`, `TXSCRATCH`,
+  `TXWORKLOAD`). The old role witness artifacts still fail `e2fsck -fn` with
+  exit `12` and unused/deleted inode plus inode-checksum errors; they remain
+  invalid and were not overwritten. `foundation_lane` returned a read-only B4
+  evidence table: `e7285e5f` has no unstaged overlap, `git show --check` and
+  two-file `rustfmt --check` are clean, and the pre-commit/data-error/commit
+  quarantine witnesses are present in `journal_prepared_transaction.rs`.
+  `pressure_lane` returned the next safe TDD target without editing: a pure
+  `SecondChancePolicy` in `crates/tx-services/src/memory_pressure/policy.rs`
+  with one RED test
+  `second_chance_policy_prefers_cold_provider_over_rapid_refault_provider`;
+  it must not touch PageBacked ghost ownership, VM/ext4 caller migration, or
+  kernel init. The host volume was about 235-266 MiB free, so fresh role-image
+  staging, `cargo xtask full-build`, QEMU, and new Cargo tests remain deferred
+  until at least about 1 GiB is available or explicit cleanup of regenerable
+  build artifacts is authorized.
+
+- 2026-07-27 (memory/I-O ext4 lane continuation).
+  Reused the existing `foundation_lane`, `journal_lane`, and `pressure_lane`;
+  no new worker was spawned. `journal_lane` landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `1cee426a fix(ext4): preserve metadata checksums on mutation`,
+  fixing the host-format direct mutation path so allocation/group/superblock
+  counters, bitmap/group descriptor checksums, `bg_itable_unused`, inode
+  checksums and directory tail checksums are preserved. Verification in that
+  worktree: `PATH=/opt/homebrew/opt/e2fsprogs/sbin:$PATH cargo test -p
+  tx-ext4-format` passed all 34 tests, including a real `mke2fs`
+  `metadata_csum` image regression where Tx creates a file and `e2fsck -fn`
+  passes; `git diff --check` passed. `foundation_lane` landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/memory-io-foundation` commit
+  `e7285e5f fix(ext4): settle journal reservations by durability phase`, with
+  `git show --check --stat` and two-file `rustfmt --check` passing; its
+  targeted `tx-ext4` test remains deferred because the host volume had about
+  278 MiB free and prior `tx-ext4` compilation hit ENOSPC. `pressure_lane`
+  made no file changes; it remains at `7c4394dd` with a clean worktree and
+  deferred the next second-chance policy TDD slice because its worktree has no
+  target directory and the host volume had about 277 MiB free. Updated
+  `docs/progress/plans/2026-07-25-memory-io-ext4-repair.json`; V1 remains
+  open until fresh role-witness images are regenerated or copied, the QEMU role
+  witness is rerun, and read-only `e2fsck -fn` passes on those resulting
+  images. The old failed role images were not repaired in place.
+
+- 2026-07-27 (memory/I-O ext4 V1 namespace checkpoint publish fix).
+  Reused the existing `journal_lane` worktree; no replacement worker was
+  spawned. After the role-image e2fsck authority gate failed, the next root
+  cause was narrowed to namespace mutation settlement: `JournalFsyncSource`
+  treated durable JBD2 commit as enough to publish a create/unlink, while the
+  home-block checkpoint could still be pending. The journal worktree landed
+  commit `9f39f58f fix(ext4): publish namespace mutations after checkpoint`.
+  The fix makes namespace settlement true only when no active transaction or
+  checkpoint submission remains, and checkpoint success now wakes the namespace
+  wait source. Host tests were updated so create/unlink publish only after
+  checkpoint. Verification in the journal worktree: RED
+  `cargo test -p tx-ext4 --lib
+  namespace_settlement_waits_for_checkpoint_not_just_commit --
+  --test-threads=1` failed on the pre-fix commit-durable condition, then passed
+  after the fix; `cargo test -p tx-ext4 --lib journal::tests --
+  --test-threads=1` passed 5/5; `rustfmt --edition 2021 --check
+  crates/tx-ext4/src/journal.rs crates/tx-ext4/src/tests_v3.rs`, scoped
+  `git diff --check`, and `git show --check --stat HEAD` passed. V1 still
+  needs a fresh role-witness QEMU run on clean/copied images followed by
+  `e2fsck -fn`; the previous failed images were not repaired in place.
+  Follow-up read-only e2fsprogs probing showed the blocker is broader than the
+  named directory entries: `debugfs` refused to open TEST/SCRATCH/WORKLOAD with
+  `Block bitmap checksum does not match bitmap while reading allocation
+  bitmaps`, while `dumpe2fs -h` shows all three images have `metadata_csum`
+  and `metadata_csum_seed` and still report filesystem state `clean`.
+
+- 2026-07-27 (memory/I-O ext4 V1 role-image e2fsck authority gate).
+  Reused the existing `journal_lane`; no replacement worker was spawned.
+  The lane ran Homebrew e2fsprogs `1.47.4 (6-Mar-2025)` read-only checks
+  against the current role-witness images in
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`.
+  `e2fsck -fn` failed for all three images: `test-copy.ext4`,
+  `scratch-journal.ext4`, and `workload.ext4` each exited `12`. Logs are
+  `target/ext4/role-witness/e2fsck-test-copy-fn.log`,
+  `e2fsck-scratch-journal-fn.log`, and `e2fsck-workload-fn.log`; each reports
+  a directory entry pointing at an inode in the unused/deleted inode area plus
+  an inode checksum mismatch (`tx-ext4-sqlite.db` inode 966,
+  `tx-role-witness.txt` inode 971, and `ext4-busybox` inode 970 respectively).
+  No repair flags were used. This narrows V1 from missing e2fsprogs input to a
+  concrete image/interoperability blocker: the role runtime witness can pass
+  guest behavior, but the same role images are not e2fsprogs-clean.
+
+- 2026-07-27 (memory/I-O ext4 V1 combined net+role runtime proof).
+  Reused the existing `journal_lane` worktree context; no replacement worker
+  was spawned. Landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `81248e77 test(ext4): run role witness with rv64 net`, extending
+  `shell-test` with `--net` support and adding a `net-user` group to
+  `tools/shell-tests/ext4-role-consumption-witness.txt`. Verification passed
+  in the journal worktree: `cargo test -p xtask shell_test --
+  --test-threads=1`, `cargo test -p xtask qemu -- --test-threads=1`, `cargo
+  fmt --check --package xtask`, `cargo build -p xtask`, scoped `git diff
+  --check`, an isolated `net-user` QEMU run, and the full combined
+  `net-user` + `scratch-rw` + `workload-ro` Alpine run with `--net user`.
+  Serial evidence is
+  `target/ext4/role-witness/serial-alpine-net-role-consumption-all.log`: the
+  same QEMU invocation renders TEST/SCRATCH/WORKLOAD on buses 0/1/2 and net
+  on bus 3, the kernel reports `devices:net:eth0:ok`, vda/vdb/vdc exist,
+  `ip link show eth0` and `ip link set eth0 up` pass, SCRATCH RW writes and
+  reads back 16 bytes, and WORKLOAD RO rejects writes. V1 is still not closed:
+  TEST-role e2fsck/xfstests/upstream-lock inputs and broader deterministic
+  fault/interoperability gates remain pending.
+
+- 2026-07-27 (memory/I-O ext4 V1 net+role qemu host surface).
+  Reused the existing `journal_lane` worktree context; no replacement worker
+  was spawned. Coordinator follow-up messages to the lane are currently
+  unreliable because the worker receives them as unreadable encrypted-style
+  text, so this narrow host-side slice was done in the journal worktree without
+  touching the lane's existing coordinator/L6 prototype leftovers or the
+  user-owned `xtask/src/lint_invariants_api_language.rs`. Landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `c6f5526c fix(qemu): place rv64 net after ext4 role transports`.
+  `xtask qemu` now renders RV64 net on `virtio-mmio-bus.3`, matching the
+  existing kernel/HAL `virtio3` net move and keeping TEST/SCRATCH/WORKLOAD on
+  buses 0/1/2. Verification passed: `cargo test -p xtask qemu --
+  --test-threads=1`, `cargo fmt --check --package xtask`, `cargo build -p
+  xtask`, scoped `git diff --check -- xtask/src/qemu.rs`, and a
+  `target/debug/xtask qemu --target rv64-qemu --profile alpine --dry-run
+  --net user --ext4-test-image ... --ext4-scratch-image ...
+  --ext4-workload-image ...` check that rendered role cmdline tokens plus
+  block buses 0/1/2 and net bus 3. This is command-surface evidence only; V1
+  still needs real combined QEMU runtime proof and the TEST/e2fsck/xfstests
+  authority inputs.
+
+- 2026-07-26 (memory/I-O ext4 V1 scratch RW role-consumption fix).
+  Reused the existing `journal_lane`; no replacement worker was spawned.
+  Root-caused the `scratch-rw` role witness from first-create/write hang to a
+  PageBacked visibility bug: ext4 dynamic mounts materialised a fresh
+  `PageContainer` after the writer process dropped its open file because the
+  parent dentry cache is weak and the ext4 file-I/O binder only registered a
+  service, not a mount-scoped canonical PC. The journal worktree now keeps a
+  per-inode file PC inside `Ext4FsInstance`, reuses it from
+  `materialise_rnode`, and lets ext4 inode-meta queries report the live PC
+  size when it is newer than disk metadata. The verified slice is isolated in
+  journal commit `d11b6399 fix(ext4): reuse mount-scoped file page
+  containers`; coordinator/L6 prototype leftovers and the user-owned
+  `xtask/src/lint_invariants_api_language.rs` remain unstaged. Verification passed in
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`:
+  `cargo test -p tx-ext4 --lib ext4_materialise -- --test-threads=1`,
+  `cargo xtask build --target rv64-qemu`, `scratch-rw` Alpine shell-test with
+  `serial-alpine-scratch-rw-pc-cache-stat.log`, `workload-ro` Alpine
+  shell-test with `serial-alpine-workload-ro-post-pc-cache.log`,
+  `rustfmt --edition 2021 --check` on the touched ext4 Rust files, and scoped
+  `git diff --check`. A follow-up clean detached revalidation of `d11b6399`
+  was attempted with a shared Cargo target, but stopped during
+  `tx-subsystems` compilation with `No space left on device` before reaching
+  the `tx-ext4` test binary; the generated incremental cache was removed.
+  `scratch-rw` now mounts vdb read-write, creates the file,
+  writes 16 bytes via BusyBox `dd`, reports size 16 through `ls`/`wc`, reads
+  back `scratch-role-ok`, and unmounts. V1 is still not closed: TEST-role
+  e2fsck/xfstests/upstream-lock inputs, combined net+multi-block proof, and
+  product evidence remain pending.
+
+- 2026-07-26 (memory/I-O ext4 V1 role-consumption runtime probe).
+  Reused the existing `journal_lane`; no replacement worker was spawned. The
+  journal worktree now has explicit role-input artifacts under
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement/target/ext4/role-witness`
+  sourced from existing local ext4 images, plus a symlink to the main checkout's
+  Alpine initramfs. Runtime probing reached the guest with
+  `tx.ext4.test=vda`, `tx.ext4.scratch=vdb`, `tx.ext4.workload=vdc` and
+  `/dev/block/vda`, `/dev/block/vdb`, `/dev/block/vdc` present. The isolated
+  `workload-ro` group passed on `profile=alpine` with
+  `tx.mount.sdcard=0`: vdc mounted read-only, listed successfully, rejected a
+  write with `Read-only file system`, and unmounted; serial evidence is
+  `target/ext4/role-witness/serial-alpine-workload-ro.log` in the journal
+  worktree. The `scratch-rw` group remains blocked: using the write-probe
+  image as SCRATCH failed RW mount with `Function not implemented`; using the
+  known journaled TCC image mounted vdb read-write, but the first
+  `printf > /tmp/tx-role-scratch/tx-role-witness.txt` did not return before the
+  10s split-write expectation, and the earlier combined write+sync command also
+  did not return before 30s. This narrows V1 from missing fixture inputs to a
+  real scratch RW ext4 create/write runtime blocker. Verification passed in the
+  journal worktree for `CARGO_INCREMENTAL=0 cargo test -p xtask shell_test --
+  --test-threads=1`, script `--list-groups`, `git diff --check` on the touched
+  shell-test/script files, and the successful `workload-ro` shell-test run. V1
+  is still pending; do not promote this to Tier 1 interoperability or product
+  evidence.
+
+- 2026-07-26 (memory/I-O ext4 V3/V4 product evidence assembler).
+  Reused the journal lane write scope; no replacement worker was spawned.
+  Landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `3661a3fd test(ext4): assemble product evidence inputs`, adding
+  `tools/ext4/assemble_product_evidence.py` plus
+  `tools/tests/test_ext4_product_evidence.py`. The new Python tool assembles
+  `product-evidence.json` from explicit measured per-run metric files with
+  schema `tx.ext4.product_run.v1`; it fail-closes on mixed host/fixture
+  identity, missing Linux+Tx ext4 pair, incomplete traces, missing queue
+  attribution, missing data-write bytes, or missing journal/checkpoint bytes.
+  This connects the earlier `cargo xtask ext4 report --gate product`
+  fail-closed DTO to a deterministic input artifact, but it is still not
+  product evidence: no QEMU run, Linux baseline, Tx trace, or attribution
+  backend produced metrics. TDD/verification: RED failed because
+  `assemble_product_evidence.py` was absent; GREEN passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_product_evidence`, `PYTHONDONTWRITEBYTECODE=1
+  python3 -m py_compile tools/ext4/assemble_product_evidence.py
+  tools/tests/test_ext4_product_evidence.py`, and scoped `git diff --check`.
+  The unrelated dirty `xtask/src/lint_invariants_api_language.rs` file was
+  preserved and not committed.
+
+- 2026-07-26 (memory/I-O foundation T2 sparse fsync frontier fix).
+  Reused the existing `foundation_lane`; no replacement worker was spawned.
+  Foundation lane patch was completed and coordinator-scoped committed as
+  `/Users/3y/.config/superpowers/worktrees/Tx/memory-io-foundation`
+  commit `88d1d813 fix(ext4): preserve sparse fsync frontiers`. The fix adds
+  `Ext4Pager::plan_write_page_rows`, keeps the existing contiguous
+  `plan_write_pages` API as a wrapper, threads the execution guard into
+  `Ext4MutationPlanSource::plan_writeback_mutation`, and derives exact logical
+  page rows from the retained `PageDataLease` view before asking the pure pager
+  to plan writeback. The new tests cover direct discontiguous pager rows and an
+  ext4 retained sparse lease for pages `0` and `3`, including rejection of a
+  forged source whose segment count no longer matches the retained lease.
+  Low-disk-safe verification passed in the foundation worktree:
+  `rustfmt --edition 2021 --check` on the changed ext4/format files,
+  scoped `git diff --check`, scoped `rg` callsite scan, and
+  `git show --check HEAD`; the format-layer exact regression
+  `pager_plans_discontiguous_write_rows_as_one_frontier` also passed. Full
+  `tx-ext4` adapter tests were attempted but interrupted during dependency
+  compilation by ENOSPC. The lane cleaned regenerable Cargo artifacts and
+  recovered 134.9 MiB, but the host still had only about 221 MiB free. The
+  unrelated dirty `xtask/src/lint_invariants_api_language.rs` file was
+  preserved and not committed.
+
+- 2026-07-26 (memory/I-O foundation T2 discontiguous-fsync audit).
+  Reused the existing `foundation_lane`; no replacement worker was spawned.
+  The lane found no safe same-scope code slice left for T2 under the current
+  low-disk constraint. Existing T2 commits `de5ecd66`, `6cf6e029`,
+  `89d90dec`, and `9d9cc930` remain clean, and the only dirty file in that
+  worktree is the preserved user-owned
+  `xtask/src/lint_invariants_api_language.rs`. The remaining correctness gap
+  is discontiguous fsync frontiers: current PageBacked submission still lowers
+  a frontier to `[min(frontier), max(frontier))`, while the pure pager and
+  journal expect one-to-one segment/data counts, so holes fail closed instead
+  of being represented explicitly. Closing this needs a pure-pager API change
+  that passes explicit `(PageIndex, payload)` rows rather than
+  `first_page_index + &[Page4K]`. Low-disk-safe validation passed
+  `git show --check` for the four T2 commits, `git diff --check`, and scoped
+  `rg` constraint scans. Cargo/rustfmt verification remains blocked by ENOSPC
+  and existing sibling-format drift reached from `page_backed/mod.rs`.
+
+- 2026-07-26 (memory/I-O ext4 V1 net transport separation).
+  Reused the existing `journal_lane`; no replacement worker was spawned.
+  Journal landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `2b88c6f9 fix(rv64): separate net from ext4 role transports`.
+  RV64 boot net no longer probes the TEST/SCRATCH/WORKLOAD role transports
+  `virtio0..2`; it now uses dedicated `virtio3`, and the static qemu-virt MMIO
+  table/test coverage includes `virtio3` at `0x1000_4000`. Low-disk-safe
+  verification passed in the journal worktree: `rustfmt --check` on
+  `crates/tx-kernel/src/devices.rs`,
+  `boards/tx-hal-riscv64-qemu-virt/src/boot_static.rs`, and
+  `boards/tx-hal-riscv64-qemu-virt/src/tests.rs`, plus `git diff --check`.
+  This removes the known static net/block role collision, but does not close
+  V1: there is still no QEMU runtime proof that host net is assigned to
+  `virtio3`, no actual role-consumption guest run, and no fixture/e2fsck/
+  xfstests evidence. The unrelated dirty
+  `xtask/src/lint_invariants_api_language.rs` file was preserved.
+
+- 2026-07-26 (memory/I-O foundation T2 batch-fsync/PageSlot settlement).
+  Reused the existing `foundation_lane`; no replacement worker was spawned.
+  Foundation landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/memory-io-foundation` commits
+  `de5ecd66 feat(ext4): plan atomic multi-page mutation frontiers`,
+  `6cf6e029 fix(page-backed): join concurrent fsync submissions`,
+  `89d90dec feat(ext4): aggregate fsync writeback transactions`, and
+  `9d9cc930 fix(page-backed): reconcile batch fsync with PageSlot authority`.
+  The slice groups after-images by metadata home block, lets concurrent fsync
+  join a covering in-flight transaction, adds retained multi-page batch
+  writeback with per-page generation settlement, and removes dirty/writeback
+  duplication from `PageMarks` so `PageSlot` remains the sole authority.
+  `git show --check` and `git diff --check` passed in the foundation worktree.
+  `cargo test -p tx-subsystems --lib multi_page_fsync -- --test-threads=1`
+  failed during compilation with ENOSPC, not a Rust/test assertion failure;
+  that worktree's `target/` was moved to Trash by the worker, but the same
+  volume still has only about 175 MiB free. The user-owned dirty
+  `xtask/src/lint_invariants_api_language.rs` change was preserved.
+
+- 2026-07-26 (memory/I-O ext4 V3/V4 product attribution gate).
+  Reused the existing `foundation_lane`, `journal_lane` and `pressure_lane`;
+  no replacement worker was spawned. The journal lane/coordinator landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `04868bef test(ext4): require product report attribution`, making
+  `cargo xtask ext4 report --gate product` fail closed unless
+  `product-evidence.json` exists and contains complete V3/V4 product evidence:
+  paired Linux/Tx ext4 run identities, fixture/source attribution, completed
+  traces, queue wait/completion metrics, data-write bytes, and journal or
+  checkpoint write bytes. Bring-up reports remain identity-only. Verification
+  passed in the journal worktree: `cargo fmt --check --package xtask`,
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`, and
+  `git diff --check`. This is a report-promotion safety gate only, not
+  performance or interoperability evidence. Remaining blockers are unchanged:
+  explicit TEST/SCRATCH/WORKLOAD fixture images, `target/ext4` seeds/runs,
+  QEMU guest execution, xfstests mirror/manifests/results, Linux baseline,
+  Tx trace, measured source/toolchain/image hashes, and attribution-producing
+  perf backend/results.
+
+- 2026-07-26 (memory/I-O ext4 V1 role-consumption witness scaffold).
+  Reused the existing lane setup and advanced the journal lane in
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  without spawning a replacement worker. Landed commit
+  `afc9722b test(ext4): add role consumption witness script`, adding
+  `tools/shell-tests/ext4-role-consumption-witness.txt`. The script is a
+  sequential-only scaffold for the pending TEST/SCRATCH/WORKLOAD consumption
+  proof: it fail-closes on exact `tx.ext4.test=vda`,
+  `tx.ext4.scratch=vdb`, `tx.ext4.workload=vdc` cmdline tokens and
+  `/dev/block/vda`, `/dev/block/vdb`, `/dev/block/vdc` existence, then mounts
+  SCRATCH (`vdb`) read-write for write/readback/sync and mounts WORKLOAD
+  (`vdc`) read-only for probe plus rejected write. Verification passed in the
+  journal worktree: `target/debug/xtask shell-test --target rv64-qemu
+  --profile busybox --script
+  tools/shell-tests/ext4-role-consumption-witness.txt --list-groups` and
+  `CARGO_INCREMENTAL=0 cargo test -p xtask shell_test -- --test-threads=1`
+  (11 tests). This is still not guest execution evidence because explicit
+  TEST/SCRATCH/WORKLOAD fixture images and enough disk headroom are absent;
+  next step is to provide/generate measured role images, then run this script
+  sequentially without `--parallel`.
+
+- 2026-07-26 (memory/I-O ext4 lane continuation blocked by evidence inputs).
+  Reused the existing `foundation_lane`, `journal_lane` and `pressure_lane`;
+  no new worker was spawned. `foundation_lane` confirmed its
+  `/Users/3y/.config/superpowers/worktrees/Tx/memory-io-foundation` baseline
+  is not a safe place to add a `vdb/vdc` consumer witness because that tree
+  lacks the three-role HAL/kernel transport registration. `journal_lane`
+  checked the journal worktree for the next V1 role-consumption witness but
+  blocked on absent explicit TEST/SCRATCH/WORKLOAD fixture images. Coordinator
+  spot-check corrected one part of the worker report: journal commit
+  `7a3443a2 feat(rv64): register ext4 block role devices` and
+  `7d9441d1 test(ext4): assert guest test role before mounts` are present and
+  publish `virtio0..2` plus guest `vda/vdb/vdc`; the remaining blocker is
+  executable evidence, not missing role-registration code. `pressure_lane`
+  found no isolated pressure/tx-observe-only slice that can produce valid V3
+  rustc attribution without crossing PageBacked, I/O, observe schema and
+  `xtask ext4 report`. Low-disk-safe validation passed
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+  tools.tests.test_ext4_rustc_workload` and scoped `git diff --check` in the
+  pressure worktree. During required progress/docs xtask validation, host free
+  space fluctuated between about 134 MiB and 1.3 GiB, and the
+  journal worktree has no `target/ext4` run/fixture directory, so do not start
+  Cargo, QEMU or image preparation until disk space and pinned fixture inputs
+  exist. Remaining next step: provide or generate measured TEST/SCRATCH/
+  WORKLOAD images plus source/toolchain hashes, then run a sequential
+  role-consumption witness and only after that continue xfstests/perf execution.
+
+- 2026-07-26 (memory/I-O ext4 V3 perf-run count gate).
+  Reused the existing `journal_lane` again for the Task 7 `perf run --runs`
+  slice. The worker started the parser change but returned `BLOCKED` before
+  tests/commit; the coordinator completed the small patch in the same
+  journal worktree and landed commit
+  `8c730ab9 test(ext4): validate perf run counts`. `cargo xtask ext4 perf
+  run` now defaults to one run, renders the selected run count in dry-run
+  descriptions, accepts explicit positive `--runs N`, and rejects missing,
+  zero or non-numeric run counts before reaching the still-unimplemented
+  backend. Verification passed in
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`:
+  `cargo test -p xtask ext4 -- --test-threads=1` (25 tests),
+  `cargo fmt --check --package xtask`, and `git diff --check`. This closes
+  another command-contract gap but is still not performance evidence; real
+  perf execution, paired Linux/Tx QEMU runs, traces and measured ratios remain
+  pending.
+
+- 2026-07-26 (memory/I-O ext4 V3 guest runner contract).
+  Reused existing `journal_lane` for the next V3 slice; no new worker was
+  spawned. Journal lane landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `af9af6d7 test(ext4): add rustc workload guest runners`, adding
+  `tools/ext4/guest/run-rustc-kernel-build.sh` and
+  `tools/ext4/guest/run-raw-io-roofline.sh` plus Python contract coverage. The
+  coordinator tightened the slice in commit
+  `48d4c6b1 test(ext4): tighten rustc workload guest runners`: the rustc
+  runner now fail-closes on swap, mounts TEST read-write and WORKLOAD
+  read-only, builds from the TEST source tree with the WORKLOAD toolchain on
+  PATH, and syncs before cleanup; the raw roofline runner only targets SCRATCH
+  and contains no filesystem build invocation. Verification passed in the
+  journal worktree: `bash -n tools/ext4/guest/run-rustc-kernel-build.sh
+  tools/ext4/guest/run-raw-io-roofline.sh`, `python3 -m unittest
+  tools.tests.test_ext4_rustc_workload`, `python3 -m py_compile
+  tools/tests/test_ext4_rustc_workload.py`, `cargo test -p xtask ext4 --
+  --test-threads=1`, `cargo fmt --check --package xtask`, and `git diff
+  --check`. This is still a host/guest contract slice, not performance
+  evidence: measured non-zero source/toolchain/image hashes, real workload
+  image preparation, `perf run` backend, QEMU execution, Linux baseline, Tx
+  trace and raw/tmpfs/ext4 measured outputs remain pending.
+
+- 2026-07-26 (memory/I-O ext4 V3 rustc workload preparer gate).
+  Reused the existing `journal_lane` worker after recovery; no new workers
+  were spawned. Journal lane landed
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement`
+  commit `88ff3c72 test(ext4): add native rustc workload contract`, adding the
+  fixture-only `tools/ext4/workloads/rustc-kernel-build.json` manifest. The
+  coordinator then added the next fail-closed preparer slice in the same
+  worktree: `tools/ext4/prepare_rustc_kernel_workload.py`,
+  `xtask/src/ext4/perf.rs`, and expanded
+  `tools/tests/test_ext4_rustc_workload.py`. The manifest is now accepted as
+  shape-compatible by the workload DTO but explicitly rejected by
+  `cargo xtask ext4 perf prepare` as `fixture-non-evidence`; the Python
+  preparer rejects missing manifests, dirty Tx source trees and unmeasured
+  fixture manifests before any QEMU/image work. Verification passed:
+  `python3 -m unittest tools.tests.test_ext4_rustc_workload`,
+  `python3 -m py_compile tools/ext4/prepare_rustc_kernel_workload.py
+  tools/tests/test_ext4_rustc_workload.py`, `cargo test -p xtask ext4 --
+  --test-threads=1`, `cargo fmt --check --package xtask`, and `git diff
+  --check`. The intentional `cargo xtask ext4 perf prepare --manifest
+  tools/ext4/workloads/rustc-kernel-build.json --out target/ext4/workloads`
+  failure now names `fixture-non-evidence` and points to the preparer. V3 is
+  still not performance evidence: real clean source/toolchain/image hashes,
+  guest runners, `xtask/src/ext4/perf.rs` execution backend, Linux baseline,
+  Tx trace and measured raw/tmpfs/ext4 results remain pending.
+
+- 2026-07-26 (memory/I-O ext4 V3 rustc workload RED gate).
+  Existing lane workers were reused for dispatch, but all three follow-up
+  turns failed externally with `403 insufficient balance`, so the coordinator
+  advanced the low-disk V3 slice in the journal worktree without spawning new
+  workers. Added
+  `tools/tests/test_ext4_rustc_workload.py` in
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement` as the
+  planned RED gate for the native RV64 rustc kernel-build workload contract.
+  The test requires the future
+  `tools/ext4/workloads/rustc-kernel-build.json` manifest to pin the Tx source
+  commit, `Cargo.lock`, vendor tree, native RV64 rustc/cargo artifacts,
+  `rustc -vV`, linker identity, exact offline/frozen build command, immutable
+  TEST/SCRATCH/WORKLOAD role images and one-CPU/4-GiB/no-swap measurement
+  geometry. Landed journal worktree commit `0620f4d9 test(ext4): add rustc
+  workload manifest gate`. The `xtask` perf path now has a separate workload
+  manifest validator in
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement/xtask/src/ext4/workload.rs`,
+  so `perf prepare|run` no longer reuses the older fixture profile DTO.
+  Verification intentionally reports RED:
+  `python3 -m unittest tools.tests.test_ext4_rustc_workload` fails with
+  `missing V3 rustc workload manifest:
+  tools/ext4/workloads/rustc-kernel-build.json`; `python3 -m py_compile
+  tools/tests/test_ext4_rustc_workload.py`, `cargo test -p xtask ext4 --
+  --test-threads=1`, `cargo fmt --check --package xtask`, and `git diff
+  --check -- ...` pass. V3 remains pending: no manifest, preparer, guest
+  runner, perf execution backend, Linux baseline, Tx trace, images or measured
+  performance evidence exist.
+
+- 2026-07-26 (memory/I-O ext4 V2 xfstests fail-closed input gate).
+  Reused the existing lane workers. Journal lane identified that real V2
+  xfstests execution still lacks pinned manifests, upstream lock inputs and a
+  guest runner, while foundation/pressure lanes confirmed `vdb/vdc` role
+  consumption and V3 rustc workload evidence remain artifact- and
+  disk-space-bound. Landed journal worktree commit `750e27c0 fix(xtask): fail
+  closed for ext4 xfstests inputs`: `cargo xtask ext4 xfstests` now requires
+  an explicit `--xfstests-root`, validates TEST/SCRATCH image paths, validates
+  a pinned xfstests manifest with full revision plus TEST/SCRATCH SHA-256
+  fields, requires a local git mirror with `.git`, and still refuses execution
+  after validation because the backend is intentionally absent. Verification
+  passed `cargo test -p xtask ext4 -- --test-threads=1`, `cargo fmt --check
+  --package xtask`, `cargo xtask ext4 xfstests ... --dry-run`, and `git diff
+  --check`. Commit initially failed with ENOSPC; the coordinator deleted only
+  the explicit regenerable journal-worktree Cargo incremental caches
+  `target/debug/incremental` and
+  `target/riscv64gc-unknown-none-elf/debug/incremental`, restoring free space
+  from roughly 120 MiB to roughly 1.2 GiB. V2 is still not evidence-complete:
+  no upstream-lock values were fabricated, no xfstests mirror/manifests/images
+  are present, and no guest xfstests run has executed.
+
+- 2026-07-26 (memory/I-O ext4 V1 Task 2 role-device slice).
+  Reused the existing foundation/journal/pressure lane workers. Journal
+  worktree `codex/ext4-journal-settlement` now has
+  `7a3443a2 feat(rv64): register ext4 block role devices` and
+  `7d9441d1 test(ext4): assert guest test role before mounts`. The slice
+  expands the RV64 static MMIO table for `virtio0..2`, registers initialized
+  block roles as stable `/dev/block/vda`, `/dev/block/vdb` and
+  `/dev/block/vdc` with `DevT(254,0..2)` without compacting skipped roles,
+  moves fallback `ltpdev` to `DevT(254,255)`, and makes legacy ext4 shell
+  witnesses assert exact `tx.ext4.test=vda` plus `/dev/block/vda` existence
+  before mounting. Verification passed scoped `rustfmt --check`, HAL MMIO
+  tests, `cargo test -p tx-kernel devices::tests -- --test-threads=1`,
+  `cargo test -p xtask qemu -- --test-threads=1`,
+  `cargo test -p xtask shell_test -- --test-threads=1`,
+  `cargo test -p xtask ext4 -- --test-threads=1`, `CARGO_INCREMENTAL=0 cargo
+  xtask build --target rv64-qemu`, three-role QEMU dry-run with `--no-block`,
+  a busybox `cargo xtask shell-test` proof that exact `tx.ext4.test=vda`,
+  `tx.ext4.scratch=vdb` and `tx.ext4.workload=vdc` tokens are present and that
+  `/dev/block/vda`, `/dev/block/vdb` and `/dev/block/vdc` exist, scoped
+  role-token greps and `git diff --check`. V1 is still not closed: actual
+  `vdb/vdc` role workload consumption is pending, net init still
+  hard-codes `virtio0`, upstream locks/manifests require measured
+  Linux/e2fsprogs/xfstests source revisions, the xfstests backend is still
+  unimplemented, and broad `cargo -q xtask unit` remains blocked by local disk
+  pressure.
+
+- 2026-07-26 (memory/I-O ext4 T6 integrated gate).
+  Reused the existing lane workers and kept implementation in isolated
+  worktrees. Foundation lane completed PageSlot authority/reclaim/file-PC
+  ownership through `08075df7`; pressure lane completed M1-M5 through
+  `7c4394dd`; journal lane completed T1-T6 and then integrated the foundation
+  PageSlot fixes through `cd2f746c`, `42d71882`, `fde7f4d6`, and `8f05227f`.
+  The integration makes batch fsync enter, complete and abort writeback only
+  through matching `PageSlot` generations while legacy ext4 RW production
+  admission stays retired. Coordinator spot-checks in the journal worktree
+  passed `cargo xtask lint invariants memory-io-ownership`,
+  `cargo test -p tx-subsystems --lib clean_reclaim -- --test-threads=1`,
+  `cargo test -p tx-ext4 --lib -- --test-threads=1`, `git diff --check`,
+  `cargo -q xtask unit`, and
+  `cargo xtask test busybox-boot --target rv64-qemu --timeout-ms 60000`.
+  Local ignored vendor fixtures (`tx-netfast-riscv64` and
+  `busybox-riscv64-musl`) were copied from the main checkout to satisfy the
+  QEMU build. T6 is now complete in
+  `docs/progress/plans/2026-07-25-memory-io-ext4-repair.json`. Next: reuse an
+  existing lane worker for V1 fault/interoperability. Remaining blockers are
+  V1/V2/V3 evidence: crash/replay plus `e2fsck`, pinned xfstests TEST/SCRATCH
+  images/manifests, and the same-run native RV64 rustc workload/Linux baseline.
+  V1 has since started but is not closed: journal lane added deterministic
+  fixture-matrix foundations (`cb45c83b`), the `cargo xtask ext4` acceptance
+  command surface (`65ba5767`), strict profile/report DTO validation
+  (`24540064`), and coordinator wiring for non-dry-run validation before the
+  unimplemented backend (`db978fcc`). Fresh checks passed
+  `python3 -m unittest tools.tests.test_ext4_fixture_matrix`,
+  `cargo test -p xtask ext4 -- --test-threads=1`,
+  `cargo xtask ext4 --help`, fixture-verify dry-run,
+  `cargo fmt --check --package xtask`, and `git diff --check`. Current blocker:
+  Task 3 cannot create Tier 1/Tier 2 source locks or manifests without measured
+  Linux/e2fsprogs/xfstests checkouts or revision/hash inputs; fabricating those
+  values is not allowed. V1 Task 2 host-side role plumbing also has a partial
+  slice in journal worktree commit `ce57400a`: `cargo xtask qemu` and
+  `cargo xtask shell-test` now accept TEST/SCRATCH/WORKLOAD ext4 image roles,
+  preserve `--extra-rv64-ext4` as a TEST alias, reject mixed/duplicate role
+  inputs, attach TEST/SCRATCH/WORKLOAD as `vda`/`vdb`/`vdc` on
+  `virtio-mmio-bus.0..2`, mark WORKLOAD read-only, and copy writable
+  TEST/SCRATCH images per parallel shell-test group. Verification passed
+  `cargo test -p xtask qemu -- --test-threads=1`,
+  `cargo test -p xtask shell_test -- --test-threads=1`,
+  `cargo test -p xtask ext4 -- --test-threads=1`, the three-role QEMU
+  dry-run, `cargo fmt --check --package xtask`, and `git diff --check`.
+  A follow-up `cargo -q xtask unit` in the journal worktree passed build,
+  `tx-shims`, `tx-kernel`, and `tx-ext4`, then failed before completing
+  `tx-scripts` because the host filesystem had only about 120 MiB free and
+  rustc could not write a `target/debug/deps/...rcgu.o` object (`No space left
+  on device`); treat that as a disk-space blocker, not a semantic regression.
+  To restore write headroom, the coordinator deleted the regenerable journal
+  worktree build cache
+  `/Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement/target/debug/incremental`,
+  recovering roughly 1.3 GiB.
+  Remaining Task 2 work is kernel/HAL/device side: static RV64 MMIO maps,
+  virtio block probing and stable `vda`/`vdb`/`vdc` identities,
+  `DevT(254,0..2)` registration, and guest scripts that validate cmdline roles
+  before mounting.
+
+- 2026-07-25 (memory/I-O ext4 complete repair planning).
+  Landed one executable roadmap and four test-first subplans covering the
+  correctness foundation, multi-page transactional ext4/pure reusable pager,
+  owner-driven memory pressure, and Tier 1/Tier 2 correctness plus native
+  rustc performance acceptance. Corrected the dependency order so retained
+  multi-page `PageDataLease` precedes fsync aggregation, then atomic namespace
+  transactions, pager extraction and production cutover. Added a proposed
+  20-step progress record with explicit ownership, dependencies, evidence and
+  product gates. No Rust implementation changed. Verification: `cargo xtask
+  progress validate` passed for 38 records; `cargo xtask lint docs` passed with
+  the 7 existing retired-vocabulary discussion warnings; JSON parsing,
+  placeholder scans and `git diff --check` passed. Next: claim an isolated
+  worktree and execute Plan A Task 1 (`PageSlot`-only dirty/writeback
+  authority) from a fresh B0 baseline. Blockers: implementation is not started,
+  TEST/SCRATCH xfstests fixtures are absent, and the pinned native RV64 rustc
+  workload plus same-run Linux baseline do not yet exist. See
+  `docs/superpowers/plans/2026-07-25-memory-io-ext4-repair-roadmap.md` and
+  `docs/progress/plans/2026-07-25-memory-io-ext4-repair.json`.
 
 - 2026-07-25 (memory/I-O ext4 implementation-readiness correction).
   Re-audited the canonical dual-plane plan against the current ext4,
@@ -26706,3 +29824,111 @@
   deadline/mailbox path, TCP/UDP loopback, device, veth, rtnetlink, and
   netfilter modules. Next: use a targeted QEMU witness only when validating
   guest-visible timer or RTC behavior; the host network unit-test gate is green.
+- 2026-07-30 (ext4 Tier 1 durability bridge).
+  Completed Task 7 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  The real block dispatch adapter now maps `BlockFlags::FUA` to a typed write
+  option and rejects a device that does not advertise FUA rather than ignoring
+  the flag. Current virtio PCI/MMIO devices advertise flush but no FUA because
+  the available driver exposes `flush()` only; JBD2 transaction graphs thus
+  use explicit ordered post-commit and clean-write flush fences. Verification
+  passed the capable-device FUA-forwarding and unsupported-FUA rejection unit
+  tests, `journal_transaction_plan` (3), `mutation_lifecycle` (4), `cargo
+  check -p tx-drivers`, and `cargo -q xtask unit` (639 `tx-shims` tests), with
+  scoped Rust 2024 formatting and `git diff --check`. This is a bridge and
+  graph-contract slice, not a claim of a production RW path or durable product
+  acceptance: recovery/cache gating, revoke/deferred-free, mount settlement,
+  production routing, and QEMU/e2fsck/xfstests evidence remain pending.
+- 2026-07-30 (ext4 recovery admission sub-slice).
+  Task 8 remains active in
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  The format layer now exposes ext4 `needs_recovery` and calls JBD2 replay plus
+  journal clean only when that bit is set; a new regression proves stale log
+  records do not overwrite a clean filesystem and the converse regression
+  proves recovery-required replay does install and clean the committed record.
+  `BlockImage::barrier` is now mandatory, and the production ext4 block bridge
+  forwards it to the registered device. Verification passed `jbd2_recovery`
+  (6), `pager_mock` (16), the ext4 bridge unit selection (4), and `cargo -q
+  xtask unit` (639 + 114 + 34), with scoped formatting. Remaining blockers for
+  Task 8 are JBD2 descriptor/commit checksum admission, writing ext4 recovery
+  state before RW mutation, and one owner-driven pager/mapping/inode/directory/
+  lookup/bridge cache settlement path after replay or checkpoint.
+- 2026-07-30 (ext4 Tier 1 recovery and cache settlement).
+  Completed Task 8 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  Recovery is gated by ext4 `needs_recovery`: clean images skip stale JBD2
+  records, recovery-required images replay committed entries and publish a
+  clean journal state. JBD2 superblock CRC32C has both valid and corrupt
+  witnesses; unsupported descriptor/commit checksum layouts fail closed.
+  RW admission persists recovery-required before mutation. After a durable
+  checkpoint, a weak mount observer invalidates pager-image, extent mapping,
+  lookup, directory, inode metadata, and bridge block caches; only after that
+  settlement returns does the `JournalExtentToken` reclaim the tail. Verification
+  passed `jbd2_recovery` (9), `pager_mock` (17), `tx-ext4` library (35),
+  `mutation_lifecycle` (5), `tx-fs tx_ext4_bridge` (6), scoped rustfmt, and
+  `git diff --check`. This does not constitute Tier 1 product acceptance:
+  revoke/deferred-free, full mutation slices, MountSettlementOp, production
+  cutover, and QEMU/e2fsck/xfstests crash evidence remain open; Task 9 is next.
+
+- 2026-07-30 (ext4 Tier 1 revoke and deferred-free ownership).
+  Completed Task 9 of
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  `Ext4MutationPlan` now canonically pairs sorted, deduplicated revoke records
+  with deferred-free claims; the JBD2 image/ring/staging path retains an
+  optional revoke page through commit. `MutationHandle` owns those claims from
+  admission through checkpoint cache settlement and journal-tail reclaim, and
+  the lifecycle regression proves a freed block is `EBUSY` during settlement
+  but reusable after tail reclaim. Recovery parses the optional revoke page,
+  validates its sequence, advances its ring accounting, and suppresses a
+  matching stale after-image. Verification passed `jbd2_transaction_image`
+  (2), `jbd2_recovery` (10), `journal_transaction_plan` (4),
+  `mutation_lifecycle` (6), and `cargo -q xtask unit` (639 + 114 + 35 + 166),
+  with scoped Rust formatting and `git diff --check`. This is not product
+  acceptance: truncate, unlink, rename-overwrite, and orphan cleanup still
+  fail closed; Task 10 starts the setattr vertical slice, while QEMU crash,
+  replay, `e2fsck`, and xfstests evidence remain required.
+
+- 2026-07-30 (ext4 Tier 1 setattr planning prerequisite).
+  Task 10 is in progress, not complete. The format pager now produces an
+  immutable `SetAttr` inode-table after-image for mode, owner, and timestamp
+  changes; it preserves unknown inode bytes and recomputes `metadata_csum`.
+  Verification passed `cargo check -p tx-ext4-format --no-default-features`
+  and `cargo test -p tx-ext4-format --test pager_mock` (19). The planned public
+  `FsOps::serialize_inode_meta` route remains correctly fail-closed with
+  `EOPNOTSUPP`: `Ext4FsInstance` has no mount-owned operation that can retain
+  the mutation through checkpoint, tail reclaim, and cache settlement, and
+  reusing the legacy direct journal helper would violate the lifecycle contract.
+  Next: bring the minimal MountSettlementOp/runtime-attachment prerequisite
+  forward before opening setattr admission; Tasks 11--16, production RW
+  cutover, and QEMU/e2fsck/xfstests acceptance remain blocked.
+
+- 2026-07-31 (ext4 mount settlement foundation).
+  Added the minimal mount-side lifecycle scaffold required by the Tier 1
+  convergence plan: `tx-subsystems::page_backed::ErrorSeq`/`ErrorCursor` now
+  track one-observation error publication, and `tx-subsystems::mount::settlement`
+  now carries a small `MountRuntimeCell` state machine with Open/Quiescing/
+  RecoveryOnly/DetachedPending/Detached transitions plus payload-pin tracking.
+  New regression tests prove one-shot error observation, normal detach busy
+  handling, and lazy-detach payload retention. Verification passed `cargo test
+  -p tx-subsystems --lib settlement_lifecycle_tests -- --test-threads=1` and
+  the ext4 format setattr slice still passes. Task 10's runtime admission path
+  remains fail-closed until `tx-ext4` consumes this mount settlement scaffold;
+  Tasks 11--16 are still pending.
+
+- 2026-08-01 (ext4 Task 10 setattr admission and Task 13 frontier fix).
+  Completed the public setattr vertical slice tracked by
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  Mutation-journal mounts now bind their `JournalMutationRuntime` back to the
+  ext4 backend for metadata-only admission; `serialize_inode_meta`,
+  `chmod_inode`, and `chown_inode` admit supported `SetAttr` mutations through
+  `MutationHandle` without direct home writes. `JournalMutationRuntime` now
+  exposes `snapshot_transaction_frontier()` from the active handle sequence,
+  and metadata-only transactions enter `Prepared` so fsync/sync settlement can
+  drive their commit graph. Verification passed `cargo test -p tx-ext4 --lib
+  --no-default-features -- --test-threads=1` (39) and `cargo test -p tx-ext4
+  --test mutation_lifecycle -- --test-threads=1` (7), plus
+  `cargo -q xtask unit` (646 + 114 + 39 + 166), with scoped
+  `cargo fmt --package tx-ext4`. Remaining blockers: Task 11 multi-page
+  data/truncate, Task 12 namespace/orphan plans, Task 14 production cutover/G0
+  lints, Task 15 `cargo xtask ext4 tier1`, and Task 16 fresh
+  QEMU/e2fsck/xfstests receipt.

@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::Guard;
-use crate::page_backed::FsPageBacking;
+use crate::page_backed::{FileFsyncFrontier, FsPageBacking};
 use crate::tty;
 use crate::vfs::adapter::step_engine::{
     self, ByteProgress, Cap, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
@@ -23,7 +23,7 @@ use super::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileBacking,
     OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
-use crate::mount::{MountIdentity, MountNamespace, MountPayload};
+use crate::mount::{MountIdentity, MountNamespace, MountPayload, MountTransactionFrontier};
 
 // === FsOps — emits step_v3 outcomes ==================================
 //
@@ -176,6 +176,41 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
+
+    /// Settle backend-owned state after PageBacked has driven the file's
+    /// dirty-page frontier and `FsPageBacking::fsync_file` has returned.
+    /// Stateless and in-memory backends inherit the no-op default.
+    fn settle_file(
+        &self,
+        fs_object_id: FsObjectId,
+        generation_frontier: &FileFsyncFrontier,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let _ = (fs_object_id, generation_frontier, guard);
+        StepOutcome::done(())
+    }
+
+    /// Settle backend-owned mount-wide state after a filesystem sync frontier.
+    /// Stateless and in-memory backends inherit the no-op default.
+    fn snapshot_mount_transaction_frontier(&self) -> MountTransactionFrontier {
+        MountTransactionFrontier::default()
+    }
+
+    fn settle_mount(
+        &self,
+        transaction_frontier: MountTransactionFrontier,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let _ = (transaction_frontier, guard);
+        StepOutcome::done(())
+    }
+
+    /// Quiesce backend-owned runtime state before mount payload reclamation.
+    /// Stateless and read-only backends inherit the no-op default.
+    fn shutdown(&self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        let _ = guard;
+        StepOutcome::done(())
+    }
 
     /// Read a symlink's target bytes. Default returns `ENOSYS` (parity
     /// with [`FsOps::read_link`]).
@@ -2346,7 +2381,7 @@ mod step_op_wraps {
         dentry.set_parent_hint(parent_dentry);
         let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
 
-        let open_file = OpenFile::new_cap(
+        let open_file = OpenFile::new_cap_with_mount_payload(
             rnode,
             OpenFileFlags {
                 read: false,
@@ -2356,6 +2391,7 @@ mod step_op_wraps {
                 nonblocking: false,
                 packet: false,
             },
+            mount_payload,
         )
         .map_err(|_| Errno::ENOMEM)?;
 

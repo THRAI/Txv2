@@ -209,9 +209,20 @@ pub(in crate::linux_syscall) async fn sys_fstatfs<P: PmapIf>(
 /// `sync()`. Linux RV64 ABI `__NR_sync = 81`.
 pub(in crate::linux_syscall) async fn sys_sync<P: PmapIf>(
     _args: [u64; 6],
-    _ctx: &SyscallCtx<'_>,
+    ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
+    if let Some(namespace) = ctx.process.mount_namespace_cap() {
+        for pin in namespace.snapshot_payload_pins() {
+            let transaction_frontier = pin.payload().snapshot_transaction_frontier();
+            let _ = drive_mount_settlement(
+                pin,
+                tx_subsystems::mount::SettlementScope::Mount {
+                    transaction_frontier,
+                },
+            );
+        }
+    }
     SyscallResult::Return(0)
 }
 
@@ -228,17 +239,48 @@ pub(in crate::linux_syscall) async fn sys_syncfs<P: PmapIf>(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     let rnode = open_file.rnode();
-    let page_backing = match MountedNode::from_rnode_direct(rnode) {
-        Some(mounted) => mounted.fs_page_backing(),
+    let mounted = match MountedNode::from_rnode_direct(rnode) {
+        Some(mounted) => mounted,
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
+    let payload = mounted.payload();
+    if let Some(errno) = open_file.observe_mount_error(&payload) {
+        return SyscallResult::error_from(errno);
+    }
+    let page_backing = mounted.fs_page_backing();
     let guard = step_engine::guard();
     // syncfs: flush the entire filesystem. The default impl falls back
     // to `fsync_file(ROOT)`; journaling filesystems can override.
-    match page_backing.sync_filesystem(&guard) {
-        StepOutcome::Done(()) => SyscallResult::Return(0),
+    let outcome = page_backing.sync_filesystem(&guard);
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(()) => {
+            let transaction_frontier = payload.snapshot_transaction_frontier();
+            match drive_mount_settlement(
+                tx_subsystems::mount::MountPayloadPin::acquire_cap(&payload),
+                tx_subsystems::mount::SettlementScope::Mount {
+                    transaction_frontier,
+                },
+            ) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
+        }
         StepOutcome::Err(e) => SyscallResult::error_from(Errno::from(e)),
         _ => SyscallResult::Error(EIO_VALUE),
+    }
+}
+
+fn drive_mount_settlement(
+    pin: tx_subsystems::mount::MountPayloadPin,
+    scope: tx_subsystems::mount::SettlementScope,
+) -> Result<(), Errno> {
+    let mut op = tx_subsystems::mount::MountSettlementOp::new(pin, scope)?;
+    let guard = step_engine::guard();
+    match op.drive(&guard) {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Err(errno) => Err(Errno::from(errno)),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
     }
 }
 
@@ -258,14 +300,19 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
     let fs_object_id = rnode.fs_object_id();
     let page_container = crate::linux_syscall::vm::extract_page_container(&open_file);
     // `MountedNode` scopes the mount-weak upgrade to the helper call and
-    // returns a cloned page-backing handle, so no guard crosses the subsequent
+    // returns cloned handles, so no guard crosses the subsequent
     // `drive(...).await` (INVARIANTS_v5 EBR-7).
-    let page_backing = {
-        match MountedNode::from_rnode_direct(rnode) {
-            Some(mounted) => mounted.fs_page_backing(),
-            None => return SyscallResult::Error(ENODEV_VALUE),
-        }
+    let (payload, page_backing) = match MountedNode::from_rnode_direct(rnode) {
+        Some(mounted) => (mounted.payload(), mounted.fs_page_backing()),
+        None => return SyscallResult::Error(ENODEV_VALUE),
     };
+    if let Some(errno) = open_file.observe_payload_error(&payload) {
+        return SyscallResult::error_from(errno);
+    }
+    let generation_frontier = page_container
+        .as_ref()
+        .and_then(|pc| pc.snapshot_file_fsync_frontier())
+        .unwrap_or_else(tx_subsystems::page_backed::FileFsyncFrontier::empty);
     // fsync: sync the specific file via FileFsyncOp + drive().
     use step_engine::DriveMode;
     use tx_scripts::drive;
@@ -276,7 +323,9 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
         page_backing,
         fs_object_id,
         page_container,
-        state: tx_subsystems::page_backed::FileFsyncState::new(),
+        state: tx_subsystems::page_backed::FileFsyncState::from_frontier(
+            generation_frontier.clone(),
+        ),
     };
     match drive(
         op,
@@ -288,7 +337,16 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
     )
     .await
     {
-        Ok(()) => SyscallResult::Return(0),
+        Ok(()) => match drive_mount_settlement(
+            tx_subsystems::mount::MountPayloadPin::acquire_cap(&payload),
+            tx_subsystems::mount::SettlementScope::File {
+                object: fs_object_id,
+                generation_frontier,
+            },
+        ) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::error_from(errno),
+        },
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

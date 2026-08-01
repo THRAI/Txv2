@@ -79,6 +79,10 @@ impl BlockImage for VecImage {
         bytes.copy_from_slice(data);
         Ok(())
     }
+
+    fn barrier(&mut self) -> tx_ext4_format::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]

@@ -61,6 +61,31 @@ fn mount_identity_for_dentry(
     None
 }
 
+fn drive_umount_detach_settlement(payload: &Cap<mount::MountPayload>) -> Result<(), Errno> {
+    let pin = mount::MountPayloadPin::acquire_cap(payload);
+    let mut op = mount::MountSettlementOp::new(pin, mount::SettlementScope::Detach)?;
+    let guard = step_engine::guard();
+    match op.drive(&guard) {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Err(errno) => Err(Errno::from(errno)),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
+    }
+}
+
+fn begin_lazy_detach_after_topology_withdrawal(
+    payload: &Cap<mount::MountPayload>,
+) -> Result<(), Errno> {
+    if payload.begin_lazy_detach()? {
+        drive_umount_detach_settlement(payload)
+    } else {
+        // No mount settlement background queue is currently exposed to
+        // tx-shims. The external payload pin keeps the payload alive in
+        // DetachedPending; the queue driver must be added before claiming
+        // retry/wake based background detach completion.
+        Ok(())
+    }
+}
+
 fn resolve_cwd_for_path(dirfd: i32, path: &[u8], ctx: &SyscallCtx<'_>) -> Result<Cap<DEntry>, i32> {
     dirfd_anchor_errno(dirfd, path, ctx)
 }
@@ -1497,13 +1522,18 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let target_uaddr = args[0];
     let flags = args[1] as u64;
 
+    const MNT_FORCE: u64 = 1;
+    const MNT_DETACH: u64 = 2;
+    const MNT_EXPIRE: u64 = 4;
+    const UMOUNT_NOFOLLOW: u64 = 8;
+
     // umount2 flags: MNT_FORCE(1) MNT_DETACH(2) MNT_EXPIRE(4) UMOUNT_NOFOLLOW(8).
-    // No per-mount busy refs / lazy-detach queue in this model, so force/detach
-    // reduce to a plain synchronous umount; MNT_EXPIRE 2-phase and nofollow are
-    // not modelled. Reject unknown bits. (MNT_DETACH is what the fs_bind* mount
-    // tests use to tear down their sandbox.)
-    if flags & !(1 | 2 | 4 | 8) != 0 {
+    // MNT_EXPIRE 2-phase and nofollow are not modelled. Reject unknown bits.
+    if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & MNT_FORCE != 0 {
+        return SyscallResult::Error(EOPNOTSUPP_VALUE);
     }
 
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
@@ -1527,12 +1557,43 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
         Err(e) => return SyscallResult::Error(e),
     };
     let result = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
+        let target_mount = match mnt_ns.mount_containing_dentry(&target_dentry) {
+            Some(mount) if mount.key() != mnt_ns.root().key() => mount,
+            _ => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        let target_is_mount_boundary = target_mount.root_dentry().key() == target_dentry.key()
+            || target_mount
+                .mountpoint()
+                .is_some_and(|mountpoint| mountpoint.key() == target_dentry.key());
+        if !target_is_mount_boundary {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        let target_payload = match target_mount.payload_cap() {
+            Ok(payload) => payload.into_cap(),
+            Err(_) => return SyscallResult::Error(ENODEV_VALUE),
+        };
+        if flags & MNT_DETACH == 0 && target_payload.payload_pin_count() != 0 {
+            return SyscallResult::error_from(Errno::EBUSY);
+        }
+        if flags & MNT_DETACH == 0 {
+            if let Err(errno) = drive_umount_detach_settlement(&target_payload) {
+                return SyscallResult::error_from(errno);
+            }
+        }
         // The namespace row is authoritative and returns the identity it
         // actually removed. Only that exact identity may be withdrawn from
         // the legacy global index; a cloned identity has no global row, which
         // is intentionally a successful no-op.
-        mnt_ns.umount(&target_dentry).map(|removed_mount| {
+        mnt_ns.umount(&target_dentry).and_then(|removed_mount| {
             let _ = mount::umount_identity_exact(&removed_mount);
+            if flags & MNT_DETACH != 0 {
+                let payload = removed_mount
+                    .payload_cap()
+                    .map_err(|_| Errno::ENODEV)?
+                    .into_cap();
+                begin_lazy_detach_after_topology_withdrawal(&payload)?;
+            }
+            Ok(())
         })
     } else {
         // Namespace-less compatibility retains the legacy dentry lookup.
@@ -1544,6 +1605,10 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
             target_dentry.clone()
         };
         match mount_payload_for_dentry(&umount_target) {
+            // The legacy global mount table only returns `Result<()>`, not the
+            // removed mount identity, so this compatibility branch cannot
+            // safely drive child-payload settlement. Namespace-bearing tasks
+            // use the owner-aware path above.
             Some(parent_payload) => mount::umount(&umount_target, &parent_payload),
             None => return SyscallResult::Error(ENODEV_VALUE),
         }

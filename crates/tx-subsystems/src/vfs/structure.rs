@@ -29,7 +29,7 @@ use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
 use crate::mount::{MountApiFile, MountIdentity, MountPayload};
 use crate::net::{NetNamespacePayload, SocketIdentity};
-use crate::page_backed::PageContainer;
+use crate::page_backed::{ErrorCursor, PageContainer};
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
 use crate::timerfd::TimerFd;
@@ -1140,9 +1140,27 @@ pub struct BpfMapFile {
 /// happens to be a `userfaultfd(2)` (a state no VFS-aware caller can
 /// reach today).
 #[derive(Debug)]
+struct OpenFileErrorCursors {
+    mount: ErrorCursor,
+    payload: ErrorCursor,
+}
+
+impl OpenFileErrorCursors {
+    fn new(mount_payload: Option<&MountPayload>) -> Self {
+        let cursor =
+            mount_payload.map_or_else(ErrorCursor::new, MountPayload::snapshot_error_cursor);
+        Self {
+            mount: cursor,
+            payload: cursor,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct OpenFile {
     pub(crate) backing: OpenFileBacking,
     offset: AtomicU64,
+    error_cursors: SpinMutex<OpenFileErrorCursors>,
     /// Per-fd readdir cursor. Slice 6 of the shell-prompt roadmap
     /// added this so `getdents64(2)` can resume across calls without
     /// rewinding the directory each time.
@@ -1167,9 +1185,18 @@ pub struct OpenFile {
 
 impl OpenFile {
     pub fn new(rnode: Cap<RNode>, flags: OpenFileFlags) -> Self {
+        Self::new_with_optional_mount_payload(rnode, flags, None)
+    }
+
+    fn new_with_optional_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        mount_payload: Option<&MountPayload>,
+    ) -> Self {
         Self {
             backing: OpenFileBacking::Rnode { rnode },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(mount_payload)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1178,8 +1205,24 @@ impl OpenFile {
         }
     }
 
+    pub fn new_with_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        mount_payload: &MountPayload,
+    ) -> Self {
+        Self::new_with_optional_mount_payload(rnode, flags, Some(mount_payload))
+    }
+
     pub fn new_cap(rnode: Cap<RNode>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
         step_engine::sign(Self::new(rnode, flags))
+    }
+
+    pub fn new_cap_with_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        mount_payload: &MountPayload,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_with_mount_payload(rnode, flags, mount_payload))
     }
 
     /// Like [`Self::new_cap`] but also records the DEntry that
@@ -1194,6 +1237,17 @@ impl OpenFile {
         step_engine::sign(file)
     }
 
+    pub fn new_cap_with_dentry_and_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        dentry: Cap<DEntry>,
+        mount_payload: &MountPayload,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let mut file = Self::new_with_mount_payload(rnode, flags, mount_payload);
+        file.opendir_dentry = Some(dentry);
+        step_engine::sign(file)
+    }
+
     /// Construct a userfaultfd-backed `OpenFile` (PR-10 phase 0). The
     /// resulting value carries `OpenFileBacking::Ufd { ufd }` and no
     /// `Cap<RNode>` — userfaultfd is a non-VFS fd kind (see D7 §3.7).
@@ -1204,6 +1258,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Ufd { ufd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1234,6 +1289,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::AioContext { ctx },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1260,6 +1316,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::SignalFd { sfd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1283,6 +1340,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Epoll { ep },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1303,6 +1361,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Eventfd { efd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1326,6 +1385,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Timerfd { tfd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1347,6 +1407,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::PosixMq { mq },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1368,6 +1429,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Pidfd { process },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1389,6 +1451,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::KernelObject { object },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1410,6 +1473,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::MountApi { file },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1435,6 +1499,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::SocketPair { rx, tx },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1462,6 +1527,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::IoUring { ring },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1626,6 +1692,16 @@ impl OpenFile {
                  dispatch via OpenFile::backing() / OpenFile::socketpair_endpoint() first",
             ),
         }
+    }
+
+    pub fn observe_mount_error(&self, mount_payload: &MountPayload) -> Option<Errno> {
+        let mut cursors = self.error_cursors.lock();
+        mount_payload.observe_mount_error_with_cursor(&mut cursors.mount)
+    }
+
+    pub fn observe_payload_error(&self, mount_payload: &MountPayload) -> Option<Errno> {
+        let mut cursors = self.error_cursors.lock();
+        mount_payload.observe_payload_error_with_cursor(&mut cursors.payload)
     }
 
     /// Return the DEntry hint set by step_open.  Used by fchdir.

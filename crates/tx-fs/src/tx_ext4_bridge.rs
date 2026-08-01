@@ -189,6 +189,27 @@ impl BlockImage for BlockDeviceImage {
             StepOutcome::Err(_) => Err(Ext4FormatError::Truncated),
         }
     }
+
+    fn barrier(&mut self) -> Result<()> {
+        let guard = borrow_current_guard().unwrap_or_else(guard);
+        let outcome = self.device.barrier(&guard);
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(()) => Ok(()),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                Err(Ext4FormatError::WouldBlock)
+            }
+            StepOutcome::Err(_) => Err(Ext4FormatError::Truncated),
+        }
+    }
+
+    fn invalidate_block(&mut self, block: u64) {
+        self.cache.lock().invalidate(block);
+    }
+
+    fn invalidate_all(&mut self) {
+        self.cache.lock().clear();
+    }
 }
 
 // 4096 × 4 KiB = 16 MiB. 128 entries (512 KiB) thrashed on every exec: the
@@ -247,6 +268,17 @@ impl ReadBlockCache {
         self.entries.insert(block, (clock, data));
         self.lru.insert(clock, block);
     }
+
+    fn invalidate(&mut self, block: u64) {
+        if let Some((last_used, _)) = self.entries.remove(&block) {
+            self.lru.remove(&last_used);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +304,28 @@ mod tests {
         assert!(alloc::sync::Arc::ptr_eq(&cached, &shared));
         assert_eq!(cached[0], 0x5a);
         assert_eq!(cached[BLOCK_SIZE - 1], 0xa5);
+        assert!(cache.get(8).is_none());
+    }
+
+    #[test]
+    fn read_block_cache_invalidates_replayed_home_block() {
+        let mut cache = ReadBlockCache::new();
+        cache.insert(7, Arc::new([0x5a; BLOCK_SIZE]));
+
+        cache.invalidate(7);
+
+        assert!(cache.get(7).is_none());
+    }
+
+    #[test]
+    fn read_block_cache_clears_every_entry_after_checkpoint_settlement() {
+        let mut cache = ReadBlockCache::new();
+        cache.insert(7, Arc::new([0x5a; BLOCK_SIZE]));
+        cache.insert(8, Arc::new([0xa5; BLOCK_SIZE]));
+
+        cache.clear();
+
+        assert!(cache.get(7).is_none());
         assert!(cache.get(8).is_none());
     }
 

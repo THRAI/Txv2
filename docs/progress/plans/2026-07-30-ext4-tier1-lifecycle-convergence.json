@@ -4,7 +4,7 @@
   "title": "Converge ext4 Tier 1 lifecycle ownership",
   "status": "active",
   "created": "2026-07-30",
-  "updated": "2026-07-30",
+  "updated": "2026-07-31",
   "owner": "ext4-lifecycle-coordinator",
   "summary": "Implement the bounded ext4 Tier 1 surface through OwnedFileIoRequest, MutationHandle, and MountSettlementOp, then prove one production RW durability path with G0-G7 evidence.",
   "scope": {
@@ -149,7 +149,7 @@
     {
       "id": "task-05-mutation-handle",
       "title": "Add MutationHandle and owned cross-yield tokens",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-04-page-backed-migration"
       ],
@@ -164,12 +164,12 @@
         "cargo test -p tx-ext4 --test journal_prepared_transaction -- --test-threads=1",
         "cargo xtask lint arch"
       ],
-      "notes": "Move lifecycle orchestration out of journal.rs; retain child request IDs, frozen metadata, allocator claims, and JournalExtentToken, never borrowed guards or PageDataLease bundles."
+      "notes": "Completed: private MutationHandle now owns prepared journal records, optional JournalExtentToken, data/commit request IDs, phase-local error state, and checkpoint retry state. JournalFsyncSource is a compatibility re-export but its callback orchestration moved to mutation_lifecycle.rs; a data failure consumes the handle and releases its ring extent exactly once. This bounded slice retains the existing immutable after-images inside PreparedJournalTransaction but does not yet add explicit frozen-read/allocator-claim tokens, AbortDraining, CommitUnknown/RecoveryOnly, or real FUA/flush durability. Verified cargo test -p tx-ext4 --test mutation_lifecycle, cargo test -p tx-ext4 --test journal_prepared_transaction, cargo test -p tx-ext4 --lib --no-default-features, cargo -q xtask unit, scoped rustfmt/diff checks. cargo xtask lint arch ran: the touched ext4 journal length finding was eliminated, but the repository still has 90 unrelated pre-existing architecture lint findings."
     },
     {
       "id": "task-06-failure-settlement",
       "title": "Close abort drain, commit uncertainty, and checkpoint retry",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-05-mutation-handle"
       ],
@@ -183,12 +183,12 @@
         "cargo test -p tx-ext4 --test journal_prepared_transaction -- --test-threads=1",
         "cargo -q xtask unit"
       ],
-      "notes": "Implement AbortRequested -> AbortDraining -> RolledBack, CommitUnknown -> RecoveryOnly, and CommittedNeedsSettlement retry without premature lease or ring release."
+      "notes": "Completed: MutationHandle now records AbortRequested -> AbortDraining -> RolledBack for known pre-commit data or commit failure, releasing its JournalExtentToken once the aggregate graph completion reports terminal failure. The explicit commit_unknown request-ID path retains the handle and ring extent, records the source error, and gates new writeback/fsync planning with RecoveryOnly/EIO. Checkpoint failure records a source error but retains CommittedNeedsSettlement and its extent for retry; a later successful checkpoint is still the sole release route. This source-local gate precedes Task 13 errseq/open-file cursor and mounted-instance publication; Task 7 still must prove real FUA/flush ordering. Verified lifecycle, prepared-transaction, ext4 library, workspace unit, scoped rustfmt, and diff checks."
     },
     {
       "id": "task-07-durability",
       "title": "Implement real FUA and flush durability",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-06-failure-settlement"
       ],
@@ -204,12 +204,12 @@
         "cargo test -p tx-ext4 --test journal_transaction_plan -- --test-threads=1",
         "cargo -q xtask unit"
       ],
-      "notes": "Consume device flags at the real bridge and emit an explicit post-commit flush whenever FUA is absent or unreliable; assert the device trace."
+      "notes": "Completed: BlockDeviceOps exposes immutable FUA/flush capabilities plus write options; BlockDeviceDispatchAdapter transfers BlockFlags::FUA to a capable device and rejects unsupported FUA rather than silently dropping it. RV64 virtio PCI/MMIO truthfully advertise flush=true and fua=false because the present virtio driver exposes flush but no FUA write API. JournalTransactionPlan therefore emits ordered explicit flush fences after the journal body and commit, plus after the clean checkpoint write, rather than attaching an unsupported FUA flag. Verified dispatch_adapter_passes_fua_to_capable_device, default_device_rejects_fua_instead_of_ignoring_it, journal_transaction_plan (3), mutation_lifecycle (4), cargo check -p tx-drivers, cargo -q xtask unit (639 tx-shims tests), scoped rustfmt, and git diff --check. This does not admit a production RW path, runtime device-capability selection, tail/cache settlement, replay, or QEMU durability evidence; Task 8 remains next."
     },
     {
       "id": "task-08-recovery-cache",
       "title": "Gate replay on recovery state and refresh caches",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-07-durability"
       ],
@@ -227,12 +227,12 @@
         "cargo test -p tx-ext4 --lib recovery -- --test-threads=1",
         "cargo test -p tx-fs tx_ext4_bridge -- --test-threads=1"
       ],
-      "notes": "Require ext4 needs_recovery before replay, validate sequence/checksum, make barrier non-no-op, and refresh pager, bridge, mapping, inode, and directory caches after checkpoint/replay."
+      "notes": "Completed: recovery admission exposes Superblock::needs_recovery and recover_if_required; a clean ext4 superblock skips stale JBD2 replay, while recovery-required runs replay plus durable journal clean. JBD2 superblock CRC32C has valid and invalid witnesses; unsupported descriptor/commit checksum layouts fail closed. BlockImage::barrier is mandatory and the production bridge forwards it to the registered block device. RW admission persists recovery-required before a journalled mutation. A weak mount settlement observer invalidates pager image, extent mapping, lookup, directory, inode metadata, and bridge block caches after durable checkpoint; JournalExtentToken remains retained until that settlement returns, then tail reclaim releases it. Verified jbd2_recovery (9), pager_mock (17), tx-ext4 library (35), mutation_lifecycle (5), tx-fs bridge (6), scoped rustfmt, and git diff --check. This is not product recovery acceptance: Task 9 revoke/deferred-free, complete mutation vertical slices, mount settlement, production cutover, QEMU crash, e2fsck, and xfstests evidence remain pending."
     },
     {
       "id": "task-09-revoke-free",
       "title": "Add revoke records and deferred-free ownership",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-08-recovery-cache"
       ],
@@ -243,16 +243,18 @@
         "crates/tx-ext4/src/journal.rs"
       ],
       "verification": [
-        "cargo test -p tx-ext4-format --test pager_mock revoke_ -- --test-threads=1",
-        "cargo test -p tx-ext4 --test mutation_lifecycle free_reuse -- --test-threads=1",
+        "cargo test -p tx-ext4-format --test jbd2_transaction_image -- --test-threads=1",
+        "cargo test -p tx-ext4-format --test jbd2_recovery -- --test-threads=1",
+        "cargo test -p tx-ext4 --test journal_transaction_plan -- --test-threads=1",
+        "cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1",
         "cargo -q xtask unit"
       ],
-      "notes": "Keep freed blocks unavailable until checkpoint and tail advancement prove replay safety; cover truncate, unlink, rename-overwrite, and orphan cleanup cuts."
+      "notes": "Completed: immutable Ext4MutationPlan values canonicalize paired RevokeRecord and DeferredFreeClaim entries; JBD2 reserves and stages an optional revoke page between metadata and commit, and its durable graph orders that page before commit. MutationHandle owns the deferred-free claims from admission through cache observer settlement and JournalExtentToken tail reclaim, so test-only reuse remains EBUSY until tail reclaim. Replay recognizes the optional revoke page, validates its sequence, includes it in cursor accounting, and suppresses matching same-transaction stale after-images. Verified jbd2_transaction_image (2), jbd2_recovery (10), journal_transaction_plan (4), mutation_lifecycle (6), cargo -q xtask unit (639 + 114 + 35 + 166), scoped rustfmt, and git diff --check. This is not a production free path: truncate/unlink/rename-overwrite/orphan cleanup remain fail-closed and require Task 11/12 vertical slices plus QEMU crash/replay, e2fsck, and xfstests evidence."
     },
     {
       "id": "task-10-setattr",
       "title": "Migrate setattr as the first complete vertical slice",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "task-09-revoke-free"
       ],
@@ -267,7 +269,7 @@
         "cargo test -p tx-ext4 --lib setattr -- --test-threads=1",
         "cargo test -p tx-ext4 --lib --no-default-features"
       ],
-      "notes": "Make chmod, chown, timestamps, and size metadata use complete after-images and publish only after settled checkpoint."
+      "notes": "Completed: mutation-journal mounts now bind the mount-owned JournalMutationRuntime back to Ext4FsInstance for metadata-only admission. FsOps::serialize_inode_meta admits exactly one supported SetAttr class (mode, owner, or times) through Ext4Pager::plan_setattr plus JournalMutationRuntime::begin_mutation, while size/nlink/blocks/flags and mixed-class updates remain fail-closed for Task 11/12. Ext4 overrides public chmod_inode and chown_inode to admit SetAttr::Mode and SetAttr::Owner directly; tests prove these public paths create an active journal transaction frontier without any direct home write. Verified cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1 (39), cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1 (7), cargo -q xtask unit (646 + 114 + 39 + 166), and scoped rustfmt."
     },
     {
       "id": "task-11-data-truncate",
@@ -317,17 +319,23 @@
     {
       "id": "task-13-mount-settlement",
       "title": "Add MountSettlementOp, errseq, and syscall routing",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": [
         "task-12-namespace-orphan"
       ],
       "paths": [
         "crates/tx-subsystems/src/page_backed/error_seq.rs",
+        "crates/tx-subsystems/src/mount/mod.rs",
         "crates/tx-subsystems/src/mount/settlement.rs",
         "crates/tx-subsystems/src/page_backed/fs_page_backing.rs",
         "crates/tx-subsystems/src/vfs/execution.rs",
+        "crates/tx-subsystems/src/vfs/structure.rs",
+        "crates/tx-subsystems/src/vfs/walker.rs",
+        "crates/tx-ext4/src/namespace.rs",
         "crates/tx-ext4/src/settlement.rs",
+        "crates/tx-ext4/src/tests_v3.rs",
         "crates/tx-shims/src/linux_syscall/fs_basic/dir_sync.rs",
+        "crates/tx-shims/src/linux_syscall/fs_handle.rs",
         "crates/tx-shims/src/linux_syscall/fs_mut.rs"
       ],
       "verification": [
@@ -336,7 +344,7 @@
         "cargo test -p tx-shims --lib syncfs -- --test-threads=1",
         "cargo test -p tx-shims --lib umount -- --test-threads=1"
       ],
-      "notes": "Route fsync, fdatasync, syncfs, sync, normal umount, and lazy detach through one operation; MNT_FORCE stays unsupported and MNT_DETACH retains payload ownership after topology withdrawal."
+      "notes": "In progress: the mount-side scaffold has default FsOps::shutdown plus FsOps::settle_file/settle_mount hooks, a MountRuntimeCell-backed MountSettlementOp that owns a MountPayloadPin while active, records detach shutdown errors through ErrorSeq, and drives successful detach to Detached or failure to RecoveryOnly. SettlementScope::File now carries the FsObjectId plus a captured FileFsyncFrontier generation frontier; sys_fsync snapshots that PageBacked frontier once, drives FileFsyncOp from the same value, and passes it through MountSettlementOp into the backend settle_file hook. JournalMutationRuntime now exposes snapshot_transaction_frontier(), backed by the active MutationHandle transaction sequence, and FsOps::snapshot_mount_transaction_frontier() can route mount-wide sync/syncfs settlement to that JBD2 frontier. Metadata-only mutations without a data graph enter Prepared directly so their commit graph can be driven by fsync/sync settlement. Ext4 overrides settle_file and settle_mount to settle mount-local pager/mapping/lookup/directory/inode caches without releasing the backend-held mount pin; detach shutdown still owns that release. Syscall routing covers sync, syncfs, fsync, fdatasync, and namespace-backed umount2: sync snapshots visible mount payload pins and preserves the Linux success return contract; syncfs observes mount errors through the calling open-file description and drives mount-scope settlement; fsync/fdatasync observe payload errors through the calling open-file description and drive file-scope settlement after FileFsyncOp with the captured generation frontier; normal namespace umount checks active payload users before quiesce and topology withdrawal; MNT_FORCE returns EOPNOTSUPP; MNT_DETACH withdraws topology and leaves active payload users in DetachedPending. OpenFile stores mount/payload errseq cursors shared by dup/forked file descriptions and samples the current mount sequence when opened through the walker, bootstrap create, or open_by_handle_at. Lazy detach has a background mount-settlement queue that registers a retained MountSettlementOp when the final payload user releases and keeps retryable detach operations queued across EAGAIN. The legacy namespace-less umount branch remains topology-only because the global helper does not return the removed mount identity. Verified cargo test -p tx-subsystems --lib settlement_lifecycle_tests -- --test-threads=1 (11), cargo test -p tx-subsystems --lib page_backed -- --test-threads=1 (154), cargo test -p tx-shims --lib fd_ops_wave2 -- --test-threads=1 (52), cargo test -p tx-ext4 --lib --no-default-features (39), cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1 (7), cargo -q xtask unit (646 + 114 + 39 + 166), and scoped rustfmt. Remaining Task 13/product work: Task 11/12 data+namespace vertical slices, Task 14 production cutover/G0 lints, Task 15 Tier 1 runner, and Task 16 fresh QEMU/e2fsck/xfstests receipt."
     },
     {
       "id": "task-14-production-cutover",

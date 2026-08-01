@@ -15,29 +15,29 @@ pub mod adapter;
 pub mod notification;
 
 use adapter::step_engine::{
-    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
-    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak,
-    ZeroPolicy, Zone, ZoneAllocated, ZoneError,
+    self as step_engine, AllocError, BitmapPageAllocator, ByteProgress, CachePin, Cap, DeviceFrame,
+    MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak, ZeroPolicy, Zone,
+    ZoneAllocated, ZoneError, page_allocator,
 };
 
 use crate::execution::{Errno, Guard};
 use crate::fs_iface::{BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
-    dispatch_backend_plan, BlockPageCompletion, BlockPageRequestTracker, PageFrameRef,
+    BlockPageCompletion, BlockPageRequestTracker, PageFrameRef, dispatch_backend_plan,
 };
 use crate::io_manager::block::{
     BlockCompletion, BlockCompletionSource, BlockDispatchExecutor, BlockQueue, BlockRequestId,
     BlockServiceDriver, BlockServiceNext, BlockTagTable, QueueError, SubmitOutcome,
 };
 use crate::io_manager::page::{
+    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
+    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
     service::{
         PageCompletionRoute, PageService, PageServiceBackendContext, PageServiceBackendDriven,
         PageServiceBackendOutcome, PageServiceBackendSubmitOutcome, PageServiceDrivenWork,
         PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWork,
         PageWaitInterest, PageWaiter,
     },
-    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
-    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
 };
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
@@ -50,6 +50,7 @@ use tx_substrate::page_allocator::OwnedFrame;
 
 mod cross_variant;
 mod direct_io;
+mod error_seq;
 mod fs_page_backing;
 mod gift;
 mod lifecycle;
@@ -64,8 +65,9 @@ pub use direct_io::{
     DirectIoBuffer, DirectIoBufferError, DirectIoCompletion, DirectIoOperation, DirectIoSubmission,
     DirectIoWaitableSubmission,
 };
+pub use error_seq::{ErrorCursor, ErrorSeq};
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
+pub use lifecycle::{FallocateOp, FsyncOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
 use lifecycle::{FileIoPayload, FileIoTerminalResult, OwnedFileIoRequest, PageDataLease};
 pub use range::{
     PageRange, RangeReservation, RangeReservationError, RangeReservationId, RangeReservationKind,
@@ -79,8 +81,8 @@ pub use slot::{
 use sparse_index::SparseIndex;
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
-    step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
-    ReadToUserOp, WriteFromUserOp,
+    ReadToUserOp, WriteFromUserOp, step_read_to_kernel, step_read_to_user, step_write_from_kernel,
+    step_write_from_user,
 };
 
 #[cfg(test)]
@@ -539,8 +541,17 @@ pub struct PageLease {
 pub struct FileFsyncFrontier(Vec<(PageIndex, PageGeneration)>);
 
 impl FileFsyncFrontier {
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
     pub fn pages(&self) -> &[(PageIndex, PageGeneration)] {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub fn from_pages_for_test(pages: Vec<(PageIndex, PageGeneration)>) -> Self {
+        Self(pages)
     }
 }
 
@@ -564,6 +575,16 @@ pub struct FileFsyncState {
 impl FileFsyncState {
     pub const fn new() -> Self {
         Self { frontier: None }
+    }
+
+    pub fn from_frontier(frontier: FileFsyncFrontier) -> Self {
+        Self {
+            frontier: Some(frontier),
+        }
+    }
+
+    pub fn frontier(&self) -> Option<&FileFsyncFrontier> {
+        self.frontier.as_ref()
     }
 
     pub fn advance(&mut self, pc: &PageContainer) -> Result<FileFsyncFrontierAdvance, Errno> {
@@ -2227,9 +2248,11 @@ impl PageContainer {
         terminal: FileIoTerminalResult,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
         let owner = self.state.lock().owned_file_requests.remove(&request.id);
-        debug_assert!(owner
-            .as_ref()
-            .is_none_or(|owner| owner.request().id == request.id));
+        debug_assert!(
+            owner
+                .as_ref()
+                .is_none_or(|owner| owner.request().id == request.id)
+        );
         // PageService deliberately supports a completion racing ahead of the
         // submission turn. For PageBacked-owned I/O, this is the sole terminal
         // route, so retire the matching L4 row only after consuming its owner.
@@ -3042,9 +3065,11 @@ impl PageContainer {
     ) -> Option<notification::PageReadyNotifier> {
         let routed_waiters = fetch.request_id.map_or_else(Vec::new, |request_id| {
             let owner = state.owned_file_requests.remove(&request_id);
-            debug_assert!(owner
-                .as_ref()
-                .is_none_or(|owner| owner.request().id == request_id));
+            debug_assert!(
+                owner
+                    .as_ref()
+                    .is_none_or(|owner| owner.request().id == request_id)
+            );
             state.file_io_service.retire_submission(request_id)
         });
         (!routed_waiters.is_empty())

@@ -7,6 +7,8 @@ extern crate std;
 
 pub mod adapter;
 
+mod mutation_lifecycle;
+
 #[cfg(feature = "host-async")]
 pub mod host_async;
 pub mod journal;
@@ -15,6 +17,7 @@ pub mod namespace;
 pub mod pager;
 pub mod planner;
 mod read_backend;
+pub mod settlement;
 mod sync;
 
 #[cfg(test)]

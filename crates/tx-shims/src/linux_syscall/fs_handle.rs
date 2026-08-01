@@ -8,8 +8,8 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_subsystems::mount::MountPayload;
-use tx_subsystems::vfs::structure::RNode;
 use tx_subsystems::vfs::FsObjectId;
+use tx_subsystems::vfs::structure::RNode;
 
 const MAX_HANDLE_BYTES: u32 = 128;
 const TXV2_HANDLE_BYTES: u32 = 16;
@@ -336,7 +336,7 @@ pub(super) fn sys_open_by_handle_at(
         }
     };
 
-    let open_file = match OpenFile::new_cap(rnode, open_flags) {
+    let open_file = match OpenFile::new_cap_with_mount_payload(rnode, open_flags, &mount_payload) {
         Ok(file) => file,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };

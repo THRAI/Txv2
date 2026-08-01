@@ -16,12 +16,13 @@ use crate::execution::{Errno, Guard};
 use crate::io_manager::backend::{BlockPageCompletion, BlockPageRequestTracker, PageFrameRef};
 use crate::io_manager::block::{
     BioVec, BlockCompletionSource, BlockDeviceCompletion, BlockDispatch, BlockDispatchExecutor,
-    BlockOp, BlockQueue, BlockServiceDriver, BlockServiceNext, BlockTagTable, DeviceKey,
+    BlockFlags, BlockOp, BlockQueue, BlockServiceDriver, BlockServiceNext, BlockTagTable,
+    DeviceKey,
 };
+use crate::io_manager::page::PageIoOp;
 use crate::io_manager::page::service::{
     PageService, PageServiceBackendDriven, PageServiceTaggedBlockCompletionError,
 };
-use crate::io_manager::page::PageIoOp;
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
 };
@@ -332,6 +333,23 @@ pub trait BlockDeviceOps: Send + Sync + 'static {
 
     fn barrier(&self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
 
+    fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+        BlockDurabilityCapabilities::NONE
+    }
+
+    fn write_blocks_with_options(
+        &self,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+        options: BlockWriteOptions,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if options.fua {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        self.write_blocks(block_id, source, guard)
+    }
+
     fn read_blocks_bootstrap(
         &self,
         block_id: PhysicalBlockNumber,
@@ -354,6 +372,24 @@ pub trait BlockDeviceOps: Send + Sync + 'static {
         let guard = crate::adapter::step_engine::guard();
         self.barrier(&guard)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockDurabilityCapabilities {
+    pub fua: bool,
+    pub flush: bool,
+}
+
+impl BlockDurabilityCapabilities {
+    pub const NONE: Self = Self {
+        fua: false,
+        flush: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockWriteOptions {
+    pub fua: bool,
 }
 
 pub trait BlockDevice: BlockDeviceOps {
@@ -443,7 +479,28 @@ impl BlockDeviceHandle {
         self.reg.ops.write_blocks(block_id, source, guard)
     }
 
+    pub fn write_blocks_with_options(
+        self,
+        lba_offset: u64,
+        source: &[Frame],
+        options: BlockWriteOptions,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let Some(block_id) = self.block_id_for(lba_offset, source.len() as u64) else {
+            return StepOutcome::err(Errno::EINVAL.into());
+        };
+        if options.fua && !self.reg.ops.durability_capabilities().fua {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        self.reg
+            .ops
+            .write_blocks_with_options(block_id, source, options, guard)
+    }
+
     pub fn barrier(self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        if !self.reg.ops.durability_capabilities().flush {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
         self.reg.ops.barrier(guard)
     }
 
@@ -499,9 +556,12 @@ impl<'a, 'g> BlockDeviceDispatchAdapter<'a, 'g> {
             }
             BlockOp::Write => {
                 let frames = frames_from_bio_vecs(&dispatch.bio.plan.vecs)?;
-                step_result_to_result(self.handle.write_blocks(
+                step_result_to_result(self.handle.write_blocks_with_options(
                     dispatch.bio.plan.lba.start_lba(),
                     &frames,
+                    BlockWriteOptions {
+                        fua: dispatch.bio.plan.flags.contains(BlockFlags::FUA),
+                    },
                     self.guard,
                 ))
             }
@@ -1104,13 +1164,14 @@ mod tests {
     };
     use crate::io_manager::runtime::{QueueDepth, ServiceBudget};
     use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tx_hal::Ppn;
     use tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS;
 
     struct RecordingBlockDevice;
     static LAST_READ_BLOCK: AtomicU64 = AtomicU64::new(u64::MAX);
     static BARRIER_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static LAST_WRITE_FUA: AtomicBool = AtomicBool::new(false);
 
     impl BlockDeviceOps for RecordingBlockDevice {
         fn read_blocks(
@@ -1137,6 +1198,24 @@ mod tests {
             BARRIER_COUNT.fetch_add(1, Ordering::SeqCst);
             StepOutcome::done(())
         }
+
+        fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+            BlockDurabilityCapabilities {
+                fua: true,
+                flush: true,
+            }
+        }
+
+        fn write_blocks_with_options(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            options: BlockWriteOptions,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            LAST_WRITE_FUA.store(options.fua, Ordering::SeqCst);
+            StepOutcome::done(())
+        }
     }
 
     impl BlockDevice for RecordingBlockDevice {
@@ -1158,7 +1237,7 @@ mod tests {
 
     #[test]
     fn block_device_handle_translates_partition_relative_lbas() {
-        use crate::adapter::step_engine::{guard, StepOutcome as V3};
+        use crate::adapter::step_engine::{StepOutcome as V3, guard};
         tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
@@ -1379,6 +1458,113 @@ mod tests {
         assert_eq!(completion.tag, BlockTag::new(8));
         assert_eq!(completion.result, Ok(()));
         assert_eq!(BARRIER_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dispatch_adapter_passes_fua_to_capable_device() {
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        LAST_WRITE_FUA.store(false, Ordering::SeqCst);
+        let guard = guard();
+        let mut adapter =
+            BlockDeviceDispatchAdapter::new(BlockDeviceHandle::whole(&BLOCK_REG), &guard);
+        let dispatch = BlockDispatch {
+            tag: BlockTag::new(9),
+            bio: Bio {
+                id: BlockRequestId::new(5),
+                plan: BioPlan::new(
+                    DeviceKey::new(BLOCK_REG.devt.raw()),
+                    BlockOp::Write,
+                    LbaRange::new(2, 8),
+                    alloc::vec![BioVec::new(0, 0, 4096)],
+                    BlockFlags::FUA,
+                ),
+            },
+        };
+
+        adapter.submit(&dispatch);
+
+        assert_eq!(
+            adapter.poll_completion().expect("completion").result,
+            Ok(())
+        );
+        assert!(LAST_WRITE_FUA.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn default_device_rejects_fua_instead_of_ignoring_it() {
+        struct FlushOnlyDevice;
+
+        impl BlockDeviceOps for FlushOnlyDevice {
+            fn read_blocks(
+                &self,
+                _block_id: PhysicalBlockNumber,
+                _target: &mut [Frame],
+                _guard: &Guard<'_>,
+            ) -> StepOutcome<(), NoProgress> {
+                StepOutcome::done(())
+            }
+
+            fn write_blocks(
+                &self,
+                _block_id: PhysicalBlockNumber,
+                _source: &[Frame],
+                _guard: &Guard<'_>,
+            ) -> StepOutcome<(), NoProgress> {
+                StepOutcome::done(())
+            }
+
+            fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+                StepOutcome::done(())
+            }
+        }
+
+        impl BlockDevice for FlushOnlyDevice {
+            fn total_blocks(&self) -> u64 {
+                8
+            }
+
+            fn block_size(&self) -> u32 {
+                4096
+            }
+        }
+
+        static OPS: FlushOnlyDevice = FlushOnlyDevice;
+        static REG: BlockDeviceRegistration = BlockDeviceRegistration {
+            devt: DevT::new(8, 9),
+            name: "fua-none",
+            ops: &OPS,
+        };
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let guard = guard();
+        let mut adapter = BlockDeviceDispatchAdapter::new(BlockDeviceHandle::whole(&REG), &guard);
+        let dispatch = BlockDispatch {
+            tag: BlockTag::new(10),
+            bio: Bio {
+                id: BlockRequestId::new(6),
+                plan: BioPlan::new(
+                    DeviceKey::new(REG.devt.raw()),
+                    BlockOp::Write,
+                    LbaRange::new(0, 8),
+                    alloc::vec![BioVec::new(0, 0, 4096)],
+                    BlockFlags::FUA,
+                ),
+            },
+        };
+
+        adapter.submit(&dispatch);
+
+        assert_eq!(
+            adapter.poll_completion().expect("completion").result,
+            Err(Errno::EOPNOTSUPP)
+        );
     }
 
     #[test]

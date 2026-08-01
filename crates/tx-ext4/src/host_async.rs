@@ -210,7 +210,7 @@ impl<D: AsyncBlockDevice> Ext4Async<D> {
         {
             BlockMapping::Data(block) => block,
             BlockMapping::Hole | BlockMapping::NeedNode(_) => {
-                return Err(Ext4FormatError::Unsupported)
+                return Err(Ext4FormatError::Unsupported);
             }
         };
         self.device.write_block(block, page).await?;

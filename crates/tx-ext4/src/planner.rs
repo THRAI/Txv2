@@ -181,6 +181,15 @@ impl Ext4MappingTable {
         self.state.lock().rows.len()
     }
 
+    /// Drop every derived extent mapping after replay or a durable checkpoint.
+    ///
+    /// All entries are reconstructed from the authoritative ext4 metadata on
+    /// their next lookup, so keeping them across a metadata settlement could
+    /// route a page I/O request through an obsolete extent tree.
+    pub fn clear(&self) {
+        *self.state.lock() = Ext4MappingTableState::default();
+    }
+
     fn resume_token(object: u64, page: u64) -> PagerResumeToken {
         PagerResumeToken::new(object.rotate_left(17) ^ page.rotate_left(31))
     }

@@ -1,6 +1,6 @@
 use tx_ext4_format::journal::{
-    Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
-    JBD2_MAGIC,
+    Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage,
+    JBD2_BLOCK_SIZE, JBD2_MAGIC,
 };
 
 #[test]
@@ -34,5 +34,23 @@ fn transaction_image_encodes_descriptor_metadata_and_commit() {
     assert_eq!(
         Jbd2Commit::parse(&image.commit).unwrap().header.sequence,
         77
+    );
+}
+
+#[test]
+fn freeing_transaction_image_encodes_sorted_revokes_before_commit() {
+    let image = Jbd2TransactionImage::encode_legacy_with_revokes(
+        77,
+        [0x44; 16],
+        vec![Jbd2MetadataUpdate::new(9, [0x5A; JBD2_BLOCK_SIZE])],
+        vec![33, 8, 33],
+    )
+    .unwrap();
+
+    assert_eq!(
+        Jbd2Revoke::parse(image.revoke.as_ref().expect("revoke page"))
+            .unwrap()
+            .blocks,
+        vec![8, 33]
     );
 }

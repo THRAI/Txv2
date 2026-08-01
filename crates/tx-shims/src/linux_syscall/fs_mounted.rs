@@ -11,8 +11,8 @@ use crate::adapter::step_engine::{self as step_engine, Cap};
 use alloc::sync::Arc;
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::structure::RNode;
 use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::structure::RNode;
 
 pub(super) struct MountedDentry {
     _dentry: Cap<DEntry>,
@@ -66,6 +66,10 @@ impl MountedNode {
 
     pub(super) fn into_payload(self) -> Cap<MountPayload> {
         self.payload
+    }
+
+    pub(super) fn payload(&self) -> Cap<MountPayload> {
+        self.payload.clone()
     }
 
     pub(super) fn fs_ops(&self) -> Arc<dyn FsOps> {

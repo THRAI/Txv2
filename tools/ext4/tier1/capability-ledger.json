@@ -6,7 +6,7 @@
     "feature_bits": {
       "compat_allowed": 4,
       "incompat_required": 64,
-      "incompat_allowed": 8384,
+      "incompat_allowed": 8388,
       "ro_compat_allowed": 1032,
       "metadata_csum_required": true,
       "ordered_jbd2_required": true

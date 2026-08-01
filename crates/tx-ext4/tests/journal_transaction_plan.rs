@@ -31,14 +31,14 @@ fn commit_graph_orders_data_journal_fences_and_durable_commit() {
     let graph = plan.commit_graph().unwrap();
     let nodes = graph.nodes();
 
-    assert_eq!(nodes.len(), 6);
+    assert_eq!(nodes.len(), 7);
     assert_eq!(nodes[0].bio.lba, LbaRange::new(100, 8));
     assert_eq!(nodes[1].bio.op, BlockOp::Barrier);
     assert_eq!(nodes[2].bio.lba, LbaRange::new(200, 8));
     assert_eq!(nodes[3].bio.lba, LbaRange::new(208, 8));
     assert_eq!(nodes[4].bio.op, BlockOp::Barrier);
-    assert!(nodes[5].bio.flags.contains(BlockFlags::FUA));
     assert_eq!(nodes[5].bio.lba, LbaRange::new(216, 8));
+    assert_eq!(nodes[6].bio.op, BlockOp::Barrier);
 
     assert_eq!(
         graph.dependencies(),
@@ -49,6 +49,7 @@ fn commit_graph_orders_data_journal_fences_and_durable_commit() {
             BackendBioDependency::new(BackendBioNodeId::new(3), BackendBioNodeId::new(5)),
             BackendBioDependency::new(BackendBioNodeId::new(4), BackendBioNodeId::new(5)),
             BackendBioDependency::new(BackendBioNodeId::new(5), BackendBioNodeId::new(6)),
+            BackendBioDependency::new(BackendBioNodeId::new(6), BackendBioNodeId::new(7)),
         ]
     );
 
@@ -99,9 +100,35 @@ fn split_graphs_fence_data_before_journal_commit() {
     assert_eq!(data.nodes()[1].bio.op, BlockOp::Barrier);
 
     let commit = plan.commit_graph_after_data().unwrap();
-    assert_eq!(commit.nodes().len(), 4);
+    assert_eq!(commit.nodes().len(), 5);
     assert_eq!(commit.nodes()[0].bio.lba, LbaRange::new(200, 8));
     assert_eq!(commit.nodes()[1].bio.lba, LbaRange::new(208, 8));
     assert_eq!(commit.nodes()[2].bio.op, BlockOp::Barrier);
-    assert!(commit.nodes()[3].bio.flags.contains(BlockFlags::FUA));
+    assert_eq!(commit.nodes()[3].bio.op, BlockOp::Write);
+    assert_eq!(commit.nodes()[4].bio.op, BlockOp::Barrier);
+}
+
+#[test]
+fn commit_graph_places_revoke_in_the_durable_journal_body() {
+    let device = DeviceKey::new(9);
+    let plan = JournalTransactionPlan::with_revoke(
+        41,
+        vec![],
+        write(device, 200, 2),
+        vec![write(device, 208, 3)],
+        Some(write(device, 216, 4)),
+        write(device, 224, 5),
+        vec![],
+    )
+    .unwrap();
+
+    let graph = plan.commit_graph_after_data().unwrap();
+
+    assert_eq!(graph.nodes().len(), 6);
+    assert_eq!(graph.nodes()[0].bio.lba, LbaRange::new(200, 8));
+    assert_eq!(graph.nodes()[1].bio.lba, LbaRange::new(208, 8));
+    assert_eq!(graph.nodes()[2].bio.lba, LbaRange::new(216, 8));
+    assert_eq!(graph.nodes()[3].bio.op, BlockOp::Barrier);
+    assert_eq!(graph.nodes()[4].bio.lba, LbaRange::new(224, 8));
+    assert_eq!(graph.nodes()[5].bio.op, BlockOp::Barrier);
 }

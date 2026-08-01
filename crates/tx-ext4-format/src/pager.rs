@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use crate::mutation::{
     BlockClaim, Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin,
-    SealedDataWrite,
+    SealedDataWrite, SetAttr,
 };
 
 pub const BLOCK_SIZE: usize = 4096;
@@ -22,9 +22,15 @@ pub trait BlockImage {
     fn total_blocks(&self) -> u64;
     fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()>;
     fn write_block(&mut self, block: u64, data: &Page4K) -> Result<()>;
-    fn barrier(&mut self) -> Result<()> {
-        Ok(())
-    }
+    fn barrier(&mut self) -> Result<()>;
+
+    /// Drop any cache entry that could hold a stale copy after an external
+    /// journal replay or checkpoint overwrites this physical block.
+    fn invalidate_block(&mut self, _block: u64) {}
+
+    /// Drop all derived block-cache entries after a checkpoint whose home
+    /// block set is owned by a separate L6 graph.
+    fn invalidate_all(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,8 +189,41 @@ impl<I: BlockImage> Ext4Pager<I> {
         &self.image
     }
 
+    pub const fn superblock(&self) -> Superblock {
+        self.superblock
+    }
+
+    /// Persist ext4's recovery-required state before admitting a journalled
+    /// read-write mount. A later clean detach is the only path allowed to
+    /// clear it.
+    pub fn mark_recovery_required(&mut self) -> Result<()> {
+        let mut page = [0; BLOCK_SIZE];
+        self.image.read_block(0, &mut page)?;
+        let mut superblock = Superblock::parse(&page[1024..2048])?;
+        superblock.feature_compat |= Superblock::FEATURE_COMPAT_HAS_JOURNAL;
+        superblock.feature_incompat |= Superblock::FEATURE_INCOMPAT_RECOVER;
+        page[1024 + 92..1024 + 96].copy_from_slice(&superblock.feature_compat.to_le_bytes());
+        page[1024 + 96..1024 + 100].copy_from_slice(&superblock.feature_incompat.to_le_bytes());
+        if superblock.has_metadata_csum() {
+            let bytes = &mut page[1024..2048];
+            bytes[1020..1024].fill(0);
+            let checksum = superblock_csum32(bytes)?;
+            bytes[1020..1024].copy_from_slice(&checksum.to_le_bytes());
+        }
+        self.image.write_block(0, &page)?;
+        self.image.barrier()?;
+        self.superblock = superblock;
+        Ok(())
+    }
+
     pub fn into_inner(self) -> I {
         self.image
+    }
+
+    /// Invalidate the image adapter's derived block cache after an L6-owned
+    /// checkpoint. The format pager itself retains no metadata cache.
+    pub fn settle_image_cache(&mut self) {
+        self.image.invalidate_all();
     }
 
     pub fn inode_meta(&mut self, inode: InodeNo) -> Result<InodeMetaLite> {
@@ -410,6 +449,100 @@ impl<I: BlockImage> Ext4Pager<I> {
             bytes: *page,
         });
         Ok(plan)
+    }
+
+    /// Build the complete inode-table after-image for a bounded metadata-only
+    /// update. This function is pure with respect to the home image: callers
+    /// must admit the returned plan through `MutationHandle` before writing it.
+    pub fn plan_setattr(
+        &mut self,
+        inode: InodeNo,
+        update: SetAttr,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        let location = self.inode_location(inode)?;
+        let mut inode_table_before = [0u8; BLOCK_SIZE];
+        self.image
+            .read_block(location.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        let inode_bytes = &mut inode_table_after[location.offset..location.offset + location.len];
+        let mut disk_inode = Inode::parse(inode_bytes)?;
+
+        match update {
+            SetAttr::Mode(mode) => {
+                disk_inode.mode = (disk_inode.mode & Inode::S_IFMT) | (mode & !Inode::S_IFMT);
+            }
+            SetAttr::Owner { uid, gid } => {
+                if let Some(uid) = uid {
+                    disk_inode.uid = uid;
+                }
+                if let Some(gid) = gid {
+                    disk_inode.gid = gid;
+                }
+            }
+            SetAttr::Times {
+                atime_ns,
+                mtime_ns,
+                ctime_ns,
+            } => {
+                if let Some(atime_ns) = atime_ns {
+                    disk_inode.atime = seconds_from_ns(atime_ns)?;
+                }
+                if let Some(mtime_ns) = mtime_ns {
+                    disk_inode.mtime = seconds_from_ns(mtime_ns)?;
+                }
+                disk_inode.ctime = seconds_from_ns(ctime_ns)?;
+            }
+        }
+        disk_inode.encode_preserving_unknown(inode_bytes)?;
+        self.refresh_inode_checksum(inode, &disk_inode, inode_bytes)?;
+
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::SetAttr, inode.get() as u64, fsync_stamp);
+        plan.push_metadata(MetadataBlock {
+            home: location.block,
+            role: MetaRole::InodeTable,
+            before_version: crc32c(0, &inode_table_before) as u64,
+            after: inode_table_after,
+            depends_on: Vec::new(),
+        })
+        .map_err(|_| Ext4FormatError::Corrupt)?;
+        Ok(plan)
+    }
+
+    pub fn plan_setattr_mode(
+        &mut self,
+        inode: InodeNo,
+        mode: u16,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        self.plan_setattr(inode, SetAttr::Mode(mode), fsync_stamp)
+    }
+
+    fn refresh_inode_checksum(
+        &self,
+        inode: InodeNo,
+        disk_inode: &Inode,
+        inode_bytes: &mut [u8],
+    ) -> Result<()> {
+        if !self.superblock.has_metadata_csum() {
+            return Ok(());
+        }
+        inode_bytes[124..126].fill(0);
+        if inode_bytes.len() >= 132 {
+            inode_bytes[130..132].fill(0);
+        }
+        let checksum = inode_csum32(
+            self.superblock.metadata_csum_seed(),
+            inode.get(),
+            disk_inode.generation,
+            inode_bytes,
+        )?;
+        inode_bytes[124..126].copy_from_slice(&(checksum as u16).to_le_bytes());
+        if inode_bytes.len() >= 132 {
+            inode_bytes[130..132].copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
+        }
+        Ok(())
     }
 
     fn plan_block_allocation(&self) -> Result<(u64, usize, u64, Page4K, Page4K)> {
@@ -1324,6 +1457,12 @@ fn apply_meta(inode: &mut Inode, meta: InodeMetaLite) {
 
 fn logical_block(file_page_index: u64) -> Result<u32> {
     file_page_index
+        .try_into()
+        .map_err(|_| Ext4FormatError::OutOfBounds)
+}
+
+fn seconds_from_ns(timestamp_ns: u64) -> Result<u32> {
+    (timestamp_ns / 1_000_000_000)
         .try_into()
         .map_err(|_| Ext4FormatError::OutOfBounds)
 }
