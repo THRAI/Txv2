@@ -315,6 +315,7 @@ fn setup() -> TestSetup {
     tx_subsystems::net::device::reset_net_registry_for_test();
     tx_subsystems::net::reset_netfilter_for_test();
     super::reset_itimer_registry_for_test();
+    super::clear_stat_meta_overrides();
     tx_fs::devfs::reset_rtc_backend_for_test();
     SHIMS_TEST_RTC_NS.store(
         tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS,

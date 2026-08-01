@@ -51,10 +51,12 @@ fn vm_copy_to_user_then_copy_from_user_walks_recipes_and_pmap() {
     let copied = aspace.copy_from_user(&mut observed, UserPtr::new(user_addr), &guard);
     assert_eq!(copied, StepOutcome::Done(payload.len()));
     assert_eq!(observed, payload);
-    assert!(aspace
-        .pmap()
-        .lookup(UserVirtAddr(user_addr).containing_page())
-        .is_some());
+    assert!(
+        aspace
+            .pmap()
+            .lookup(UserVirtAddr(user_addr).containing_page())
+            .is_some()
+    );
 }
 
 #[test]

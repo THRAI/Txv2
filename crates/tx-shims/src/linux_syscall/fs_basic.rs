@@ -51,11 +51,19 @@ pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMet
 }
 
 pub(super) fn stat_meta_override_or(fs_object_id: FsObjectId, fallback: InodeMeta) -> InodeMeta {
-    STAT_META_OVERRIDES
-        .lock()
-        .get(&fs_object_id)
-        .copied()
-        .unwrap_or(fallback)
+    let Some(override_meta) = STAT_META_OVERRIDES.lock().get(&fs_object_id).copied() else {
+        return fallback;
+    };
+    if override_meta.kind() != fallback.kind() {
+        return fallback;
+    }
+    InodeMeta {
+        size: override_meta.size,
+        atime: override_meta.atime,
+        mtime: override_meta.mtime,
+        ctime: override_meta.ctime,
+        ..fallback
+    }
 }
 
 /// Drain all stale entries from the global `STAT_META_OVERRIDES` map.
@@ -629,6 +637,27 @@ fn queue_file_close_writeback(file: &Cap<OpenFile>) {
     }
 }
 
+fn maybe_destroy_zero_link_inode_after_fd_remove(file: &Cap<OpenFile>) {
+    if file.retain_count() > 1 {
+        return;
+    }
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return;
+    };
+    let Some(fs_ops) = fs_ops_for_rnode(rnode) else {
+        return;
+    };
+    let guard = step_engine::guard();
+    let fs_object_id = rnode.fs_object_id();
+    let meta = match fs_ops.load_inode_meta(fs_object_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => return,
+    };
+    if meta.nlinks == 0 {
+        let _ = fs_ops.destroy_inode(fs_object_id, &guard);
+    }
+}
+
 fn fcntl_getlk(ctx: &SyscallCtx<'_>, file: &OpenFile, flock_uaddr: u64) -> SyscallResult {
     let mut flock = match bootstrap_read_user::<FlockLayout>(&ctx.aspace, flock_uaddr) {
         Ok(flock) => flock,
@@ -756,6 +785,7 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         file.flock_release();
         fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
         maybe_close_socket_file_after_fd_remove(&file);
+        maybe_destroy_zero_link_inode_after_fd_remove(&file);
     }
     SyscallResult::Return(0)
 }
@@ -1069,8 +1099,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             match unlink_result {
                 Ok(()) => {
                     dir_dentry.remove_cached_child_by_name(&tmp_name);
-                    let guard = step_engine::guard();
-                    let _ = fs_ops.destroy_inode(target_id, &guard);
                     opened = Some(openfile);
                     break;
                 }
@@ -1495,6 +1523,7 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
             file.flock_release();
             fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
             maybe_close_socket_file_after_fd_remove(&file);
+            maybe_destroy_zero_link_inode_after_fd_remove(&file);
             SyscallResult::Return(0)
         }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),

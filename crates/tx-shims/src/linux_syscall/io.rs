@@ -8,8 +8,8 @@ use crate::adapter::reactor_entry;
 use crate::adapter::step_engine::Cap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
-use tx_subsystems::vfs::{query_fd_ready, FdReadyMask, FdReadyQuery, FdReadyReport, FdWait};
+use tx_services::time::{ClockRead, TimekeeperClock, timekeeper_clock};
+use tx_subsystems::vfs::{FdReadyMask, FdReadyQuery, FdReadyReport, FdWait, query_fd_ready};
 
 const PSELECT_READY_YIELD_INTERVAL: usize = 4;
 const PSELECT_EMPTY_POLL_YIELD_INTERVAL: usize = 4;
@@ -382,7 +382,7 @@ fn read_ppoll_sigmask(
 fn set_thread_signal_mask(ctx: &SyscallCtx<'_>, mask_bits: u64) -> Result<u64, SyscallResult> {
     use tx_subsystems::{
         signal::SignalMask,
-        thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange},
+        thread_runtime::execution::{SigmaskHow, SigprocmaskChange, step_sigprocmask},
     };
 
     match step_sigprocmask(&ctx.thread, SigmaskHow::SetMask, SignalMask::new(mask_bits)) {
@@ -696,8 +696,8 @@ where
     use tx_substrate::step::DriveMode;
     use tx_subsystems::tty::adapter::step_engine::StepOutcome;
     use tx_subsystems::tty::execution::{
-        step_read_after_vtime_for_process, step_read_for_process, tty_read_wait_plan,
-        ReadForProcessOp, TtyReadWaitPlan,
+        ReadForProcessOp, TtyReadWaitPlan, step_read_after_vtime_for_process,
+        step_read_for_process, tty_read_wait_plan,
     };
 
     if nonblocking {
@@ -968,7 +968,6 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
 
     const IOVEC_BYTES: u64 = 16;
     let mut total: i64 = 0;
-    let mut script_ctx = build_subject_script_ctx(ctx);
     for i in 0..iovcnt as u64 {
         let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
         let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
@@ -990,16 +989,15 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
 
         if let Some(range) = super::user_copy::covering_user_range(base, len) {
             use tx_subsystems::vm::UserAccessKind;
-            let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-                aspace: &ctx.aspace,
-                range,
-                kind: UserAccessKind::Read,
-            };
-            if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                if total > 0 {
-                    return Some(SyscallResult::Return(total));
-                }
-                return Some(SyscallResult::error_from(errno.into()));
+            if !ctx
+                .aspace
+                .user_range_is_ready_for_access(range, UserAccessKind::Read)
+            {
+                return if total > 0 {
+                    Some(SyscallResult::Return(total))
+                } else {
+                    None
+                };
             }
         }
 
@@ -1576,6 +1574,29 @@ where
     SyscallResult::Return(ready_count)
 }
 
+async fn drive_user_prefault(
+    ctx: &SyscallCtx<'_>,
+    range: tx_subsystems::vm::UserRange,
+    kind: tx_subsystems::vm::UserAccessKind,
+) -> Result<(), tx_substrate::step::Errno> {
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox = script_ctx.mailbox().cloned();
+    let delegates = script_ctx.delegate_registry().cloned();
+    let timers = script_ctx.timer_registrar().cloned();
+    drive(
+        tx_subsystems::vm::step_ops::ReserveUserRangeOp::new(&ctx.aspace, range, kind),
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox.as_ref(),
+        delegates.as_deref(),
+        timers.as_ref(),
+    )
+    .await
+}
+
 /// PageBacked `write(2)` — direct user-buffer path.
 ///
 /// Prefaults the user buffer through `reserve_user_range_for_access`,
@@ -1600,15 +1621,8 @@ async fn sys_write_pagebacked<'a>(
     // transferring any bytes.
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
         use tx_subsystems::vm::UserAccessKind;
-        let _guard = crate::adapter::step_engine::guard();
         emit_debug_counter(b"debug.write.pagebacked.phase", 1);
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-            aspace: &ctx.aspace,
-            range,
-            kind: UserAccessKind::Read,
-        };
-        if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        if let Err(errno) = drive_user_prefault(ctx, range, UserAccessKind::Read).await {
             emit_debug_counter(b"debug.write.pagebacked.err", 1);
             return SyscallResult::error_from(errno.into());
         }
@@ -1675,7 +1689,7 @@ async fn sys_direct_pagebacked<'a>(
         DirectIoBuffer, DirectIoBufferError, DirectIoCompletionError, PageIndex, PageRange,
     };
     use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
-    use tx_subsystems::vm::{UserAccessKind, USER_PAGE_SIZE};
+    use tx_subsystems::vm::{USER_PAGE_SIZE, UserAccessKind};
 
     if len == 0 {
         return SyscallResult::Return(0);
@@ -1704,13 +1718,7 @@ async fn sys_direct_pagebacked<'a>(
     let Some(user_range) = super::user_copy::covering_user_range(buf_ptr as u64, len) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-        aspace: &ctx.aspace,
-        range: user_range,
-        kind: access,
-    };
-    if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+    if let Err(errno) = drive_user_prefault(ctx, user_range, access).await {
         return SyscallResult::error_from(errno.into());
     }
     let buffer = match DirectIoBuffer::pin(&ctx.aspace, tx_hal::UserPtr::new(buf_ptr), len, access)
@@ -1727,7 +1735,7 @@ async fn sys_direct_pagebacked<'a>(
     let submission = match submission {
         Ok(submission) => submission,
         Err(tx_subsystems::page_backed::DirectIoAdmissionError::Busy { .. }) => {
-            return SyscallResult::Error(EAGAIN_VALUE)
+            return SyscallResult::Error(EAGAIN_VALUE);
         }
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
@@ -2102,14 +2110,7 @@ where
     // Access is Write — we're writing data *into* the user buffer.
     if let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) {
         use tx_subsystems::vm::UserAccessKind;
-        let _guard = crate::adapter::step_engine::guard();
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = tx_subsystems::vm::step_ops::ReserveUserRangeOp {
-            aspace: &ctx.aspace,
-            range,
-            kind: UserAccessKind::Write,
-        };
-        if let Err(errno) = step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        if let Err(errno) = drive_user_prefault(ctx, range, UserAccessKind::Write).await {
             return SyscallResult::error_from(errno.into());
         }
     }

@@ -3,29 +3,30 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome,
+    self as step_engine, Cap, StepOutcome, guard, page_allocator, reserve_for, sign_for,
 };
-use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
+use tx_fs::tmpfs::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
     Propagation, SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::pipe::{step_pipe2, PipeFlags};
+use tx_subsystems::pipe::{PipeFlags, step_pipe2};
 use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::{DirEntry, FsOps};
 
 use crate::linux_syscall::{
-    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_MOUNT,
-    NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT,
-    O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
+    AT_FDCWD, AT_REMOVEDIR, NR_CLOSE, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT,
+    NR_MOUNT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT,
+    NR_UTIMENSAT, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -111,6 +112,225 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
 
     let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
     (root_dentry, tmpfs)
+}
+
+struct DestroyCountingFs {
+    inner: Arc<Tmpfs>,
+    destroy_calls: Arc<AtomicUsize>,
+}
+
+impl DestroyCountingFs {
+    fn new(inner: Arc<Tmpfs>) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let destroy_calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                inner,
+                destroy_calls: Arc::clone(&destroy_calls),
+            }),
+            destroy_calls,
+        )
+    }
+}
+
+impl FsOps for DestroyCountingFs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<FsObjectId, step_engine::NoProgress> {
+        self.inner.lookup(parent, name, guard)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<InodeMeta, step_engine::NoProgress> {
+        self.inner.load_inode_meta(fs_object_id, guard)
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.serialize_inode_meta(fs_object_id, meta, guard)
+    }
+
+    fn create_inode(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        self.inner.create_inode(parent, name, mode, cred, guard)
+    }
+
+    fn unlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.unlink(parent, name, target, guard)
+    }
+
+    fn rename(
+        &self,
+        old_parent: FsObjectId,
+        old_name: &[u8],
+        new_parent: FsObjectId,
+        new_name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner
+            .rename(old_parent, old_name, new_parent, new_name, guard)
+    }
+
+    fn link(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.link(parent, name, target, guard)
+    }
+
+    fn mkdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        self.inner.mkdir(parent, name, mode, cred, guard)
+    }
+
+    fn rmdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.rmdir(parent, name, target, guard)
+    }
+
+    fn symlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        self.inner.symlink(parent, name, link_target, cred, guard)
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, step_engine::NoProgress> {
+        self.inner.readdir(fs_object_id, cursor, guard)
+    }
+
+    fn destroy_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.destroy_calls.fetch_add(1, Ordering::AcqRel);
+        self.inner.destroy_inode(fs_object_id, guard)
+    }
+
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, step_engine::NoProgress> {
+        self.inner.read_link(fs_object_id, guard)
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, step_engine::NoProgress> {
+        self.inner
+            .materialise_rnode(fs_object_id, meta, mount, guard)
+    }
+
+    fn chmod_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.chmod_inode(fs_object_id, new_mode, cred, guard)
+    }
+
+    fn chown_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner
+            .chown_inode(fs_object_id, new_uid, new_gid, cred, guard)
+    }
+}
+
+fn build_destroy_counting_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Arc<AtomicUsize>) {
+    let tmpfs = Arc::new(Tmpfs::new());
+    let (counting_fs, destroy_calls) = DestroyCountingFs::new(Arc::clone(&tmpfs));
+    let payload = MountPayload::new_cap(
+        counting_fs as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        DevId::new(412),
+        MountOptions::default(),
+        "tmpfs-destroy-counting-file-mutation",
+        SourceLabel::Static("tmpfs-destroy-counting-file-mutation"),
+    )
+    .expect("mount payload");
+
+    let root_rnode = {
+        let raw = RNode::new(
+            TMPFS_ROOT_OBJECT_ID,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
+    };
+
+    let _mount = MountIdentity::new_cap(
+        MountId::new(42),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("mount identity");
+
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    (root_dentry, tmpfs, destroy_calls)
 }
 
 fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
@@ -450,6 +670,114 @@ fn dispatch_unlinkat_removes_regular_file() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert!(!lookup_exists(&tmpfs, b"f"), "/f should be removed");
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_open_regular_file_defers_destroy() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"open");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/open");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /open: {other:?}"),
+    };
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"open"),
+        "/open name must be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "unlinkat must not destroy storage while an fd still owns the rnode"
+    );
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_FSTAT, [fd, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0],),
+            &ctx
+        )),
+        SyscallResult::Return(0)
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_close_last_unlinked_regular_file_destroys_inode() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"gone");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/gone");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                O_RDWR as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /gone: {other:?}"),
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_UNLINKAT,
+                [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+            ),
+            &ctx
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(destroy_calls.load(Ordering::Acquire), 0);
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_CLOSE, [fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "last close of a zero-link file must run backend destroy"
+    );
     drop(path);
 }
 
@@ -1043,23 +1371,15 @@ fn dispatch_renameat2_same_directory_succeeds() {
     drop(newpath);
 }
 
-/// Rename-over at the syscall layer must complete the VFS lifetime
-/// protocol by destroying the displaced inode after tmpfs drops its
-/// last link. Otherwise repeated temp-file replacement keeps old
-/// PageContainers resident until the whole tmpfs mount is torn down.
+/// Rename-over replaces the destination namespace entry. Backend
+/// storage reclamation is deferred until VFS can prove no fd/RNode
+/// payload remains live.
 #[test]
-fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
+fn dispatch_renameat2_over_existing_replaces_destination_name() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs) = build_tmpfs_root();
     create_regular(&tmpfs, b"source");
     create_regular(&tmpfs, b"target");
-
-    let first_guard = guard();
-    let displaced_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &first_guard) {
-        StepOutcome::Done(id) => id,
-        other => panic!("lookup target before rename: {other:?}"),
-    };
-    drop(first_guard);
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
@@ -1082,11 +1402,81 @@ fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
     );
 
     let guard = guard();
-    assert_eq!(
-        tmpfs.load_inode_meta(displaced_id, &guard),
-        StepOutcome::Err(step_engine::Errno::ENOENT),
-        "rename-over should destroy the displaced zero-link inode"
+    assert!(matches!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"source", &guard),
+        StepOutcome::Err(step_engine::Errno::ENOENT)
+    ));
+    assert!(matches!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &guard),
+        StepOutcome::Done(_)
+    ));
+    drop(oldpath);
+    drop(newpath);
+}
+
+#[test]
+fn dispatch_renameat2_over_open_target_defers_displaced_destroy() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"source");
+    create_regular(&tmpfs, b"target");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let target_path = nul_terminate(b"/target");
+    let target_fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                target_path.as_ptr() as u64,
+                O_RDWR as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /target: {other:?}"),
+    };
+
+    let oldpath = nul_terminate(b"/source");
+    let newpath = nul_terminate(b"/target");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
     );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "rename-over must not destroy a displaced inode while its fd is open"
+    );
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_FSTAT,
+                [target_fd, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0],
+            ),
+            &ctx
+        )),
+        SyscallResult::Return(0)
+    );
+    drop(target_path);
     drop(oldpath);
     drop(newpath);
 }
@@ -1471,6 +1861,47 @@ fn dispatch_openat_o_tmpfile_returns_unlinked_regular_file() {
         tmpfs.readdir(tmp_id, DirCursor::START, &guard),
         StepOutcome::Done(None),
         "O_TMPFILE helper name must be unlinked immediately"
+    );
+}
+
+#[test]
+fn dispatch_openat_o_tmpfile_defers_destroy_while_fd_is_live() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    make_dir(&tmpfs, b"tmp");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/tmp");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (O_TMPFILE | O_RDWR) as u64,
+                0o600,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat O_TMPFILE /tmp: {other:?}"),
+    };
+
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "O_TMPFILE must keep backend storage while returning a live fd"
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_LSEEK, [fd, 0, SEEK_SET as u64, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
     );
 }
 

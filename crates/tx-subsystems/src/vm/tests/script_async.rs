@@ -345,11 +345,13 @@ fn brk_script_many_unaligned_grows_remain_one_recipe() {
 
     assert_eq!(aspace.stats().recipe_count, 1);
     assert!(aspace.lookup(committed_base).is_some());
-    assert!(aspace
-        .lookup(crate::vm::UserVirtAddr(
-            committed_base.0 + 1023 * crate::vm::USER_PAGE_SIZE
-        ))
-        .is_some());
+    assert!(
+        aspace
+            .lookup(crate::vm::UserVirtAddr(
+                committed_base.0 + 1023 * crate::vm::USER_PAGE_SIZE
+            ))
+            .is_some()
+    );
 }
 
 #[test]
@@ -376,11 +378,13 @@ fn try_brk_many_unaligned_grows_map_requested_pages() {
         "synchronous brk growth should use the same coalesced recipe contract as brk_script"
     );
     assert!(aspace.lookup(committed_base).is_some());
-    assert!(aspace
-        .lookup(crate::vm::UserVirtAddr(
-            committed_base.0 + 1023 * crate::vm::USER_PAGE_SIZE
-        ))
-        .is_some());
+    assert!(
+        aspace
+            .lookup(crate::vm::UserVirtAddr(
+                committed_base.0 + 1023 * crate::vm::USER_PAGE_SIZE
+            ))
+            .is_some()
+    );
 }
 
 #[test]
@@ -403,11 +407,13 @@ fn try_brk_growth_maps_only_requested_committed_range() {
         "brk growth should not reserve hidden capacity beyond the published break"
     );
     assert!(aspace.lookup(committed_base).is_some());
-    assert!(aspace
-        .lookup(crate::vm::UserVirtAddr(
-            committed_base.0 + crate::vm::USER_PAGE_SIZE
-        ))
-        .is_none());
+    assert!(
+        aspace
+            .lookup(crate::vm::UserVirtAddr(
+                committed_base.0 + crate::vm::USER_PAGE_SIZE
+            ))
+            .is_none()
+    );
 }
 
 #[test]
@@ -805,14 +811,18 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
             .expect("publish");
     }
 
-    assert!(parent
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
-        .is_some());
-    assert!(parent
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
-        .is_some());
+    assert!(
+        parent
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
+            .is_some()
+    );
+    assert!(
+        parent
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
+            .is_some()
+    );
 
     let _child =
         crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
@@ -879,18 +889,22 @@ fn exec_aspace_tears_down_all_resident_ptes() {
     aspace
         .publish_fault_materialization(outcome, materialized)
         .expect("publish");
-    assert!(aspace
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
-        .is_some());
+    assert!(
+        aspace
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
+            .is_some()
+    );
 
     let torn = crate::vm::AddressSpace::exec_aspace(&aspace);
 
     assert_eq!(torn, 1);
-    assert!(aspace
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
-        .is_none());
+    assert!(
+        aspace
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
+            .is_none()
+    );
 }
 
 /// Hot-path verification for the D15 / PC CoW plan: parent writes a

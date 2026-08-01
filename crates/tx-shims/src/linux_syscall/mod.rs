@@ -852,10 +852,9 @@ fn emit_writev_hot_trace(name: &[u8], value: i64) {
 /// This handles the libcbench tmpfile shape without allocating and polling the
 /// broad async `sys_writev` future. It is deliberately a narrow prefilter:
 /// non-PageBacked fds return `None` and continue through the existing async
-/// dispatcher. PageBacked writes that unexpectedly need to yield surface
-/// `EAGAIN`; the current PageBacked user-buffer path materializes
-/// synchronously, so that is a defensive future-backend branch rather than the
-/// libcbench path.
+/// dispatcher. A cold user range, or a future PageBacked backend that needs to
+/// yield, returns `None` so the full async `writev` lane can wait on the real
+/// source.
 pub fn dispatch_writev_pagebacked_oneshot(
     req: &SyscallRequest,
     ctx: &SyscallCtx<'_>,
@@ -864,11 +863,13 @@ pub fn dispatch_writev_pagebacked_oneshot(
         return None;
     }
 
+    let result = match sys_writev_pagebacked_oneshot(req.args, ctx) {
+        Some(result) => result,
+        None => return None,
+    };
     let l0_span = emit_syscall_enter(req);
     let prev = tx_observe::set_current_parent_span(l0_span);
     emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.enter", req.nr as i64);
-    let result =
-        sys_writev_pagebacked_oneshot(req.args, ctx).unwrap_or(SyscallResult::Error(EAGAIN_VALUE));
     emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.after", req.nr as i64);
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);

@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::util::{collect_files, relative};
 use crate::Result;
+use crate::util::{collect_files, relative};
 
 // ---------------------------------------------------------------------------
 // Ratchet ceilings
@@ -573,38 +573,38 @@ mod tests {
     }
 
     #[test]
-    fn direct_pagebacked_prefault_uses_the_one_shot_driver() {
+    fn direct_pagebacked_prefault_uses_the_waiting_driver() {
         let source = include_str!("../../crates/tx-shims/src/linux_syscall/io.rs");
         let direct_io = function_body(&source, "async fn sys_direct_pagebacked");
 
-        assert!(direct_io.contains("ReserveUserRangeOp"));
-        assert!(direct_io.contains("drive_oneshot"));
+        assert!(direct_io.contains("drive_user_prefault"));
+        assert!(source.contains("ReserveUserRangeOp::new"));
+        assert!(source.contains("DriveMode::Waiting"));
         assert!(!direct_io.contains("reserve_user_range_for_access"));
         assert!(!direct_io.contains("StepOutcome"));
     }
 
     #[test]
-    fn buffered_pagebacked_prefaults_use_the_one_shot_driver() {
+    fn buffered_pagebacked_prefaults_use_the_waiting_driver() {
         let source = include_str!("../../crates/tx-shims/src/linux_syscall/io.rs");
         let write = function_body(&source, "async fn sys_write_pagebacked");
         let read = function_body(&source, "async fn sys_read_pagebacked");
 
         for syscall in [write, read] {
-            assert!(syscall.contains("ReserveUserRangeOp"));
-            assert!(syscall.contains("drive_oneshot"));
+            assert!(syscall.contains("drive_user_prefault"));
             assert!(!syscall.contains("reserve_user_range_for_access"));
             assert!(!syscall.contains("StepOutcome"));
         }
     }
 
     #[test]
-    fn pagebacked_writev_prefault_uses_the_one_shot_driver() {
+    fn pagebacked_writev_cold_prefault_falls_back_to_async_driver() {
         let source = include_str!("../../crates/tx-shims/src/linux_syscall/io.rs");
         let writev = function_body(&source, "pub(super) fn sys_writev_pagebacked_oneshot");
 
-        assert!(writev.contains("ReserveUserRangeOp"));
-        assert!(writev.contains("drive_oneshot"));
-        assert!(!writev.contains("reserve_user_range_for_access"));
+        assert!(writev.contains("user_range_is_ready_for_access"));
+        assert!(!writev.contains("ReserveUserRangeOp"));
+        assert!(!writev.contains("drive_oneshot"));
     }
 
     #[test]

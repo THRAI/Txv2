@@ -10,10 +10,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use tx_hal::PmapIf;
+use tx_substrate::wake::WaitEndpoint;
 
 use crate::execution::Guard;
 use crate::execution::WaitToken;
-use crate::page_backed::{step_fsync, PageContainerKind};
+use crate::page_backed::{PageContainerKind, step_fsync};
 use crate::vm::adapter::step_engine::{
     self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
     DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
@@ -26,10 +27,10 @@ use crate::vm::pmap::PmapBatchPage;
 use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
     AccessMode, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard,
-    UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault, VmFaultError,
-    VmFaultMaterialization, VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError,
-    VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
-    USER_PAGE_SIZE,
+    USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault,
+    VmFaultError, VmFaultMaterialization, VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit,
+    VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement,
+    VmRemapRequest,
 };
 
 const PRIVATE_ANON_FAULT_BATCH_PAGES: usize = 16;
@@ -59,6 +60,14 @@ impl AddressSpace {
     pub fn publish_fault_materialization(
         &self,
         outcome: VmFaultOutcome,
+        materialization: VmFaultMaterialization,
+    ) -> Result<PmapPublishOutcome, VmFaultError> {
+        self.publish_fault_materialization_ref(&outcome, materialization)
+    }
+
+    pub(crate) fn publish_fault_materialization_ref(
+        &self,
+        outcome: &VmFaultOutcome,
         materialization: VmFaultMaterialization,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
         let V3StepOutcome::Done(_guard) = self
@@ -169,17 +178,16 @@ impl AddressSpace {
     ///
     /// VM_v1_2 §5.1 + §3.6 cross-async-wait discipline. Each iteration:
     ///
-    /// 1. Acquires a Materializer reservation, observes the recipe, and
-    ///    drops the reservation. On WouldBlock the future awaits on the
-    ///    `RangeLock`'s wait channel and retries.
-    /// 2. Materializes the page through `materialize_pagebacked`. PC-side
-    ///    Blocked outcomes (File-variant `step_fsync` / FsPageBacking)
-    ///    are not yet exposed through this script — they remain a
-    ///    follow-up that requires per-`PageContainer` wait channels.
-    /// 3. Re-acquires the Materializer reservation and publishes the
-    ///    materialization through the pmap. WouldBlock here drops the
-    ///    materialization (releasing the MapPin) and retries from
-    ///    step 1, re-observing the recipe afresh.
+    /// 1. Resolves the recipe under a Materializer reservation. On
+    ///    RangeLock WouldBlock the future awaits that lock's source and
+    ///    retries resolution.
+    /// 2. Materializes through `materialize_pagebacked`. File-backed
+    ///    Blocked outcomes carry the PageContainer/FS token and are awaited
+    ///    by source id; wake resumes this same owned outcome in the inner
+    ///    materialize/publish lane.
+    /// 3. Re-acquires the Materializer reservation and publishes through the
+    ///    pmap. A publication wait drops the pin and retries materialization;
+    ///    a stamped-generation mismatch restarts recipe resolution.
     pub async fn fault_script(&self, fault: VmFault) -> Result<PmapPublishOutcome, VmFaultError> {
         // The OnAgent dispatcher slot is empty for the simple
         // entrypoint — callers that want userfaultfd-aware fault
@@ -262,12 +270,11 @@ impl AddressSpace {
         dispatch: D,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
-        loop {
+        'resolve: loop {
             let outcome = match self.try_fault_script_resolve(page_range, fault)? {
                 FaultScriptResolve::Done(outcome) => outcome,
                 FaultScriptResolve::Wait(token) => {
-                    await_range_lock(self.range_lock.release_endpoint().clone(), token.interest())
-                        .await;
+                    await_fault_wait(self, token).await;
                     continue;
                 }
             };
@@ -293,19 +300,25 @@ impl AddressSpace {
                 None
             };
 
-            emit_vm_trace(b"debug.vm.fault.script.phase", 0);
-            match self.try_fault_script_materialize_and_publish(&outcome, ufd_reply)? {
-                FaultScriptPublish::Done(published) => {
-                    emit_vm_trace(b"debug.vm.fault.script.phase", 1);
-                    self.prefault_private_anon_write_batch(&outcome);
-                    emit_vm_trace(b"debug.vm.fault.script.phase", 2);
-                    return Ok(published);
-                }
-                FaultScriptPublish::Wait(token) => {
-                    emit_vm_trace(b"debug.vm.fault.script.wait", 1);
-                    await_range_lock(self.range_lock.release_endpoint().clone(), token.interest())
-                        .await;
-                    continue;
+            loop {
+                emit_vm_trace(b"debug.vm.fault.script.phase", 0);
+                match self.try_fault_script_materialize_and_publish(&outcome, ufd_reply) {
+                    Ok(FaultScriptPublish::Done(published)) => {
+                        emit_vm_trace(b"debug.vm.fault.script.phase", 1);
+                        self.prefault_private_anon_write_batch(&outcome);
+                        emit_vm_trace(b"debug.vm.fault.script.phase", 2);
+                        return Ok(published);
+                    }
+                    Ok(FaultScriptPublish::Wait(token)) => {
+                        emit_vm_trace(b"debug.vm.fault.script.wait", token.source_id() as i64);
+                        // A materialization wait is tied to the same resolved
+                        // recipe. Resume the inner lane after the exact source
+                        // wakes; only stale publication restarts resolution.
+                        await_fault_wait(self, token).await;
+                        continue;
+                    }
+                    Err(VmFaultError::StaleRecipe) => continue 'resolve,
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -442,7 +455,11 @@ impl AddressSpace {
             }
         };
         emit_vm_trace(b"debug.vm.fault.materialize.phase", 3);
-        self.try_fault_script_publish(outcome, materialization)
+        match self.try_fault_script_publish(outcome, materialization) {
+            Ok(published) => Ok(published),
+            Err(VmFaultError::StaleRecipe) => Err(VmFaultError::StaleRecipe),
+            Err(error) => Err(error),
+        }
     }
 
     fn prefault_private_anon_write_batch(&self, first: &VmFaultOutcome) {
@@ -1351,6 +1368,32 @@ impl MapReservation<'_> {
 /// not route through the registered source-id bridge.
 async fn await_range_lock(endpoint: impl tx_substrate::wake::WaitEndpoint, interest: u64) {
     let _ = crate::wait_source::wait_on_endpoint(&endpoint, interest).await;
+}
+
+/// Await the source carried by a fault/materialization token.  RangeLock
+/// tokens use the endpoint directly; file/page-cache tokens resolve through
+/// the registered source-id table.  The fallback yields once when a test
+/// placeholder has no registered source instead of silently waiting on the
+/// unrelated RangeLock channel.
+async fn await_fault_wait(aspace: &AddressSpace, token: WaitToken) {
+    let range_endpoint = aspace.range_lock.release_endpoint();
+    if range_endpoint.source_id().raw() == token.source_id() {
+        await_range_lock(range_endpoint.clone(), token.interest()).await;
+        return;
+    }
+    if let Some(source) =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(token.source_id()))
+    {
+        let _ = crate::wait_source::wait_on_endpoint(&source, token.interest()).await;
+        return;
+    }
+    if let Some(wait) =
+        crate::wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
+    {
+        let _ = wait.await;
+    } else {
+        tx_reactor::yield_now().await;
+    }
 }
 
 /// `RangeLock::acquire_step` only ever produces `V3StepOutcome::Done`

@@ -333,11 +333,11 @@ This does not starve faults: once a writer completes and releases, faults unbloc
 
 **A reservation protects only the synchronous publication or rewrite phase of an operation. It must not be held across unbounded asynchronous waits.**
 
-If a step yields while preparing publication (e.g., the fault handler blocking on `materialize_page` for a disk read), it **must drop the reservation** before yielding. Upon resume, it **must reacquire** the reservation and **must re-observe all authoritative state** from the beginning of the step.
+If a step yields while preparing publication (e.g., the fault handler blocking on `materialize_page` for a disk read), it **must drop the reservation** before yielding. Upon resume, it **must reacquire** the reservation. A waitable fault script may then continue materialization with its owned `VmFaultOutcome`; publication performs the stamped-generation fast check and falls back to the full target-field comparison. Only a stale target requires restarting recipe resolution; a wake from the page-I/O source does not force a redundant recipe lookup.
 
 Rationale. Holding a RangeLock reservation across disk I/O would serialize an entire range against every concurrent operation for the duration of the I/O — potentially tens of milliseconds. The reservation is for synchronous coordination of binding-and-materialization consistency, not for blocking other threads while waiting on hardware.
 
-Application. The fault handler (§5.1) acquires a Materializer reservation, re-observes recipes, calls `materialize_page`. If `materialize_page` returns `Blocked`, the handler drops the reservation and its guards, yields, and on wake retries from the top. The second acquisition re-runs `acquire_step` (cheap), re-observes recipes (possibly changed during the wait), and continues.
+Application. The fault handler (§5.1) acquires a Materializer reservation, observes recipes, and calls `materialize_page`. If `materialize_page` returns `Blocked`, the handler drops the reservation and its guards, yields on the token's exact source, and on wake continues the materialize/publish lane with the owned outcome. Reacquisition and publication validation still reject a changed recipe; only that stale result restarts the outer recipe-resolution loop.
 
 ### 3.7 WaitToken abstraction
 <!-- txdoc:VM-3-7-WAITTOKEN-ABSTRACTION -->

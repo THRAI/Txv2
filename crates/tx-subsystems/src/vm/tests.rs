@@ -1,6 +1,7 @@
 use super::*;
 use crate::page_backed::PageContainer;
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::vm::adapter::step_engine::StepOp;
 use alloc::collections::BTreeMap;
 use std::sync::{Arc, Barrier, LazyLock, Mutex};
 use std::thread_local;
@@ -652,16 +653,20 @@ fn vm_recipe_ordered_coverage_walk_rejects_first_gap_without_partial_tagging() {
         aspace.tag_ufd_registration(range(0x10_0000, 5), tag),
         Err(VmMapError::MissingMapping)
     );
-    assert!(aspace
-        .lookup(UserVirtAddr(0x10_0000))
-        .expect("left recipe")
-        .ufd_registration
-        .is_none());
-    assert!(aspace
-        .lookup(UserVirtAddr(0x10_4000))
-        .expect("right recipe")
-        .ufd_registration
-        .is_none());
+    assert!(
+        aspace
+            .lookup(UserVirtAddr(0x10_0000))
+            .expect("left recipe")
+            .ufd_registration
+            .is_none()
+    );
+    assert!(
+        aspace
+            .lookup(UserVirtAddr(0x10_4000))
+            .expect("right recipe")
+            .ufd_registration
+            .is_none()
+    );
 }
 
 #[test]
@@ -2509,6 +2514,99 @@ fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
     assert_eq!(
         outcome,
         crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+    );
+}
+
+#[test]
+fn vm_reserve_user_range_op_keeps_page_cursor_across_successive_steps() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x48000, 2),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let mut op = crate::vm::step_ops::ReserveUserRangeOp::new(
+        &aspace,
+        range(0x48000, 2),
+        UserAccessKind::Write,
+    );
+    let mut ctx = crate::vm::adapter::step_engine::ScriptCtx::<
+        crate::vm::adapter::step_engine::PlaceholderProcessSubject,
+    >::new();
+
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Continue {
+            progress: crate::vm::adapter::step_engine::PageProgress::new(1),
+        }
+    );
+    assert!(aspace.pmap().lookup(UserPage(0x48)).is_some());
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Continue {
+            progress: crate::vm::adapter::step_engine::PageProgress::new(1),
+        }
+    );
+    assert!(aspace.pmap().lookup(UserPage(0x49)).is_some());
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
+    );
+}
+
+#[test]
+fn vm_reserve_user_range_op_yields_range_lock_and_retries() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x4a000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+    let holder = acquired(
+        aspace
+            .range_lock()
+            .acquire_step_rich(target, LockMode::ExclusiveWriter),
+    );
+
+    let mut op =
+        crate::vm::step_ops::ReserveUserRangeOp::new(&aspace, target, UserAccessKind::Read);
+    let mut ctx = crate::vm::adapter::step_engine::ScriptCtx::<
+        crate::vm::adapter::step_engine::PlaceholderProcessSubject,
+    >::new();
+    let blocked = op.step(&mut ctx);
+    assert_eq!(
+        blocked,
+        crate::vm::adapter::step_engine::StepOutcome::yield_on_wait_source(
+            crate::vm::adapter::step_engine::PageProgress::EMPTY,
+            aspace.range_lock().wait_source_id(),
+            RANGE_LOCK_RELEASE_MASK,
+        )
+    );
+
+    drop(holder);
+    assert!(matches!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Continue { .. }
+    ));
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     );
 }
 

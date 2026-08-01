@@ -1,3 +1,51 @@
+- 2026-08-01 (ext4 Task 12 unlinked-open destroy lifetime).
+  Advanced Task 12 without marking it complete. The syscall layer no longer
+  calls `FsOps::destroy_inode` directly from `unlinkat`, `O_TMPFILE` helper
+  unlink, or rename-overwrite after the namespace mutation succeeds; those
+  paths now only remove names and invalidate dentry caches. `close` and
+  `close_range` share a last-open-file-description hook that reloads backend
+  metadata through the mounted `FsOps` and calls `destroy_inode` only when the
+  fd-table reference has been removed, no other `OpenFile` cap retains the same
+  file description, and the backend reports `nlinks == 0`. New syscall tests
+  use a destroy-counting tmpfs wrapper to prove open-unlink, rename-over-open,
+  and `O_TMPFILE` keep storage while fd-backed `RNode`s remain live, and that
+  last close of an unlinked regular file admits backend destroy. Verification
+  passed `cargo test -p tx-shims --lib defers -- --test-threads=1` (5),
+  `cargo test -p tx-shims --lib
+  dispatch_close_last_unlinked_regular_file_destroys_inode -- --test-threads=1`,
+  `cargo test -p tx-shims --lib file_mutation -- --test-threads=1` (41),
+  `cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1` (7),
+  `cargo test -p tx-ext4 --lib --no-default-features namespace --
+  --test-threads=1` (5), `cargo test -p tx-ext4-format --test pager_mock
+  namespace_plan_ -- --test-threads=1` (9), touched-file
+  `rustfmt --edition 2024 --check`, and scoped `git diff --check`. Remaining
+  Task 12 blockers: classic orphan recovery/replay, directory/non-inline/
+  cross-group destroy shapes, and e2fsck/xfstests evidence; Task 14-16 remain
+  pending.
+
+- 2026-08-01 (VM full pmap performance audit).
+  Completed a read-only audit of the full VM pmap path and related interfaces.
+  The strongest measured hotspot is the `VmPmap::state` spin lock covering HAL
+  PTE mutation, shootdown, pin release, and resident shadow updates; historical
+  lock data records about 320408 acquisitions, 7.319s total service, p99 169us,
+  and max 588us. Continuous teardown also has a cross-platform per-page
+  page-table prune scan, while the default sorted Vec resident store moves its
+  suffix on middle drains/inserts. The existing batch APIs are split: the
+  substrate batch mainly delays `MapPin` release, the HAL default still falls
+  back to singleton calls, and RV64 remote SBI RFENCE still loops once per
+  coalesced range. `protect_range` therefore defeats the real RV64 coalescing
+  path by issuing one-element slices for each resident page. Additional
+  candidates are fork CoW over-enumeration, mprotect/mremap teardown+refault,
+  mincore and Direct I/O repeated walks, user-copy repeated resolve, and trace
+  argument evaluation while metrics are disabled. Root destroy/ASID reuse and
+  LA64 shootdown/activation remain correctness gates before cross-hart mutation
+  batching. No Rust source or runtime benchmark changed. Details and evidence:
+  `docs/progress/research/2026-08-01-vm-pmap-full-performance-audit.md`.
+  Verification: `git diff --check`; `cargo xtask lint docs`; no JSON records
+  changed, so `cargo xtask progress validate` is not applicable. Next: add TDD
+  protect collector tests, instrument the four batch layers, then run a
+  lossless Vec/chunked guest A/B before changing the default backend.
+
 - 2026-08-01 (ext4 Task 12 zero-link destroy admission).
   Advanced Task 12 without marking it complete. `Ext4Pager::plan_destroy_inode`
   now builds a bounded immutable Destroy mutation for zero-link regular files

@@ -43,8 +43,8 @@ use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmEntry, VmEntryBacking, VmFault,
-    VmFaultOutcome, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmEntry, VmEntryBacking,
+    VmFault, VmFaultError, VmFaultMaterializationStep, VmFaultOutcome,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 
@@ -74,6 +74,18 @@ impl UserAccessKind {
 }
 
 impl AddressSpace {
+    /// Return whether every page already has a PTE with the requested access.
+    ///
+    /// This is deliberately non-materializing. Synchronous syscall fast lanes
+    /// use it to decline cold ranges and fall through to their waitable driver.
+    pub fn user_range_is_ready_for_access(&self, range: UserRange, kind: UserAccessKind) -> bool {
+        range.iter_pages().all(|page| {
+            self.pmap
+                .lookup(page)
+                .is_some_and(|snapshot| snapshot.prot.permits(kind.required_prot()))
+        })
+    }
+
     /// Copy `dst.len()` bytes from user-space `src` to kernel-side `dst`.
     /// Returns the number of bytes copied (= `dst.len()` on success).
     pub fn copy_from_user(
@@ -180,15 +192,15 @@ impl AddressSpace {
     /// published pages whose protection already permits the access
     /// are skipped, so calling this twice on the same range is cheap.
     ///
-    /// Errors and Blocked propagate to the caller:
+    /// Errors and waits propagate to the caller:
     ///
     /// - `Err(Errno::EFAULT)` for unmapped pages (no recipe), for
     ///   prot-mismatch (recipe rejects the access), and for
     ///   materialisation / publication failures from the underlying
     ///   subsystems (`VmFault` / pmap surface them as opaque internal
     ///   shapes; the user-VA contract collapses every one to EFAULT).
-    /// - `Blocked(token)` if a page-cache fetch needs to await; the
-    ///   caller awaits the wait source and retries.
+    /// - `Yield(OnWaitSource)` if a page-cache fetch or RangeLock needs to
+    ///   await; the caller awaits the exact wait source and retries.
     ///
     /// Per VM_v1_2 §"No rmap": private anon frames are tracked only
     /// via published PTEs, so the pmap is the canonical authoritative
@@ -205,55 +217,93 @@ impl AddressSpace {
         range: UserRange,
         kind: UserAccessKind,
     ) -> StepOutcome<(), NoProgress> {
-        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         for page in range.iter_pages() {
-            // Skip pages already published with sufficient protection.
-            // We only avoid re-materialisation when the cached entry
-            // already permits the requested access.
-            if let Some(snapshot) = self.pmap.lookup(page) {
-                if snapshot.prot.permits(kind.required_prot()) {
-                    continue;
+            let mut pending = None;
+            loop {
+                match self.reserve_user_page_for_access_step(page, kind, &mut pending) {
+                    StepOutcome::Done(()) => break,
+                    StepOutcome::Continue { .. } => continue,
+                    wait @ StepOutcome::Yield { .. } => return wait,
+                    error @ StepOutcome::Err(_) => return error,
                 }
-                // Insufficient cached protection is not a hard fault:
-                // fork CoW deliberately leaves parent private pages
-                // mapped read-only. If the recipe permits the requested
-                // access, fall through and materialise/publish the
-                // writable private page below.
-            }
-            // Build a synthetic fault, observe the recipe, materialise,
-            // and publish synchronously.
-            let page_addr = match page.checked_start_addr() {
-                Ok(a) => a,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
-            };
-            let fault = VmFault::new(page_addr, kind.required_prot());
-            let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
-                Ok(o) => o,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
-            };
-            let materialization = match outcome.materialize_pagebacked() {
-                Ok(m) => m,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
-            };
-            // Publish the materialisation. `replace_existing` honours
-            // the materialisation's own intent (private CoW path sets
-            // it; otherwise false). The page-key derives from the
-            // outcome's page_range, mirroring `fault_script`.
-            if self
-                .pmap
-                .publish_page_with_replacement(
-                    outcome.page_range.start().containing_page(),
-                    materialization.page.ppn,
-                    materialization.publish_prot,
-                    materialization.page.map_pin,
-                    materialization.replace_existing,
-                )
-                .is_err()
-            {
-                return V3::err(Errno::EFAULT.into());
             }
         }
-        V3::done(())
+        StepOutcome::Done(())
+    }
+
+    /// Perform one bounded page-reservation attempt.
+    ///
+    /// `pending` contains only an owned recipe snapshot and its optional
+    /// publication sequence. It is retained across a wait so file completion
+    /// can continue directly into materialization/publication; guards,
+    /// reservations, and `MapPin`s are always released before Yield.
+    pub(crate) fn reserve_user_page_for_access_step(
+        &self,
+        page: crate::vm::UserPage,
+        kind: UserAccessKind,
+        pending: &mut Option<VmFaultOutcome>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self
+            .pmap
+            .lookup(page)
+            .is_some_and(|snapshot| snapshot.prot.permits(kind.required_prot()))
+        {
+            *pending = None;
+            return StepOutcome::Done(());
+        }
+
+        if pending.is_none() {
+            let page_addr = match page.checked_start_addr() {
+                Ok(addr) => addr,
+                Err(_) => return StepOutcome::Err(Errno::EFAULT.into()),
+            };
+            let fault = VmFault::new(page_addr, kind.required_prot());
+            *pending = match self.resolve_fault(fault) {
+                Ok(outcome) => Some(outcome),
+                Err(VmFaultError::WouldBlock) => {
+                    return crate::vm::notification::range_lock_blocked(
+                        self.range_lock().release_endpoint(),
+                    );
+                }
+                Err(_) => return StepOutcome::Err(Errno::EFAULT.into()),
+            };
+        }
+
+        let outcome = pending.as_ref().expect("pending fault outcome");
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let materialization = match outcome.materialize_pagebacked_step(&guard) {
+            VmFaultMaterializationStep::Done(materialization) => materialization,
+            VmFaultMaterializationStep::Blocked(token) => {
+                drop(guard);
+                return crate::vm::notification::yield_wait_token(NoProgress, token);
+            }
+            VmFaultMaterializationStep::Err(_) => {
+                drop(guard);
+                *pending = None;
+                return StepOutcome::Err(Errno::EFAULT.into());
+            }
+        };
+        drop(guard);
+
+        match self.publish_fault_materialization_ref(outcome, materialization) {
+            Ok(_) => {
+                *pending = None;
+                StepOutcome::Done(())
+            }
+            Err(VmFaultError::WouldBlock) => {
+                crate::vm::notification::range_lock_blocked(self.range_lock().release_endpoint())
+            }
+            Err(VmFaultError::StaleRecipe) => {
+                *pending = None;
+                StepOutcome::Continue {
+                    progress: NoProgress,
+                }
+            }
+            Err(_) => {
+                *pending = None;
+                StepOutcome::Err(Errno::EFAULT.into())
+            }
+        }
     }
 
     /// Read a NUL-terminated byte string starting at `src`, capped at

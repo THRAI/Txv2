@@ -388,10 +388,6 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match result {
         Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
-            if want_rmdir || child_meta.nlinks <= 1 {
-                let guard = step_engine::guard();
-                let _ = fs_ops.destroy_inode(target_id, &guard);
-            }
             SyscallResult::Return(0)
         }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
@@ -2025,12 +2021,6 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
             old_parent_dentry.remove_cached_child_by_name(old_basename);
             new_parent_dentry.remove_cached_child_by_name(new_basename);
-            if (flags & RENAME_EXCHANGE) == 0 {
-                if let Some(displaced) = displaced_dentry.as_ref() {
-                    let guard = step_engine::guard();
-                    let _ = fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard);
-                }
-            }
             SyscallResult::Return(0)
         }
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),

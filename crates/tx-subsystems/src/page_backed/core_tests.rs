@@ -36,9 +36,24 @@ use crate::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
     OpenFileFlags, RNode, RNodeBacking,
 };
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use core::future::Future;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |_| RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE),
+    |_| {},
+    |_| {},
+    |_| {},
+);
+
+fn noop_waker() -> Waker {
+    // SAFETY: the no-op raw waker never dereferences its null data pointer.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) }
+}
 
 struct RecordingPlanner;
 
@@ -1160,6 +1175,60 @@ impl FsPageBacking for BlockingFs {
     }
 }
 
+struct StatefulFetchFs {
+    ready: AtomicBool,
+    fetches: AtomicUsize,
+}
+
+impl StatefulFetchFs {
+    fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            fetches: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl FsPageBacking for StatefulFetchFs {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Out<Frame, NoProgress> {
+        if !self.ready.load(Ordering::Acquire) {
+            return V3Out::yield_on_wait_source(NoProgress, 9, 0x44);
+        }
+        self.fetches.fetch_add(1, Ordering::AcqRel);
+        V3Out::done(Frame::new(
+            page_allocator::zero_frame_ppn().expect("zero frame"),
+        ))
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+}
+
 fn file_page_container(
     fs_v3: Arc<dyn FsOps>,
     page_backing_v3: Arc<dyn FsPageBacking>,
@@ -1183,6 +1252,32 @@ fn file_page_container(
         },
         page_count,
     )
+}
+
+fn file_page_container_cap(
+    fs_v3: Arc<dyn FsOps>,
+    page_backing_v3: Arc<dyn FsPageBacking>,
+    fs_object_id: FsObjectId,
+    page_count: u64,
+) -> step_engine::Cap<PageContainer> {
+    let mount = MountPayload::new_cap(
+        fs_v3,
+        page_backing_v3,
+        None,
+        DevId::new(8),
+        MountOptions::default(),
+        "mockfs",
+        SourceLabel::Static("mock"),
+    )
+    .expect("mount payload");
+    PageContainer::new_cap(
+        PageContainerKind::File {
+            mount: MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
+            fs_object_id,
+        },
+        page_count,
+    )
+    .expect("page container cap")
 }
 
 fn file_page_container_with_planner(
@@ -1238,6 +1333,107 @@ fn file_page_container_cap_with_planner(
         page_count,
     )
     .expect("page container cap")
+}
+
+#[test]
+fn vm_reserve_user_range_op_waits_and_resumes_cold_file_vma() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    let fs = Arc::new(BlockingFs);
+    let fetch = Arc::new(StatefulFetchFs::new());
+    let pc = file_page_container_cap(fs.clone(), fetch.clone(), FsObjectId::new(177), 1);
+    let aspace = crate::vm::AddressSpace::new();
+    let range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr(0x70000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("user range");
+    aspace
+        .try_mmap(crate::vm::VmMapRequest::fixed(
+            range,
+            crate::vm::MapPlacement::RequireFree,
+            crate::vm::Prot::READ,
+            crate::vm::VmEntryFlags::SHARED,
+            crate::vm::VmBacking::Page {
+                pc: pc.clone().into(),
+                offset: 0,
+            },
+        ))
+        .expect("file-backed VMA");
+
+    let mut op = crate::vm::step_ops::ReserveUserRangeOp::new(
+        &aspace,
+        range,
+        crate::vm::UserAccessKind::Read,
+    );
+    let mut script_ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+    assert_eq!(
+        op.step(&mut script_ctx),
+        V3Out::yield_on_wait_source(step_engine::PageProgress::EMPTY, 9, 0x44)
+    );
+    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+    assert_eq!(pc.resident_pages(), 0);
+
+    fetch.ready.store(true, Ordering::Release);
+    assert_eq!(
+        op.step(&mut script_ctx),
+        V3Out::Continue {
+            progress: step_engine::PageProgress::new(1),
+        }
+    );
+    assert_eq!(op.step(&mut script_ctx), V3Out::Done(()));
+    assert_eq!(fetch.fetches.load(Ordering::Acquire), 1);
+    assert_eq!(aspace.pmap().stats().mapped_pages, 1);
+    assert_eq!(pc.resident_pages(), 1);
+}
+
+#[test]
+fn vm_fault_script_waits_on_file_source_and_continues_resolved_recipe() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    let source = tx_substrate::wake::new_source(9);
+    crate::wait_source::register_wait_source_with_id(9, source.clone());
+    let fs = Arc::new(BlockingFs);
+    let fetch = Arc::new(StatefulFetchFs::new());
+    let pc = file_page_container_cap(fs.clone(), fetch.clone(), FsObjectId::new(178), 1);
+    let aspace = crate::vm::AddressSpace::new();
+    let range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr(0x72000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("user range");
+    aspace
+        .try_mmap(crate::vm::VmMapRequest::fixed(
+            range,
+            crate::vm::MapPlacement::RequireFree,
+            crate::vm::Prot::READ,
+            crate::vm::VmEntryFlags::SHARED,
+            crate::vm::VmBacking::Page {
+                pc: pc.clone().into(),
+                offset: 0,
+            },
+        ))
+        .expect("file-backed VMA");
+
+    let mut future = Box::pin(aspace.fault_script(crate::vm::VmFault::new(
+        crate::vm::UserVirtAddr(0x72000),
+        crate::vm::AccessMode::Read,
+    )));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+
+    fetch.ready.store(true, Ordering::Release);
+    source.notify_emit(step_engine::InterestMask::new(0x44));
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+    assert_eq!(fetch.fetches.load(Ordering::Acquire), 1);
+    assert_eq!(aspace.pmap().stats().mapped_pages, 1);
+
+    crate::wait_source::release_wait_source(9);
+    tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(9));
 }
 
 fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
@@ -1663,22 +1859,24 @@ fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
             && source.raw() == 0x7103
             && interests.raw() == IoServiceKind::Page.mask_bits()
     ));
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(
-            pc.io_manager_key(),
-            PageIoRange::new(page.as_u64(), 1),
-            PageIoOp::Writeback,
-        )
-        .is_some());
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
-        .is_none());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(
+                pc.io_manager_key(),
+                PageIoRange::new(page.as_u64(), 1),
+                PageIoOp::Writeback,
+            )
+            .is_some()
+    );
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
+            .is_none()
+    );
     assert_eq!(
         pc.file_page_slot_snapshot_for_test(page)
             .expect("slot")
@@ -4000,12 +4198,13 @@ fn fsync_op_calls_backing_after_an_empty_frontier_without_l4_fsync() {
 
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-        .is_none());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+            .is_none()
+    );
 }
 
 #[test]
@@ -4031,12 +4230,13 @@ fn vfs_fsync_op_calls_backing_once_after_an_empty_frontier_without_l4_fsync() {
 
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-        .is_none());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+            .is_none()
+    );
 }
 
 #[test]
@@ -4085,12 +4285,13 @@ fn fsync_op_waits_for_dirty_frontier_before_calling_backing() {
         .cloned()
         .expect("writeback precedes fsync");
     let _ = pc.prepare_owned_file_io_request(&writeback);
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-        .is_none());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+            .is_none()
+    );
     pc.state
         .lock()
         .file_io_service
@@ -4107,12 +4308,13 @@ fn fsync_op_waits_for_dirty_frontier_before_calling_backing() {
 
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
-    assert!(pc
-        .state
-        .lock()
-        .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-        .is_none());
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+            .is_none()
+    );
 }
 
 #[test]
