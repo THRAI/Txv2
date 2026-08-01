@@ -1,3 +1,17 @@
+- 2026-08-01 (**RV64 guest curl/wget HTTPS 与 ext4 重定向验证完成**).
+  **Changed**：未改内核或母盘；只在 `boot.sh` 生成的临时 disk 副本中运行探针。
+  母盘自带 BusyBox 1.37.0 `wget`，但没有 curl。wget 访问测试仓库 raw README
+  得到 HTTP 200，直接 `-O` 和 stdout shell 重定向均返回 0、落盘 12 字节，
+  两份 `cmp` 一致。临时 `apk add curl` 能完成仓库 DNS/HTTPS 下载，但因
+  ownership 操作和 trigger `chroot` 返回 ENOSYS，apk 总体返回 2；curl 主程序
+  仍成功落盘并可执行。curl 8.14.1 的直接下载和 shell 重定向同样均返回 0、
+  落盘 12 字节，curl 自身两份及 curl/wget 跨工具 `cmp` 全部一致。
+  **Verification**：串口 `target/curl-wget-rv64-20260801.log`；新进程
+  `wc -c`/`cat` 可读四个 ext4 文件，无 panic/hang。**Next**：若要求每次干净
+  boot 都直接提供 curl，应在宿主侧重制 `alpine-riscv64-ex4fs.img` 并预装
+  curl；不要依赖当前 guest apk 路径。**Blocker**：网络功能无 blocker；持久
+  curl 仅受镜像打包以及 apk 所需 ownership/chroot syscall 缺口影响。
+
 - 2026-08-01 (**RV64 大型 Git 工作流恢复：timer 历史槽有界复用，merge 前
   exit/dup3 文件落盘语义补回**). 大型 clone 的 2,621,440 字节分配失败并非
   栈不足或总内存 OOM，而是 merge 侧 `dd9435f3` 引入的 `MinHeap.slots`
