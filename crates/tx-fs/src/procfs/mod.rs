@@ -1580,7 +1580,7 @@ impl FsOps for Procfs {
             }
         } else {
             // Other projected files: render content via read::render.
-            let content: Vec<u8> = read::render(fs_object_id).into_bytes();
+            let content: Vec<u8> = read::render(fs_object_id, guard).into_bytes();
             let bytes = content.as_slice();
             let off = offset as usize;
             if off >= bytes.len() {
@@ -1604,7 +1604,8 @@ impl FsOps for Procfs {
         if pid_from_mem_id(fs_object_id).is_some() {
             return self.read_projected(fs_object_id, offset, buf, guard);
         }
-        let content: Vec<u8> = read::render_with_netns(fs_object_id, caller_netns).into_bytes();
+        let content: Vec<u8> =
+            read::render_with_netns(fs_object_id, caller_netns, guard).into_bytes();
         let bytes = content.as_slice();
         let off = offset as usize;
         if off >= bytes.len() {
@@ -1817,6 +1818,7 @@ fn is_writable_procfs_projection(fs_object_id: FsObjectId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
     use std::collections::BTreeMap;
     use std::sync::{LazyLock, Mutex};
     use tx_hal::{
@@ -1955,6 +1957,19 @@ mod tests {
         names
     }
 
+    fn render_for_test(id: FsObjectId) -> String {
+        let guard = adapter::step_engine::guard();
+        read::render(id, &guard)
+    }
+
+    fn render_with_netns_for_test(
+        id: FsObjectId,
+        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+    ) -> String {
+        let guard = adapter::step_engine::guard();
+        read::render_with_netns(id, caller_netns, &guard)
+    }
+
     #[test]
     fn procfs_root_readdir_advances_from_dots_to_static_entries() {
         let _setup = setup();
@@ -1985,8 +2000,8 @@ mod tests {
         assert!(names.iter().any(|name| name == b"udp"));
         assert!(names.iter().any(|name| name == b"snmp"));
         assert!(names.iter().any(|name| name == b"netlink"));
-        assert!(read::render(lookup(&fs, net_id, b"tcp")).contains("local_address"));
-        let snmp = read::render(lookup(&fs, net_id, b"snmp"));
+        assert!(render_for_test(lookup(&fs, net_id, b"tcp")).contains("local_address"));
+        let snmp = render_for_test(lookup(&fs, net_id, b"snmp"));
         assert!(snmp.contains("Ip:"), "{snmp}");
         assert!(snmp.contains("Tcp:"), "{snmp}");
         assert!(snmp.contains("Udp:"), "{snmp}");
@@ -2007,13 +2022,13 @@ mod tests {
         assert!(names.iter().any(|name| name == b"route"));
         assert!(names.iter().any(|name| name == b"nf_conntrack"));
         assert!(names.iter().any(|name| name == b"tx_nf_rules"));
-        assert!(read::render(lookup(&fs, net_id, b"dev")).contains("lo:"));
-        assert!(read::render(lookup(&fs, net_id, b"route")).contains("Iface"));
-        assert_eq!(read::render(lookup(&fs, net_id, b"nf_conntrack")), "");
+        assert!(render_for_test(lookup(&fs, net_id, b"dev")).contains("lo:"));
+        assert!(render_for_test(lookup(&fs, net_id, b"route")).contains("Iface"));
+        assert_eq!(render_for_test(lookup(&fs, net_id, b"nf_conntrack")), "");
 
         let ip_forward_id = lookup(&fs, sys_net_ipv4_id, b"ip_forward");
         let tx_nf_rules_id = lookup(&fs, net_id, b"tx_nf_rules");
-        assert_eq!(read::render(ip_forward_id), "0\n");
+        assert_eq!(render_for_test(ip_forward_id), "0\n");
         {
             let guard = adapter::step_engine::guard();
             assert!(matches!(
@@ -2029,7 +2044,7 @@ mod tests {
                 StepOutcome::Done(2)
             ));
         }
-        assert_eq!(read::render(ip_forward_id), "1\n");
+        assert_eq!(render_for_test(ip_forward_id), "1\n");
 
         let target_netns_identity =
             tx_subsystems::net::create_isolated_net_namespace_for_test("procfs-target-netns")
@@ -2050,9 +2065,9 @@ mod tests {
                 StepOutcome::Done(2)
             ));
         }
-        assert_eq!(read::render_with_netns(ip_forward_id, None), "1\n");
+        assert_eq!(render_with_netns_for_test(ip_forward_id, None), "1\n");
         assert_eq!(
-            read::render_with_netns(ip_forward_id, Some(&target_netns)),
+            render_with_netns_for_test(ip_forward_id, Some(&target_netns)),
             "0\n"
         );
 
@@ -2077,8 +2092,8 @@ mod tests {
                 StepOutcome::Done(22)
             ));
         }
-        let host_rules = read::render_with_netns(tx_nf_rules_id, None);
-        let target_rules = read::render_with_netns(tx_nf_rules_id, Some(&target_netns));
+        let host_rules = render_with_netns_for_test(tx_nf_rules_id, None);
+        let target_rules = render_with_netns_for_test(tx_nf_rules_id, Some(&target_netns));
         assert!(host_rules.contains("DROP"), "{host_rules}");
         assert!(!host_rules.contains("ACCEPT"), "{host_rules}");
         assert!(target_rules.contains("ACCEPT"), "{target_rules}");
@@ -2105,29 +2120,55 @@ mod tests {
                 core::str::from_utf8(expected).unwrap_or("<non-utf8>")
             );
         }
-        let filesystems = read::render(lookup(&fs, PROCFS_ROOT_ID, b"filesystems"));
+        let filesystems = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"filesystems"));
         assert!(filesystems.contains("tmpfs"), "{filesystems}");
         assert!(filesystems.contains("proc"), "{filesystems}");
         assert!(filesystems.contains("sysfs"), "{filesystems}");
-        assert_eq!(read::render(lookup(&fs, PROCFS_ROOT_ID, b"modules")), "");
-        let devices = read::render(lookup(&fs, PROCFS_ROOT_ID, b"devices"));
+        assert_eq!(render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"modules")), "");
+        let devices = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"devices"));
         assert!(devices.contains("Character devices:"), "{devices}");
         assert!(devices.contains("Block devices:"), "{devices}");
-        let cgroups = read::render(lookup(&fs, PROCFS_ROOT_ID, b"cgroups"));
+        let cgroups = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"cgroups"));
         assert!(cgroups.contains("#subsys_name"), "{cgroups}");
-        let mounts = read::render(lookup(&fs, PROCFS_ROOT_ID, b"mounts"));
+        let mounts = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"mounts"));
         assert!(mounts.contains(" /proc proc "), "{mounts}");
         assert!(mounts.contains(" /sys sysfs "), "{mounts}");
         bootstrap_procfs_test_init_process();
         let pid_dir = lookup(&fs, PROCFS_ROOT_ID, b"1");
         let pid_mounts_id = lookup(&fs, pid_dir, b"mounts");
-        let guard = adapter::step_engine::guard();
-        assert_eq!(
-            fs.load_inode_meta(pid_mounts_id, &guard),
-            StepOutcome::Done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
-        );
-        let pid_mounts = read::render(pid_mounts_id);
+        {
+            let guard = adapter::step_engine::guard();
+            assert_eq!(
+                fs.load_inode_meta(pid_mounts_id, &guard),
+                StepOutcome::Done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            );
+        }
+        let pid_mounts = render_for_test(pid_mounts_id);
         assert_eq!(pid_mounts, mounts);
+    }
+
+    #[test]
+    fn procfs_process_renderers_reuse_one_caller_guard() {
+        let _setup = setup();
+        let fs = Procfs::new();
+        bootstrap_procfs_test_init_process();
+
+        let pid_dir = lookup(&fs, PROCFS_ROOT_ID, b"1");
+        let stat_id = lookup(&fs, pid_dir, b"stat");
+        let status_id = lookup(&fs, pid_dir, b"status");
+        let maps_id = lookup(&fs, pid_dir, b"maps");
+        let smaps_id = lookup(&fs, pid_dir, b"smaps");
+
+        let guard = adapter::step_engine::guard();
+        let stat = read::render(stat_id, &guard);
+        let status = read::render(status_id, &guard);
+        let maps = read::render(maps_id, &guard);
+        let smaps = read::render(smaps_id, &guard);
+
+        assert!(stat.starts_with("1 "), "{stat}");
+        assert!(status.contains("Pid:\t1\n"), "{status}");
+        assert!(maps.is_empty(), "{maps}");
+        assert!(smaps.is_empty(), "{smaps}");
     }
 
     #[test]
@@ -2185,17 +2226,17 @@ mod tests {
         let sem_id = lookup(&fs, sysvipc_id, b"sem");
         let shm_id = lookup(&fs, sysvipc_id, b"shm");
 
-        let msg = read::render(msg_id);
+        let msg = render_for_test(msg_id);
         assert!(msg.contains("key"));
         assert!(msg.contains(&alloc::format!("{} {}", 0x4d534750, msqid)));
         assert!(msg.contains("5"), "{msg}");
 
-        let sem = read::render(sem_id);
+        let sem = render_for_test(sem_id);
         assert!(sem.contains("nsems"));
         assert!(sem.contains(&alloc::format!("{} {}", 0x53454d50, semid)));
         assert!(sem.contains("2"), "{sem}");
 
-        let shm = read::render(shm_id);
+        let shm = render_for_test(shm_id);
         assert!(shm.contains("bytes"));
         assert!(shm.contains(&alloc::format!("{} {}", 0x53484d50, shmid)));
         assert!(shm.contains("4096"), "{shm}");
@@ -2248,7 +2289,7 @@ mod tests {
         let proc_id = lookup(&fs, PROCFS_ROOT_ID, b"1");
         let fdinfo_dir = lookup(&fs, proc_id, b"fdinfo");
         let fdinfo_id = lookup(&fs, fdinfo_dir, b"7");
-        let fdinfo = read::render(fdinfo_id);
+        let fdinfo = render_for_test(fdinfo_id);
 
         assert!(fdinfo.contains("mq_maxmsg:\t4"), "{fdinfo}");
         assert!(fdinfo.contains("mq_msgsize:\t32"), "{fdinfo}");

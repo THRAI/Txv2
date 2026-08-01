@@ -244,9 +244,16 @@ impl ProcessIdentity {
     /// retained somewhere. Returns `None` for `pid=1` init (no parent)
     /// and after the parent identity has been fully reclaimed.
     pub fn parent_cap(&self) -> Option<Cap<ProcessIdentity>> {
-        let weak = (*self.parent.lock())?;
         let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        weak.upgrade(&guard)
+        self.parent_cap_with_guard(&guard)
+    }
+
+    pub fn parent_cap_with_guard(
+        &self,
+        guard: &step_engine::Guard<'_>,
+    ) -> Option<Cap<ProcessIdentity>> {
+        let weak = (*self.parent.lock())?;
+        weak.upgrade(guard)
     }
 
     /// Render the parent's pid for `getppid` and tracing. Returns
@@ -254,7 +261,14 @@ impl ProcessIdentity {
     /// has been reclaimed. Day-1 single-namespace; namespace-aware
     /// rendering arrives with `PidName` / `nsproxy`.
     pub fn parent_pid(&self) -> Pid {
-        self.parent_cap().map(|p| p.pid).unwrap_or(Pid::RESERVED)
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        self.parent_pid_with_guard(&guard)
+    }
+
+    pub fn parent_pid_with_guard(&self, guard: &step_engine::Guard<'_>) -> Pid {
+        self.parent_cap_with_guard(guard)
+            .map(|p| p.pid)
+            .unwrap_or(Pid::RESERVED)
     }
 
     /// Number of children currently retained by this process. All

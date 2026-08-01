@@ -123,7 +123,11 @@ impl AddressSpace {
 
     pub fn recipes_snapshot(&self) -> Vec<VmEntry> {
         let guard = Self::recipe_guard();
-        self.recipes.snapshot(&guard)
+        self.recipes_snapshot_with_guard(&guard)
+    }
+
+    pub fn recipes_snapshot_with_guard(&self, guard: &step_engine::Guard<'_>) -> Vec<VmEntry> {
+        self.recipes.snapshot(guard)
     }
 
     /// Stamp a [`UfdRegistration`] tag on every VMA whose range is
