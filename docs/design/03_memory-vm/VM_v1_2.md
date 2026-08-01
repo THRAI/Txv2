@@ -128,7 +128,7 @@ This invariant must hold at every observable moment, under arbitrary concurrency
 
 - **Binding mutations** (`munmap`, `mprotect`, `mremap`, `mmap`'s MAP_FIXED replacement) linearize at the **recipes BTree mutation** (substrate `swap_commit` / `withdraw_commit` / `commit` on the recipes index).
 - **Pmap teardown and shootdown** remove **derived materializations** *after* the binding change. Their linearization point is per-PTE (pmap leaf atomicity); collectively, they bring the materialization state into agreement with the new binding state.
-- **Materialization publication** (PTE install from the fault handler) linearizes at the **pmap leaf install**, subject to re-verification against current bindings. The RangeLock's Materializer reservation ensures no concurrent ExclusiveWriter is mutating bindings in the target range during publication.
+- **Materialization publication** (PTE install from the fault handler) linearizes at the **pmap leaf install**, subject to re-verification against current bindings. The page-sized Materializer reservation is held continuously across the final synchronous materialize/private-page/PTE transaction, excluding every overlapping publisher and binding writer while leaving disjoint pages concurrent.
 
 ### 1.2 Publication rule
 <!-- txdoc:VM-1-2-PUBLICATION-RULE -->
@@ -137,7 +137,7 @@ This invariant must hold at every observable moment, under arbitrary concurrency
 
 This rule is enforced by construction:
 
-- The RangeLock's Materializer reservation blocks concurrent ExclusiveWriters in the range; no binding mutation can occur while the reservation is held.
+- The RangeLock's page-sized Materializer reservation blocks every overlapping Materializer and ExclusiveWriter; no competing private-page/PTE publication or binding mutation can occur while the final transaction is held.
 - The fault handler (§5.1) observes the recipe *after* acquiring Materializer and *before* committing the PTE. If any intervening release-reacquire cycle occurred (e.g., due to async I/O), the handler re-observes the recipe on resume and aborts if changed.
 
 ---
@@ -289,20 +289,20 @@ Excludes all overlapping reservations. Used for operations that **mutate authori
 
 **Materializer.**
 
-Excludes overlapping `ExclusiveWriter` reservations. Does not exclude overlapping `Materializer` reservations at the range-lock layer.
+Excludes every overlapping reservation, including another `Materializer`.
 
-**Uniqueness and linearization of page publication are not guaranteed by `RangeLock`**; they are enforced by the page-materialization and pmap layers (PageContainer `install_if_absent` at the PC page-index slot; pmap leaf-level atomicity for PTE install). Duplicate publication is resolved below.
+The reservation is page-sized for ordinary faults, so only publishers of the same page serialize. Faults on different pages remain concurrent. PageContainer `install_if_absent` and pmap leaf atomicity remain defensive lower-level invariants rather than the primary same-page arbitration mechanism.
 
 Used for operations that publish materializations (PTEs) without mutating recipes: the fault handler, eager prefault during syscall observe phases.
 
 ### 3.3 Non-goal
 <!-- txdoc:VM-3-3-NON-GOAL -->
 
-**`RangeLock` does not guarantee uniqueness of page publication and does not replace page-level linearization in the PageContainer or pmap.** It only governs **range-level exclusion** between binding mutations and materialization.
+**`RangeLock` supplies the AddressSpace-level uniqueness owner for page publication but does not replace lower-level linearization in the PageContainer or pmap.**
 
 - Uniqueness at the PC page-index slot (one Frame per offset) comes from `install_if_absent`.
 - Linearization of PTE install comes from pmap leaf-level atomicity.
-- RangeLock prevents an ExclusiveWriter from running concurrently with a Materializer in the overlapping range; it does not prevent two Materializers from racing in the same range.
+- RangeLock prevents any overlapping Materializer or ExclusiveWriter from entering while the final page transaction is active.
 
 ### 3.4 Declared-range reservation rule
 <!-- txdoc:VM-3-4-DECLARED-RANGE-RESERVATION-RULE -->
@@ -322,7 +322,7 @@ This rule makes range-lock conflict domains operationally defined: two operation
 
 **Writer-preferred with writers FIFO.**
 
-Once an ExclusiveWriter is queued on a range that overlaps ongoing Materializers, newly arriving overlapping Materializers must also queue behind the writer. Writers are served FIFO among themselves.
+Once an ExclusiveWriter is queued on a range that overlaps an ongoing Materializer, newly arriving overlapping Materializers also queue behind the writer. Writers are served FIFO among themselves.
 
 **Rationale.** `ExclusiveWriter` corresponds to mutation of authoritative bindings, while `Materializer` corresponds to publication derived from those bindings. Prioritizing writers ensures forward progress of binding state and prevents unbounded delay of mutations under fault-heavy workloads. Under heavy fault pressure (workloads touching fresh anonymous memory rapidly), a pure FIFO policy permits unbounded writer delay because faults can overlap each other and each wake re-starts the queueing race. Writer-preferred makes the semantic priority of authoritative mutations explicit.
 
@@ -337,7 +337,20 @@ If a step yields while preparing publication (e.g., the fault handler blocking o
 
 Rationale. Holding a RangeLock reservation across disk I/O would serialize an entire range against every concurrent operation for the duration of the I/O — potentially tens of milliseconds. The reservation is for synchronous coordination of binding-and-materialization consistency, not for blocking other threads while waiting on hardware.
 
-Application. The fault handler (§5.1) acquires a Materializer reservation, re-observes recipes, calls `materialize_page`. If `materialize_page` returns `Blocked`, the handler drops the reservation and its guards, yields, and on wake retries from the top. The second acquisition re-runs `acquire_step` (cheap), re-observes recipes (possibly changed during the wait), and continues.
+Application. The fault handler (§5.1) acquires a page-sized Materializer, re-observes recipes, and keeps the reservation through synchronous materialization and PTE publication. If `materialize_page` returns `Blocked`, the handler drops the reservation and its guards, yields, and on wake retries from the top.
+
+The same rule applies to syscall-side user-buffer prefault. An overlapping
+Materializer is ordinary SMP contention: the async syscall entry consumes the
+RangeLock wait token, waits without retaining a guard, and retries the whole
+range. It must never translate this internal `Yield` into userspace `EIO`.
+
+After acquiring the final page transaction, a fault rechecks the resident PTE
+before allocating. If another hart has already installed a mapping that
+permits the faulting access, the waiter converges on that mapping and only
+refreshes its translation. Every invalid-to-valid PTE commit performs the
+ASID-scoped local translation barrier before releasing the page transaction;
+a remote hart that had already trapped performs its own local refresh when it
+converges. Publishing software bookkeeping alone is not completion.
 
 ### 3.7 WaitToken abstraction
 <!-- txdoc:VM-3-7-WAITTOKEN-ABSTRACTION -->
@@ -491,9 +504,9 @@ async fn fault_script(
             Err(e) => return Err(SigInfo::for_fault_error(e)),
         };
 
-        // Phase: install PTE. Under Materializer reservation, no ExclusiveWriter
-        // on this range can interfere. Pmap atomicity via HAL's PmapReservation
-        // at leaf granularity.
+        // Phase: install PTE. The page-sized Materializer excludes every
+        // overlapping publisher and ExclusiveWriter. Pmap atomicity via HAL's
+        // PmapReservation remains the final leaf-level linearization point.
         match pmap_install_pte(
             &ctx.aspace.pmap,
             va,
@@ -502,10 +515,9 @@ async fn fault_script(
         ) {
             Ok(()) => return Ok(()),
             Err(PmapInstallError::AlreadyPresent) => {
-                // Raced with another Materializer on same page; their PTE is
-                // now there, equivalent to ours. Our frame reference drops;
-                // if we allocated it, its cache_ref handles cleanup.
-                return Ok(());
+                // Canonical publishers cannot race on this page. Preserve the
+                // existing PTE and report a publication-protocol violation.
+                return Err(SigInfo::for_internal_vm_error());
             }
             Err(e) => return Err(SigInfo::for_pmap_error(e)),
         }
@@ -817,6 +829,13 @@ async fn fork_aspace(
 
 **v1 policy: fork serializes all parent VM operations for its duration.** This design **intentionally serializes** all concurrent VM activity in the parent during fork (v1 simplification). Breaking fork into range-by-range pmap walks, allowing concurrent VM ops on disjoint ranges, is a potential v2 optimization.
 
+**SMP syscall integration.** The synchronous `fork_aspace` try-entry may
+return `WouldBlock` for one-shot internal callers and tests. Linux
+`fork`/process-`clone` must use the wait-capable entry: it consumes the
+RangeLock wait token, drops all reservation state before awaiting, and retries
+the full-range acquisition from scratch. Ordinary VM contention is therefore
+kernel scheduling state, not userspace `EAGAIN`.
+
 ### 5.7 exec
 <!-- txdoc:VM-5-7-EXEC -->
 
@@ -915,11 +934,10 @@ Each race closes via the RangeLock reservation.
 
 Two threads fault on VA X concurrently.
 
-- Both acquire Materializer on `[X, X+PAGE)`. Materializer does not exclude Materializer; both proceed concurrently.
-- Both observe recipes, both call `materialize_page`.
-- `materialize_page` uses PageContainer's page-index `install_if_absent`: one thread's Frame wins; the other's Frame (if it allocated one) drops via the page index's rejection.
-- Both threads have the same Frame reference now.
-- Both try to install PTE at VA X via pmap. HAL's PmapReservation serializes per-leaf. One installer succeeds; the other gets `AlreadyPresent` and treats it as success (the PTE is already there, pointing at the same Frame).
+- Both may enter the kernel before either has installed a PTE.
+- One acquires the page-sized Materializer; the other waits.
+- The winner materializes, installs the PTE, performs its ASID-scoped local translation barrier, then releases the transaction.
+- The waiter acquires the Materializer and rechecks pmap. The installed protection permits its access, so it refreshes the faulting translation and returns without allocating or publishing a second page.
 
 Result: one Frame materialized in PC, one PTE in pmap, both faults complete successfully.
 

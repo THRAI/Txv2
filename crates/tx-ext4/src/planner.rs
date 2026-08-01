@@ -216,7 +216,9 @@ impl Ext4ReadMappingSource for Ext4MappingTable {
                 Ok(BlockMapping::Data(physical_block)) => {
                     return Ext4ReadMapping::Data { physical_block };
                 }
-                Ok(BlockMapping::Hole) => return Ext4ReadMapping::Hole,
+                Ok(BlockMapping::Hole | BlockMapping::Unwritten(_)) => {
+                    return Ext4ReadMapping::Hole;
+                }
                 Ok(BlockMapping::NeedNode(physical_block)) => {
                     let Some(cached) = state.nodes.get(&(object, physical_block)) else {
                         return Ext4ReadMapping::MetadataFirst {

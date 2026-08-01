@@ -1736,14 +1736,37 @@ fn open_executable_candidate(
             return Err(ExecError::from_walker_errno(Errno::from(err)));
         }
     };
-    drop(guard);
 
     if opened.mount.flags().contains(MountFlags::NOEXEC) {
         return Err(ExecError::PermissionDenied);
     }
     let file = opened.open_file;
 
-    let meta = file.rnode().meta();
+    // RNode metadata is a materialisation-time snapshot.  In particular,
+    // linkers commonly create an output with 0666 (subject to umask), then
+    // fchmod it executable while an earlier path lookup still keeps the
+    // dentry/RNode alive.  Permission and credential transitions must use
+    // the filesystem's current inode metadata, just like Linux consults the
+    // canonical live inode, rather than the stale RNode snapshot.
+    //
+    // Keeping the load on the mount selected by the namespace walk also
+    // matters for bind mounts: ascending an arbitrary dentry parent chain can
+    // select the wrong filesystem after a concurrent namespace operation.
+    let mount_payload = opened
+        .mount
+        .payload_cap()
+        .map_err(|_| ExecError::Retry)?;
+    let meta = match mount_payload
+        .fs_ops()
+        .load_inode_meta(file.rnode().fs_object_id(), &guard)
+    {
+        V3::Done(meta) => meta,
+        V3::Continue { .. } => return Err(ExecError::Retry),
+        V3::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
+        V3::Err(err) => return Err(ExecError::from_walker_errno(Errno::from(err))),
+    };
+    drop(guard);
+
     check_exec_perm(&meta, cred)?;
     if meta.kind() == InodeKind::Directory {
         return Err(ExecError::PermissionDenied);

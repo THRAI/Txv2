@@ -11,4 +11,4 @@ pub mod loader;
 pub mod script;
 pub mod stack;
 
-pub use script::{exec_script, ExecError, ExecScriptOp};
+pub use script::{exec_script, ExecError, ExecScriptOp, EXEC_LAST_OPEN_ERRNO};

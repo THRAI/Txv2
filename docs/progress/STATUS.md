@@ -1,3 +1,26 @@
+- 2026-08-01 (**main 合入 network recovery，RV64/LA64 GitHub 与网络基准双架构闭环**).
+  将 `main@5cd2f8de` 以显式 merge 合入
+  `feature-network-refactor-recovery@66a846de`；Phase 1～8 继续搁置。三处
+  语义缝已按运行证据修复：RV64 block/net 恢复到不同 virtio-mmio bus；
+  `tx.runsh` 与 Oscomp/Ltp/Test compatibility mode 保持 tmpfs root；LA64
+  ExtIOI 用软件 claim ownership 吸收 deferred bottom half 完成前的重复 pending，
+  避免 `deferred IRQ slot already owns` panic。首次“claim 即关 ExtIOI”的方案
+  虽过 host test，却在 QEMU 卡于 rootfs mount 后，已撤销并保留为反证。
+  **Verification**：RV64、LA64 本地 Git/HTTP/HTTPS/push/pull/DNS/NET_IRQ 均
+  **9/9**（LA64 `claims=104/completions=104/wrong-hart=0/missing-device=0`）；
+  两架构均从真实 `github.com/oscomp/xv6-riscv.git` 完成 depth=1 clone，HEAD
+  `f5dea58c`、README 2425 bytes；授权测试仓库真实 push→第二 clone→push→
+  pull 闭环通过，远端验证分支为
+  `txv2-merge-verify-la64-2020802-001` 与 `verify-rv64-20260802-1`。
+  netperf/iperf 的 musl+glibc 四组在 RV64 **22/22**、LA64 **22/22**，总计
+  **44/44**，两架构 TCP_CRR 均通过。LA64 HAL 63/63、xtask QEMU 34/34，
+  debug/release 双架构 build 通过。workspace unit 的 tx-shims 37 项、tx-kernel
+  3 项失败已在干净 `main` worktree 原样复现，未抬 ratchet 或弱化断言。
+  **Next**：无；该 merge 验收闭环，按需创建 PR。若要清理 GitHub 测试分支需单独授权删除。
+  **Blocker**：本次恢复范围无；完整 xv6 full clone 本轮仅因约 49 KiB/s 外网
+  吞吐触发既有 240 s 上限（已传 10.48 MiB，无 panic/OOM），不作为内核失败。
+  详见 `docs/progress/research/2026-08-01-main-merge-network-validation.md`。
+
 - 2026-08-01 (**RV64 guest curl/wget HTTPS 与 ext4 重定向验证完成**).
   **Changed**：未改内核或母盘；只在 `boot.sh` 生成的临时 disk 副本中运行探针。
   母盘自带 BusyBox 1.37.0 `wget`，但没有 curl。wget 访问测试仓库 raw README

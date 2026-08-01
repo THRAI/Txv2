@@ -81,10 +81,7 @@ fn path_display(path: &[u8]) -> alloc::string::String {
     alloc::string::String::from_utf8_lossy(without_nul).into_owned()
 }
 
-fn build_procfs_root_with_mount(
-    dev_id: u32,
-    mount_id: u64,
-) -> (Cap<DEntry>, Cap<MountIdentity>) {
+fn build_procfs_root_with_mount(dev_id: u32, mount_id: u64) -> (Cap<DEntry>, Cap<MountIdentity>) {
     let procfs = tx_fs::procfs::Procfs::new();
     let fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
     let backing: Arc<dyn tx_subsystems::page_backed::FsPageBacking> =

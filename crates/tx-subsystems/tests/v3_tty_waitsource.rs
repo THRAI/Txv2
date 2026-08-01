@@ -170,7 +170,7 @@ fn tty_ingest_uses_injected_mailbox_ref_post_for_readable_wake() {
 
     let tty = alloc_hardware_tty(701, "ttyV3-with-post");
     let tty_source_id = tty.wait_source_id();
-    let tty_source: Arc<WaitSource> = tty.wait_source().clone();
+    let tty_source: Arc<WaitSource> = tty.read_endpoint().clone();
     let mailbox = Arc::new(TaskMailbox::new());
     let (_reg_guard, gen) = register(&tty_source, &mailbox, TTY_READABLE);
 
@@ -217,7 +217,7 @@ fn tty_wait_source_invariants_round_trip() {
 
     // ---- (1) WaitSourceId round-trip pin --------------------------
     let tty_source_id = tty.wait_source_id();
-    let tty_source: Arc<WaitSource> = tty.wait_source().clone();
+    let tty_source: Arc<WaitSource> = tty.read_endpoint().clone();
     assert_eq!(
         tx_substrate::wake::WaitEndpoint::source_id(tty.read_endpoint()),
         WaitSourceId::new(tty_source_id),
@@ -331,7 +331,7 @@ fn tty_wait_source_invariants_round_trip() {
     // payload). A clone of the source we held before hangup is still
     // a live `Arc` and reports the same id; no spurious posts.
     assert!(!tty.is_live(), "payload dropped on hangup");
-    let post_hangup_source = tty.wait_source();
+    let post_hangup_source = tty.read_endpoint();
     assert_eq!(
         post_hangup_source.id(),
         WaitSourceId::new(tty_source_id),

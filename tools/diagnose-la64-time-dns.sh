@@ -10,6 +10,7 @@
 #   bash tools/diagnose-la64-time-dns.sh git-dns-trace
 #   bash tools/diagnose-la64-time-dns.sh github-ls-remote
 #   bash tools/diagnose-la64-time-dns.sh github-clone
+#   bash tools/diagnose-la64-time-dns.sh github-shallow-clone
 # Optional:
 #   TX_LA64_FOCUS_TIMEOUT=60 bash tools/diagnose-la64-time-dns.sh dns
 #   TX_FOCUS_ARCH=rv64 bash tools/diagnose-la64-time-dns.sh connect-timeout
@@ -24,7 +25,7 @@ WORK="$(mktemp -d /tmp/la64-focus-XXXXXX)"
 SERIAL="$WORK/serial.log"
 cleanup() { rm -f "$WORK/disk.img"; }
 trap cleanup EXIT
-if [ "$MODE" = "github-clone" ]; then
+if [ "$MODE" = "github-clone" ] || [ "$MODE" = "github-shallow-clone" ]; then
   DEFAULT_QEMU_TIMEOUT=240
 else
   DEFAULT_QEMU_TIMEOUT=45
@@ -202,6 +203,28 @@ fi
 echo "LAFOCUS:END"
 GUESTEOF
     ;;
+  github-shallow-clone)
+    cat > "$WORK/tx-run.sh" <<'GUESTEOF'
+BB=/musl/bin/busybox
+export GIT_PAGER=cat HOME=/musl/root GIT_EXEC_PATH=/musl/usr/libexec/git-core \
+       GIT_TEMPLATE_DIR= PATH=/musl/usr/bin:/musl/bin:/usr/bin:/bin
+G="git -c gc.auto=0 -c maintenance.auto=false -c http.sslVerify=true -c http.proxy=http://10.0.2.2:7897"
+$BB mkdir -p /etc 2>/dev/null
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
+if [ ! -e /etc/ssl ]; then
+    $BB ln -s /musl/etc/ssl /etc/ssl
+fi
+echo "LAFOCUS:github-shallow-clone:begin"
+$BB timeout 180 $G clone --depth 1 https://github.com/oscomp/xv6-riscv.git /musl/xv6-riscv
+clone_rc=$?
+echo "LAFOCUS:github-shallow-clone:rc:$clone_rc"
+if [ "$clone_rc" -eq 0 ]; then
+    echo "LAFOCUS:github-shallow-clone:head:[$($G -C /musl/xv6-riscv rev-parse HEAD 2>&1)]"
+    echo "LAFOCUS:github-shallow-clone:readme-bytes:[$($BB wc -c < /musl/xv6-riscv/README)]"
+fi
+echo "LAFOCUS:END"
+GUESTEOF
+    ;;
   connect-timeout)
     cat > "$WORK/tx-run.sh" <<'GUESTEOF'
 BB=/musl/bin/busybox
@@ -217,7 +240,7 @@ echo "LAFOCUS:END"
 GUESTEOF
     ;;
   *)
-    echo "usage: $0 [clock|timer|dns|resolver|git-dns|git-dns-trace|github-ls-remote|github-clone|connect-timeout]"
+    echo "usage: $0 [clock|timer|dns|resolver|git-dns|git-dns-trace|github-ls-remote|github-clone|github-shallow-clone|connect-timeout]"
     exit 2
     ;;
 esac

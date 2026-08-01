@@ -36,14 +36,15 @@ impl<P: TxPlatform> CoreInit<P> {
     /// scores 0/N (libctest 0/220, lua 0/9 in the 2026-05-18
     /// scoreboard — see `docs/progress/SYSCALL_STATUS.md`).
     ///
-    /// **Order invariant:** must run after
-    /// [`Self::mount_sdcard_at_musl`] so `/musl/musl/busybox` is a
-    /// reachable target (symlink resolution happens at exec time,
-    /// not at symlink-creation time, so the order isn't strictly
-    /// required for the symlink to succeed — but if the target's
-    /// mount isn't yet attached the very first exec attempt fails,
-    /// not a later one). Runs after [`Self::mount_procfs_at_proc`]
-    /// so its sentinel comes first in the boot log.
+    /// **Order invariant (updated 2026-07-02):** must run after
+    /// [`Self::mount_sdcard_at_musl`] (so the `/musl/musl/busybox`
+    /// target is attachable) AND after
+    /// `register_initramfs_if_present` — the cpio's REAL
+    /// `/bin/busybox` must land first so these shims EEXIST-skip it.
+    /// Seeding the shims earlier made the initramfs unpack skip its
+    /// busybox, and boards without a block device (VF2 before the SD
+    /// driver) then resolved `/bin/busybox` to a dead `/musl` target
+    /// and lost the initramfs shell entirely.
     ///
     /// Failures are non-fatal — the helper logs a sentinel and
     /// returns. The kernel boots; the libctest / lua suites stay
@@ -102,13 +103,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // shebang shims above.
         match P::ARCH {
             tx_hal::Arch::Riscv64 => {
-                let lib_id = match mkdir_or_find(
-                    fs_ops,
-                    root_fs_object_id,
-                    b"lib",
-                    0o755,
-                    &cred,
-                ) {
+                let lib_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"lib", 0o755, &cred) {
                     Some(id) => id,
                     None => {
                         Self::write_board_sentinel_prefix();
@@ -139,20 +134,15 @@ impl<P: TxPlatform> CoreInit<P> {
                 );
             }
             tx_hal::Arch::LoongArch64 => {
-                let lib64_id = match mkdir_or_find(
-                    fs_ops,
-                    root_fs_object_id,
-                    b"lib64",
-                    0o755,
-                    &cred,
-                ) {
-                    Some(id) => id,
-                    None => {
-                        Self::write_board_sentinel_prefix();
-                        tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib64\n");
-                        return;
-                    }
-                };
+                let lib64_id =
+                    match mkdir_or_find(fs_ops, root_fs_object_id, b"lib64", 0o755, &cred) {
+                        Some(id) => id,
+                        None => {
+                            Self::write_board_sentinel_prefix();
+                            tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib64\n");
+                            return;
+                        }
+                    };
                 shims_ok &= symlink_into(
                     fs_ops,
                     lib64_id,
@@ -506,12 +496,9 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
             }
         };
 
-        // la64: the judged image's busybox has only 73 applets and no awk;
-        // the LTP shell library hard-depends on awk (timeout multiply,
-        // tst_net parsing), so every shell test died at
-        // "TWARN: timeout need to be >= 1" + instant watchdog kill. Ship a
-        // Txv2-built full-applet static busybox; the walk env's /bin
-        // install prefers it (see append_busybox_bin_install).
+        // la64's image busybox lacks applets (notably awk) required by the
+        // LTP shell helpers.  Keep main's full-applet fallback while retaining
+        // final-smp's surrounding mount/bootstrap ordering.
         #[cfg(target_arch = "loongarch64")]
         {
             static LA_BUSYBOX_FULL: &[u8] = include_bytes!(concat!(
@@ -531,9 +518,8 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
             }
         }
 
-        // Busybox-forwarded names. On rv64, cat/cut/grep are instead served
-        // by the tx-netfast multicall binary installed below (with execve
-        // fallback to busybox for any argv shape it does not model).
+        // On RV the hot-path cat/cut/grep applets are provided by tx-netfast
+        // below.  Other architectures retain the image busybox forwarding.
         #[cfg(target_arch = "riscv64")]
         let bb_forward_names: &[&[u8]] = &[
             b"arp",
@@ -561,21 +547,9 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
             let _ = symlink_into(fs_ops, tx_ltp_bin_id, name, b"/bin/busybox", &cred);
         }
 
-        // tx-netfast: freestanding static multicall fast-path binary
-        // (tools/netfast/netfast.c). Under TCG every busybox-sized
-        // fork+exec costs ~0.6-0.9s; the net_stress hot loops spawn 15-25
-        // of them per iteration (tst_rhost_run ns-exec chains, the
-        // awk-per-tst_iface pipelines, the ping/ip script shims that each
-        // stack a `sh` exec on top of busybox). The multicall binary
-        // serves the verified hot argv shapes in-process (~4 pages, ~60
-        // syscalls) and execve-falls-back to the previous handler for
-        // everything else: ping/ping6 -> ping.nf/ping6.nf (the netfilter
-        // state scripts installed below), ip -> ip.fallback (the prior ip
-        // script), the rest -> busybox. ping additionally understands
-        // `-f` flood, so tst_ping's flood probe succeeds and the 10ms
-        // per-packet `-i 0.01` floor disappears (score-neutral: tst_ping
-        // TPASSes per invocation, never per packet). rv64-only for now —
-        // la64 keeps the prior script/symlink layout.
+        // Main's RV multicall fast path is independent of final-smp's SMP
+        // correctness changes and must survive the merge.  Unsupported argv
+        // shapes fall back to the original scripts/busybox.
         #[cfg(target_arch = "riscv64")]
         {
             static TX_NETFAST: &[u8] = include_bytes!(concat!(
@@ -609,6 +583,7 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
                 );
             }
         }
+
         // `sysctl` is a thin shim: LTP tst_net setup does
         // `sysctl -qw net.ipv6.conf.<iface>.accept_dad=0`, and busybox sysctl
         // writing that key returns non-zero here (no per-iface DAD toggle file),
@@ -1196,9 +1171,6 @@ echo "--- $target ping statistics ---"
 echo "$count packets transmitted, $count packets received, 0% packet loss"
 exit 0
 "#;
-        // On rv64 the `ping`/`ping6` names are tx-netfast symlinks (real
-        // ICMP with -f flood); the netfilter-state script keeps owning the
-        // loopback/no-target/unknown-flag shapes via these fallback names.
         #[cfg(target_arch = "riscv64")]
         let (ping_script_name, ping6_script_name): (&[u8], &[u8]) = (b"ping.nf", b"ping6.nf");
         #[cfg(not(target_arch = "riscv64"))]
@@ -1739,9 +1711,6 @@ if [ \"$1\" = \"maddr\" ]; then\n\
     esac\n\
 fi\n\
 tx_ltp_exec \"$bb\" ip \"$@\"\n";
-        // On rv64 the `ip` name is a tx-netfast symlink (in-process hot
-        // forms); this script keeps owning everything else via the
-        // fallback name.
         #[cfg(target_arch = "riscv64")]
         let ip_script_name: &[u8] = b"ip.fallback";
         #[cfg(not(target_arch = "riscv64"))]

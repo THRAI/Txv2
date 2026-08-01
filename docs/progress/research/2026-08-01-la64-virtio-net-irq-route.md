@@ -49,6 +49,12 @@ and an HTTP/2-only bug.
   then expose the PCH input.
 - Enable virtio-pci network notifications only after `eth0` publication, using
   the existing deferred top-half/bottom-half completion protocol.
+- Emulate destructive claim semantics at the ExtIOI boundary. The first
+  presentation records software ownership without changing the proven route.
+  If the non-destructive pending bitmap presents that source again before
+  completion, acknowledge the duplicate and suppress its ExtIOI delivery line;
+  the original owner's `complete` restores delivery. This prevents a deferred
+  level-triggered IRQ from being published twice before its bottom half runs.
 - Pin LA64 block/net PCI slots to 1/2 in maintained launchers so the static
   board fact cannot drift with QEMU device ordering.
 - Extend the LA64 Git gate with the RV64-style opt-in IRQ counter assertion and
@@ -74,6 +80,15 @@ not move network semantics into HAL or IRQ context.
   `wrong-hart=0`, `missing-device=0`; serial
   `/tmp/verifygit-hIv6bt/serial.log`.
 - `cargo test -p xtask qemu`: 33/33; `cargo test -p xtask oscomp`: 2/2.
+
+Post-main-merge verification exposed one controller-semantics gap: ExtIOI's
+pending bitmap can present the same level source again before a deferred bottom
+half completes, unlike a destructive PLIC claim. The retained software logical
+claim gateway acknowledges and suppresses only that duplicate presentation.
+After the fix, the LA64 Git/IRQ gate passed 9/9 with 104 claims, 104
+completions, and zero wrong-hart or missing-device drains; both LA64 netperf
+lanes and both iperf lanes passed 22/22 in total. See
+`2026-08-01-main-merge-network-validation.md`.
 
 ## Next and blockers
 

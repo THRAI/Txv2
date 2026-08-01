@@ -52,7 +52,7 @@ use tx_subsystems::vfs::structure::OpenFileBacking;
 /// shape, freshly-resolved child rnodes do **not** carry a
 /// `with_containing_mount` weak — the walker tracks `current_fs_ops`
 /// internally via the parent dentry chain. Callers that need to
-/// dispatch through `FsOps::chmod_inode` etc. must ascend the dentry
+/// dispatch through `FsOps::step_chmod` etc. must ascend the dentry
 /// chain to find an rnode with the mount weak set (the mount root
 /// rnode, which `MountIdentity::new_cap` wires up).
 ///
@@ -74,13 +74,46 @@ use tx_subsystems::vfs::structure::OpenFileBacking;
 // arch-lint substring check (`#[allow(`) does not also fire.
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
-fn resolve_path_at<P: PmapIf>(
+/// Translate a dirfd into the root dentry for path resolution.
+/// `AT_FDCWD` resolves to the process's cwd; any other dirfd is
+/// looked up in the fd table and must reference a directory
+/// (`OpenFile::opendir_dentry()` carries the dentry for fds opened
+/// with `O_DIRECTORY`). Returns `EBADF` for closed/invalid fds and
+/// `ENOTDIR` for fds that aren't directories.
+fn resolve_cwd_for_path(dirfd: i32, path: &[u8], ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
+    // Keep the file-mode syscall family on the same Linux *at resolver as
+    // openat/statx/renameat: an absolute pathname is rooted at the process
+    // root and therefore never consults dirfd.
+    dirfd_anchor_errno(dirfd, path, ctx)
+}
+
+pub(super) fn resolve_path_at<P: PmapIf>(
     dirfd: i32,
     path: &[u8],
     cred: &Credential,
     ctx: &SyscallCtx<'_>,
 ) -> Result<Cap<DEntry>, i32> {
-    ResolvedPath::at(dirfd, path, cred, ctx).map(ResolvedPath::into_dentry)
+    let cwd: Cap<DEntry> = resolve_cwd_for_path(dirfd, path, ctx)?;
+    let guard = step_engine::guard();
+    // Uses `step_walk` (consuming `FsOps` via the direct
+    // `MountPayload::fs_ops` field) and matches the four-variant
+    // outcome. Errno routes back through the reverse `From` bridge so
+    // the existing `errno_to_i32` table stays the single source of truth.
+    use StepOutcome as V3;
+    let outcome = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
+        tx_subsystems::vfs::step_walk_in_mount_namespace(cwd, path, cred, &mnt_ns, &guard)
+    } else {
+        tx_subsystems::vfs::step_walk(cwd, path, cred, &guard)
+    };
+    let dentry = match outcome {
+        V3::Done(d) => d,
+        V3::Continue { .. } | V3::Yield { .. } => {
+            return Err(EIO_VALUE);
+        }
+        V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
+    };
+    drop(guard);
+    Ok(dentry)
 }
 
 /// Poll a walker future synchronously, panicking if it returns
@@ -116,7 +149,7 @@ pub(crate) fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F
     }
 }
 
-/// Translate an `Errno` from `chmod_inode` / `chown_inode` to the
+/// Translate an `Errno` from `step_chmod` / `step_chown` to the
 /// dispatched `-errno` magnitude. Mirrors the existing
 /// `errno_to_i32` table; the inline match keeps the file-mode arms
 /// readable (only the four errnos the FsOps surface produces are
@@ -148,12 +181,21 @@ pub(super) fn fs_change_errno_magnitude(errno: Errno) -> i32 {
 pub(super) fn fs_ops_for_dentry(
     dentry: &Cap<DEntry>,
 ) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
-    MountedDentry::find_ascending(dentry).map(|mounted| mounted.fs_ops())
+    let guard = step_engine::guard();
+    let mut cursor: Cap<DEntry> = dentry.clone();
+    loop {
+        if let Some(weak) = cursor.rnode().containing_mount_weak() {
+            if let Some(payload) = weak.upgrade(&guard) {
+                return Some(payload.fs_ops.clone());
+            }
+        }
+        cursor = cursor.parent_hint()?;
+    }
 }
 
 /// `fchmodat(dirfd, path, mode, flags)`. Linux RV64 generic ABI.
 ///
-/// Wraps `FsOps::chmod_inode` (Wave 3 Part 2). Permission failures
+/// Wraps `FsOps::step_chmod` (Wave 3 Part 2). Permission failures
 /// surface as `-EPERM`; read-only filesystems (e.g. devfs) return
 /// `-EROFS`. The `flags` argument (`AT_SYMLINK_NOFOLLOW`) is accepted
 /// silently — chmod doesn't follow symlinks at this layer in the
@@ -169,13 +211,12 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let rooted_at = match dirfd_anchor_errno(dirfd, &path, ctx) {
+    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -183,17 +224,15 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     let requested_mode = (mode & 0o7777) as u16;
 
     // Cred check at the syscall arm using ctx.cred_snapshot().
-    // Per-FS chmod_inode impls (tmpfs / devfs / bdevfs / procfs)
+    // Per-FS step_chmod impls (tmpfs / devfs / bdevfs / procfs)
     // also enforce the rule internally; this is defense-in-depth at
     // the canonical cred::checks::* seam per cred_service_v_1 §"Cred
     // owns credential semantics". When the per-FS check is removed
     // in a follow-up, this remains the single enforcement site.
-    let target_dentry =
-        match ResolvedPath::from_process_root(rooted_at.clone(), &path, &walker_cred, &ctx.process)
-        {
-            Ok(resolved) => resolved.into_dentry(),
-            Err(e) => return SyscallResult::Error(e),
-        };
+    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
     let target_meta = target_dentry.rnode().meta();
     if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, requested_mode)
     {
@@ -221,7 +260,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
 /// `fchmod(fd, mode)`. Linux RV64 generic ABI.
 ///
 /// Resolves the fd's rnode and applies the same authorization and
-/// `FsOps::chmod_inode` mutation path as `fchmodat`, without adding
+/// `FsOps::step_chmod` mutation path as `fchmodat`, without adding
 /// any path or symlink policy.
 pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallResult {
     let open_file = match ctx.process.fd(fd) {
@@ -269,7 +308,7 @@ fn chmod_mode_after_linux_fsetid_clear(
 
 /// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI.
 ///
-/// Wraps `FsOps::chown_inode` (Wave 3 Part 2). Each of `uid` / `gid`
+/// Wraps `FsOps::step_chown` (Wave 3 Part 2). Each of `uid` / `gid`
 /// decodes the `(u32) -1 == u32::MAX` "leave unchanged" sentinel to
 /// `Option::None` (same convention as `setre{u,g}id`'s
 /// `decode_uid_arg` / `decode_gid_arg`). Non-privileged callers may
@@ -286,26 +325,23 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     let walker_cred = ctx.walker_cred();
     let uid = decode_uid_arg(uid_arg).map(|u| u.0);
     let gid = decode_gid_arg(gid_arg).map(|g| g.0);
-    let rooted_at = match dirfd_anchor_errno(dirfd, &path, ctx) {
+    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
 
     // Cred check at the syscall arm using ctx.cred_snapshot(). Same
-    // defense-in-depth role as sys_fchmodat — per-FS chown_inode
+    // defense-in-depth role as sys_fchmodat — per-FS step_chown
     // impls also enforce the rule.
-    let target_dentry =
-        match ResolvedPath::from_process_root(rooted_at.clone(), &path, &walker_cred, &ctx.process)
-        {
-            Ok(resolved) => resolved.into_dentry(),
-            Err(e) => return SyscallResult::Error(e),
-        };
+    let target_dentry = match walk_from(rooted_at.clone(), &path, &walker_cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
     let target_meta = target_dentry.rnode().meta();
     if let Err(e) = cred_checks::authorize_chown(ctx.cred_snapshot(), &target_meta, uid, gid) {
         return SyscallResult::error_from(e);
@@ -332,7 +368,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
 /// `fchown(fd, uid, gid)`. Linux RV64 generic ABI.
 ///
 /// Resolves the fd's rnode and applies the same authorization,
-/// `(u32)-1` sentinel decoding, and `FsOps::chown_inode` mutation path
+/// `(u32)-1` sentinel decoding, and `FsOps::step_chown` mutation path
 /// as `fchownat`.
 pub(super) fn sys_fchown(
     fd: u32,
@@ -421,7 +457,6 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
@@ -442,16 +477,11 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
 
     // Resolve the path via AccessOp + drive_oneshot. Returns InodeMeta
     // for the DAC checks below.
-    let rooted_at = match dirfd_anchor_for_path(dirfd, &path, ctx) {
+    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
         Ok(d) => d,
-        Err(result) => return result,
+        Err(e) => return SyscallResult::Error(e),
     };
-    let inode_meta = if is_caller_dev_tty_path(&path, &rooted_at) {
-        match caller_dev_tty_stat_info(ctx) {
-            Ok((meta, _, _, _)) => meta,
-            Err(result) => return result,
-        }
-    } else {
+    let inode_meta = {
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = AccessOp {
             rooted_at: &rooted_at,
@@ -547,7 +577,6 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::OutOfMemory) => return SyscallResult::Error(ENOMEM_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
@@ -706,7 +735,16 @@ pub(super) fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 /// parent-hint chain to find the containing mount.  Used by
 /// `sys_mount` / `sys_umount2`.
 pub(super) fn mount_payload_for_dentry(dentry: &Cap<DEntry>) -> Option<Cap<MountPayload>> {
-    MountedDentry::find_ascending(dentry).map(MountedDentry::into_payload)
+    let guard = step_engine::guard();
+    let mut cursor = dentry.clone();
+    loop {
+        if let Some(weak) = cursor.rnode().containing_mount_weak() {
+            if let Some(payload) = weak.upgrade(&guard) {
+                return Some(payload);
+            }
+        }
+        cursor = cursor.parent_hint()?;
+    }
 }
 
 /// Walk `path` from `cwd` synchronously, returning the resolved
@@ -720,7 +758,15 @@ pub(super) fn walk_from(
     path: &[u8],
     cred: &Credential,
 ) -> Result<Cap<DEntry>, i32> {
-    ResolvedPath::from_root(cwd, path, cred).map(ResolvedPath::into_dentry)
+    let guard = step_engine::guard();
+    use StepOutcome as V3;
+    let outcome = step_walk(cwd, path, cred, &guard);
+    drop(guard);
+    match outcome {
+        V3::Done(d) => Ok(d),
+        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
+    }
 }
 
 pub(super) fn walk_from_process(
@@ -729,5 +775,59 @@ pub(super) fn walk_from_process(
     cred: &Credential,
     process: &Cap<ProcessIdentity>,
 ) -> Result<Cap<DEntry>, i32> {
-    ResolvedPath::from_process_root(cwd, path, cred, process).map(ResolvedPath::into_dentry)
+    let guard = step_engine::guard();
+    use StepOutcome as V3;
+    let outcome = if let Some(mnt_ns) = process.mount_namespace_cap() {
+        tx_subsystems::vfs::step_walk_in_mount_namespace(cwd, path, cred, &mnt_ns, &guard)
+    } else {
+        step_walk(cwd, path, cred, &guard)
+    };
+    drop(guard);
+    match outcome {
+        V3::Done(d) => Ok(d),
+        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
+    }
+}
+
+/// Resolve `path` without following its final symlink while honoring the
+/// caller's mount namespace. Namespace-removal operations need the terminal
+/// dentry itself both for POSIX no-follow semantics and to keep the victim's
+/// RNode/PageContainer alive until the namespace mutation has committed.
+pub(super) fn walk_from_nofollow_process(
+    cwd: Cap<DEntry>,
+    path: &[u8],
+    cred: &Credential,
+    process: &Cap<ProcessIdentity>,
+) -> Result<Cap<DEntry>, i32> {
+    use tx_subsystems::vfs::resolution::driver::{
+        walk_to_completion, walk_to_completion_with_mount_namespace,
+    };
+    use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, WalkMode};
+
+    let guard = step_engine::guard();
+    let resolved = if let Some(mnt_ns) = process.mount_namespace_cap() {
+        walk_to_completion_with_mount_namespace(
+            cwd,
+            path,
+            WalkMode::EntityUnfollowed,
+            FinalSymlinkPolicy::NoFollow,
+            cred,
+            Some(&mnt_ns),
+            &guard,
+        )
+    } else {
+        walk_to_completion(
+            cwd,
+            path,
+            WalkMode::EntityUnfollowed,
+            FinalSymlinkPolicy::NoFollow,
+            cred,
+            &guard,
+        )
+    };
+    drop(guard);
+    resolved
+        .map(|resolved| resolved.dentry)
+        .map_err(|errno| errno_to_i32(Errno::from(errno)))
 }

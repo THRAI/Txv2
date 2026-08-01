@@ -12,7 +12,8 @@ use crate::net::structure::{
 
 use super::{
     step_process_loopback_icmp_on_iface, step_process_loopback_tcp,
-    step_process_loopback_udp_on_iface, step_tcp_loopback_handshake_on_iface,
+    step_process_loopback_udp_on_iface, step_socket_close::finalize_tcp_close_if_complete,
+    step_tcp_loopback_handshake_on_iface,
 };
 
 pub const LOOPBACK_POLL_BUDGET_DEFAULT: LoopbackPollBudget = LoopbackPollBudget {
@@ -144,18 +145,26 @@ pub fn step_process_loopback_pending_in_namespace(
                 outcome.wakes_fired += connect.wakes_fired;
             }
             StepOutcome::Err(_) => outcome.tcp_connect_failed += 1,
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                outcome.tcp_connect_failed += 1
-            }
+            // Another CPU may own this flow's short handshake drive. It will
+            // publish CONNECT_DONE; contention is progress-in-flight, not a
+            // refused connection.
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {}
         }
     }
 
     // One TCP flow owns two connection-table entries, one for each endpoint.
     // Build an undirected flow list before applying the budget so a single
     // transfer (which already drives both raw sockets) consumes one slot.
+    let tcp_connections = table.snapshot_tcp_connections(guard);
+    // Closed/TimeWait sockets may have no immediate transport work.  Finalize
+    // them before filtering flows so deferred close cannot leak indefinitely.
+    for socket in &tcp_connections {
+        let _ = finalize_tcp_close_if_complete(socket, guard);
+    }
+
     let mut tcp_flows_seen = Vec::new();
     let mut tcp_flows = Vec::new();
-    for socket in table.snapshot_tcp_connections(guard) {
+    for socket in tcp_connections {
         let Some((local, remote)) = in_kernel_tcp_flow(&socket, table, guard) else {
             continue;
         };
@@ -189,6 +198,12 @@ pub fn step_process_loopback_pending_in_namespace(
                 outcome.tcp_transfer_failed += 1
             }
         }
+        // Processing either endpoint advances both raw TCP state machines.
+        // Recheck every table entry below as the closing endpoint need not be
+        // the representative selected for this undirected flow.
+    }
+    for socket in table.snapshot_tcp_connections(guard) {
+        let _ = finalize_tcp_close_if_complete(&socket, guard);
     }
     // A window can contain only idle flows while a later flow needs an ACK,
     // window update, retransmit, FIN, keepalive, or queued-data dispatch. Use

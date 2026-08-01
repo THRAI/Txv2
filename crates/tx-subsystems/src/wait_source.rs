@@ -22,6 +22,7 @@ use tx_substrate::wake::WaitEndpoint;
 use crate::adapter::step_engine::SpinMutex;
 use crate::adapter::wait_mailbox::{ActiveWait, InterestMask, TaskMailbox, WaitGeneration};
 use crate::adapter::wait_routing::{Mask, WaitOutcome};
+use crate::execution::WaitToken;
 
 #[derive(Clone)]
 enum RegisteredWaitSource {
@@ -112,6 +113,18 @@ pub fn register_wait_queue(queue: RawQueue) -> u64 {
     id
 }
 
+/// Register a level-triggered queue under an object-owned source id.
+///
+/// Page-backed waits deliberately pair this readiness predicate with a
+/// `WaitSource` carrying the same id: the queue closes the subscribe-after-
+/// completion race, while the WaitSource preserves owner-aware reactor wakeup.
+pub fn register_wait_queue_with_id(id: u64, queue: RawQueue) {
+    queue.set_source_id(tx_substrate::step::WaitSourceId::new(id));
+    REGISTRY
+        .lock()
+        .insert(id, RegisteredWaitSource::RawQueue(queue));
+}
+
 /// Register an edge-triggered port for wait-source resolution.
 pub fn register_wait_port(port: RawPort) -> u64 {
     let mut registry = REGISTRY.lock();
@@ -125,6 +138,14 @@ pub fn register_wait_port(port: RawPort) -> u64 {
     port.set_source_id(tx_substrate::step::WaitSourceId::new(id));
     registry.insert(id, RegisteredWaitSource::RawPort(port));
     id
+}
+
+/// Register an edge-triggered port under an object-owned source id.
+pub fn register_wait_port_with_id(id: u64, port: RawPort) {
+    port.set_source_id(tx_substrate::step::WaitSourceId::new(id));
+    REGISTRY
+        .lock()
+        .insert(id, RegisteredWaitSource::RawPort(port));
 }
 
 /// Drop the registry's clone of any wait source registered under `id`.
@@ -278,6 +299,13 @@ pub fn wait_on_registered_source_id(source_id: u64, interest: u64) -> Option<Reg
             })))
         }
     }
+}
+
+/// Compatibility bridge for subsystems that still carry a structured
+/// [`WaitToken`]. Resolution uses main's unified registered-source registry,
+/// so channel, raw-queue, and raw-port waits all preserve the same semantics.
+pub fn wait_on_token(token: WaitToken) -> Option<RegisteredWaitFuture> {
+    wait_on_registered_source_id(token.source_id(), token.interest())
 }
 
 impl Unpin for RegisteredWaitFuture {}

@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use tx_substrate::bus::RawPort;
 use tx_substrate::step::WaitSourceId;
 use tx_substrate::zone::PayloadCap;
@@ -23,6 +25,9 @@ pub struct SocketIdentity {
     pub readiness: SocketReadiness,
     pub wait_carriers: SocketWaitCarriers,
     pub urgent_port: RawPort,
+    /// User-visible fd-table entries referring to this socket's open-file
+    /// description. Capability clones are lifetime pins, not dup/fork fds.
+    fd_refs: AtomicU32,
     pub(crate) payload: SpinMutex<Option<PayloadCap<SocketPayload>>>,
 }
 
@@ -42,6 +47,7 @@ impl SocketIdentity {
             readiness,
             wait_carriers,
             urgent_port,
+            fd_refs: AtomicU32::new(1),
             payload: SpinMutex::new(None),
         }
     }
@@ -64,6 +70,29 @@ impl SocketIdentity {
 
     pub fn is_payload_live(&self) -> bool {
         self.live_payload().is_some()
+    }
+
+    pub(crate) fn incr_fd_ref(&self) {
+        self.fd_refs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn decr_fd_ref(&self) {
+        let mut current = self.fd_refs.load(Ordering::Acquire);
+        while current != 0 {
+            match self.fd_refs.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn fd_ref_count(&self) -> u32 {
+        self.fd_refs.load(Ordering::Acquire)
     }
 
     pub(crate) fn with_payload_for_check<R>(

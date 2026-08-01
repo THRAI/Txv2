@@ -117,10 +117,20 @@ where
 
         match op.step(ctx) {
             StepOutcome::Continue { progress } => {
+                let made_progress = !progress.is_empty();
                 emit_step_end(step_span, 0, &progress, 0, 0);
                 tx_observe::dump_registered_if_requested();
                 accumulated.extend(progress);
                 iteration = iteration.saturating_add(1);
+                // `Continue` is allowed to request an immediate retry only
+                // after making observable progress.  Retrying an empty step
+                // inline can monopolise a reactor worker and starve the
+                // service task whose completion the operation is polling
+                // (notably file writeback/fsync on a per-hart runtime).
+                // Create one scheduler boundary instead of busy-spinning.
+                if !made_progress {
+                    tx_reactor::yield_now().await;
+                }
             }
             StepOutcome::Yield { progress, shape } => {
                 let shape_kind = yield_shape_kind(&shape);
@@ -415,7 +425,7 @@ impl<'a, I: SubjectIdentity> InterruptView<'a, I> {
         };
         if I::thread_termination_in_force(thread) {
             SignalWake::Kill
-        } else if I::thread_deliverable_signal_pending(thread) {
+        } else if I::thread_signal_interrupts_wait(thread) {
             SignalWake::Interrupt
         } else {
             SignalWake::Retry
@@ -844,6 +854,14 @@ where
                         self.interrupt_state.classify_signal_wake(),
                     ));
                 }
+                self.mailbox.clear_waker();
+                return Poll::Ready(MailboxWake::Matched);
+            }
+            // Overflow means at least one wake hint was dropped.  The step
+            // predicate is the source of truth, so resolve this suspension and
+            // let drive() re-run the operation instead of spinning forever on
+            // a permanently latched overflow bit.
+            if self.mailbox.take_overflow() {
                 self.mailbox.clear_waker();
                 return Poll::Ready(MailboxWake::Matched);
             }

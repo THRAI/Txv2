@@ -31,10 +31,10 @@ use tx_hal::{
 const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{
-    CoreInit, console_tty, dev_mount, dev_shm_mount, publish_boot_mountpoint_dentry, root_mount,
+    console_tty, dev_mount, dev_shm_mount, publish_boot_mountpoint_dentry, root_mount, CoreInit,
 };
 
-use crate::adapter::step_engine::{self as step_engine, StepOutcome, guard, page_allocator};
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 /// Serialise every test in this module against the rest of tx-kernel's
 /// test set: they all touch the global `INIT_PROCESS` / mount / TTY
 /// slots plus the per-CPU epoch domain (which forbids guard nesting
@@ -495,7 +495,7 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
 }
 
 #[test]
-fn initial_userspace_sched_meta_stays_on_current_hart_when_boot_hart_is_nonzero() {
+fn userspace_sched_meta_exposes_online_harts_without_initial_migration() {
     let _serial = setup();
     TEST_CURRENT_CPU.store(3, Ordering::Release);
     TEST_ONLINE_CPUS.store(0b1111, Ordering::Release);
@@ -503,12 +503,80 @@ fn initial_userspace_sched_meta_stays_on_current_hart_when_boot_hart_is_nonzero(
     let meta = CoreInit::<TestPlatform>::userspace_thread_sched_meta();
 
     assert_eq!(
-        meta.affinity,
-        CpuMask::single(CpuId(3)).bits(),
-        "initial userspace stays on the submit hart until userspace handoff is migration-safe",
+        meta.affinity, 0b1111,
+        "the Linux affinity ABI exposes every online hart",
     );
     assert!(meta.userspace_thread);
     assert!(!meta.spread_on_submit);
+    assert_eq!(meta.migration, tx_reactor::MigrationPolicy::Pinned);
+
+    let child = CoreInit::<TestPlatform>::userspace_child_thread_sched_meta_for(CpuId(3));
+    assert_eq!(child.affinity, 0b1111);
+    assert!(child.userspace_thread);
+    assert!(child.spread_on_submit);
+    assert_eq!(child.migration, tx_reactor::MigrationPolicy::Pinned);
+}
+
+#[test]
+fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roots() {
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("", false),
+        Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=onsite", false),
+        Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=mmcblk0", false),
+        Some("mmcblk0")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sdcard", false),
+        Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=pretest", false),
+        None
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=busybox", false),
+        None
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot(
+            "tx.runsh=/musl/tx-run.sh console=ttyS0",
+            false,
+        ),
+        None
+    );
+    for compatibility_mode in [
+        "tx.boot.mode=oscomp",
+        "tx.boot.mode=ltp",
+        "tx.boot.mode=test",
+        "tx.oscomp.groups=netperf-musl",
+    ] {
+        assert_eq!(
+            CoreInit::<TestPlatform>::root_device_name_from_boot(compatibility_mode, false),
+            None,
+            "{compatibility_mode} needs the tmpfs-root shim layout"
+        );
+    }
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("", true),
+        None
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=vda", true),
+        Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot(
+            "tx.boot.mode=oscomp tx.root=vda",
+            false,
+        ),
+        Some("vda")
+    );
 }
 
 #[test]
@@ -592,7 +660,7 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
 /// RNode is a `StructBacked { Tty(...) }` for the boot console.
 #[test]
 fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, StructPayload, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking, StructPayload};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -631,7 +699,7 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
 
 #[test]
 fn boot_mountpoints_cross_by_namespace_dentry_identity_without_global_fallback() {
-    use tx_subsystems::vfs::{Credential, walker};
+    use tx_subsystems::vfs::{walker, Credential};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -723,7 +791,7 @@ fn boot_mountpoint_publication_returns_pre_cached_canonical_dentry() {
 /// (`docs/design/05_filesystem/BDEV_FS.md` §7.1).
 #[test]
 fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -759,7 +827,7 @@ fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
 
 #[test]
 fn boot_smoke_initramfs_busybox_is_openable_from_init_root() {
-    use tx_subsystems::vfs::{Credential, OpenFileFlags, RNodeBacking, walker};
+    use tx_subsystems::vfs::{walker, Credential, OpenFileFlags, RNodeBacking};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -841,7 +909,7 @@ fn boot_smoke_initramfs_busybox_is_openable_from_init_root() {
 /// publish a tmpfs mount over devfs's synthetic `/dev/shm` directory.
 #[test]
 fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -882,7 +950,7 @@ fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
 
 #[test]
 fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -952,8 +1020,8 @@ fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
 #[test]
 fn boot_wiring_mounts_writable_tmpfs_at_dev_shm_for_musl_shm_open() {
     use tx_shims::linux_syscall::{
-        AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_RDWR,
-        SyscallCtx, SyscallResult, dispatch,
+        dispatch, SyscallCtx, SyscallResult, AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_EXCL,
+        O_NOFOLLOW, O_NONBLOCK, O_RDWR,
     };
 
     let _serial = setup();

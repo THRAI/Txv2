@@ -6,14 +6,14 @@ extern crate std;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
-    DeadlineTimerIf, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf, IpiKind, IrqDispatchTable,
-    IrqHandled, IrqIf, KernelTrapSink, LocalExecutionGuard, MemoryRegion, MemoryRegionKind,
-    MmioFlags, MmioRegion, MonotonicCounterIf, ObserverIf, PercpuIf, PersistentClockError,
-    PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
-    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
-    PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
-    PtNodeAllocator, SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFramePlacement,
-    SignalFrameWrite, SignalHandlerRegs, SmpIf, TrapAction, TrapClass, TrapFrameMut,
+    CpuPinGuard, DeadlineTimerIf, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf,
+    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink,
+    LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr, PhysRange,
+    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
+    PmapPermissions, PmapReservation, PmapReservationIntermediates, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator, SavedSignalFrame, SecondaryEntry,
+    SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf, TrapAction, TrapClass, TrapFrameMut,
     TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext,
     UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
 };
@@ -22,15 +22,14 @@ pub use boot_args::capture_loongarch64_qemu_boot_args;
 use boot_facts::ensure_static_boot_facts;
 use la64_irq_trap::classify_la64_trap;
 pub use la64_irq_trap::{dispatch_trap_frame, return_to_userspace};
+pub(crate) use la64_percpu::la64_current_cpu_id;
 #[cfg(target_arch = "loongarch64")]
 use la64_pmap::la64_kernel_addr_to_phys;
 use la64_pmap::{la64_cached_virt, la64_uncached_virt, uart_put_byte, uart_try_get_byte};
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-#[cfg(not(target_arch = "loongarch64"))]
-use core::sync::atomic::AtomicU8;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
@@ -130,7 +129,9 @@ const QEMU_LA64_RTC_SIZE: usize = 0x100;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_FW_CFG_BASE: usize = 0x1e02_0000;
 const QEMU_LA64_FDT_BASE: usize = 0x0010_0000;
-const LA64_MAX_BOOT_CPUS: usize = 4;
+// Keep this in sync with the 12 per-hart boot stacks reserved by the linker
+// and with the QEMU evaluation profile (`-smp 12`).
+const LA64_MAX_BOOT_CPUS: usize = 12;
 #[cfg(target_arch = "loongarch64")]
 const LA64_DEFAULT_POSSIBLE_CPUS: usize = LA64_MAX_BOOT_CPUS;
 #[cfg(not(target_arch = "loongarch64"))]
@@ -139,7 +140,6 @@ const LA64_DMW_CACHED_BASE: usize = 0x9000_0000_0000_0000;
 const LA64_DMW_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
 const LA64_PHYS_ADDR_MASK: usize = (1usize << 48) - 1;
 const LA64_CSR_CRMD: usize = 0x00;
-#[cfg(target_arch = "loongarch64")]
 const LA64_CSR_EUEN: usize = 0x02;
 const LA64_CSR_ECFG: usize = 0x04;
 const LA64_CSR_EENTRY: usize = 0x0c;
@@ -160,8 +160,9 @@ const LA64_CRMD_IE: usize = 1 << 2;
 const LA64_CRMD_PG: usize = 1 << 4;
 const LA64_CRMD_DATF_CC: usize = 0b01 << 5;
 const LA64_CRMD_DATM_CC: usize = 0b01 << 7;
-#[cfg(target_arch = "loongarch64")]
 const LA64_EUEN_FPE: usize = 1 << 0;
+const LA64_EUEN_SXE: usize = 1 << 1;
+const LA64_EUEN_ASXE: usize = 1 << 2;
 const LA64_ASID_MASK: usize = 0x3ff;
 const LA64_TCFG_ENABLE: usize = 1 << 0;
 const LA64_TCFG_PERIODIC: usize = 1 << 1;
@@ -184,14 +185,19 @@ const LA64_ECODE_PME: usize = 4;
 const LA64_ECODE_PNR: usize = 5;
 const LA64_ECODE_PNX: usize = 6;
 const LA64_ECODE_PPI: usize = 7;
-const LA64_ECODE_ADEF: usize = 8;
-const LA64_ECODE_ADEM: usize = 9;
-const LA64_ECODE_ALE: usize = 10;
+// ADE is Ecode 8. ADEF/ADEM are its EsubCodes; ALE is Ecode 9.
+const LA64_ESTAT_ESUBCODE_SHIFT: usize = 22;
+const LA64_ESTAT_ESUBCODE_MASK: usize = 0x1ff;
+const LA64_ECODE_ADE: usize = 8;
+const LA64_ESUBCODE_ADEF: usize = 0;
+const LA64_ECODE_ALE: usize = 9;
 const LA64_ECODE_SYS: usize = 11;
 const LA64_ECODE_BRK: usize = 12;
 const LA64_ECODE_INE: usize = 13;
 const LA64_ECODE_IPE: usize = 14;
 const LA64_ECODE_FPD: usize = 15;
+const LA64_ECODE_SXD: usize = 16;
+const LA64_ECODE_ASXD: usize = 17;
 const LA64_USER_TOP: usize = 0x0000_4000_0000_0000;
 const LA64_PTE_PFN_MASK: u64 = ((1u64 << 48) - 1) & !((1u64 << 12) - 1);
 const LA64_PTE_V: u64 = 1 << 0;
@@ -253,12 +259,10 @@ static INSTALLED_PT_NODE_ALLOCATOR: AtomicUsize = AtomicUsize::new(0);
 static LA64_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
 static LA64_POSSIBLE_CPU_COUNT: AtomicUsize = AtomicUsize::new(LA64_DEFAULT_POSSIBLE_CPUS);
 static LA64_ONLINE_CPUS: AtomicU64 = AtomicU64::new(1);
-static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_CPU_PIN_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
 /// LA64 supports a 10-bit ASID space (`ASID_BITS = 10`, `LA64_ASID_MASK =
 /// 0x3ff`), i.e. 1024 ASIDs. The allocator must cover that whole space so that
@@ -271,22 +275,71 @@ const LA64_ASID_CAPACITY: usize = LA64_ASID_BITMAP_WORDS * u64::BITS as usize;
 static LA64_ALLOCATED_ASIDS: [AtomicU64; LA64_ASID_BITMAP_WORDS] =
     [const { AtomicU64::new(0) }; LA64_ASID_BITMAP_WORDS];
 static LA64_KERNEL_PGDH_PHYS: AtomicUsize = AtomicUsize::new(0);
-static LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED: AtomicBool = AtomicBool::new(false);
-static LA64_ACTIVE_PGDL: AtomicUsize = AtomicUsize::new(0);
-static LA64_ACTIVE_PGDH: AtomicUsize = AtomicUsize::new(0);
-static LA64_ACTIVE_ASID: AtomicUsize = AtomicUsize::new(0);
+const LA64_PGDH_BOOTSTRAP_UNINIT: u8 = 0;
+const LA64_PGDH_BOOTSTRAP_BUILDING: u8 = 1;
+const LA64_PGDH_BOOTSTRAP_READY: u8 = 2;
+/// One-time state for the shared high-half kernel mapping.
+///
+/// A boolean "done" flag is insufficient under SMP because two first users
+/// can concurrently mutate the same PGDH tree. BUILDING gives waiters an
+/// explicit lock-free progress state; a failed builder returns to UNINIT so a
+/// later caller can complete the partially materialised, still-valid tree.
+static LA64_KERNEL_PGDH_BOOTSTRAP_STATE: AtomicU8 = AtomicU8::new(LA64_PGDH_BOOTSTRAP_UNINIT);
+/// Sequence protecting each hart's software view of its hardware
+/// ASID/PGDL/PGDH transition. Even values are stable; odd values mean the hart
+/// is between publication and completion of a hardware pmap switch.
+static LA64_PMAP_SWITCH_SEQ: [AtomicU64; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_ACTIVE_PGDL: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_ACTIVE_PGDH: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_ACTIVE_ASID: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+/// Address-space transition published before hardware starts using a new
+/// PGDL.  Root teardown consults both this tuple and the active tuple so it
+/// can distinguish a live in-progress switch from a stale residency bit.
+static LA64_SWITCHING_PGDL: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_SWITCHING_ASID: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_ASID_RESIDENCY: [AtomicU64; LA64_ASID_CAPACITY] =
+    [const { AtomicU64::new(0) }; LA64_ASID_CAPACITY];
+/// Per-hart full-TLB shootdown mailbox.
+///
+/// LoongArch's board-level IPI is a maskable supervisor interrupt. Txv2 keeps
+/// CRMD.IE clear while executing syscall/fault handlers, so a sender must not
+/// rely exclusively on the interrupt trap to make progress. Request/completion
+/// generations let the target service the same mailbox either from its IPI
+/// handler or from an explicitly safe lock-contention point. Multiple senders
+/// naturally coalesce because every LA64 request currently performs INVTLB-all.
+static LA64_TLB_SHOOTDOWN_REQUESTED: [AtomicU64; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_TLB_SHOOTDOWN_COMPLETED: [AtomicU64; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_TLB_SHOOTDOWN_SERVICING: [AtomicBool; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicBool::new(false) }; LA64_MAX_BOOT_CPUS];
+/// CPUs which still accept new synchronous shootdown acquisitions.
+///
+/// This differs from scheduler online state during the short AP shutdown
+/// drain. A sender pins one target user across request publication and
+/// completion; an offlining CPU clears this mask first and waits for its user
+/// count to reach zero before disabling interrupts permanently.
+static LA64_TLB_ACCEPTING_CPUS: AtomicU64 = AtomicU64::new(1);
+static LA64_TLB_TARGET_USERS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
-const LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS: usize = 4096;
+/// Physical-address ownership registry for committed intermediate page-table
+/// nodes. Keep the capacity and lookup shape aligned with RV64: BuildStorm can
+/// keep thousands of address-space nodes live, and a linear 4096-entry scan
+/// under one global lock becomes both a capacity limit and an SMP bottleneck.
+const LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS: usize = 8192;
 static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry = La64CommittedPtNodeRegistry(
-    UnsafeCell::new([None; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]),
+    UnsafeCell::new([La64CommittedPtNodeEntry::Empty; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]),
 );
 #[cfg(target_arch = "loongarch64")]
-static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
+static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicBool::new(false) }; LA64_MAX_BOOT_CPUS];
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_KERNEL_TLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(target_arch = "loongarch64"))]
@@ -421,36 +474,16 @@ impl<T> PerHartCell<T> {
 }
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-static LA64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; LA64_MAX_BOOT_CPUS] = [
+static LA64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; LA64_MAX_BOOT_CPUS] = [const {
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
         r21: 0,
         tp: 0,
         r22: [0; 10],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        r21: 0,
-        tp: 0,
-        r22: [0; 10],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        r21: 0,
-        tp: 0,
-        r22: [0; 10],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        r21: 0,
-        tp: 0,
-        r22: [0; 10],
-    }),
-];
+    })
+};
+    LA64_MAX_BOOT_CPUS];
 
 const LA64_TRAP_STACK_SIZE: usize = 16 * 1024;
 
@@ -458,12 +491,8 @@ const LA64_TRAP_STACK_SIZE: usize = 16 * 1024;
 pub struct La64TrapStack(pub [u8; LA64_TRAP_STACK_SIZE]);
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-static LA64_TRAP_STACKS: [PerHartCell<La64TrapStack>; LA64_MAX_BOOT_CPUS] = [
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-];
+static LA64_TRAP_STACKS: [PerHartCell<La64TrapStack>; LA64_MAX_BOOT_CPUS] =
+    [const { PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])) }; LA64_MAX_BOOT_CPUS];
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_trap_stack_top_for_cpu(cpu: CpuId) -> usize {
@@ -477,6 +506,27 @@ pub(crate) fn la64_trap_stack_top_for_cpu(cpu: CpuId) -> usize {
     {
         stack as usize + LA64_TRAP_STACK_SIZE
     }
+}
+
+#[inline]
+pub(crate) fn la64_current_stack_is_trap_stack() -> bool {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let sp: usize;
+        unsafe {
+            core::arch::asm!(
+                "move {sp}, $sp",
+                sp = out(reg) sp,
+                options(nomem, nostack)
+            );
+        }
+        let cpu = <Platform as SmpIf>::current_cpu_id();
+        let top = la64_trap_stack_top_for_cpu(cpu);
+        return (top.saturating_sub(LA64_TRAP_STACK_SIZE)..top).contains(&sp);
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    false
 }
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
@@ -494,12 +544,8 @@ pub(crate) fn la64_kernel_resume_ctx_ptr_for_cpu(cpu: CpuId) -> *mut KernelResum
 }
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-static LA64_ENTRY_TRAP_FRAMES: [PerHartCell<La64TrapFrame>; LA64_MAX_BOOT_CPUS] = [
-    PerHartCell::new(La64TrapFrame::empty()),
-    PerHartCell::new(La64TrapFrame::empty()),
-    PerHartCell::new(La64TrapFrame::empty()),
-    PerHartCell::new(La64TrapFrame::empty()),
-];
+static LA64_ENTRY_TRAP_FRAMES: [PerHartCell<La64TrapFrame>; LA64_MAX_BOOT_CPUS] =
+    [const { PerHartCell::new(La64TrapFrame::empty()) }; LA64_MAX_BOOT_CPUS];
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFrame {
@@ -516,10 +562,17 @@ pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFram
 }
 
 struct La64CommittedPtNodeRegistry(
-    UnsafeCell<[Option<PtNode>; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]>,
+    UnsafeCell<[La64CommittedPtNodeEntry; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]>,
 );
 
 unsafe impl Sync for La64CommittedPtNodeRegistry {}
+
+#[derive(Clone, Copy)]
+enum La64CommittedPtNodeEntry {
+    Empty,
+    Tombstone,
+    Occupied(PtNode),
+}
 
 struct La64CommittedPtNodeRegistryGuard;
 
@@ -785,7 +838,7 @@ fn la64_set_fpu_enabled(enabled: bool) {
     if enabled {
         euen |= LA64_EUEN_FPE;
     } else {
-        euen &= !LA64_EUEN_FPE;
+        euen &= !(LA64_EUEN_FPE | LA64_EUEN_SXE | LA64_EUEN_ASXE);
     }
     la64_irq_trap::write_la64_csr(LA64_CSR_EUEN, euen);
 }
@@ -1137,7 +1190,7 @@ impl PlatformConfig for Platform {
     const DIRECT_MAP_SIZE: usize = QEMU_LA64_DIRECT_MAP_SIZE;
     const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(la64_cached_virt(QEMU_LA64_KERNEL_LOAD_BASE));
     const USER_TOP: VirtAddr = VirtAddr(LA64_USER_TOP);
-    const KERNEL_STACK_SIZE: usize = 128 * 1024;
+    const KERNEL_STACK_SIZE: usize = 512 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 4;
     const ASID_BITS: u8 = 10;
@@ -1149,8 +1202,10 @@ impl BootPlatformIf for Platform {
     const BOOT_PROTOCOL: BootProtocol = BootProtocol::LoongArchFirmware;
 
     fn boot_handoff(cpu_id: usize, firmware_arg: usize) -> BootHandoff {
-        boot_args::record_legacy_firmware_arg(firmware_arg);
-        ensure_static_boot_facts();
+        // la 比 riscv 少一步"建引导页表":龙芯有 DMW 硬件直映射窗口(见 boot_asm.rs),
+        // 早期汇编已设好,内核靠硬件窗口即可访问物理内存,无需软件页表。
+        boot_args::record_legacy_firmware_arg(firmware_arg); // 记下固件参数(la 固件约定,供后续取用)
+        ensure_static_boot_facts(); // 采集并发布 BootInfo/PlatformInfo(等价 riscv 的发布步)
 
         BootHandoff {
             cpu_id: CpuId(cpu_id),
@@ -1211,6 +1266,7 @@ mod boot_firmware;
 mod boot_smp;
 mod dtb;
 mod la64_irq_trap;
+mod la64_percpu;
 mod la64_pmap;
 mod la64_unaligned;
 mod platform_impls;

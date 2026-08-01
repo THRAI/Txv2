@@ -170,8 +170,8 @@ fn vfs_rnode_fire_wait_uses_injected_mailbox_ref_post() {
     let rnode = make_rnode(9101);
     let read_id = rnode.read_wait_source_id();
     let write_id = rnode.write_wait_source_id();
-    let read_source: Arc<WaitSource> = rnode.read_wait_source().clone();
-    let write_source: Arc<WaitSource> = rnode.write_wait_source().clone();
+    let read_source: Arc<WaitSource> = rnode.read_endpoint();
+    let write_source: Arc<WaitSource> = rnode.write_endpoint();
     let reader_mb = Arc::new(TaskMailbox::new());
     let writer_mb = Arc::new(TaskMailbox::new());
     let (_reader_guard, reader_gen) = register(&read_source, &reader_mb, VFS_READABLE);

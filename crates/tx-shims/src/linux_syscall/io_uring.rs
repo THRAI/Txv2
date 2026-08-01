@@ -61,8 +61,8 @@ use tx_subsystems::io_uring::{
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 
-use super::{next_stdio_fd_below_nofile, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
 use super::{SyscallCtx, SyscallResult};
+use super::{EBADF_VALUE, EINVAL_VALUE, EMFILE_VALUE, ENOMEM_VALUE};
 use crate::adapter::step_engine::SpinMutex;
 
 const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
@@ -165,11 +165,9 @@ pub(super) fn sys_io_uring_setup(
     };
 
     // Install at the lowest free fd.
-    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(result) => return result,
+    let Some(fd) = ctx.process.install_new_fd(open_cap, false) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(fd, open_cap);
 
     SyscallResult::Return(fd as i64)
 }

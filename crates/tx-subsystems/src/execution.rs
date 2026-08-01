@@ -18,13 +18,29 @@ pub type KernelResult<T> = Result<T, Errno>;
 pub struct WaitToken {
     source_id: u64,
     interest: u64,
+    observed_generation: u64,
 }
 
 impl WaitToken {
+    const NO_OBSERVED_GENERATION: u64 = u64::MAX;
+
     pub const fn new(source_id: u64, interest: u64) -> Self {
         Self {
             source_id,
             interest,
+            observed_generation: Self::NO_OBSERVED_GENERATION,
+        }
+    }
+
+    pub(crate) const fn with_observed_generation(
+        source_id: u64,
+        interest: u64,
+        observed_generation: u64,
+    ) -> Self {
+        Self {
+            source_id,
+            interest,
+            observed_generation,
         }
     }
 
@@ -34,6 +50,14 @@ impl WaitToken {
 
     pub const fn interest(self) -> u64 {
         self.interest
+    }
+
+    pub(crate) const fn observed_generation(self) -> Option<u64> {
+        if self.observed_generation == Self::NO_OBSERVED_GENERATION {
+            None
+        } else {
+            Some(self.observed_generation)
+        }
     }
 }
 

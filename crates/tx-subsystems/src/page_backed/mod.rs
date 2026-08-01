@@ -43,7 +43,7 @@ use crate::io_manager::page::{
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
 };
-use crate::mount::{MountPayloadBackendContext, MountPayloadPin};
+use crate::mount::{FsObjectPin, MountPayloadBackendContext, MountPayloadPin};
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::{Ppn, UserPtr};
@@ -65,7 +65,7 @@ pub use direct_io::{
     DirectIoBuffer, DirectIoBufferError, DirectIoCompletion, DirectIoOperation, DirectIoSubmission,
     DirectIoWaitableSubmission,
 };
-pub use fs_page_backing::FsPageBacking;
+pub use fs_page_backing::{FilesystemStats, FsPageBacking};
 pub use fsync_submission::FsyncSubmissionState;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
 pub use range::{
@@ -91,8 +91,10 @@ static PAGE_CONTAINER_ZONE: Zone<PageContainer> = Zone::const_new();
 static PAGE_CONTAINER_RECLAIM_REGISTRY: SpinMutex<alloc::vec::Vec<Weak<PageContainer>>> =
     SpinMutex::new(alloc::vec::Vec::new());
 
-const PAGE_CACHE_RECLAIM_BATCH: usize = 256;
-const PAGE_CACHE_RECLAIM_LOW_WATERMARK: usize = 1024;
+const PAGE_CACHE_RECLAIM_MIN_BATCH: usize = 256;
+const PAGE_CACHE_RECLAIM_MAX_BATCH: usize = 4096;
+const PAGE_CACHE_RECLAIM_MIN_WATERMARK: usize = 1024;
+const PAGE_CACHE_RECLAIM_MAX_WATERMARK: usize = 128 * 1024;
 
 unsafe impl ZoneAllocated for PageContainer {
     fn zone() -> &'static Zone<Self> {
@@ -165,6 +167,9 @@ pub(crate) struct PageCacheEntry {
     ppn: Ppn,
     pin: PageCachePin,
     marks: PageMarks,
+    /// Monotonic content generation used to reject stale writeback
+    /// completions when a page is dirtied again during I/O.
+    dirty_generation: u64,
 }
 
 impl PageCacheEntry {
@@ -176,6 +181,7 @@ impl PageCacheEntry {
                 referenced: true,
                 ..PageMarks::new()
             },
+            dirty_generation: 0,
         }
     }
 }
@@ -206,6 +212,7 @@ impl core::fmt::Debug for PageCacheEntry {
             .field("ppn", &self.ppn)
             .field("pin", &self.pin)
             .field("marks", &self.marks)
+            .field("dirty_generation", &self.dirty_generation)
             .finish()
     }
 }
@@ -356,8 +363,24 @@ impl PageCacheIndex {
     }
 
     fn mark_dirty(&mut self, page: PageIndex) -> Result<(), PageCacheError> {
-        self.set_mark(page, PageCacheMark::Dirty)?;
-        self.set_mark(page, PageCacheMark::Referenced)
+        let entry = self.load_mut(page).ok_or(PageCacheError::MissingPage)?;
+        entry.dirty_generation = entry.dirty_generation.wrapping_add(1);
+        entry.marks.dirty = true;
+        entry.marks.referenced = true;
+        Ok(())
+    }
+
+    fn mark_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn) -> Result<(), PageCacheError> {
+        let Some(entry) = self.load_mut(page) else {
+            return Err(PageCacheError::MissingPage);
+        };
+        if entry.ppn != ppn {
+            return Err(PageCacheError::MismatchedFrame { current: entry.ppn });
+        }
+        entry.dirty_generation = entry.dirty_generation.wrapping_add(1);
+        entry.marks.dirty = true;
+        entry.marks.referenced = true;
+        Ok(())
     }
 
     fn reclaim_clean_pages(&mut self, budget: usize) -> usize {
@@ -564,6 +587,14 @@ pub struct FileFsyncState {
     wait: Option<notification::PageReadyWait>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileIoServiceDiagnostic {
+    pub page: crate::io_manager::page::service::PageServiceDiagnostic,
+    pub fsync_submissions: usize,
+    pub block_queue: usize,
+    pub background_graphs: usize,
+}
+
 impl FileFsyncState {
     pub const fn new() -> Self {
         Self {
@@ -715,8 +746,13 @@ impl MaterializedPageSnapshot {
 #[derive(Debug)]
 pub struct PageContainer {
     kind: PageContainerKind,
+    _object_pin: Option<FsObjectPin>,
     page_count: u64,
     size_bytes: AtomicU64,
+    /// Logical-size generations are separate from page generations because a
+    /// truncate or sparse extension may change EOF without dirtying a page.
+    size_generation: AtomicU64,
+    persisted_size_generation: AtomicU64,
     state: PageContainerStateCell,
 }
 
@@ -1017,12 +1053,42 @@ fn record_map_pin_for_test() {
 }
 
 impl PageContainer {
+
+    /// Whether this container has a live L4/L6 file-I/O runtime attached.
+    ///
+    /// Merely having a file-backed PageContainer is not enough to use its
+    /// asynchronous submission queues: legacy/final-smp ext4 mounts perform
+    /// synchronous backing operations and deliberately install no service
+    /// runtime. Callers must fall back to `FsPageBacking` in that case.
+    pub fn has_file_io_service_runtime(&self) -> bool {
+        self.state.lock().file_io_wake.is_some()
+    }
+
+    pub fn file_io_service_diagnostic(&self) -> FileIoServiceDiagnostic {
+        let state = self.state.lock();
+        FileIoServiceDiagnostic {
+            page: state.file_io_service.diagnostic(),
+            fsync_submissions: state.fsync_submissions.len(),
+            block_queue: state.file_block_runtime.queue.len(),
+            background_graphs: state.background_graphs.len(),
+        }
+    }
     pub fn new(kind: PageContainerKind, page_count: u64) -> Self {
         let capacity = page_count.saturating_mul(crate::vm::USER_PAGE_SIZE as u64);
+        let object_pin = match &kind {
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            } => Some(FsObjectPin::from_mount_pin(mount.clone(), *fs_object_id)),
+            _ => None,
+        };
         Self {
             kind,
+            _object_pin: object_pin,
             page_count,
             size_bytes: AtomicU64::new(capacity),
+            size_generation: AtomicU64::new(0),
+            persisted_size_generation: AtomicU64::new(0),
             state: PageContainerStateCell::new(PageContainerState {
                 pages: PageCacheIndex::new(),
                 file_page_slots: BTreeMap::new(),
@@ -1048,7 +1114,14 @@ impl PageContainer {
         kind: PageContainerKind,
         page_count: u64,
     ) -> Result<Cap<PageContainer>, ZoneError> {
-        step_engine::sign(Self::new(kind, page_count))
+        let reclaimable_file = matches!(&kind, PageContainerKind::File { .. });
+        let container = step_engine::sign(Self::new(kind, page_count))?;
+        if reclaimable_file {
+            PAGE_CONTAINER_RECLAIM_REGISTRY
+                .lock()
+                .push(container.downgrade());
+        }
+        Ok(container)
     }
 
     pub fn new_file_cap(
@@ -1069,10 +1142,7 @@ impl PageContainer {
             },
             page_count,
         )?;
-        container.set_size_bytes(size_bytes);
-        PAGE_CONTAINER_RECLAIM_REGISTRY
-            .lock()
-            .push(container.downgrade());
+        container.set_size_bytes_persisted(size_bytes);
         Ok(container)
     }
 
@@ -1090,6 +1160,26 @@ impl PageContainer {
 
     pub fn resident_pages(&self) -> usize {
         self.state.lock().pages.len()
+    }
+
+    pub fn diagnostic_page_counts(&self) -> (usize, usize, usize) {
+        let state = self.state.lock();
+        let resident = state.pages.pages.len();
+        let dirty = state
+            .pages
+            .pages
+            .values()
+            .filter(|entry| entry.get_mark(PageCacheMark::Dirty))
+            .count();
+        (resident, dirty, state.in_flight_file_pages.len())
+    }
+
+    pub(crate) fn mark_completed_write(
+        &self,
+        page: PageIndex,
+        ppn: Ppn,
+    ) -> Result<(), PageCacheError> {
+        self.state.lock().pages.mark_dirty_if_match(page, ppn)
     }
 
     fn io_manager_key(&self) -> PageContainerKey {
@@ -1680,6 +1770,14 @@ impl PageContainer {
     /// visibility writeback, but only an explicit fsync owns a durability
     /// frontier and waits for its journal commit.
     pub fn queue_dirty_file_writeback(&self) -> usize {
+        // Close is a fire-and-forget caller.  Without a service runtime there
+        // is nobody to consume this queue, so leave the page Dirty for the
+        // synchronous backing path instead of manufacturing permanent
+        // Writeback state.  Explicit low-level submissions remain usable by
+        // tests and manually-driven runtimes.
+        if !self.has_file_io_service_runtime() {
+            return 0;
+        }
         let Some(frontier) = self.snapshot_file_fsync_frontier() else {
             return 0;
         };
@@ -3077,6 +3175,12 @@ impl PageContainer {
             }
 
             let fetch_id = state.allocate_file_fetch_id();
+            if let Some(wait) = state.file_page_waits.get(&page) {
+                // A retained page wait may still carry the completion bit from
+                // the preceding fetch generation. Clear it while holding the
+                // same state lock that publishes the new owner.
+                notification::reset_page_ready(wait);
+            }
             let generation = match state.file_page_slots.entry(page).or_default().begin_fetch() {
                 PageSlotFetch::Owner { generation }
                 | PageSlotFetch::Joined { generation }
@@ -3410,6 +3514,9 @@ impl PageContainer {
     }
 
     fn check_bounds(&self, page: PageIndex) -> Result<(), PageCacheError> {
+        if matches!(self.kind, PageContainerKind::File { .. }) {
+            return Ok(());
+        }
         if page.as_u64() >= self.page_count {
             return Err(PageCacheError::OutOfBounds);
         }
@@ -3417,12 +3524,44 @@ impl PageContainer {
     }
 
     fn byte_capacity(&self) -> Option<u64> {
+        if matches!(self.kind, PageContainerKind::File { .. }) {
+            return Some(u64::MAX);
+        }
         self.page_count
             .checked_mul(crate::vm::USER_PAGE_SIZE as u64)
     }
 
     pub fn set_size_bytes(&self, size: u64) {
+        let previous = self.size_bytes.swap(size, Ordering::AcqRel);
+        if previous != size && matches!(self.kind, PageContainerKind::File { .. }) {
+            self.size_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Publish an EOF already committed by the backing filesystem.
+    pub fn set_size_bytes_persisted(&self, size: u64) {
         self.size_bytes.store(size, Ordering::Release);
+        let generation = self.size_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.persisted_size_generation
+            .store(generation, Ordering::Release);
+    }
+
+    fn size_writeback_snapshot(&self) -> (u64, u64, bool) {
+        loop {
+            let generation = self.size_generation.load(Ordering::Acquire);
+            let size = self.size_bytes();
+            if self.size_generation.load(Ordering::Acquire) == generation {
+                let persisted = self.persisted_size_generation.load(Ordering::Acquire);
+                return (size, generation, generation != persisted);
+            }
+        }
+    }
+
+    fn acknowledge_size_if_match(&self, generation: u64) {
+        if self.size_generation.load(Ordering::Acquire) == generation {
+            self.persisted_size_generation
+                .store(generation, Ordering::Release);
+        }
     }
 
     fn grow_size_to(&self, new_size: u64) {
@@ -3434,7 +3573,12 @@ impl PageContainer {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    if matches!(self.kind, PageContainerKind::File { .. }) {
+                        self.size_generation.fetch_add(1, Ordering::AcqRel);
+                    }
+                    break;
+                }
                 Err(current) => observed = current,
             }
         }
@@ -3674,7 +3818,7 @@ pub fn reserve_frame_with_reclaim(
     match page_allocator::reserve_frame(policy) {
         Ok(frame) => Ok(frame),
         Err(AllocError::Exhausted) => {
-            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH);
+            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_MAX_BATCH);
             page_allocator::reserve_frame(policy)
         }
         Err(error) => Err(error),
@@ -3682,12 +3826,21 @@ pub fn reserve_frame_with_reclaim(
 }
 
 pub fn reclaim_clean_file_pages_if_low() -> usize {
-    match page_allocator::free_count() {
-        Ok(free) if free <= PAGE_CACHE_RECLAIM_LOW_WATERMARK => {
-            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH)
-        }
-        _ => 0,
+    let (Ok(free), Ok(total)) = (page_allocator::free_count(), page_allocator::total_count())
+    else {
+        return 0;
+    };
+    let watermark = (total / 8).clamp(
+        PAGE_CACHE_RECLAIM_MIN_WATERMARK,
+        PAGE_CACHE_RECLAIM_MAX_WATERMARK,
+    );
+    if free > watermark {
+        return 0;
     }
+    let deficit = watermark.saturating_sub(free).saturating_add(1);
+    reclaim_clean_file_pages(
+        deficit.clamp(PAGE_CACHE_RECLAIM_MIN_BATCH, PAGE_CACHE_RECLAIM_MAX_BATCH),
+    )
 }
 
 pub fn reclaim_clean_file_pages(budget: usize) -> usize {

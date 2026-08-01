@@ -382,6 +382,33 @@ pub(crate) fn drive_loopback_pending() {
     );
 }
 
+pub(crate) fn socket_poll_mask_from_file(
+    file: &Cap<OpenFile>,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Option<Result<PollMask, Errno>> {
+    let socket = socket_identity_from_file(file).ok()?;
+    Some(match tx_subsystems::net::step_poll_ready(&socket, guard) {
+        StepOutcome::Done(mask) => Ok(mask),
+        StepOutcome::Err(errno) => Err(errno),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
+    })
+}
+
+pub(crate) fn socket_poll_wait_token_from_file(
+    file: &Cap<OpenFile>,
+    interests: PollMask,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Option<Result<Option<tx_subsystems::execution::WaitToken>, Errno>> {
+    let socket = socket_identity_from_file(file).ok()?;
+    Some(
+        match tx_subsystems::net::step_poll_wait_token(&socket, interests, guard) {
+            StepOutcome::Done(token) => Ok(token),
+            StepOutcome::Err(errno) => Err(errno),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
+        },
+    )
+}
+
 pub(super) fn recv_ready_mask(mask: PollMask) -> bool {
     mask.intersects(PollMask::IN | PollMask::ERR | PollMask::HUP | PollMask::RDHUP)
 }

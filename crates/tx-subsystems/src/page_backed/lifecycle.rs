@@ -15,23 +15,23 @@ impl PageCacheIndex {
         self.erase_from(first);
     }
 
-    fn dirty_pages(&self) -> Vec<(PageIndex, Ppn)> {
+    fn dirty_pages(&self) -> Vec<(PageIndex, Ppn, u64)> {
         if !self.marked(PageCacheMark::Dirty) {
             return Vec::new();
         }
         self.collect_marked(PageCacheMark::Dirty)
             .into_iter()
-            .map(|(page, entry)| (page, entry.ppn))
+            .map(|(page, entry)| (page, entry.ppn, entry.dirty_generation))
             .collect()
     }
 
-    fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn) {
-        let Some(entry) = self.load(page) else {
+    fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn, dirty_generation: u64) {
+        let Some(entry) = self.load_mut(page) else {
             return;
         };
-        if entry.ppn == ppn {
-            let _ = self.clear_mark(page, PageCacheMark::Dirty);
-            let _ = self.clear_mark(page, PageCacheMark::Writeback);
+        if entry.ppn == ppn && entry.dirty_generation == dirty_generation {
+            entry.marks.dirty = false;
+            entry.marks.writeback = false;
         }
     }
 }
@@ -57,12 +57,15 @@ impl PageContainer {
         }
     }
 
-    fn dirty_pages_snapshot(&self) -> Vec<(PageIndex, Ppn)> {
+    fn dirty_pages_snapshot(&self) -> Vec<(PageIndex, Ppn, u64)> {
         self.state.lock().pages.dirty_pages()
     }
 
-    fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn) {
-        self.state.lock().pages.clear_dirty_if_match(page, ppn);
+    fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn, dirty_generation: u64) {
+        self.state
+            .lock()
+            .pages
+            .clear_dirty_if_match(page, ppn, dirty_generation);
     }
 
     fn begin_synchronous_writeback(
@@ -109,13 +112,12 @@ impl PageContainer {
     ) -> Result<(), Errno> {
         let mut state = self.state.lock();
         let slot = state.file_page_slots.get(&page).ok_or(Errno::EIO)?;
-        let snapshot = slot
-            .complete_writeback(generation, Ok(()))
+        slot.complete_writeback(generation, Ok(()))
             .map_err(|_| Errno::EIO)?;
         let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
-        if matches!(snapshot.state, PageSlotState::Resident { .. }) {
-            let _ = state.pages.clear_mark(page, PageCacheMark::Dirty);
-        }
+        // Keep Dirty until the file-level fsync succeeds. The page data has
+        // reached the backend here, but clearing it before the durability
+        // frontier would lose the retry signal when fsync fails.
         Ok(())
     }
 
@@ -178,8 +180,10 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         return V3::done(());
     };
 
+    let dirty_pages = pc.dirty_pages_snapshot();
+    let (size, size_generation, size_dirty) = pc.size_writeback_snapshot();
     let mut pages_so_far: u32 = 0;
-    for (page, ppn) in pc.dirty_pages_snapshot() {
+    for (page, ppn, dirty_generation) in dirty_pages.iter().copied() {
         let admission = pc.begin_synchronous_writeback(page, ppn);
         if matches!(admission, SynchronousWritebackAdmission::Busy) {
             let progress = if pages_so_far == 0 {
@@ -209,7 +213,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
                         }
                     }
                     SynchronousWritebackAdmission::Legacy => {
-                        pc.clear_dirty_if_match(page, ppn);
+                        pc.clear_dirty_if_match(page, ppn, dirty_generation);
                     }
                     SynchronousWritebackAdmission::Busy => unreachable!(),
                 }
@@ -256,8 +260,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
     // Persist the logical size once data blocks are written back:
     // `flush_page` writes data only, so without this a fresh reopen
     // sees the inode's stale (create-time) size and reads zero bytes.
-    if pages_so_far > 0 {
-        let size = pc.size_bytes();
+    if !dirty_pages.is_empty() || size_dirty {
         match mount
             .payload()
             .fs_page_backing
@@ -283,12 +286,18 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
     }
 
-    match mount
+    let fsync_outcome = mount
         .payload()
         .fs_page_backing
-        .fsync_file(*fs_object_id, guard)
-    {
-        V3::Done(()) => V3::done(()),
+        .fsync_file(*fs_object_id, guard);
+    match fsync_outcome {
+        V3::Done(()) => {
+            for (page, ppn, dirty_generation) in dirty_pages {
+                pc.clear_dirty_if_match(page, ppn, dirty_generation);
+            }
+            pc.acknowledge_size_if_match(size_generation);
+            V3::done(())
+        }
         V3::Continue { progress: _ } => {
             let progress = if pages_so_far == 0 {
                 PageProgress::EMPTY
@@ -420,7 +429,7 @@ pub fn step_truncate(
     };
 
     let old_size = pc.size_bytes();
-    pc.set_size_bytes(new_size);
+    pc.set_size_bytes_persisted(new_size);
 
     if new_size < old_size {
         let Some(first_drop) = first_page_after_size(new_size) else {
@@ -494,7 +503,7 @@ pub fn step_fallocate(
         PageContainerKind::Device { .. } => false,
     };
 
-    pc.set_size_bytes(new_size);
+    pc.set_size_bytes_persisted(new_size);
 
     if fs_advanced {
         V3::continue_with(PageProgress::EMPTY)
@@ -514,7 +523,7 @@ pub fn step_fallocate(
 // the `*Op` types incrementally.
 
 /// `StepOp` wrap of [`step_fsync`].
-#[allow(dead_code)]// txdoc:pr2-step-op-scaffold
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FsyncOp<'a> {
     pub pc: &'a PageContainer,
     state: FileFsyncState,
@@ -539,7 +548,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
         let PageContainerKind::File { mount, .. } = self.pc.kind() else {
             return V3::done(());
         };
-        if mount.payload().backend_planner().is_none() {
+        if mount.payload().backend_planner().is_none() || !self.pc.has_file_io_service_runtime() {
             let guard = step_engine::guard();
             return step_fsync(self.pc, &guard);
         }
@@ -573,7 +582,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
 }
 
 /// `StepOp` wrap of [`step_fallocate`].
-#[allow(dead_code)]// txdoc:pr2-step-op-scaffold
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FallocateOp<'a> {
     pub pc: &'a PageContainer,
     pub new_size: u64,

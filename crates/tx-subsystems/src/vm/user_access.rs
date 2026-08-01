@@ -47,6 +47,8 @@ use super::structure::{
     UserVirtAddr, VmEntry, VmEntryBacking, VmFault, VmFaultOutcome, USER_PAGE_SIZE,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
+use crate::vm::checks::require_fault_recipe;
+use crate::vm::LockMode;
 
 /// Whether a user-access primitive is reading from or writing to
 /// user-space memory. Determines both the protection check and the
@@ -207,6 +209,30 @@ impl AddressSpace {
     ) -> StepOutcome<(), NoProgress> {
         use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         for page in range.iter_pages() {
+            let page_addr = match page.checked_start_addr() {
+                Ok(addr) => addr,
+                Err(_) => return V3::err(Errno::EFAULT.into()),
+            };
+            let page_range = match UserRange::containing_page(page_addr) {
+                Ok(range) => range,
+                Err(_) => return V3::err(Errno::EFAULT.into()),
+            };
+            // Keep the same per-page publication discipline as the trap fault
+            // path. This covers the pmap fast-path check, recipe observation,
+            // private-page materialization and final PTE install.
+            let _page_guard = match self
+                .range_lock
+                .acquire_step(page_range, LockMode::Materializer)
+            {
+                V3::Done(guard) => guard,
+                V3::Yield { shape, .. } => {
+                    return V3::Yield {
+                        progress: NoProgress,
+                        shape,
+                    };
+                }
+                _ => return V3::err(Errno::EFAULT.into()),
+            };
             // Skip pages already published with sufficient protection.
             // We only avoid re-materialisation when the cached entry
             // already permits the requested access.
@@ -222,12 +248,8 @@ impl AddressSpace {
             }
             // Build a synthetic fault, observe the recipe, materialise,
             // and publish synchronously.
-            let page_addr = match page.checked_start_addr() {
-                Ok(a) => a,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
-            };
             let fault = VmFault::new(page_addr, kind.required_prot());
-            let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
+            let outcome: VmFaultOutcome = match require_fault_recipe(self, fault) {
                 Ok(o) => o,
                 Err(e) => {
                     // PROBE(git fork-exec EFAULT hunt): which VA, which error.
@@ -265,6 +287,50 @@ impl AddressSpace {
             }
         }
         V3::done(())
+    }
+
+    /// Wait-capable counterpart of [`Self::reserve_user_range_for_access`].
+    ///
+    /// A concurrent first-touch, CoW publication, or binding mutation can
+    /// legitimately own the page-sized `RangeLock` transaction.  That is
+    /// kernel-internal scheduling state, not an I/O failure visible to the
+    /// syscall caller.  Drop all per-attempt state, await the lock's release
+    /// notification, and retry the complete range.  Rewalking pages already
+    /// published by a previous attempt is cheap because the pmap fast path
+    /// skips them.
+    ///
+    /// No epoch guard or `RangeGuard` is held across `.await`.
+    pub async fn reserve_user_range_for_access_wait(
+        &self,
+        range: UserRange,
+        kind: UserAccessKind,
+    ) -> Result<(), Errno> {
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
+        loop {
+            match self.reserve_user_range_for_access(range, kind) {
+                V3::Done(()) => return Ok(()),
+                V3::Err(error) => return Err(error.into()),
+                V3::Continue { .. } => {
+                    // The current synchronous implementation never emits
+                    // Continue, but retrying preserves the step contract if a
+                    // future backend starts using it.
+                    continue;
+                }
+                V3::Yield { shape, .. } => {
+                    let token =
+                        crate::vm::notification::wait_token_from_shape(&shape).ok_or(Errno::EIO)?;
+                    if let Some(wait) = crate::wait_source::wait_on_registered_source_id(
+                        token.source_id(),
+                        token.interest(),
+                    ) {
+                        let _ = wait.await;
+                    }
+                    // `None` means the release raced ahead of registration.
+                    // Retrying immediately is both safe and necessary.
+                }
+            }
+        }
     }
 
     /// Read a NUL-terminated byte string starting at `src`, capped at

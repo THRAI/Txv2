@@ -237,6 +237,13 @@ fn process_tcp_tx_socket(
     let Some(payload) = ident.acquire_operational() else {
         return;
     };
+    // Loopback and physical-device TX are distinct routing owners.  The
+    // loopback handshake/data lane consumes smoltcp egress into LoopbackIface;
+    // letting this lane consume the same socket races that lane and can put a
+    // SYN/SYN-ACK on the virtio device instead of the loopback queue.
+    if tcp_remote_endpoint(&payload.protocol_snapshot()).is_some_and(IpEndpoint::is_loopback) {
+        return;
+    }
     let Some(raw_tcp) = payload.raw_tcp_socket() else {
         return;
     };
@@ -497,6 +504,15 @@ fn process_raw_icmp_tx_socket(
 
 fn is_external_ipv4(addr: Ipv4Address) -> bool {
     addr != Ipv4Address::LOOPBACK && addr != Ipv4Address::BROADCAST
+}
+
+fn tcp_remote_endpoint(protocol: &SocketProtocol) -> Option<IpEndpoint> {
+    match protocol {
+        SocketProtocol::Tcp(
+            TcpState::Connecting { remote, .. } | TcpState::Connected { remote, .. },
+        ) => Some(*remote),
+        _ => None,
+    }
 }
 
 fn is_tcp_connecting(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {

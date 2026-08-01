@@ -5,14 +5,14 @@ use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno as V4Errno, Guard};
 use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
 use crate::process::execution::reset_init_process_for_test;
-use crate::process::structure::{Pgid, reset_pid_counter_for_test};
-use crate::process::{ProcessIdentity, bootstrap_init_process, step_fork, step_setpgid};
+use crate::process::structure::{reset_pid_counter_for_test, Pgid};
+use crate::process::{bootstrap_init_process, step_fork, step_setpgid, ProcessIdentity};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::{Termios, TtyIdentity, TtyKind, TtyPayload, Winsize};
 use crate::vfs::adapter::step_engine::{
-    ByteProgress, Cap, Errno, PayloadCap, StepOutcome, guard, reserve_for, sign_for,
+    guard, reserve_for, sign_for, ByteProgress, Cap, Errno, PayloadCap, StepOutcome,
 };
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
@@ -351,29 +351,21 @@ fn fd_ready_facade_reports_eventfd_readiness_and_waits() {
         &guard,
     );
 
-    assert!(
-        report
-            .ready
-            .contains(crate::vfs::fd_ready::FdReadyMask::READ)
-    );
-    assert!(
-        report
-            .ready
-            .contains(crate::vfs::fd_ready::FdReadyMask::WRITE)
-    );
+    assert!(report
+        .ready
+        .contains(crate::vfs::fd_ready::FdReadyMask::READ));
+    assert!(report
+        .ready
+        .contains(crate::vfs::fd_ready::FdReadyMask::WRITE));
     assert!(report.epoll_watchable);
-    assert!(
-        report
-            .waits
-            .iter()
-            .any(|wait| wait.source.raw() == efd.reader_source_id())
-    );
-    assert!(
-        report
-            .waits
-            .iter()
-            .any(|wait| wait.source.raw() == efd.writer_source_id())
-    );
+    assert!(report
+        .waits
+        .iter()
+        .any(|wait| wait.source.raw() == efd.reader_source_id()));
+    assert!(report
+        .waits
+        .iter()
+        .any(|wait| wait.source.raw() == efd.writer_source_id()));
     let reader_wait = report
         .waits
         .iter()

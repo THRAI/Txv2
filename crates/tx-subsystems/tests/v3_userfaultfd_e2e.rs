@@ -561,7 +561,7 @@ fn process_fault_push_uses_injected_mailbox_ref_post_for_ufd_readable_wake() {
     let vma_base = 0x6000_0000u64;
     let (proc_cap, _fd, ufd_cap, fault_mailbox) = setup_proc_with_registered_ufd(vma_base);
     let handler_mailbox = Arc::new(TaskMailbox::new());
-    let (_registration, generation) = register_waiter(ufd_cap.wait_source(), &handler_mailbox, 1);
+    let (_registration, generation) = register_waiter(ufd_cap.read_endpoint(), &handler_mailbox, 1);
 
     let aspace = proc_cap.aspace_cap().expect("aspace");
     let fault = VmFault::new(UserVirtAddr::new(vma_base as usize), AccessMode::Read);

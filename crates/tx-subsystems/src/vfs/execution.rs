@@ -854,6 +854,39 @@ fn step_tty_ioctl(
 // unchanged. The `Cap<OpenFile>` is borrowed (not cloned) so the `Op` shape
 // matches the other wave-3 byte-IO wraps in TTY.
 
+/// Fold one byte-I/O step into an operation-wide cursor.
+///
+/// `drive()` accumulates `Continue`/`Yield` progress only to classify the
+/// intermediate outcome; once the operation reaches `Done`, it returns the
+/// `Done` payload verbatim. Therefore a resumable byte-I/O `StepOp` must make
+/// that payload operation-wide rather than returning only the final step's
+/// byte count. Otherwise a read that copied bytes, waited for another page
+/// materializer, and then completed is reported to userspace as a short read.
+///
+/// An error after prior progress is likewise a successful partial transfer,
+/// matching Linux/POSIX read/write semantics.
+fn accumulate_byte_io_step(
+    cursor: &mut usize,
+    outcome: StepOutcome<usize, ByteProgress>,
+) -> StepOutcome<usize, ByteProgress> {
+    match outcome {
+        StepOutcome::Done(bytes) => {
+            *cursor += bytes;
+            StepOutcome::Done(*cursor)
+        }
+        StepOutcome::Continue { progress } => {
+            *cursor += progress.bytes();
+            StepOutcome::Continue { progress }
+        }
+        StepOutcome::Yield { progress, shape } => {
+            *cursor += progress.bytes();
+            StepOutcome::Yield { progress, shape }
+        }
+        StepOutcome::Err(_) if *cursor != 0 => StepOutcome::Done(*cursor),
+        StepOutcome::Err(error) => StepOutcome::Err(error),
+    }
+}
+
 /// `StepOp` wrap of [`OpenFile::step_read`].
 ///
 /// Per `STEP_MODEL_v2` §1 + `INVARIANTS_v5` YIELD-5/EBR-7, each `step()`
@@ -881,26 +914,10 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
             .caller_netns
             .as_ref()
             .map(|netns| &**netns as &crate::net::NetNamespacePayload);
-        let result =
+        let outcome =
             self.file
                 .step_read_with_netns(&mut self.out[self.cursor..], caller_netns, &guard);
-        // Advance cursor by the bytes read in this step. The
-        // `StepProgress` accumulator (ByteProgress) carries the same
-        // value, so `drive()`'s `accumulated` stays in sync with the
-        // actual fill position.
-        match &result {
-            StepOutcome::Done(n) => {
-                self.cursor += *n;
-            }
-            StepOutcome::Continue { progress } => {
-                self.cursor += progress.bytes();
-            }
-            StepOutcome::Yield { progress, .. } => {
-                self.cursor += progress.bytes();
-            }
-            StepOutcome::Err(_) => {}
-        }
-        result
+        accumulate_byte_io_step(&mut self.cursor, outcome)
     }
 }
 
@@ -945,22 +962,10 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
             .caller_netns
             .as_ref()
             .map(|netns| &**netns as &crate::net::NetNamespacePayload);
-        let result =
+        let outcome =
             self.file
                 .step_write_with_netns(&self.bytes[self.cursor..], caller_netns, &guard);
-        match &result {
-            StepOutcome::Done(n) => {
-                self.cursor += *n;
-            }
-            StepOutcome::Continue { progress } => {
-                self.cursor += progress.bytes();
-            }
-            StepOutcome::Yield { progress, .. } => {
-                self.cursor += progress.bytes();
-            }
-            StepOutcome::Err(_) => {}
-        }
-        result
+        accumulate_byte_io_step(&mut self.cursor, outcome)
     }
 }
 
@@ -1005,7 +1010,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
         match self.file.rnode().backing() {
             RNodeBacking::PageBacked { pc } => {
                 emit_vfs_trace(b"debug.vfs.write_from_user_op.phase", 0);
-                let result = crate::page_backed::step_write_from_user(
+                let outcome = crate::page_backed::step_write_from_user(
                     pc,
                     self.file,
                     self.aspace,
@@ -1013,31 +1018,28 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
                     remaining,
                     &guard,
                 );
-                match &result {
+                match &outcome {
                     StepOutcome::Done(n) => {
                         emit_vfs_trace(b"debug.vfs.write_from_user_op.done", *n as i64);
-                        self.cursor += *n;
                     }
                     StepOutcome::Continue { progress } => {
                         emit_vfs_trace(
                             b"debug.vfs.write_from_user_op.progress",
                             progress.bytes() as i64,
                         );
-                        self.cursor += progress.bytes();
                     }
                     StepOutcome::Yield { progress, .. } => {
                         emit_vfs_trace(
                             b"debug.vfs.write_from_user_op.yield_progress",
                             progress.bytes() as i64,
                         );
-                        self.cursor += progress.bytes();
                     }
                     StepOutcome::Err(_) => {
                         emit_vfs_trace(b"debug.vfs.write_from_user_op.err", 1);
                     }
                 }
                 emit_vfs_trace(b"debug.vfs.write_from_user_op.phase", 1);
-                result
+                accumulate_byte_io_step(&mut self.cursor, outcome)
             }
             _ => StepOutcome::Err(Errno::ENOSYS),
         }
@@ -1068,7 +1070,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadToUserOp<'a> {
         }
         match self.file.rnode().backing() {
             RNodeBacking::PageBacked { pc } => {
-                let result = crate::page_backed::step_read_to_user(
+                let outcome = crate::page_backed::step_read_to_user(
                     pc,
                     self.file,
                     self.aspace,
@@ -1076,13 +1078,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadToUserOp<'a> {
                     remaining,
                     &guard,
                 );
-                match &result {
-                    StepOutcome::Done(n) => self.cursor += *n,
-                    StepOutcome::Continue { progress } => self.cursor += progress.bytes(),
-                    StepOutcome::Yield { progress, .. } => self.cursor += progress.bytes(),
-                    StepOutcome::Err(_) => {}
-                }
-                result
+                accumulate_byte_io_step(&mut self.cursor, outcome)
             }
             _ => StepOutcome::Err(Errno::ENOSYS),
         }
@@ -1974,7 +1970,7 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                 }
                 _ => false,
             };
-            if has_backend_planner {
+            if has_backend_planner && container.has_file_io_service_runtime() {
                 return match self.state.advance(container) {
                     Err(errno) => V3::Err(errno.into()),
                     Ok(None) => self.state.pending_outcome(NoProgress),
@@ -1982,7 +1978,6 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                     Ok(Some(Err(errno))) => V3::Err(errno.into()),
                 };
             }
-
             let guard = step_engine::guard();
             return match crate::page_backed::step_fsync(container, &guard) {
                 V3::Done(()) => V3::Done(()),
@@ -2023,8 +2018,8 @@ mod step_op_wraps {
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
     use crate::vfs::adapter::step_engine::{
-        Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp, StepOutcome as V3, reserve_for,
-        sign_for,
+        reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome as V3,
     };
     use crate::vfs::structure::{
         DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
@@ -2146,6 +2141,36 @@ mod step_op_wraps {
             },
         )
         .expect("open file")
+    }
+
+    #[test]
+    fn resumable_byte_io_done_reports_operation_wide_total() {
+        let mut cursor = 0usize;
+        let first: StepOutcome<usize, ByteProgress> = StepOutcome::Continue {
+            progress: ByteProgress::new(1024),
+        };
+        assert!(matches!(
+            accumulate_byte_io_step(&mut cursor, first),
+            StepOutcome::Continue { .. }
+        ));
+        assert_eq!(cursor, 1024);
+
+        let final_step: StepOutcome<usize, ByteProgress> = StepOutcome::Done(3072);
+        match accumulate_byte_io_step(&mut cursor, final_step) {
+            StepOutcome::Done(total) => assert_eq!(total, 4096),
+            other => panic!("expected operation-wide Done(4096), got {other:?}"),
+        }
+        assert_eq!(cursor, 4096);
+    }
+
+    #[test]
+    fn resumable_byte_io_error_after_progress_returns_partial_success() {
+        let mut cursor = 2048usize;
+        let error: StepOutcome<usize, ByteProgress> = StepOutcome::Err(Errno::EIO);
+        match accumulate_byte_io_step(&mut cursor, error) {
+            StepOutcome::Done(total) => assert_eq!(total, 2048),
+            other => panic!("expected partial Done(2048), got {other:?}"),
+        }
     }
 
     #[test]

@@ -89,7 +89,7 @@ impl BootArgs {
     }
 }
 
-fn boot_mode_from_cmdline_str(cmdline: Option<&str>) -> BootMode {
+pub(super) fn boot_mode_from_cmdline_str(cmdline: Option<&str>) -> BootMode {
     let Some(cmdline) = cmdline else {
         return BootMode::Normal;
     };

@@ -15,15 +15,15 @@ use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use crate::page_backed::FsPageBacking;
-use crate::vfs::FsOps;
-use crate::vfs::adapter::step_engine::{Cap, guard, reserve_for, sign_for};
+use crate::vfs::adapter::step_engine::{guard, reserve_for, sign_for, Cap};
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
     S_IFDIR,
 };
 use crate::vfs::walker::{step_open, step_walk};
+use crate::vfs::FsOps;
 
-use super::{TestFs, init_zones};
+use super::{init_zones, TestFs};
 
 // === fixture: rootfs over TestFs ===================================
 

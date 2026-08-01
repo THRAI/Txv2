@@ -261,10 +261,7 @@ pub trait FileOps: Send + Sync {
     ) -> StepOutcome<usize, ByteProgress>;
     /// F_SETFL O_NONBLOCK side-effect hook (P3-S5). Sockets re-kick send
     /// readiness so writers parked behind a formerly-blocking fd re-poll.
-    fn on_set_fl_nonblock(
-        &self,
-        post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
-    ) {
+    fn on_set_fl_nonblock(&self, post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool) {
         let _ = post;
     }
 
@@ -734,6 +731,15 @@ impl PageContainerFileIoServiceRuntime {
 
     pub fn kick(&self, service: IoServiceKind) -> usize {
         post_file_io_service_kick(&self.wake_source, ServiceKick::new(service)) as usize
+    }
+
+    pub fn diagnostic(&self) -> (u64, usize, u64, crate::page_backed::FileIoServiceDiagnostic) {
+        (
+            self.wake_source.source_id(),
+            self.wake_source.wake_endpoint().subscriber_count(),
+            self.wake_source.wake_endpoint().pending_mask_snapshot(),
+            self.container.file_io_service_diagnostic(),
+        )
     }
 }
 

@@ -22,6 +22,7 @@ _start:
     move    $s1, $a0
     move    $s2, $a1
     move    $s3, $a2
+    move    $s4, $zero
 
     // Use CPUID CSR for hart identity.
     csrrd   $s0, 0x20
@@ -30,21 +31,41 @@ _start:
     csrwr   $t0, TX_LA64_CSR_DMW0
     li.d    $t0, TX_LA64_DMW_UNCACHED
     csrwr   $t0, TX_LA64_CSR_DMW1
-    move    $t0, $zero
-    csrwr   $t0, TX_LA64_CSR_DMW2
-    csrwr   $t0, TX_LA64_CSR_DMW3
+    csrwr   $zero, TX_LA64_CSR_DMW2
+    csrwr   $zero, TX_LA64_CSR_DMW3
     invtlb  0x0, $zero, $zero
 
     li.d    $t0, TX_LA64_HIGH_START
     jirl    $zero, $t0, 0
 
+    // QEMU direct boot parks every AP in its built-in slave ROM. The ROM
+    // reads mailbox 0 and jumps here, but does not provide a stack or a0.
+    // Keep this trampoline in the physical boot segment so it is executable
+    // while the AP is still in direct-address mode.
+    .globl tx_la64_secondary_start
+tx_la64_secondary_start:
+    csrrd   $s0, 0x20
+    li.d    $t0, TX_LA64_DMW_CACHED
+    csrwr   $t0, TX_LA64_CSR_DMW0
+    li.d    $t0, TX_LA64_DMW_UNCACHED
+    csrwr   $t0, TX_LA64_CSR_DMW1
+    csrwr   $zero, TX_LA64_CSR_DMW2
+    csrwr   $zero, TX_LA64_CSR_DMW3
+    invtlb  0x0, $zero, $zero
+    li.d    $s4, 1
+    li.d    $t0, TX_LA64_HIGH_START
+    jirl    $zero, $t0, 0
+
     .section .text.boot.high, "ax"
 tx_la64_high_start:
+    bnez    $s4, tx_la64_secondary_high_start
     bnez    $s0, .Ltx_la64_secondary_wait
     la.local $sp, __tx_boot_stack_top
-    li.d    $t2, 4
+    // Keep the static stack geometry in sync with LA64_MAX_BOOT_CPUS and
+    // LA64_BOOT_STACK_STRIDE (12 harts × 512 KiB).
+    li.d    $t2, 12
     bgeu    $s0, $t2, .Ltx_la64_bsp_stack_ready
-    slli.d  $t1, $s0, 16
+    slli.d  $t1, $s0, 19
     sub.d   $sp, $sp, $t1
 .Ltx_la64_bsp_stack_ready:
 
@@ -82,30 +103,19 @@ tx_la64_high_start:
     csrwr   $t0, TX_LA64_CSR_DMW0
     li.d    $t0, TX_LA64_DMW_UNCACHED
     csrwr   $t0, TX_LA64_CSR_DMW1
-    move    $t0, $zero
-    csrwr   $t0, TX_LA64_CSR_DMW2
-    csrwr   $t0, TX_LA64_CSR_DMW3
+    csrwr   $zero, TX_LA64_CSR_DMW2
+    csrwr   $zero, TX_LA64_CSR_DMW3
     li.w    $t4, -1
     li.d    $t5, TX_LA64_IOCSR_IPI_EN
     iocsrwr.w $t4, $t5
 
 .Ltx_la64_secondary_park:
     li.d    $t2, TX_LA64_IOCSR_MBUF4
-    li.d    $t3, TX_LA64_IOCSR_MBUF5
-    li.d    $t4, TX_LA64_IOCSR_MBUF6
     iocsrrd.d $t0, $t2
     beqz    $t0, .Ltx_la64_secondary_idle
-    iocsrrd.d $t1, $t3
-    iocsrrd.d $a0, $t4
     iocsrwr.d $zero, $t2
-    iocsrwr.d $zero, $t3
-    iocsrwr.d $zero, $t4
     li.d    $t2, TX_LA64_PHYS_ADDR_MASK
-    and     $sp, $t1, $t2
     and     $t0, $t0, $t2
-    li.d    $t2, TX_LA64_DMW_CACHED_BASE
-    or      $sp, $sp, $t2
-    or      $t0, $t0, $t2
     jirl    $zero, $t0, 0
 .Ltx_la64_secondary_idle:
     // Keep polling the mailbox even if IPI delivery is masked/late.
@@ -113,6 +123,30 @@ tx_la64_high_start:
     // are fully configured for interrupt wakeups.
     nop
     b       .Ltx_la64_secondary_park
+
+tx_la64_secondary_high_start:
+    // CSR.CPUID is both the QEMU arch id and Txv2 logical CpuId on this
+    // board. Reject a malformed id before indexing the static stack arena.
+    csrrd   $a0, 0x20
+    li.d    $t2, 12
+    bgeu    $a0, $t2, .Ltx_la64_secondary_bad_id
+
+    la.local $sp, __tx_boot_stack_top
+    slli.d  $t1, $a0, 19
+    sub.d   $sp, $sp, $t1
+
+    // Mailbox 1 contains CoreInit::<P>::secondary_cpu_entry. Mailbox 0 was
+    // consumed and cleared by QEMU's slave ROM before entering the physical
+    // trampoline.
+    li.d    $t2, TX_LA64_IOCSR_MBUF5
+    iocsrrd.d $t0, $t2
+    iocsrwr.d $zero, $t2
+    beqz    $t0, .Ltx_la64_secondary_bad_id
+    jirl    $zero, $t0, 0
+
+.Ltx_la64_secondary_bad_id:
+    idle    0
+    b       .Ltx_la64_secondary_bad_id
 
 "#
 );

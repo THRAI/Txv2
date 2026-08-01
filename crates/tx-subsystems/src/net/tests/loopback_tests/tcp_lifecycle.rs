@@ -551,7 +551,17 @@ fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
         StepOutcome::Done(close) => close,
         _ => panic!("unexpected socket close outcome"),
     };
-    assert_eq!(close.tcp_flushed_bytes, 1);
+    assert!(!close.payload_taken);
+
+    // close is delegate-owned: queued stream bytes and FIN must be delivered
+    // before the connection-table reference and payload are retired.
+    for _ in 0..8 {
+        let _ = step_process_loopback_pending_zero(
+            loopback_iface(),
+            LoopbackPollBudget::default(),
+            &guard,
+        );
+    }
 
     let mut out = [0u8; 1];
     assert_eq!(
@@ -575,10 +585,9 @@ fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
         step_recv(&accepted, 1, SendRecvFlags::empty(), &guard),
         StepOutcome::Done(0)
     );
-    assert_eq!(
-        step_send_kernel_bytes(&accepted, b"x", SendRecvFlags::empty(), &guard),
-        StepOutcome::Err(Errno::EPIPE)
-    );
+    // Receiving FIN is a half-close. Linux permits the peer to write until
+    // the reverse direction is closed or reset; do not require an immediate
+    // EPIPE here.
 }
 
 #[test]
@@ -647,6 +656,13 @@ fn tcp_loopback_listener_accepts_after_clients_close_without_draining() {
             step_socket_close(&client, &guard),
             StepOutcome::Done(_)
         ));
+        for _ in 0..8 {
+            let _ = step_process_loopback_pending_zero(
+                loopback_iface(),
+                LoopbackPollBudget::default(),
+                &guard,
+            );
+        }
         assert!(matches!(
             step_poll_ready(&accepted, &guard),
             StepOutcome::Done(mask) if mask.intersects(PollMask::IN | PollMask::RDHUP)
@@ -701,6 +717,28 @@ fn tcp_loopback_handshake_does_not_mark_client_readable_without_data() {
     assert!(matches!(
         step_poll_ready(&client, &guard),
         StepOutcome::Done(mask) if !mask.intersects(PollMask::IN | PollMask::RDHUP)
+    ));
+}
+
+#[test]
+fn tcp_loopback_handshake_contention_is_progress_not_refusal() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, _listener, _local, _remote) = prepare_loopback_connect(45_999, 55_999);
+    let guard = tx_substrate::epoch::guard();
+    let payload = client.acquire_operational().expect("client payload");
+
+    assert!(payload.try_claim_tcp_handshake_driver());
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Continue { .. }
+    ));
+    payload.release_tcp_handshake_driver();
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
     ));
 }
 

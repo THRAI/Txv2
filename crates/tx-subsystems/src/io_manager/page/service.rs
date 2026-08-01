@@ -372,6 +372,17 @@ pub struct PageService {
     next: PageServiceNext,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageServiceDiagnostic {
+    pub submissions: usize,
+    pub completions: usize,
+    pub backend_resumes: usize,
+    pub metadata_waits: usize,
+    pub graphs: usize,
+    pub waiters: usize,
+    pub next: PageServiceNext,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MetadataContinuation {
     page_request: PageIoRequest,
@@ -397,6 +408,18 @@ impl PageService {
             graphs: BTreeMap::new(),
             waiters: BTreeMap::new(),
             next: PageServiceNext::Sleeping,
+        }
+    }
+
+    pub fn diagnostic(&self) -> PageServiceDiagnostic {
+        PageServiceDiagnostic {
+            submissions: self.submissions.len(),
+            completions: self.completions.len(),
+            backend_resumes: self.backend_resumes.len(),
+            metadata_waits: self.metadata.len(),
+            graphs: self.graphs.len(),
+            waiters: self.waiters.len(),
+            next: self.next,
         }
     }
 

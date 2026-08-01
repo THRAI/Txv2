@@ -13,7 +13,7 @@ use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
     SourceLabel,
 };
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::page_backed::{Frame as PageFrame, FsPageBacking};
 use crate::process::adapter::step_engine::{
@@ -30,10 +30,10 @@ use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
 };
 use crate::process::{
-    bootstrap_init_process, step_chdir, step_chdir_with_mount, step_exit_group_with_posts,
-    step_fork, step_fork_with_options, step_getcwd, step_set_mount_namespace, step_setpgid,
-    step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError, ForkOptions, SetpgidError,
-    WaitError, WaitTarget,
+    bootstrap_init_process, fork_with_options_wait, step_chdir, step_chdir_with_mount,
+    step_exit_group_with_posts, step_fork, step_fork_with_options, step_getcwd,
+    step_set_mount_namespace, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome,
+    ForkError, ForkOptions, SetpgidError, WaitError, WaitTarget,
 };
 use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
@@ -874,6 +874,42 @@ fn fork_clones_address_space_into_distinct_cap() {
 
     // The Cap keys must differ — child has its own address space slot.
     assert_ne!(parent_aspace.key(), child_aspace.key());
+}
+
+#[test]
+fn wait_capable_fork_does_not_publish_before_vm_conflict_clears() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_aspace = parent.aspace_cap().expect("parent aspace");
+    let holder = match parent_aspace.range_lock().acquire_step_rich(
+        crate::vm::UserRange::new_aligned(crate::vm::UserVirtAddr(0x40000), 0x1000).expect("range"),
+        crate::vm::LockMode::ExclusiveWriter,
+    ) {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline reservation should succeed"),
+    };
+
+    let mut future = Box::pin(fork_with_options_wait::<TestPmap>(
+        &parent,
+        ForkOptions::default(),
+    ));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(
+        parent.children.snapshot().is_empty(),
+        "contended VM preparation must not publish a child"
+    );
+
+    drop(holder);
+    let child = match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(child)) => child,
+        Poll::Ready(Err(error)) => panic!("post-release fork errored: {error:?}"),
+        Poll::Pending => panic!("fork should complete after VM reservation release"),
+    };
+    let children = parent.children.snapshot();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0], child);
 }
 
 #[test]

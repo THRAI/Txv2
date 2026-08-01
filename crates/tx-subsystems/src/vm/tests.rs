@@ -592,29 +592,6 @@ fn vm_address_space_map_reservation_publishes_recipe_on_commit() {
 }
 
 #[test]
-fn vm_recipe_publish_allocation_failure_preserves_authoritative_root() {
-    setup_host_substrate();
-    let aspace = AddressSpace::new();
-    let original = VmEntry::new(
-        range(0x4000, 2),
-        Prot::READ_WRITE,
-        VmEntryFlags::PRIVATE,
-        VmBacking::PrivateAnon,
-    );
-    map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
-        .commit()
-        .expect("initial map");
-    let before_stats = aspace.stats();
-
-    tx_substrate::testing::fail_next_publication_allocations(1);
-    let result = aspace.try_mprotect(original.range, Prot::READ);
-
-    assert_eq!(result, Err(VmMapError::NoFreeRange));
-    assert_eq!(aspace.lookup(UserVirtAddr(0x4000)), Some(original));
-    assert_eq!(aspace.stats(), before_stats);
-}
-
-#[test]
 fn vm_recipe_guarded_reader_survives_replacement_publication() {
     setup_host_substrate();
     let aspace = Arc::new(AddressSpace::new());
@@ -683,10 +660,7 @@ fn vm_recipe_ordered_coverage_walk_rejects_first_gap_without_partial_tagging() {
             .commit()
             .expect("sparse recipe map");
     }
-    let tag = UfdRegistration {
-        ufd_id: 7,
-        mode: 1,
-    };
+    let tag = UfdRegistration { ufd_id: 7, mode: 1 };
 
     assert_eq!(
         aspace.tag_ufd_registration(range(0x10_0000, 5), tag),
@@ -1769,6 +1743,48 @@ fn vm_checks_require_fault_publication_rejects_replaced_private_set_identity() {
 }
 
 #[test]
+fn vm_checks_require_fault_publication_retries_stale_private_read_after_writer_wins() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x5000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+
+    // The reader observes an empty PrivatePageSet and prepares the shared
+    // zero frame, but has not published its PTE yet.
+    let read = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Read))
+        .expect("read fault resolves");
+    let stale_read = read.materialize_pagebacked().expect("read materialization");
+
+    // A concurrent writer wins the page-level CAS and installs the
+    // authoritative private frame before the reader reaches publication.
+    let write = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Write))
+        .expect("write fault resolves");
+    let winning_write = write
+        .materialize_pagebacked()
+        .expect("write materialization");
+
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &read, &stale_read),
+        Err(VmFaultError::StaleRecipe)
+    );
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &write, &winning_write),
+        Ok(())
+    );
+}
+
+#[test]
 fn vm_checks_require_map_admission_preserves_placement_rules() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -2059,6 +2075,68 @@ fn vm_pmap_duplicate_publish_converges_on_existing_mapping() {
             rollbacks: 0,
             shootdowns: 0,
         }
+    );
+}
+
+#[test]
+fn vm_pmap_distinguishes_materializer_race_from_mapping_corruption() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0xd000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+
+    // Reader validates an empty private set and prepares the shared zero page.
+    let read = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xd000), AccessMode::Read))
+        .expect("read fault resolves");
+    let stale_read = read.materialize_pagebacked().expect("read materializes");
+    super::checks::require_fault_publication(&aspace, &read, &stale_read)
+        .expect("reader validates before writer wins");
+
+    // A writer wins after that validation but before the reader acquires the
+    // pmap lock.
+    let write = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xd000), AccessMode::Write))
+        .expect("write fault resolves");
+    let winning_write = write.materialize_pagebacked().expect("write materializes");
+    let winning_ppn = winning_write.page.ppn;
+    aspace
+        .pmap
+        .publish_page_with_replacement(
+            UserPage(13),
+            winning_write.page.ppn,
+            winning_write.publish_prot,
+            winning_write.page.map_pin,
+            winning_write.replace_existing,
+        )
+        .expect("writer publishes");
+
+    assert_eq!(
+        aspace.pmap.publish_page_with_replacement(
+            UserPage(13),
+            stale_read.page.ppn,
+            stale_read.publish_prot,
+            stale_read.page.map_pin,
+            stale_read.replace_existing,
+        ),
+        Err(VmPmapError::ConcurrentPublication)
+    );
+    assert_eq!(
+        aspace.pmap().lookup(UserPage(13)),
+        Some(PmapMappingSnapshot {
+            ppn: winning_ppn,
+            prot: Prot::READ_WRITE,
+        }),
+        "the optimistic loser must not disturb the winning PTE"
     );
 }
 

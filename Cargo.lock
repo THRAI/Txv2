@@ -711,6 +711,7 @@ dependencies = [
  "tx-observe",
  "tx-observe-types",
  "tx-platform-adapter",
+ "tx-reactor",
  "tx-services",
  "tx-substrate",
  "tx-subsystems",

@@ -224,26 +224,35 @@ impl PollContext {
         &mut self,
         iface: &LoopbackIface,
         target: &Cap<SocketIdentity>,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
         budget: usize,
     ) -> PollContextOutcome {
         let mut publishes = Vec::new();
         let mut bytes_moved = 0;
+        let mut matched = 0usize;
 
-        for _ in 0..budget {
-            let Some(packet) = iface.pop_ingress() else {
+        while matched < budget {
+            let Some(target_payload) = target.acquire_operational() else {
                 break;
             };
-            self.packets_seen += 1;
-
+            let target_protocol = target_payload.protocol_snapshot();
+            let Some(packet) = iface.take_ingress_matching(|packet| {
+                SmoltcpTcpSegment::packet_endpoints(packet).is_some_and(|(src, dst)| {
+                    tcp_endpoints_match_socket(&target_protocol, src, dst)
+                })
+            }) else {
+                break;
+            };
             let Some(segment) = SmoltcpTcpSegment::parse_ipv4_packet(&packet) else {
                 continue;
             };
             let Some(target_payload) = target.acquire_operational() else {
                 continue;
             };
+            self.packets_seen += 1;
+            matched += 1;
             if let Some(publish) =
-                self.process_segment_for_target(target, &target_payload, &segment, _guard)
+                self.process_segment_for_target(target, &target_payload, &segment, guard)
             {
                 bytes_moved += publish.bytes_moved;
                 publishes.extend(publish.publishes);
@@ -257,6 +266,69 @@ impl PollContext {
             bytes_moved,
             publishes,
             created_children: Vec::new(),
+        }
+    }
+
+    /// Process TCP packets for exactly one connection direction.
+    ///
+    /// Before the first SYN creates a child socket, the endpoints themselves
+    /// identify the handshake. Selection is atomic in `LoopbackIface`, so
+    /// concurrent connect syscalls cannot consume each other's packets.
+    pub fn poll_tcp_ingress_for_flow(
+        &mut self,
+        iface: &LoopbackIface,
+        expected_src: IpEndpoint,
+        expected_dst: IpEndpoint,
+        guard: &Guard<'_>,
+        budget: usize,
+    ) -> PollContextOutcome {
+        let mut publishes = Vec::new();
+        let mut created_children = Vec::new();
+        let mut bytes_moved = 0;
+        let mut matched = 0usize;
+
+        while matched < budget {
+            let Some(packet) = iface.take_ingress_matching(|packet| {
+                SmoltcpTcpSegment::packet_endpoints(packet) == Some((expected_src, expected_dst))
+            }) else {
+                break;
+            };
+            let Some(segment) = SmoltcpTcpSegment::parse_ipv4_packet(&packet) else {
+                continue;
+            };
+            self.packets_seen += 1;
+            matched += 1;
+
+            let key = ConnectionKey::new(expected_dst, expected_src);
+            if let Some(target) = self.socket_table.lookup_tcp_connection(key, guard) {
+                let Some(target_payload) = target.acquire_operational() else {
+                    continue;
+                };
+                if let Some(publish) =
+                    self.process_segment_for_target(&target, &target_payload, &segment, guard)
+                {
+                    bytes_moved += publish.bytes_moved;
+                    publishes.extend(publish.publishes);
+                }
+            } else if let Some(first_syn) = self.process_first_syn_for_listener(&segment, guard) {
+                bytes_moved += first_syn.bytes_moved;
+                publishes.extend(first_syn.publishes);
+                if let Some(child) = first_syn.created_child {
+                    created_children.push(child);
+                }
+            } else if let Some(backlog) = self.process_listener_backlog_segment(&segment, guard) {
+                bytes_moved += backlog.bytes_moved;
+                publishes.extend(backlog.publishes);
+            }
+        }
+
+        PollContextOutcome {
+            packets_seen: self.packets_seen,
+            tx_packets: self.tx_packets,
+            sockets_touched: self.sockets_touched,
+            bytes_moved,
+            publishes,
+            created_children,
         }
     }
 
@@ -591,6 +663,15 @@ fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
         SocketProtocol::RawIcmp(state) => state.accepts_ipv4_reply_to(dst),
         _ => false,
     }
+}
+
+fn tcp_endpoints_match_socket(protocol: &SocketProtocol, src: IpEndpoint, dst: IpEndpoint) -> bool {
+    matches!(
+        protocol,
+        SocketProtocol::Tcp(
+            TcpState::Connecting { local, remote } | TcpState::Connected { local, remote }
+        ) if *local == dst && *remote == src
+    )
 }
 
 pub(crate) enum TcpConnectedPromotion {

@@ -485,6 +485,13 @@ impl BackendPageRequest {
         }
     }
 
+    /// Builder used when the caller first constructs the operation/source and
+    /// binds the L4-owned destination in a later planning step.
+    pub fn with_target(mut self, target: IoDataTarget) -> Self {
+        self.target = target;
+        self
+    }
+
     pub const fn from_page_io_request(object: FsObjectKey, request: PageIoRequest) -> Self {
         Self::new(
             object,

@@ -41,11 +41,19 @@ pub fn step_recv(
     if witness.flags.contains(SendRecvFlags::MSG_PEEK) {
         return match payload.peek_recv_bytes(len) {
             Some(bytes) => StepOutcome::Done(bytes),
-            None => yield_bytes_on_token(ByteProgress::EMPTY, socket_recv_wait_token(socket)),
+            None => {
+                clear_recv_data_if_empty(socket, &payload);
+                if recv_peer_closed(socket, &payload) {
+                    StepOutcome::Done(0)
+                } else {
+                    yield_bytes_on_token(ByteProgress::EMPTY, socket_recv_wait_token(socket))
+                }
+            }
         };
     }
 
     let Some(consume) = payload.consume_recv_bytes(len) else {
+        clear_recv_data_if_empty(socket, &payload);
         if recv_peer_closed(socket, &payload) {
             return StepOutcome::Done(0);
         }
@@ -53,7 +61,7 @@ pub fn step_recv(
     };
 
     if consume.became_empty {
-        socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
+        clear_recv_data_if_empty(socket, &payload);
     }
     kick_tcp_loopback_after_recv(&payload, consume.bytes);
 
@@ -92,6 +100,7 @@ pub fn step_recv_kernel_bytes(
     }
 
     let Some(outcome) = payload.consume_recv_bytes_into(out, witness.flags) else {
+        clear_recv_data_if_empty(socket, &payload);
         // SCTP 1-to-1: with no data to drain, a recv on a socket whose
         // association is not established — never connected (listening/bound/init)
         // or locally shut down via SHUT_WR — returns ENOTCONN rather than
@@ -106,13 +115,25 @@ pub fn step_recv_kernel_bytes(
     };
 
     if outcome.became_empty && !witness.flags.contains(SendRecvFlags::MSG_PEEK) {
-        socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
+        clear_recv_data_if_empty(socket, &payload);
     }
     if !witness.flags.contains(SendRecvFlags::MSG_PEEK) {
         kick_tcp_loopback_after_recv(&payload, outcome.bytes);
     }
 
     StepOutcome::Done(outcome)
+}
+
+/// Clear an edge hint using the standard clear-then-recheck pattern.
+///
+/// A producer may enqueue bytes after `recv` released the raw-socket lock but
+/// before this CPU clears HAS_DATA.  Re-reading the authoritative queue after
+/// the clear prevents that producer's wake from being erased.
+fn clear_recv_data_if_empty(socket: &Cap<SocketIdentity>, payload: &SocketPayload) {
+    socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
+    if payload.io_snapshot().recv_len != 0 {
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    }
 }
 
 fn kick_tcp_loopback_after_recv(payload: &SocketPayload, bytes: usize) {

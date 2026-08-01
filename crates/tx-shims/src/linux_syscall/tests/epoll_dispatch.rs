@@ -712,4 +712,3 @@ fn dispatch_epoll_pwait_blocks_until_socket_becomes_readable() {
         "epoll_pwait(timeout=-1) on an unreadable socket must park; got {first:?}"
     );
 }
-

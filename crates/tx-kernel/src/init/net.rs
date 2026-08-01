@@ -13,8 +13,8 @@ use tx_services::time::{timekeeper_clock, ClockRead};
 use tx_substrate::SpinMutex;
 use tx_subsystems::net::delegate::{
     net_delegate_kick_poll, net_delegate_kick_tick,
-    net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver,
-    NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
+    net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver, NetDelegateSupervisor,
+    NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
 };
 #[cfg(test)]
 use tx_subsystems::net::device::VIRTIO_NET0_DEVICE;
@@ -40,9 +40,8 @@ const BOOT_ETH_NETMASK: Ipv4Address = Ipv4Address::new([255, 255, 255, 0]);
 const BOOT_ETH_GATEWAY: Ipv4Address = Ipv4Address::new([10, 0, 2, 2]);
 /// V5-2: static v6 address for the boot NIC, mirroring `BOOT_ETH_IPV4` under
 /// the same SLIRP convention (`fec0::/64`, host side `fec0::2`, DNS `fec0::3`).
-const BOOT_ETH_IPV6: Ipv6Address = Ipv6Address::new([
-    0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
-]);
+const BOOT_ETH_IPV6: Ipv6Address =
+    Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15]);
 const BOOT_ETH_IPV6_PREFIX_LEN: u8 = 64;
 const BOOT_ETH_NAME: &str = "eth0";
 
@@ -404,8 +403,7 @@ impl<P: TxPlatform> CoreInit<P> {
                             // until that transport behavior has a stronger
                             // witness; normal traffic wakes through IRQ first.
                             let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
-                            let now =
-                                Instant::from_micros(micros.min(i64::MAX as u64) as i64);
+                            let now = Instant::from_micros(micros.min(i64::MAX as u64) as i64);
                             let floor = now + smoltcp::time::Duration::from_millis(10);
                             let clamped = Some(match next_deadline {
                                 Some(deadline) if deadline < floor => deadline,
@@ -416,7 +414,13 @@ impl<P: TxPlatform> CoreInit<P> {
                     )
                     .await;
                 },
+                // The network state machine has one protocol owner. Pin both
+                // its future and its timer publisher to the same hart so the
+                // delegate's wait registration, wake routing, and protocol
+                // ownership cannot move independently between polls. User
+                // processes remain movable across every online CPU.
                 tx_reactor::InitialSchedMeta::kernel()
+                    .pinned()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
             )
         })
@@ -428,6 +432,7 @@ impl<P: TxPlatform> CoreInit<P> {
             reactor.submit_task_with_meta(
                 boot_net_deadline_task(runtime),
                 tx_reactor::InitialSchedMeta::kernel()
+                    .pinned()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
             )
         })

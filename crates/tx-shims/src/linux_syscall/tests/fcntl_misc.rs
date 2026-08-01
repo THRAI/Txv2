@@ -1199,6 +1199,7 @@ impl PmapIf for LoongArchUnamePmap {
 
 impl EntropyIf for LoongArchUnamePmap {}
 impl tx_hal::AuxvIf for LoongArchUnamePmap {}
+impl tx_hal::CacheIf for LoongArchUnamePmap {}
 impl tx_hal::ConsoleIf for LoongArchUnamePmap {
     fn write_bytes(_bytes: &[u8]) {}
 }
@@ -1358,35 +1359,22 @@ fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
     assert_eq!(r, SyscallResult::Error(14)); // EFAULT
 }
 
-/// The syscall-layer fallback still restores the parked pre-handler
-/// snapshot when no platform frame reader has run. The full kernel
-/// thread future handles user-edited frames before this result is
-/// observed.
+/// `rt_sigreturn` is valid only after the architecture layer has decoded the
+/// userspace signal frame.  There is deliberately no kernel-side shadow
+/// context fallback: such a fallback would discard handler edits to
+/// `ucontext_t` (notably musl pthread cancellation).
 #[test]
-fn dispatch_rt_sigreturn_restores_parked_signal_context() {
+fn dispatch_rt_sigreturn_without_decoded_userspace_frame_returns_neg_efault() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let payload = thread.payload_cap().expect("thread has payload");
-    let mut parked = tx_hal::UserTrapContext::empty();
-    parked.pc = 0x1234_5678;
-    parked.regs[10] = 0xdead_beef;
-    payload.store_saved_signal_context(Some(parked));
 
     let ctx = make_ctx(proc_cap, thread.clone());
     let r = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::SigreturnRestored);
-
-    let restored = thread
-        .payload_cap()
-        .expect("thread has payload")
-        .saved_user_context()
-        .expect("rt_sigreturn must have stored the parked context");
-    assert_eq!(restored.pc, 0x1234_5678);
-    assert_eq!(restored.regs[10], 0xdead_beef);
+    assert_eq!(r, SyscallResult::Error(14)); // EFAULT
 }
 
 // E_BADF is reserved for the F_DUPFD-against-closed-fd shape;

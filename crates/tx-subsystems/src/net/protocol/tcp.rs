@@ -714,6 +714,38 @@ impl SmoltcpTcpSegment {
         Some(Self::from_reprs(IpRepr::Ipv6(ipv6_repr), tcp_repr))
     }
 
+    /// Read only the TCP four-tuple from a queued loopback packet.
+    ///
+    /// Unlike `parse_ipv4_packet`, this does not copy the TCP payload, so it
+    /// can be used while the short loopback-queue selection lock is held.
+    pub fn packet_endpoints(packet: &LoopbackIpPacket) -> Option<(IpEndpoint, IpEndpoint)> {
+        if let Ok(ipv4) = Ipv4Packet::new_checked(packet.as_bytes()) {
+            if ipv4.version() == 4 {
+                if ipv4.next_header() != IpProtocol::Tcp {
+                    return None;
+                }
+                let tcp = TcpPacket::new_checked(ipv4.payload()).ok()?;
+                return Some((
+                    IpEndpoint::new(from_smoltcp_ipv4(ipv4.src_addr()), tcp.src_port()),
+                    IpEndpoint::new(from_smoltcp_ipv4(ipv4.dst_addr()), tcp.dst_port()),
+                ));
+            }
+        }
+
+        let ipv6 = Ipv6Packet::new_checked(packet.as_bytes()).ok()?;
+        if ipv6.version() != 6 {
+            return None;
+        }
+        if ipv6.next_header() != IpProtocol::Tcp {
+            return None;
+        }
+        let tcp = TcpPacket::new_checked(ipv6.payload()).ok()?;
+        Some((
+            IpEndpoint::new_v6(from_smoltcp_ipv6(ipv6.src_addr()), tcp.src_port()),
+            IpEndpoint::new_v6(from_smoltcp_ipv6(ipv6.dst_addr()), tcp.dst_port()),
+        ))
+    }
+
     pub fn src_endpoint(&self) -> Option<IpEndpoint> {
         match self.ip_repr.src_addr() {
             IpAddress::Ipv4(addr) => {

@@ -2169,6 +2169,7 @@ pub const IPV6_TCLASS: i32 = 67;
 pub const SO_BINDTODEVICE: i32 = 25;
 
 // IPPROTO_IP options.
+pub const IP_TOS: i32 = 1;
 pub const IP_TTL: i32 = 2;
 pub const IP_MULTICAST_IF: i32 = 32;
 pub const IP_MULTICAST_TTL: i32 = 33;

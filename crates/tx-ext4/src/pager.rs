@@ -1,7 +1,9 @@
 use step_engine::Guard;
-use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_ext4_format::pager::{BlockImage, CheckedPageRead, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking};
+use tx_subsystems::page_backed::{
+    reserve_frame_with_reclaim, FilesystemStats, Frame, FsPageBacking,
+};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
@@ -22,7 +24,7 @@ use page_allocator::ZeroPolicy;
 fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     let owned = match reserve_frame_with_reclaim(ZeroPolicy::Zeroed) {
         Ok(reservation) => reservation.commit(),
-        Err(_) => return StepOutcome::err(Errno::EBUSY),
+        Err(_) => return StepOutcome::err(Errno::EBUSY.into()),
     };
     let ppn = owned.ppn();
 
@@ -34,7 +36,7 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     {
         let dst = match page_allocator::frame_kernel_addr(ppn) {
             Ok(ptr) => ptr,
-            Err(_) => return StepOutcome::err(Errno::EIO),
+            Err(_) => return StepOutcome::err(Errno::EIO.into()),
         };
         // SAFETY: `dst` is the kernel direct-map VA of a freshly
         // allocated frame we own through `owned`. `page` is a
@@ -100,6 +102,21 @@ impl<I> FsPageBacking for Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {
+    fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
+        match self.with_pager(|pager| pager.filesystem_stats()) {
+            Ok(stats) => StepOutcome::done(FilesystemStats {
+                block_size: stats.block_size,
+                total_blocks: stats.total_blocks,
+                free_blocks: stats.free_blocks,
+                available_blocks: stats.available_blocks,
+                total_inodes: stats.total_inodes,
+                free_inodes: stats.free_inodes,
+                max_name_len: stats.max_name_len,
+            }),
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
@@ -107,19 +124,27 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
 
-        if let Err(err) =
-            self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
-        {
-            return StepOutcome::err(err);
+        match self.with_pager(|pager| {
+            pager.read_page_checked(
+                inode,
+                fs_object_id.inode_generation(),
+                file_page_index,
+                &mut page,
+            )
+        }) {
+            Ok(CheckedPageRead::Page(_)) => {}
+            Ok(CheckedPageRead::Missing) => return StepOutcome::err(Errno::ENOENT.into()),
+            Ok(CheckedPageRead::Stale) => return StepOutcome::err(Errno::ESTALE.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         }
 
         materialize_frame(&page)
@@ -132,24 +157,32 @@ where
         frame: &Frame,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        // Main routes normal writeback through the owned IO manager.  Do not
+        // let this legacy synchronous hook perform a second write when that
+        // backend is active; final-smp's checked inode/write diagnostics remain
+        // below for the legacy path.
         if !self.legacy_writeback_enabled() {
             return StepOutcome::err(Errno::ENOSYS.into());
         }
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err),
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
         if let Err(err) = read_frame_bytes(frame, &mut page) {
-            return StepOutcome::err(err);
+            return StepOutcome::err(err.into());
         }
-        match self.with_pager(|pager| pager.write_page(inode, file_page_index, &page)) {
+        match self.with_pager_raw(|pager| pager.write_page(inode, file_page_index, &page)) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err),
+            Err(err) => {
+                let stats = self.with_pager_raw(|pager| pager.filesystem_stats()).ok();
+                crate::report_writeback_stats(inode.get(), file_page_index, err, stats);
+                StepOutcome::err(crate::read_backend::map_format_error(err).into())
+            }
         }
     }
 
@@ -159,25 +192,29 @@ where
         new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err),
+        let inode = match self.resolve_object(fs_object_id) {
+            Ok((inode, _)) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
         };
-        match self.with_pager(|pager| pager.set_inode_size(inode, new_size)) {
+        let now_sec = tx_subsystems::wall_clock::current_realtime_sec().min(u32::MAX as u64) as u32;
+        match self.with_pager(|pager| pager.set_inode_size_and_times(inode, new_size, now_sec)) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err),
+            Err(err) => StepOutcome::err(err.into()),
         }
     }
 
     fn fsync_file(
         &self,
-        _fs_object_id: FsObjectId,
+        fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if !self.legacy_writeback_enabled() {
             return StepOutcome::err(Errno::ENOSYS.into());
         }
-        StepOutcome::done(())
+        match self.resolve_object(fs_object_id) {
+            Ok(_) => StepOutcome::done(()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
     }
 
     // `fallocate` and `supports_reflink` inherit the trait defaults

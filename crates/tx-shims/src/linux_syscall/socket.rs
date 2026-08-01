@@ -13,20 +13,18 @@ use tx_subsystems::net::protocol::loopback_iface;
 use tx_subsystems::net::{
     net_namespace_payload_from_file, net_namespace_payloads_snapshot, netlink_netfilter_recv,
     netlink_netfilter_send, netlink_route_recv, netlink_route_recv_packet,
-    netlink_route_send_with_netns_resolvers, netlink_xfrm_recv,
-    netlink_xfrm_send, require_net_raw, socket_open_file_from_identity, step_accept,
-    step_bind, step_connect, step_listen, step_poll_ready, step_poll_wait_token,
-    step_process_loopback_udp, step_recv_kernel_bytes, step_sctp_peeloff,
-    step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
+    netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
+    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
+    step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
+    step_sctp_peeloff, step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
     step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_open_file_in_namespace,
-    step_tcp_loopback_handshake,
-    step_tcp_loopback_transfer, step_unix_socketpair_connect, AddressFamily,
-    ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr,
-    LingerOption, NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags, SockAddrIn,
-    SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind,
-    SocketOperationalEvidence, SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner,
-    UnixDatagramState, UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType,
+    step_tcp_loopback_handshake, step_tcp_loopback_transfer, step_unix_socketpair_connect,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address,
+    KernelSockAddr, LingerOption, NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags,
+    SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity,
+    SocketKind, SocketOperationalEvidence, SocketProtocol, SocketType, TcpState, TcpTlsUlpState,
+    UdpInner, UnixDatagramState, UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType,
     VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -54,9 +52,8 @@ static NEXT_EPHEMERAL_PORT_OFFSET: core::sync::atomic::AtomicU16 =
 
 pub(super) fn ephemeral_port_candidates() -> impl Iterator<Item = u16> {
     const LEN: u16 = EPHEMERAL_PORT_END - EPHEMERAL_PORT_START;
-    let start = NEXT_EPHEMERAL_PORT_OFFSET
-        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        % LEN;
+    let start =
+        NEXT_EPHEMERAL_PORT_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % LEN;
     (0..LEN).map(move |i| EPHEMERAL_PORT_START + (start + i) % LEN)
 }
 const IOVEC_BYTES: u64 = 16;
@@ -612,9 +609,12 @@ fn sctp_connectx3(
 }
 
 mod helpers;
-use helpers::*;
 pub(super) use helpers::drive_loopback_pending;
-pub(crate) use helpers::{socket_identity_from_file, unix_pathname_key};
+use helpers::*;
+pub(crate) use helpers::{
+    socket_identity_from_file, socket_poll_mask_from_file, socket_poll_wait_token_from_file,
+    unix_pathname_key,
+};
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let socket = match resolve_socket_fd(ctx, args[0] as i32) {
@@ -900,13 +900,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         loop {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
-                step_send_udp_loopback_kernel_bytes(
-                    &socket,
-                    dst,
-                    &bytes,
-                    flags,
-                    &guard,
-                )
+                step_send_udp_loopback_kernel_bytes(&socket, dst, &bytes, flags, &guard)
             };
             match outcome {
                 StepOutcome::Done(sent) => {
@@ -1286,9 +1280,7 @@ fn maybe_queue_packet_arp_reply(
         target_mac.len() as u8,
     );
     if payload.record_packet_frame(source, reply).unwrap_or(false) {
-        socket
-            .readiness
-            .fire_recv(RecvWireSet::HAS_DATA);
+        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
 }
 

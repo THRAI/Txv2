@@ -86,8 +86,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
                 // Preserve the interrupted userspace run in its hart slot
                 // before requesting that jump, exactly as the timer path does.
                 if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
-                    let hart = <P as PercpuIf>::current_cpu_id().0;
-                    let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
+                    let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
                     if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
                         crate::init::mark_boot_reactor_userspace_preempt(cpu);
                     }
@@ -99,8 +98,38 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         }
     }
 
-    fn on_ipi(_cpu: CpuId) -> TrapAction {
-        dispatch_pending_ipis::<P>()
+    fn on_ipi(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+        let maintenance = P::pending_ipi(IpiKind::Maintenance);
+        let reschedule = P::pending_ipi(IpiKind::Reschedule);
+        if maintenance {
+            P::ack_ipi(IpiKind::Maintenance);
+        }
+        if P::pending_ipi(IpiKind::Membarrier) {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            P::ack_ipi(IpiKind::Membarrier);
+        }
+        if reschedule {
+            P::ack_ipi(IpiKind::Reschedule);
+        }
+        if P::pending_ipi(IpiKind::TlbShootdown) {
+            P::ack_ipi(IpiKind::TlbShootdown);
+        }
+
+        if (maintenance || reschedule)
+            && view.view().previous_mode == tx_hal::TrapPreviousMode::User
+        {
+            let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
+            if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
+                crate::init::mark_boot_reactor_userspace_preempt(cpu);
+            }
+            return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
+        }
+
+        if maintenance {
+            TrapAction::Reschedule
+        } else {
+            TrapAction::Resume
+        }
     }
 
     fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
@@ -215,8 +244,11 @@ fn try_direct_trap_syscall<P: TxPlatform>(
 
     let context_start = direct_sigprocmask_detail_now(req.nr);
     let thread_lookup_start = direct_sigprocmask_detail_now(req.nr);
-    let Some(thread) = tx_subsystems::thread_runtime::current_userspace_thread_identity(hart)
-    else {
+    // The trap runs inside `PerHartSlotted::poll`, which keeps the current
+    // thread identity installed until the userspace round-trip longjmps back
+    // and the wrapped poll returns.  Use that poll-scoped authority instead of
+    // maintaining a second userspace identity cache with a wider lifetime.
+    let Some(thread) = tx_subsystems::thread_runtime::current_thread_identity(hart) else {
         emit_direct_sigprocmask_detail_value(req.nr, b"debug.trap.direct_sigprocmask.no_thread", 1);
         return None;
     };

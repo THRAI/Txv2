@@ -22,13 +22,14 @@ mod tests;
 
 pub use exec_prep::{ExecPrepError, PreparedCloexecClose, ProcessExecPrep};
 pub use execution::{
-    all_pids, bootstrap_init_process, init_process, process_by_pid, process_group_by_pgid,
+    all_pids, bootstrap_init_process, finalize_detached_open_files, flush_page_backed_open_file,
+    fork_with_options_wait, init_process, process_by_pid, process_group_by_pgid,
     seed_child_leader_context, step_chdir, step_chdir_with_mount, step_exit_group_with_posts,
     step_fork, step_fork_with_options, step_getcwd, step_set_mount_namespace, step_setpgid,
-    step_setsid, step_waitpid_nohang, ChdirOp, ChdirOutcome, CloneThreadOp, CloseOp, Dup3Op, DupOp,
-    FcntlDupFdOp, FcntlFdOp, ForkError, ForkOptions, GetcwdOp, InstallBrkForExecOp,
-    ProcessExitOutcome, ResetSignalDispositionsForExecOp, SetpgidError, SetpgidOp, SetsidError,
-    SetsidOp, WaitError, WaitTarget,
+    step_setsid, step_waitpid_nohang, waitpid_would_block, ChdirOp, ChdirOutcome, CloneThreadOp,
+    CloseOp, Dup3Op, DupOp, FcntlDupFdOp, FcntlFdOp, ForkError, ForkOptions, GetcwdOp,
+    InstallBrkForExecOp, ProcessExitOutcome, ResetSignalDispositionsForExecOp, SetpgidError,
+    SetpgidOp, SetsidError, SetsidOp, WaitError, WaitTarget,
 };
 pub use structure::{
     CwdBinding, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,

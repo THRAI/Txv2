@@ -476,6 +476,11 @@ impl Inode {
                     if let Some(block) = extent.physical_for(logical_block) {
                         return Ok(BlockMapping::Data(block));
                     }
+                    if extent.contains(logical_block) {
+                        return Ok(BlockMapping::Unwritten(
+                            extent.physical_start + (logical_block - extent.logical_block) as u64,
+                        ));
+                    }
                 }
                 Ok(BlockMapping::Hole)
             }
@@ -523,6 +528,10 @@ impl Default for Inode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockMapping {
     Data(u64),
+    /// A physically allocated extent whose contents are not initialized yet.
+    /// Reads return zeroes; the first write converts the covered block to an
+    /// initialized extent without allocating another physical block.
+    Unwritten(u64),
     Hole,
     NeedNode(u64),
 }
@@ -592,17 +601,30 @@ impl Extent {
         Ok(())
     }
 
+    /// Return the number of blocks represented by `ee_len`.
+    ///
+    /// ext4 reserves raw values above 0x8000 for unwritten extents, while
+    /// exactly 0x8000 is the largest initialized extent. Treating bit 15 as a
+    /// plain flag therefore turns a valid 32768-block extent into length zero.
+    pub fn actual_len(&self) -> u32 {
+        if self.len <= Self::UNINITIALIZED_MASK {
+            self.len as u32
+        } else {
+            (self.len - Self::UNINITIALIZED_MASK) as u32
+        }
+    }
+
     pub fn initialized_len(&self) -> u32 {
-        (self.len & !Self::UNINITIALIZED_MASK) as u32
+        self.actual_len()
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.len & Self::UNINITIALIZED_MASK == 0
+        self.len <= Self::UNINITIALIZED_MASK
     }
 
     pub fn contains(&self, logical_block: u32) -> bool {
         logical_block >= self.logical_block
-            && logical_block < self.logical_block.saturating_add(self.initialized_len())
+            && logical_block < self.logical_block.saturating_add(self.actual_len())
     }
 
     pub fn physical_for(&self, logical_block: u32) -> Option<u64> {

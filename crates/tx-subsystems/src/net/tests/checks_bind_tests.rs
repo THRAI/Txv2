@@ -400,10 +400,7 @@ fn execution_connect_blocks_tcp_and_completes_udp() {
     let wait = expect_carrier_yield(step_connect(&tcp, remote, &guard));
     assert_ne!(wait.source_id(), tcp.raw() as u64);
     assert_eq!(wait.source_id(), tcp.wait_carriers.send);
-    assert!(
-        crate::wait_source::wait_on_registered_source_id(wait.source_id(), wait.interest())
-            .is_some()
-    );
+    assert!(crate::wait_source::wait_on_token(wait).is_some());
     assert!(wait.interest() & SendWireSet::SPACE.bits() != 0);
     assert!(wait.interest() & SendWireSet::BROKEN.bits() != 0);
     assert_eq!(
@@ -493,9 +490,7 @@ fn shutdown_fires_same_rawqueue_used_by_wait_token() {
     )
     .expect("tcp socket");
     let token = socket_send_wait_token(&tcp);
-    let mut future =
-        crate::wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
-            .expect("send wq registered");
+    let mut future = crate::wait_source::wait_on_token(token).expect("send wq registered");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 

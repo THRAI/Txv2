@@ -10,7 +10,12 @@ static RECLAIM_COUNT: AtomicUsize = AtomicUsize::new(0);
 struct TestPlatform;
 
 impl PercpuIf for TestPlatform {}
-impl IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_: usize) {}
+impl IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
+}
 impl EntropyIf for TestPlatform {}
 impl SmpIf for TestPlatform {}
 
@@ -19,6 +24,7 @@ unsafe fn count_reclaim(_ptr: *mut u8) {
 }
 
 fn reset_epoch() {
+    tx_substrate::testing::init_host_for_test_once();
     unsafe {
         testing::reset_for_test();
     }
@@ -78,29 +84,23 @@ fn drain_budget_limits_reclaim_work() {
 }
 
 #[test]
-fn retired_node_pool_exhaustion_is_reported() {
+fn retired_bags_grow_past_local_capacity() {
     let _guard = EPOCH_TEST_LOCK.lock().expect("epoch test lock");
     reset_epoch();
 
     let epoch_guard = epoch::guard();
-    for _ in 0..testing::RETIRED_NODE_POOL_CAPACITY {
+    let retire_count = testing::RETIRED_BAG_CAPACITY + 1;
+    for _ in 0..retire_count {
         unsafe {
             testing::retire_raw_for_test(retired_ptr(), count_reclaim).expect("retire");
         }
     }
-
-    let error = unsafe { testing::retire_raw_for_test(retired_ptr(), count_reclaim) }
-        .expect_err("retired node pool must be exhausted");
-    assert_eq!(error, EpochError::RetiredNodePoolExhausted);
     assert_eq!(RECLAIM_COUNT.load(Ordering::Acquire), 0);
 
     drop(epoch_guard);
     let first = epoch::try_drain(usize::MAX);
     let second = epoch::try_drain(usize::MAX);
-    assert_eq!(
-        first.reclaimed + second.reclaimed,
-        testing::RETIRED_NODE_POOL_CAPACITY
-    );
+    assert_eq!(first.reclaimed + second.reclaimed, retire_count);
 }
 
 #[test]

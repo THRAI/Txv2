@@ -444,6 +444,22 @@ impl ExecTestFs {
         );
         id
     }
+
+    fn set_regular_mode_bits(&self, fs_object_id: FsObjectId, mode_bits: u16) {
+        let mut inner = self.inner.lock();
+        match inner.inodes.get_mut(&fs_object_id) {
+            Some(ExecTestInode::Regular {
+                mode_bits: current, ..
+            })
+            | Some(ExecTestInode::RegularNonPageBacked {
+                mode_bits: current, ..
+            }) => *current = mode_bits,
+            Some(ExecTestInode::Directory | ExecTestInode::Symlink { .. }) => {
+                panic!("set_regular_mode_bits called for non-regular inode")
+            }
+            None => panic!("set_regular_mode_bits called for missing inode"),
+        }
+    }
 }
 
 struct ErrnoPageBacking(tx_subsystems::execution::Errno);
@@ -2695,6 +2711,49 @@ fn exec_script_dac_override_still_requires_some_x_bit() {
         &cred,
     ));
     assert_eq!(result, Err(ExecError::PermissionDenied));
+}
+
+#[test]
+fn executable_permission_uses_live_inode_meta_after_cached_rnode_chmod() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let root_id = FsObjectId::new(2);
+    let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    let file_id =
+        fs.add_regular_with_bytes_meta(root_id, b"minibuild", &bytes, 0o644, 0, 0);
+    let namespace = MountNamespace::new_cap(mount.clone()).expect("mount namespace");
+
+    // Keep the pre-chmod dentry/RNode alive, reproducing the VFS cache shape
+    // seen when Cargo/linker creates, stats and then chmods its output.
+    let guard = guard();
+    let stale_dentry = match tx_subsystems::vfs::step_walk_in_mount_namespace_with_origin_mount(
+        root_dentry.clone(),
+        &mount,
+        b"/minibuild",
+        &Credential::root(),
+        &namespace,
+        &guard,
+    ) {
+        StepOutcome::Done(resolved) => resolved.dentry,
+        other => panic!("materialise pre-chmod dentry: {other:?}"),
+    };
+    drop(guard);
+    assert_eq!(stale_dentry.rnode().meta().mode & 0o7777, 0o644);
+
+    // The filesystem has committed chmod, while the cached RNode correctly
+    // remains a snapshot.  Exec must consult live inode metadata and accept
+    // the file without weakening Linux's root-requires-some-X rule.
+    fs.set_regular_mode_bits(file_id, 0o755);
+    let candidate = super::open_executable_candidate(
+        root_dentry,
+        &mount,
+        b"/minibuild",
+        &Credential::root(),
+        &namespace,
+        super::ExecutableCandidateRole::Main,
+    );
+    assert!(candidate.is_ok(), "live chmod mode must authorize exec");
+    assert_eq!(stale_dentry.rnode().meta().mode & 0o7777, 0o644);
 }
 
 #[test]

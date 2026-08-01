@@ -42,7 +42,7 @@ pub struct VirtioNetPollOutcome {
 }
 
 pub struct VirtioMmioNet<P: TxPlatform, const QUEUE_SIZE: usize> {
-    mmio_region_name: &'static str,
+    region_source: crate::virtio::mmio::RegionSource,
     inner: SpinMutex<Option<VirtioNetRawState<P, MmioTransport<'static>, QUEUE_SIZE>>>,
     initialized: AtomicBool,
     mac: AtomicU64,
@@ -83,8 +83,16 @@ struct PendingTxBuffer {
 
 impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
     pub const fn new(mmio_region_name: &'static str) -> Self {
+        Self::with_source(crate::virtio::mmio::RegionSource::Name(mmio_region_name))
+    }
+
+    pub const fn from_region(region: tx_hal::MmioRegion) -> Self {
+        Self::with_source(crate::virtio::mmio::RegionSource::Region(region))
+    }
+
+    const fn with_source(region_source: crate::virtio::mmio::RegionSource) -> Self {
         Self {
-            mmio_region_name,
+            region_source,
             inner: SpinMutex::new(None),
             initialized: AtomicBool::new(false),
             mac: AtomicU64::new(0),
@@ -99,12 +107,15 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
             return Ok(());
         }
 
-        let region = <P as PlatformInfoIf>::platform_info()
-            .mmio_regions
-            .iter()
-            .copied()
-            .find(|region| region.name == self.mmio_region_name)
-            .ok_or(VirtioNetError::MissingMmioRegion(self.mmio_region_name))?;
+        let region = match self.region_source {
+            crate::virtio::mmio::RegionSource::Name(name) => <P as PlatformInfoIf>::platform_info()
+                .mmio_regions
+                .iter()
+                .copied()
+                .find(|region| region.name == name)
+                .ok_or(VirtioNetError::MissingMmioRegion(name))?,
+            crate::virtio::mmio::RegionSource::Region(region) => region,
+        };
         // Do not construct MmioTransport for a non-net device: dropping it
         // resets the underlying virtio device, including the boot block disk.
         let device_type = peek_mmio_device_type(region)?;
@@ -112,7 +123,7 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
             return Err(VirtioNetError::WrongDeviceType(device_type));
         }
         let header = NonNull::new(region.virt.start.0 as *mut VirtIOHeader)
-            .ok_or(VirtioNetError::MissingMmioRegion(self.mmio_region_name))?;
+            .ok_or(VirtioNetError::MissingMmioRegion(region.name))?;
         let transport = unsafe { MmioTransport::new(header, region.virt.size) }
             .map_err(VirtioNetError::Mmio)?;
         init_raw_device(self, transport)

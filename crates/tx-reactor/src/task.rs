@@ -1,7 +1,12 @@
 //! Reactor task identity and task-table entries.
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
-use core::{future::Future, pin::Pin, task::Waker};
+use core::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Waker,
+};
 
 use tx_substrate::wake::mailbox::{MailboxSchedulerHint, TaskMailbox};
 
@@ -86,6 +91,18 @@ pub struct TaskDrainRecord {
     pub last_stop_reason: Option<StopReason>,
 }
 
+/// Lock-consistent task-table state used by one-shot kernel stall diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskRuntimeDiagnostic {
+    pub id: TaskId,
+    pub generation: TaskGeneration,
+    pub status: TaskStatus,
+    pub wake_requested: bool,
+    pub mailbox_len: usize,
+    pub mailbox_has_waker: bool,
+    pub last_stop_reason: Option<StopReason>,
+}
+
 /// Current reactor-visible state of a task future.
 ///
 /// These states describe polling mechanics only. They are not thread,
@@ -133,13 +150,14 @@ impl Task {
         handle: TaskKey,
         future: F,
         wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
+        queued_wakes: Arc<AtomicUsize>,
     ) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let future: TaskFuture = Box::pin(future);
         emit_task_submit_debug(b"debug.task.submit.future_box.after", handle.id);
-        let wake_state = Arc::new(TaskWakeState::new(handle.id, wake_queue));
+        let wake_state = Arc::new(TaskWakeState::new(handle.id, wake_queue, queued_wakes));
         emit_task_submit_debug(b"debug.task.submit.wake_state.after", handle.id);
         let mailbox = Arc::new(
             TaskMailbox::new()
@@ -177,6 +195,7 @@ pub struct TaskTable {
     completed: Vec<TaskId>,
     cancelled: Vec<TaskId>,
     wake_queue: Arc<SpinLock<VecDeque<TaskId>>>,
+    queued_wakes: Arc<AtomicUsize>,
 }
 
 struct TaskSlot {
@@ -192,7 +211,28 @@ impl TaskTable {
             completed: Vec::new(),
             cancelled: Vec::new(),
             wake_queue: Arc::new(SpinLock::new(VecDeque::new())),
+            queued_wakes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn queued_wake_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.queued_wakes)
+    }
+
+    pub(crate) fn runtime_diagnostics(&self) -> Vec<TaskRuntimeDiagnostic> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.task.as_ref())
+            .map(|task| TaskRuntimeDiagnostic {
+                id: task.id,
+                generation: task.generation,
+                status: task.status,
+                wake_requested: task.wake_state.is_wake_requested(),
+                mailbox_len: task.mailbox.len(),
+                mailbox_has_waker: task.mailbox.has_waker(),
+                last_stop_reason: task.last_stop_reason,
+            })
+            .collect()
     }
 
     pub fn submit<F>(&mut self, future: F) -> TaskKey
@@ -208,7 +248,12 @@ impl TaskTable {
             core::mem::size_of::<F>() as i64,
         );
         let handle = TaskKey::new(id, generation);
-        let task = Task::new_for_handle(handle, future, Arc::clone(&self.wake_queue));
+        let task = Task::new_for_handle(
+            handle,
+            future,
+            Arc::clone(&self.wake_queue),
+            Arc::clone(&self.queued_wakes),
+        );
         emit_task_submit_debug(b"debug.task.submit.construct.after", id);
         self.slots[id.index()].task = Some(task);
         emit_task_submit_debug(b"debug.task.submit.store.after", id);
@@ -221,6 +266,11 @@ impl TaskTable {
 
     pub(crate) fn status_by_id(&self, id: TaskId) -> Option<TaskStatus> {
         self.task_by_id(id).map(|task| task.status)
+    }
+
+    pub(crate) fn wake_requested_by_id(&self, id: TaskId) -> Option<bool> {
+        self.task_by_id(id)
+            .map(|task| task.wake_state.is_wake_requested())
     }
 
     pub(crate) fn last_stop_reason_by_id(&self, id: TaskId) -> Option<StopReason> {
@@ -337,6 +387,13 @@ impl TaskTable {
         let task = self.live_nonterminal_task_mut(handle)?;
         task.future = Some(future);
         if task.wake_state.take_wake() {
+            // A wake may race with the task's current poll.  In that case the
+            // waker has already queued this task before `poll()` returns
+            // `Pending`.  The queue entry is only useful if the task-table
+            // state is committed back to Runnable as well; leaving it in
+            // Polling makes the scheduler reject the queued entry and loses
+            // the wake permanently.
+            task.status = TaskStatus::Runnable;
             let mailbox_event = !task.mailbox.is_empty() || task.mailbox.overflow();
             Ok(PendingPollCommit::Woken {
                 hint: task.mailbox.take_scheduler_hint(),
@@ -391,6 +448,8 @@ impl TaskTable {
             let Some(id) = id else {
                 break;
             };
+            let previous = self.queued_wakes.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0, "wake queue counter underflow");
             woken.push(id);
         }
         woken
@@ -406,15 +465,29 @@ impl TaskTable {
         id: TaskId,
     ) -> Option<(TaskKey, MailboxSchedulerHint)> {
         let task = self.slots.get_mut(id.index())?.task.as_mut()?;
-        if !task.wake_state.take_wake() {
-            return None;
-        }
-        if task.status == TaskStatus::Parked {
-            task.status = TaskStatus::Runnable;
-            let hint = task.mailbox.take_scheduler_hint();
-            Some((task.handle(), hint))
-        } else {
-            None
+        match task.status {
+            TaskStatus::Parked => {
+                if !task.wake_state.take_wake() {
+                    return None;
+                }
+                task.status = TaskStatus::Runnable;
+                let hint = task.mailbox.take_scheduler_hint();
+                Some((task.handle(), hint))
+            }
+            TaskStatus::Polling => {
+                // A different hart may drain the global wake queue while this
+                // task is still inside `Future::poll`.  Keep the wake bit set:
+                // `finish_polled_pending` owns the poll/park handshake and
+                // will turn the task straight back into Runnable.  Consuming
+                // it here loses the only wake when poll later returns Pending.
+                None
+            }
+            TaskStatus::Runnable | TaskStatus::Completed | TaskStatus::Cancelled => {
+                // Runnable tasks already have queue ownership; terminal tasks
+                // cannot be resumed.  Discard redundant/stale wake state.
+                let _ = task.wake_state.take_wake();
+                None
+            }
         }
     }
 
@@ -574,12 +647,57 @@ const fn is_terminal(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
 }
 
+#[cfg(test)]
+mod tests {
+    use core::future::pending;
+
+    use super::*;
+
+    #[test]
+    fn wake_during_poll_commits_task_back_to_runnable() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let (key, future, wake_state, _) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("take task for polling");
+
+        task_waker(wake_state).wake_by_ref();
+        let drained = tasks.drain_wake_ids();
+        assert_eq!(drained, [handle.id()]);
+        assert_eq!(tasks.take_wake_if_parked_by_id_with_hint(handle.id()), None);
+
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken { .. })
+        ));
+        assert_eq!(tasks.status(handle), Some(TaskStatus::Runnable));
+    }
+
+    #[test]
+    fn repeated_wakes_share_one_queue_entry() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let waker = tasks.waker(handle).expect("task waker");
+
+        waker.wake_by_ref();
+        waker.wake_by_ref();
+        waker.wake_by_ref();
+
+        assert_eq!(tasks.queued_wakes.load(Ordering::Acquire), 1);
+        assert_eq!(tasks.drain_wake_ids(), [handle.id()]);
+        assert_eq!(tasks.queued_wakes.load(Ordering::Acquire), 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-hart current-task mailbox slot (drive-taskmb trampoline injection)
 // ---------------------------------------------------------------------------
 
-/// Max harts for per-hart runtime context slots in the Phase 1 SMP shell.
-const MAX_HARTS: usize = 8;
+/// Capacity of the per-hart runtime context slots.
+///
+/// Keep this aligned with `MAX_REACTOR_HARTS` and the 64-bit CPU masks used
+/// by the runtime rather than with any one board's current QEMU topology.
+const MAX_HARTS: usize = 64;
 
 /// Per-hart slots for the currently-polling task's mailbox.
 /// Indexed by `HartId.0`.  Each hart writes only its own slot before

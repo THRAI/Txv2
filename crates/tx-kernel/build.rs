@@ -5,7 +5,5 @@
 //! the kernel image.
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(tx_userspace_child_spread_smp1)");
-    println!("cargo:rustc-check-cfg=cfg(tx_userspace_child_spread_smp4)");
     println!("cargo:rerun-if-env-changed=TX_OSCOMP_GROUPS");
 }

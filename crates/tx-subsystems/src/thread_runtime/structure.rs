@@ -8,6 +8,7 @@
 
 use alloc::sync::Weak as ArcWeak;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::task::Waker;
 
 use tx_hal::UserTrapContext;
 
@@ -170,6 +171,13 @@ pub struct ThreadPayload {
     /// `view.capture_user_context()`, restored before next userspace
     /// entry. Per `THREAD-5-1-STATE-PLACEMENT`.
     pub(crate) saved_user_context: SpinMutex<Option<UserTrapContext>>,
+    /// Mask to restore after a handler which interrupted
+    /// `rt_sigsuspend`.
+    ///
+    /// This is distinct from `saved_signal_mask`: the handler must start with
+    /// the temporary suspend mask, while `rt_sigreturn` must restore the mask
+    /// that was active before `rt_sigsuspend`.
+    pub(crate) sigsuspend_restore_mask: SpinMutex<Option<SignalMask>>,
     /// Saved signal context: the `UserTrapContext` that was active
     /// before the most recent handler delivery.  Written by the AST
     /// checkpoint in `thread_future` when `DeliverHandler` fires;
@@ -213,6 +221,10 @@ pub struct ThreadPayload {
     /// `Arc`-managed at the substrate layer; the eventual zone
     /// migration (PR-3D+) flips this to `zone::Weak<TaskMailbox>`.
     pub(crate) mailbox: SpinMutex<Option<ArcWeak<TaskMailbox>>>,
+    /// Stable scheduler wake route for exec/group-exit lifecycle events.
+    /// Unlike the mailbox's transient wait waker, this binding survives a
+    /// nested futex/I/O wait clearing its own registration.
+    pub(crate) lifecycle_waker: SpinMutex<Option<Waker>>,
     /// Thread stop flag.  Set by Gewalt routing for SIGSTOP /
     /// `DefaultStop` AST materialisation; cleared by
     /// Gewalt routing for SIGCONT.  When `true`, the thread must not
@@ -244,6 +256,15 @@ pub struct ThreadPayload {
     /// awaiting syscall dispatch; blocking syscall futures should
     /// appear as sleeping to procfs observers.
     pub(crate) proc_sleeping: AtomicBool,
+    active_syscall_nr: AtomicU64,
+    active_syscall_arg0: AtomicU64,
+    active_syscall_arg1: AtomicU64,
+    last_user_entry_pc: AtomicU64,
+    last_user_entry_ra: AtomicU64,
+    last_user_entry_sp: AtomicU64,
+    last_user_entry_tls: AtomicU64,
+    last_user_entry_syscall: AtomicU64,
+    last_user_entry_hart: AtomicU64,
     /// `clear_child_tid` pointer from `set_tid_address`.  Written
     /// atomically to 0 on thread exit when futex wake is supported.
     pub clear_child_tid: SpinMutex<Option<u64>>,
@@ -269,13 +290,24 @@ impl ThreadPayload {
             userspace_slot: UserspaceRunSlot::new(),
             active_request: SpinMutex::new(None),
             saved_user_context: SpinMutex::new(None),
+            sigsuspend_restore_mask: SpinMutex::new(None),
             saved_signal_context: SpinMutex::new(None),
             saved_signal_mask: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
             mailbox: SpinMutex::new(None),
+            lifecycle_waker: SpinMutex::new(None),
             stopped: core::sync::atomic::AtomicBool::new(false),
             alt_stack: SpinMutex::new(None),
             proc_sleeping: AtomicBool::new(false),
+            active_syscall_nr: AtomicU64::new(u64::MAX),
+            active_syscall_arg0: AtomicU64::new(0),
+            active_syscall_arg1: AtomicU64::new(0),
+            last_user_entry_pc: AtomicU64::new(0),
+            last_user_entry_ra: AtomicU64::new(0),
+            last_user_entry_sp: AtomicU64::new(0),
+            last_user_entry_tls: AtomicU64::new(0),
+            last_user_entry_syscall: AtomicU64::new(u64::MAX),
+            last_user_entry_hart: AtomicU64::new(u64::MAX),
             clear_child_tid: SpinMutex::new(None),
             robust_list_head: SpinMutex::new(None),
             robust_list_len: SpinMutex::new(0),
@@ -304,6 +336,17 @@ impl ThreadPayload {
         self.mailbox.lock().clone()
     }
 
+    pub fn bind_lifecycle_waker(&self, waker: Waker) {
+        *self.lifecycle_waker.lock() = Some(waker);
+    }
+
+    pub(crate) fn wake_lifecycle_task(&self) {
+        let waker = self.lifecycle_waker.lock().clone();
+        if let Some(waker) = waker {
+            waker.wake_by_ref();
+        }
+    }
+
     /// Snapshot the reactor task handle, if one has been bound. Always
     /// `None` until the reactor coupling lands.
     pub fn task(&self) -> Option<TaskKey> {
@@ -318,6 +361,57 @@ impl ThreadPayload {
     /// Update the procfs sleep-state hint for syscall dispatch.
     pub fn set_proc_sleeping(&self, sleeping: bool) {
         self.proc_sleeping.store(sleeping, Ordering::Release);
+    }
+
+    pub fn begin_syscall_diagnostic(&self, nr: u64, arg0: u64, arg1: u64) {
+        self.active_syscall_arg0.store(arg0, Ordering::Relaxed);
+        self.active_syscall_arg1.store(arg1, Ordering::Relaxed);
+        self.active_syscall_nr.store(nr, Ordering::Release);
+    }
+
+    pub fn end_syscall_diagnostic(&self) {
+        self.active_syscall_nr.store(u64::MAX, Ordering::Release);
+    }
+
+    pub fn active_syscall_diagnostic(&self) -> Option<(u64, u64, u64)> {
+        let nr = self.active_syscall_nr.load(Ordering::Acquire);
+        (nr != u64::MAX).then(|| {
+            (
+                nr,
+                self.active_syscall_arg0.load(Ordering::Relaxed),
+                self.active_syscall_arg1.load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    pub fn record_user_entry_diagnostic(
+        &self,
+        pc: u64,
+        ra: u64,
+        sp: u64,
+        tls: u64,
+        syscall: u64,
+        hart: u64,
+    ) {
+        self.last_user_entry_pc.store(pc, Ordering::Relaxed);
+        self.last_user_entry_ra.store(ra, Ordering::Relaxed);
+        self.last_user_entry_sp.store(sp, Ordering::Relaxed);
+        self.last_user_entry_tls.store(tls, Ordering::Relaxed);
+        self.last_user_entry_syscall
+            .store(syscall, Ordering::Relaxed);
+        self.last_user_entry_hart.store(hart, Ordering::Release);
+    }
+
+    pub fn user_entry_diagnostic(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let hart = self.last_user_entry_hart.load(Ordering::Acquire);
+        (
+            self.last_user_entry_pc.load(Ordering::Relaxed),
+            self.last_user_entry_ra.load(Ordering::Relaxed),
+            self.last_user_entry_sp.load(Ordering::Relaxed),
+            self.last_user_entry_tls.load(Ordering::Relaxed),
+            self.last_user_entry_syscall.load(Ordering::Relaxed),
+            hart,
+        )
     }
 
     /// Borrow the userspace-run slot owned by this thread. The trap
@@ -349,6 +443,16 @@ impl ThreadPayload {
     /// discipline.
     pub fn store_saved_user_context(&self, ctx: Option<UserTrapContext>) {
         *self.saved_user_context.lock() = ctx;
+    }
+
+    /// Publish the pre-`rt_sigsuspend` mask for the next handler frame.
+    pub fn store_sigsuspend_restore_mask(&self, mask: Option<SignalMask>) {
+        *self.sigsuspend_restore_mask.lock() = mask;
+    }
+
+    /// Consume the pre-`rt_sigsuspend` mask while building that handler frame.
+    pub fn take_sigsuspend_restore_mask(&self) -> Option<SignalMask> {
+        self.sigsuspend_restore_mask.lock().take()
     }
 
     /// Replace the saved signal context. Called by signal delivery
@@ -528,7 +632,7 @@ pub fn prewarm_thread_payload_slots(count: usize) -> usize {
     let mut quiet = 0u8;
     while quiet < 2 {
         let stats = crate::thread_runtime::adapter::step_engine::drain_with_budget(usize::MAX);
-        if stats.bag_reclaimed == 0 && stats.publication_dropped == 0 {
+        if stats.reclaimed == 0 {
             quiet += 1;
         } else {
             quiet = 0;

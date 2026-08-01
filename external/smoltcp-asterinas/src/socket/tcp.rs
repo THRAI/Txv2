@@ -867,6 +867,16 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// Return whether an in-order FIN has been accepted from the remote peer.
+    ///
+    /// This is deliberately distinct from inspecting the control bits of the
+    /// most recently received segment: TCP may defer an out-of-order FIN until
+    /// all preceding stream bytes have arrived.
+    #[inline]
+    pub fn recv_fin_received(&self) -> bool {
+        self.rx_fin_received
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;

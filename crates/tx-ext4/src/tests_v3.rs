@@ -13,16 +13,17 @@
 //! four-variant outcome); `tmpfs/tests.rs` (canonical wave-9a
 //! reference).
 
+#![cfg(test)]
+
 extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
     self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
 };
-use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
+use tx_ext4_format::ondisk::{BitmapMut, BitmapView, Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::fs_iface::{
     BackendPageCompletion, BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId,
@@ -37,7 +38,7 @@ use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, RNodeBacking};
 use tx_subsystems::vfs::FsOps;
 
 use crate::planner::{Ext4BlockGeometry, Ext4FsyncPlanSource, Ext4PlannerBinding};
-use crate::read_backend::{Ext4FsInstance, Ext4PagerMutationPlanSource, FilePageContainerBinder};
+use crate::read_backend::{Ext4FsInstance, Ext4PagerMutationPlanSource};
 use crate::{
     journal::{
         Ext4MutationPlanSource, JournalFsyncSource, JournalMutationRuntime, JournalPagePool,
@@ -75,6 +76,10 @@ impl MemImage {
 
     fn block_mut(&mut self, idx: u64) -> &mut Page4K {
         &mut self.blocks[idx as usize]
+    }
+
+    fn block(&self, idx: u64) -> &Page4K {
+        &self.blocks[idx as usize]
     }
 }
 
@@ -171,6 +176,34 @@ fn build_image() -> MemImage {
     }
     .encode(&mut image.block_mut(1)[..64])
     .unwrap();
+    for bit in 0..12 {
+        BitmapMut::new(image.block_mut(3)).set(bit).unwrap();
+    }
+    for bit in 0..=20 {
+        BitmapMut::new(image.block_mut(2)).set(bit).unwrap();
+    }
+
+    // journal inode (ino 8), matching the production image's internal
+    // journal shape. Metadata mutation tests need a real journal extent so
+    // they exercise commit + checkpoint rather than the ENOSYS no-journal
+    // branch.
+    let mut journal_inode = Inode::default();
+    journal_inode.mode = 0x8000 | 0o600;
+    journal_inode.size = 8 * BLOCK_SIZE as u64;
+    journal_inode.blocks_512 = 64;
+    journal_inode.links_count = 1;
+    journal_inode.flags = Inode::EXTENTS_FL;
+    journal_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 8,
+            physical_start: 40,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 8, &journal_inode);
+    for bit in 40..48 {
+        BitmapMut::new(image.block_mut(2)).set(bit).unwrap();
+    }
 
     // root inode (ino 2): directory containing "hello" (ino 12).
     let mut root_inode = Inode::default();
@@ -413,6 +446,31 @@ fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
 }
 
 #[test]
+fn ext4_chmod_is_immediately_visible_to_live_inode_meta_reads() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let guard = epoch::guard();
+    let file = FsObjectId::new(12);
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::chmod_inode(
+            &*fs,
+            file,
+            0o755,
+            &tx_subsystems::vfs::Credential::root(),
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    let meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, file, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load inode metadata after chmod: {other:?}"),
+    };
+    assert_eq!(meta.mode & 0o7777, 0o755);
+}
+
+#[test]
 fn ext4_inode_metadata_seeds_l5_extent_root_for_page_planning() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
@@ -447,9 +505,8 @@ fn ext4_inode_metadata_seeds_l5_extent_root_for_page_planning() {
 
 #[test]
 fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
-    // create_inode and mkdir are now implemented; they succeed on the
-    // in-memory image.  destroy_inode, rename, link, symlink, and
-    // serialize_inode_meta still surface ENOSYS.
+    // create_inode and mkdir are implemented. destroy_inode is a no-op for a
+    // linked inode and only reclaims a zero-link orphan.
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -482,26 +539,81 @@ fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
         "mkdir should succeed: {result:?}"
     );
 
-    // destroy_inode is still unimplemented.
     assert_eq!(
         <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, FsObjectId::new(12), &guard),
-        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+        V3::<(), NoProgress>::done(())
+    );
+}
+
+#[test]
+fn ext4_inode_reuse_rejects_old_identity_and_cache_entries() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let root = FsObjectId::new(2);
+
+    let first_id = match <Ext4FsInstance<MemImage> as FsOps>::create_inode(
+        &*fs,
+        root,
+        b"first-generation",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, _)) => id,
+        other => panic!("create first generation: {other:?}"),
+    };
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, root, b"first-generation", &guard,),
+        V3::<_, NoProgress>::done(first_id)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::unlink(
+            &*fs,
+            root,
+            b"first-generation",
+            first_id,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, first_id, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+
+    let second_id = match <Ext4FsInstance<MemImage> as FsOps>::create_inode(
+        &*fs,
+        root,
+        b"second-generation",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, _)) => id,
+        other => panic!("create second generation: {other:?}"),
+    };
+
+    assert_eq!(first_id.inode_number(), second_id.inode_number());
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, first_id, &guard),
+        V3::<_, NoProgress>::err(V3Errno::ESTALE)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, root, b"first-generation", &guard,),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, root, b"second-generation", &guard,),
+        V3::<_, NoProgress>::done(second_id)
     );
 }
 
 #[test]
 fn ext4_materialise_new_regular_file_has_iozone_growth_capacity() {
-    struct CountingBinder(AtomicUsize);
-
-    impl FilePageContainerBinder for CountingBinder {
-        fn bind_file_page_container(
-            &self,
-            _container: crate::adapter::step_engine::Cap<tx_subsystems::page_backed::PageContainer>,
-        ) {
-            self.0.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -523,26 +635,189 @@ fn ext4_materialise_new_regular_file_has_iozone_growth_capacity() {
 
     let mount = test_mount_payload(&fs);
     fs.bind_mount_payload(&mount);
-    let binder = Arc::new(CountingBinder(AtomicUsize::new(0)));
-    fs.set_file_page_container_binder(Some(binder.clone()));
     let rnode = match <Ext4FsInstance<MemImage> as FsOps>::materialise_rnode(
         &*fs, file_id, meta, &mount, &guard,
     ) {
         V3::Done(rnode) => rnode,
         other => panic!("materialise_rnode should succeed: {other:?}"),
     };
-    assert_eq!(binder.0.load(Ordering::Acquire), 1);
+    let alias_rnode = match <Ext4FsInstance<MemImage> as FsOps>::materialise_rnode(
+        &*fs, file_id, meta, &mount, &guard,
+    ) {
+        V3::Done(rnode) => rnode,
+        other => panic!("second materialise_rnode should succeed: {other:?}"),
+    };
 
-    match rnode.backing() {
-        RNodeBacking::PageBacked { pc } => {
+    match (rnode.backing(), alias_rnode.backing()) {
+        (RNodeBacking::PageBacked { pc }, RNodeBacking::PageBacked { pc: alias_pc }) => {
+            assert_eq!(pc, alias_pc, "one ext4 inode must have one live page cache");
             assert_eq!(pc.size_bytes(), 0, "visible file size starts at EOF");
             assert!(
                 pc.page_count() >= 256,
                 "iozone writes 1MiB per child in 1KiB chunks; new ext4 files need more than a one-page PageContainer capacity"
             );
         }
-        other => panic!("expected PageBacked ext4 regular file, got {other:?}"),
+        other => panic!("expected PageBacked ext4 regular files, got {other:?}"),
     }
+}
+
+#[test]
+fn ext4_unlinked_open_file_reclaims_only_after_last_page_container() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let fs = Ext4FsInstance::open(build_image(), false).expect("open reclaim test image");
+    let mount = test_mount_payload(&fs);
+    fs.bind_mount_payload(&mount);
+    let guard = epoch::guard();
+    let meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
+        &*fs,
+        FsObjectId::new(12),
+        &guard,
+    ) {
+        V3::Done(meta) => meta,
+        other => panic!("load inode 12: {other:?}"),
+    };
+    let rnode = match <Ext4FsInstance<MemImage> as FsOps>::materialise_rnode(
+        &*fs,
+        FsObjectId::new(12),
+        meta,
+        &mount,
+        &guard,
+    ) {
+        V3::Done(rnode) => rnode,
+        other => panic!("materialise inode 12: {other:?}"),
+    };
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::unlink(
+            &*fs,
+            FsObjectId::new(2),
+            b"hello",
+            FsObjectId::new(12),
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, FsObjectId::new(12), &guard,),
+        V3::<(), NoProgress>::done(())
+    );
+    let mode_while_open = fs
+        .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(12)))
+        .unwrap()
+        .mode;
+    assert_ne!(mode_while_open, 0, "open payload must prevent early reuse");
+
+    drop(rnode);
+    drop(guard);
+    for _ in 0..8 {
+        let guard = epoch::guard();
+        drop(guard);
+        let _ = tx_substrate::epoch::drain_with_budget(1024);
+    }
+
+    let (mode, inode_used, block_used) = fs
+        .with_pager(|pager| {
+            Ok((
+                pager
+                    .inode_meta(tx_ext4_format::pager::InodeNo::new(12))?
+                    .mode,
+                BitmapView::new(pager.image().block(3)).is_set(11),
+                BitmapView::new(pager.image().block(2)).is_set(20),
+            ))
+        })
+        .unwrap();
+    assert_eq!(mode, 0);
+    assert!(!inode_used, "last payload drop must free the inode bitmap");
+    assert!(!block_used, "last payload drop must free extent blocks");
+}
+
+#[test]
+fn ext4_rename_replacement_reclaims_displaced_open_file_on_last_drop() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let fs = Ext4FsInstance::open(build_image(), false).expect("open rename reclaim image");
+    let mount = test_mount_payload(&fs);
+    fs.bind_mount_payload(&mount);
+    let guard = epoch::guard();
+    let old_meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
+        &*fs,
+        FsObjectId::new(12),
+        &guard,
+    ) {
+        V3::Done(meta) => meta,
+        other => panic!("load displaced inode: {other:?}"),
+    };
+    let displaced_rnode = match <Ext4FsInstance<MemImage> as FsOps>::materialise_rnode(
+        &*fs,
+        FsObjectId::new(12),
+        old_meta,
+        &mount,
+        &guard,
+    ) {
+        V3::Done(rnode) => rnode,
+        other => panic!("materialise displaced inode: {other:?}"),
+    };
+    let cred = tx_subsystems::vfs::Credential::root();
+    let source_id = match <Ext4FsInstance<MemImage> as FsOps>::create_inode(
+        &*fs,
+        FsObjectId::new(2),
+        b"source",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, _)) => id,
+        other => panic!("create rename source: {other:?}"),
+    };
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::rename(
+            &*fs,
+            FsObjectId::new(2),
+            b"source",
+            FsObjectId::new(2),
+            b"hello",
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard,),
+        V3::<_, NoProgress>::done(source_id)
+    );
+    assert_ne!(
+        fs.with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(12)))
+            .unwrap()
+            .mode,
+        0,
+        "rename replacement must not reclaim an open payload"
+    );
+
+    drop(displaced_rnode);
+    drop(guard);
+    for _ in 0..8 {
+        let guard = epoch::guard();
+        drop(guard);
+        let _ = tx_substrate::epoch::drain_with_budget(1024);
+    }
+
+    let (mode, inode_used, block_used) = fs
+        .with_pager(|pager| {
+            Ok((
+                pager
+                    .inode_meta(tx_ext4_format::pager::InodeNo::new(12))?
+                    .mode,
+                BitmapView::new(pager.image().block(3)).is_set(11),
+                BitmapView::new(pager.image().block(2)).is_set(20),
+            ))
+        })
+        .unwrap();
+    assert_eq!(mode, 0);
+    assert!(!inode_used);
+    assert!(!block_used);
 }
 
 #[test]
@@ -659,10 +934,11 @@ fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
 }
 
 #[test]
-fn ext4_v3_truncate_and_fsync_surfaces_are_accepted() {
-    // Ext4 now accepts truncate through the kernel-facing PageBacked
-    // surface, and fsync remains a no-op success for already-accepted
-    // in-memory writes.
+fn ext4_v3_truncate_and_fsync_are_accepted() {
+    // Truncate through the kernel-facing PageBacked surface became real
+    // with the iozone ext4 writeback work (2026-06); fsync must keep
+    // accepting so OSComp workloads see in-memory writes become
+    // sync-visible.
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();

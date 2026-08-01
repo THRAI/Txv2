@@ -55,6 +55,10 @@ impl CpuMask {
         cpu.0 < u64::BITS as usize && (self.0 & (1u64 << cpu.0)) != 0
     }
 
+    pub const fn without(self, cpu: CpuId) -> Self {
+        Self(self.0 & !Self::single(cpu).0)
+    }
+
     pub fn count(self) -> usize {
         self.0.count_ones() as usize
     }
@@ -68,6 +72,7 @@ impl CpuMask {
 #[must_use]
 pub struct CpuPinGuard {
     cpu_id: CpuId,
+    unpin: Option<fn(CpuId)>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
@@ -75,6 +80,18 @@ impl CpuPinGuard {
     pub const fn new(cpu_id: CpuId) -> Self {
         Self {
             cpu_id,
+            unpin: None,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Construct a platform-backed CPU pin. The platform must have already
+    /// entered its non-migratable section. `unpin` leaves that section when
+    /// the guard drops.
+    pub const fn with_unpin(cpu_id: CpuId, unpin: fn(CpuId)) -> Self {
+        Self {
+            cpu_id,
+            unpin: Some(unpin),
             _not_send_sync: PhantomData,
         }
     }
@@ -84,11 +101,19 @@ impl CpuPinGuard {
     }
 }
 
+impl Drop for CpuPinGuard {
+    fn drop(&mut self) {
+        if let Some(unpin) = self.unpin {
+            unpin(self.cpu_id);
+        }
+    }
+}
+
 /// RAII token that masks ordinary interrupt-driven execution on the current CPU.
 ///
-/// This guard covers maskable local IRQ admission only. It does not mask NMI-like
-/// events, pin the CPU, or make yielding/migration safe. CPU affinity remains
-/// the responsibility of [`CpuPinGuard`].
+/// This is deliberately separate from [`CpuPinGuard`]: excluding local IRQ
+/// execution does not pin a task to a CPU, while an SMP CPU pin does not by
+/// itself preserve the local interrupt-enable state.
 #[derive(Debug)]
 #[must_use]
 pub struct LocalExecutionGuard {
@@ -99,14 +124,13 @@ pub struct LocalExecutionGuard {
 
 impl LocalExecutionGuard {
     /// Construct a guard from an already-saved and already-disabled platform
-    /// state.
+    /// interrupt state.
     ///
     /// # Safety
     ///
-    /// `restore(saved_state)` must restore exactly the maskable local interrupt
-    /// state captured by the matching exclusion operation. The callback runs
-    /// once on the CPU that drops this non-transferable guard. The caller must
-    /// ensure the guard cannot cross a yield or CPU migration point.
+    /// `restore(saved_state)` must restore exactly the state captured by the
+    /// matching exclusion operation, and the guard must not cross a yield or
+    /// CPU migration point.
     pub const unsafe fn new(saved_state: usize, restore: unsafe fn(usize)) -> Self {
         Self {
             restore,
@@ -282,6 +306,28 @@ pub struct PlatformInfo {
     pub possible_cpu_count: usize,
 }
 
+/// Firmware- or board-described device class published by the selected
+/// platform.  The generic kernel consumes these facts to choose a driver; the
+/// HAL does not own the resulting semantic device object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceKind {
+    Uart,
+    IntController,
+    VirtioMmio,
+    PciEcam,
+    SdController,
+}
+
+/// One statically published platform-device fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInfo {
+    pub kind: DeviceKind,
+    pub mmio: PhysRange,
+    pub irq: Option<u32>,
+    pub reg_shift: u8,
+    pub reg_io_width: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchAuxvFacts {
     pub page_size: usize,
@@ -315,25 +361,28 @@ pub const RISCV_HWCAP_IMAFDC: u64 = RISCV_HWCAP_ISA_I
     | RISCV_HWCAP_ISA_C;
 
 pub trait PlatformConfig {
-    const ARCH: Arch;
-    const BOARD: &'static str;
-    const SUBSTRATE_BOOT_READY: bool = false;
-    const PAGE_SIZE: usize = 4096;
-    const PAGE_SHIFT: usize = 12;
-    const PHYS_ADDR_BITS: u8 = 0;
-    const VIRT_ADDR_BITS: u8 = 0;
-    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0);
-    const DIRECT_MAP_SIZE: usize = 0;
-    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0);
-    const USER_TOP: VirtAddr = VirtAddr(0);
-    const USER_RESERVED_TOP_SIZE: usize = 0;
-    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP;
-    const KERNEL_STACK_SIZE: usize = 0;
-    const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
-    const PAGE_TABLE_LEVELS: u8 = 0;
-    const ASID_BITS: u8 = 0;
-    const CACHE_LINE_SIZE: usize = 0;
-    const DMA_COHERENT: bool = false;
+    const ARCH: Arch; // 架构 Riscv64/LoongArch64，必填
+    const BOARD: &'static str; // 板名字符串，必填
+    const SUBSTRATE_BOOT_READY: bool = false; // 启动是否已对接 substrate
+    const PAGE_SIZE: usize = 4096; // 一页字节数（分页最小单位）
+    const PAGE_SHIFT: usize = 12; // log2(页大小)，地址右移求页号
+    const PHYS_ADDR_BITS: u8 = 0; // 物理地址位数（riscv 56）
+    const VIRT_ADDR_BITS: u8 = 0; // 虚拟地址位数（riscv 39=Sv39）
+    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0); // 直连区起点，虚拟=物理+此值
+    const DIRECT_MAP_SIZE: usize = 0; // 直连区大小（覆盖全物理内存，128GB）
+    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0); // 内核代码虚拟基址（住最高处）
+    /// Whether page-table-backed kernel mappings are accessible while the
+    /// substrate initializes the heap. LA64 enables PGDH later.
+    const KERNEL_PAGE_TABLE_ACTIVE_AT_SUBSTRATE_INIT: bool = false;
+    const USER_TOP: VirtAddr = VirtAddr(0); // 用户地址天花板（riscv 256GB）
+    const USER_RESERVED_TOP_SIZE: usize = 0; // 顶部保留、不给用户的大小（4MB）
+    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP; // 用户可分配上限=天花板-保留（派生）
+    const KERNEL_STACK_SIZE: usize = 0; // 内核栈大小（riscv 128KB）
+    const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE; // 内核栈对齐（页对齐）
+    const PAGE_TABLE_LEVELS: u8 = 0; // 页表层数（riscv Sv39 = 3 级）
+    const ASID_BITS: u8 = 0; // ASID 位数，切进程免清整个 TLB（16）
+    const CACHE_LINE_SIZE: usize = 0; // 缓存行字节数，防多核伪共享（64）
+    const DMA_COHERENT: bool = false; // DMA 是否与缓存一致，false 需手动刷
 }
 
 pub trait BootPlatformIf {
@@ -363,6 +412,14 @@ pub trait BootInfoIf {
 
 pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
+
+    /// Platform devices discovered before the heap becomes available.
+    ///
+    /// Boards without a firmware device table may keep the empty default and
+    /// let their generic-device setup use its documented legacy fallback.
+    fn devices() -> &'static [DeviceInfo] {
+        &[]
+    }
 }
 
 pub trait AuxvIf: PlatformConfig {
@@ -467,6 +524,7 @@ impl PartialEq for PtNode {
 impl Eq for PtNode {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// pmap 操作的错误类型:非法请求 / 已映射冲突 / 内存耗尽 / 不支持
 pub enum PmapError {
     InvalidRequest,
     AlreadyMapped,
@@ -475,6 +533,7 @@ pub enum PmapError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 映射粒度:1GB 大页 / 2MB 大页 / 4KB 普通页(决定走几级 Sv39 页表)
 pub enum PmapReserveKind {
     Superpage1G,
     Superpage2M,
@@ -492,6 +551,7 @@ impl PmapReserveKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 一页的访问权限位图(READ/WRITE/EXECUTE/USER/GLOBAL/DEVICE 及常用组合)
 pub struct PmapPermissions {
     bits: u8,
 }
@@ -534,6 +594,7 @@ impl PmapPermissions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 预约时新分配的中间层页表节点(L2/L1/L0),挂在预约单上,提交前可回滚
 pub struct PmapReservationIntermediates {
     pub l2: Option<PtNode>,
     pub l1: Option<PtNode>,
@@ -550,6 +611,9 @@ impl PmapReservationIntermediates {
     }
 }
 
+/// 一次"加映射"的预约单(reserve→commit 两阶段的载体):
+/// 记着要映射的虚拟/物理地址、粒度、以及预分配好的中间节点。
+/// `#[must_use]`:预约了必须 commit 或 rollback,不能丢弃(否则中间节点泄漏)。
 #[derive(Debug, Eq, PartialEq)]
 #[must_use]
 pub struct PmapReservation {
@@ -601,8 +665,11 @@ impl PmapReservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 地址空间编号(TLB 优化:切进程不必清整个 TLB,不同 ASID 的翻译可共存)
 pub struct Asid(pub u16);
 
+/// 一个进程整套页表的入口 = 根页表物理页 + ASID。切进程 = 换它写进 satp。
+/// `#[must_use]`:建出来必须激活或销毁。
 #[derive(Debug)]
 #[must_use]
 pub struct PmapRoot {
@@ -633,6 +700,7 @@ impl PmapRoot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// TLB 失效凭据:"这段虚拟地址的旧翻译作废了",交给 shootdown 去刷 TLB
 pub struct PmapInvalidation {
     virt: VirtAddr,
     size: usize,
@@ -653,6 +721,8 @@ impl PmapInvalidation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 删映射的结果:被删的虚拟/物理地址、粒度,外加一个 TLB 失效凭据。
+/// 物理地址供上层把这页归还给页分配器。
 pub struct PmapUnmapResult {
     virt: VirtAddr,
     phys: PhysAddr,
@@ -696,6 +766,8 @@ impl PmapUnmapResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 引导页表的自述事实(启动时发布,substrate 建堆时读):
+/// 根表地址、已映射物理范围、直接映射区、内核镜像、临时恒等桥、页表节点池、保留的页表页。
 pub struct BootstrapPmapInfo {
     pub root: PhysAddr,
     pub mapped: PhysRange,
@@ -707,21 +779,31 @@ pub struct BootstrapPmapInfo {
     pub reserved_page_tables: &'static [PhysRange],
 }
 
+/// 虚拟内存/页表子系统的接口:让通用内核建/改/删地址空间映射,不碰架构页表格式。
+/// HAL 最大的 trait;fork/mmap/exec/缺页/切进程全靠它。方法几乎都有默认实现
+/// (返回 Unsupported 或空),mock/测试板不实现也能链接,真板覆盖。约分五组(见下)。
 pub trait PmapIf {
+    // ===== 组1:页表节点分配(建页表要内存,来源是 boot_static 的 pt_node 池) =====
     fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
+        // 引导页表自述事实
         None
     }
 
     fn alloc_pt_node() -> Result<PtNode, AllocError> {
+        // 要一页当页表节点
         Err(AllocError::Exhausted)
     }
 
-    fn free_pt_node(_node: PtNode) {}
+    fn free_pt_node(_node: PtNode) {} // 还回去
 
     fn install_pt_node_allocator(_allocator: PtNodeAllocator) -> Result<(), PmapError> {
+        // 装 substrate 的正式分配器
         Err(PmapError::Unsupported)
     }
 
+    // ===== 组2:内核空间映射(操作全局唯一的内核页表,所有进程共享的那半) =====
+    // reserve→commit 两阶段:reserve 干会失败的分配,commit 干不会失败的写入;
+    // 下面 direct_map 是直接映射区专用,extend_direct_map 供 substrate 建堆时扩展。
     fn reserve_kernel_direct_map_1g(_phys: PhysAddr) -> Result<Option<PmapReservation>, PmapError> {
         Err(PmapError::Unsupported)
     }
@@ -743,6 +825,17 @@ pub trait PmapIf {
     fn rollback_kernel_mapping(_reservation: PmapReservation) {}
 
     fn commit_kernel_mapping(_reservation: PmapReservation, _permissions: PmapPermissions) {}
+
+    /// Publish a mapping into a leaf slot that was previously unmapped.
+    ///
+    /// Unlike `commit_kernel_mapping`, implementations may omit the immediate
+    /// per-leaf TLB synchronization because the reservation proved that no old
+    /// valid mapping existed. The caller must issue one architecture-appropriate
+    /// publication fence/shootdown after completing the whole new range. The
+    /// default preserves the conservative legacy behaviour.
+    fn commit_new_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+        Self::commit_kernel_mapping(reservation, permissions);
+    }
 
     fn unmap_kernel_mapping(
         _virt: VirtAddr,
@@ -767,23 +860,34 @@ pub trait PmapIf {
         }
     }
 
+    /// Make progress on a remote TLB invalidation addressed to the current CPU.
+    ///
+    /// Most platforms can rely on their architectural interrupt/firmware
+    /// machinery and keep this as a no-op. Platforms whose shootdown transport
+    /// is a maskable supervisor interrupt may override it so lock-contention
+    /// paths can service a pending invalidation while ordinary interrupts are
+    /// masked. The implementation must not acquire VM or heap locks.
+    fn service_pending_tlb_shootdown() {}
+
+    // ===== 组3:用户地址空间的创建/销毁/激活(fork/exec/切进程的核心) =====
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        // 建一个新进程的页表根
         Err(PmapError::Unsupported)
     }
 
-    fn destroy_pmap_root(_root: PmapRoot) {}
+    fn destroy_pmap_root(_root: PmapRoot) {} // 销毁
 
-    /// VM-facing alias for activating a user address-space root.
+    /// 激活一个用户地址空间根(面向 VM 的别名,默认转调 activate_user_pmap)。
     ///
-    /// `PmapRoot` is intentionally architecture-defined. RV64 boards may make
-    /// it a complete root containing both user and copied kernel-half entries;
-    /// LA64 boards may make it the per-process PGDL while keeping kernel
-    /// mappings in a board-global PGDH.
+    /// `PmapRoot` 有意做成架构自定义:RV64 板可以让它是包含用户半+拷贝内核半的完整根;
+    /// LA64 板可以让它是每进程的 PGDL,而内核映射放在板级全局的 PGDH。
     fn activate_pmap(root: &PmapRoot) -> Result<(), PmapError> {
         Self::activate_user_pmap(root);
         Ok(())
     }
 
+    // ===== 组4:用户空间映射(针对某个进程 root,与组2内核版镜像,只多了 root 参数) =====
+    // mmap 走 reserve_mapping + commit_mapping。
     fn reserve_mapping(
         _root: &PmapRoot,
         _virt: VirtAddr,
@@ -819,30 +923,39 @@ pub trait PmapIf {
         Err(PmapError::Unsupported)
     }
 
+    // ===== 组5:用户映射的 TLB shootdown(带 asid,只刷该地址空间的 TLB 项) =====
     fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
 
     fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        // 批量版
         for invalidation in invalidations {
             Self::shootdown_mapping(asid, *invalidation);
         }
     }
 
-    /// Activate `root` as the current hart's user pmap.
+    /// Complete publication of newly-valid user leaves on the current hart.
     ///
-    /// On RV64 this is `csrw satp, ((root.phys >> 12) | SV_MODE_BITS)
-    ///     + sfence.vma`. On LA64 this writes the active ASID/PGDL/PGDH state:
-    ///     `root` is the user PGDL and kernel mappings live in the board-global
-    ///     PGDH.
+    /// A new mapping does not replace a valid translation, so remote harts do
+    /// not need an eager shootdown: a hart that retained a failed walk will
+    /// trap and synchronize before retrying. The publishing/faulting hart must
+    /// nevertheless cross the architecture's local translation barrier.
     ///
-    /// Called by the thread runtime immediately before
-    /// `TrapIf::enter_userspace_with_context` so the MMU consults the
-    /// process's per-aspace pmap on the upcoming user fetches/loads.
-    /// Without this, satp keeps pointing at the kernel bootstrap root
-    /// (which has no user mappings), and every user-mode instruction
-    /// fetch faults.
+    /// Platforms may override this with a local-only batch operation. The
+    /// conservative default uses the ordinary shootdown surface.
+    fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        Self::shootdown_mappings(asid, invalidations);
+    }
+
+    /// 把 `root` 激活为当前 hart 的用户页表。
+    ///
+    /// RV64 上就是 `csrw satp, ((root.phys >> 12) | Sv39 模式位) + sfence.vma`。
+    /// LA64 上写 ASID/PGDL/PGDH 状态:`root` 是用户 PGDL,内核映射在板级全局 PGDH。
+    ///
+    /// 线程运行时在 `TrapIf::enter_userspace_with_context` 之前紧接着调它,
+    /// 好让 MMU 在接下来的用户取指/取数时查这个进程自己的页表。
+    /// 不调的话 satp 一直指着内核引导根(没有用户映射),用户态每条取指都缺页。
     fn activate_user_pmap(_root: &PmapRoot) {
-        // Default impl is a no-op so host platforms link; production
-        // boards override.
+        // 默认空实现,好让 host 平台能链接;产品板覆盖它。
     }
 }
 
@@ -1016,7 +1129,11 @@ pub struct SignalFrameBytes {
 }
 
 impl SignalFrameBytes {
-    pub const CAPACITY: usize = 2048;
+    // LA64's full LASX register file extends UserFpContext to 1,312 bytes.
+    // RV64 keeps that opaque context in its private validation header in
+    // addition to the Linux-compatible ucontext, making Rv64SignalFrame 2,464
+    // bytes. Keep one page here so both board layouts fit without truncation.
+    pub const CAPACITY: usize = 4096;
 
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();
@@ -1185,6 +1302,20 @@ pub trait IrqIf {
     /// §"Open questions #6".
     const UART_IRQ: u32 = 0;
 
+    /// Runtime UART IRQ number. Boards with firmware discovery can override
+    /// this while retaining `UART_IRQ` as a static fallback.
+    fn uart_irq() -> u32 {
+        Self::UART_IRQ
+    }
+
+    /// Platform-specific IRQ number for the boot network device.
+    const NET_IRQ: u32 = 0;
+
+    /// Runtime network IRQ number. A zero value means polling-only.
+    fn net_irq() -> u32 {
+        Self::NET_IRQ
+    }
+
     /// Platform-specific IRQ number for a wake-capable persistent-clock RTC.
     ///
     /// Boards without a hardware RTC alarm interrupt keep the `0` sentinel
@@ -1193,16 +1324,19 @@ pub trait IrqIf {
     /// userspace state.
     const RTC_IRQ: u32 = 0;
 
-    /// Platform-specific IRQ number for the boot network device.
-    ///
-    /// Boards without a proven external-interrupt route keep the `0` sentinel
-    /// default. The generic kernel uses a non-zero value to install a deferred
-    /// network handler; the platform remains responsible only for controller
-    /// mechanics and numbering.
-    const NET_IRQ: u32 = 0;
-
     fn in_irq_context() -> bool {
         false
+    }
+
+    /// Return whether the current execution is using an architecture trap
+    /// stack.
+    ///
+    /// Synchronous exceptions such as syscalls are not IRQ context, but they
+    /// still run on a small per-hart trap stack on stackless platforms.
+    /// Substrates use this fact to defer destructor-heavy maintenance until
+    /// control has returned to a normal kernel/reactor stack.
+    fn in_trap_context() -> bool {
+        Self::in_irq_context()
     }
 
     fn interrupts_enabled() -> bool {
@@ -1336,6 +1470,40 @@ pub trait DeadlineTimerIf {
     fn enable_timer_wakeups() {}
 }
 
+/// Compatibility view used by subsystems that still consume monotonic time and
+/// per-hart deadlines as one capability.
+///
+/// Platforms continue to implement the split mainline interfaces. This blanket
+/// bridge keeps the final-SMP syscall and wait paths source-compatible without
+/// restoring a second platform-time implementation.
+pub trait TimeIf {
+    fn read_ns() -> u64;
+    fn set_deadline_ns(deadline: u64);
+    fn cancel_deadline();
+    fn frequency_hz() -> u64;
+}
+
+impl<T> TimeIf for T
+where
+    T: MonotonicCounterIf + DeadlineTimerIf,
+{
+    fn read_ns() -> u64 {
+        <T as MonotonicCounterIf>::read_ns()
+    }
+
+    fn set_deadline_ns(deadline: u64) {
+        <T as DeadlineTimerIf>::set_deadline_ns(deadline);
+    }
+
+    fn cancel_deadline() {
+        <T as DeadlineTimerIf>::cancel_deadline();
+    }
+
+    fn frequency_hz() -> u64 {
+        <T as MonotonicCounterIf>::frequency_hz()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PersistentClockError {
     Unsupported,
@@ -1403,6 +1571,15 @@ pub trait PercpuIf {
     fn pin_current_cpu() -> CpuPinGuard {
         CpuPinGuard::new(Self::current_cpu_id())
     }
+
+    /// Current nesting depth of platform CPU pins.
+    ///
+    /// A non-zero value means the current execution context must not migrate
+    /// to another hart. Platforms with a non-preemptive kernel may implement
+    /// this as a checked per-hart nesting counter instead of masking IRQs.
+    fn cpu_pin_depth() -> usize {
+        0
+    }
 }
 pub trait CacheIf {
     fn fence_all() {}
@@ -1441,6 +1618,32 @@ pub trait DmaIf: PlatformConfig {
 }
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
+
+/// Opaque platform state captured while entering an interrupt-wait window.
+///
+/// The kernel must pass the value returned by
+/// [`SmpIf::prepare_interrupt_wait`] exactly once to either
+/// [`SmpIf::cancel_interrupt_wait`] or
+/// [`SmpIf::wait_for_interrupt_prepared`].  Its raw contents are private to
+/// the selected platform.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "a prepared interrupt wait must be cancelled or committed"]
+pub struct InterruptWaitState(usize);
+
+impl InterruptWaitState {
+    /// Construct platform-private wait state.
+    ///
+    /// Board crates use this to preserve the architecture interrupt-enable
+    /// state that must be restored when the wait window closes.
+    pub const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    /// Return the platform-private raw state.
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpiKind {
@@ -1482,6 +1685,16 @@ pub trait SmpIf {
 
     fn mark_cpu_online(_cpu: CpuId) {}
 
+    /// Withdraw the current CPU from synchronous cross-CPU work before it is
+    /// permanently parked.
+    ///
+    /// Platforms with a maskable-IPI TLB shootdown transport use this hook to
+    /// stop new target acquisitions, drain requests which were already
+    /// acquired by senders, and only then publish the CPU offline. The method
+    /// runs in normal kernel context and must return with no future
+    /// synchronous request able to wait on this CPU.
+    fn prepare_cpu_offline() {}
+
     fn boot_secondary_cpus(_entry: SecondaryEntry) -> usize {
         0
     }
@@ -1492,6 +1705,28 @@ pub trait SmpIf {
         core::hint::spin_loop();
     }
 
+    /// Start the race-free half of an idle transition.
+    ///
+    /// The caller performs its final runnable-work check after this method
+    /// returns. Platforms whose interrupt architecture permits it should
+    /// defer interrupt delivery until the matching cancel/commit operation,
+    /// while keeping wake sources pending. This closes the classic
+    /// check-empty -> interrupt-arrives -> handler-clears -> WFI lost-wake
+    /// window.
+    fn prepare_interrupt_wait() -> InterruptWaitState {
+        InterruptWaitState::from_raw(0)
+    }
+
+    /// Abort a prepared idle transition because the final work check found
+    /// runnable work.
+    fn cancel_interrupt_wait(_state: InterruptWaitState) {}
+
+    /// Commit a prepared idle transition, wait once, and restore the
+    /// interrupt state captured by [`Self::prepare_interrupt_wait`].
+    fn wait_for_interrupt_prepared(_state: InterruptWaitState) {
+        Self::wait_for_interrupt_once();
+    }
+
     fn pending_ipi(_kind: IpiKind) -> bool {
         false
     }
@@ -1500,6 +1735,17 @@ pub trait SmpIf {
         loop {
             Self::wait_for_interrupt_once();
         }
+    }
+
+    /// Permanently stop the current CPU after it has left all shared runtime
+    /// code.
+    ///
+    /// Unlike [`Self::park_this_cpu`], this is a shutdown primitive: platform
+    /// implementations must prevent timer/device/IPI handlers from re-entering
+    /// kernel services after this call.  The default is sufficient for
+    /// single-CPU/test platforms that never call the SMP shutdown path.
+    fn quiesce_this_cpu() -> ! {
+        Self::park_this_cpu()
     }
 
     fn send_ipi(target: CpuId, _kind: IpiKind) {

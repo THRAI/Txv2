@@ -6,6 +6,7 @@
 
 use core::marker::PhantomData;
 
+use super::domain::EpochDomain;
 use super::local::CpuLocalEpochState;
 use tx_hal::{CpuId, CpuPinGuard};
 
@@ -15,11 +16,12 @@ use tx_hal::{CpuId, CpuPinGuard};
 /// the current CPU's read-side critical section and must not migrate as an
 /// owned Rust value.
 ///
-/// When `owned` is false this is a *borrow* of an existing guard: Drop is a
-/// no-op and epoch counters are not modified.  Use `epoch::borrow_current_guard`
-/// to obtain one when a caller already holds a guard but needs to satisfy an
-/// API that requires `&Guard`.
+/// Guards may be nested on one CPU. Every guard contributes one level to the
+/// CPU-local pin depth; only the outermost guard publishes an epoch and only
+/// the final guard to leave makes the participant quiescent.
 pub struct Guard<'g> {
+    /// Domain to notify when the guard leaves.
+    domain: &'static EpochDomain,
     /// Current CPU's local epoch slot.
     local: &'static CpuLocalEpochState,
     /// Captured for diagnostics and for callers that need to know where the
@@ -29,47 +31,24 @@ pub struct Guard<'g> {
     entered_epoch: u64,
     /// Holding this value prevents migration while the guard is alive.
     _cpu_pin: CpuPinGuard,
-    /// When false this guard borrows an existing epoch window; Drop is a no-op.
-    owned: bool,
-    pin_accounted: bool,
     _scope: PhantomData<&'g ()>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl<'g> Guard<'g> {
     pub(crate) fn new(
+        domain: &'static EpochDomain,
         local: &'static CpuLocalEpochState,
         cpu_id: CpuId,
         entered_epoch: u64,
         cpu_pin: CpuPinGuard,
     ) -> Self {
         Self {
+            domain,
             local,
             cpu_id,
             entered_epoch,
             _cpu_pin: cpu_pin,
-            owned: true,
-            pin_accounted: true,
-            _scope: PhantomData,
-            _not_send_sync: PhantomData,
-        }
-    }
-
-    /// Create a borrow-mode guard that does not modify epoch counters on
-    /// creation or drop.  The caller must already hold a real guard on this CPU.
-    pub(crate) fn new_borrowed(
-        local: &'static CpuLocalEpochState,
-        cpu_id: CpuId,
-        entered_epoch: u64,
-        cpu_pin: CpuPinGuard,
-    ) -> Self {
-        Self {
-            local,
-            cpu_id,
-            entered_epoch,
-            _cpu_pin: cpu_pin,
-            owned: false,
-            pin_accounted: false,
             _scope: PhantomData,
             _not_send_sync: PhantomData,
         }
@@ -86,11 +65,8 @@ impl<'g> Guard<'g> {
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        if self.owned {
-            self.local.leave();
-        }
-        if self.pin_accounted {
-            self.local.unpin();
+        if self.local.unpin() {
+            self.domain.leave_guard();
         }
     }
 }

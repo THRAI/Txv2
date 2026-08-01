@@ -990,6 +990,7 @@ pub trait PmapIf {
     ) -> Result<Option<PmapReservation>, PmapError>;
     fn rollback_kernel_mapping(reservation: PmapReservation);
     fn commit_kernel_mapping(reservation: PmapReservation);
+    fn commit_new_kernel_mapping(reservation: PmapReservation);
     fn unmap_kernel_mapping(
         virt: VirtAddr,
         kind: PmapReserveKind,
@@ -1000,6 +1001,7 @@ pub trait PmapIf {
         permissions: PmapPermissions,
     ) -> Result<Option<PmapInvalidation>, PmapError>;
     fn shootdown_kernel_mapping(invalidation: PmapInvalidation);
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]);
 }
 ```
 
@@ -1025,6 +1027,15 @@ The executable pmap mutation surface is still intentionally narrow:
 commits before the allocator is installed, while `reserve_kernel_mapping()` /
 `commit_kernel_mapping()` cover boot-time kernel mappings at 2 MiB or 4 KiB
 granularity for platform MMIO.
+`commit_new_kernel_mapping()` is the vmap-specific publication primitive. A
+`PmapReservation` proves that the leaf was empty, so RV64 and LA64 publish the
+new PTE without issuing a per-leaf synchronization. After filling the range,
+the caller performs one architecture-appropriate range publication/shootdown;
+this preserves page-walk visibility without invalidating after every 4 KiB
+write. The conservative `commit_kernel_mapping()` remains available to callers
+that require its legacy immediate post-publication fence.
+`shootdown_kernel_mappings()` lets a platform coalesce publication or teardown
+invalidations into one range operation (RV64) or one global INVTLB (LA64).
 Abandoned 2 MiB / 4 KiB reservations can be rolled back, releasing any
 `PT_NODE_POOL` intermediates allocated while reserving. Kernel 2 MiB / 4 KiB
 mappings can also be unmapped into a `PmapUnmapResult`, whose invalidation is
@@ -1051,8 +1062,51 @@ session API over those single mapping operations; the board still owns the
 actual PTE walk and mutation. Substrate has an ASID-scoped page shootdown batch
 that holds `MapPin`s until after `PmapIf::shootdown_mapping()`.
 Superpage/multi-frame accounting remains before userspace work; the current
-remote shootdown implementation is RV64 QEMU SBI RFENCE rather than a full
-kernel-managed IPI/ack protocol.
+remote implementations are RV64 QEMU SBI RFENCE and LA64 QEMU's
+kernel-managed per-hart generation mailbox. LA64 uses one full remote INVTLB
+per observed generation and may coalesce concurrent requests. Because its
+board IPI is maskable while Txv2 keeps CRMD.IE clear in syscall/fault paths,
+mailbox service is also exposed as a lock-free progress hook at the pmap and
+vmalloc locks that can participate in a synchronous shootdown cycle. Reactor
+boundaries, prepared interrupt waits, unbounded pmap waits, and CPU shutdown
+drains are also progress points; correctness therefore does not depend on a
+particular lock being contended when the IPI arrives.
+
+RV64 process-root activation and ASID reuse obey two distinct SMP masks.
+The **residency mask** names harts whose `satp` currently carries the ASID and
+therefore acts as a page-table-root lifetime reference. The **TLB-history
+mask** names every hart that may still cache a translation for the ASID; it is
+not cleared on a context switch. During a `satp` switch, the incoming ASID is
+added to both masks before the CSR write, while the outgoing ASID remains
+resident until after the CSR write completes. Normal unmap/protect shootdowns
+target the TLB-history mask rather than only current residents, matching the
+`mm_cpumask` discipline used by mature kernels: a hart that switched away can
+still carry tagged translations and must be invalidated before a mapped frame
+is released. Root destruction first prevents re-entry and waits for the
+residency mask to become empty, then invalidates the ASID on **all online
+harts**. Only after that global invalidation completes is the TLB-history mask
+cleared and may page-table pages and the numeric ASID be reused.
+
+LA64 QEMU uses a deliberately more conservative switch discipline. Every
+actual PGDL/ASID transition performs a full local INVTLB, so a hart that has
+finished switching away retains no ASID-tagged history and normal shootdowns
+may target the current residency mask. A per-hart odd/even switch sequence
+surrounds incoming-tuple publication, incoming residency, CSR writes, full
+INVTLB, active-tuple publication, and outgoing-residency removal. Teardown
+accepts only a stable even-sequence snapshot; it never clears remote residency
+by inference. Ordinary leaf unmap never prunes committed L0/L1/L2 tables:
+user intermediates remain owned by the process root until ASID quiescence and
+root destruction, while bounded kernel/vmalloc intermediates remain resident.
+This prevents a stale hardware page-table walk from dereferencing a page-table
+page that has already been reused.
+
+LA64 CPU shutdown uses a separate target-acquisition protocol in addition to
+the scheduler online mask. A sender pins an accepting target across mailbox
+publication and completion. An offlining CPU first withdraws acceptance,
+services requests from already-pinned senders until their count reaches zero,
+and only then masks interrupts permanently. Shared kernel PGDH bootstrap
+mapping likewise uses a three-state `UNINIT/BUILDING/READY` once protocol so
+concurrent first users cannot mutate the same page-table tree.
 
 The full planned trait surface is:
 
@@ -2322,7 +2376,12 @@ pub trait CacheIf {
 
 - **exec / ELF loader.** After loading executable pages, call `flush_icache_range` over the .text region before the first user-mode entry. Otherwise the i-cache may hold stale data from the previous use of those frames.
 - **DMA.** Drivers call `dcache_clean_range` before handing a buffer to a device (write to memory must be visible to the device) and `dcache_invalidate_range` after the device has written into memory and before the CPU reads it. The `DmaIf` (§17) wraps these in direction-aware helpers.
-- **PTE publication.** After installing PTEs, the hart that installed them issues `sfence.vma` / `invtlb` (this is `PmapIf::shootdown`, not `CacheIf`). But `CacheIf::fence_all` is what subsystems use when they need general memory ordering across HAL layers.
+- **PTE publication.** Replacing or changing an existing translation requires
+  `sfence.vma` / `invtlb` through `PmapIf::shootdown`; publishing into a leaf
+  proven empty by `PmapReservation` may use `commit_new_kernel_mapping()` to
+  defer synchronization until one range publication after all leaves are
+  installed. `CacheIf::fence_all` remains the general memory-ordering surface
+  across HAL layers.
 - **JIT / future module loading.** Out of scope for v1.
 
 ### 16.2 Why not `cfg`?
@@ -2448,8 +2507,20 @@ pub trait SmpIf {
     fn enable_ipi_wakeups();
 
     /// Wait once for an interrupt or platform wake event. The caller owns the
-    /// surrounding condition check and lost-wake discipline.
+    /// surrounding condition check. Callers that can race remote publication
+    /// use the prepared three-step protocol below instead.
     fn wait_for_interrupt_once();
+
+    /// Enter the platform half of a race-free idle transition. The kernel
+    /// performs its final runnable-work check only after this returns.
+    fn prepare_interrupt_wait() -> InterruptWaitState;
+
+    /// Abort a prepared transition because the final check found work.
+    fn cancel_interrupt_wait(state: InterruptWaitState);
+
+    /// Commit a prepared transition, wait once, and restore the saved local
+    /// interrupt state.
+    fn wait_for_interrupt_prepared(state: InterruptWaitState);
 
     /// Report whether an IPI of this kind is pending on the current hart.
     /// Used by kernel-owned AP loops that poll/ack low-level IPI state instead
@@ -2503,6 +2574,10 @@ pub enum IpiKind {
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
 
+/// Opaque platform state carried across prepare/check/commit.
+#[derive(Eq, PartialEq, Debug)]
+pub struct InterruptWaitState(/* platform-private */);
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct CpuMask(pub u64);  // v1: 64 CPU max
 ```
@@ -2518,8 +2593,12 @@ pub struct CpuMask(pub u64);  // v1: 64 CPU max
   generic kernel publishes AP online only after AP-local substrate init.
 - IPI send/receive primitives, pending-state observation, wake-from-wait
   enablement, and low-level acknowledgement observation.
-- A single low-power wait primitive that a kernel-owned AP loop can compose
-  with its own condition checks.
+- A low-power wait primitive plus a prepare/check/commit protocol that a
+  kernel-owned AP loop can compose with its own authoritative work check
+  without an interrupt-before-wait lost-wake window. On RV64,
+  `prepare_interrupt_wait` clears global `sstatus.SIE` while leaving local
+  `sie` sources enabled; a racing SSIP therefore stays pending and makes the
+  following `wfi` resume before SIE is restored.
 - CPU parking primitive.
 - Platform remote-TLB primitive when firmware provides one. RV64 QEMU uses SBI
   RFENCE behind `PmapIf::shootdown_*`; this is not exposed as a scheduler
@@ -2552,6 +2631,9 @@ In v1 single-CPU builds:
 - `boot_secondary_cpus()` is a no-op and returns `0`.
 - `enable_ipi_wakeups()` is a no-op.
 - `wait_for_interrupt_once()` may be a spin-loop fallback.
+- `prepare_interrupt_wait()` returns an empty token;
+  `cancel_interrupt_wait()` is a no-op; and
+  `wait_for_interrupt_prepared()` may use the same spin-loop fallback.
 - `pending_ipi(_)` returns `false`.
 - `send_ipi(target, _)` asserts if `target != current_cpu_id()`.
 - `broadcast_ipi(mask, _)` asserts if `mask` has more than the current CPU bit set.
@@ -2759,7 +2841,39 @@ The platform crate (e.g., `tx-hal-loongarch64-qemu-virt`, `tx-hal-loongarch64-2k
 
 - **Expose DMW activation in H1.** Two DMW windows: one for the kernel direct map (cached), one for MMIO (uncached). DMW activation happens before MMU enable.
 
-- **Implement invtlb in `PmapIf::shootdown`.** Single-hart: `invtlb 0x5, asid, vaddr` (invalidate by VA + ASID). `shootdown_global` uses `invtlb 0x6, x0, vaddr` (invalidate by VA, all ASIDs). Cross-hart deferred to SMP_v1.
+- **Implement invtlb in `PmapIf::shootdown`.** Single-hart:
+  `invtlb 0x5, asid, vaddr` (invalidate by VA + ASID).
+  `shootdown_global` uses `invtlb 0x6, x0, vaddr` (invalidate by VA, all
+  ASIDs). LA64 QEMU implements cross-hart completion with a per-target
+  generation mailbox carried by the board IPI. The receiver retires the
+  interrupt transport before draining the mailbox so an arriving generation
+  cannot be lost by a trailing hardware clear. Concurrent senders service
+  their own inbound mailbox while waiting; pmap/vmalloc lock contention also
+  runs the same lock-free service hook because CRMD.IE may be clear. Reactor
+  boundaries and unbounded pmap/shutdown waits are progress points as well.
+
+- **Publish pmap lifetime transitions explicitly.** Each hart has an
+  odd/even switch sequence. The odd interval begins before incoming root
+  publication and ends only after CSR installation, full local INVTLB, active
+  tuple publication, and outgoing-residency removal. Root teardown waits for
+  stable even snapshots and never edits another hart's residency by
+  inference.
+
+- **Drain synchronous targets before CPU parking.** Sender-side target pins
+  cover request publication through completion. An offlining CPU stops
+  accepting pins, drains existing users and its mailbox, then disables
+  interrupts.
+
+- **Serialize shared PGDH bootstrap.** Concurrent first users participate in
+  an `UNINIT -> BUILDING -> READY` once protocol. Waiters service shootdowns,
+  and a failed idempotent builder returns to `UNINIT` for retry.
+
+- **Keep committed intermediate page tables alive through shootdown.**
+  Ordinary unmap clears only the leaf. User L0/L1/L2 nodes are released only
+  after root residency reaches zero during root destruction; bounded kernel
+  intermediates remain resident. Uncommitted reservation intermediates may
+  still be rolled back immediately because no valid leaf ever referenced
+  them.
 
 - **Use $r21 for percpu.** `$r21` (a.k.a. `tp` in LA64 conventions) holds the per-CPU pointer in kernel mode. Trap entry preserves $r21 via the architecture's trap-frame save discipline.
 

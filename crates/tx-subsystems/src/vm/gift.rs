@@ -448,6 +448,7 @@ const fn vm_fault_error_to_errno(error: VmFaultError) -> Errno {
             VmPmapError::Pmap(_)
             | VmPmapError::MissingReservation
             | VmPmapError::AlreadyMappedDrift
+            | VmPmapError::ConcurrentPublication
             | VmPmapError::MappingMismatch,
         ) => Errno::EIO,
     }

@@ -340,13 +340,8 @@ pub(super) fn sys_open_by_handle_at(
         Ok(file) => file,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
-    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(fd) = ctx.process.install_new_fd(open_file, open_flags.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.set_fd(fd, Some(open_file));
-    if open_flags.cloexec {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
     SyscallResult::Return(fd as i64)
 }

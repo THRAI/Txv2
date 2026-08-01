@@ -27,7 +27,7 @@ use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
-use crate::mount::{MountApiFile, MountIdentity, MountPayload};
+use crate::mount::{FsObjectPin, MountApiFile, MountIdentity, MountPayload};
 use crate::net::{NetNamespacePayload, SocketIdentity};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
@@ -97,8 +97,27 @@ impl FsObjectId {
         Self(value)
     }
 
+    /// Construct a persistent-filesystem object identity from its allocation
+    /// slot and incarnation generation.
+    ///
+    /// The low 32 bits remain the on-disk inode number for backends such as
+    /// ext4.  The high 32 bits distinguish successive occupants of the same
+    /// inode bitmap slot, preventing a reclaimed inode from inheriting an old
+    /// RNode, page cache, orphan record, or advisory lock.
+    pub const fn from_inode_generation(inode: u32, generation: u32) -> Self {
+        Self(((generation as u64) << 32) | inode as u64)
+    }
+
     pub const fn as_u64(self) -> u64 {
         self.0
+    }
+
+    pub const fn inode_number(self) -> u32 {
+        self.0 as u32
+    }
+
+    pub const fn inode_generation(self) -> u32 {
+        (self.0 >> 32) as u32
     }
 }
 
@@ -574,6 +593,9 @@ pub struct RNode {
     meta: InodeMeta,
     backing: RNodeBacking,
     containing_mount: Option<Weak<MountPayload>>,
+    /// Shared persistent-object lifetime.  All RNodes and file
+    /// PageContainers for the same `(mount, FsObjectId)` hold the same pin.
+    object_pin: Option<FsObjectPin>,
     /// Optional per-inode readiness endpoints. Most RNodes in the current
     /// tree never expose VFS-level blocking readiness (pipes, tty, sockets,
     /// timerfd, eventfd, etc. own their wait sources on the backing object),
@@ -590,6 +612,7 @@ impl RNode {
             meta,
             backing,
             containing_mount: None,
+            object_pin: None,
             wait_points: SpinMutex::new(None),
         }
     }
@@ -703,6 +726,9 @@ impl RNode {
     }
 
     pub fn with_containing_mount(mut self, mount: &Cap<MountPayload>) -> Self {
+        if self.object_pin.is_none() {
+            self.object_pin = Some(FsObjectPin::acquire(mount, self.fs_object_id));
+        }
         self.containing_mount = Some(mount.downgrade());
         self
     }
@@ -838,6 +864,7 @@ impl core::fmt::Debug for RNode {
             .field("meta", &self.meta)
             .field("backing", &self.backing)
             .field("containing_mount", &self.containing_mount)
+            .field("object_pin", &self.object_pin)
             .field("wait_points_allocated", &self.wait_points.lock().is_some())
             .finish()
     }
@@ -1557,6 +1584,16 @@ impl OpenFile {
     /// Exec's post-PoNR CLOEXEC commit uses the decrement form, so this method
     /// must remain allocation-free and infallible.
     pub(crate) fn adjust_process_fd_reference(&self, increment: bool) {
+        // final-smp tracks descriptor ownership explicitly for network
+        // sockets. Cap clones are lifetime pins and cannot be used to decide
+        // when close(2) must publish FIN/EOF.
+        if let Some(socket) = self.socket_identity() {
+            if increment {
+                socket.incr_fd_ref();
+            } else {
+                socket.decr_fd_ref();
+            }
+        }
         match &self.backing {
             OpenFileBacking::Rnode { rnode } => {
                 let RNodeBacking::StructBacked {

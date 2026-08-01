@@ -353,6 +353,11 @@ fn qemu_command(
         args.push("-no-shutdown".into());
     }
 
+    // QEMU's firmware topology is the default source of truth. Keep an
+    // explicit matching cap in xtask-generated command lines so `--smp N`
+    // remains deterministic even when a custom firmware tree exposes more
+    // harts than QEMU was asked to run.
+    let maxcpus_suffix = format!(" tx.maxcpus={}", qemu_smp(target, profile, options));
     if matches!(profile, Profile::Busybox | Profile::Alpine) {
         let initramfs_name = match profile {
             Profile::Busybox => busybox_initramfs_name(target),
@@ -366,20 +371,30 @@ fn qemu_command(
             .unwrap_or_else(|| default_boot_mode_for_profile(profile));
         let cmdline_base = match (profile, target) {
             (Profile::Busybox, TxTarget::Rv64M1DockMock) => {
-                format!("tx.profile=busybox tx.boot.mode={boot_mode} tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0")
+                format!(
+                    "tx.profile=busybox tx.boot.mode={boot_mode} tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+                )
             }
             (Profile::Busybox, _) => {
                 format!("tx.profile=busybox tx.boot.mode={boot_mode} console=ttyS0")
             }
             (Profile::Alpine, _) => {
-                format!("tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0")
+                format!(
+                    "tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0"
+                )
             }
             (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
+        let cmdline_base = format!("{cmdline_base}{maxcpus_suffix}");
         let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
         let cmdline = append_tty_winsize_cmdline(&cmdline_base);
-        args.push("-initrd".into());
-        args.push(initramfs.display().to_string());
+        // LA64's unified high kernel load base is not compatible with
+        // QEMU's direct `-initrd` placement.  The board copies the image
+        // from fw_cfg instead; RV64 keeps the ordinary `-initrd` path.
+        if target != TxTarget::La64Qemu {
+            args.push("-initrd".into());
+            args.push(initramfs.display().to_string());
+        }
         args.push("-append".into());
         args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {
@@ -394,18 +409,25 @@ fn qemu_command(
             .as_deref()
             .unwrap_or_else(|| default_boot_mode_for_profile(profile));
         let cmdline_base = if target == TxTarget::Rv64M1DockMock {
-            format!("tx.profile=smoke tx.boot.mode={boot_mode} tx.board=m1dock-mock init=/tx-test-init tx.test_init=1 console=ttyS0")
+            format!(
+                "tx.profile=smoke tx.boot.mode={boot_mode} tx.board=m1dock-mock init=/tx-test-init tx.test_init=1 console=ttyS0"
+            )
         } else {
-            format!("tx.profile=smoke tx.boot.mode={boot_mode} init=/tx-test-init tx.test_init=1 console=ttyS0")
+            format!(
+                "tx.profile=smoke tx.boot.mode={boot_mode} init=/tx-test-init tx.test_init=1 console=ttyS0"
+            )
         };
+        let cmdline_base = format!("{cmdline_base}{maxcpus_suffix}");
         let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
         let cmdline = append_tty_winsize_cmdline(&cmdline_base);
         let initramfs = root
             .join("target")
             .join("images")
             .join(test_initramfs_name(target));
-        args.push("-initrd".into());
-        args.push(initramfs.display().to_string());
+        if target != TxTarget::La64Qemu {
+            args.push("-initrd".into());
+            args.push(initramfs.display().to_string());
+        }
         args.push("-append".into());
         args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {
@@ -426,11 +448,8 @@ fn qemu_command(
                 args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0,addr=1".into());
             }
             TxTarget::Rv64Qemu => {
-                // Pin the block device to virtio-mmio-bus.0 (-> "virtio0" @
-                // 0x1000_1000, where the block driver probes — see the rv64
-                // board `boot_static.rs`). Net takes bus.1 (-> "virtio1"); an
-                // unpinned block would drift to another slot when net is present
-                // and the block-0 read would hang.
+                // The RV64 block probe expects the first virtio-mmio slot.
+                // Pinning avoids device-order changes when networking is on.
                 args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
             }
         }
@@ -516,6 +535,11 @@ fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
     args.push("-device".into());
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
+            // Keep networking on the second transport whenever the first
+            // transport may be occupied by the root block device. QEMU's
+            // virtio-mmio buses are single-device buses, so assigning both
+            // devices to bus.0 makes combined block+network boots fail before
+            // the kernel can probe either transport.
             args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1".into());
         }
         TxTarget::La64Qemu => {
@@ -1077,6 +1101,9 @@ mod tests {
         assert!(rendered.contains(
             "-fw_cfg name=opt/tx.initrd,file=/tmp/tx/target/images/test-init-initramfs-la64-qemu.cpio"
         ));
+        assert!(
+            !rendered.contains("-initrd /tmp/tx/target/images/test-init-initramfs-la64-qemu.cpio")
+        );
         assert!(rendered.contains("tx.tty.rows="));
         assert!(rendered.contains("tx.tty.cols="));
         assert!(rendered.contains("tx-kernel-loongarch64-qemu-virt"));
@@ -1161,6 +1188,27 @@ mod tests {
         .join(" ");
         assert!(la64.contains("-netdev user,id=net0"));
         assert!(la64.contains("-device virtio-net-pci,netdev=net0,addr=2"));
+    }
+
+    #[test]
+    fn rv64_busybox_block_and_network_use_distinct_mmio_buses() {
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Busybox,
+            &QemuOptions {
+                net: QemuNet::User,
+                ..test_options()
+            },
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command
+            .contains("-device virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0"));
+        assert!(
+            command.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1")
+        );
     }
 
     #[test]

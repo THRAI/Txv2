@@ -3,7 +3,7 @@
 //! Spec:
 //! - `docs/progress/decisions/2026-05-11-d9-signal-wake-migration.md`
 //!   §6 (Option C follow-up: signalfd as a per-process subscription
-//!   driven from the process-directed kill helper after the thread-eligibility
+//!   driven from `step_kill_process` after the thread-eligibility
 //!   post)
 //! - `man 2 signalfd`, `man 2 signalfd4`
 //!
@@ -29,8 +29,8 @@ use tx_subsystems::vfs::OpenFile;
 
 use super::numbers::{O_CLOEXEC, O_NONBLOCK, SFD_CLOEXEC, SFD_NONBLOCK};
 use super::{
-    bootstrap_read_user, errno_to_i32, next_stdio_fd_below_nofile, SyscallCtx, SyscallResult,
-    EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult, EBADF_VALUE, EINVAL_VALUE,
+    ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
 
@@ -112,14 +112,9 @@ pub(super) fn sys_signalfd4<'a>(
             Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
         };
 
-        let new_fd = match next_stdio_fd_below_nofile(&ctx.process) {
-            Ok(fd) => fd,
-            Err(result) => return result,
+        let Some(new_fd) = ctx.process.install_new_fd(open_cap, cloexec) else {
+            return SyscallResult::Error(super::EMFILE_VALUE);
         };
-        let _ = ctx.process.install_fd(new_fd, open_cap);
-        if cloexec {
-            ctx.process.set_fd_cloexec(new_fd, true);
-        }
         return SyscallResult::Return(new_fd as i64);
     }
 

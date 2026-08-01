@@ -214,6 +214,12 @@ pub struct SocketPayload {
     pub(crate) tcp_backlog: SpinMutex<TcpBacklog>,
     pub shutdown_rd: AtomicBool,
     pub shutdown_wr: AtomicBool,
+    /// The final open-file reference has been closed.  The network delegate
+    /// owns the payload until queued bytes and the TCP FIN exchange complete.
+    tcp_close_requested: AtomicBool,
+    /// Exactly one CPU may drive a given active-open loopback handshake at a
+    /// time. Other flows remain fully parallel.
+    tcp_handshake_driving: AtomicBool,
 }
 
 impl SocketPayload {
@@ -302,6 +308,8 @@ impl SocketPayload {
             tcp_backlog: SpinMutex::new(TcpBacklog::new()),
             shutdown_rd: AtomicBool::new(false),
             shutdown_wr: AtomicBool::new(false),
+            tcp_close_requested: AtomicBool::new(false),
+            tcp_handshake_driving: AtomicBool::new(false),
         };
         payload
     }
@@ -328,6 +336,25 @@ impl SocketPayload {
 
     pub fn shutdown_wr(&self) -> bool {
         self.shutdown_wr.load(Ordering::Acquire)
+    }
+
+    /// Start delegate-owned graceful TCP teardown exactly once.
+    pub(crate) fn request_tcp_close(&self) -> bool {
+        !self.tcp_close_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn tcp_close_requested(&self) -> bool {
+        self.tcp_close_requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_claim_tcp_handshake_driver(&self) -> bool {
+        self.tcp_handshake_driving
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn release_tcp_handshake_driver(&self) {
+        self.tcp_handshake_driving.store(false, Ordering::Release);
     }
 
     pub fn socket_error(&self) -> Option<Errno> {

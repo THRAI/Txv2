@@ -56,7 +56,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         panic!("unexpected external irq")
     }
 
-    fn on_ipi(_cpu: CpuId) -> TrapAction {
+    fn on_ipi(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected ipi")
     }
 
@@ -90,7 +90,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         panic!("unexpected external irq")
     }
 
-    fn on_ipi(_cpu: CpuId) -> TrapAction {
+    fn on_ipi(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected ipi")
     }
 
@@ -619,6 +619,8 @@ fn la64_signal_frame_restore_uses_saved_user_context() {
                 _reserved0: [0; 3],
                 flags: tx_hal::UserFpContext::FLAG_VALID | tx_hal::UserFpContext::FLAG_DIRTY,
                 _reserved1: 0,
+                _reserved2: [0; 2],
+                simd_regs: [0; 128],
             },
         },
     };
@@ -717,17 +719,16 @@ fn la64_kernel_mmio_mapping_commits_through_pgdh_root() {
         .expect("unmap")
         .expect("mapping present");
     assert_eq!(unmapped.phys(), phys);
-    assert_eq!(
-        la64_page_table_mut_from_phys(pgdh)[la64_l3_index(virt.0)],
-        0
-    );
-    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 3);
+    assert!(la64_pte_is_branch(
+        la64_page_table_mut_from_phys(pgdh)[la64_l3_index(virt.0)]
+    ));
+    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 0);
 
     reset_pmap_test_state();
 }
 
 #[test]
-fn la64_kernel_superpage_mappings_prune_committed_intermediates() {
+fn la64_kernel_superpage_mappings_keep_committed_intermediates() {
     let _guard = lock_test_pmap_state();
     reset_pmap_test_state();
     assert_eq!(
@@ -773,11 +774,10 @@ fn la64_kernel_superpage_mappings_prune_committed_intermediates() {
             .phys(),
         phys_1g
     );
-    assert_eq!(
-        la64_page_table_mut_from_phys(pgdh)[la64_l3_index(virt_1g.0)],
-        0
-    );
-    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 1);
+    assert!(la64_pte_is_branch(
+        la64_page_table_mut_from_phys(pgdh)[la64_l3_index(virt_1g.0)]
+    ));
+    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 0);
 
     reset_pmap_test_state();
     assert_eq!(
@@ -811,11 +811,10 @@ fn la64_kernel_superpage_mappings_prune_committed_intermediates() {
             .phys(),
         phys_2m
     );
-    assert_eq!(
-        la64_page_table_mut_from_phys(pgdh)[la64_l3_index(virt_2m.0)],
-        0
-    );
-    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 2);
+    assert!(la64_pte_is_branch(
+        la64_page_table_mut_from_phys(pgdh)[la64_l3_index(virt_2m.0)]
+    ));
+    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 0);
 
     reset_pmap_test_state();
 }
@@ -929,11 +928,15 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 2);
 
     Platform::activate_user_pmap(&first);
-    let pgdh = LA64_ACTIVE_PGDH.load(Ordering::Acquire);
+    let cpu = la64_current_cpu_id().0;
+    let pgdh = LA64_ACTIVE_PGDH[cpu].load(Ordering::Acquire);
     assert_ne!(pgdh, 0);
-    assert_eq!(LA64_ACTIVE_PGDL.load(Ordering::Acquire), first.phys().0);
     assert_eq!(
-        LA64_ACTIVE_ASID.load(Ordering::Acquire),
+        LA64_ACTIVE_PGDL[cpu].load(Ordering::Acquire),
+        first.phys().0
+    );
+    assert_eq!(
+        LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire),
         first.asid().0 as usize
     );
     assert_eq!(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire), pgdh);
@@ -953,17 +956,224 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
 
     Platform::activate_user_pmap(&second);
-    assert_eq!(LA64_ACTIVE_PGDL.load(Ordering::Acquire), second.phys().0);
     assert_eq!(
-        LA64_ACTIVE_ASID.load(Ordering::Acquire),
+        LA64_ACTIVE_PGDL[cpu].load(Ordering::Acquire),
+        second.phys().0
+    );
+    assert_eq!(
+        LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire),
         second.asid().0 as usize
     );
-    assert_eq!(LA64_ACTIVE_PGDH.load(Ordering::Acquire), pgdh);
+    assert_eq!(LA64_ACTIVE_PGDH[cpu].load(Ordering::Acquire), pgdh);
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
 
     Platform::destroy_pmap_root(first);
+    assert_eq!(
+        LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire),
+        second.asid().0 as usize,
+        "destroying another root must not deactivate the current root"
+    );
+    assert_eq!(
+        LA64_ACTIVE_PGDL[cpu].load(Ordering::Acquire),
+        second.phys().0
+    );
     Platform::destroy_pmap_root(second);
     assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 2);
+
+    reset_pmap_test_state();
+}
+
+#[test]
+fn la64_asid_switch_retains_outgoing_residency_until_hardware_finish() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+
+    let cpu = la64_current_cpu_id().0;
+    let old = 10usize;
+    let new = 11usize;
+    let bit = 1u64 << cpu;
+    LA64_ACTIVE_ASID[cpu].store(old, Ordering::Release);
+    LA64_ACTIVE_PGDL[cpu].store(0x1000, Ordering::Release);
+    LA64_ACTIVE_PGDH[cpu].store(0x2000, Ordering::Release);
+    LA64_ASID_RESIDENCY[old].store(bit, Ordering::Release);
+
+    tx_la64_begin_pmap_switch(new, 0x3000);
+
+    assert_eq!(LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire) & 1, 1);
+    assert!(stable_la64_active_root(cpu).is_none());
+    assert_eq!(LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire), old);
+    assert_eq!(LA64_ASID_RESIDENCY[old].load(Ordering::Acquire), bit);
+    assert_eq!(LA64_ASID_RESIDENCY[new].load(Ordering::Acquire), bit);
+    assert_eq!(LA64_SWITCHING_ASID[cpu].load(Ordering::Acquire), new);
+    assert_eq!(LA64_SWITCHING_PGDL[cpu].load(Ordering::Acquire), 0x3000);
+
+    tx_la64_finish_pmap_switch(new, 0x3000, 0x4000);
+
+    assert_eq!(LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire) & 1, 0);
+    assert_eq!(stable_la64_active_root(cpu), Some((new, 0x3000, 0x4000)));
+    assert_eq!(LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire), new);
+    assert_eq!(LA64_ACTIVE_PGDL[cpu].load(Ordering::Acquire), 0x3000);
+    assert_eq!(LA64_ACTIVE_PGDH[cpu].load(Ordering::Acquire), 0x4000);
+    assert_eq!(LA64_SWITCHING_ASID[cpu].load(Ordering::Acquire), 0);
+    assert_eq!(LA64_SWITCHING_PGDL[cpu].load(Ordering::Acquire), 0);
+    assert_eq!(LA64_ASID_RESIDENCY[old].load(Ordering::Acquire), 0);
+    assert_eq!(LA64_ASID_RESIDENCY[new].load(Ordering::Acquire), bit);
+
+    reset_pmap_test_state();
+}
+
+#[test]
+fn la64_pmap_transition_sequence_covers_publication_gap() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+
+    let asid = Asid(12);
+    let pgdl = PhysAddr(0x3000);
+    let cpu = la64_current_cpu_id().0;
+    let bit = 1u64 << cpu;
+
+    tx_la64_begin_pmap_switch(asid.0 as usize, pgdl.0);
+    assert_eq!(LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire) & 1, 1);
+    assert!(stable_la64_active_root(cpu).is_none());
+    assert_eq!(
+        LA64_ASID_RESIDENCY[asid.0 as usize].load(Ordering::Acquire),
+        bit
+    );
+
+    tx_la64_finish_pmap_switch(asid.0 as usize, pgdl.0, 0x4000);
+    assert_eq!(LA64_PMAP_SWITCH_SEQ[cpu].load(Ordering::Acquire) & 1, 0);
+    assert_eq!(
+        LA64_ASID_RESIDENCY[asid.0 as usize].load(Ordering::Acquire),
+        bit
+    );
+
+    reset_pmap_test_state();
+}
+
+#[test]
+fn la64_tlb_mailbox_coalesces_generations_at_polling_safe_point() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+
+    let cpu = la64_current_cpu_id().0;
+    LA64_TLB_SHOOTDOWN_COMPLETED[cpu].store(2, Ordering::Release);
+    LA64_TLB_SHOOTDOWN_REQUESTED[cpu].store(5, Ordering::Release);
+
+    assert!(service_la64_pending_tlb_shootdown());
+    assert_eq!(LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire), 5);
+    assert!(!service_la64_pending_tlb_shootdown());
+    assert!(la64_tlb_generation_reached(5, 3));
+    assert!(!la64_tlb_generation_reached(3, 5));
+
+    reset_pmap_test_state();
+}
+
+#[test]
+fn la64_tlb_target_lifecycle_rejects_new_senders_before_offline() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let target = CpuId(1);
+    let bit = CpuMask::single(target).bits();
+
+    mark_la64_tlb_cpu_online(target);
+    LA64_ONLINE_CPUS.fetch_or(bit, Ordering::AcqRel);
+    assert!(try_pin_la64_tlb_target(target.0));
+    assert_eq!(LA64_TLB_TARGET_USERS[target.0].load(Ordering::Acquire), 1);
+
+    // This is the linearization point used by prepare_cpu_offline: senders
+    // which arrive afterwards cannot acquire a target reference, while the
+    // prior sender remains visible to the drain.
+    LA64_TLB_ACCEPTING_CPUS.fetch_and(!bit, Ordering::AcqRel);
+    assert!(!try_pin_la64_tlb_target(target.0));
+    assert_eq!(LA64_TLB_TARGET_USERS[target.0].load(Ordering::Acquire), 1);
+    unpin_la64_tlb_target(target.0);
+    assert_eq!(LA64_TLB_TARGET_USERS[target.0].load(Ordering::Acquire), 0);
+
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_kernel_pgdh_bootstrap_is_built_once_under_concurrency() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    assert_eq!(
+        Platform::install_pt_node_allocator(test_pmap_allocator),
+        Ok(())
+    );
+
+    let first = std::thread::spawn(ensure_la64_kernel_pgdh_bootstrap_mapped);
+    let second = std::thread::spawn(ensure_la64_kernel_pgdh_bootstrap_mapped);
+    let first = first.join().expect("first PGDH builder thread").unwrap();
+    let second = second.join().expect("second PGDH builder thread").unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(
+        LA64_KERNEL_PGDH_BOOTSTRAP_STATE.load(Ordering::Acquire),
+        LA64_PGDH_BOOTSTRAP_READY
+    );
+    assert_eq!(
+        TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire),
+        4,
+        "one PGDH root plus one three-level path"
+    );
+
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_ipi_kinds_ack_independently() {
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    <Platform as SmpIf>::send_ipi(CpuId(1), IpiKind::Reschedule);
+    <Platform as SmpIf>::send_ipi(CpuId(1), IpiKind::TlbShootdown);
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::Reschedule));
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    <Platform as SmpIf>::ack_ipi(IpiKind::Reschedule);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Reschedule));
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+}
+
+#[test]
+fn la64_committed_pt_node_registry_handles_collisions_and_tombstones() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+
+    let stride = LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS << 12;
+    let first = PtNode::boot_pool(PhysAddr(0x4000_0000));
+    let second = PtNode::boot_pool(PhysAddr(first.phys.0 + stride));
+    let replacement = PtNode::boot_pool(PhysAddr(first.phys.0 + stride * 2));
+    assert_eq!(
+        la64_committed_pt_node_slot_index(first.phys),
+        la64_committed_pt_node_slot_index(second.phys)
+    );
+
+    register_la64_committed_pt_node(first);
+    register_la64_committed_pt_node(second);
+    assert_eq!(
+        take_la64_committed_pt_node(first.phys).map(|node| node.phys),
+        Some(first.phys)
+    );
+
+    register_la64_committed_pt_node(replacement);
+    assert_eq!(
+        take_la64_committed_pt_node(second.phys).map(|node| node.phys),
+        Some(second.phys)
+    );
+    assert_eq!(
+        take_la64_committed_pt_node(replacement.phys).map(|node| node.phys),
+        Some(replacement.phys)
+    );
+    assert!(take_la64_committed_pt_node(first.phys).is_none());
 
     reset_pmap_test_state();
 }
@@ -1021,11 +1231,10 @@ fn la64_user_page_mapping_reserve_commit_protect_and_unmap() {
     assert_eq!(unmapped.virt(), virt);
     assert_eq!(unmapped.phys(), phys);
     assert_eq!(unmapped.kind(), PmapReserveKind::Page4K);
-    assert_eq!(
-        la64_page_table_mut_from_phys(root.phys())[la64_l3_index(virt.0)],
-        0
-    );
-    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 3);
+    assert!(la64_pte_is_branch(
+        la64_page_table_mut_from_phys(root.phys())[la64_l3_index(virt.0)]
+    ));
+    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 0);
 
     Platform::destroy_pmap_root(root);
     assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 4);
@@ -1195,7 +1404,7 @@ fn la64_net_irq_unmask_programs_pch_vector_eighteen() {
 
 #[test]
 #[cfg(not(target_arch = "loongarch64"))]
-fn la64_irq_claim_masks_and_completes_qemu_uart_gsi() {
+fn la64_irq_claim_deduplicates_and_completes_qemu_uart_gsi() {
     let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
     reset_la64_host_irq_controller_for_test();
     let ext_irq = QEMU_LA64_UART0_IRQ - QEMU_LA64_GSI_BASE;
@@ -1212,9 +1421,35 @@ fn la64_irq_claim_masks_and_completes_qemu_uart_gsi() {
         ext_irq as u8
     );
     assert_eq!(<Platform as IrqIf>::claim(), QEMU_LA64_UART0_IRQ);
+    assert_eq!(
+        LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire) & bit,
+        bit,
+        "the first logical claim must preserve the proven ExtIOI route"
+    );
+    assert_eq!(
+        LA64_HOST_PCH_PIC_MASK.load(Ordering::Acquire) & bit,
+        0,
+        "claim suppression must not become an explicit PCH-PIC mask"
+    );
+    assert_eq!(
+        <Platform as IrqIf>::claim(),
+        0,
+        "an outstanding ExtIOI claim must not be delivered twice"
+    );
+    assert_eq!(
+        LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire) & bit,
+        0,
+        "a duplicate presentation must be suppressed until completion"
+    );
+    assert_eq!(
+        LA64_HOST_EIOINTC_COREISR0.load(Ordering::Acquire) & bit,
+        0,
+        "a duplicate presentation must be acknowledged"
+    );
 
     <Platform as IrqIf>::complete(QEMU_LA64_UART0_IRQ);
     assert_eq!(LA64_HOST_EIOINTC_COREISR0.load(Ordering::Acquire) & bit, 0);
+    assert_eq!(LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire), bit);
 
     LA64_HOST_EIOINTC_COREISR0.store(bit, Ordering::Release);
     <Platform as IrqIf>::mask(QEMU_LA64_UART0_IRQ);
@@ -1388,6 +1623,47 @@ fn la64_timer_deadline_rounds_up_to_tcfg_granule() {
 }
 
 #[test]
+fn la64_timer_deadline_is_one_shot() {
+    let minimum = la64_deadline_tcfg(1);
+    assert_eq!(minimum, 4 | LA64_TCFG_ENABLE);
+    assert_eq!(minimum & LA64_TCFG_PERIODIC, 0);
+
+    let rounded = la64_deadline_tcfg(5);
+    assert_eq!(rounded, 8 | LA64_TCFG_ENABLE);
+    assert_eq!(rounded & LA64_TCFG_PERIODIC, 0);
+}
+
+#[test]
+fn la64_idle_interrupt_region_redirects_to_exit() {
+    let start = 0x1000;
+    let exit = 0x100c;
+
+    assert_eq!(
+        la64_idle_interrupt_resume_pc(start, start, exit),
+        Some(exit)
+    );
+    assert_eq!(
+        la64_idle_interrupt_resume_pc(start + 4, start, exit),
+        Some(exit)
+    );
+    assert_eq!(
+        la64_idle_interrupt_resume_pc(start + 8, start, exit),
+        Some(exit)
+    );
+    assert_eq!(la64_idle_interrupt_resume_pc(exit, start, exit), None);
+    assert_eq!(la64_idle_interrupt_resume_pc(start - 4, start, exit), None);
+}
+
+#[test]
+fn la64_smp_static_capacity_covers_final_twelve_hart_lane() {
+    assert_eq!(LA64_MAX_BOOT_CPUS, 12);
+    assert_eq!(LA64_IRQ_CONTEXT_DEPTHS.len(), LA64_MAX_BOOT_CPUS);
+    assert_eq!(LA64_KERNEL_RESUME_CTX.len(), LA64_MAX_BOOT_CPUS);
+    assert_eq!(LA64_TRAP_STACKS.len(), LA64_MAX_BOOT_CPUS);
+    assert_eq!(LA64_ENTRY_TRAP_FRAMES.len(), LA64_MAX_BOOT_CPUS);
+}
+
+#[test]
 #[cfg(not(target_arch = "loongarch64"))]
 fn timeif_paths_are_host_noops_without_cpu_counter() {
     assert_eq!(<Platform as MonotonicCounterIf>::frequency_hz(), 0);
@@ -1422,7 +1698,10 @@ fn percpu_and_smp_publish_uniprocessor_state() {
     assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Reschedule));
     <Platform as SmpIf>::enable_ipi_wakeups();
 
-    <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Reschedule, CpuMask::single(CpuId(0)));
+    <Platform as SmpIf>::clear_ipi_ack_cpus(
+        IpiKind::Reschedule,
+        CpuMask::first(LA64_MAX_BOOT_CPUS),
+    );
     assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Reschedule),
         CpuMask::EMPTY
@@ -1530,10 +1809,42 @@ fn reset_pmap_test_state() {
     TEST_PMAP_ALLOCATIONS.store(0, Ordering::Release);
     TEST_PMAP_RELEASES.store(0, Ordering::Release);
     LA64_KERNEL_PGDH_PHYS.store(0, Ordering::Release);
-    LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED.store(false, Ordering::Release);
-    LA64_ACTIVE_PGDL.store(0, Ordering::Release);
-    LA64_ACTIVE_PGDH.store(0, Ordering::Release);
-    LA64_ACTIVE_ASID.store(0, Ordering::Release);
+    LA64_KERNEL_PGDH_BOOTSTRAP_STATE.store(LA64_PGDH_BOOTSTRAP_UNINIT, Ordering::Release);
+    for sequence in &LA64_PMAP_SWITCH_SEQ {
+        sequence.store(0, Ordering::Release);
+    }
+    for active in &LA64_ACTIVE_PGDL {
+        active.store(0, Ordering::Release);
+    }
+    for active in &LA64_ACTIVE_PGDH {
+        active.store(0, Ordering::Release);
+    }
+    for active in &LA64_ACTIVE_ASID {
+        active.store(0, Ordering::Release);
+    }
+    for switching in &LA64_SWITCHING_PGDL {
+        switching.store(0, Ordering::Release);
+    }
+    for switching in &LA64_SWITCHING_ASID {
+        switching.store(0, Ordering::Release);
+    }
+    for resident in &LA64_ASID_RESIDENCY {
+        resident.store(0, Ordering::Release);
+    }
+    for requested in &LA64_TLB_SHOOTDOWN_REQUESTED {
+        requested.store(0, Ordering::Release);
+    }
+    for completed in &LA64_TLB_SHOOTDOWN_COMPLETED {
+        completed.store(0, Ordering::Release);
+    }
+    for servicing in &LA64_TLB_SHOOTDOWN_SERVICING {
+        servicing.store(false, Ordering::Release);
+    }
+    LA64_ONLINE_CPUS.store(1, Ordering::Release);
+    LA64_TLB_ACCEPTING_CPUS.store(1, Ordering::Release);
+    for users in &LA64_TLB_TARGET_USERS {
+        users.store(0, Ordering::Release);
+    }
     unsafe {
         core::ptr::write_bytes(
             core::ptr::addr_of_mut!(TEST_PMAP_PAGES).cast::<u8>(),
@@ -1553,7 +1864,7 @@ fn lock_test_pmap_state() -> std::sync::MutexGuard<'static, ()> {
 fn reset_la64_committed_pt_nodes_for_test() {
     let _guard = lock_la64_committed_pt_node_registry();
     let nodes = unsafe { &mut *LA64_COMMITTED_PT_NODES.0.get() };
-    nodes.fill(None);
+    nodes.fill(La64CommittedPtNodeEntry::Empty);
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
@@ -1561,6 +1872,7 @@ fn reset_la64_host_irq_controller_for_test() {
     LA64_HOST_EIOINTC_ENABLE0.store(0, Ordering::Release);
     LA64_HOST_EIOINTC_COREISR0.store(0, Ordering::Release);
     LA64_HOST_PCH_PIC_MASK.store(u64::MAX, Ordering::Release);
+    reset_la64_extioi_claim_state_for_test();
     for vector in &LA64_HOST_PCH_PIC_HTMSI_VECTOR {
         vector.store(0, Ordering::Release);
     }

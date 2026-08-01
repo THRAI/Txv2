@@ -240,7 +240,7 @@ internals; owner facades remain unchanged when their backend migrates.
 
 <!-- txdoc:INV-V5-ASYNC -->
 
-ASYNC-1 through ASYNC-N. **Preserved from v4.** No epoch guard across `.await`; no nested guards; reactor poll boundaries are safe points; userspace preemption does not advance the thread future.
+ASYNC-1 through ASYNC-N. **Preserved from v4 except for EBR-6's nested-pin refinement.** No epoch guard crosses `.await`; balanced same-CPU guard nesting is allowed only inside one synchronous execution extent; reactor poll boundaries are safe points; userspace preemption does not advance the thread future.
 
 ---
 
@@ -256,9 +256,10 @@ ARCH-1 through ARCH-5. **Preserved from v4.** ARCH-3 (closed-catalog extension r
 
 <!-- txdoc:INV-V5-EBR -->
 
-All v4 EBR-* and ZONE-* invariants hold unchanged. Notably:
+All v4 EBR-* and ZONE-* invariants hold, with EBR-6 refined from rejecting
+nesting to requiring balanced same-CPU nesting. Notably:
 
-- EBR-6: Guards cannot be nested.
+- EBR-6: Guards may be nested on the same CPU with balanced depth accounting. Only the outermost `0 -> 1` transition publishes the local epoch and participates in periodic collection; only the final `1 -> 0` transition clears it. Guards remain forbidden across yield/await/thread boundaries.
 - EBR-7: Guards are `!Send`, `!Sync`.
 - EBR-8: IRQ handlers do not create Guards.
 - ZONE-3: Old `Weak<T>` cannot observe a reused slot (generation tag).

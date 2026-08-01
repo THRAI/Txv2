@@ -1,4 +1,5 @@
 use tx_substrate::index::IndexError;
+use tx_substrate::step::NoProgress;
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
@@ -11,6 +12,14 @@ use crate::net::structure::{
 };
 
 use super::step_connect::fail_indexed_tcp_connect_attempt;
+
+struct TcpHandshakeDriver<'a>(&'a crate::net::structure::SocketOperationalEvidence);
+
+impl Drop for TcpHandshakeDriver<'_> {
+    fn drop(&mut self) {
+        self.0.release_tcp_handshake_driver();
+    }
+}
 
 const TCP_LOOPBACK_TRANSFER_PACKET_PASSES: usize = 64;
 
@@ -82,6 +91,17 @@ pub fn step_tcp_loopback_handshake_on_iface(
     if local.is_unspecified() || local.port == 0 {
         return fail(Errno::EADDRNOTAVAIL);
     }
+
+    // step_connect wakes the delegate and the blocking syscall also attempts
+    // an inline loopback drive. On SMP those are two legitimate callers, but
+    // smoltcp egress is consumptive: without per-flow ownership one CPU can
+    // consume SYN-ACK/ACK and make the other report a false refusal.
+    if !client_payload.try_claim_tcp_handshake_driver() {
+        return StepOutcome::Continue {
+            progress: NoProgress,
+        };
+    }
+    let _driver = TcpHandshakeDriver(&client_payload);
 
     let table = client_payload.socket_table();
     let Some(listener) = table.lookup_tcp_listener_dual_stack_endpoint(remote, guard) else {
@@ -202,7 +222,7 @@ pub fn step_process_loopback_tcp(
             egress_packets += 1;
             publish_targets.push(source_publish);
 
-            let ingress = ctx.poll_ingress(iface, guard, 1);
+            let ingress = ctx.poll_ingress_to_socket(iface, &peer, guard, 1);
             bytes_moved += ingress.bytes_moved;
             peer_wake_fired |= publishes_recv_data_for(&ingress.publishes, &peer);
             publish_targets.extend(ingress.publishes);
@@ -219,7 +239,7 @@ pub fn step_process_loopback_tcp(
             dispatched = true;
             egress_packets += 1;
             publish_targets.push(peer_publish);
-            let peer_ingress = ctx.poll_ingress(iface, guard, 1);
+            let peer_ingress = ctx.poll_ingress_to_socket(iface, source, guard, 1);
             bytes_moved += peer_ingress.bytes_moved;
             publish_targets.extend(peer_ingress.publishes);
         }
@@ -381,28 +401,37 @@ fn establish_smoltcp_loopback_on_iface(
     let local = attempt.local();
     let remote = attempt.remote();
 
-    publishes.push(
+    let Some(client_syn) =
         ctx.poll_tcp_egress_one_for_flow(client, generation, local, remote, iface, guard)
-            .ok_or(Errno::ECONNREFUSED)?,
-    );
-    let syn_ingress = ctx.poll_ingress(iface, guard, 1);
+    else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    publishes.push(client_syn);
+    let syn_ingress = ctx.poll_tcp_ingress_for_flow(iface, local, remote, guard, 1);
     publishes.extend(syn_ingress.publishes);
-    let child = syn_ingress
-        .created_children
-        .into_iter()
-        .next()
-        .ok_or(Errno::ECONNREFUSED)?;
-    let child_payload = child.acquire_operational().ok_or(Errno::ECONNREFUSED)?;
-    let child_raw = child_payload.raw_tcp_socket().ok_or(Errno::ECONNREFUSED)?;
+    let Some(child) = syn_ingress.created_children.into_iter().next() else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    let Some(child_payload) = child.acquire_operational() else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    let Some(child_raw) = child_payload.raw_tcp_socket() else {
+        return Err(Errno::ECONNREFUSED);
+    };
 
-    drive_loopback_packet_to_socket(&mut ctx, &child, client, iface, guard, &mut publishes)
-        .ok_or(Errno::ECONNREFUSED)?;
+    if drive_loopback_packet_to_socket(&mut ctx, &child, client, iface, guard, &mut publishes)
+        .is_none()
+    {
+        return Err(Errno::ECONNREFUSED);
+    }
 
-    publishes.push(
+    let Some(client_ack) =
         ctx.poll_tcp_egress_one_for_flow(client, generation, local, remote, iface, guard)
-            .ok_or(Errno::ECONNREFUSED)?,
-    );
-    let ack_ingress = ctx.poll_ingress(iface, guard, 1);
+    else {
+        return Err(Errno::ECONNREFUSED);
+    };
+    publishes.push(client_ack);
+    let ack_ingress = ctx.poll_ingress_to_socket(iface, &child, guard, 1);
     publishes.extend(ack_ingress.publishes);
 
     if client_payload

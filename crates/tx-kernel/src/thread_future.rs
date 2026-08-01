@@ -94,8 +94,8 @@ use boot_runtime::userspace::{
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_services::time::{DeadlineRegistrar, DeadlineRegistrarHandle};
 use tx_shims::linux_syscall::numbers::{
-    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_FUTEX, NR_MMAP, NR_MPROTECT,
-    NR_MUNMAP, NR_READ, NR_READV, NR_RT_SIGPROCMASK, NR_WRITE, NR_WRITEV,
+    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_EXIT, NR_EXIT_GROUP, NR_FUTEX,
+    NR_MMAP, NR_MPROTECT, NR_MUNMAP, NR_READ, NR_READV, NR_RT_SIGPROCMASK, NR_WRITE, NR_WRITEV,
 };
 use tx_shims::linux_syscall::SyscallResult;
 use tx_substrate::wake::MailboxSchedulerHint;
@@ -116,6 +116,24 @@ use tx_subsystems::vm::{
 };
 
 const HOT_SYSCALL_HANDOFF_BUDGET: u8 = 64;
+const POST_TRAP_EBR_BUDGET: usize = 512;
+
+/// Run deferred destructors after the architecture trap shell has longjmped
+/// back to the saved reactor stack.
+///
+/// `epoch::guard()` can be entered on the small per-hart trap stack, so its
+/// periodic cold path only publishes a collection request there. Waiting for
+/// the outer hart loop is too late for a continuously runnable compiler: one
+/// future poll can process many immediately-ready syscall/page-fault
+/// round-trips. This seam executes once per resolved userspace trap, on the
+/// ordinary kernel stack, and preserves Crossbeam's bounded 512-callback batch.
+fn drain_post_trap_epoch_maintenance() {
+    let _ = crate::adapter::step_engine::drain_requested_with_budget(POST_TRAP_EBR_BUDGET);
+    // RecipeTree's EBR callback intentionally transfers ownership to a second
+    // normal-stack queue. Drain it in the same round so old persistent roots do
+    // not retain millions of shared treap nodes until the reactor becomes idle.
+    let _ = tx_subsystems::vm::drain_deferred_recipe_reclaims(POST_TRAP_EBR_BUDGET);
+}
 
 struct ThreadLoopState {
     last_entry_sysno: Option<u64>,
@@ -179,9 +197,10 @@ where
 
 fn fatal_signal_teardown_from_current_hart<P: TxPlatform>(
     process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
     sig: Signum,
 ) -> ThreadLoopControl {
-    fatal_signal_teardown_with_posts(
+    let control = fatal_signal_teardown_with_posts(
         process,
         sig,
         |mailbox, event| {
@@ -194,7 +213,11 @@ fn fatal_signal_teardown_from_current_hart<P: TxPlatform>(
                 MailboxSchedulerHint::Normal,
             )
         },
-    )
+    );
+    if matches!(control, ThreadLoopControl::Exit) {
+        tx_subsystems::process::execution::step_current_thread_group_exit(thread);
+    }
+    control
 }
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
@@ -303,8 +326,8 @@ impl<P: TxPlatform, F: Future> PerHartSlotted<P, F> {
     }
 }
 
-impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
-    type Output = F::Output;
+impl<P: TxPlatform, F: Future<Output = ()>> Future for PerHartSlotted<P, F> {
+    type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: structural pinning — we never move `inner` out of
@@ -314,14 +337,53 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
 
         let _prev_thread = set_current_thread_identity(hart, this.thread.clone());
         let _prev = set_current_thread_payload(hart, this.payload.clone());
-        if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
-            this.payload.bind_mailbox(Arc::downgrade(&mailbox));
+        this.payload.bind_lifecycle_waker(cx.waker().clone());
+        let task_mailbox = crate::adapter::boot_runtime::current_task_mailbox(hart);
+        if let Some(mailbox) = task_mailbox.as_ref() {
+            this.payload.bind_mailbox(Arc::downgrade(mailbox));
+            // `ThreadPayload::mailbox` is the lifecycle wake route used by
+            // exec/group-exit and fatal signals.  It must retain a task waker
+            // even when the inner future is parked on a userspace-run wait
+            // rather than one of drive.rs' mailbox-backed waits.
+            //
+            // Local wait futures are allowed to replace/clear the mailbox
+            // waker while they are polled, so install it both before and
+            // after the inner poll.  The post-poll pending check closes the
+            // register-vs-post race: an event published before registration
+            // is observed in the queue; an event published afterwards sees
+            // the registered waker.
+            mailbox.register_waker(cx.waker().clone());
+        }
+
+        // Process termination is a task-level AST, not a property of the
+        // particular wait currently held inside `run_thread`. Checking it in
+        // the outer wrapper lets exec/group-exit cancel a thread parked in
+        // *any* nested await (userspace-run, futex, I/O, timer, ...). The old
+        // inner-loop-only checkpoint was unreachable until that await happened
+        // to resolve, which left exec waiting forever for random siblings.
+        if this.payload.interrupt_summary().termination {
+            tx_subsystems::process::execution::step_current_thread_group_exit(&this.thread);
+            let _ = clear_current_userspace_payload(hart);
+            let _ = clear_current_thread_payload(hart);
+            let _ = clear_current_thread_identity(hart);
+            return Poll::Ready(());
         }
 
         // SAFETY: `this.inner` is structurally pinned via the
         // `get_unchecked_mut` above; we never move out of it.
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         let out = inner.poll(cx);
+
+        if out.is_pending() {
+            if let Some(mailbox) = task_mailbox.as_ref() {
+                mailbox.register_waker(cx.waker().clone());
+                if !mailbox.is_empty() || mailbox.overflow() {
+                    cx.waker().wake_by_ref();
+                }
+            }
+        } else {
+            let _ = clear_current_userspace_payload(hart);
+        }
 
         let _ = clear_current_thread_payload(hart);
         let _ = clear_current_thread_identity(hart);
@@ -430,10 +492,16 @@ pub async fn run_thread<P: TxPlatform>(
                     return;
                 }
             }
-            AstOutcome::InitiateTermination => return,
+            AstOutcome::InitiateTermination => {
+                payload.set_active_userspace_request(None);
+                drop(entry_wait);
+                tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
+                return;
+            }
             AstOutcome::DefaultTerminate { .. } => {
                 payload.set_active_userspace_request(None);
                 drop(entry_wait);
+                tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
                 return;
             }
             AstOutcome::DefaultTerminateDeferred { .. } => {
@@ -519,6 +587,7 @@ pub async fn run_thread<P: TxPlatform>(
         }
 
         payload.set_active_userspace_request(None);
+        drain_post_trap_epoch_maintenance();
 
         if let UserspaceTrapInfo::Syscall(req) = trap {
             emit_syscall_roundtrip_marker(req.nr, b"debug.thread.trap.consumed");
@@ -623,9 +692,11 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     };
     let siginfo_record = process.siginfo_take(sig);
 
-    let old_mask = payload.signal_mask();
-    payload.store_saved_signal_mask(Some(old_mask));
-    let mut new_mask = old_mask.union(action.sa_mask);
+    let handler_base_mask = payload.signal_mask();
+    let return_mask = payload
+        .take_sigsuspend_restore_mask()
+        .unwrap_or(handler_base_mask);
+    let mut new_mask = handler_base_mask.union(action.sa_mask);
     if !action
         .flags
         .contains(tx_subsystems::signal::SaFlags::NODEFER)
@@ -636,16 +707,24 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
         .map(siginfo_to_user_abi)
         .unwrap_or(tx_hal::UserSigInfoAbi::ZERO);
 
+    let current_sp = user_sp_from_context::<P>(&saved_ctx);
     let stack_top = if action
         .flags
         .contains(tx_subsystems::signal::SaFlags::ONSTACK)
     {
         payload
             .alt_stack()
-            .map(|(base, size)| tx_hal::UserPtr::<u8>::new(base + size))
-            .unwrap_or_else(|| tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&saved_ctx)))
+            .and_then(|(base, size)| {
+                let end = base.checked_add(size)?;
+                Some(if (base..end).contains(&current_sp) {
+                    tx_hal::UserPtr::<u8>::new(current_sp)
+                } else {
+                    tx_hal::UserPtr::<u8>::new(end)
+                })
+            })
+            .unwrap_or_else(|| tx_hal::UserPtr::<u8>::new(current_sp))
     } else {
-        tx_hal::UserPtr::<u8>::new(user_sp_from_context::<P>(&saved_ctx))
+        tx_hal::UserPtr::<u8>::new(current_sp)
     };
     let restorer_pc = tx_subsystems::vm::vdso_rt_sigreturn_addr(&aspace)
         .map(|address| address.as_usize())
@@ -655,7 +734,7 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
         sig_no: sig.raw() as u32,
         siginfo,
         old_mask: tx_hal::UserSignalMaskAbi {
-            bits: old_mask.raw_bits(),
+            bits: return_mask.raw_bits(),
         },
         flags: tx_hal::UserSaFlagsAbi {
             bits: action.flags.bits(),
@@ -669,10 +748,10 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
         Ok((handler_ctx, frame_bytes)) => {
             let frame_addr = user_sp_from_context::<P>(&handler_ctx);
             if !reserve_signal_frame_storage(&aspace, frame_addr, frame_bytes.as_slice().len()) {
-                return fatal_signal_teardown_from_current_hart::<P>(&process, sig);
+                return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
             if !copy_signal_frame_to_user(&aspace, frame_addr, frame_bytes.as_slice()) {
-                return fatal_signal_teardown_from_current_hart::<P>(&process, sig);
+                return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
             if restorer_pc == 0 {
                 make_signal_frame_executable(&aspace, frame_addr, frame_bytes.as_slice().len());
@@ -695,7 +774,7 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
             payload.store_saved_user_context(Some(handler_ctx));
             ThreadLoopControl::Continue
         }
-        Err(_) => fatal_signal_teardown_from_current_hart::<P>(&process, sig),
+        Err(_) => fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig),
     }
 }
 
@@ -738,17 +817,23 @@ fn enter_userspace_once<P: TxPlatform>(
     let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
     let _prev_userspace_thread = set_current_userspace_thread_identity(entry_hart, thread.clone());
     let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
-    ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal_with_post::<P, _>(
-        ctx,
-        &process,
-        thread,
-        &aspace,
-        |mailbox, event| crate::init::post_mailbox_event_from_current_hart::<P>(mailbox, event),
+    payload.record_user_entry_diagnostic(
+        ctx.pc as u64,
+        user_ra_from_context(&ctx) as u64,
+        user_sp_from_context::<P>(&ctx) as u64,
+        user_tls_from_context::<P>(&ctx) as u64,
+        user_syscall_from_context::<P>(&ctx) as u64,
+        entry_hart as u64,
     );
+    // Interval/posix timers are polled before this entry and publish normal
+    // pending signals. The shared AST delivery path below is architecture
+    // neutral; the older RV-only inline signal-frame injection is deliberately
+    // not repeated here.
     if let Some(sysno) = last_entry_sysno {
         emit_syscall_roundtrip_marker(sysno, b"debug.thread.enter.before");
     }
     <P as TrapIf>::enter_userspace_with_context(&ctx, root);
+    tx_substrate::slab::enable_vmalloc_after_kernel_pmap_activation();
     ThreadLoopControl::Continue
 }
 
@@ -782,6 +867,7 @@ async fn dispatch_userspace_trap<P: TxPlatform>(
             write_hex_u64::<P>(info.value);
             tx_hal::console_write_str::<P>("\n");
             log_user_segv::<P>(
+                thread,
                 payload,
                 info.value,
                 PageFaultAccess::Unknown,
@@ -790,7 +876,10 @@ async fn dispatch_userspace_trap<P: TxPlatform>(
             );
             dump_syscall_history::<P>();
             match deliver_synchronous_fault(thread, Signum::SIGSEGV) {
-                tx_subsystems::process::ProcessExitOutcome::Completed => ThreadLoopControl::Exit,
+                tx_subsystems::process::ProcessExitOutcome::Completed => {
+                    tx_subsystems::process::execution::step_current_thread_group_exit(thread);
+                    ThreadLoopControl::Exit
+                }
                 tx_subsystems::process::ProcessExitOutcome::Retry => ThreadLoopControl::Continue,
             }
         }
@@ -815,13 +904,18 @@ async fn dispatch_syscall_trap<P: TxPlatform>(
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.process.after");
 
     let sigreturn_ctx = payload.saved_user_context();
+    payload.begin_syscall_diagnostic(req.nr, req.args[0], req.args[1]);
     payload.set_proc_sleeping(true);
     let result = match run_syscall_dispatch::<P>(thread, payload, &process, req).await {
         Some(result) => result,
         None => return ThreadLoopControl::Exit,
     };
     payload.set_proc_sleeping(false);
+    payload.end_syscall_diagnostic();
 
+    if matches!(result, SyscallResult::Error(5)) {
+        log_syscall_eio::<P>(&req, &process, thread, payload);
+    }
     dump_observe_threshold_if_ready::<P>();
 
     if matches!(
@@ -843,6 +937,20 @@ async fn run_syscall_dispatch<P: TxPlatform>(
     process: &Cap<ProcessIdentity>,
     req: SyscallRequest,
 ) -> Option<SyscallResult> {
+    if req.nr == NR_EXIT {
+        loop {
+            let result = tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, thread)
+                .expect("NR_EXIT is owned by the thread-exit lane");
+            if !matches!(result, SyscallResult::Error(11)) {
+                emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
+                return Some(result);
+            }
+            // Exec may briefly own the process lifecycle lane.  Yielding here
+            // lets its initiator either commit the collapse or release the
+            // reservation; exit(2) itself must never return EAGAIN.
+            crate::adapter::boot_runtime::yield_now().await;
+        }
+    }
     if let Some(result) = tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, thread) {
         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
         return Some(result);
@@ -880,6 +988,17 @@ async fn run_syscall_dispatch<P: TxPlatform>(
     }
 
     let ctx = build_syscall_ctx::<P>(&req, thread, process, &aspace);
+    if req.nr == NR_EXIT_GROUP {
+        loop {
+            let result = dispatch_full_syscall::<P>(req, &ctx).await;
+            if !matches!(result, SyscallResult::Error(11)) {
+                return Some(result);
+            }
+            // This EAGAIN is an internal exec/group-exit serialization
+            // signal, not a Linux-visible exit_group result.
+            crate::adapter::boot_runtime::yield_now().await;
+        }
+    }
     Some(dispatch_full_syscall::<P>(req, &ctx).await)
 }
 
@@ -977,19 +1096,28 @@ fn store_syscall_result<P: TxPlatform>(
             payload.store_pending_syscall_return(Some(Err(*e)));
         }
         SyscallResult::NoReturn => {
+            tx_subsystems::process::execution::step_current_thread_group_exit(thread);
             return ThreadLoopControl::Exit;
         }
         SyscallResult::ExecCommitted => {}
         SyscallResult::SigreturnContextRestored => {}
         SyscallResult::SigreturnRestored => {
             let Some(sigreturn_ctx) = sigreturn_ctx else {
-                return fatal_signal_teardown_from_current_hart::<P>(process, Signum::SIGSEGV);
+                return fatal_signal_teardown_from_current_hart::<P>(
+                    process,
+                    thread,
+                    Signum::SIGSEGV,
+                );
             };
             let Some(aspace) = process.aspace_cap() else {
                 return ThreadLoopControl::Exit;
             };
             if restore_sigreturn_frame::<P>(thread, &aspace, payload, sigreturn_ctx).is_err() {
-                return fatal_signal_teardown_from_current_hart::<P>(process, Signum::SIGSEGV);
+                return fatal_signal_teardown_from_current_hart::<P>(
+                    process,
+                    thread,
+                    Signum::SIGSEGV,
+                );
             }
         }
     }
@@ -1055,20 +1183,20 @@ async fn handle_page_fault_trap<P: TxPlatform>(
         }
         Err(e) => {
             emit_thread_debug_value(b"debug.thread.page_fault.err", vm_fault_error_code(e));
-            log_user_segv::<P>(payload, info.addr.raw(), info.access, "pf", e);
-            log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize);
-            // Also dump the recipe containing the faulting PC, so we get the
-            // library load base and can disassemble the exact faulting
-            // instruction offline.
-            if let Some(c) = payload.saved_user_context() {
-                log_nearby_recipes::<P>(&aspace, c.pc as usize);
+            let pc = log_user_segv::<P>(thread, payload, info.addr.raw(), info.access, "pf", e);
+            log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize, "fault");
+            if pc as usize != info.addr.raw() as usize {
+                log_nearby_recipes::<P>(&aspace, pc as usize, "pc");
             }
             dump_syscall_history::<P>();
             dump_user_regs::<P>(payload);
             dump_user_mem_windows::<P>(&aspace, payload);
             dump_all_recipes::<P>(&aspace);
             match deliver_synchronous_fault(thread, Signum::SIGSEGV) {
-                tx_subsystems::process::ProcessExitOutcome::Completed => ThreadLoopControl::Exit,
+                tx_subsystems::process::ProcessExitOutcome::Completed => {
+                    tx_subsystems::process::execution::step_current_thread_group_exit(thread);
+                    ThreadLoopControl::Exit
+                }
                 tx_subsystems::process::ProcessExitOutcome::Retry => {
                     ThreadLoopControl::YieldBeforeContinue
                 }
@@ -1209,17 +1337,79 @@ fn dump_observe_threshold_if_ready<P: TxPlatform>() {
     }
 }
 
+/// Print one complete record when a userspace syscall returns `EIO`.
+///
+/// This sits after every dispatch lane (direct, one-shot, hot, and generic), so
+/// it identifies the actual failing syscall even when libc reports only that a
+/// child process was "never executed". Normal syscall traffic is silent.
+fn log_syscall_eio<P: TxPlatform>(
+    req: &SyscallRequest,
+    process: &Cap<tx_subsystems::process::ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    payload: &PayloadCap<ThreadPayload>,
+) {
+    let comm = process.comm();
+    let comm_len = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    let comm = core::str::from_utf8(&comm[..comm_len]).unwrap_or("<non-utf8>");
+    let saved = payload.saved_user_context();
+    let pc = saved.as_ref().map(|ctx| ctx.pc).unwrap_or(0);
+    let sp = saved.as_ref().map(user_sp_from_context::<P>).unwrap_or(0);
+    let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+
+    if let Some(aspace) = process.aspace_cap() {
+        let pmap = aspace.pmap().stats();
+        let range = aspace.range_lock().diagnostic_snapshot();
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:syscall-eio:pid={}:tid={}:comm={comm}:hart={hart}:nr={}:a0={:#x}:a1={:#x}:a2={:#x}:a3={:#x}:a4={:#x}:a5={:#x}:pc={pc:#x}:sp={sp:#x}:aspace={}:pmap_mapped={}:pmap_reservations={}:pmap_commits={}:pmap_rollbacks={}:pmap_shootdowns={}:range_active={}:range_pending={}:range_source={:#x}\n",
+            process.pid.0,
+            thread.tid.0,
+            req.nr,
+            req.args[0],
+            req.args[1],
+            req.args[2],
+            req.args[3],
+            req.args[4],
+            req.args[5],
+            aspace.futex_identity(),
+            pmap.mapped_pages,
+            pmap.reservations,
+            pmap.commits,
+            pmap.rollbacks,
+            pmap.shootdowns,
+            range.active,
+            range.pending_writers,
+            range.wait_source_id,
+        ));
+    } else {
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            "txkernel:syscall-eio:pid={}:tid={}:comm={comm}:hart={hart}:nr={}:a0={:#x}:a1={:#x}:a2={:#x}:a3={:#x}:a4={:#x}:a5={:#x}:pc={pc:#x}:sp={sp:#x}:aspace=none\n",
+            process.pid.0,
+            thread.tid.0,
+            req.nr,
+            req.args[0],
+            req.args[1],
+            req.args[2],
+            req.args[3],
+            req.args[4],
+            req.args[5],
+        ));
+    }
+}
+
 fn log_user_segv<P: TxPlatform>(
+    thread: &Cap<ThreadIdentity>,
     payload: &ThreadPayload,
     fault_addr: u64,
     access: PageFaultAccess,
     kind: &str,
     error: tx_subsystems::vm::VmFaultError,
-) {
-    let pc = payload
-        .saved_user_context()
-        .map(|ctx| ctx.pc as u64)
-        .unwrap_or(0);
+) -> u64 {
+    let ctx = payload.saved_user_context();
+    let pc = ctx.as_ref().map(|ctx| ctx.pc as u64).unwrap_or(0);
+    let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
     tx_hal::console_write_str::<P>("txkernel:");
     tx_hal::console_write_str::<P>(P::BOARD);
     tx_hal::console_write_str::<P>(":user-segv:");
@@ -1237,10 +1427,61 @@ fn log_user_segv<P: TxPlatform>(
     write_hex_u64::<P>(pc);
     tx_hal::console_write_str::<P>(":addr=0x");
     write_hex_u64::<P>(fault_addr);
+    tx_hal::console_write_str::<P>(":tid=0x");
+    write_hex_u64::<P>(thread.tid.0 as u64);
+    tx_hal::console_write_str::<P>(":hart=0x");
+    write_hex_u64::<P>(hart as u64);
+    if let Some(process) = thread.upgrade_owner_proc() {
+        let comm = process.comm();
+        let comm_len = comm
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(comm.len());
+        let comm = core::str::from_utf8(&comm[..comm_len]).unwrap_or("<non-utf8>");
+        tx_hal::console_write_str::<P>(":pid=0x");
+        write_hex_u64::<P>(process.pid.0 as u64);
+        tx_hal::console_write_str::<P>(":comm=");
+        tx_hal::console_write_str::<P>(comm);
+    }
+    if let Some(ctx) = ctx.as_ref() {
+        tx_hal::console_write_str::<P>(":ra=0x");
+        write_hex_u64::<P>(user_ra_from_context(ctx) as u64);
+        tx_hal::console_write_str::<P>(":sp=0x");
+        write_hex_u64::<P>(user_sp_from_context::<P>(ctx) as u64);
+        tx_hal::console_write_str::<P>(":tls=0x");
+        write_hex_u64::<P>(user_tls_from_context::<P>(ctx) as u64);
+        tx_hal::console_write_str::<P>(":syscall=0x");
+        write_hex_u64::<P>(user_syscall_from_context::<P>(ctx) as u64);
+        tx_hal::console_write_str::<P>(":a0=0x");
+        write_hex_u64::<P>(user_arg_from_context::<P>(ctx, 0) as u64);
+        tx_hal::console_write_str::<P>(":a1=0x");
+        write_hex_u64::<P>(user_arg_from_context::<P>(ctx, 1) as u64);
+        tx_hal::console_write_str::<P>(":a2=0x");
+        write_hex_u64::<P>(user_arg_from_context::<P>(ctx, 2) as u64);
+    }
+    let (entry_pc, entry_ra, entry_sp, entry_tls, entry_syscall, entry_hart) =
+        payload.user_entry_diagnostic();
+    tx_hal::console_write_str::<P>(":last-entry-pc=0x");
+    write_hex_u64::<P>(entry_pc);
+    tx_hal::console_write_str::<P>(":last-entry-ra=0x");
+    write_hex_u64::<P>(entry_ra);
+    tx_hal::console_write_str::<P>(":last-entry-sp=0x");
+    write_hex_u64::<P>(entry_sp);
+    tx_hal::console_write_str::<P>(":last-entry-tls=0x");
+    write_hex_u64::<P>(entry_tls);
+    tx_hal::console_write_str::<P>(":last-entry-syscall=0x");
+    write_hex_u64::<P>(entry_syscall);
+    tx_hal::console_write_str::<P>(":last-entry-hart=0x");
+    write_hex_u64::<P>(entry_hart);
     tx_hal::console_write_str::<P>("\n");
+    pc
 }
 
-fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
+fn log_nearby_recipes<P: TxPlatform>(
+    aspace: &AddressSpace,
+    lookup_addr: usize,
+    lookup_label: &str,
+) {
     let recipes = aspace.recipes_snapshot();
     let mut containing: Option<VmEntry> = None;
     let mut lower: Option<VmEntry> = None;
@@ -1249,18 +1490,18 @@ fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
     for entry in recipes.iter().cloned() {
         let start = entry.range.start().as_usize();
         let end = entry.range.end().as_usize();
-        if start <= fault_addr && fault_addr < end {
+        if start <= lookup_addr && lookup_addr < end {
             containing = Some(entry);
             break;
         }
-        if end <= fault_addr
+        if end <= lookup_addr
             && lower
                 .as_ref()
                 .is_none_or(|old| old.range.end().as_usize() < end)
         {
             lower = Some(entry.clone());
         }
-        if fault_addr < start
+        if lookup_addr < start
             && upper
                 .as_ref()
                 .is_none_or(|old| start < old.range.start().as_usize())
@@ -1273,8 +1514,10 @@ fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
     tx_hal::console_write_str::<P>(P::BOARD);
     tx_hal::console_write_str::<P>(":user-segv:recipes:count=0x");
     write_hex_u64::<P>(recipes.len() as u64);
-    tx_hal::console_write_str::<P>(":fault=0x");
-    write_hex_u64::<P>(fault_addr as u64);
+    tx_hal::console_write_str::<P>(":");
+    tx_hal::console_write_str::<P>(lookup_label);
+    tx_hal::console_write_str::<P>("=0x");
+    write_hex_u64::<P>(lookup_addr as u64);
     tx_hal::console_write_str::<P>("\n");
 
     if let Some(entry) = containing {
@@ -1309,6 +1552,26 @@ fn log_recipe<P: TxPlatform>(label: &str, entry: &VmEntry) {
         VmEntryBacking::Page { offset } => {
             tx_hal::console_write_str::<P>("page@0x");
             write_hex_u64::<P>(offset);
+            if let Some((pc, _)) = entry.page_backing() {
+                tx_hal::console_write_str::<P>(":pc-size=0x");
+                write_hex_u64::<P>(pc.size_bytes());
+                tx_hal::console_write_str::<P>(":pc-pages=0x");
+                write_hex_u64::<P>(pc.page_count());
+                match pc.kind() {
+                    tx_subsystems::page_backed::PageContainerKind::File {
+                        fs_object_id, ..
+                    } => {
+                        tx_hal::console_write_str::<P>(":file-id=0x");
+                        write_hex_u64::<P>(fs_object_id.as_u64());
+                    }
+                    tx_subsystems::page_backed::PageContainerKind::Anon { .. } => {
+                        tx_hal::console_write_str::<P>(":anon");
+                    }
+                    tx_subsystems::page_backed::PageContainerKind::Device { .. } => {
+                        tx_hal::console_write_str::<P>(":device");
+                    }
+                }
+            }
         }
     }
     tx_hal::console_write_str::<P>("\n");
@@ -1340,6 +1603,7 @@ fn vm_fault_error_label(error: tx_subsystems::vm::VmFaultError) -> &'static str 
             tx_subsystems::vm::VmPmapError::Zone(_) => "pmap-zone",
             tx_subsystems::vm::VmPmapError::MissingReservation => "pmap-missing-reservation",
             tx_subsystems::vm::VmPmapError::AlreadyMappedDrift => "pmap-already-mapped-drift",
+            tx_subsystems::vm::VmPmapError::ConcurrentPublication => "pmap-concurrent-publication",
             tx_subsystems::vm::VmPmapError::MappingMismatch => "pmap-mapping-mismatch",
         },
     }
@@ -1432,6 +1696,32 @@ fn user_sp_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
         tx_hal::Arch::Riscv64 => ctx.regs[2],
         tx_hal::Arch::LoongArch64 => ctx.regs[3],
     }
+}
+
+fn user_ra_from_context(ctx: &tx_hal::UserTrapContext) -> usize {
+    ctx.regs[1]
+}
+
+fn user_tls_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[4],
+        tx_hal::Arch::LoongArch64 => ctx.regs[2],
+    }
+}
+
+fn user_syscall_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext) -> usize {
+    match P::ARCH {
+        tx_hal::Arch::Riscv64 => ctx.regs[17],
+        tx_hal::Arch::LoongArch64 => ctx.regs[11],
+    }
+}
+
+fn user_arg_from_context<P: TxPlatform>(ctx: &tx_hal::UserTrapContext, index: usize) -> usize {
+    let base = match P::ARCH {
+        tx_hal::Arch::Riscv64 => 10,
+        tx_hal::Arch::LoongArch64 => 4,
+    };
+    ctx.regs[base + index]
 }
 
 fn make_signal_frame_executable(aspace: &AddressSpace, frame_addr: usize, frame_len: usize) {

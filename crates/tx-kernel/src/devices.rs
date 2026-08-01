@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::marker::PhantomData;
 
 use crate::adapter::step_engine::{NoProgress, StepOutcome};
-use tx_hal::{Arch, IrqIf, TxPlatform};
+use tx_hal::{Arch, DeviceInfo, DeviceKind, IrqIf, MmioRegion, PlatformInfoIf, TxPlatform};
 use tx_subsystems::device::{
     register_block_devices, BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT,
     PhysicalBlockNumber,
@@ -54,28 +54,94 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
     }
 
     fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
-        let scratch = scratch_block_registration();
-        let block = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioBlock::<P>::new(
-            "virtio0",
-        )));
-        if let Err(err) = block.init() {
-            let _ = err;
-            let registrations: &'static [&'static BlockDeviceRegistration] =
-                Box::leak(Box::new([scratch]));
-            return register_block_devices(registrations);
+        let mut regs: alloc::vec::Vec<&'static BlockDeviceRegistration> = alloc::vec::Vec::new();
+
+        // QEMU exposes the root disk as virtio-mmio (`vda`). The VisionFive 2
+        // board has no virtio; there the SD card (DesignWare MSHC) is the root
+        // disk and registers as `mmcblk0`. Probe virtio first; fall back to SD.
+        if let Some(block) = Self::probe_virtio_mmio_block() {
+            regs.push(Box::leak(Box::new(BlockDeviceRegistration {
+                devt: DevT::new(254, 0),
+                name: "vda",
+                ops: block,
+            })));
+        } else if let Some(sd) = Self::probe_sd_block() {
+            regs.push(Box::leak(Box::new(BlockDeviceRegistration {
+                devt: DevT::new(179, 0), // Linux mmcblk major
+                name: "mmcblk0",
+                ops: sd,
+            })));
         }
 
-        let registration = Box::leak(Box::new(BlockDeviceRegistration {
-            devt: DevT::new(254, 0),
-            name: "vda",
-            ops: block,
-        }));
-        let registrations: &'static [&'static BlockDeviceRegistration] = Box::leak(Box::new([
-            registration as &'static BlockDeviceRegistration,
-            scratch,
-        ]));
+        regs.push(scratch_block_registration());
+        let registrations: &'static [&'static BlockDeviceRegistration] =
+            Box::leak(regs.into_boxed_slice());
         register_block_devices(registrations)
     }
+
+    /// Probe the device table for a DesignWare MSHC SD controller (the
+    /// VisionFive 2 SD card slot, discovered from the JH7110 device tree as
+    /// `DeviceKind::SdController`). Maps its registers through the kernel
+    /// direct map and runs the card-init handshake; returns the initialized
+    /// block device, or `None` when no card came ready (or on QEMU, which has
+    /// no such controller).
+    fn probe_sd_block() -> Option<&'static tx_drivers::mmc::Vf2Mmc> {
+        for device in P::devices() {
+            if device.kind != DeviceKind::SdController {
+                continue;
+            }
+            let base = P::DIRECT_MAP_BASE.0 + device.mmio.start.0;
+            let mmc = Box::leak(Box::new(tx_drivers::mmc::Vf2Mmc::new(base)));
+            if mmc.card_init() {
+                return Some(mmc);
+            }
+        }
+        None
+    }
+
+    /// Find the virtio block device by probing every discovered
+    /// virtio-mmio slot: the block device lands on whichever slot
+    /// QEMU's device ordering picked, and the driver's device-type
+    /// peek skips net and empty slots without touching them. Boards
+    /// without a device table fall back to the legacy "virtio0"
+    /// named region.
+    fn probe_virtio_mmio_block() -> Option<&'static tx_drivers::virtio::VirtioMmioBlock<P>> {
+        let devices = P::devices();
+        for device in devices {
+            if device.kind != DeviceKind::VirtioMmio {
+                continue;
+            }
+            let Some(region) = mmio_region_for::<P>(device) else {
+                continue;
+            };
+            let block = Box::leak(Box::new(
+                tx_drivers::virtio::VirtioMmioBlock::<P>::from_region(region),
+            ));
+            if block.init().is_ok() {
+                return Some(block);
+            }
+        }
+        if devices.is_empty() {
+            let block = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioBlock::<P>::new(
+                "virtio0",
+            )));
+            if block.init().is_ok() {
+                return Some(block);
+            }
+        }
+        None
+    }
+}
+
+/// Resolve a discovered device to its mapped MMIO region (published
+/// by the board alongside the device table; matched by physical
+/// base).
+fn mmio_region_for<P: TxPlatform>(device: &DeviceInfo) -> Option<MmioRegion> {
+    <P as PlatformInfoIf>::platform_info()
+        .mmio_regions
+        .iter()
+        .copied()
+        .find(|region| region.phys.start == device.mmio.start)
 }
 
 impl<P: TxPlatform> Default for KernelBlockDevices<P> {
@@ -148,17 +214,9 @@ impl<P: TxPlatform> KernelNetDevices<P> {
     }
 
     fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
-        // "virtio1" (0x1000_2000), NOT "virtio0" — the block driver owns
-        // virtio0 (0x1000_1000). Probing virtio0 here binds the block device
-        // and `init()` rejects it with `WrongDeviceType`, leaving the guest
-        // with no network at all.
-        let net = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioNet::<P, 256>::new(
-            "virtio1",
-        )));
-        if let Err(err) = net.init() {
-            Self::write_net_init_error::<P>(err);
+        let Some(net) = Self::probe_virtio_mmio_net() else {
             return StepOutcome::Done(());
-        }
+        };
         // Publish `eth0` before allowing the device to assert its line. The
         // controller handler is installed earlier in boot, while virtio
         // notifications remain disabled throughout `init()`.
@@ -171,6 +229,42 @@ impl<P: TxPlatform> KernelNetDevices<P> {
             }
             other => other,
         }
+    }
+
+    /// Same slot-probing as the block path: the net device sits on
+    /// whichever virtio-mmio slot QEMU assigned; the driver's
+    /// device-type peek rejects non-net slots without touching them.
+    fn probe_virtio_mmio_net() -> Option<&'static tx_drivers::virtio::VirtioMmioNet<P, 256>> {
+        let devices = P::devices();
+        let mut last_error = None;
+        for device in devices {
+            if device.kind != DeviceKind::VirtioMmio {
+                continue;
+            }
+            let Some(region) = mmio_region_for::<P>(device) else {
+                continue;
+            };
+            let net = Box::leak(Box::new(
+                tx_drivers::virtio::VirtioMmioNet::<P, 256>::from_region(region),
+            ));
+            match net.init() {
+                Ok(()) => return Some(net),
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if devices.is_empty() {
+            let net = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioNet::<P, 256>::new(
+                "virtio0",
+            )));
+            match net.init() {
+                Ok(()) => return Some(net),
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if let Some(err) = last_error {
+            Self::write_net_init_error::<P>(err);
+        }
+        None
     }
 
     fn init_la64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {

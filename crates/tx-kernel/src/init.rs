@@ -2,11 +2,11 @@ use core::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
@@ -17,7 +17,8 @@ use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_services::time::{
     platform::HalDeadlineTimer, platform::HalRtcDevice, timekeeper_clock, ClockRead,
-    CurrentHartDeadlineTimer, DeadlineNs, DeadlineRegistrar, TimerRole, TimerTarget,
+    CurrentHartDeadlineTimer, DeadlineNs, DeadlineRegistrar, RealtimeControl, TimerRole,
+    TimerTarget,
 };
 use tx_services::time::{RtcDeviceOps as TimeRtcDeviceOps, TimeError};
 use tx_substrate::wake::MailboxSchedulerHint;
@@ -53,6 +54,11 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 /// tasks block on WaitSources rather than timer-backed futures.
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 const POLLING_IDLE_SPINS: usize = 256;
+/// Emit one wait-chain snapshot after the whole SMP reactor has made no task
+/// progress for this long. The snapshot is globally one-shot, so a real hang
+/// produces useful evidence without turning normal BuildStorm output into a
+/// periodic diagnostic stream.
+const SMP_STALL_DIAG_NS: u64 = 15_000_000_000;
 /// Return from the reactor after each future poll so task-context device IRQ
 /// work runs promptly on the hart that claimed the interrupt.
 const REACTOR_POLLS_PER_DEVICE_IRQ_CHECK: usize = 1;
@@ -85,12 +91,17 @@ where
     HalRtcDevice::<P>::new().clear_alarm()
 }
 
+fn platform_realtime_now_ns<P: TxPlatform>() -> u64 {
+    timekeeper_clock::<P>().realtime_now_ns()
+}
+
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
 /// Switched to true when the userspace reactor phase begins, enabling
 /// the concurrent poll path on all harts.
 pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static CONSOLE_WRITE_LOCK: SpinMutex<()> = spin_mutex((), b"debug.lock.kernel.console_write");
+pub(crate) static CONSOLE_WRITE_LOCK: SpinMutex<()> =
+    spin_mutex((), b"debug.lock.kernel.console_write");
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
@@ -100,6 +111,8 @@ static OWNER_WAKE_SMP_DELEGATE_TOKEN: SpinMutex<Option<boot_runtime::DelegateTok
 static OWNER_WAKE_SMP_DELEGATE_REGISTRY: SpinMutex<Option<Arc<boot_runtime::DelegateRegistry>>> =
     spin_mutex(None, b"debug.lock.kernel.owner_wake_registry");
 static RCU_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
+static FILE_IO_SERVICE_REACTOR_TASKS: SpinMutex<Vec<boot_runtime::TaskId>> =
+    spin_mutex(Vec::new(), b"debug.lock.kernel.file_io_service_tasks");
 
 struct FileIoRuntimeTaskSpawner<P: TxPlatform>(PhantomData<fn() -> P>);
 
@@ -110,10 +123,11 @@ impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
         &self,
         runtime: tx_subsystems::device::PageContainerFileIoServiceRuntime,
     ) {
+        let mut submitted_task = None;
         let submitted = CoreInit::<P>::submit_file_io_runtime_task_with(
             runtime,
             |runtime, config, meta| {
-                BOOT_REACTOR
+                let result = BOOT_REACTOR
                     .with(|reactor| {
                         reactor.submit_task_with_meta(
                             async move {
@@ -124,14 +138,18 @@ impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
                             },
                             meta,
                         )
-                    })
-                    .is_some()
+                    });
+                submitted_task = result.map(|key| key.id());
+                submitted_task.is_some()
             },
         );
         assert!(
             submitted,
             "file I/O runtime spawner requires an initialized reactor"
         );
+        if let Some(task) = submitted_task {
+            FILE_IO_SERVICE_REACTOR_TASKS.lock().push(task);
+        }
     }
 }
 
@@ -319,11 +337,64 @@ impl Future for OwnerWakeSmpPark {
     }
 }
 
+/// Shutdown handshake for AP reactor loops. Zone teardown is only safe after
+/// every AP has returned from its current task poll and published itself here.
+static AP_REACTOR_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static AP_REACTOR_STOPPED_CPUS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_LAST_PROGRESS_NS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_STALL_DUMPED: AtomicBool = AtomicBool::new(false);
+/// Debugger-set one-shot request. Checked from an already-idle hart so a
+/// single runnable-but-livelocked task cannot suppress the normal all-idle
+/// detector by continuously reporting scheduler polls as progress.
+static REACTOR_STALL_DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Global root-mount slot retained for the kernel lifetime after
 /// `mount_rootfs_tmpfs` bootstraps the process subsystem.
 static ROOT_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.root_mount");
 
+/// True when boot media is mounted directly as `/`.
+static ROOTFS_FROM_BOOT_MEDIA: AtomicBool = AtomicBool::new(false);
+
+/// Accumulated real `/proc/mounts` lines. Each boot mount helper appends
+/// its line on success via `note_mount_line`; `publish_proc_mounts` hands
+/// the composed table to procfs once the boot mount sequence completes.
+/// Runtime `mount(2)` calls are not reflected — boot-time snapshot only.
+/// Motivation: the procfs stub line (`rootfs / rootfs …`) is skipped by
+/// busybox/coreutils `df`, so `df /` failed with "can't find mount
+/// point" (finals CAgent fs-usage would score 0).
+static PROC_MOUNTS_TABLE: SpinMutex<Option<alloc::string::String>> =
+    spin_mutex(None, b"debug.lock.kernel.proc_mounts_table");
+
+/// Append one `/proc/mounts` line (no trailing newline) unless its
+/// mountpoint (2nd whitespace field) is already recorded — procfs/sysfs
+/// have two alternate mount paths sharing one sentinel each, so appends
+/// must be idempotent per mountpoint.
+pub(crate) fn note_mount_line(line: &str) {
+    let mut slot = PROC_MOUNTS_TABLE.lock();
+    let table = slot.get_or_insert_with(alloc::string::String::new);
+    let mountpoint = line.split(' ').nth(1);
+    if mountpoint.is_some()
+        && table
+            .lines()
+            .any(|recorded| recorded.split(' ').nth(1) == mountpoint)
+    {
+        return;
+    }
+    table.push_str(line);
+    table.push('\n');
+}
+
+/// Hand the accumulated mount table to procfs. Called once at the end of
+/// the boot mount sequence (before userspace starts).
+pub(crate) fn publish_proc_mounts() {
+    if let Some(table) = PROC_MOUNTS_TABLE.lock().take() {
+        if !table.is_empty() {
+            tx_fs::procfs::procfs_set_mounts(table);
+        }
+    }
+}
 /// Pin slot for the rootfs's root `DEntry` identity. Populated by
 /// `bind_init_cwd_and_root` with a clone of the same `Cap<DEntry>`
 /// it hands to `step_chdir(init, …)`. Each `DEntry` produced by the
@@ -394,6 +465,22 @@ pub fn root_mount() -> Option<Cap<MountIdentity>> {
     ROOT_MOUNT.lock().clone()
 }
 
+/// One-shot console alarm installed via
+/// `tx_subsystems::process::numbers::install_pid_tripwire_sink`. Fires
+/// when the monotone pid/tid counter crosses 3M in a single boot —
+/// 75% of the procfs pid-id window. See ljs/08-pid分配与procfs窗口事故.md.
+fn pid_tripwire_warning<P: TxPlatform>() {
+    tx_hal::console_write_str::<P>("txkernel:");
+    tx_hal::console_write_str::<P>(P::BOARD);
+    tx_hal::console_write_str::<P>(
+        ":pid:tripwire:3145728: pid space 75% of procfs window (0x400000); \
+         monotone allocator never recycles — reboot before exhaustion\n",
+    );
+}
+
+fn ext4_writeback_diagnostic<P: TxPlatform>(message: &str) {
+    tx_hal::console_write_str::<P>(message);
+}
 fn init_mount_namespace() -> Option<Cap<MountNamespace>> {
     tx_subsystems::process::init_process()?.mount_namespace_cap()
 }
@@ -529,7 +616,6 @@ pub(crate) fn boot_reactor_hart_is_polling_idle(hart: boot_runtime::HartId) -> b
         .with(|reactor| reactor.is_polling_idle(hart))
         .unwrap_or(false)
 }
-
 #[cfg(test)]
 pub fn reset_boot_state_for_test() {
     *ROOT_MOUNT.lock() = None;
@@ -641,6 +727,15 @@ impl<P: TxPlatform> CoreInit<P> {
         // syscall zombifies init.
         if P::SUBSTRATE_BOOT_READY {
             Self::run_userspace_reactor_loop();
+            if !Self::quiesce_secondary_reactors() {
+                // Continuing into zone teardown while an AP still owns a
+                // reactor/zone reference is a use-after-free. The process has
+                // already exited, so a direct poweroff is the only safe
+                // timeout fallback.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":smp:quiesce:WARN-timeout\n");
+                P::system_off();
+            }
         }
         // Drain registered zones, then power off. The
         // zones-aware shutdown lives on the BSP shutdown lane (the
@@ -727,6 +822,10 @@ impl<P: TxPlatform> CoreInit<P> {
             if boot_plan.args.mount_sdcard {
                 Self::mount_sdcard_at_musl();
             }
+            publish_proc_mounts();
+            // Scratch directories are runtime infrastructure, not image
+            // policy. Ensure them for both ext4-root and tmpfs-root boots.
+            Self::populate_rootfs_tmp_dirs();
             // `tx.runsh` runs Alpine userland out of the mounted ext4 image,
             // but it still needs the kernel rootfs skeleton: `/bin/sh`
             // shebang shims, `/tmp`, identity files, resolver databases. The
@@ -756,7 +855,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
                 RootfsSetup::LegacyKernelShims => {
                     Self::populate_rootfs_shebang_shims();
-                    Self::populate_rootfs_tmp_dirs();
                     Self::populate_rootfs_identity_files();
                     Self::populate_rootfs_kernel_config();
                     Self::populate_rootfs_network_databases();
@@ -1041,14 +1139,35 @@ impl<P: TxPlatform> CoreInit<P> {
         );
     }
 
-    /// Mount tmpfs as the boot rootfs.
+    /// Select and mount the boot rootfs.
     ///
-    /// Keep LA64 aligned with RV64: `/` is a writable tmpfs used for
-    /// devfs, initramfs overlays, and bootstrap fixtures; block-backed
-    /// ext4 media is mounted later under `/musl` by
-    /// `mount_sdcard_at_musl`.
+    /// Final-test boots default to the `vda` ext4 image. Compatibility boots
+    /// using an initrd, `tx.profile=busybox`, or `tx.profile=pretest` keep the
+    /// writable tmpfs root; their block-backed ext4 media is mounted later
+    /// under `/musl` by `mount_sdcard_at_musl`.
+    ///
+    /// When `root_device_name` selects a root block device, mount its ext4 image
+    /// directly as `/` so Alpine's natural `/bin`, `/usr`, `/lib`, and `/etc`
+    /// paths are visible without compatibility symlinks. QEMU passes
+    /// `tx.root=sdcard`/`tx.profile=onsite` (→ `vda`); the board passes
+    /// `tx.root=mmcblk0` (the SD card).  A QEMU boot with neither an initrd nor
+    /// an explicit compatibility profile also defaults to `vda`, matching the
+    /// contest platform's kernel-plus-sdcard invocation without `-append`.
     pub(crate) fn mount_rootfs_from_boot_media() {
-        Self::mount_rootfs_tmpfs();
+        if !Self::mount_sdcard_as_root_if_requested() {
+            Self::mount_rootfs_tmpfs();
+        }
+
+        Self::init_vdso_after_rootfs_mount();
+    }
+
+    fn init_vdso_after_rootfs_mount() {
+        // Seed the canonical tx-time clock even when the optional vDSO image is
+        // unavailable. Filesystem timestamps and timerfd must share this one
+        // realtime authority.
+        let rtc_synced = timekeeper_clock::<P>()
+            .seed_realtime_from_persistent()
+            .is_ok();
         // Initialise the vDSO image and high-res clock parameters.
         // Must run after the substrate page allocator is ready.
         if let Err(e) = crate::vdso::init::<P>() {
@@ -1061,13 +1180,142 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
-        // Route CLOCK_REALTIME to code below the platform generic
-        // (page-backed writeback stamps file mtimes on flush). The hook now
-        // lives in `tx-time` alongside main's other non-generic time hooks;
-        // main's own RTC seeding runs from `vdso::init` via
-        // `RealtimeControl::seed_realtime_from_persistent`, so the feature
-        // branch's `P::read_rtc_epoch_ns()` block is dropped as redundant.
+        // VFS and concrete filesystem backends are deliberately not generic
+        // over the platform. Install a type-erased read bridge only after the
+        // canonical clock has been seeded.
+        tx_subsystems::wall_clock::install_realtime_source(platform_realtime_now_ns::<P>);
+        // Keep tx-time's monotonic bridge aligned with the platform clock as
+        // required by the network timers and page-backed timestamp path.
         tx_services::time::install_monotonic_ns_source(P::read_ns);
+        if rtc_synced {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":rtc:synced\n");
+        }
+    }
+
+    fn mount_sdcard_as_root_if_requested() -> bool {
+        let Some(dev_name) = Self::root_device_name() else {
+            return false;
+        };
+
+        tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
+        use tx_subsystems::device::block_device_by_name;
+
+        let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+            tx_hal::console_write_str::<P>(dev_name);
+            tx_hal::console_write_str::<P>(":missing\n");
+            return false;
+        };
+
+        let image = BlockDeviceImage::new(reg.ops);
+        let mount_output = match mount_ext4_read_write(image) {
+            Ok(out) => out,
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                tx_hal::console_write_str::<P>(dev_name);
+                tx_hal::console_write_str::<P>(":err\n");
+                return false;
+            }
+        };
+
+        let ext4_payload = MountPayload::new_cap(
+            mount_output.fs_ops().clone(),
+            mount_output.fs_page_backing().clone(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "ext4",
+            SourceLabel::Static(dev_name),
+        )
+        .expect("mount_sdcard_as_root_if_requested: payload reservation");
+
+        mount_output.bind_mount_payload(&ext4_payload);
+
+        let ext4_root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&ext4_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_sdcard_as_root_if_requested: root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            None,
+            ext4_root_rnode,
+            None,
+            ext4_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_sdcard_as_root_if_requested: mount identity reservation");
+
+        let mnt_ns = MountNamespace::new_cap(mount.clone())
+            .expect("mount_sdcard_as_root_if_requested: mount namespace reservation");
+        if let Some(init) = tx_subsystems::process::init_process() {
+            tx_subsystems::process::step_set_mount_namespace(&init, mnt_ns)
+                .expect("mount_sdcard_as_root_if_requested: publish init mount namespace");
+        }
+
+        *ROOT_MOUNT.lock() = Some(mount);
+        ROOTFS_FROM_BOOT_MEDIA.store(true, Ordering::Release);
+
+        note_mount_line(&alloc::format!("/dev/{dev_name} / ext4 rw 0 0"));
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+        tx_hal::console_write_str::<P>(dev_name);
+        tx_hal::console_write_str::<P>(":ok\n");
+        true
+    }
+
+    /// Resolve the root block device to mount from the boot cmdline, the way
+    /// Linux's `root=` parameter works. `tx.root=<name>` names the block
+    /// device directly (`vda` for the QEMU virtio disk, `mmcblk0` for the
+    /// SD card on the board, …). The legacy `tx.root=sdcard` alias resolves to
+    /// `vda`.  Explicit `tx.root=` always wins.  Initramfs/busybox and
+    /// `tx.profile=pretest`, legacy `tx.runsh=`, and typed compatibility modes
+    /// whose boot plan installs kernel rootfs shims retain the tmpfs-root
+    /// layout; otherwise QEMU defaults to `vda` so a judge does not need a
+    /// custom kernel command line. Returns `None` for a tmpfs-root boot.
+    fn root_device_name() -> Option<&'static str> {
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        Self::root_device_name_from_boot(
+            boot_info.cmdline.unwrap_or(""),
+            boot_info.initrd.is_some(),
+        )
+    }
+
+    fn root_device_name_from_boot(cmdline: &'static str, has_initrd: bool) -> Option<&'static str> {
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(val) = token.strip_prefix("tx.root=") {
+                return match val {
+                    "tmpfs" => None,
+                    "sdcard" => Some("vda"),
+                    _ => Some(val),
+                };
+            }
+        }
+
+        let boot_mode = boot_args::boot_mode_from_cmdline_str(Some(cmdline));
+        if has_initrd
+            || boot_mode.uses_kernel_rootfs_shims()
+            || cmdline.split_ascii_whitespace().any(|token| {
+                token == "tx.profile=busybox"
+                    || token == "tx.profile=pretest"
+                    || token.starts_with("tx.runsh=")
+            })
+        {
+            return None;
+        }
+
+        Some("vda")
     }
 
     /// Mount tmpfs as the rootfs.
@@ -1147,6 +1395,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *ROOT_MOUNT.lock() = Some(mount);
 
+        note_mount_line("tmpfs / tmpfs rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:rootfs:tmpfs:ok\n");
     }
@@ -1178,19 +1427,46 @@ impl<P: TxPlatform> CoreInit<P> {
         let cred = Credential::root();
         use StepOutcome as V3;
         let root_fs_object_id = root_mount.root().fs_object_id();
-        let (dev_object_id, dev_meta) = match root_mount
+        let root_payload = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
-        {
-            V3::Done(out) => out,
-            V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
-                (root_fs_object_id, root_mount.root().meta())
-            }
-            other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
-        };
+            .into_cap();
+        let (dev_object_id, dev_meta) =
+            match root_payload
+                .fs_ops
+                .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
+            {
+                V3::Done(out) => out,
+                V3::Err(step_engine::Errno::EEXIST) => {
+                    let dev_object_id =
+                        match root_payload
+                            .fs_ops
+                            .lookup(root_fs_object_id, b"dev", &guard)
+                        {
+                            V3::Done(id) => id,
+                            other => {
+                                panic!("mount_devfs_at_dev: lookup(/dev) after EEXIST: {other:?}")
+                            }
+                        };
+                    let dev_meta = match root_payload.fs_ops.load_inode_meta(dev_object_id, &guard)
+                    {
+                        V3::Done(meta) => meta,
+                        other => panic!(
+                            "mount_devfs_at_dev: load_inode_meta(/dev) after EEXIST: {other:?}"
+                        ),
+                    };
+                    assert_eq!(
+                        dev_meta.kind(),
+                        tx_subsystems::vfs::InodeKind::Directory,
+                        "mount_devfs_at_dev: existing /dev is not a directory"
+                    );
+                    (dev_object_id, dev_meta)
+                }
+                V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                    (root_fs_object_id, root_mount.root().meta())
+                }
+                other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
+            };
         drop(guard);
 
         // Build the `/dev` mountpoint DEntry on the rootfs.
@@ -1268,6 +1544,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *DEV_MOUNT.lock() = Some(dev_mount);
 
+        note_mount_line("devtmpfs /dev devtmpfs rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
     }
@@ -1381,6 +1658,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *PROC_MOUNT.lock() = Some(proc_mount);
 
+        note_mount_line("proc /proc proc rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
     }
@@ -1480,6 +1758,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *SYS_MOUNT.lock() = Some(sys_mount);
 
+        note_mount_line("sysfs /sys sysfs rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:sysfs:ok\n");
     }
@@ -1562,6 +1841,7 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         *DEV_SHM_MOUNT.lock() = Some(shm_mount);
+        note_mount_line("tmpfs /dev/shm tmpfs rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:devshm:tmpfs:ok\n");
     }
@@ -1685,6 +1965,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // rootfs, bdev-fs is mounted on devfs.
         let _ = root_mount;
 
+        note_mount_line("bdevfs /dev/block bdevfs rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:bdevfs:ok\n");
     }
@@ -1700,6 +1981,11 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
+        if ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+            return;
+        }
+
+        tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
         use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
@@ -1947,6 +2233,7 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
+        note_mount_line("/dev/vda /musl ext4 rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:sdcard:ext4:ok\n");
     }
@@ -2097,8 +2384,25 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn boot_secondary_cpus() {
-        let started = P::boot_secondary_cpus(Self::secondary_cpu_entry);
-        if started > 0 {
+        let possible = P::possible_cpus();
+        let expected_secondaries = possible.count().saturating_sub(usize::from(
+            possible.contains(<P as tx_hal::SmpIf>::current_cpu_id()),
+        ));
+        let online_secondaries = P::boot_secondary_cpus(Self::secondary_cpu_entry);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":smp:cpus:possible=");
+        Self::write_usize(possible.count());
+        tx_hal::console_write_str::<P>(":online-aps=");
+        Self::write_usize(online_secondaries);
+        tx_hal::console_write_str::<P>(":online=");
+        Self::write_usize(P::online_cpu_count());
+        if online_secondaries != expected_secondaries {
+            tx_hal::console_write_str::<P>(":WARN-partial");
+        }
+        tx_hal::console_write_str::<P>("\n");
+
+        if online_secondaries > 0 {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":smp:aps:online\n");
         }
@@ -2417,11 +2721,7 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":rcu:smp:guarded-overlap:ok\n");
 
         let early = step_engine::drain_with_budget(RCU_DRAIN_BUDGET);
-        assert_eq!(early.bag_reclaimed, 0, "RCU smoke early bag reclaim");
-        assert_eq!(
-            early.publication_dropped, 0,
-            "RCU smoke early publication drop"
-        );
+        assert_eq!(early.reclaimed, 0, "RCU smoke early reclaim");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":rcu:smp:no-early-reclaim:ok\n");
 
@@ -2440,28 +2740,21 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::wait_for_rcu_smp_stage(RCU_SMP_STAGE_READER_DONE);
 
         let mut reclaimed = 0usize;
-        let mut dropped = 0usize;
         let mut quiet = false;
         for _ in 0..RCU_DRAIN_ROUNDS {
             let stats = step_engine::drain_with_budget(RCU_DRAIN_BUDGET);
             assert!(
-                stats.bag_reclaimed <= RCU_DRAIN_BUDGET,
-                "RCU smoke bag drain exceeded budget"
+                stats.reclaimed <= RCU_DRAIN_BUDGET,
+                "RCU smoke drain exceeded budget"
             );
-            assert!(
-                stats.publication_dropped <= RCU_DRAIN_BUDGET,
-                "RCU smoke publication drain exceeded budget"
-            );
-            reclaimed += stats.bag_reclaimed;
-            dropped += stats.publication_dropped;
-            if stats.bag_remaining == 0 && stats.publication_remaining == 0 {
+            reclaimed += stats.reclaimed;
+            if stats.remaining == 0 {
                 quiet = true;
                 break;
             }
         }
         assert!(quiet, "RCU smoke bounded drain did not quiesce");
         assert!(reclaimed >= 1, "RCU smoke retired root was not reclaimed");
-        assert!(dropped >= 1, "RCU smoke retired root was not dropped");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":rcu:smp:bounded-drain:ok\n");
         Self::write_board_sentinel_prefix();
@@ -2471,7 +2764,7 @@ impl<P: TxPlatform> CoreInit<P> {
     fn drain_rcu_smoke_until_quiet(rounds: usize, budget: usize) {
         for _ in 0..rounds {
             let stats = step_engine::drain_with_budget(budget);
-            if stats.bag_remaining == 0 && stats.publication_remaining == 0 {
+            if stats.remaining == 0 {
                 return;
             }
         }
@@ -2510,6 +2803,12 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::init_observe_on_ap(cpu_id);
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
+        // `online` is a readiness publication, not merely proof that the AP
+        // reached Rust.  The BSP may target every online hart immediately
+        // (the boot IPI smoke does exactly that), so install the local wake
+        // sources before making this hart visible in `online_cpus()`.
+        P::enable_ipi_wakeups();
+        P::enable_timer_wakeups();
         P::mark_cpu_online(cpu_id);
         Self::secondary_reactor_loop()
     }
@@ -2526,13 +2825,27 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn secondary_reactor_loop() -> ! {
-        P::enable_ipi_wakeups();
-        Self::deadline_timer().enable_timer_wakeups();
         loop {
             // Re-read after every trap/longjmp round-trip; the boot argument is
             // not the authoritative hart identity once the reactor is running.
             let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
-            let _ = step_engine::service_local_drain_request(64);
+            let _ = step_engine::drain_requested_with_budget(64);
+            P::service_pending_tlb_shootdown();
+            if AP_REACTOR_STOP_REQUESTED.load(core::sync::atomic::Ordering::Acquire) {
+                P::cancel_deadline();
+                if P::pending_ipi(IpiKind::Stop) {
+                    P::ack_ipi(IpiKind::Stop);
+                }
+                // The platform first withdraws this CPU from synchronous
+                // shootdown targeting and drains senders which already pinned
+                // it. Publishing STOPPED before that handshake would let the
+                // BSP free shared pmap/zone state while a sender still waits
+                // on a CPU that is about to disable interrupts forever.
+                P::prepare_cpu_offline();
+                AP_REACTOR_STOPPED_CPUS
+                    .fetch_or(Self::cpu_bit(cpu_id), core::sync::atomic::Ordering::Release);
+                P::quiesce_this_cpu();
+            }
             if Self::run_secondary_reactor_once(cpu_id) {
                 continue;
             }
@@ -2541,10 +2854,52 @@ impl<P: TxPlatform> CoreInit<P> {
             if Self::poll_boot_reactor_idle_window(hart) {
                 continue;
             }
-            P::wait_for_interrupt_once();
+            Self::note_reactor_hart_idle(cpu_id);
+            let wait_state = P::prepare_interrupt_wait();
+            if AP_REACTOR_STOP_REQUESTED.load(core::sync::atomic::Ordering::Acquire)
+                || Self::boot_reactor_has_runnable_work(hart)
+            {
+                Self::note_reactor_hart_active(cpu_id);
+                P::cancel_interrupt_wait(wait_state);
+                continue;
+            }
+            P::wait_for_interrupt_prepared(wait_state);
+            P::service_pending_tlb_shootdown();
+            Self::note_reactor_hart_active(cpu_id);
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
             }
+        }
+    }
+
+    fn quiesce_secondary_reactors() -> bool {
+        let current = <P as tx_hal::SmpIf>::current_cpu_id();
+        let targets =
+            CpuMask::from_bits(P::online_cpus().bits() & !CpuMask::single(current).bits());
+        if targets.is_empty() {
+            return true;
+        }
+
+        AP_REACTOR_STOPPED_CPUS.fetch_and(!targets.bits(), core::sync::atomic::Ordering::AcqRel);
+        AP_REACTOR_STOP_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
+        P::broadcast_ipi(targets, IpiKind::Stop);
+
+        let deadline = P::read_ns().saturating_add(2_000_000_000);
+        loop {
+            // A secondary can be draining a shootdown which was initiated by
+            // this hart while it concurrently observes the stop request.
+            // Progressing our inbound mailbox here prevents a shutdown-only
+            // circular wait.
+            P::service_pending_tlb_shootdown();
+            let stopped = AP_REACTOR_STOPPED_CPUS.load(core::sync::atomic::Ordering::Acquire)
+                & targets.bits();
+            if stopped == targets.bits() {
+                return true;
+            }
+            if P::read_ns() >= deadline {
+                return false;
+            }
+            core::hint::spin_loop();
         }
     }
 
@@ -2590,6 +2945,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
             )
         })?;
+        if step.ran_work() {
+            Self::note_reactor_progress(cpu_id, now_ns);
+        }
         Self::program_boot_reactor_deadline(hart);
         Some(step)
     }
@@ -2630,11 +2988,218 @@ impl<P: TxPlatform> CoreInit<P> {
             &mut slice_clock,
             boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
         )?;
+        if step.ran_work() {
+            Self::note_reactor_progress(cpu_id, now_ns);
+        }
         Self::program_boot_reactor_deadline(hart);
         Some(step)
     }
 
-    fn program_boot_reactor_deadline(hart: boot_runtime::HartId) {
+    pub(super) fn reset_smp_stall_diagnostic() {
+        REACTOR_IDLE_CPUS.store(0, Ordering::Release);
+        REACTOR_LAST_PROGRESS_NS.store(P::read_ns(), Ordering::Release);
+        REACTOR_STALL_DUMPED.store(false, Ordering::Release);
+    }
+
+    fn note_reactor_progress(cpu_id: CpuId, now_ns: u64) {
+        REACTOR_IDLE_CPUS.fetch_and(!Self::cpu_bit(cpu_id), Ordering::AcqRel);
+        REACTOR_LAST_PROGRESS_NS.store(now_ns, Ordering::Release);
+    }
+
+    pub(super) fn note_reactor_hart_active(cpu_id: CpuId) {
+        REACTOR_IDLE_CPUS.fetch_and(!Self::cpu_bit(cpu_id), Ordering::AcqRel);
+    }
+
+    pub(super) fn note_reactor_hart_idle(cpu_id: CpuId) {
+        if REACTOR_STALL_DUMP_REQUESTED.swap(false, Ordering::AcqRel) {
+            tx_hal::console_write_str::<P>("txkernel:smp-stall:forced\n");
+            tx_subsystems::zones::dump_smp_wait_diagnostics::<P>();
+            Self::dump_reactor_task_diagnostics();
+            tx_hal::console_write_str::<P>("txkernel:smp-stall:end\n");
+        }
+        let online = P::online_cpus().bits();
+        if online.count_ones() <= 1 {
+            return;
+        }
+        let idle = REACTOR_IDLE_CPUS.fetch_or(Self::cpu_bit(cpu_id), Ordering::AcqRel)
+            | Self::cpu_bit(cpu_id);
+        if idle & online != online {
+            return;
+        }
+
+        let now_ns = P::read_ns();
+        let last_ns = REACTOR_LAST_PROGRESS_NS.load(Ordering::Acquire);
+        if last_ns == 0 {
+            let _ = REACTOR_LAST_PROGRESS_NS.compare_exchange(
+                0,
+                now_ns,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return;
+        }
+        let stalled_ns = now_ns.saturating_sub(last_ns);
+        if stalled_ns < SMP_STALL_DIAG_NS
+            || REACTOR_STALL_DUMPED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+
+        tx_hal::console_write_str::<P>("txkernel:smp-stall:begin:idle_mask=");
+        Self::write_u64(idle & online);
+        tx_hal::console_write_str::<P>(":online_mask=");
+        Self::write_u64(online);
+        tx_hal::console_write_str::<P>(":stalled_ms=");
+        Self::write_u64(stalled_ns / 1_000_000);
+        tx_hal::console_write_str::<P>("\n");
+        tx_subsystems::zones::dump_smp_wait_diagnostics::<P>();
+        Self::dump_reactor_task_diagnostics();
+        tx_hal::console_write_str::<P>("txkernel:smp-stall:end\n");
+    }
+
+    fn dump_reactor_task_diagnostics() {
+        let _ = BOOT_REACTOR.with(|reactor| {
+            tx_hal::console_write_str::<P>("txkernel:smp-stall:reactor:queued_wakes=");
+            Self::write_u64(reactor.queued_wake_count() as u64);
+            tx_hal::console_write_str::<P>("\n");
+
+            let service_tasks = FILE_IO_SERVICE_REACTOR_TASKS.lock().clone();
+            for task in reactor.task_runtime_diagnostics() {
+                tx_hal::console_write_str::<P>("txkernel:smp-stall:all-task:id=");
+                Self::write_u64(task.id.0 as u64);
+                tx_hal::console_write_str::<P>(":file_io=");
+                Self::write_u64(service_tasks.contains(&task.id) as u64);
+                tx_hal::console_write_str::<P>(":status=");
+                Self::write_u64(match task.status {
+                    boot_runtime::TaskStatus::Runnable => 1,
+                    boot_runtime::TaskStatus::Polling => 2,
+                    boot_runtime::TaskStatus::Parked => 3,
+                    boot_runtime::TaskStatus::Completed => 4,
+                    boot_runtime::TaskStatus::Cancelled => 5,
+                });
+                tx_hal::console_write_str::<P>(":wake=");
+                Self::write_u64(task.wake_requested as u64);
+                tx_hal::console_write_str::<P>(":queued=");
+                Self::write_u64(reactor.task_is_queued(task.id) as u64);
+                tx_hal::console_write_str::<P>(":owner=");
+                match reactor.task_run_owner(task.id) {
+                    Some(boot_runtime::TaskRunOwner::Parked) => {
+                        tx_hal::console_write_str::<P>("parked")
+                    }
+                    Some(boot_runtime::TaskRunOwner::Queued { hart, .. }) => {
+                        tx_hal::console_write_str::<P>("queued@");
+                        Self::write_u64(hart.0 as u64);
+                    }
+                    Some(boot_runtime::TaskRunOwner::Polling { hart }) => {
+                        tx_hal::console_write_str::<P>("polling@");
+                        Self::write_u64(hart.0 as u64);
+                    }
+                    Some(boot_runtime::TaskRunOwner::Terminal) => {
+                        tx_hal::console_write_str::<P>("terminal")
+                    }
+                    None => tx_hal::console_write_str::<P>("none"),
+                }
+                tx_hal::console_write_str::<P>(":mailbox_len=");
+                Self::write_u64(task.mailbox_len as u64);
+                tx_hal::console_write_str::<P>(":mailbox_waker=");
+                Self::write_u64(task.mailbox_has_waker as u64);
+                tx_hal::console_write_str::<P>("\n");
+            }
+
+            for runtime in tx_subsystems::device::page_container_file_io_service_runtimes_snapshot()
+            {
+                let (source, subscribers, pending, io) = runtime.diagnostic();
+                tx_hal::console_write_str::<P>("txkernel:smp-stall:file-io:source=");
+                Self::write_u64(source);
+                tx_hal::console_write_str::<P>(":subscribers=");
+                Self::write_u64(subscribers as u64);
+                tx_hal::console_write_str::<P>(":pending_mask=");
+                Self::write_u64(pending);
+                tx_hal::console_write_str::<P>(":submissions=");
+                Self::write_u64(io.page.submissions as u64);
+                tx_hal::console_write_str::<P>(":completions=");
+                Self::write_u64(io.page.completions as u64);
+                tx_hal::console_write_str::<P>(":resumes=");
+                Self::write_u64(io.page.backend_resumes as u64);
+                tx_hal::console_write_str::<P>(":metadata=");
+                Self::write_u64(io.page.metadata_waits as u64);
+                tx_hal::console_write_str::<P>(":graphs=");
+                Self::write_u64(io.page.graphs as u64);
+                tx_hal::console_write_str::<P>(":waiters=");
+                Self::write_u64(io.page.waiters as u64);
+                tx_hal::console_write_str::<P>(":fsyncs=");
+                Self::write_u64(io.fsync_submissions as u64);
+                tx_hal::console_write_str::<P>(":block_queue=");
+                Self::write_u64(io.block_queue as u64);
+                tx_hal::console_write_str::<P>(":background=");
+                Self::write_u64(io.background_graphs as u64);
+                tx_hal::console_write_str::<P>("\n");
+            }
+
+            for (pid, _) in tx_subsystems::process::all_pids() {
+                let Some(process) = tx_subsystems::process::process_by_pid(pid) else {
+                    continue;
+                };
+                for thread in process.threads_snapshot().unwrap_or_default() {
+                    let Some(payload) = thread.payload_cap() else {
+                        continue;
+                    };
+                    let Some(mailbox) = payload.mailbox_handle().and_then(|weak| weak.upgrade())
+                    else {
+                        continue;
+                    };
+                    let task = boot_runtime::TaskId(mailbox.task_id_low() as usize);
+                    tx_hal::console_write_str::<P>("txkernel:smp-stall:reactor-task:pid=");
+                    Self::write_u64(pid.0 as u64);
+                    tx_hal::console_write_str::<P>(":tid=");
+                    Self::write_u64(thread.tid.0 as u64);
+                    tx_hal::console_write_str::<P>(":task=");
+                    Self::write_u64(task.0 as u64);
+                    tx_hal::console_write_str::<P>(":status=");
+                    let status = match reactor.task_status(task) {
+                        Some(boot_runtime::TaskStatus::Runnable) => 1,
+                        Some(boot_runtime::TaskStatus::Polling) => 2,
+                        Some(boot_runtime::TaskStatus::Parked) => 3,
+                        Some(boot_runtime::TaskStatus::Completed) => 4,
+                        Some(boot_runtime::TaskStatus::Cancelled) => 5,
+                        None => 0,
+                    };
+                    Self::write_u64(status);
+                    tx_hal::console_write_str::<P>(":wake=");
+                    Self::write_u64(reactor.task_wake_requested(task).unwrap_or(false) as u64);
+                    tx_hal::console_write_str::<P>(":queued=");
+                    Self::write_u64(reactor.task_is_queued(task) as u64);
+                    tx_hal::console_write_str::<P>(":owner=");
+                    match reactor.task_run_owner(task) {
+                        Some(boot_runtime::TaskRunOwner::Parked) => {
+                            tx_hal::console_write_str::<P>("parked")
+                        }
+                        Some(boot_runtime::TaskRunOwner::Queued { hart, .. }) => {
+                            tx_hal::console_write_str::<P>("queued@");
+                            Self::write_u64(hart.0 as u64);
+                        }
+                        Some(boot_runtime::TaskRunOwner::Polling { hart }) => {
+                            tx_hal::console_write_str::<P>("polling@");
+                            Self::write_u64(hart.0 as u64);
+                        }
+                        Some(boot_runtime::TaskRunOwner::Terminal) => {
+                            tx_hal::console_write_str::<P>("terminal")
+                        }
+                        None => tx_hal::console_write_str::<P>("none"),
+                    }
+                    tx_hal::console_write_str::<P>(":mailbox_len=");
+                    Self::write_u64(mailbox.len() as u64);
+                    tx_hal::console_write_str::<P>(":mailbox_waker=");
+                    Self::write_u64(mailbox.has_waker() as u64);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            }
+        });
+    }
+
+    fn program_boot_reactor_deadline(_hart: boot_runtime::HartId) {
         let mut deadline_timer = Self::deadline_timer();
         let _ = BOOT_REACTOR.with(|reactor| {
             reactor.program_current_hart_deadline(&mut deadline_timer);
@@ -2769,10 +3334,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let mut observed = false;
         let _ = BOOT_REACTOR.with(|reactor| reactor.begin_polling_idle(hart));
         for _ in 0..POLLING_IDLE_SPINS {
-            if BOOT_REACTOR
-                .with(|reactor| reactor.should_leave_polling_idle(hart))
-                .unwrap_or(false)
-            {
+            if Self::boot_reactor_has_runnable_work(hart) {
                 observed = true;
                 break;
             }
@@ -2780,6 +3342,12 @@ impl<P: TxPlatform> CoreInit<P> {
         }
         let _ = BOOT_REACTOR.with(|reactor| reactor.end_polling_idle(hart));
         observed
+    }
+
+    fn boot_reactor_has_runnable_work(hart: boot_runtime::HartId) -> bool {
+        BOOT_REACTOR
+            .with(|reactor| reactor.should_leave_polling_idle(hart))
+            .unwrap_or(false)
     }
 
     fn clear_ap_reactor_task_done(cpus: CpuMask) {
@@ -2814,26 +3382,28 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn userspace_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
-        // Userspace trap/return state still has hart-local architectural
-        // coupling. Keep OSComp user threads on the submit hart until the
-        // userspace context handoff is fully migration-safe.
-        let affinity = Self::cpu_bit(cpu_id);
+        // Expose every online hart to userspace from the first task so
+        // sched_getaffinity/nproc observe the SMP machine. The initial task is
+        // still pinned and has no spread-on-submit flag, so it starts on the
+        // first online hart (normally CPU0) and never migrates while a
+        // userspace trap round-trip is active.
+        let fallback = Self::cpu_bit(cpu_id);
+        let online = P::online_cpus().bits();
+        let affinity = if online == 0 { fallback } else { online };
         boot_runtime::InitialSchedMeta::fair()
             .with_affinity(affinity)
             .pinned()
             .userspace_thread()
     }
 
-    #[cfg(not(any(tx_userspace_child_spread_smp1, tx_userspace_child_spread_smp4)))]
-    fn userspace_child_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
-        Self::userspace_thread_sched_meta_for(cpu_id)
-    }
-
-    #[cfg(any(tx_userspace_child_spread_smp1, tx_userspace_child_spread_smp4))]
     fn userspace_child_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
         let fallback = Self::cpu_bit(cpu_id);
         let online = P::online_cpus().bits();
         let affinity = if online == 0 { fallback } else { online };
+        // Distribute newly submitted children round-robin across online
+        // hart, then keep each child pinned there. This activates parallel
+        // Cargo/rustc processes without enabling post-trap userspace migration
+        // or userspace work stealing yet.
         boot_runtime::InitialSchedMeta::fair()
             .with_affinity(affinity)
             .pinned()

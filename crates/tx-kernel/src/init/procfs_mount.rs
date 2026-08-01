@@ -98,6 +98,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         mount::register_mount(&rootfs_payload, proc_object_id, proc_mount);
 
+        crate::init::note_mount_line("proc /proc proc rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:procfs:ok\n");
     }
