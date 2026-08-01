@@ -8,7 +8,9 @@ use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
 use step_engine::page_allocator;
 use step_engine::SpinMutex;
 use tx_hal::{MmioRegion, PlatformInfoIf, TxPlatform};
-use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
+use tx_subsystems::device::{
+    BlockDevice, BlockDeviceOps, BlockDurabilityCapabilities, PhysicalBlockNumber,
+};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::Frame;
 use virtio_drivers::device::blk::VirtIOBlk;
@@ -170,6 +172,14 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             return StepOutcome::Err(Errno::EIO.into());
         }
         StepOutcome::Done(())
+    }
+
+    fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+        // virtio-drivers exposes a durable flush but no FUA write option.
+        BlockDurabilityCapabilities {
+            fua: false,
+            flush: true,
+        }
     }
 }
 

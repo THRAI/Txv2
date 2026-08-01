@@ -76,6 +76,37 @@ In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the re
 If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
 <!-- CODEGRAPH_END -->
 
+## Toolchain inventory
+
+Last verified locally: 2026-08-01 (macOS, `/Users/3y/Downloads/Tx`). Prefer
+the repository entry points below when operating on Tx:
+
+- Rust: `rustc`/`cargo` 1.89.0-nightly, `rustup` 1.28.2; targets
+  `riscv64gc-unknown-none-elf` and `loongarch64-unknown-none-softfloat`, with
+  `rustfmt`, `clippy`, `rust-src`, and `llvm-tools` installed.
+- Tx workflow: `cargo xtask doctor`, `unit`, `check`, `full-build`, `image`,
+  `qemu`, `test`, `shell-test`, `fault-decode`, `trap-trace`, `progress`, and
+  `observe` (see `.agents/skills/tx-xtask/SKILL.md`).
+- Emulation and indexing: QEMU 10.2.2 (`qemu-system-riscv64`,
+  `qemu-system-loongarch64`) and CodeGraph 1.4.1. If `.codegraph/` exists,
+  use CodeGraph before broad text searches.
+- Containers: Docker CLI 28.3.2 with a reachable Docker Engine 29.5.2;
+  Docker Compose v2.38.2-desktop.1 and Buildx v0.25.0 are available. Podman
+  is not installed. Use Docker for containerized build/test workflows when a
+  repository script or task requires it; do not assume Podman compatibility.
+- Host utilities available: Python 3.14.5, Node.js v26.0.0/npm, Git 2.50.1,
+  GitHub CLI 2.92.0, `rg`, `jq`, CMake, Ninja, Make, Clang, GCC, Typst, and
+  Pandoc.
+- Tx doctor gaps: `mkfs.ext4`, `debugfs`, `e2fsck`, and `mcopy` are currently
+  unavailable. Ext4 image creation/checking and FAT image workflows that need
+  these tools may therefore fail or omit their corresponding steps. The
+  vendored RV64 BusyBox and OSComp autotest submodule are present; the
+  LoongArch BusyBox binary and `TX_MUSL_LIBC` are not configured.
+
+When this inventory changes, rerun `cargo xtask doctor` plus the relevant
+version/runtime checks and update this section rather than relying on stale
+tool assumptions.
+
 ## Discover and output discipline
 
 - confirm discovery files first: use `rg -l <keyword>' <paths>` to search for files, then `rg -n` on selected candidate files.
