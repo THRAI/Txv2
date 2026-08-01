@@ -48,6 +48,7 @@ use crate::zones;
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr::null;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::time::Duration;
@@ -335,6 +336,84 @@ fn process_exit_payload_slot_guard_only_detaches_state() {
 }
 
 struct NullMountFs;
+
+#[derive(Default)]
+struct RecordingFsyncBacking {
+    fsyncs: AtomicUsize,
+}
+
+impl FsPageBacking for RecordingFsyncBacking {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<PageFrame, crate::process::adapter::step_engine::NoProgress> {
+        unreachable!("exit flush test has no resident pages")
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &PageFrame,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
+        self.fsyncs.fetch_add(1, Ordering::AcqRel);
+        StepOutcome::done(())
+    }
+}
+
+fn recording_page_backed_open_file() -> (Cap<crate::vfs::OpenFile>, Arc<RecordingFsyncBacking>) {
+    use crate::mount::MountPayloadPin;
+    use crate::page_backed::PageContainer;
+    use crate::process::adapter::step_engine::PayloadCap;
+    use crate::vfs::OpenFileFlags;
+
+    let backing = Arc::new(RecordingFsyncBacking::default());
+    let mount = MountPayload::new_cap(
+        Arc::new(NullMountFs),
+        backing.clone(),
+        None,
+        DevId::new(101),
+        MountOptions::default(),
+        "recording-fsync",
+        SourceLabel::Static("recording-fsync"),
+    )
+    .expect("recording fsync mount payload");
+    let pc = PageContainer::new_file_cap(
+        MountPayloadPin::acquire(&PayloadCap::from_cap(mount)),
+        FsObjectId::new(2),
+        0,
+    )
+    .expect("recording file page container");
+    let rnode = RNode::new_cap(
+        FsObjectId::new(2),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::PageBacked { pc },
+    )
+    .expect("recording file rnode");
+    let file = crate::vfs::OpenFile::new_cap(rnode, OpenFileFlags::default())
+        .expect("recording open file");
+    (file, backing)
+}
 
 impl FsOps for NullMountFs {
     fn lookup(
@@ -881,6 +960,31 @@ fn exit_group_zombifies_process_at_once_and_records_status() {
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(42)));
     assert_eq!(proc_cap.live_thread_count(), 0);
+}
+
+#[test]
+fn exit_group_flushes_page_backed_files_drained_from_fd_table() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let (file, backing) = recording_page_backed_open_file();
+    proc_cap.set_fd(1, Some(file));
+
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
+
+    assert_eq!(backing.fsyncs.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn last_thread_exit_flushes_page_backed_files_drained_from_fd_table() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let (file, backing) = recording_page_backed_open_file();
+    proc_cap.set_fd(1, Some(file));
+    let leader = first_thread(&proc_cap);
+
+    step_thread_exit(leader, 0);
+
+    assert_eq!(backing.fsyncs.load(Ordering::Acquire), 1);
 }
 
 #[test]

@@ -1610,6 +1610,7 @@ pub(super) fn sys_dup3<'a>(
     if newfd >= soft_limit {
         return SyscallResult::Error(EBADF_VALUE);
     }
+    let replaced_file = (oldfd != newfd).then(|| ctx.process.fd(newfd)).flatten();
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = Dup3Op {
         process: ctx.process.clone(),
@@ -1618,7 +1619,12 @@ pub(super) fn sys_dup3<'a>(
         flags,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(fd) => SyscallResult::Return(fd as i64),
+        Ok(fd) => {
+            if let Some(file) = replaced_file {
+                queue_file_close_writeback(&file);
+            }
+            SyscallResult::Return(fd as i64)
+        }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
