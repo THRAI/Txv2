@@ -544,6 +544,21 @@ fn tier1_verify_receipt_rejects_executor_plan_semantic_preflight_mismatch() {
     assert!(error.contains("command_source must be `repository-default`"));
 }
 
+#[test]
+fn tier1_verify_receipt_rejects_fault_executor_log_command_mismatch() {
+    let root = temp_root("verify-receipt-fault-executor-log-command");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-fault-executor-log",
+        "$ python3 /tmp/forged-fault_qemu_executor.py /tmp/job-request.json\nstatus=exit status: 0\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("executor log drift must fail");
+    assert!(error.contains("missing command line"));
+}
+
 struct TempCleanup(PathBuf);
 
 impl Drop for TempCleanup {
@@ -929,6 +944,18 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         );
         let job_request_path = run_dir.join(format!("{cut_dir}/job-request.json"));
         let result_path = run_dir.join(format!("{cut_dir}/result.json"));
+        add_artifact(
+            &format!("{cut_id}-fault-executor-log"),
+            format!("{cut_dir}/fault-executor.log"),
+            format!(
+                "$ python3 {} {}\nstatus=exit status: 0\nstdout:\nfault qemu executor result: {}\n",
+                repo_root
+                    .join("tools/ext4/fault_qemu_executor.py")
+                    .display(),
+                job_request_path.display(),
+                result_path.display()
+            ),
+        );
         let staged_test_image = run_dir.join(format!("{cut_dir}/roles/test.img"));
         let staged_scratch_image = run_dir.join(format!("{cut_dir}/roles/scratch.img"));
         let staged_workload_image = run_dir.join(format!("{cut_dir}/roles/workload.img"));

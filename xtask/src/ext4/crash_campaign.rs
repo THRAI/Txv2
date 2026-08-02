@@ -219,7 +219,8 @@ pub(crate) fn execute_crash_cut_campaign(
             source_image,
             workload_image,
         )?;
-        let executor_result = run_fault_qemu_executor(root, &job.request_path, e2fsck);
+        let executor_result =
+            run_fault_qemu_executor(root, &job.request_path, &job.fault_executor_log, e2fsck);
         record_existing_fault_job_artifacts(run, &cut_id, &job)?;
         executor_result?;
         let campaign_plan_sha256 = sha256_file(&manifest)?;
@@ -344,6 +345,7 @@ pub(crate) struct FaultJobPaths {
     pub(crate) semantic_oracle_request: PathBuf,
     pub(crate) semantic_oracle_image: PathBuf,
     pub(crate) semantic_oracle_log: PathBuf,
+    pub(crate) fault_executor_log: PathBuf,
 }
 
 #[derive(Debug)]
@@ -382,6 +384,7 @@ pub(crate) fn write_fault_job_request(
     let semantic_oracle_request = job_dir.join("semantic-oracle-01-request.json");
     let semantic_oracle_image = job_dir.join("semantic-oracle.img");
     let semantic_oracle_log = job_dir.join("semantic-oracle.log");
+    let fault_executor_log = job_dir.join("fault-executor.log");
     let manifest = serde_json::json!({
         "schema": "tx.ext4.fault_job_request.v1",
         "campaign_plan_sha256": sha256_file(campaign_manifest)?,
@@ -464,6 +467,7 @@ pub(crate) fn write_fault_job_request(
         semantic_oracle_request,
         semantic_oracle_image,
         semantic_oracle_log,
+        fault_executor_log,
     })
 }
 
@@ -490,6 +494,7 @@ fn record_existing_fault_job_artifacts(
         ("semantic-oracle-request", &job.semantic_oracle_request),
         ("semantic-oracle-image", &job.semantic_oracle_image),
         ("semantic-oracle-log", &job.semantic_oracle_log),
+        ("fault-executor-log", &job.fault_executor_log),
     ] {
         if path.is_file() {
             run.record_artifact(format!("{cut_id}-{suffix}"), path.clone())?;
@@ -498,25 +503,49 @@ fn record_existing_fault_job_artifacts(
     Ok(())
 }
 
-fn run_fault_qemu_executor(root: &Path, request_path: &Path, e2fsck: &str) -> Result<()> {
+fn run_fault_qemu_executor(
+    root: &Path,
+    request_path: &Path,
+    log_path: &Path,
+    e2fsck: &str,
+) -> Result<()> {
     let script = root.join("tools/ext4/fault_qemu_executor.py");
     if !script.is_file() {
         return Err(format!("missing fault executor {}", script.display()));
     }
-    println!("$ python3 {} {}", script.display(), request_path.display());
-    let status = Command::new("python3")
+    let command_line = format!("python3 {} {}", script.display(), request_path.display());
+    println!("$ {command_line}");
+    let output = Command::new("python3")
         .arg(&script)
         .arg(request_path)
         .env("TX_EXT4_FAULT_E2FSCK_COMMAND", e2fsck)
         .current_dir(root)
-        .status()
+        .output()
         .map_err(|err| format!("failed to run {}: {err}", script.display()))?;
-    if status.success() {
+    let mut log = format!("$ {command_line}\nstatus={}\n", output.status);
+    if !output.stdout.is_empty() {
+        log.push_str("stdout:\n");
+        log.push_str(&String::from_utf8_lossy(&output.stdout));
+        if !log.ends_with('\n') {
+            log.push('\n');
+        }
+    }
+    if !output.stderr.is_empty() {
+        log.push_str("stderr:\n");
+        log.push_str(&String::from_utf8_lossy(&output.stderr));
+        if !log.ends_with('\n') {
+            log.push('\n');
+        }
+    }
+    fs::write(log_path, log)
+        .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
+    if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "fault executor {} exited with {status}",
-            script.display()
+            "fault executor {} exited with {}",
+            script.display(),
+            output.status
         ))
     }
 }

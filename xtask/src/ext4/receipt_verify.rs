@@ -1274,6 +1274,7 @@ fn verify_required_crash_cut_artifacts(
             "semantic-oracle-request",
             "semantic-oracle-image",
             "semantic-oracle-log",
+            "fault-executor-log",
         ] {
             let name = format!("{cut_id}-{suffix}");
             if !artifacts.contains_key(&name) {
@@ -1296,6 +1297,8 @@ fn verify_crash_cut_job_result(
 ) -> Result<()> {
     let job_request = crash_cut_artifact_path(cut_id, "job-request", artifacts, path)?;
     let executor_plan = crash_cut_artifact_path(cut_id, "executor-plan", artifacts, path)?;
+    let fault_executor_log =
+        crash_cut_artifact_path(cut_id, "fault-executor-log", artifacts, path)?;
     let result = crash_cut_artifact_path(cut_id, "result", artifacts, path)?;
     let request_json = read_json(&job_request)?;
     require_schema(&request_json, "tx.ext4.fault_job_request.v1", &job_request)?;
@@ -1323,6 +1326,7 @@ fn verify_crash_cut_job_result(
     }
     let qemu = required_json_object(request, "qemu", &job_request)?;
     let phase_marker = required_json_string(qemu, "cut_marker", &job_request)?;
+    verify_fault_executor_log(&fault_executor_log, &job_request, path)?;
     verify_crash_cut_executor_plan(
         cut_id,
         &executor_plan,
@@ -1368,6 +1372,42 @@ fn verify_crash_cut_job_result(
         &phase_marker,
         &e2fsck_log,
     )?;
+    Ok(())
+}
+
+fn verify_fault_executor_log(
+    log_path: &Path,
+    job_request: &Path,
+    receipt_path: &Path,
+) -> Result<()> {
+    let text = std::fs::read_to_string(log_path).map_err(|err| {
+        format!(
+            "{}: failed to read {}: {err}",
+            receipt_path.display(),
+            log_path.display()
+        )
+    })?;
+    let root = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current repository directory: {err}"))?;
+    let command_line = format!(
+        "$ python3 {} {}",
+        root.join("tools/ext4/fault_qemu_executor.py").display(),
+        job_request.display()
+    );
+    if !text.lines().any(|line| line == command_line) {
+        return Err(format!(
+            "{}: fault executor log {} missing command line `{command_line}`",
+            receipt_path.display(),
+            log_path.display()
+        ));
+    }
+    if !text.lines().any(|line| line == "status=exit status: 0") {
+        return Err(format!(
+            "{}: fault executor log {} missing successful exit status",
+            receipt_path.display(),
+            log_path.display()
+        ));
+    }
     Ok(())
 }
 

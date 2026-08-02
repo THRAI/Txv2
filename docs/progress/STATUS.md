@@ -1,3 +1,23 @@
+- 2026-08-02 (ext4 Tier 1 fault executor log artifact).
+  Advanced Task 16 live crash-runner evidence without promoting final
+  acceptance. The live crash-cut executor path now captures each
+  repository-owned `tools/ext4/fault_qemu_executor.py` invocation into a
+  per-cut `fault-executor.log` before registering existing fault-job artifacts,
+  preserving command line, exit status, stdout, and stderr even when the
+  executor fails. `cargo xtask ext4 tier1 --verify-receipt PATH` now requires
+  that log for every `crash-cut-0000..0999` and rejects logs whose command line
+  is not the run-owned repository executor invocation or whose status is not
+  `exit status: 0`. Verification passed `CARGO_INCREMENTAL=0 cargo test -p
+  xtask receipt_verify -- --test-threads=1` (33), `CARGO_INCREMENTAL=0 cargo
+  test -p xtask tier1_fault_job_request -- --test-threads=1` (2),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (76),
+  scoped rustfmt, `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, `git
+  diff --check`, and the expected fail-closed live preflight
+  `task16-fault-executor-log-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 executor preflight contract).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. The fault QEMU executor now records `replay_matrix_preflight`
