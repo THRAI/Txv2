@@ -1102,7 +1102,7 @@ where
         nr if nr == NR_SPLICE => sys_splice::<P>(req.args, ctx).await,
         nr if nr == NR_TEE => sys_tee(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
-        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx).await,
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),

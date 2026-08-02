@@ -837,6 +837,32 @@ pub(super) fn validate_user_range<'a>(
     }
 }
 
+/// Wait-capable counterpart of [`validate_user_range`].
+///
+/// On SMP, another materializer may briefly own the page that receives a
+/// socketpair's descriptor array.  That is normal contention, not an I/O
+/// failure, so async syscall paths wait for the reservation instead of
+/// returning a transient `EIO` to userspace.
+pub(super) async fn validate_user_range_wait<'a>(
+    ctx: &SyscallCtx<'a>,
+    uaddr: u64,
+    len: usize,
+    access: UserAccessKind,
+) -> Result<(), Errno> {
+    #[cfg(not(target_os = "none"))]
+    {
+        validate_user_range(ctx, uaddr, len, access)
+    }
+
+    #[cfg(target_os = "none")]
+    {
+        let range = covering_user_range(uaddr, len).ok_or(Errno::EFAULT)?;
+        ctx.aspace
+            .reserve_user_range_for_access_wait(range, access)
+            .await
+    }
+}
+
 pub(super) fn write_mmsghdr_len<'a>(
     ctx: &SyscallCtx<'a>,
     mmsghdr_ptr: u64,

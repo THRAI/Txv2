@@ -167,9 +167,9 @@ pub(super) fn sys_socket<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         }
     };
 
-    let fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(fd, Some(opened.file));
-    ctx.process.set_fd_cloexec(fd, opened.cloexec);
+    let Some(fd) = ctx.process.install_new_fd(opened.file, opened.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
     SyscallResult::Return(fd as i64)
 }
 
@@ -182,7 +182,7 @@ fn socket_requires_net_raw(kind: SocketKind, valid: ValidSocketType) -> bool {
             ))
 }
 
-pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let domain = args[0] as i32;
     let type_ = args[1] as i32;
     let protocol = args[2] as i32;
@@ -201,7 +201,7 @@ pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     if !matches!(kind, SocketKind::UnixDatagram | SocketKind::UnixStream) {
         return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
     }
-    if let Err(errno) = validate_user_range(ctx, sv, 8, UserAccessKind::Write) {
+    if let Err(errno) = validate_user_range_wait(ctx, sv, 8, UserAccessKind::Write).await {
         return SyscallResult::Error(errno_to_i32(errno));
     }
 
@@ -245,15 +245,24 @@ pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
     }
 
-    let first_fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(first_fd, Some(first.file));
-    ctx.process.set_fd_cloexec(first_fd, first.cloexec);
-    let second_fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(second_fd, Some(second.file));
-    ctx.process.set_fd_cloexec(second_fd, second.cloexec);
-    match bootstrap_write_user::<[i32; 2]>(&ctx.aspace, sv, [first_fd as i32, second_fd as i32]) {
+    let Some(first_fd) = ctx.process.install_new_fd(first.file, first.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
+    let Some(second_fd) = ctx.process.install_new_fd(second.file, second.cloexec) else {
+        let _ = ctx.process.set_fd(first_fd, None);
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
+
+    let mut fd_bytes = [0u8; core::mem::size_of::<[i32; 2]>()];
+    fd_bytes[..4].copy_from_slice(&(first_fd as i32).to_le_bytes());
+    fd_bytes[4..].copy_from_slice(&(second_fd as i32).to_le_bytes());
+    match super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, sv, &fd_bytes).await {
         Ok(()) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => {
+            let _ = ctx.process.set_fd(first_fd, None);
+            let _ = ctx.process.set_fd(second_fd, None);
+            SyscallResult::Error(errno_to_i32(errno))
+        }
     }
 }
 
@@ -409,9 +418,9 @@ where
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
 
-                let new_fd = ctx.process.allocate_fd();
-                let _ = ctx.process.set_fd(new_fd, Some(opened.file));
-                ctx.process.set_fd_cloexec(new_fd, opened.cloexec);
+                let Some(new_fd) = ctx.process.install_new_fd(opened.file, opened.cloexec) else {
+                    return SyscallResult::Error(EMFILE_VALUE);
+                };
                 return SyscallResult::Return(new_fd as i64);
             }
             StepOutcome::Yield { shape, .. } => {
@@ -771,7 +780,13 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         }
         if len <= NETLINK_INLINE_SEND_MAX {
             let mut inline = [0u8; NETLINK_INLINE_SEND_MAX];
-            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut inline[..len], args[1]) {
+            if let Err(errno) = super::user_copy::bootstrap_copy_from_user_wait(
+                &ctx.aspace,
+                &mut inline[..len],
+                args[1],
+            )
+            .await
+            {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             let result = dispatch_netlink_send(ctx, &socket, &inline[..len]);
@@ -782,7 +797,9 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         }
 
         let mut bytes = alloc::vec![0; len];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, args[1]).await
+        {
             return SyscallResult::Error(errno_to_i32(errno));
         }
         let result = dispatch_netlink_send(ctx, &socket, &bytes);
@@ -819,7 +836,9 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
             return SyscallResult::Error(ENODEV_VALUE);
         }
         let mut bytes = alloc::vec![0; len];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
+        if let Err(errno) =
+            super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, args[1]).await
+        {
             return SyscallResult::Error(errno_to_i32(errno));
         }
         maybe_queue_packet_arp_reply(ctx, &socket, &payload, &netns, sockaddr, &bytes);
@@ -891,7 +910,9 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     }
 
     let mut bytes = alloc::vec![0; len];
-    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
+    if let Err(errno) =
+        super::user_copy::bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, args[1]).await
+    {
         return SyscallResult::Error(errno_to_i32(errno));
     }
 
@@ -1159,7 +1180,7 @@ where
         // queued message (a later recv must still see it).
         if staging_len > 0 && !flags.contains(SendRecvFlags::MSG_PEEK) {
             if let Err(errno) =
-                validate_user_range(ctx, args[1], staging_len, UserAccessKind::Write)
+                validate_user_range_wait(ctx, args[1], staging_len, UserAccessKind::Write).await
             {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
@@ -1172,8 +1193,12 @@ where
         match outcome {
             StepOutcome::Done(recv) => {
                 if recv.bytes > 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..recv.bytes])
+                    if let Err(errno) = super::user_copy::bootstrap_copy_to_user_wait(
+                        &ctx.aspace,
+                        args[1],
+                        &staging[..recv.bytes],
+                    )
+                    .await
                     {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
@@ -3375,10 +3400,19 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                             },
                         ) {
                             Ok(opened) => {
-                                let new_fd = ctx.process.allocate_fd();
-                                let _ = ctx.process.set_fd(new_fd, Some(opened.file));
+                                let Some(new_fd) =
+                                    ctx.process.install_new_fd(opened.file, opened.cloexec)
+                                else {
+                                    return SyscallResult::Error(EMFILE_VALUE);
+                                };
                                 buf[4..8].copy_from_slice(&(new_fd as i32).to_le_bytes());
-                                write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+                                match write_sockopt_bytes(ctx, optval, optlen_ptr, &buf) {
+                                    Ok(()) => Ok(()),
+                                    Err(errno) => {
+                                        let _ = ctx.process.set_fd(new_fd, None);
+                                        Err(errno)
+                                    }
+                                }
                             }
                             Err(errno) => Err(errno),
                         }
