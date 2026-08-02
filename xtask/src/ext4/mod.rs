@@ -114,7 +114,7 @@ fn run_live_tier1(
         }
     }
 
-    run_g0_lints(root)?;
+    run_g0_lints(root, run)?;
 
     full_build::full_build(
         root,
@@ -350,18 +350,27 @@ impl Tier1Invocation {
     }
 }
 
-fn run_g0_lints(root: &Path) -> Result<()> {
+fn run_g0_lints(root: &Path, run: &mut run_workspace::RunWorkspace) -> Result<()> {
     for rule in G0_EXT4_LINTS {
-        run_cmd_owned_in(
-            root,
-            "cargo",
-            &[
-                "xtask".into(),
-                "lint".into(),
-                "invariants".into(),
-                (*rule).into(),
-            ],
-        )?;
+        let args = vec![
+            "xtask".into(),
+            "lint".into(),
+            "invariants".into(),
+            (*rule).into(),
+        ];
+        let (code, output) = run_capture(root, "cargo", &args)?;
+        let log_path = run.working_dir().join(format!("g0/{rule}.log"));
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+        let log = format!("$ cargo {}\nexit_code={code}\n{output}", shell_join(&args));
+        fs::write(&log_path, log)
+            .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
+        run.record_artifact(format!("g0-{rule}-log"), log_path)?;
+        if code != 0 {
+            return Err(format!("G0 lint {rule} exited with {code}"));
+        }
     }
     Ok(())
 }

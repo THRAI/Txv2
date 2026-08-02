@@ -51,6 +51,29 @@ fn tier1_verify_receipt_rejects_authority_artifact_sha_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_missing_g0_log_artifact() {
+    let root = temp_root("verify-receipt-missing-g0-log");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let artifacts_path = root.join("target/ext4/tier1/accepted-run/artifacts.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifacts_path).expect("read artifacts"))
+            .expect("parse artifacts");
+    manifest["artifacts"]
+        .as_array_mut()
+        .expect("artifacts array")
+        .retain(|artifact| artifact["name"] != "g0-ext4-lifecycle-ownership-log");
+    write_json(
+        &artifacts_path,
+        &serde_json::to_string_pretty(&manifest).expect("artifact manifest json"),
+    );
+    rewrite_receipt_artifact_manifest_sha(&root);
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing G0 log must fail");
+    assert!(error.contains("missing required artifact g0-ext4-lifecycle-ownership-log"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_tampered_artifact() {
     let root = temp_root("verify-receipt-tampered");
     let _cleanup = TempCleanup(root.clone());
@@ -166,6 +189,17 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         "authorities/ext4-tier1.scn".into(),
         "# ext4 tier1\n".into(),
     );
+    for rule in [
+        "ext4-lifecycle-ownership",
+        "ext4-no-direct-home-write",
+        "ext4-durability-flags",
+    ] {
+        add_artifact(
+            &format!("g0-{rule}-log"),
+            format!("g0/{rule}.log"),
+            format!("$ cargo xtask lint invariants {rule}\nexit_code=0\nok\n"),
+        );
+    }
 
     let (test_image, test_sha) =
         add_artifact("test-image", "test.img".into(), "test image\n".into());
@@ -548,4 +582,30 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         .expect("receipt lock json"),
     );
     receipt_path
+}
+
+fn rewrite_receipt_artifact_manifest_sha(root: &PathBuf) {
+    let run_dir = root.join("target/ext4/tier1/accepted-run");
+    let artifacts_path = run_dir.join("artifacts.json");
+    let artifacts_sha = sha256_file(&artifacts_path).expect("artifact manifest sha");
+    let receipt_path = run_dir.join("acceptance-receipt.json");
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).expect("read receipt"))
+            .expect("parse receipt");
+    receipt["artifact_manifest"]["sha256"] = serde_json::Value::String(artifacts_sha.clone());
+    write_json(
+        &receipt_path,
+        &serde_json::to_string_pretty(&receipt).expect("receipt json"),
+    );
+    let receipt_sha = sha256_file(&receipt_path).expect("receipt sha");
+    let mut lock: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("receipt-lock.json")).expect("read lock"),
+    )
+    .expect("parse lock");
+    lock["receipt"]["sha256"] = serde_json::Value::String(receipt_sha);
+    lock["artifact_manifest"]["sha256"] = serde_json::Value::String(artifacts_sha);
+    write_json(
+        &run_dir.join("receipt-lock.json"),
+        &serde_json::to_string_pretty(&lock).expect("lock json"),
+    );
 }

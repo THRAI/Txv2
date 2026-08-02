@@ -367,6 +367,9 @@ fn verify_required_log_artifacts(
     path: &Path,
 ) -> Result<()> {
     for name in [
+        "g0-ext4-lifecycle-ownership-log",
+        "g0-ext4-no-direct-home-write-log",
+        "g0-ext4-durability-flags-log",
         "crash-campaign-plan",
         "crash-cut-outcomes",
         "e2fsck-test-log",

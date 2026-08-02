@@ -1,3 +1,19 @@
+- 2026-08-02 (ext4 Tier 1 G0 lint evidence artifacts).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. Live Tier 1 G0 lints now write run-owned logs for
+  `ext4-lifecycle-ownership`, `ext4-no-direct-home-write`, and
+  `ext4-durability-flags`, recording each as an artifact before later
+  build/QEMU work. `--verify-receipt` now requires those three G0 log artifacts,
+  so a final G0-passed receipt must carry same-run lint evidence instead of
+  relying on an unlogged host command. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify --
+  --test-threads=1` (7), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (49), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --dry-run`, and the expected fail-closed live preflight
+  `task16-g0-log-preflight-20260802`. Task 16 still needs acceptance-ready
+  authority ledgers, a full fresh 1000-cut QEMU/e2fsck campaign, pinned
+  xfstests execution, and the verified immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 authority artifact binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. Live Tier 1 workspaces now stage the four authority inputs
