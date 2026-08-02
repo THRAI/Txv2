@@ -59,6 +59,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
+    verify_required_crash_cut_artifacts(&artifacts, receipt_path)?;
     Ok(())
 }
 
@@ -367,6 +368,34 @@ fn verify_required_log_artifacts(
                 "{}: missing required artifact {name}",
                 path.display()
             ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_required_crash_cut_artifacts(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    for idx in 0..1000 {
+        let cut_id = format!("crash-cut-{idx:04}");
+        for suffix in [
+            "job-request",
+            "executor-plan",
+            "result",
+            "serial",
+            "replay-serial",
+            "e2fsck-log",
+            "crash-image",
+            "replay-image",
+        ] {
+            let name = format!("{cut_id}-{suffix}");
+            if !artifacts.contains_key(&name) {
+                return Err(format!(
+                    "{}: missing required crash-cut artifact {name}",
+                    path.display()
+                ));
+            }
         }
     }
     Ok(())

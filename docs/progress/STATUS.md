@@ -1,3 +1,19 @@
+- 2026-08-02 (ext4 Tier 1 per-cut receipt evidence).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now requires every
+  `crash-cut-0000..0999` to carry the full artifact evidence package
+  (`job-request`, `executor-plan`, `result`, `serial`, `replay-serial`,
+  `e2fsck-log`, `crash-image`, and `replay-image`) in addition to replay-image
+  e2fsck coverage. The receipt verifier tests moved to
+  `xtask/src/ext4/receipt_verify_tests.rs`, keeping all ext4 xtask Rust files
+  under the 1,500-line hygiene ceiling. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (42),
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-crash-artifact-verify-preflight-20260802b`.
+  Task 16 still needs acceptance-ready authority ledgers, a full fresh
+  1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and the verified
+  immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 fault artifact timing).
   Advanced Task 16 crash-campaign evidence preservation without promoting final
   acceptance. Per-cut fault jobs now register `job-request.json` immediately
