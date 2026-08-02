@@ -1,3 +1,22 @@
+- 2026-08-02 (ext4 Tier 1 executor-plan contract binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now reconstructs
+  each fault executor shell-test command from the job request, requires staged
+  TEST/SCRATCH/WORKLOAD role images to live under the per-cut `roles/`
+  directory and match the source image digests, binds `preserved_images` to the
+  planned crash/replay/source paths, and requires executor-plan
+  `executed_checks` to equal the fault result `e2fsck_checks`. Regressions now
+  reject shell-command role drift, preserved-source drift, and executed-check
+  drift even when artifact hashes are updated. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify -- --test-threads=1`
+  (30), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`
+  (73), scoped rustfmt, `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`,
+  `git diff --check`, and the expected fail-closed live preflight
+  `task16-executor-plan-contract-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 executor-plan receipt binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now parses every

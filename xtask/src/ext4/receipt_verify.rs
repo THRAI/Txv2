@@ -1424,6 +1424,13 @@ fn verify_crash_cut_executor_plan(
     }
 
     let request_qemu = required_json_object(request, "qemu", job_request)?;
+    verify_executor_plan_staged_roles_and_command(
+        plan,
+        request,
+        request_job,
+        request_qemu,
+        executor_plan,
+    )?;
     let runner = required_json_object(plan, "runner", executor_plan)?;
     require_matching_json_string(runner, request_job, "serial_log", executor_plan)?;
     require_field_value(
@@ -1446,6 +1453,9 @@ fn verify_crash_cut_executor_plan(
     require_bool_value(hard_kill, "required", true, executor_plan)?;
     require_field_value(hard_kill, "status", "observed-by-shell-test", executor_plan)?;
 
+    verify_executor_plan_preserved_images(plan, plan_job, executor_plan)?;
+    verify_executor_plan_executed_checks(plan, result_path, executor_plan)?;
+
     let result = required_json_object(plan, "result", executor_plan)?;
     require_field_value(
         result,
@@ -1454,6 +1464,168 @@ fn verify_crash_cut_executor_plan(
         executor_plan,
     )?;
     require_field_value(result, "status", "written", executor_plan)?;
+    Ok(())
+}
+
+fn verify_executor_plan_staged_roles_and_command(
+    plan: &serde_json::Map<String, serde_json::Value>,
+    request: &serde_json::Map<String, serde_json::Value>,
+    request_job: &serde_json::Map<String, serde_json::Value>,
+    request_qemu: &serde_json::Map<String, serde_json::Value>,
+    executor_plan: &Path,
+) -> Result<()> {
+    let staged = required_json_object(plan, "staged_role_images", executor_plan)?;
+    let role_images = required_json_object(request, "role_images", executor_plan)?;
+    if staged.len() != 3 {
+        return Err(format!(
+            "{}: executor plan staged_role_images has {}, expected 3",
+            executor_plan.display(),
+            staged.len()
+        ));
+    }
+
+    let job_dir = executor_plan
+        .parent()
+        .ok_or_else(|| format!("{}: executor plan has no parent", executor_plan.display()))?;
+    for role in ["test", "scratch", "workload"] {
+        let source = PathBuf::from(required_json_string(role_images, role, executor_plan)?);
+        let expected_staged = job_dir.join("roles").join(format!("{role}.img"));
+        let staged_path = required_bound_path(staged, role, &expected_staged, executor_plan)?;
+        if !source.is_file() {
+            return Err(format!(
+                "{}: role image source is missing for {role}: {}",
+                executor_plan.display(),
+                source.display()
+            ));
+        }
+        if !staged_path.is_file() {
+            return Err(format!(
+                "{}: staged role image is missing for {role}: {}",
+                executor_plan.display(),
+                staged_path.display()
+            ));
+        }
+        let source_sha = sha256_file(&source)?;
+        let staged_sha = sha256_file(&staged_path)?;
+        if source_sha != staged_sha {
+            return Err(format!(
+                "{}: staged role image digest mismatch for {role}",
+                executor_plan.display()
+            ));
+        }
+    }
+
+    let serial_log = required_json_string(request_job, "serial_log", executor_plan)?;
+    let cut_marker = required_json_string(request_qemu, "cut_marker", executor_plan)?;
+    let timeout_ms = required_json_usize(request_qemu, "timeout_ms", executor_plan)?;
+    let expected = vec![
+        "cargo".to_string(),
+        "xtask".to_string(),
+        "shell-test".to_string(),
+        "--target".to_string(),
+        required_json_string(request_qemu, "target", executor_plan)?,
+        "--profile".to_string(),
+        required_json_string(request_qemu, "profile", executor_plan)?,
+        "--script".to_string(),
+        required_json_string(request_qemu, "script", executor_plan)?,
+        "--serial-log".to_string(),
+        serial_log,
+        "--timeout-ms".to_string(),
+        timeout_ms.to_string(),
+        "--stop-after-needle".to_string(),
+        cut_marker,
+        "--extra-rv64-ext4".to_string(),
+        required_json_string(staged, "test", executor_plan)?,
+        "--extra-rv64-ext4".to_string(),
+        required_json_string(staged, "scratch", executor_plan)?,
+        "--extra-rv64-ext4".to_string(),
+        required_json_string(staged, "workload", executor_plan)?,
+    ];
+    let actual = required_json_string_array(plan, "shell_test_command", executor_plan)?;
+    if actual != expected {
+        return Err(format!(
+            "{}: executor plan shell_test_command mismatch",
+            executor_plan.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_executor_plan_preserved_images(
+    plan: &serde_json::Map<String, serde_json::Value>,
+    plan_job: &serde_json::Map<String, serde_json::Value>,
+    executor_plan: &Path,
+) -> Result<()> {
+    let staged = required_json_object(plan, "staged_role_images", executor_plan)?;
+    let preserved = required_json_object(plan, "preserved_images", executor_plan)?;
+    if preserved.len() != 4 {
+        return Err(format!(
+            "{}: executor plan preserved_images has {}, expected 4",
+            executor_plan.display(),
+            preserved.len()
+        ));
+    }
+    require_field_value(
+        preserved,
+        "status",
+        "copied-after-runner-termination",
+        executor_plan,
+    )?;
+    required_bound_path(
+        preserved,
+        "crash",
+        &PathBuf::from(required_json_string(
+            plan_job,
+            "crash_image",
+            executor_plan,
+        )?),
+        executor_plan,
+    )?;
+    required_bound_path(
+        preserved,
+        "replay",
+        &PathBuf::from(required_json_string(
+            plan_job,
+            "replay_image",
+            executor_plan,
+        )?),
+        executor_plan,
+    )?;
+    required_bound_path(
+        preserved,
+        "source",
+        &PathBuf::from(required_json_string(staged, "scratch", executor_plan)?),
+        executor_plan,
+    )?;
+    Ok(())
+}
+
+fn verify_executor_plan_executed_checks(
+    plan: &serde_json::Map<String, serde_json::Value>,
+    result_path: &Path,
+    executor_plan: &Path,
+) -> Result<()> {
+    let result_json = read_json(result_path)?;
+    require_schema(&result_json, "tx.ext4.fault_job_result.v1", result_path)?;
+    let result = json_object(&result_json, "fault job result", result_path)?;
+    let actual = plan.get("executed_checks").ok_or_else(|| {
+        format!(
+            "{}: executor plan missing executed_checks",
+            executor_plan.display()
+        )
+    })?;
+    let expected = result.get("e2fsck_checks").ok_or_else(|| {
+        format!(
+            "{}: fault job result missing e2fsck_checks",
+            result_path.display()
+        )
+    })?;
+    if actual != expected {
+        return Err(format!(
+            "{}: executor plan executed_checks mismatch",
+            executor_plan.display()
+        ));
+    }
     Ok(())
 }
 
@@ -1830,6 +2002,25 @@ fn required_json_usize(
         .and_then(|raw| {
             usize::try_from(raw).map_err(|_| format!("{}: {key} out of range", path.display()))
         })
+}
+
+fn required_json_string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<Vec<String>> {
+    object
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing array {key}", path.display()))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: array {key} entries must be strings", path.display()))
+        })
+        .collect()
 }
 
 fn require_non_empty_array<'a>(

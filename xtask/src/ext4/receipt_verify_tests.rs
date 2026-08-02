@@ -438,6 +438,69 @@ fn tier1_verify_receipt_rejects_executor_plan_without_written_result() {
     assert!(error.contains("status must be `written`, found `not-written`"));
 }
 
+#[test]
+fn tier1_verify_receipt_rejects_executor_plan_shell_command_mismatch() {
+    let root = temp_root("verify-receipt-executor-plan-shell-command");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["shell_test_command"][17] = plan["staged_role_images"]["scratch"].clone();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("shell command drift must fail");
+    assert!(error.contains("executor plan shell_test_command mismatch"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_executor_plan_preserved_source_mismatch() {
+    let root = temp_root("verify-receipt-executor-plan-preserved-source");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["preserved_images"]["source"] = plan["staged_role_images"]["workload"].clone();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("preserved source drift must fail");
+    assert!(error.contains("job request source mismatch"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_executor_plan_executed_checks_mismatch() {
+    let root = temp_root("verify-receipt-executor-plan-executed-checks");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["executed_checks"][0]["exit_code"] = 1.into();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("executed check drift must fail");
+    assert!(error.contains("executor plan executed_checks mismatch"));
+}
+
 struct TempCleanup(PathBuf);
 
 impl Drop for TempCleanup {
@@ -822,6 +885,19 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         );
         let job_request_path = run_dir.join(format!("{cut_dir}/job-request.json"));
         let result_path = run_dir.join(format!("{cut_dir}/result.json"));
+        let staged_test_image = run_dir.join(format!("{cut_dir}/roles/test.img"));
+        let staged_scratch_image = run_dir.join(format!("{cut_dir}/roles/scratch.img"));
+        let staged_workload_image = run_dir.join(format!("{cut_dir}/roles/workload.img"));
+        write_text(&staged_test_image, "test image\n");
+        write_text(&staged_scratch_image, "scratch image\n");
+        write_text(&staged_workload_image, "workload image\n");
+        let e2fsck_checks = serde_json::json!([{
+            "tool": "e2fsck",
+            "args": ["-fn", replay_image.display().to_string()],
+            "log": e2fsck_log.display().to_string(),
+            "log_sha256": e2fsck_log_sha256,
+            "exit_code": 0
+        }]);
         add_artifact(
             &format!("{cut_id}-executor-plan"),
             format!("{cut_dir}/executor-plan.json"),
@@ -866,6 +942,34 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                         "expected": {"present": {"/": {}}}
                     }]
                 },
+                "staged_role_images": {
+                    "test": staged_test_image.display().to_string(),
+                    "scratch": staged_scratch_image.display().to_string(),
+                    "workload": staged_workload_image.display().to_string()
+                },
+                "shell_test_command": [
+                    "cargo",
+                    "xtask",
+                    "shell-test",
+                    "--target",
+                    "rv64-qemu",
+                    "--profile",
+                    "busybox",
+                    "--script",
+                    "tools/ext4/tier1/crash-workload.scn",
+                    "--serial-log",
+                    serial_log.display().to_string(),
+                    "--timeout-ms",
+                    "120000",
+                    "--stop-after-needle",
+                    "tx.ext4.crash.phase.D7",
+                    "--extra-rv64-ext4",
+                    staged_test_image.display().to_string(),
+                    "--extra-rv64-ext4",
+                    staged_scratch_image.display().to_string(),
+                    "--extra-rv64-ext4",
+                    staged_workload_image.display().to_string()
+                ],
                 "runner": {
                     "serial_log": serial_log.display().to_string(),
                     "cut_marker": "tx.ext4.crash.phase.D7",
@@ -876,6 +980,13 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                     "required": true,
                     "status": "observed-by-shell-test"
                 },
+                "preserved_images": {
+                    "crash": crash_image.display().to_string(),
+                    "replay": replay_image.display().to_string(),
+                    "source": staged_scratch_image.display().to_string(),
+                    "status": "copied-after-runner-termination"
+                },
+                "executed_checks": e2fsck_checks.clone(),
                 "result": {
                     "path": result_path.display().to_string(),
                     "status": "written"
@@ -953,13 +1064,7 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                 "hard_kill_observed": true,
                 "replay_attempted": true,
                 "e2fsck_exit": 0,
-                "e2fsck_checks": [{
-                    "tool": "e2fsck",
-                    "args": ["-fn", replay_image.display().to_string()],
-                    "log": e2fsck_log.display().to_string(),
-                    "log_sha256": e2fsck_log_sha256,
-                    "exit_code": 0
-                }],
+                "e2fsck_checks": e2fsck_checks,
                 "replay_matrix": [
                     {
                         "id": "linux-rw-replay",
