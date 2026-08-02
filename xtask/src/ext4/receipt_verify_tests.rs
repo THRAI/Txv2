@@ -62,6 +62,38 @@ fn tier1_verify_receipt_rejects_missing_g0_log_artifact() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_g0_lint_log_without_zero_exit() {
+    let root = temp_root("verify-receipt-g0-log-exit");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "g0-ext4-no-direct-home-write-log",
+        "$ cargo xtask lint invariants ext4-no-direct-home-write\nexit_code=1\nfound direct write\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("bad G0 exit must fail");
+    assert!(error.contains("G0 lint ext4-no-direct-home-write log missing exit_code=0"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_g0_lint_log_for_wrong_rule() {
+    let root = temp_root("verify-receipt-g0-log-wrong-rule");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "g0-ext4-durability-flags-log",
+        "$ cargo xtask lint invariants ext4-no-direct-home-write\nexit_code=0\nok\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("wrong G0 rule must fail");
+    assert!(error.contains(
+        "G0 lint log missing command `$ cargo xtask lint invariants ext4-durability-flags`"
+    ));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_missing_guest_matrix_serial_log() {
     let root = temp_root("verify-receipt-missing-guest-serial");
     let _cleanup = TempCleanup(root.clone());

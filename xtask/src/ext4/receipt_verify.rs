@@ -59,6 +59,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
+    verify_g0_lint_log_evidence(&artifacts, receipt_path)?;
     verify_xfstests_source_lock_evidence(&artifacts, receipt_path)?;
     verify_xfstests_log_evidence(receipt_object, &artifacts, receipt_path)?;
     verify_crash_cut_outcome_manifest(&artifacts, receipt_path)?;
@@ -439,6 +440,43 @@ fn verify_required_log_artifacts(
                 path.display()
             ));
         }
+    }
+    Ok(())
+}
+
+fn verify_g0_lint_log_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    for rule in [
+        "ext4-lifecycle-ownership",
+        "ext4-no-direct-home-write",
+        "ext4-durability-flags",
+    ] {
+        let artifact_name = format!("g0-{rule}-log");
+        let artifact = artifacts
+            .get(&artifact_name)
+            .ok_or_else(|| format!("{}: missing artifact {artifact_name}", path.display()))?;
+        let log = std::fs::read_to_string(&artifact.path)
+            .map_err(|err| format!("failed to read {}: {err}", artifact.path.display()))?;
+        verify_g0_lint_log(rule, &log, &artifact.path)?;
+    }
+    Ok(())
+}
+
+fn verify_g0_lint_log(rule: &str, log: &str, path: &Path) -> Result<()> {
+    let expected_command = format!("$ cargo xtask lint invariants {rule}");
+    if !log.lines().any(|line| line.trim() == expected_command) {
+        return Err(format!(
+            "{}: G0 lint log missing command `{expected_command}`",
+            path.display()
+        ));
+    }
+    if !log.lines().any(|line| line.trim() == "exit_code=0") {
+        return Err(format!(
+            "{}: G0 lint {rule} log missing exit_code=0",
+            path.display()
+        ));
     }
     Ok(())
 }
