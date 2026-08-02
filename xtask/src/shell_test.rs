@@ -54,6 +54,8 @@
 //! parses the script and prints group names without spawning QEMU.
 //! `--keep-going` runs every selected group even if an earlier one
 //! fails, and reports a per-group summary at the end.
+//! `--serial-log PATH` writes the captured QEMU console output to PATH
+//! after a sequential run, including failing or stop-after-needle runs.
 //!
 //! ## Parallel mode
 //!
@@ -108,6 +110,8 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let keep_going = args.iter().any(|a| a == "--keep-going");
     let parallel = args.iter().any(|a| a == "--parallel");
     let stop_after_needle = optional_option_value(&args, "--stop-after-needle");
+    let serial_log =
+        optional_option_value(&args, "--serial-log").map(|path| resolve_path(root, path.into()));
     let extra_rv64_ext4: Vec<PathBuf> = option_values(&args, "--extra-rv64-ext4")?
         .into_iter()
         .map(|path| resolve_path(root, PathBuf::from(path)))
@@ -157,6 +161,9 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
 
     if stop_after_needle.is_some() && parallel {
         return Err("--stop-after-needle is only supported in sequential mode".into());
+    }
+    if serial_log.is_some() && parallel {
+        return Err("--serial-log is only supported in sequential mode".into());
     }
 
     // Validate that every name passed to --group exists in the script.
@@ -395,6 +402,10 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
 
+    if let Some(path) = &serial_log {
+        write_serial_log(path, &buffer)?;
+    }
+
     let captured_bytes = buffer.lock().unwrap().len();
     let dump_captured = || {
         println!();
@@ -441,6 +452,15 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             Err(err)
         }
     }
+}
+
+fn write_serial_log(path: &Path, buffer: &Arc<Mutex<String>>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let captured = buffer.lock().unwrap().clone();
+    fs::write(path, captured).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 fn directives_quit(d: &[Directive]) -> bool {
@@ -1066,6 +1086,7 @@ fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn alpine_profile_uses_alpine_initramfs_and_cmdline() {
@@ -1160,6 +1181,41 @@ mod tests {
     }
 
     #[test]
+    fn shell_test_rejects_serial_log_parallel_mode() {
+        let root = temp_root("serial-log-parallel");
+        let script = root.join("script.scn");
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            &script,
+            r#"
+group one
+wait "never" within 1
+group two
+wait "never" within 1
+"#,
+        )
+        .expect("write script");
+
+        let error = shell_test(
+            &root,
+            vec![
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "alpine".into(),
+                "--script".into(),
+                script.display().to_string(),
+                "--parallel".into(),
+                "--serial-log".into(),
+                root.join("serial.log").display().to_string(),
+            ],
+        )
+        .expect_err("parallel serial log must be rejected before qemu");
+
+        assert!(error.contains("--serial-log is only supported in sequential mode"));
+    }
+
+    #[test]
     fn shell_test_can_append_kernel_cmdline_tokens() {
         let root = Path::new("/tmp/tx");
         let command = build_qemu_command(
@@ -1223,5 +1279,16 @@ mod tests {
 
         assert_eq!(out, b"\x1b:wq\n");
         assert!(start.elapsed() >= ESC_KEY_DELAY);
+    }
+
+    fn temp_root(suffix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tx-shell-test-{suffix}-{}-{unique}",
+            std::process::id()
+        ))
     }
 }

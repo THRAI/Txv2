@@ -46,8 +46,8 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
             command = module.build_shell_test_command(image, ROOT, dict(os.environ))
 
         self.assertEqual(command[:3], ["cargo", "xtask", "shell-test"])
-        self.assertIn("--ext4-scratch-image", command)
-        self.assertEqual(command[command.index("--ext4-scratch-image") + 1], str(image))
+        self.assertIn("--extra-rv64-ext4", command)
+        self.assertEqual(command[command.index("--extra-rv64-ext4") + 1], str(image))
         self.assertEqual(command[command.index("--script") + 1], str(TX_SCRIPT))
         self.assertEqual(command[command.index("--target") + 1], "rv64-qemu")
         self.assertEqual(command[command.index("--profile") + 1], "alpine")

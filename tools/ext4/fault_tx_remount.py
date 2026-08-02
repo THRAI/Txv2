@@ -64,7 +64,7 @@ def build_shell_test_command(image: Path, root: Path, env: dict[str, str]) -> li
         str(script),
         "--timeout-ms",
         timeout,
-        "--ext4-scratch-image",
+        "--extra-rv64-ext4",
         str(image),
     ]
 

@@ -162,12 +162,25 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
         self.assertEqual(executor_plan["runner"]["serial_log"], str(job_dir / "serial.log"))
         self.assertEqual(executor_plan["runner"]["cwd"], str(ROOT))
         self.assertEqual(executor_plan["hard_kill"]["marker"], "tx-ext4-fault-cut:write_fsync:after-commit")
-        self.assertIn("--fault-cut-marker", executor_plan["shell_test_command"])
+        self.assertIn("--stop-after-needle", executor_plan["shell_test_command"])
         self.assertEqual(
             executor_plan["shell_test_command"][
-                executor_plan["shell_test_command"].index("--fault-cut-marker") + 1
+                executor_plan["shell_test_command"].index("--stop-after-needle") + 1
             ],
             "tx-ext4-fault-cut:write_fsync:after-commit",
+        )
+        extra_images = [
+            executor_plan["shell_test_command"][idx + 1]
+            for idx, arg in enumerate(executor_plan["shell_test_command"])
+            if arg == "--extra-rv64-ext4"
+        ]
+        self.assertEqual(
+            extra_images,
+            [
+                str(job_dir / "roles" / "test.img"),
+                str(job_dir / "roles" / "scratch.img"),
+                str(job_dir / "roles" / "workload.img"),
+            ],
         )
         self.assertFalse((job_dir / "result.json").exists())
 

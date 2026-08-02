@@ -124,13 +124,13 @@ def write_executor_plan(request_path: Path, request: dict[str, Any]) -> Path:
         serial_log,
         "--timeout-ms",
         str(require_positive_int(qemu, "timeout_ms")),
-        "--fault-cut-marker",
+        "--stop-after-needle",
         cut_marker,
-        "--ext4-test-image",
+        "--extra-rv64-ext4",
         staged["test"],
-        "--ext4-scratch-image",
+        "--extra-rv64-ext4",
         staged["scratch"],
-        "--ext4-workload-image",
+        "--extra-rv64-ext4",
         staged["workload"],
     ]
     plan = {

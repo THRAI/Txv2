@@ -1,3 +1,18 @@
+- 2026-08-02 (ext4 Tier 1 fault executor shell-test contract).
+  Advanced Task 16 crash-runner executability without promoting final
+  acceptance. `cargo xtask shell-test` now supports `--serial-log PATH` for
+  sequential runs, so repository-owned fault jobs can retain per-cut serial
+  evidence from the same captured console stream used by the script assertions.
+  The fault QEMU executor and Tx remount replay runner now call the current
+  shell-test interface (`--stop-after-needle` and repeated
+  `--extra-rv64-ext4`) instead of stale role-specific flags, keeping role
+  ordering in the executor while preserving shell-test's generic image API.
+  Verification passed `CARGO_INCREMENTAL=0 cargo test -p xtask shell_test --
+  --test-threads=1`, `python3 tools/tests/test_ext4_fault_qemu_executor.py`,
+  and `python3 tools/tests/test_ext4_fault_matrix_runners.py`. Task 16 still
+  needs the live 1000-cut crash/e2fsck/xfstests campaign and immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 crash executor live path).
   Wired the live crash-campaign executor into `run_live_tier1`: each cut now
   stages a fresh immutable copy from SCRATCH, boots a two-drive QEMU
