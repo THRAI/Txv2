@@ -1346,8 +1346,8 @@ fn verify_crash_cut_job_result(
         &crash_cut_artifact_path(cut_id, "e2fsck-log", artifacts, path)?,
         &job_request,
     )?;
-    require_non_empty_array(job, "replay_matrix", &job_request)?;
-    require_non_empty_array(job, "semantic_oracles", &job_request)?;
+    verify_job_request_replay_matrix(job, cut_id, artifacts, path, &job_request)?;
+    verify_job_request_semantic_oracle(job, cut_id, artifacts, path, &job_request)?;
     parse_fault_job_result(
         &result,
         &case_id,
@@ -1359,6 +1359,188 @@ fn verify_crash_cut_job_result(
         &phase_marker,
         &e2fsck_log,
     )?;
+    Ok(())
+}
+
+fn verify_job_request_replay_matrix(
+    job: &serde_json::Map<String, serde_json::Value>,
+    cut_id: &str,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+    job_request: &Path,
+) -> Result<()> {
+    let entries = require_non_empty_array(job, "replay_matrix", job_request)?;
+    let expected = [
+        (
+            "linux-rw-replay",
+            "linux-rw-replay-image",
+            None,
+            "linux-rw-replay-log",
+        ),
+        (
+            "linux-post-replay-e2fsck",
+            "linux-rw-replay-image",
+            Some("linux-rw-replay-image"),
+            "linux-post-replay-e2fsck-log",
+        ),
+        ("tx-remount", "tx-remount-image", None, "tx-remount-log"),
+    ];
+    if entries.len() != expected.len() {
+        return Err(format!(
+            "{}: job request replay_matrix has {}, expected {}",
+            job_request.display(),
+            entries.len(),
+            expected.len()
+        ));
+    }
+    for (entry, (expected_id, image_suffix, args_image_suffix, log_suffix)) in
+        entries.iter().zip(expected)
+    {
+        let entry = entry.as_object().ok_or_else(|| {
+            format!(
+                "{}: job request replay_matrix entry must be an object",
+                job_request.display()
+            )
+        })?;
+        require_job_request_observation_entry(
+            entry,
+            "replay_matrix",
+            expected_id,
+            &crash_cut_artifact_path(cut_id, image_suffix, artifacts, path)?,
+            &crash_cut_artifact_path(cut_id, log_suffix, artifacts, path)?,
+            job_request,
+        )?;
+        if let Some(args_image_suffix) = args_image_suffix {
+            let image = crash_cut_artifact_path(cut_id, args_image_suffix, artifacts, path)?;
+            let args = entry
+                .get("args")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| {
+                    format!(
+                        "{}: job request replay_matrix {expected_id} missing args",
+                        job_request.display()
+                    )
+                })?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        format!(
+                            "{}: job request replay_matrix {expected_id} args must be strings",
+                            job_request.display()
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if args != ["-fn", image.display().to_string().as_str()] {
+                return Err(format!(
+                    "{}: job request replay_matrix {expected_id} args mismatch",
+                    job_request.display()
+                ));
+            }
+        } else if entry.contains_key("args") {
+            return Err(format!(
+                "{}: job request replay_matrix {expected_id} must not declare args",
+                job_request.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_job_request_semantic_oracle(
+    job: &serde_json::Map<String, serde_json::Value>,
+    cut_id: &str,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+    job_request: &Path,
+) -> Result<()> {
+    let entries = require_non_empty_array(job, "semantic_oracles", job_request)?;
+    if entries.len() != 1 {
+        return Err(format!(
+            "{}: job request semantic_oracles has {}, expected 1",
+            job_request.display(),
+            entries.len()
+        ));
+    }
+    let expected_image = crash_cut_artifact_path(cut_id, "semantic-oracle-image", artifacts, path)?;
+    let expected_log = crash_cut_artifact_path(cut_id, "semantic-oracle-log", artifacts, path)?;
+    let entry = entries[0].as_object().ok_or_else(|| {
+        format!(
+            "{}: job request semantic_oracles entry must be an object",
+            job_request.display()
+        )
+    })?;
+    verify_job_request_semantic_oracle_entry(entry, &expected_image, &expected_log, job_request)?;
+
+    let oracle_request =
+        crash_cut_artifact_path(cut_id, "semantic-oracle-request", artifacts, path)?;
+    let oracle_json = read_json(&oracle_request)?;
+    require_schema(
+        &oracle_json,
+        "tx.ext4.fault_semantic_oracle_request.v1",
+        &oracle_request,
+    )?;
+    let oracle = json_object(&oracle_json, "semantic oracle request", &oracle_request)?;
+    verify_job_request_semantic_oracle_entry(
+        oracle,
+        &expected_image,
+        &expected_log,
+        &oracle_request,
+    )
+}
+
+fn verify_job_request_semantic_oracle_entry(
+    entry: &serde_json::Map<String, serde_json::Value>,
+    expected_image: &Path,
+    expected_log: &Path,
+    path: &Path,
+) -> Result<()> {
+    require_job_request_observation_entry(
+        entry,
+        "semantic_oracles",
+        "debugfs-file-hash-namespace",
+        expected_image,
+        expected_log,
+        path,
+    )?;
+    let expected = entry.get("expected").ok_or_else(|| {
+        format!(
+            "{}: job request semantic_oracles debugfs-file-hash-namespace missing expected",
+            path.display()
+        )
+    })?;
+    if expected
+        != &serde_json::json!({
+            "present": {
+                "/": {}
+            }
+        })
+    {
+        return Err(format!(
+            "{}: job request semantic_oracles debugfs-file-hash-namespace expected mismatch",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_job_request_observation_entry(
+    entry: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    expected_id: &str,
+    expected_image: &Path,
+    expected_log: &Path,
+    path: &Path,
+) -> Result<()> {
+    let id = required_json_string(entry, "id", path)?;
+    if id != expected_id {
+        return Err(format!(
+            "{}: job request {field} id mismatch: expected {expected_id}, found {id}",
+            path.display()
+        ));
+    }
+    required_bound_path(entry, "image", expected_image, path)?;
+    required_bound_path(entry, "log", expected_log, path)?;
     Ok(())
 }
 
@@ -1405,6 +1587,13 @@ fn required_e2fsck_log_path(
     path: &Path,
 ) -> Result<PathBuf> {
     let checks = require_non_empty_array(job, "checks", path)?;
+    if checks.len() != 1 {
+        return Err(format!(
+            "{}: job request e2fsck checks has {}, expected 1",
+            path.display(),
+            checks.len()
+        ));
+    }
     let check = checks[0].as_object().ok_or_else(|| {
         format!(
             "{}: job request e2fsck check must be an object",

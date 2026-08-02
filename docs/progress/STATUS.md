@@ -1,3 +1,21 @@
+- 2026-08-02 (ext4 Tier 1 job-request matrix binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now validates each
+  per-cut fault job request `replay_matrix` and `semantic_oracles` entry against
+  the same run-owned artifact paths used by the result parser, requires the
+  e2fsck request `checks` array to contain exactly the single `-fn`
+  replay-image check, and parses the semantic-oracle request artifact body. This
+  closes the gap where a receipt could pair a valid result with a weaker or
+  mismatched request declaration. Verification passed `CARGO_INCREMENTAL=0 cargo
+  test -p xtask receipt_verify -- --test-threads=1` (26),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (69),
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, `git diff --check`,
+  and the expected fail-closed live preflight
+  `task16-job-request-matrix-bind-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 run-owned artifact path binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now canonicalizes

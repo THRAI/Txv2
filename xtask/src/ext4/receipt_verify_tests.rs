@@ -395,6 +395,28 @@ fn tier1_verify_receipt_rejects_missing_per_cut_serial_artifact() {
     assert!(error.contains("artifact crash-cut-0000-serial is missing"));
 }
 
+#[test]
+fn tier1_verify_receipt_rejects_job_request_replay_matrix_mismatch() {
+    let root = temp_root("verify-receipt-job-request-replay-matrix");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let request_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/job-request.json");
+    let mut request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&request_path).expect("read job request"))
+            .expect("parse job request");
+    request["job"]["replay_matrix"][0]["image"] =
+        request["job"]["replay_image"].as_str().unwrap().into();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-job-request",
+        &serde_json::to_string_pretty(&request).expect("job request json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("mismatched request must fail");
+    assert!(error.contains("job request image mismatch"));
+}
+
 struct TempCleanup(PathBuf);
 
 impl Drop for TempCleanup {
