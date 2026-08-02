@@ -1,3 +1,20 @@
+- 2026-08-02 (ext4 Tier 1 pinned xfstests source materialized).
+  Reduced one Task 16 live-preflight blocker without promoting final
+  acceptance. `cargo xtask ext4 tier1 --preflight-live` now supports
+  `--materialize-xfstests`, which clones/checks out the manifest-pinned
+  xfstests source into ignored local state at `external/xfstests` and verifies
+  the `check` script sha256 before reporting readiness. The current checkout
+  now has `external/xfstests` at
+  `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509`, with `check` sha256
+  `104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642`.
+  The live report
+  `target/ext4/tier1/preflight/task16-xfstests-materialize-20260802.json`
+  shows `xfstests_source_prepared=true` and the expected remaining three
+  blockers: placeholder xfstests authority status, placeholder crash-cut
+  authority status, and macOS lacking Linux/root replay. Task 16 still needs
+  acceptance-ready authorities, a full fresh 1000-cut QEMU/e2fsck campaign,
+  pinned xfstests execution, and the verified immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 preflight report artifact).
   Advanced Task 16 live readiness auditing without promoting final acceptance.
   `cargo xtask ext4 tier1 --preflight-live` now accepts

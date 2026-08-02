@@ -1,5 +1,7 @@
 /target/
 /tools/images/vendor/
+/external/xfstests/
+/external/.xfstests.tmp/
 /.cache/
 **/.venv/
 __pycache__/

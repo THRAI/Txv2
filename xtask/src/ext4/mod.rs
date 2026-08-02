@@ -11,6 +11,7 @@ use crate::util::{
 };
 
 mod crash_campaign;
+mod live_preflight;
 mod receipt;
 mod receipt_verify;
 mod run_workspace;
@@ -21,6 +22,7 @@ pub(crate) use crash_campaign::{
     CrashCutCampaignEvidence, CrashCutOutcome, crash_cut_shell_test_args, parse_fault_job_result,
     run_crash_cut_campaign, write_fault_job_request,
 };
+use live_preflight::run_live_preflight;
 pub(crate) use receipt_verify::verify_tier1_receipt;
 
 const G0_EXT4_LINTS: &[&str] = &[
@@ -58,6 +60,7 @@ fn tier1(root: &Path, args: &[String]) -> Result<()> {
             root,
             &invocation.run_id,
             invocation.preflight_report.as_deref(),
+            invocation.materialize_xfstests,
             &invocation.authorities,
         );
     }
@@ -305,6 +308,7 @@ struct Tier1Invocation {
     dry_run: bool,
     preflight_live: bool,
     preflight_report: Option<PathBuf>,
+    materialize_xfstests: bool,
     authorities: Tier1Authorities,
 }
 
@@ -383,274 +387,6 @@ impl Tier1Invocation {
     }
 }
 
-fn run_live_preflight(
-    root: &Path,
-    run_id: &str,
-    report_path: Option<&Path>,
-    authorities: &Tier1Authorities,
-) -> Result<()> {
-    let mut blockers = Vec::new();
-    println!("ext4 tier1: live-preflight");
-    collect_authority_preflight(authorities, &mut blockers);
-    collect_tool_preflight(root, authorities, &mut blockers);
-    collect_xfstests_preflight(root, authorities, &mut blockers);
-    collect_linux_replay_preflight(&mut blockers);
-    if let Some(report_path) = report_path {
-        write_live_preflight_report(root, run_id, authorities, &blockers, report_path)?;
-        println!(
-            "ext4 tier1: live-preflight report {}",
-            report_path.display()
-        );
-    }
-    if blockers.is_empty() {
-        println!("ext4 tier1: live-preflight ok");
-        Ok(())
-    } else {
-        for blocker in &blockers {
-            println!("ext4 tier1: live-preflight blocker: {blocker}");
-        }
-        Err(format!(
-            "live ext4 Tier 1 preflight blocked: {}",
-            blockers.join("; ")
-        ))
-    }
-}
-
-fn write_live_preflight_report(
-    root: &Path,
-    run_id: &str,
-    authorities: &Tier1Authorities,
-    blockers: &[String],
-    report_path: &Path,
-) -> Result<()> {
-    let path = resolve_repo_path(root, report_path.to_path_buf());
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-    }
-    let generated_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    let value = serde_json::json!({
-        "schema": "tx.ext4.tier1_live_preflight.v1",
-        "run_id": run_id,
-        "generated_unix_ms": generated_unix_ms,
-        "host": {
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-        },
-        "authorities": {
-            "capability_ledger": {
-                "path": authorities.capability.path.display().to_string(),
-                "sha256": authorities.capability.sha256,
-            },
-            "xfstests_selection": {
-                "path": authorities.selection.file.path.display().to_string(),
-                "sha256": authorities.selection.sha256(),
-                "status": authorities.selection.status,
-                "selected_count": authorities.selection.case_count,
-                "source_lock": {
-                    "path": authorities.selection.source_lock.path.display().to_string(),
-                    "revision": authorities.selection.source_lock.revision,
-                    "check_sha256": authorities.selection.source_lock.check_sha256,
-                },
-            },
-            "crash_cut_catalog": {
-                "path": authorities.crash_cuts.file.path.display().to_string(),
-                "sha256": authorities.crash_cuts.sha256(),
-                "status": authorities.crash_cuts.status,
-                "expanded_cut_count": authorities.crash_cuts.expanded_cut_count,
-                "campaign_declared": authorities.crash_cuts.campaign.is_some(),
-            },
-            "shell_scenario": {
-                "path": authorities.shell_scenario.path.display().to_string(),
-                "sha256": authorities.shell_scenario.sha256,
-            },
-        },
-        "result": {
-            "ready": blockers.is_empty(),
-            "blocker_count": blockers.len(),
-            "blockers": blockers,
-            "acceptance_receipt_generated": false,
-        },
-    });
-    let text = serde_json::to_string_pretty(&value)
-        .map_err(|err| format!("failed to encode live preflight report: {err}"))?;
-    fs::write(&path, text + "\n")
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))
-}
-
-fn collect_authority_preflight(authorities: &Tier1Authorities, blockers: &mut Vec<String>) {
-    if let Some(blocker) = authorities.selection.live_acceptance_blocker() {
-        blockers.push(blocker);
-    }
-    if let Some(blocker) = authorities.crash_cuts.live_acceptance_blocker() {
-        blockers.push(blocker);
-    }
-}
-
-fn collect_tool_preflight(root: &Path, authorities: &Tier1Authorities, blockers: &mut Vec<String>) {
-    for tool in ["cargo", "git", "python3", "qemu-system-riscv64"] {
-        if !command_exists(tool) {
-            blockers.push(format!("{tool} is required for live Tier 1 execution"));
-        }
-    }
-    if command_or_candidates(
-        "e2fsck",
-        &[
-            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
-            "/opt/homebrew/sbin/e2fsck",
-            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/e2fsck",
-            "/usr/local/opt/e2fsprogs/sbin/e2fsck",
-            "/usr/local/sbin/e2fsck",
-        ],
-    )
-    .is_none()
-    {
-        blockers.push("e2fsck is required for live Tier 1 execution".into());
-    }
-    if command_or_candidates(
-        "debugfs",
-        &[
-            "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
-            "/opt/homebrew/sbin/debugfs",
-            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/debugfs",
-            "/usr/local/opt/e2fsprogs/sbin/debugfs",
-            "/usr/local/sbin/debugfs",
-        ],
-    )
-    .is_none()
-    {
-        blockers.push("debugfs is required for semantic oracle verification".into());
-    }
-    for relative in [
-        "tools/ext4/fault_qemu_executor.py",
-        "tools/ext4/fault_linux_rw_replay.py",
-        "tools/ext4/fault_tx_remount.py",
-        "tools/ext4/fault_semantic_oracle.py",
-    ] {
-        let path = root.join(relative);
-        if !path_is_executable(&path) {
-            blockers.push(format!(
-                "repository runner is not executable: {}",
-                path.display()
-            ));
-        }
-    }
-    if let Some(campaign) = &authorities.crash_cuts.campaign {
-        if let Err(err) = verify_campaign_markers(root, &authorities.crash_cuts.families, campaign)
-        {
-            blockers.push(err);
-        }
-    }
-}
-
-fn collect_xfstests_preflight(
-    root: &Path,
-    authorities: &Tier1Authorities,
-    blockers: &mut Vec<String>,
-) {
-    let source_root = authorities.selection.source_lock.root_path(root);
-    if !source_root.exists() {
-        blockers.push(format!(
-            "pinned xfstests source is missing at {}; clone before live preflight can prove execution readiness",
-            source_root.display()
-        ));
-        return;
-    }
-    if let Err(err) = verify_xfstests_source_lock(&source_root, &authorities.selection.source_lock)
-    {
-        blockers.push(format!("pinned xfstests source is not ready: {err}"));
-    }
-}
-
-fn collect_linux_replay_preflight(blockers: &mut Vec<String>) {
-    if std::env::consts::OS != "linux" {
-        blockers.push(format!(
-            "Linux RW replay requires a Linux host; current host is {}",
-            std::env::consts::OS
-        ));
-        return;
-    }
-    match current_uid() {
-        Ok(0) => {}
-        Ok(uid) => blockers.push(format!(
-            "Linux RW replay requires root for a loop mount; current uid is {uid}"
-        )),
-        Err(err) => blockers.push(err),
-    }
-    for tool in ["mount", "umount"] {
-        if !command_exists(tool) {
-            blockers.push(format!("Linux RW replay requires tool: {tool}"));
-        }
-    }
-}
-
-fn current_uid() -> Result<u32> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|err| format!("failed to run id -u for live preflight: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "id -u failed during live preflight with {}",
-            output.status
-        ));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim()
-        .parse::<u32>()
-        .map_err(|err| format!("failed to parse id -u output `{}`: {err}", text.trim()))
-}
-
-fn path_is_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn verify_campaign_markers(
-    root: &Path,
-    families: &[CrashCutFamily],
-    campaign: &CrashCutCampaignPlan,
-) -> Result<()> {
-    let script = root.join(&campaign.workload_script);
-    let text = fs::read_to_string(&script).map_err(|err| {
-        format!(
-            "failed to read crash workload script {}: {err}",
-            script.display()
-        )
-    })?;
-    for family in families {
-        let Some(marker) = &family.phase_marker else {
-            return Err(format!(
-                "crash family {} is missing a phase marker",
-                family.id
-            ));
-        };
-        if !text.contains(marker) {
-            return Err(format!(
-                "crash workload script {} does not contain phase marker {}",
-                script.display(),
-                marker
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn run_g0_lints(root: &Path, run: &mut run_workspace::RunWorkspace) -> Result<()> {
     for rule in G0_EXT4_LINTS {
         let args = vec![
@@ -711,6 +447,7 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
         match args[idx].as_str() {
             "--dry-run" => idx += 1,
             "--preflight-live" => idx += 1,
+            "--materialize-xfstests" => idx += 1,
             "--preflight-report" => {
                 let Some(value) = args.get(idx + 1) else {
                     return Err("option --preflight-report needs a value".into());
@@ -739,6 +476,7 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
     }
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
     let preflight_live = args.iter().any(|arg| arg == "--preflight-live");
+    let materialize_xfstests = args.iter().any(|arg| arg == "--materialize-xfstests");
     if dry_run && preflight_live {
         return Err("ext4 tier1 accepts only one of --dry-run or --preflight-live".into());
     }
@@ -748,6 +486,9 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
     if preflight_report.is_some() && !preflight_live {
         return Err("ext4 tier1 --preflight-report requires --preflight-live".into());
     }
+    if materialize_xfstests && !preflight_live {
+        return Err("ext4 tier1 --materialize-xfstests requires --preflight-live".into());
+    }
     let run_id = optional_option_value(args, "--run-id").unwrap_or_else(|| "tier1-dry-run".into());
     let authorities = Tier1Authorities::load(root)?;
     Ok(Tier1Invocation {
@@ -755,6 +496,7 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
         dry_run,
         preflight_live,
         preflight_report,
+        materialize_xfstests,
         authorities,
     })
 }
@@ -791,10 +533,10 @@ fn resolve_repo_path(root: &Path, path: PathBuf) -> PathBuf {
 
 #[derive(Debug)]
 struct Tier1Authorities {
-    capability: AuthorityFile,
-    selection: XfstestsSelection,
-    crash_cuts: CrashCutCatalog,
-    shell_scenario: AuthorityFile,
+    pub(super) capability: AuthorityFile,
+    pub(super) selection: XfstestsSelection,
+    pub(super) crash_cuts: CrashCutCatalog,
+    pub(super) shell_scenario: AuthorityFile,
 }
 
 impl Tier1Authorities {
@@ -843,9 +585,9 @@ impl Tier1Authorities {
 }
 
 #[derive(Debug)]
-struct AuthorityFile {
-    path: PathBuf,
-    sha256: String,
+pub(super) struct AuthorityFile {
+    pub(super) path: PathBuf,
+    pub(super) sha256: String,
 }
 
 impl AuthorityFile {
@@ -861,18 +603,18 @@ impl AuthorityFile {
 
 #[derive(Debug)]
 struct XfstestsSelection {
-    file: AuthorityFile,
-    status: String,
-    source_lock: XfstestsSourceLock,
-    case_count: usize,
+    pub(super) file: AuthorityFile,
+    pub(super) status: String,
+    pub(super) source_lock: XfstestsSourceLock,
+    pub(super) case_count: usize,
     cases: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-struct XfstestsSourceLock {
-    path: PathBuf,
-    revision: String,
-    check_sha256: String,
+pub(super) struct XfstestsSourceLock {
+    pub(super) path: PathBuf,
+    pub(super) revision: String,
+    pub(super) check_sha256: String,
 }
 
 #[derive(Debug)]
@@ -942,11 +684,11 @@ impl XfstestsSelection {
         })
     }
 
-    fn sha256(&self) -> &str {
+    pub(super) fn sha256(&self) -> &str {
         &self.file.sha256
     }
 
-    fn live_acceptance_blocker(&self) -> Option<String> {
+    pub(super) fn live_acceptance_blocker(&self) -> Option<String> {
         if self.status == "acceptance-ready" {
             None
         } else {
@@ -1006,7 +748,7 @@ impl XfstestsSourceLock {
         })
     }
 
-    fn root_path(&self, root: &Path) -> PathBuf {
+    pub(super) fn root_path(&self, root: &Path) -> PathBuf {
         root.join(&self.path)
     }
 
@@ -1033,22 +775,22 @@ impl XfstestsSourceLock {
 
 #[derive(Debug)]
 pub(crate) struct CrashCutCatalog {
-    file: AuthorityFile,
-    status: String,
-    expanded_cut_count: usize,
-    families: Vec<CrashCutFamily>,
-    campaign: Option<CrashCutCampaignPlan>,
+    pub(super) file: AuthorityFile,
+    pub(super) status: String,
+    pub(super) expanded_cut_count: usize,
+    pub(super) families: Vec<CrashCutFamily>,
+    pub(super) campaign: Option<CrashCutCampaignPlan>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CrashCutFamily {
-    id: String,
-    phase_marker: Option<String>,
+    pub(super) id: String,
+    pub(super) phase_marker: Option<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CrashCutCampaignPlan {
-    workload_script: PathBuf,
+    pub(super) workload_script: PathBuf,
     workload_script_sha256: String,
     replay_script: PathBuf,
     replay_script_sha256: String,
@@ -1136,11 +878,11 @@ impl CrashCutCatalog {
         })
     }
 
-    fn sha256(&self) -> &str {
+    pub(super) fn sha256(&self) -> &str {
         &self.file.sha256
     }
 
-    fn live_acceptance_blocker(&self) -> Option<String> {
+    pub(super) fn live_acceptance_blocker(&self) -> Option<String> {
         if self.status != "acceptance-ready" {
             return Some(format!(
                 "crash-cut catalog status is `{}`; expected `acceptance-ready`",
@@ -1391,7 +1133,7 @@ fn ensure_xfstests_root(
     Ok(clone_dir)
 }
 
-fn verify_xfstests_source_lock(
+pub(super) fn verify_xfstests_source_lock(
     xfstests_root: &Path,
     source_lock: &XfstestsSourceLock,
 ) -> Result<()> {

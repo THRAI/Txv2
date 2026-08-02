@@ -317,6 +317,7 @@ fn tier1_parse_accepts_live_preflight_mode() {
 
     assert!(invocation.preflight_live);
     assert!(!invocation.dry_run);
+    assert!(!invocation.materialize_xfstests);
 }
 
 #[test]
@@ -335,6 +336,17 @@ fn tier1_parse_rejects_preflight_report_without_live_preflight() {
     .expect_err("preflight report only applies to live preflight");
 
     assert!(error.contains("--preflight-report requires --preflight-live"));
+}
+
+#[test]
+fn tier1_parse_rejects_materialize_xfstests_without_live_preflight() {
+    let root = temp_root("materialize-without-live");
+    write_tier1_authority_fixture(&root);
+
+    let error = parse_tier1_args(&root, &["tier1".into(), "--materialize-xfstests".into()])
+        .expect_err("materialize only applies to live preflight");
+
+    assert!(error.contains("--materialize-xfstests requires --preflight-live"));
 }
 
 #[test]
@@ -361,7 +373,7 @@ fn tier1_live_preflight_reports_later_blockers_with_placeholder_authorities() {
     write_tier1_authority_fixture(&root);
     let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
 
-    let error = run_live_preflight(&root, "preflight-placeholder", None, &authorities)
+    let error = run_live_preflight(&root, "preflight-placeholder", None, false, &authorities)
         .expect_err("placeholder preflight must fail");
 
     assert!(error.contains("xfstests selection status is `selection-authority-declared`"));
@@ -376,7 +388,7 @@ fn tier1_live_preflight_writes_durable_blocker_report() {
     let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
     let report = root.join("target/ext4/tier1/preflight/report.json");
 
-    let error = run_live_preflight(&root, "report-run", Some(&report), &authorities)
+    let error = run_live_preflight(&root, "report-run", Some(&report), false, &authorities)
         .expect_err("placeholder preflight must fail");
 
     assert!(error.contains("pinned xfstests source is missing"));
@@ -400,6 +412,58 @@ fn tier1_live_preflight_writes_durable_blocker_report() {
                 .unwrap()
                 .contains("pinned xfstests source is missing"))
     );
+}
+
+#[test]
+fn tier1_live_preflight_materialize_verifies_existing_pinned_source() {
+    let root = temp_root("preflight-materialize-existing");
+    write_tier1_authority_fixture(&root);
+    let xfstests = root.join("external/xfstests");
+    fs::create_dir_all(&xfstests).unwrap();
+    write_text(&xfstests.join("check"), "#!/bin/sh\nexit 0\n");
+    run_git(&xfstests, &["init"]);
+    run_git(&xfstests, &["add", "check"]);
+    run_git(
+        &xfstests,
+        &[
+            "commit",
+            "-m",
+            "pin check",
+            "--author",
+            "Tx Test <tx@example.invalid>",
+        ],
+    );
+    let revision = git_output(&xfstests, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let check_sha256 = sha256_file(&xfstests.join("check")).unwrap();
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        &format!(
+            r#"{{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"selection-authority-declared",
+          "tier":"tier1",
+          "source_lock":{{
+            "path":"external/xfstests",
+            "revision":"{revision}",
+            "check_sha256":"{check_sha256}"
+          }},
+          "selected":[{{"case_id":"generic/001"}}]
+        }}"#
+        ),
+    );
+    let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
+    let report = root.join("target/ext4/tier1/preflight/materialized.json");
+
+    let error = run_live_preflight(&root, "materialized-run", Some(&report), true, &authorities)
+        .expect_err("placeholder authorities still block");
+
+    assert!(!error.contains("pinned xfstests source is missing"));
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(value["preflight"]["materialize_xfstests_requested"], true);
+    assert_eq!(value["preflight"]["xfstests_source_prepared"], true);
 }
 
 #[test]

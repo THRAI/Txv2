@@ -418,6 +418,8 @@
       ],
       "paths": [
         "tools/ext4/tier1",
+        ".gitignore",
+        "xtask/src/ext4/live_preflight.rs",
         "docs/progress/research/2026-07-30-ext4-tier1-acceptance.md",
         "docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json",
         "docs/progress/STATUS.md"
@@ -448,6 +450,11 @@
         "CARGO_INCREMENTAL=0 cargo xtask --help | rg \"ext4 tier1\"",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-preflight-report-20260802 --preflight-report target/ext4/tier1/preflight/task16-preflight-report-20260802.json",
         "jq '{schema, run_id, ready: .result.ready, blocker_count: .result.blocker_count, receipt: .result.acceptance_receipt_generated, xfstests_status: .authorities.xfstests_selection.status, crash_status: .authorities.crash_cut_catalog.status}' target/ext4/tier1/preflight/task16-preflight-report-20260802.json",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --materialize-xfstests --run-id task16-xfstests-materialize-20260802 --preflight-report target/ext4/tier1/preflight/task16-xfstests-materialize-20260802.json",
+        "jq '{schema, run_id, ready: .result.ready, blocker_count: .result.blocker_count, materialize_requested: .preflight.materialize_xfstests_requested, xfstests_prepared: .preflight.xfstests_source_prepared, blockers: .result.blockers}' target/ext4/tier1/preflight/task16-xfstests-materialize-20260802.json",
+        "git -C external/xfstests rev-parse HEAD",
+        "shasum -a 256 external/xfstests/check",
+        "git check-ignore -v external/xfstests external/xfstests/check",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-live-preflight-default-gate-20260802"
       ],
@@ -493,7 +500,8 @@
     "Task 14 G0 lints now pass in the current checkout and the former `namespace.rs`/`pager.rs` direct-home-write allowlist has been retired, but production cutover still lacks FUA/recovery product gates and the final live Tier 1 acceptance evidence.",
     "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
     "The public `cargo xtask ext4 tier1` command exists, verifies the manifest-pinned xfstests source lock, parses xfstests output fail-closed, refuses to synthesize crash-cut completion or unconditional passed gates, and now routes per-cut fault jobs through the repository executor with bound request/result/log/image evidence. Live execution still correctly fails closed while xfstests/crash authorities remain placeholder statuses; no full 1000-cut run, pinned xfstests execution, or immutable G0-G7 receipt has been produced.",
-    "2026-08-02 preflight-report slice: `cargo xtask ext4 tier1 --preflight-live --preflight-report PATH` writes a durable `tx.ext4.tier1_live_preflight.v1` blocker report with authority hashes/statuses, host identity, blockers, and `acceptance_receipt_generated=false` without creating a run workspace or receipt. The current macOS report remains blocked on placeholder authorities, missing local `external/xfstests`, and Linux/root replay requirements."
+    "2026-08-02 preflight-report slice: `cargo xtask ext4 tier1 --preflight-live --preflight-report PATH` writes a durable `tx.ext4.tier1_live_preflight.v1` blocker report with authority hashes/statuses, host identity, blockers, and `acceptance_receipt_generated=false` without creating a run workspace or receipt. The current macOS report remains blocked on placeholder authorities, missing local `external/xfstests`, and Linux/root replay requirements.",
+    "2026-08-02 xfstests-materialize slice: `--materialize-xfstests` now clones/checks out the manifest-pinned source into ignored local `external/xfstests` state and verifies the pinned `check` sha256 before live preflight reports readiness. The current source is prepared at revision `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509`, so the live preflight blocker count dropped from four to three; authority statuses and Linux/root replay remain blocking, and no xfstests cases have been executed for acceptance."
   ],
   "handoff": {
     "needed": false,
