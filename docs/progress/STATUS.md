@@ -1,3 +1,16 @@
+- 2026-08-02 (ext4 Tier 1 evidence module split).
+  Kept Task 16 pending while making the existing Tier 1 runner/verifier easier
+  to continue: `xtask/src/ext4/mod.rs` is now split below the 1,500-line source
+  hygiene ceiling, with crash-campaign evidence in
+  `xtask/src/ext4/crash_campaign.rs` and receipt/lock/artifact verification in
+  `xtask/src/ext4/receipt_verify.rs`. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`,
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-reorg-preflight-20260802`. Task 16 still
+  needs acceptance-ready authority ledgers, a full fresh 1000-cut
+  QEMU/e2fsck campaign, pinned xfstests execution, and the verified immutable
+  G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 receipt verifier).
   Advanced Task 16 final acceptance verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now validates a
