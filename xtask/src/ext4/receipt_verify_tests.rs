@@ -105,6 +105,21 @@ fn tier1_verify_receipt_rejects_missing_guest_matrix_serial_log() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_guest_matrix_serial_log_missing_marker() {
+    let root = temp_root("verify-receipt-guest-serial-marker");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "guest-matrix-serial-log",
+        "tier1-test-role-status:0\ntier1-test-detach:0\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing guest matrix marker must fail");
+    assert!(error.contains("guest matrix serial log missing marker `tier1-workload-ro-mount:0`"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_missing_build_log_artifact() {
     let root = temp_root("verify-receipt-missing-build-log");
     let _cleanup = TempCleanup(root.clone());
@@ -378,7 +393,29 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     add_artifact(
         "guest-matrix-serial-log",
         "guest-matrix-serial.log".into(),
-        "shell-test: groups: 8 passed, 0 failed\nshell-test: ok\n".into(),
+        [
+            ":mount:sdcard:ext4:ok",
+            "tier1-test-role-status:0",
+            "tier1-test-detach:0",
+            "tier1-workload-ro-mount:0",
+            "tier1-workload-ro-write:ok",
+            "tier1-scratch-mount:0",
+            "tier1-data-mkdir:0",
+            "tier1-data-write:0",
+            "alpha",
+            "tier1-data-read:0",
+            "tier1-setattr-status:0",
+            "tier1-namespace-status:0",
+            "orphan",
+            "tier1-orphan-status:0",
+            "tier1-durability-status:0",
+            "tier1-remount-status:0",
+            "tier1-exec-ok",
+            "tier1-exec-status:0",
+            "tier1-detach-status:0",
+        ]
+        .join("\n")
+            + "\n",
     );
     add_artifact(
         "candidate-full-build-log",

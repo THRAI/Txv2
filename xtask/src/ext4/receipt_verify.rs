@@ -61,6 +61,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_required_log_artifacts(&artifacts, receipt_path)?;
     verify_g0_lint_log_evidence(&artifacts, receipt_path)?;
     verify_build_log_evidence(&artifacts, receipt_path)?;
+    verify_guest_matrix_serial_evidence(&artifacts, receipt_path)?;
     verify_xfstests_source_lock_evidence(&artifacts, receipt_path)?;
     verify_xfstests_log_evidence(receipt_object, &artifacts, receipt_path)?;
     verify_crash_cut_outcome_manifest(&artifacts, receipt_path)?;
@@ -530,6 +531,52 @@ fn verify_command_log(label: &str, expected_command: &str, log: &str, path: &Pat
             "{}: {label} log missing exit_code=0",
             path.display()
         ));
+    }
+    Ok(())
+}
+
+fn verify_guest_matrix_serial_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let artifact = artifacts.get("guest-matrix-serial-log").ok_or_else(|| {
+        format!(
+            "{}: missing artifact guest-matrix-serial-log",
+            path.display()
+        )
+    })?;
+    let log = std::fs::read_to_string(&artifact.path)
+        .map_err(|err| format!("failed to read {}: {err}", artifact.path.display()))?;
+    verify_guest_matrix_serial_log(&log, &artifact.path)
+}
+
+fn verify_guest_matrix_serial_log(log: &str, path: &Path) -> Result<()> {
+    for marker in [
+        "tier1-test-role-status:0",
+        "tier1-test-detach:0",
+        "tier1-workload-ro-mount:0",
+        "tier1-workload-ro-write:ok",
+        "tier1-scratch-mount:0",
+        "tier1-data-mkdir:0",
+        "tier1-data-write:0",
+        "alpha",
+        "tier1-data-read:0",
+        "tier1-setattr-status:0",
+        "tier1-namespace-status:0",
+        "orphan",
+        "tier1-orphan-status:0",
+        "tier1-durability-status:0",
+        "tier1-remount-status:0",
+        "tier1-exec-ok",
+        "tier1-exec-status:0",
+        "tier1-detach-status:0",
+    ] {
+        if !log.lines().any(|line| line.trim() == marker) {
+            return Err(format!(
+                "{}: guest matrix serial log missing marker `{marker}`",
+                path.display()
+            ));
+        }
     }
     Ok(())
 }
