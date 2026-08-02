@@ -219,7 +219,9 @@ pub(crate) fn execute_crash_cut_campaign(
             source_image,
             workload_image,
         )?;
-        run_fault_qemu_executor(root, &job.request_path, e2fsck)?;
+        let executor_result = run_fault_qemu_executor(root, &job.request_path, e2fsck);
+        record_existing_fault_job_artifacts(run, &cut_id, &job)?;
+        executor_result?;
         let campaign_plan_sha256 = sha256_file(&manifest)?;
         let fault_result = parse_fault_job_result(
             &job.result_path,
@@ -250,6 +252,10 @@ pub(crate) fn execute_crash_cut_campaign(
 
         let immutable_image_sha256 = sha256_file(&job.replay_image)?;
         let replay_serial_sha256 = sha256_file(&job.replay_serial_log)?;
+        run.record_artifact(
+            format!("{cut_id}-replay-serial"),
+            job.replay_serial_log.clone(),
+        )?;
         outcomes.push(CrashCutOutcome {
             cut_id,
             immutable_image_sha256,
@@ -324,6 +330,7 @@ pub(crate) fn crash_cut_shell_test_args(
 pub(crate) struct FaultJobPaths {
     pub(crate) request_path: PathBuf,
     pub(crate) result_path: PathBuf,
+    pub(crate) executor_plan_path: PathBuf,
     pub(crate) crash_image: PathBuf,
     pub(crate) replay_image: PathBuf,
     pub(crate) serial_log: PathBuf,
@@ -394,25 +401,36 @@ pub(crate) fn write_fault_job_request(
     fs::write(&request_path, text)
         .map_err(|err| format!("failed to write {}: {err}", request_path.display()))?;
     run.record_artifact(format!("{cut_id}-job-request"), request_path.clone())?;
-    run.record_artifact(
-        format!("{cut_id}-executor-plan"),
-        executor_plan_path.clone(),
-    )?;
-    run.record_artifact(format!("{cut_id}-result"), result_path.clone())?;
-    run.record_artifact(format!("{cut_id}-serial"), serial_log.clone())?;
-    run.record_artifact(format!("{cut_id}-replay-serial"), replay_serial_log.clone())?;
-    run.record_artifact(format!("{cut_id}-e2fsck-log"), e2fsck_log.clone())?;
-    run.record_artifact(format!("{cut_id}-crash-image"), crash_image.clone())?;
-    run.record_artifact(format!("{cut_id}-replay-image"), replay_image.clone())?;
     Ok(FaultJobPaths {
         request_path,
         result_path,
+        executor_plan_path,
         crash_image,
         replay_image,
         serial_log,
         replay_serial_log,
         e2fsck_log,
     })
+}
+
+fn record_existing_fault_job_artifacts(
+    run: &mut run_workspace::RunWorkspace,
+    cut_id: &str,
+    job: &FaultJobPaths,
+) -> Result<()> {
+    for (suffix, path) in [
+        ("executor-plan", &job.executor_plan_path),
+        ("result", &job.result_path),
+        ("serial", &job.serial_log),
+        ("e2fsck-log", &job.e2fsck_log),
+        ("crash-image", &job.crash_image),
+        ("replay-image", &job.replay_image),
+    ] {
+        if path.is_file() {
+            run.record_artifact(format!("{cut_id}-{suffix}"), path.clone())?;
+        }
+    }
+    Ok(())
 }
 
 fn run_fault_qemu_executor(root: &Path, request_path: &Path, e2fsck: &str) -> Result<()> {

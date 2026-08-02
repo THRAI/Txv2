@@ -1,3 +1,19 @@
+- 2026-08-02 (ext4 Tier 1 fault artifact timing).
+  Advanced Task 16 crash-campaign evidence preservation without promoting final
+  acceptance. Per-cut fault jobs now register `job-request.json` immediately
+  but defer executor-plan/result/serial/e2fsck/crash/replay artifact records
+  until those files actually exist, so a failed run before executor output can
+  still write `artifacts.json`, `failed-receipt.json`, and `receipt-lock.json`
+  instead of losing failure evidence to a missing future artifact path.
+  Verification passed `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (41), `python3 tools/tests/test_ext4_fault_qemu_executor.py`
+  (29), `python3 tools/tests/test_ext4_fault_matrix_runners.py` (4),
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-fault-artifact-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, a full fresh
+  1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and the verified
+  immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 evidence module split).
   Kept Task 16 pending while making the existing Tier 1 runner/verifier easier
   to continue: `xtask/src/ext4/mod.rs` is now split below the 1,500-line source

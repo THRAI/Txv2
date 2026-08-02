@@ -526,6 +526,63 @@ fn tier1_fault_job_request_binds_repository_executor_inputs() {
 }
 
 #[test]
+fn tier1_fault_job_request_does_not_register_future_artifacts_before_executor() {
+    let root = temp_root("fault-job-request-fail-before-executor");
+    {
+        let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+        let campaign_manifest = run.working_dir().join("crash-campaign-plan.json");
+        write_text(&campaign_manifest, "campaign-plan\n");
+        let test_image = root.join("test.img");
+        let scratch_image = root.join("scratch.img");
+        let workload_image = root.join("workload.img");
+        write_text(&test_image, "test-image\n");
+        write_text(&scratch_image, "scratch-image\n");
+        write_text(&workload_image, "workload-image\n");
+        let family = CrashCutFamily {
+            id: "D7".into(),
+            phase_marker: Some("tx.ext4.crash.phase.D7".into()),
+        };
+        let campaign = CrashCutCampaignPlan {
+            workload_script: PathBuf::from("tools/ext4/tier1/crash-workload.scn"),
+            workload_script_sha256: "a".repeat(64),
+            replay_script: PathBuf::from("tools/ext4/tier1/crash-replay.scn"),
+            replay_script_sha256: "b".repeat(64),
+            kill_policy: "deterministic-phase-marker-v1".into(),
+            e2fsck_mode: "immutable-copy".into(),
+        };
+
+        write_fault_job_request(
+            &root,
+            &mut run,
+            &campaign_manifest,
+            "crash-cut-0007",
+            &family,
+            family.phase_marker.as_deref().unwrap(),
+            &campaign,
+            &test_image,
+            &scratch_image,
+            &workload_image,
+        )
+        .expect("write request");
+        run.mark_failed_for_test("before-executor");
+    }
+
+    let manifest_path = root.join("target/ext4/tier1/crash-run/artifacts.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let names = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["crash-cut-0007-job-request"]);
+    for artifact in manifest["artifacts"].as_array().unwrap() {
+        assert!(PathBuf::from(artifact["path"].as_str().unwrap()).is_file());
+    }
+}
+
+#[test]
 fn tier1_fault_job_result_requires_hard_kill_and_e2fsck_exit() {
     let root = temp_root("fault-job-result");
     let result = root.join("result.json");
