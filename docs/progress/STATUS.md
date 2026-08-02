@@ -1,3 +1,20 @@
+- 2026-08-02 (ext4 Tier 1 replay serial evidence).
+  Advanced Task 16 crash replay evidence without promoting final acceptance.
+  Each live crash cut now runs the post-crash `crash-replay.scn` probe with a
+  per-cut `replay-serial.log`; the run workspace records that replay log as an
+  artifact, and `crash-cut-outcomes.json` must carry a nonzero
+  `replay_serial_sha256` before the row can aggregate into crash evidence.
+  Outcome manifests that only claim `replay_exit_code=0` now fail closed.
+  Verification passed focused red/green replay-serial outcome tests,
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`,
+  `python3 tools/tests/test_ext4_fault_qemu_executor.py`,
+  `python3 tools/tests/test_ext4_fault_matrix_runners.py`,
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-replay-serial-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, full fresh 1000-cut
+  QEMU/e2fsck execution, pinned xfstests execution, and the immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 fault evidence binding).
   Advanced Task 16 crash-runner evidence without promoting final acceptance.
   `run_live_tier1` now passes distinct TEST/SCRATCH/WORKLOAD images into each

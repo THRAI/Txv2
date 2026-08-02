@@ -328,16 +328,27 @@ fn tier1_crash_cut_shell_matrix_uses_boot_and_cut_images_with_phase_marker() {
     let boot = PathBuf::from("/tmp/tx/boot.img");
     let cut = PathBuf::from("/tmp/tx/crash-cut-0007.img");
     let script = PathBuf::from("/tmp/tx/tools/ext4/tier1/crash-workload.scn");
-    let args = crash_cut_shell_test_args(&boot, &cut, &script, Some("tx.ext4.crash.phase.D7"));
+    let serial = PathBuf::from("/tmp/tx/crash-cut-0007-replay.serial.log");
+    let args = crash_cut_shell_test_args(
+        &boot,
+        &cut,
+        &script,
+        Some("tx.ext4.crash.phase.D7"),
+        Some(&serial),
+    );
 
     let mut extra_images = Vec::new();
     let mut stop_marker = None;
+    let mut serial_log = None;
     for (idx, arg) in args.iter().enumerate() {
         if arg == "--extra-rv64-ext4" {
             extra_images.push(args[idx + 1].clone());
         }
         if arg == "--stop-after-needle" {
             stop_marker = args.get(idx + 1).cloned();
+        }
+        if arg == "--serial-log" {
+            serial_log = args.get(idx + 1).cloned();
         }
     }
 
@@ -346,6 +357,7 @@ fn tier1_crash_cut_shell_matrix_uses_boot_and_cut_images_with_phase_marker() {
         vec![boot.display().to_string(), cut.display().to_string()]
     );
     assert_eq!(stop_marker.as_deref(), Some("tx.ext4.crash.phase.D7"));
+    assert_eq!(serial_log.as_deref(), Some(serial.to_str().unwrap()));
 }
 
 #[test]
@@ -850,12 +862,14 @@ fn tier1_crash_cut_campaign_consumes_executor_outcome_manifest() {
             {
               "cut_id":"crash-cut-0000",
               "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "replay_serial_sha256":"3333333333333333333333333333333333333333333333333333333333333333",
               "e2fsck_exit_code":0,
               "replay_exit_code":0
             },
             {
               "cut_id":"crash-cut-0001",
               "immutable_image_sha256":"2222222222222222222222222222222222222222222222222222222222222222",
+              "replay_serial_sha256":"4444444444444444444444444444444444444444444444444444444444444444",
               "e2fsck_exit_code":0,
               "replay_exit_code":0
             }
@@ -914,6 +928,7 @@ fn tier1_crash_cut_evidence_requires_clean_per_cut_outcomes() {
     let missing = vec![CrashCutOutcome {
         cut_id: "crash-cut-0000".into(),
         immutable_image_sha256: "1".repeat(64),
+        replay_serial_sha256: "3".repeat(64),
         e2fsck_exit_code: 0,
         replay_exit_code: 0,
     }];
@@ -925,12 +940,14 @@ fn tier1_crash_cut_evidence_requires_clean_per_cut_outcomes() {
         CrashCutOutcome {
             cut_id: "crash-cut-0000".into(),
             immutable_image_sha256: "1".repeat(64),
+            replay_serial_sha256: "3".repeat(64),
             e2fsck_exit_code: 0,
             replay_exit_code: 0,
         },
         CrashCutOutcome {
             cut_id: "crash-cut-0001".into(),
             immutable_image_sha256: "2".repeat(64),
+            replay_serial_sha256: "4".repeat(64),
             e2fsck_exit_code: 0,
             replay_exit_code: 1,
         },
@@ -943,12 +960,14 @@ fn tier1_crash_cut_evidence_requires_clean_per_cut_outcomes() {
         CrashCutOutcome {
             cut_id: "crash-cut-0000".into(),
             immutable_image_sha256: "1".repeat(64),
+            replay_serial_sha256: "3".repeat(64),
             e2fsck_exit_code: 0,
             replay_exit_code: 0,
         },
         CrashCutOutcome {
             cut_id: "crash-cut-0001".into(),
             immutable_image_sha256: "2".repeat(64),
+            replay_serial_sha256: "4".repeat(64),
             e2fsck_exit_code: 0,
             replay_exit_code: 0,
         },
@@ -975,12 +994,14 @@ fn tier1_crash_cut_outcome_manifest_parses_into_clean_evidence() {
             {
               "cut_id":"crash-cut-0000",
               "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "replay_serial_sha256":"3333333333333333333333333333333333333333333333333333333333333333",
               "e2fsck_exit_code":0,
               "replay_exit_code":0
             },
             {
               "cut_id":"crash-cut-0001",
               "immutable_image_sha256":"2222222222222222222222222222222222222222222222222222222222222222",
+              "replay_serial_sha256":"4444444444444444444444444444444444444444444444444444444444444444",
               "e2fsck_exit_code":0,
               "replay_exit_code":0
             }
@@ -1012,6 +1033,7 @@ fn tier1_crash_cut_outcome_manifest_rejects_dirty_or_incomplete_rows() {
             {
               "cut_id":"crash-cut-0000",
               "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "replay_serial_sha256":"3333333333333333333333333333333333333333333333333333333333333333",
               "e2fsck_exit_code":0,
               "replay_exit_code":0
             }
@@ -1033,6 +1055,7 @@ fn tier1_crash_cut_outcome_manifest_rejects_dirty_or_incomplete_rows() {
             {
               "cut_id":"crash-cut-0000",
               "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "replay_serial_sha256":"3333333333333333333333333333333333333333333333333333333333333333",
               "e2fsck_exit_code":4,
               "replay_exit_code":0
             }
@@ -1042,6 +1065,33 @@ fn tier1_crash_cut_outcome_manifest_rejects_dirty_or_incomplete_rows() {
     let error = CrashCutCampaignEvidence::from_outcome_manifest(&path)
         .expect_err("dirty e2fsck must fail closed");
     assert!(error.contains("e2fsck failed for crash-cut-0000"));
+}
+
+#[test]
+fn tier1_crash_cut_outcome_manifest_requires_replay_serial_evidence() {
+    let root = temp_root("crash-outcome-replay-serial");
+    let path = root.join("crash-cut-outcomes.json");
+    write_json(
+        &path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_outcome_manifest.v1",
+          "completed":1,
+          "required":1000,
+          "families":["D0"],
+          "outcomes":[
+            {
+              "cut_id":"crash-cut-0000",
+              "immutable_image_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+              "e2fsck_exit_code":0,
+              "replay_exit_code":0
+            }
+          ]
+        }"#,
+    );
+
+    let error = CrashCutCampaignEvidence::from_outcome_manifest(&path)
+        .expect_err("replay serial evidence must be present");
+    assert!(error.contains("missing outcome.replay_serial_sha256"));
 }
 
 #[test]

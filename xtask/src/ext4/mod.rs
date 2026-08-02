@@ -225,6 +225,7 @@ struct CrashCutCampaignEvidence {
 struct CrashCutOutcome {
     cut_id: String,
     immutable_image_sha256: String,
+    replay_serial_sha256: String,
     e2fsck_exit_code: i32,
     replay_exit_code: i32,
 }
@@ -259,6 +260,12 @@ impl CrashCutCampaignEvidence {
         }
         let mut immutable_images = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
+            if !is_real_sha256(&outcome.replay_serial_sha256) {
+                return Err(format!(
+                    "replay serial evidence for {} is not a real sha256",
+                    outcome.cut_id
+                ));
+            }
             if outcome.e2fsck_exit_code != 0 {
                 return Err(format!(
                     "e2fsck failed for {} with exit {}",
@@ -327,10 +334,17 @@ impl CrashCutOutcome {
         Ok(Self {
             cut_id: required_object_string(object, "cut_id", path)?,
             immutable_image_sha256: required_object_string(object, "immutable_image_sha256", path)?,
+            replay_serial_sha256: required_object_string(object, "replay_serial_sha256", path)?,
             e2fsck_exit_code: required_object_i32(object, "e2fsck_exit_code", path)?,
             replay_exit_code: required_object_i32(object, "replay_exit_code", path)?,
         })
     }
+}
+
+fn is_real_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.chars().all(|ch| ch.is_ascii_hexdigit())
+        && value.chars().any(|ch| ch != '0')
 }
 
 fn run_crash_cut_campaign(
@@ -426,8 +440,13 @@ fn execute_crash_cut_campaign(
             &job.e2fsck_log,
         )?;
 
-        let replay_args =
-            crash_cut_shell_test_args(boot_image, &job.replay_image, &campaign.replay_script, None);
+        let replay_args = crash_cut_shell_test_args(
+            boot_image,
+            &job.replay_image,
+            &campaign.replay_script,
+            None,
+            Some(&job.replay_serial_log),
+        );
         let replay_exit_code = match shell_test::shell_test(root, replay_args) {
             Ok(()) => 0,
             Err(err) => {
@@ -437,9 +456,11 @@ fn execute_crash_cut_campaign(
         };
 
         let immutable_image_sha256 = sha256_file(&job.replay_image)?;
+        let replay_serial_sha256 = sha256_file(&job.replay_serial_log)?;
         outcomes.push(CrashCutOutcome {
             cut_id,
             immutable_image_sha256,
+            replay_serial_sha256,
             e2fsck_exit_code: fault_result.e2fsck_exit_code,
             replay_exit_code,
         });
@@ -481,6 +502,7 @@ fn crash_cut_shell_test_args(
     cut_image: &Path,
     script: &Path,
     stop_after_needle: Option<&str>,
+    serial_log: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "--target".into(),
@@ -498,6 +520,10 @@ fn crash_cut_shell_test_args(
         args.push("--stop-after-needle".into());
         args.push(needle.into());
     }
+    if let Some(serial_log) = serial_log {
+        args.push("--serial-log".into());
+        args.push(serial_log.display().to_string());
+    }
     args
 }
 
@@ -508,6 +534,7 @@ struct FaultJobPaths {
     crash_image: PathBuf,
     replay_image: PathBuf,
     serial_log: PathBuf,
+    replay_serial_log: PathBuf,
     e2fsck_log: PathBuf,
 }
 
@@ -538,6 +565,7 @@ fn write_fault_job_request(
     let executor_plan_path = job_dir.join("executor-plan.json");
     let e2fsck_log = job_dir.join("e2fsck-fn.log");
     let serial_log = job_dir.join("serial.log");
+    let replay_serial_log = job_dir.join("replay-serial.log");
     let manifest = serde_json::json!({
         "schema": "tx.ext4.fault_job_request.v1",
         "campaign_plan_sha256": sha256_file(campaign_manifest)?,
@@ -579,6 +607,7 @@ fn write_fault_job_request(
     )?;
     run.record_artifact(format!("{cut_id}-result"), result_path.clone())?;
     run.record_artifact(format!("{cut_id}-serial"), serial_log.clone())?;
+    run.record_artifact(format!("{cut_id}-replay-serial"), replay_serial_log.clone())?;
     run.record_artifact(format!("{cut_id}-e2fsck-log"), e2fsck_log.clone())?;
     run.record_artifact(format!("{cut_id}-crash-image"), crash_image.clone())?;
     run.record_artifact(format!("{cut_id}-replay-image"), replay_image.clone())?;
@@ -588,6 +617,7 @@ fn write_fault_job_request(
         crash_image,
         replay_image,
         serial_log,
+        replay_serial_log,
         e2fsck_log,
     })
 }
@@ -826,6 +856,7 @@ fn write_crash_cut_outcome_manifest(
         "outcomes": outcomes.iter().map(|outcome| serde_json::json!({
             "cut_id": &outcome.cut_id,
             "immutable_image_sha256": &outcome.immutable_image_sha256,
+            "replay_serial_sha256": &outcome.replay_serial_sha256,
             "e2fsck_exit_code": outcome.e2fsck_exit_code,
             "replay_exit_code": outcome.replay_exit_code
         })).collect::<Vec<_>>()
