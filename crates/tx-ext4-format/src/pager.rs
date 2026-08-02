@@ -766,6 +766,11 @@ impl<I: BlockImage> Ext4Pager<I> {
         deleted_inode.encode(inode_bytes)?;
         self.refresh_inode_checksum(inode, &deleted_inode, inode_bytes)?;
 
+        let orphan_next = if disk_inode.links_count == 0 {
+            Some((inode, disk_inode.dtime))
+        } else {
+            None
+        };
         let released_blocks =
             u32::try_from(freed.len()).map_err(|_| Ext4FormatError::Unsupported)?;
         let released_dirs = if releases_directory { 1 } else { 0 };
@@ -778,7 +783,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 released_dirs,
             )?;
         let (superblock_home, superblock_before, superblock_after) =
-            self.plan_superblock_destroy_counts(released_blocks as u64)?;
+            self.plan_superblock_destroy_counts(released_blocks as u64, orphan_next)?;
 
         let mut plan =
             Ext4MutationPlan::new(MutationOrigin::Destroy, inode.get() as u64, fsync_stamp);
@@ -1648,13 +1653,44 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((0, before, after))
     }
 
+    fn plan_superblock_orphan_head(
+        &self,
+        orphan_inode: InodeNo,
+    ) -> Result<(u64, Page4K, Page4K, u32)> {
+        let mut before = [0u8; BLOCK_SIZE];
+        self.read_block(0, &mut before)?;
+        let observed = Superblock::parse(&before[1024..2048])?;
+        let previous = observed.last_orphan;
+        if previous == orphan_inode.get() {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut after = before;
+        after[1024 + 232..1024 + 236].copy_from_slice(&orphan_inode.get().to_le_bytes());
+        if observed.has_metadata_csum() {
+            let superblock = &mut after[1024..2048];
+            superblock[1020..1024].fill(0);
+            let checksum = superblock_csum32(superblock)?;
+            superblock[1020..1024].copy_from_slice(&checksum.to_le_bytes());
+        }
+        Ok((0, before, after, previous))
+    }
+
     fn plan_superblock_destroy_counts(
         &self,
         released_blocks: u64,
+        orphan_next: Option<(InodeNo, u32)>,
     ) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
         self.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
+        let mut next_last_orphan = observed.last_orphan;
+        if let Some((orphan_inode, next)) = orphan_next {
+            if observed.last_orphan == orphan_inode.get() {
+                next_last_orphan = next;
+            } else if observed.last_orphan != 0 {
+                return Err(Ext4FormatError::Unsupported);
+            }
+        }
         let next_free_blocks = observed
             .free_blocks_count
             .checked_add(released_blocks)
@@ -1668,6 +1704,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         after[1024 + 0x158..1024 + 0x15c]
             .copy_from_slice(&((next_free_blocks >> 32) as u32).to_le_bytes());
         after[1024 + 16..1024 + 20].copy_from_slice(&next_free_inodes.to_le_bytes());
+        after[1024 + 232..1024 + 236].copy_from_slice(&next_last_orphan.to_le_bytes());
         if observed.has_metadata_csum() {
             let superblock = &mut after[1024..2048];
             superblock[1020..1024].fill(0);
@@ -2456,8 +2493,9 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     /// Build the bounded namespace mutation for unlinking one directory
     /// entry. The plan removes the dirent and decrements the target inode's
-    /// link count, but deliberately does not free inode or data storage; that
-    /// is owned by the later orphan/destroy lifecycle.
+    /// link count. When the link count reaches zero, it also links the inode
+    /// into the classic superblock orphan chain; data and inode storage are
+    /// still owned by the later destroy lifecycle once open-file pins drain.
     pub fn plan_unlink_dir_entry(
         &mut self,
         dir_ino: InodeNo,
@@ -2488,6 +2526,14 @@ impl<I: BlockImage> Ext4Pager<I> {
             .raw()
             .try_into()
             .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        let orphan_superblock_update = if disk_inode.links_count == 0 {
+            let (home, before, after, previous_last_orphan) =
+                self.plan_superblock_orphan_head(target_ino)?;
+            disk_inode.dtime = previous_last_orphan;
+            Some((home, before, after))
+        } else {
+            None
+        };
         disk_inode.encode_preserving_unknown(inode_bytes)?;
         self.refresh_inode_checksum(target_ino, &disk_inode, inode_bytes)?;
 
@@ -2509,6 +2555,16 @@ impl<I: BlockImage> Ext4Pager<I> {
             depends_on: Vec::new(),
         })
         .map_err(|_| Ext4FormatError::Corrupt)?;
+        if let Some((home, before, after)) = orphan_superblock_update {
+            plan.push_metadata(MetadataBlock {
+                home,
+                role: MetaRole::Superblock,
+                before_version: crc32c(0, &before) as u64,
+                after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
         Ok(plan)
     }
 

@@ -884,6 +884,68 @@ fn destroy_plan_frees_zero_link_regular_inode_without_home_write() {
 }
 
 #[test]
+fn destroy_plan_removes_head_orphan_from_superblock_chain() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.last_orphan = 12;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_block_bitmap_used(&mut image, 31);
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut victim = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    victim.links_count = 0;
+    victim.dtime = 14;
+    write_inode(&mut image, 12, &victim);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_destroy_inode(InodeNo::new(12), FsyncStamp::new(44))
+        .unwrap();
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let parsed_superblock = Superblock::parse(&superblock.after[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.last_orphan, 14);
+    assert_eq!(parsed_superblock.free_blocks_count, 35);
+    assert_eq!(parsed_superblock.free_inodes_count, 53);
+}
+
+#[test]
+fn destroy_plan_removes_singleton_orphan_head_from_superblock_chain() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.last_orphan = 12;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_block_bitmap_used(&mut image, 31);
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut victim = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    victim.links_count = 0;
+    victim.dtime = 0;
+    write_inode(&mut image, 12, &victim);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_destroy_inode(InodeNo::new(12), FsyncStamp::new(44))
+        .unwrap();
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let parsed_superblock = Superblock::parse(&superblock.after[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.last_orphan, 0);
+    assert_eq!(parsed_superblock.free_blocks_count, 35);
+    assert_eq!(parsed_superblock.free_inodes_count, 53);
+}
+
+#[test]
 fn destroy_plan_frees_zero_link_empty_directory_and_decrements_used_dirs() {
     let mut image = mock_image();
     mark_block_bitmap_used(&mut image, 18);
@@ -1024,7 +1086,7 @@ fn namespace_plan_unlinks_dir_entry_and_decrements_nlink_without_home_write() {
     assert!(plan.allocations.is_empty());
     assert!(plan.revokes.is_empty());
     assert!(plan.deferred_frees.is_empty());
-    assert_eq!(plan.metadata.len(), 2);
+    assert_eq!(plan.metadata.len(), 3);
 
     let dir_block = plan
         .metadata
@@ -1049,9 +1111,56 @@ fn namespace_plan_unlinks_dir_entry_and_decrements_nlink_without_home_write() {
     let inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
     assert_eq!(inode.links_count, 0);
     assert_eq!(inode.ctime, 20);
+    assert_eq!(inode.dtime, 0);
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    assert_eq!(superblock.home, 0);
+    let parsed_superblock = Superblock::parse(&superblock.after[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.last_orphan, 12);
 
     assert_eq!(pager.image().block(16), &dir_before);
     assert_eq!(pager.image().block(4), &inode_before);
+}
+
+#[test]
+fn namespace_plan_chains_zero_link_unlink_after_existing_orphan_head() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.last_orphan = 14;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_unlink_dir_entry(
+            InodeNo::new(2),
+            b"hello",
+            InodeNo::new(12),
+            FsyncStamp::new(20),
+        )
+        .unwrap();
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.links_count, 0);
+    assert_eq!(inode.dtime, 14);
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let parsed_superblock = Superblock::parse(&superblock.after[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.last_orphan, 12);
 }
 
 #[test]

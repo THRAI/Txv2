@@ -26,7 +26,14 @@ group namespace
 send "echo tx.ext4.crash.phase.D3\n"
 expect "tx.ext4.crash.phase.D3" within 10000
 expect "/ # " within 10000
-send "/bin/busybox mkdir -p /musl/crash-ns; printf ns > /musl/crash-ns/a; /bin/busybox mv /musl/crash-ns/a /musl/crash-ns/b; echo tx.ext4.crash.phase.D4\n"
+send "/bin/busybox mkdir -p /musl/crash-ns; echo crash-ns-mkdir:$?\n"
+expect "crash-ns-mkdir:0" within 30000
+expect "/ # " within 30000
+send "printf ns > /musl/crash-ns/a; echo crash-ns-write:$?\n"
+expect "crash-ns-write:0" within 30000
+expect "/ # " within 30000
+send "/bin/busybox mv /musl/crash-ns/a /musl/crash-ns/b; echo crash-ns-mv:$?; echo tx.ext4.crash.phase.D4\n"
+expect "crash-ns-mv:0" within 30000
 expect "tx.ext4.crash.phase.D4" within 30000
 expect "/ # " within 30000
 send "/bin/busybox rm /musl/crash-ns/b; echo tx.ext4.crash.phase.D5\n"
@@ -43,7 +50,8 @@ expect "/ # " within 10000
 send "/bin/busybox mkdir -p /musl/crash-orphan; printf orphan > /musl/crash-orphan/live; exec 3</musl/crash-orphan/live; echo tx.ext4.crash.phase.D8\n"
 expect "tx.ext4.crash.phase.D8" within 10000
 expect "/ # " within 10000
-send "/bin/busybox rm /musl/crash-orphan/live; echo tx.ext4.crash.phase.D9\n"
+send "/bin/busybox rm /musl/crash-orphan/live; unlink_status=$?; echo crash-orphan-unlink:$unlink_status; echo tx.ext4.crash.phase.D9\n"
+expect "crash-orphan-unlink:0" within 10000
 expect "tx.ext4.crash.phase.D9" within 10000
 expect "/ # " within 10000
 send "/bin/busybox cat <&3; status=$?; echo tx.ext4.crash.phase.D10\n"

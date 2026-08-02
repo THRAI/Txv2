@@ -30,6 +30,7 @@ pub struct Superblock {
     pub feature_ro_compat: u32,
     pub uuid: [u8; 16],
     pub journal_inode: u32,
+    pub last_orphan: u32,
     pub hash_seed: [u32; 4],
     pub default_hash_version: u8,
     pub required_extra_isize: u16,
@@ -72,6 +73,7 @@ impl Superblock {
             feature_ro_compat: read_u32_le(bytes, 100)?,
             uuid: slice_at(bytes, 104, 16)?.try_into().unwrap(),
             journal_inode: read_u32_le(bytes, 224)?,
+            last_orphan: read_u32_le(bytes, 232)?,
             hash_seed: [
                 read_u32_le(bytes, 236)?,
                 read_u32_le(bytes, 240)?,
@@ -108,6 +110,7 @@ impl Superblock {
         write_u32_le(bytes, 100, self.feature_ro_compat)?;
         slice_at_mut(bytes, 104, 16)?.copy_from_slice(&self.uuid);
         write_u32_le(bytes, 224, self.journal_inode)?;
+        write_u32_le(bytes, 232, self.last_orphan)?;
         write_u32_le(bytes, 236, self.hash_seed[0])?;
         write_u32_le(bytes, 240, self.hash_seed[1])?;
         write_u32_le(bytes, 244, self.hash_seed[2])?;
@@ -181,6 +184,7 @@ impl Default for Superblock {
             feature_ro_compat: 0,
             uuid: [0; 16],
             journal_inode: 8,
+            last_orphan: 0,
             hash_seed: [0; 4],
             default_hash_version: 1,
             required_extra_isize: 0,

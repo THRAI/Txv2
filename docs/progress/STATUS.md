@@ -1,3 +1,24 @@
+- 2026-08-03 (ext4 Task16 orphan singleton cleanup probe).
+  Fixed the live D10 blocker found in `task16-live-cow-replay-settle-20260802`
+  without promoting final acceptance. Classic orphan planning now records
+  `s_last_orphan`, unlinks zero-link files into the superblock orphan chain,
+  and destroy pops singleton heads as well as chained heads before freeing the
+  inode for reuse. The Tier 1 crash workload now fail-closes on namespace and
+  orphan command exit status, so `rm /musl/crash-orphan/live` cannot silently
+  fail before D10. Verification passed `cargo test -p tx-ext4-format --test
+  pager_mock -- --test-threads=1` (41), `cargo test -p tx-ext4 --lib
+  --no-default-features namespace -- --test-threads=1` (5), focused orphan
+  reuse runtime tests, `python3 tools/tests/test_ext4_fault_qemu_executor.py`
+  (32), `python3 tools/tests/test_ext4_fault_matrix_runners.py` (8), `cargo
+  test -p xtask ext4 -- --test-threads=1` (91), `CARGO_INCREMENTAL=0 cargo
+  xtask full-build --target rv64-qemu --skip-doctor`, and a fresh CoW QEMU
+  D10 probe at `target/ext4/probe/task16-orphan-d10-20260803003514/serial.log`
+  showing `crash-orphan-unlink:0`, fd readback `orphan`, and stop needle
+  `tx.ext4.crash.phase.D10`. Task 16 still needs host e2fsck/debugfs
+  availability, enough live-run storage, the full fresh 1000-cut
+  QEMU/replay/e2fsck campaign, pinned xfstests execution, and a verified
+  immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 authority admission and storage-capacity gate).
   Advanced Task 16 live admission without claiming final acceptance.
   `tools/ext4/tier1/xfstests-selection.json` and

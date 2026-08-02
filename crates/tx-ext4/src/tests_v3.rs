@@ -147,6 +147,50 @@ impl BlockImage for CountingImage {
     }
 }
 
+#[derive(Clone)]
+struct SharedCountingImage {
+    image: Arc<std::sync::Mutex<MemImage>>,
+    writes: Arc<AtomicUsize>,
+}
+
+impl SharedCountingImage {
+    fn new(image: MemImage, writes: Arc<AtomicUsize>) -> (Self, Arc<std::sync::Mutex<MemImage>>) {
+        let image = Arc::new(std::sync::Mutex::new(image));
+        (
+            Self {
+                image: Arc::clone(&image),
+                writes,
+            },
+            image,
+        )
+    }
+}
+
+impl BlockImage for SharedCountingImage {
+    fn total_blocks(&self) -> u64 {
+        self.image.lock().expect("shared image lock").total_blocks()
+    }
+
+    fn read_block(&self, block: u64, out: &mut Page4K) -> tx_ext4_format::Result<()> {
+        self.image
+            .lock()
+            .expect("shared image lock")
+            .read_block(block, out)
+    }
+
+    fn write_block(&mut self, block: u64, data: &Page4K) -> tx_ext4_format::Result<()> {
+        self.writes.fetch_add(1, Ordering::AcqRel);
+        self.image
+            .lock()
+            .expect("shared image lock")
+            .write_block(block, data)
+    }
+
+    fn barrier(&mut self) -> tx_ext4_format::Result<()> {
+        self.image.lock().expect("shared image lock").barrier()
+    }
+}
+
 fn init_substrate() {
     tx_test_support::init_host();
     tx_subsystems::zones::register_all().expect("tx-subsystems zones");
@@ -651,7 +695,7 @@ fn mounted_counting_unlink_fs(
     Arc<AtomicUsize>,
 ) {
     let writes = Arc::new(AtomicUsize::new(0));
-    let runtime = mutation_runtime_for_test_with_metadata(sequence, 2, false);
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 3, false);
     let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
         CountingImage {
             image: build_tier1_mount_image(),
@@ -662,6 +706,27 @@ fn mounted_counting_unlink_fs(
     )
     .expect("mount Tier 1 mutation ext4 image");
     (mounted, runtime, writes)
+}
+
+fn mounted_shared_unlink_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<SharedCountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<MemImage>>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 3, false);
+    let (image, image_handle) =
+        SharedCountingImage::new(build_tier1_mount_image(), Arc::clone(&writes));
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        image,
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 mutation ext4 image");
+    (mounted, runtime, writes, image_handle)
 }
 
 fn mounted_counting_destroy_fs(
@@ -1351,6 +1416,73 @@ fn ext4_unlink_public_path_admits_namespace_mutation_without_home_write() {
         mounted
             .fs_ops()
             .unlink(FsObjectId::new(2), b"hello", FsObjectId::new(12), &guard,),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_unlink_settlement_publishes_directory_inode_and_orphan_head() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes, image) = mounted_shared_unlink_fs(27);
+    let fs_ops = mounted.fs_ops();
+
+    assert_eq!(
+        fs_ops.unlink(FsObjectId::new(2), b"hello", FsObjectId::new(12), &guard,),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+    assert_eq!(
+        fs_ops.lookup(FsObjectId::new(2), b"hello", &guard),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
+    );
+    let meta = match fs_ops.load_inode_meta(FsObjectId::new(12), &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load unlinked inode meta after settlement: {other:?}"),
+    };
+    assert_eq!(meta.nlinks, 0);
+
+    let image = image.lock().expect("shared image lock");
+    let superblock = Superblock::parse(&image.blocks[0][1024..2048]).expect("superblock");
+    assert_eq!(superblock.last_orphan, 12);
+    let inode_offset = 11 * 256;
+    let inode = Inode::parse(&image.blocks[4][inode_offset..inode_offset + 256]).expect("inode 12");
+    assert_eq!(inode.links_count, 0);
+    assert_eq!(inode.dtime, 0);
+}
+
+#[test]
+fn ext4_destroy_clears_singleton_orphan_before_inode_reuse() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_create_fs_with_ring(41);
+    let fs_ops = mounted.fs_ops();
+
+    let (first_id, _) =
+        match fs_ops.create_inode(FsObjectId::new(2), b"first", 0o100640, &cred, &guard) {
+            V3::Done(created) => created,
+            other => panic!("create first file for orphan reuse test: {other:?}"),
+        };
+    assert_eq!(
+        fs_ops.unlink(FsObjectId::new(2), b"first", first_id, &guard,),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        fs_ops.destroy_inode(first_id, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    let (second_id, _) =
+        match fs_ops.create_inode(FsObjectId::new(2), b"second", 0o100640, &cred, &guard) {
+            V3::Done(created) => created,
+            other => panic!("create second file for orphan reuse test: {other:?}"),
+        };
+    assert_eq!(second_id, first_id);
+    assert_eq!(
+        fs_ops.unlink(FsObjectId::new(2), b"second", second_id, &guard,),
         V3::<(), NoProgress>::done(())
     );
     assert_metadata_settled(&runtime, &writes);
