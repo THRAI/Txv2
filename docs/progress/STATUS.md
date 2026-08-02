@@ -1,3 +1,21 @@
+- 2026-08-02 (ext4 Tier 1 capability ledger receipt binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now parses the
+  run-owned `authority-capability-ledger` artifact and requires the Tier 1
+  compatibility profile: 4 KiB blocks, inode sizes 128/256, pinned feature-bit
+  masks, `metadata_csum_required=true`, `ordered_jbd2_required=true`,
+  bounded extent/directory/orphan mutation shapes, and the unsupported
+  extent-growth/htree-split/orphan_file/direct-I/O list. This closes the gap
+  where a receipt could bind the capability ledger hash while the ledger body
+  was only a schema stub. Verification passed `CARGO_INCREMENTAL=0 cargo test
+  -p xtask receipt_verify -- --test-threads=1` (23),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (66),
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-capability-ledger-bind-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, a full fresh
+  1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and the verified
+  immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 authority status receipt binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now parses the

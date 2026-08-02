@@ -51,6 +51,25 @@ fn tier1_verify_receipt_rejects_authority_artifact_sha_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_capability_ledger_without_metadata_csum() {
+    let root = temp_root("verify-receipt-capability-metadata-csum");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let mut capability = capability_ledger_json();
+    capability["profile"]["feature_bits"]["metadata_csum_required"] =
+        serde_json::Value::Bool(false);
+    rewrite_authority_artifact_contents(
+        &root,
+        "authority-capability-ledger",
+        "capability_ledger_sha256",
+        &serde_json::to_string_pretty(&capability).expect("capability ledger json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("metadata_csum=false must fail");
+    assert!(error.contains("metadata_csum_required must be true, found false"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_xfstests_authority_not_acceptance_ready() {
     let root = temp_root("verify-receipt-xfstests-authority-status");
     let _cleanup = TempCleanup(root.clone());
@@ -380,6 +399,35 @@ struct FixtureOptions {
     bad_authority_sha: bool,
 }
 
+fn capability_ledger_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "tx.ext4.capability_ledger.v1",
+        "profile": {
+            "block_size": 4096,
+            "inode_sizes": [128, 256],
+            "feature_bits": {
+                "compat_allowed": 60,
+                "incompat_required": 64,
+                "incompat_allowed": 8902,
+                "ro_compat_allowed": 1131,
+                "metadata_csum_required": true,
+                "ordered_jbd2_required": true
+            },
+            "mutation_shapes": {
+                "extent": "depth_one",
+                "directory": ["linear", "htree_non_splitting"],
+                "orphan": "classic"
+            }
+        },
+        "unsupported": [
+            "extent_depth_growth",
+            "htree_split",
+            "orphan_file",
+            "direct_io"
+        ]
+    })
+}
+
 fn crash_catalog_families_json() -> Vec<serde_json::Value> {
     [
         "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12",
@@ -416,7 +464,7 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     let (_capability_ledger, capability_ledger_sha256) = add_artifact(
         "authority-capability-ledger",
         "authorities/capability-ledger.json".into(),
-        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#.into(),
+        serde_json::to_string_pretty(&capability_ledger_json()).expect("capability ledger json"),
     );
     let (_crash_cut_catalog, crash_cut_catalog_sha256) = add_artifact(
         "authority-crash-cut-catalog",

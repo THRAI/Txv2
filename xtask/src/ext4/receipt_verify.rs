@@ -168,8 +168,66 @@ fn verify_authority_ledger_evidence(
     artifacts: &BTreeMap<String, ArtifactRecord>,
     path: &Path,
 ) -> Result<()> {
+    verify_capability_ledger_evidence(artifacts, path)?;
     verify_xfstests_authority_acceptance_ready(artifacts, path)?;
     verify_crash_catalog_authority_acceptance_ready(artifacts, path)
+}
+
+fn verify_capability_ledger_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let authority_path = artifacts
+        .get("authority-capability-ledger")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing artifact authority-capability-ledger",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let authority = read_json(&authority_path)?;
+    require_schema(&authority, "tx.ext4.capability_ledger.v1", &authority_path)?;
+    let authority_object = json_object(&authority, "capability ledger", &authority_path)?;
+    let profile = required_json_object(authority_object, "profile", &authority_path)?;
+    require_usize_value(profile, "block_size", 4096, &authority_path)?;
+    require_usize_array_value(profile, "inode_sizes", &[128, 256], &authority_path)?;
+
+    let feature_bits = required_json_object(profile, "feature_bits", &authority_path)?;
+    require_usize_value(feature_bits, "compat_allowed", 60, &authority_path)?;
+    require_usize_value(feature_bits, "incompat_required", 64, &authority_path)?;
+    require_usize_value(feature_bits, "incompat_allowed", 8902, &authority_path)?;
+    require_usize_value(feature_bits, "ro_compat_allowed", 1131, &authority_path)?;
+    require_bool_value(
+        feature_bits,
+        "metadata_csum_required",
+        true,
+        &authority_path,
+    )?;
+    require_bool_value(feature_bits, "ordered_jbd2_required", true, &authority_path)?;
+
+    let mutation_shapes = required_json_object(profile, "mutation_shapes", &authority_path)?;
+    require_field_value(mutation_shapes, "extent", "depth_one", &authority_path)?;
+    require_string_array_value(
+        mutation_shapes,
+        "directory",
+        &["linear", "htree_non_splitting"],
+        &authority_path,
+    )?;
+    require_field_value(mutation_shapes, "orphan", "classic", &authority_path)?;
+    require_string_array_value(
+        authority_object,
+        "unsupported",
+        &[
+            "extent_depth_growth",
+            "htree_split",
+            "orphan_file",
+            "direct_io",
+        ],
+        &authority_path,
+    )?;
+    Ok(())
 }
 
 fn verify_xfstests_authority_acceptance_ready(
@@ -262,6 +320,104 @@ fn require_field_value(
         return Err(format!(
             "{}: {key} must be `{expected}`, found `{found}`",
             path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_usize_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: usize,
+    path: &Path,
+) -> Result<()> {
+    let found = required_json_usize(object, key, path)?;
+    if found != expected {
+        return Err(format!(
+            "{}: {key} must be {expected}, found {found}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_bool_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: bool,
+    path: &Path,
+) -> Result<()> {
+    let found = object
+        .get(key)
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| format!("{}: missing bool {key}", path.display()))?;
+    if found != expected {
+        return Err(format!(
+            "{}: {key} must be {expected}, found {found}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_usize_array_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: &[usize],
+    path: &Path,
+) -> Result<()> {
+    let found = object
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing array {key}", path.display()))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| format!("{}: {key} entries must be integers", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if found != expected {
+        return Err(format!(
+            "{}: {key} must be {:?}, found {:?}",
+            path.display(),
+            expected,
+            found
+        ));
+    }
+    Ok(())
+}
+
+fn require_string_array_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: &[&str],
+    path: &Path,
+) -> Result<()> {
+    let found = object
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing array {key}", path.display()))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: {key} entries must be strings", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected = expected
+        .iter()
+        .copied()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if found != expected {
+        return Err(format!(
+            "{}: {key} must be {:?}, found {:?}",
+            path.display(),
+            expected,
+            found
         ));
     }
     Ok(())
