@@ -1,3 +1,20 @@
+- 2026-08-02 (ext4 Tier 1 guest matrix serial evidence).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. The live Tier 1 guest matrix now runs `shell-test` with a
+  run-owned `--serial-log` path and records `guest-matrix-serial-log` after the
+  shell-test attempt, preserving the same-run QEMU console for the
+  TEST/SCRATCH/WORKLOAD scenario. `--verify-receipt` now requires that artifact,
+  so G1/G2 normal matrix claims cannot rely only on receipt summary fields.
+  Verification passed `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify
+  -- --test-threads=1` (8), `CARGO_INCREMENTAL=0 cargo test -p xtask
+  tier1_shell_matrix_passes_role_images_in_device_order -- --test-threads=1`
+  (1), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`
+  (50), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the
+  expected fail-closed live preflight `task16-guest-serial-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, a full fresh
+  1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and the verified
+  immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 G0 lint evidence artifacts).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. Live Tier 1 G0 lints now write run-owned logs for

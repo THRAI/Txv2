@@ -411,11 +411,21 @@ fn tier1_shell_matrix_passes_role_images_in_device_order() {
     let test = root.join("target/ext4/tier1/run/test.img");
     let scratch = root.join("target/ext4/tier1/run/scratch.img");
     let workload = root.join("target/ext4/tier1/run/workload.img");
-    let args = tier1_shell_test_args(TxTarget::Rv64Qemu, &scenario, &test, &scratch, &workload);
+    let serial_log = root.join("target/ext4/tier1/run/guest-matrix-serial.log");
+    let args = tier1_shell_test_args(
+        TxTarget::Rv64Qemu,
+        &scenario,
+        &test,
+        &scratch,
+        &workload,
+        &serial_log,
+    );
     let rendered = args.join(" ");
 
     assert!(rendered.contains("--target rv64-qemu"));
     assert!(rendered.contains("--profile busybox"));
+    assert!(rendered.contains("--serial-log"));
+    assert!(rendered.contains(&serial_log.display().to_string()));
     assert!(rendered.contains("--extra-rv64-ext4"));
     assert!(rendered.contains(&test.display().to_string()));
     assert!(rendered.contains(&scratch.display().to_string()));

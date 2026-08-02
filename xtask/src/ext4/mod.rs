@@ -151,7 +151,8 @@ fn run_live_tier1(
     let workload_image = run.stage_copy("workload-image", &base_image, "workload.img")?;
 
     let scenario = root.join("tools/shell-tests/ext4-tier1.scn");
-    shell_test::shell_test(
+    let guest_matrix_serial = run.working_dir().join("guest-matrix-serial.log");
+    let shell_result = shell_test::shell_test(
         root,
         tier1_shell_test_args(
             base_target,
@@ -159,8 +160,13 @@ fn run_live_tier1(
             &test_image,
             &scratch_image,
             &workload_image,
+            &guest_matrix_serial,
         ),
-    )?;
+    );
+    if guest_matrix_serial.is_file() {
+        run.record_artifact("guest-matrix-serial-log", guest_matrix_serial)?;
+    }
+    shell_result?;
 
     let crash_campaign = execute_crash_cut_campaign(
         root,
@@ -245,6 +251,7 @@ fn tier1_shell_test_args(
     test_image: &Path,
     scratch_image: &Path,
     workload_image: &Path,
+    serial_log: &Path,
 ) -> Vec<String> {
     vec![
         "--target".into(),
@@ -259,6 +266,8 @@ fn tier1_shell_test_args(
         scratch_image.display().to_string(),
         "--extra-rv64-ext4".into(),
         workload_image.display().to_string(),
+        "--serial-log".into(),
+        serial_log.display().to_string(),
     ]
 }
 
