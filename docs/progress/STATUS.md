@@ -1,3 +1,18 @@
+- 2026-08-02 (ext4 Tier 1 receipt lock).
+  Advanced Task 16 immutable-receipt evidence without promoting final
+  acceptance. Final and failed Tier 1 run workspaces now write
+  `receipt-lock.json` with schema `tx.ext4.tier1_receipt_lock.v1`, binding the
+  stable receipt path/sha256 and the artifacts manifest path/sha256 after the
+  receipt has already bound `artifacts.json`. This gives the future G0-G7
+  acceptance run a machine-checkable digest anchor for the produced receipt
+  without introducing a self-referential hash. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`,
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-receipt-lock-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, full fresh 1000-cut
+  QEMU/e2fsck execution, pinned xfstests execution, and the immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 artifact manifest binding).
   Advanced Task 16 receipt integrity without promoting final acceptance.
   `artifacts.json` now records a sha256 for every registered run artifact, the

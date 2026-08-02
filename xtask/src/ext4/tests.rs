@@ -24,8 +24,10 @@ fn run_workspace_finalizes_once_and_cleans_temporary_state() {
     assert!(!run.temporary_path_for_test().exists());
     let run_dir = root.join("target/ext4/tier1/test-run");
     let manifest_path = run_dir.join("artifacts.json");
+    let lock_path = run_dir.join("receipt-lock.json");
     assert!(run_dir.exists());
     assert!(manifest_path.exists());
+    assert!(lock_path.exists());
     let artifacts: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
     assert_eq!(artifacts["artifacts"][0]["name"], "scratch");
@@ -38,6 +40,21 @@ fn run_workspace_finalizes_once_and_cleans_temporary_state() {
     );
     assert_eq!(
         receipt_value["artifact_manifest"]["sha256"],
+        sha256_file(&manifest_path).unwrap()
+    );
+    let lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&lock_path).unwrap()).unwrap();
+    assert_eq!(lock["schema"], "tx.ext4.tier1_receipt_lock.v1");
+    assert_eq!(
+        lock["receipt"]["path"],
+        run_dir
+            .join("acceptance-receipt.json")
+            .display()
+            .to_string()
+    );
+    assert_eq!(lock["receipt"]["sha256"], sha256_file(&receipt).unwrap());
+    assert_eq!(
+        lock["artifact_manifest"]["sha256"],
         sha256_file(&manifest_path).unwrap()
     );
 }
@@ -71,6 +88,10 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         root.join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
             .exists()
     );
+    assert!(
+        root.join("target/ext4/tier1/failed-run/receipt-lock.json")
+            .exists()
+    );
     let artifacts: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap(),
     )
@@ -87,6 +108,24 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
     .unwrap();
     assert_eq!(
         receipt["artifact_manifest"]["sha256"],
+        sha256_file(&root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap()
+    );
+    let lock: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("target/ext4/tier1/failed-run/receipt-lock.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        lock["receipt"]["path"],
+        root.join("target/ext4/tier1/failed-run/failed-receipt.json")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        lock["receipt"]["sha256"],
+        sha256_file(&root.join("target/ext4/tier1/failed-run/failed-receipt.json")).unwrap()
+    );
+    assert_eq!(
+        lock["artifact_manifest"]["sha256"],
         sha256_file(&root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap()
     );
     assert!(!temp.exists());

@@ -119,6 +119,7 @@ impl RunWorkspace {
         receipt
             .write_json(&self.temporary.join("acceptance-receipt.json"))
             .map_err(|err| format!("failed to write final receipt: {err}"))?;
+        self.write_receipt_lock(&self.temporary, "acceptance-receipt.json", &manifest)?;
         if self.final_dir.exists() {
             fs::remove_dir_all(&self.final_dir).map_err(|err| {
                 format!(
@@ -198,6 +199,10 @@ impl RunWorkspace {
         let _ = fs::create_dir_all(dir);
         if let Ok(manifest) = self.write_artifacts_manifest(dir) {
             let _ = self.bind_artifact_manifest(&mut receipt, &manifest);
+            if receipt.write_json(&dir.join("failed-receipt.json")).is_ok() {
+                let _ = self.write_receipt_lock(dir, "failed-receipt.json", &manifest);
+            }
+            return;
         }
         let _ = receipt.write_json(&dir.join("failed-receipt.json"));
     }
@@ -242,6 +247,34 @@ impl RunWorkspace {
             sha256_file(manifest_path)?,
         );
         Ok(())
+    }
+
+    fn write_receipt_lock(
+        &self,
+        dir: &Path,
+        receipt_name: &str,
+        manifest_path: &Path,
+    ) -> Result<PathBuf> {
+        let receipt_path = dir.join(receipt_name);
+        let stable_receipt_path = self.final_dir.join(receipt_name);
+        let stable_manifest_path = self.final_dir.join("artifacts.json");
+        let lock = serde_json::json!({
+            "schema": "tx.ext4.tier1_receipt_lock.v1",
+            "run_id": self.run_id,
+            "receipt": {
+                "path": stable_receipt_path.display().to_string(),
+                "sha256": sha256_file(&receipt_path)?
+            },
+            "artifact_manifest": {
+                "path": stable_manifest_path.display().to_string(),
+                "sha256": sha256_file(manifest_path)?
+            }
+        });
+        let text = serde_json::to_string_pretty(&lock)
+            .map_err(|err| format!("failed to encode receipt lock: {err}"))?;
+        let path = dir.join("receipt-lock.json");
+        fs::write(&path, text).map_err(|err| format!("failed to write receipt lock: {err}"))?;
+        Ok(path)
     }
 }
 
