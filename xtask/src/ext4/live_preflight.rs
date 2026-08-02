@@ -39,7 +39,7 @@ pub(super) fn run_live_preflight(
     }
     let xfstests_selected_cases_verified =
         collect_xfstests_preflight(root, authorities, &mut blockers);
-    collect_linux_replay_preflight(&mut blockers);
+    let linux_rw_replay_ready = collect_linux_replay_preflight(root, &mut blockers);
     if let Some(report_path) = report_path {
         write_live_preflight_report(
             root,
@@ -50,6 +50,7 @@ pub(super) fn run_live_preflight(
             materialize_xfstests,
             xfstests_source_prepared,
             xfstests_selected_cases_verified,
+            linux_rw_replay_ready,
         )?;
         println!(
             "ext4 tier1: live-preflight report {}",
@@ -134,6 +135,7 @@ fn write_live_preflight_report(
     materialize_xfstests: bool,
     xfstests_source_prepared: bool,
     xfstests_selected_cases_verified: bool,
+    linux_rw_replay_ready: bool,
 ) -> Result<()> {
     let path = resolve_repo_path(root, report_path.to_path_buf());
     if let Some(parent) = path.parent() {
@@ -184,6 +186,7 @@ fn write_live_preflight_report(
             "materialize_xfstests_requested": materialize_xfstests,
             "xfstests_source_prepared": xfstests_source_prepared,
             "xfstests_selected_cases_verified": xfstests_selected_cases_verified,
+            "linux_rw_replay_ready": linux_rw_replay_ready,
         },
         "result": {
             "ready": blockers.is_empty(),
@@ -301,43 +304,39 @@ fn verify_xfstests_selected_cases(xfstests_root: &Path, cases: &[String]) -> Res
     Ok(())
 }
 
-fn collect_linux_replay_preflight(blockers: &mut Vec<String>) {
-    if std::env::consts::OS != "linux" {
-        blockers.push(format!(
-            "Linux RW replay requires a Linux host; current host is {}",
-            std::env::consts::OS
-        ));
-        return;
-    }
-    match current_uid() {
-        Ok(0) => {}
-        Ok(uid) => blockers.push(format!(
-            "Linux RW replay requires root for a loop mount; current uid is {uid}"
-        )),
-        Err(err) => blockers.push(err),
-    }
-    for tool in ["mount", "umount"] {
-        if !command_exists(tool) {
-            blockers.push(format!("Linux RW replay requires tool: {tool}"));
+fn collect_linux_replay_preflight(root: &Path, blockers: &mut Vec<String>) -> bool {
+    let runner = root.join("tools/ext4/fault_linux_rw_replay.py");
+    let output = match Command::new(&runner).arg("--preflight").output() {
+        Ok(output) => output,
+        Err(err) => {
+            blockers.push(format!(
+                "failed to run Linux RW replay preflight {}: {err}",
+                runner.display()
+            ));
+            return false;
         }
+    };
+    if output.status.success() {
+        return true;
     }
+    let reason = linux_replay_preflight_reason(&output);
+    blockers.push(format!("Linux RW replay preflight blocked: {reason}"));
+    false
 }
 
-fn current_uid() -> Result<u32> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|err| format!("failed to run id -u for live preflight: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "id -u failed during live preflight with {}",
-            output.status
-        ));
+fn linux_replay_preflight_reason(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stderr.lines().rev().chain(stdout.lines().rev()) {
+        let line = line.trim();
+        if let Some(reason) = line.strip_prefix("error: ") {
+            return reason.to_string();
+        }
+        if !line.is_empty() {
+            return line.to_string();
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim()
-        .parse::<u32>()
-        .map_err(|err| format!("failed to parse id -u output `{}`: {err}", text.trim()))
+    format!("exit {}", output.status)
 }
 
 fn path_is_executable(path: &Path) -> bool {

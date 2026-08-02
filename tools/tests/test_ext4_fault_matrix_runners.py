@@ -38,6 +38,26 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(module.LinuxReplayError, "requires a Linux host"):
                     module.validate_host(image)
 
+    def test_linux_runner_can_preflight_with_docker_fallback_off_linux(self):
+        module = load_module(LINUX_RUNNER, "fault_linux_rw_replay")
+        completed = subprocess.CompletedProcess(["docker"], 0, "", "")
+        with mock.patch.object(module.platform, "system", return_value="Darwin"), mock.patch.object(
+            module.shutil, "which", return_value="/usr/bin/docker"
+        ), mock.patch.object(module.subprocess, "run", side_effect=[completed, completed]) as run:
+            self.assertEqual(module.select_replay_backend(), "docker")
+
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("image", run.call_args_list[0].args[0])
+        self.assertIn("run", run.call_args_list[1].args[0])
+
+    def test_linux_runner_fails_preflight_when_host_and_docker_are_unavailable(self):
+        module = load_module(LINUX_RUNNER, "fault_linux_rw_replay")
+        with mock.patch.object(module.platform, "system", return_value="Darwin"), mock.patch.object(
+            module.shutil, "which", return_value=None
+        ):
+            with self.assertRaisesRegex(module.LinuxReplayError, "Docker fallback blocked"):
+                module.preflight_replay_environment()
+
     def test_tx_runner_builds_shell_test_with_matrix_image_as_scratch(self):
         with tempfile.TemporaryDirectory() as tmp:
             image = Path(tmp) / "tx-remount.img"

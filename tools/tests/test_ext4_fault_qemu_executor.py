@@ -671,7 +671,22 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                 os.environ,
                 {"TX_EXT4_FAULT_E2FSCK_COMMAND": shlex.join([sys.executable, "-c", "print('fsck')"])},
                 clear=False,
-            ), patch.object(module.platform, "system", return_value="Darwin"):
+            ), patch.object(
+                module.subprocess,
+                "run",
+                side_effect=[
+                    subprocess.CompletedProcess(["e2fsck"], 0, "fsck\n", ""),
+                    subprocess.CompletedProcess(
+                        [
+                            str(ROOT / "tools" / "ext4" / "fault_linux_rw_replay.py"),
+                            "--preflight",
+                        ],
+                        1,
+                        "",
+                        "error: Linux RW replay requires a Linux host\n",
+                    ),
+                ],
+            ):
                 module.produce_result_if_verified(plan_path, plan)
 
         self.assertFalse((job_dir / "result.json").exists())
@@ -1085,7 +1100,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
             ],
         )
 
-    def test_matrix_preflight_blocks_repository_linux_default_off_linux(self):
+    def test_matrix_preflight_blocks_when_repository_linux_default_preflight_fails(self):
         module = load_executor_module()
         with tempfile.TemporaryDirectory() as tmp:
             runner = Path(tmp) / "fault-linux-rw-replay"
@@ -1103,13 +1118,58 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                 },
                 "result": {"status": "not-written"},
             }
+            completed = subprocess.CompletedProcess(
+                [str(runner), "--preflight"],
+                1,
+                "",
+                "error: Linux RW replay requires a Linux host; Docker fallback blocked: docker is unavailable\n",
+            )
             with patch.dict(os.environ, {}, clear=True), patch.object(
                 module, "repository_linux_rw_replay_path", return_value=runner, create=True
-            ), patch.object(module.platform, "system", return_value="Darwin"):
+            ), patch.object(module.subprocess, "run", return_value=completed):
                 self.assertFalse(module.preflight_replay_matrix(plan))
 
         self.assertEqual(plan["replay_matrix_preflight"]["status"], "blocked")
         self.assertIn("Linux RW replay requires a Linux host", plan["result"]["reason"])
+
+    def test_matrix_preflight_accepts_repository_linux_default_docker_fallback(self):
+        module = load_executor_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Path(tmp) / "fault-linux-rw-replay"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(0o755)
+            plan = {
+                "job": {
+                    "replay_matrix": [
+                        {
+                            "id": "linux-rw-replay",
+                            "image": "/tmp/linux-replay.img",
+                            "log": "/tmp/linux-replay.log",
+                        }
+                    ]
+                },
+                "result": {"status": "not-written"},
+            }
+            completed = subprocess.CompletedProcess(
+                [str(runner), "--preflight"],
+                0,
+                "linux-rw-replay-preflight:docker\n",
+                "",
+            )
+            with patch.dict(os.environ, {}, clear=True), patch.object(
+                module, "repository_linux_rw_replay_path", return_value=runner, create=True
+            ), patch.object(module.subprocess, "run", return_value=completed):
+                self.assertTrue(module.preflight_replay_matrix(plan))
+
+        self.assertEqual(plan["replay_matrix_preflight"]["status"], "ready")
+        self.assertEqual(
+            plan["replay_matrix_preflight"]["commands"][0],
+            {
+                "id": "linux-rw-replay",
+                "command_source": "repository-default",
+                "command": [str(runner)],
+            },
+        )
 
     def test_matrix_preflight_rejects_empty_semantic_runner_override(self):
         module = load_executor_module()

@@ -1,3 +1,18 @@
+- 2026-08-02 (ext4 Tier 1 Docker-backed Linux replay preflight).
+  Reduced the Task 16 live-preflight blocker set without promoting final
+  acceptance. `tools/ext4/fault_linux_rw_replay.py` now supports
+  `--preflight`, uses a real Linux/root loop mount when available, and falls
+  back to privileged Docker with `tx-ext4-e2fsprogs:local` on macOS. The fault
+  QEMU executor and `cargo xtask ext4 tier1 --preflight-live` now delegate
+  Linux replay readiness to that repository-owned runner, so final executor
+  plans still record the same repository-default command. The live report
+  `target/ext4/tier1/preflight/task16-docker-linux-replay-20260802.json`
+  records `linux_rw_replay_ready=true`, selected xfstests cases verified, and
+  only two remaining blockers: xfstests selection and crash-cut catalog still
+  have placeholder authority statuses. Task 16 still needs acceptance-ready
+  authority ledgers, actual pinned xfstests execution, full fresh 1000-cut
+  QEMU/e2fsck evidence, and the verified immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 xfstests selected-case preflight).
   Advanced Task 16 xfstests authority readiness without promoting final
   acceptance. Live preflight now verifies every selected case in

@@ -8,8 +8,8 @@ crash/replay image copies. It writes a result manifest only after the default
 shell-test path observes its hard-kill contract, every required e2fsck -fn
 check succeeds, and declared replay-matrix commands complete. Linux RW replay
 and Tx remount always resolve to repository-owned runners; the Linux runner
-fail-closes before the primary run unless the host is Linux root with loop-mount
-tooling. Declared semantic oracles default to the repository-owned
+fail-closes before the primary run unless its own preflight can provide a real
+Linux root loop mount directly or through privileged Docker. Declared semantic oracles default to the repository-owned
 fault_semantic_oracle.py runner. Set TX_EXT4_FAULT_PLAN_ONLY=1 for plan-only
 preflight.
 """
@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import platform
 import shlex
 import shutil
 import subprocess
@@ -715,17 +714,28 @@ def repository_linux_rw_replay_command(result: dict[str, Any]) -> list[str] | No
     if not os.access(path, os.X_OK):
         result["reason"] = f"repository Linux RW replay command is not executable: {path}"
         return None
-    if platform.system() != "Linux":
-        result["reason"] = "Linux RW replay requires a Linux host"
-        return None
-    if os.geteuid() != 0:
-        result["reason"] = "Linux RW replay requires root for a loop mount"
-        return None
-    missing = [tool for tool in ("mount", "umount", "e2fsck") if shutil.which(tool) is None]
-    if missing:
-        result["reason"] = "Linux RW replay requires tools: " + ", ".join(missing)
+    preflight = subprocess.run(
+        [str(path), "--preflight"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if preflight.returncode != 0:
+        result["reason"] = linux_replay_preflight_error(preflight)
         return None
     return [str(path)]
+
+
+def linux_replay_preflight_error(completed: subprocess.CompletedProcess[str]) -> str:
+    text = completed.stderr.strip() or completed.stdout.strip()
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("error: "):
+            return line.removeprefix("error: ")
+        if line:
+            return line
+    return f"Linux RW replay preflight failed with exit {completed.returncode}"
 
 
 def repository_tx_remount_command(result: dict[str, Any]) -> list[str] | None:
