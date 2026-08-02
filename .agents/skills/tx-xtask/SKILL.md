@@ -23,6 +23,7 @@ binary disagree, the binary wins.
 | Decode a syscall trace from serial log | `cargo xtask trap-trace --serial PATH --syscalls` |
 | Run guest shell scenarios | `cargo xtask shell-test --target rv64-qemu --script PATH` |
 | Inspect ext4 Tier 1 plan/authorities | `cargo xtask ext4 tier1 --dry-run` |
+| Check ext4 Tier 1 live prerequisites without QEMU | `cargo xtask ext4 tier1 --preflight-live` |
 | Verify an ext4 Tier 1 receipt/lock/artifacts set | `cargo xtask ext4 tier1 --verify-receipt PATH` |
 | Validate progress JSON records | `cargo xtask progress validate` |
 | Run an architecture / docs / boundary lint | `cargo xtask lint arch\|docs\|unused\|boundary\|invariants` |
@@ -161,13 +162,17 @@ Runs guest shell scenarios from a script file. Flags:
 - `--list-groups` — print available group names from the script.
 - `--keep-going` — don't stop on first failure.
 
-### `cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run] [--verify-receipt PATH]`
+### `cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run] [--preflight-live] [--verify-receipt PATH]`
 
 Runs the ext4 Tier 1 acceptance planner/runner. `--dry-run` prints the
 ordered action list and resolved authority hashes without launching QEMU or
 producing a final receipt. The eventual live runner will own fresh images,
 crash cuts, replay, `e2fsck -fn`, pinned xfstests, and the immutable
 acceptance receipt under `target/ext4/tier1/<run-id>/`.
+`--preflight-live` checks live execution prerequisites without creating a run
+workspace or launching QEMU: authority readiness, required host tools,
+repository fault runners, pinned local xfstests source, campaign phase markers,
+and Linux/root loop-mount replay capability.
 `--verify-receipt PATH` checks a produced acceptance receipt without launching
 QEMU: G0-G7 must be passed, the receipt lock and artifact manifest digests
 must match, registered artifact files must hash cleanly, and every required

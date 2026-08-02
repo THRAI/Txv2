@@ -119,7 +119,7 @@ fn print_usage() {
            cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
-           cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run]\n\
+           cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run] [--preflight-live] [--verify-receipt PATH]\n\
            cargo xtask kernel-user-layouts [--arch riscv64|loongarch64] [--dump]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
            cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE] [--suite SUITE] [--data DIR] [--dry-run]\n\

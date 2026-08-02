@@ -6,8 +6,9 @@ use super::{
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
     CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
     parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_and_record_command,
-    run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts,
-    tier1_shell_test_args, verify_xfstests_source_lock, write_fault_job_request,
+    run_crash_cut_campaign, run_live_preflight, run_workspace::RunWorkspace, sha256_file,
+    stage_authority_artifacts, tier1_shell_test_args, verify_xfstests_source_lock,
+    write_fault_job_request,
 };
 use crate::target::TxTarget;
 
@@ -304,6 +305,50 @@ fn tier1_live_rejects_placeholder_authorities_before_acceptance_receipt() {
         .expect_err("live runner must not promote placeholder authorities");
     assert!(error.contains("xfstests selection status is `selection-authority-declared`"));
     assert!(error.contains("crash-cut catalog status is `catalog-authority-declared`"));
+}
+
+#[test]
+fn tier1_parse_accepts_live_preflight_mode() {
+    let root = temp_root("preflight-live-parse");
+    write_tier1_authority_fixture(&root);
+
+    let invocation = parse_tier1_args(&root, &["tier1".into(), "--preflight-live".into()])
+        .expect("parse preflight-live");
+
+    assert!(invocation.preflight_live);
+    assert!(!invocation.dry_run);
+}
+
+#[test]
+fn tier1_parse_rejects_dry_run_with_live_preflight() {
+    let root = temp_root("preflight-live-exclusive");
+    write_tier1_authority_fixture(&root);
+
+    let error = parse_tier1_args(
+        &root,
+        &[
+            "tier1".into(),
+            "--dry-run".into(),
+            "--preflight-live".into(),
+        ],
+    )
+    .expect_err("dry-run and live preflight are mutually exclusive");
+
+    assert!(error.contains("only one of --dry-run or --preflight-live"));
+}
+
+#[test]
+fn tier1_live_preflight_reports_later_blockers_with_placeholder_authorities() {
+    let root = temp_root("preflight-live-placeholder");
+    write_tier1_authority_fixture(&root);
+    let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
+
+    let error =
+        run_live_preflight(&root, &authorities).expect_err("placeholder preflight must fail");
+
+    assert!(error.contains("xfstests selection status is `selection-authority-declared`"));
+    assert!(error.contains("crash-cut catalog status is `catalog-authority-declared`"));
+    assert!(error.contains("pinned xfstests source is missing"));
 }
 
 #[test]

@@ -1,3 +1,24 @@
+- 2026-08-02 (ext4 Tier 1 live preflight readiness).
+  Advanced Task 16 execution readiness without promoting final acceptance.
+  `cargo xtask ext4 tier1 --preflight-live` now checks live prerequisites
+  without creating a run workspace, cloning xfstests, launching QEMU, or
+  minting a receipt. It aggregates authority readiness, required host tools,
+  repository fault runner executability, pinned local xfstests source
+  readiness, crash workload phase-marker coverage, and Linux/root loop-mount
+  replay capability. On the current macOS checkout it reports four concrete
+  blockers: placeholder xfstests authority status, placeholder crash-cut
+  catalog status, missing local pinned `external/xfstests`, and Linux RW replay
+  requiring a Linux host. Verification passed focused parser/preflight tests,
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (79),
+  `CARGO_INCREMENTAL=0 cargo xtask --help | rg "ext4 tier1"`,
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, `git diff --check`,
+  the expected failing `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --preflight-live`, and the unchanged default live authority gate
+  `task16-live-preflight-default-gate-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 fault executor log artifact).
   Advanced Task 16 live crash-runner evidence without promoting final
   acceptance. The live crash-cut executor path now captures each
