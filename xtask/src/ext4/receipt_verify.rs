@@ -16,7 +16,6 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     let receipt_object = json_object(&receipt, "receipt", receipt_path)?;
     let candidate = required_json_object(receipt_object, "candidate", receipt_path)?;
     let run_id = required_json_string(candidate, "run_id", receipt_path)?;
-    verify_authority_digests(receipt_object, receipt_path)?;
     verify_gates_passed(receipt_object, receipt_path)?;
     verify_crash_cut_summary(receipt_object, receipt_path)?;
     verify_xfstests_summary(receipt_object, receipt_path)?;
@@ -56,6 +55,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
 
     let artifact_manifest_json = read_json(&manifest_path)?;
     let artifacts = verify_artifact_manifest(&artifact_manifest_json, &run_id, &manifest_path)?;
+    verify_authority_digests(receipt_object, &artifacts, receipt_path)?;
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
@@ -116,17 +116,27 @@ fn verify_receipt_lock(
 
 fn verify_authority_digests(
     receipt: &serde_json::Map<String, serde_json::Value>,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
     path: &Path,
 ) -> Result<()> {
     let authorities = required_json_object(receipt, "authorities", path)?;
-    for key in [
-        "capability_ledger_sha256",
-        "crash_cut_catalog_sha256",
-        "xfstests_selection_sha256",
-        "shell_scenario_sha256",
+    for (key, artifact_name) in [
+        ("capability_ledger_sha256", "authority-capability-ledger"),
+        ("crash_cut_catalog_sha256", "authority-crash-cut-catalog"),
+        ("xfstests_selection_sha256", "authority-xfstests-selection"),
+        ("shell_scenario_sha256", "authority-shell-scenario"),
     ] {
         let digest = required_json_string(authorities, key, path)?;
         verify_real_sha(key, &digest, path)?;
+        let artifact = artifacts
+            .get(artifact_name)
+            .ok_or_else(|| format!("{}: missing artifact {artifact_name}", path.display()))?;
+        if artifact.sha256 != digest {
+            return Err(format!(
+                "{}: authority {key} does not match artifact {artifact_name}",
+                path.display()
+            ));
+        }
     }
     Ok(())
 }

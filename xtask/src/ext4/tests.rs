@@ -6,8 +6,8 @@ use super::{
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
     CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
     parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_crash_cut_campaign,
-    run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args, verify_xfstests_source_lock,
-    write_fault_job_request,
+    run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts, tier1_shell_test_args,
+    verify_xfstests_source_lock, write_fault_job_request,
 };
 use crate::target::TxTarget;
 
@@ -132,6 +132,55 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         sha256_file(&root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap()
     );
     assert!(!temp.exists());
+}
+
+#[test]
+fn tier1_workspace_stages_authority_artifacts() {
+    let root = temp_root("authority-artifacts");
+    write_tier1_authority_fixture(&root);
+    let authorities = Tier1Authorities::load(&root).unwrap();
+    let mut run = RunWorkspace::create(&root, "authority-run").unwrap();
+
+    stage_authority_artifacts(&mut run, &authorities).expect("stage authority artifacts");
+    let receipt = run.finalize().expect("finalize run");
+    assert!(receipt.exists());
+
+    let run_dir = root.join("target/ext4/tier1/authority-run");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("artifacts.json")).unwrap()).unwrap();
+    let artifacts = manifest["artifacts"].as_array().unwrap();
+    for (name, relative_path, expected_sha256) in [
+        (
+            "authority-capability-ledger",
+            "authorities/capability-ledger.json",
+            authorities.capability.sha256.clone(),
+        ),
+        (
+            "authority-crash-cut-catalog",
+            "authorities/crash-cuts.json",
+            authorities.crash_cuts.sha256().to_string(),
+        ),
+        (
+            "authority-xfstests-selection",
+            "authorities/xfstests-selection.json",
+            authorities.selection.sha256().to_string(),
+        ),
+        (
+            "authority-shell-scenario",
+            "authorities/ext4-tier1.scn",
+            authorities.shell_scenario.sha256.clone(),
+        ),
+    ] {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact["name"] == name)
+            .unwrap_or_else(|| panic!("missing authority artifact {name}"));
+        let path = run_dir.join(relative_path);
+        assert!(path.exists(), "missing staged authority {}", path.display());
+        assert_eq!(artifact["path"], path.display().to_string());
+        assert_eq!(artifact["sha256"], expected_sha256);
+        assert_eq!(sha256_file(&path).unwrap(), expected_sha256);
+    }
 }
 
 #[test]
@@ -1443,6 +1492,44 @@ fn fault_request_fixture(suffix: &str) -> FaultRequestFixture {
         scratch_image,
         workload_image,
     }
+}
+
+fn write_tier1_authority_fixture(root: &PathBuf) {
+    write_json(
+        &root.join("tools/ext4/tier1/capability-ledger.json"),
+        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        r#"{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"selection-authority-declared",
+          "tier":"tier1",
+          "source_lock":{
+            "path":"external/xfstests",
+            "revision":"acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509",
+            "check_sha256":"104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642"
+          },
+          "selected":[{"case_id":"generic/001"}]
+        }"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/crash-cuts.json"),
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"catalog-authority-declared",
+          "expanded_cut_count":1000,
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    write_text(
+        &root.join("tools/shell-tests/ext4-tier1.scn"),
+        "# ext4 tier1\n",
+    );
 }
 
 fn write_json(path: &PathBuf, text: &str) {

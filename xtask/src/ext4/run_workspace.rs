@@ -65,6 +65,10 @@ impl RunWorkspace {
         file_name: &str,
     ) -> Result<PathBuf> {
         let destination = self.temporary.join(file_name);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
         fs::copy(source, &destination).map_err(|err| {
             format!(
                 "failed to copy {} -> {}: {err}",

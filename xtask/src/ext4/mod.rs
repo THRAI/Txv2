@@ -58,7 +58,35 @@ fn tier1(root: &Path, args: &[String]) -> Result<()> {
 
     let mut run = run_workspace::RunWorkspace::create(root, &invocation.run_id)?;
     run.record_authority_inputs(&invocation.authorities.as_input_summary())?;
+    stage_authority_artifacts(&mut run, &invocation.authorities)?;
     run_live_tier1(root, invocation, &mut run)
+}
+
+fn stage_authority_artifacts(
+    run: &mut run_workspace::RunWorkspace,
+    authorities: &Tier1Authorities,
+) -> Result<()> {
+    run.stage_copy(
+        "authority-capability-ledger",
+        &authorities.capability.path,
+        "authorities/capability-ledger.json",
+    )?;
+    run.stage_copy(
+        "authority-crash-cut-catalog",
+        &authorities.crash_cuts.file.path,
+        "authorities/crash-cuts.json",
+    )?;
+    run.stage_copy(
+        "authority-xfstests-selection",
+        &authorities.selection.file.path,
+        "authorities/xfstests-selection.json",
+    )?;
+    run.stage_copy(
+        "authority-shell-scenario",
+        &authorities.shell_scenario.path,
+        "authorities/ext4-tier1.scn",
+    )?;
+    Ok(())
 }
 
 fn run_live_tier1(

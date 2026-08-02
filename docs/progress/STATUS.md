@@ -1,3 +1,21 @@
+- 2026-08-02 (ext4 Tier 1 authority artifact binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. Live Tier 1 workspaces now stage the four authority inputs
+  (`capability-ledger.json`, `crash-cuts.json`, `xfstests-selection.json`, and
+  `ext4-tier1.scn`) as run-owned artifacts before later build/QEMU work, and
+  `--verify-receipt` requires the receipt authority digests to match those
+  artifact hashes. This closes the gap where receipt authorities only had
+  sha-like strings without file-backed evidence. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify --
+  --test-threads=1` (6), `CARGO_INCREMENTAL=0 cargo test -p xtask
+  tier1_workspace_stages_authority_artifacts -- --test-threads=1` (1),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (48),
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-authority-artifact-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, a full fresh
+  1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and the verified
+  immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 campaign-plan digest binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now requires each

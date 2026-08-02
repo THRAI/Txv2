@@ -39,6 +39,18 @@ fn tier1_verify_receipt_rejects_campaign_plan_sha_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_authority_artifact_sha_mismatch() {
+    let root = temp_root("verify-receipt-authority-sha");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture_with_bad_authority_sha(&root);
+
+    let error = verify_tier1_receipt(&receipt).expect_err("bad authority sha must fail");
+    assert!(error.contains(
+        "authority capability_ledger_sha256 does not match artifact authority-capability-ledger"
+    ));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_tampered_artifact() {
     let root = temp_root("verify-receipt-tampered");
     let _cleanup = TempCleanup(root.clone());
@@ -98,10 +110,21 @@ fn write_acceptance_receipt_fixture_with_bad_campaign_plan_sha(root: &PathBuf) -
     )
 }
 
+fn write_acceptance_receipt_fixture_with_bad_authority_sha(root: &PathBuf) -> PathBuf {
+    write_acceptance_receipt_fixture_inner(
+        root,
+        FixtureOptions {
+            bad_authority_sha: true,
+            ..FixtureOptions::default()
+        },
+    )
+}
+
 #[derive(Clone, Copy, Default)]
 struct FixtureOptions {
     bad_first_outcome: bool,
     bad_first_campaign_plan_sha: bool,
+    bad_authority_sha: bool,
 }
 
 fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOptions) -> PathBuf {
@@ -122,6 +145,27 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         }));
         (path, sha256)
     };
+
+    let (_capability_ledger, capability_ledger_sha256) = add_artifact(
+        "authority-capability-ledger",
+        "authorities/capability-ledger.json".into(),
+        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#.into(),
+    );
+    let (_crash_cut_catalog, crash_cut_catalog_sha256) = add_artifact(
+        "authority-crash-cut-catalog",
+        "authorities/crash-cuts.json".into(),
+        r#"{"schema":"tx.ext4.crash_cut_catalog.v1"}"#.into(),
+    );
+    let (_xfstests_selection, xfstests_selection_sha256) = add_artifact(
+        "authority-xfstests-selection",
+        "authorities/xfstests-selection.json".into(),
+        r#"{"schema":"tx.ext4.xfstests_selection_ledger.v1"}"#.into(),
+    );
+    let (_shell_scenario, shell_scenario_sha256) = add_artifact(
+        "authority-shell-scenario",
+        "authorities/ext4-tier1.scn".into(),
+        "# ext4 tier1\n".into(),
+    );
 
     let (test_image, test_sha) =
         add_artifact("test-image", "test.img".into(), "test image\n".into());
@@ -429,10 +473,14 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                 "run_id": "accepted-run"
             },
             "authorities": {
-                "capability_ledger_sha256": "1".repeat(64),
-                "crash_cut_catalog_sha256": "2".repeat(64),
-                "xfstests_selection_sha256": "3".repeat(64),
-                "shell_scenario_sha256": "4".repeat(64)
+                "capability_ledger_sha256": if options.bad_authority_sha {
+                    "5".repeat(64)
+                } else {
+                    capability_ledger_sha256
+                },
+                "crash_cut_catalog_sha256": crash_cut_catalog_sha256,
+                "xfstests_selection_sha256": xfstests_selection_sha256,
+                "shell_scenario_sha256": shell_scenario_sha256
             },
             "artifact_manifest": {
                 "path": artifacts_path.display().to_string(),
