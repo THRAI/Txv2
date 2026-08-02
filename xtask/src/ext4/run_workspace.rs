@@ -117,6 +117,7 @@ impl RunWorkspace {
         receipt
             .write_json(&self.temporary.join("acceptance-receipt.json"))
             .map_err(|err| format!("failed to write final receipt: {err}"))?;
+        self.write_artifacts_manifest(&self.temporary)?;
         if self.final_dir.exists() {
             fs::remove_dir_all(&self.final_dir).map_err(|err| {
                 format!(
@@ -194,7 +195,34 @@ impl RunWorkspace {
         let receipt =
             Tier1AcceptanceReceipt::from_dry_run(&self.run_id, commit, authorities, &[note]);
         let _ = fs::create_dir_all(dir);
+        let _ = self.write_artifacts_manifest(dir);
         let _ = receipt.write_json(&dir.join("failed-receipt.json"));
+    }
+
+    fn write_artifacts_manifest(&self, dir: &Path) -> Result<()> {
+        let artifacts = self
+            .artifacts
+            .iter()
+            .map(|(name, path)| {
+                let stable_path = path
+                    .strip_prefix(&self.temporary)
+                    .map(|relative| self.final_dir.join(relative))
+                    .unwrap_or_else(|_| path.clone());
+                serde_json::json!({
+                    "name": name,
+                    "path": stable_path.display().to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({
+            "schema": "tx.ext4.tier1_artifacts.v1",
+            "run_id": self.run_id,
+            "artifacts": artifacts
+        });
+        let text = serde_json::to_string_pretty(&manifest)
+            .map_err(|err| format!("failed to encode artifact manifest: {err}"))?;
+        fs::write(dir.join("artifacts.json"), text)
+            .map_err(|err| format!("failed to write artifact manifest: {err}"))
     }
 }
 

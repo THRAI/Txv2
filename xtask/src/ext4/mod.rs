@@ -125,6 +125,7 @@ fn run_live_tier1(
         &invocation.authorities.crash_cuts,
         &test_image,
         &scratch_image,
+        &workload_image,
         &e2fsck,
     )?;
     let mut e2fsck_results = Vec::new();
@@ -367,6 +368,7 @@ fn execute_crash_cut_campaign(
     crash_cuts: &CrashCutCatalog,
     boot_image: &Path,
     source_image: &Path,
+    workload_image: &Path,
     e2fsck: &str,
 ) -> Result<CrashCutCampaignEvidence> {
     let Some(campaign) = &crash_cuts.campaign else {
@@ -398,31 +400,34 @@ fn execute_crash_cut_campaign(
         }
 
         let cut_id = format!("crash-cut-{idx:04}");
-        let cut_image = run.stage_copy(
-            format!("{cut_id}-image"),
-            source_image,
-            &format!("{cut_id}.img"),
-        )?;
-
-        let workload_args = crash_cut_shell_test_args(
-            boot_image,
-            &cut_image,
-            &campaign.workload_script,
-            Some(phase_marker),
-        );
-        shell_test::shell_test(root, workload_args)?;
-
-        let (e2fsck_exit_code, e2fsck_output) = run_capture(
+        let job = write_fault_job_request(
             root,
-            e2fsck,
-            &["-fn".into(), cut_image.display().to_string()],
+            run,
+            &manifest,
+            &cut_id,
+            family,
+            phase_marker,
+            campaign,
+            boot_image,
+            source_image,
+            workload_image,
         )?;
-        if !e2fsck_output.trim().is_empty() {
-            println!("{e2fsck_output}");
-        }
+        run_fault_qemu_executor(root, &job.request_path, e2fsck)?;
+        let campaign_plan_sha256 = sha256_file(&manifest)?;
+        let fault_result = parse_fault_job_result(
+            &job.result_path,
+            &family.id,
+            &cut_id,
+            &campaign_plan_sha256,
+            &job.crash_image,
+            &job.replay_image,
+            &job.serial_log,
+            phase_marker,
+            &job.e2fsck_log,
+        )?;
 
         let replay_args =
-            crash_cut_shell_test_args(boot_image, &cut_image, &campaign.replay_script, None);
+            crash_cut_shell_test_args(boot_image, &job.replay_image, &campaign.replay_script, None);
         let replay_exit_code = match shell_test::shell_test(root, replay_args) {
             Ok(()) => 0,
             Err(err) => {
@@ -431,21 +436,21 @@ fn execute_crash_cut_campaign(
             }
         };
 
-        let immutable_image_sha256 = sha256_file(&cut_image)?;
+        let immutable_image_sha256 = sha256_file(&job.replay_image)?;
         outcomes.push(CrashCutOutcome {
             cut_id,
             immutable_image_sha256,
-            e2fsck_exit_code,
+            e2fsck_exit_code: fault_result.e2fsck_exit_code,
             replay_exit_code,
         });
-        if e2fsck_exit_code != 0 {
+        if fault_result.e2fsck_exit_code != 0 {
             return Err(format!(
                 "crash cut {} failed e2fsck with exit {}",
                 outcomes
                     .last()
                     .map(|outcome| outcome.cut_id.as_str())
                     .unwrap_or("unknown"),
-                e2fsck_exit_code
+                fault_result.e2fsck_exit_code
             ));
         }
         if replay_exit_code != 0 {
@@ -494,6 +499,316 @@ fn crash_cut_shell_test_args(
         args.push(needle.into());
     }
     args
+}
+
+#[derive(Debug)]
+struct FaultJobPaths {
+    request_path: PathBuf,
+    result_path: PathBuf,
+    crash_image: PathBuf,
+    replay_image: PathBuf,
+    serial_log: PathBuf,
+    e2fsck_log: PathBuf,
+}
+
+#[derive(Debug)]
+struct FaultJobResult {
+    e2fsck_exit_code: i32,
+}
+
+fn write_fault_job_request(
+    root: &Path,
+    run: &mut run_workspace::RunWorkspace,
+    campaign_manifest: &Path,
+    cut_id: &str,
+    family: &CrashCutFamily,
+    phase_marker: &str,
+    campaign: &CrashCutCampaignPlan,
+    test_image: &Path,
+    scratch_image: &Path,
+    workload_image: &Path,
+) -> Result<FaultJobPaths> {
+    let job_dir = run.working_dir().join("crash-cuts").join(cut_id);
+    fs::create_dir_all(&job_dir)
+        .map_err(|err| format!("failed to create {}: {err}", job_dir.display()))?;
+    let request_path = job_dir.join("job-request.json");
+    let crash_image = job_dir.join("crash.img");
+    let replay_image = job_dir.join("replay.img");
+    let result_path = job_dir.join("result.json");
+    let executor_plan_path = job_dir.join("executor-plan.json");
+    let e2fsck_log = job_dir.join("e2fsck-fn.log");
+    let serial_log = job_dir.join("serial.log");
+    let manifest = serde_json::json!({
+        "schema": "tx.ext4.fault_job_request.v1",
+        "campaign_plan_sha256": sha256_file(campaign_manifest)?,
+        "job": {
+            "case": family.id,
+            "cut": cut_id,
+            "iteration": 1,
+            "serial_log": serial_log.display().to_string(),
+            "crash_image": crash_image.display().to_string(),
+            "replay_image": replay_image.display().to_string(),
+            "checks": [
+                {
+                    "tool": "e2fsck",
+                    "args": ["-fn", replay_image.display().to_string()],
+                    "log": e2fsck_log.display().to_string()
+                }
+            ]
+        },
+        "role_images": {
+            "test": test_image.display().to_string(),
+            "scratch": scratch_image.display().to_string(),
+            "workload": workload_image.display().to_string()
+        },
+        "qemu": {
+            "target": TxTarget::Rv64Qemu.name(),
+            "profile": "busybox",
+            "script": root.join(&campaign.workload_script).display().to_string(),
+            "timeout_ms": 120000,
+            "cut_marker": phase_marker
+        }
+    });
+    let text = serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
+    fs::write(&request_path, text)
+        .map_err(|err| format!("failed to write {}: {err}", request_path.display()))?;
+    run.record_artifact(format!("{cut_id}-job-request"), request_path.clone())?;
+    run.record_artifact(
+        format!("{cut_id}-executor-plan"),
+        executor_plan_path.clone(),
+    )?;
+    run.record_artifact(format!("{cut_id}-result"), result_path.clone())?;
+    run.record_artifact(format!("{cut_id}-serial"), serial_log.clone())?;
+    run.record_artifact(format!("{cut_id}-e2fsck-log"), e2fsck_log.clone())?;
+    run.record_artifact(format!("{cut_id}-crash-image"), crash_image.clone())?;
+    run.record_artifact(format!("{cut_id}-replay-image"), replay_image.clone())?;
+    Ok(FaultJobPaths {
+        request_path,
+        result_path,
+        crash_image,
+        replay_image,
+        serial_log,
+        e2fsck_log,
+    })
+}
+
+fn run_fault_qemu_executor(root: &Path, request_path: &Path, e2fsck: &str) -> Result<()> {
+    let script = root.join("tools/ext4/fault_qemu_executor.py");
+    if !script.is_file() {
+        return Err(format!("missing fault executor {}", script.display()));
+    }
+    println!("$ python3 {} {}", script.display(), request_path.display());
+    let status = Command::new("python3")
+        .arg(&script)
+        .arg(request_path)
+        .env("TX_EXT4_FAULT_E2FSCK_COMMAND", e2fsck)
+        .current_dir(root)
+        .status()
+        .map_err(|err| format!("failed to run {}: {err}", script.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "fault executor {} exited with {status}",
+            script.display()
+        ))
+    }
+}
+
+fn parse_fault_job_result(
+    path: &Path,
+    expected_case: &str,
+    expected_cut: &str,
+    expected_campaign_plan_sha256: &str,
+    crash_image: &Path,
+    replay_image: &Path,
+    serial_log: &Path,
+    expected_phase_marker: &str,
+    e2fsck_log: &Path,
+) -> Result<FaultJobResult> {
+    let value = read_json(path)?;
+    let schema = value
+        .get("schema")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("{}: missing schema", path.display()))?;
+    if schema != "tx.ext4.fault_job_result.v1" {
+        return Err(format!(
+            "{}: expected schema tx.ext4.fault_job_result.v1, found {schema}",
+            path.display()
+        ));
+    }
+    let required_string = |field: &str| {
+        value
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{}: missing {field}", path.display()))
+    };
+    let campaign_plan_sha256 = required_string("campaign_plan_sha256")?;
+    if campaign_plan_sha256 != expected_campaign_plan_sha256 {
+        return Err(format!(
+            "{}: campaign_plan_sha256 mismatch: expected {}, found {}",
+            path.display(),
+            expected_campaign_plan_sha256,
+            campaign_plan_sha256
+        ));
+    }
+    let case_id = required_string("case")?;
+    if case_id != expected_case {
+        return Err(format!(
+            "{}: case mismatch: expected {expected_case}, found {case_id}",
+            path.display()
+        ));
+    }
+    let cut_id = required_string("cut")?;
+    if cut_id != expected_cut {
+        return Err(format!(
+            "{}: cut mismatch: expected {expected_cut}, found {cut_id}",
+            path.display()
+        ));
+    }
+    let hard_kill = value
+        .get("hard_kill_observed")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !hard_kill {
+        return Err(format!(
+            "{}: hard_kill_observed is not true",
+            path.display()
+        ));
+    }
+    let replay_attempted = value
+        .get("replay_attempted")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !replay_attempted {
+        return Err(format!("{}: replay_attempted is not true", path.display()));
+    }
+    let serial = fs::read_to_string(serial_log).map_err(|err| {
+        format!(
+            "{}: failed to read serial log {}: {err}",
+            path.display(),
+            serial_log.display()
+        )
+    })?;
+    if !serial.contains(expected_phase_marker) {
+        return Err(format!(
+            "{}: serial log {} missing phase marker {}",
+            path.display(),
+            serial_log.display(),
+            expected_phase_marker
+        ));
+    }
+    let e2fsck_exit_code = value
+        .get("e2fsck_exit")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| format!("{}: missing e2fsck_exit", path.display()))
+        .and_then(|raw| {
+            i32::try_from(raw).map_err(|_| format!("{}: e2fsck_exit out of range", path.display()))
+        })?;
+    if e2fsck_exit_code != 0 {
+        return Err(format!(
+            "{}: e2fsck_exit must be 0, found {e2fsck_exit_code}",
+            path.display()
+        ));
+    }
+
+    let checks = value
+        .get("e2fsck_checks")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing e2fsck_checks", path.display()))?;
+    if checks.is_empty() {
+        return Err(format!("{}: e2fsck_checks is empty", path.display()));
+    }
+    let replay_arg = replay_image.display().to_string();
+    let e2fsck_log_path = e2fsck_log.display().to_string();
+    for check in checks {
+        let object = check
+            .as_object()
+            .ok_or_else(|| format!("{}: e2fsck check must be an object", path.display()))?;
+        if object.get("tool").and_then(|value| value.as_str()) != Some("e2fsck") {
+            return Err(format!(
+                "{}: e2fsck check tool must be e2fsck",
+                path.display()
+            ));
+        }
+        let args = object
+            .get("args")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| format!("{}: e2fsck check is missing args", path.display()))?;
+        let args = args
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{}: e2fsck args must be strings", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if args != ["-fn", replay_arg.as_str()] {
+            return Err(format!(
+                "{}: e2fsck check must run -fn against {}",
+                path.display(),
+                replay_image.display()
+            ));
+        }
+        if object.get("log").and_then(|value| value.as_str()) != Some(e2fsck_log_path.as_str()) {
+            return Err(format!(
+                "{}: e2fsck check log must be {}",
+                path.display(),
+                e2fsck_log.display()
+            ));
+        }
+        let log_sha256 = object
+            .get("log_sha256")
+            .and_then(|value| value.as_str())
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| format!("{}: e2fsck check has invalid log_sha256", path.display()))?;
+        if !e2fsck_log.is_file() {
+            return Err(format!(
+                "{}: e2fsck log is missing: {}",
+                path.display(),
+                e2fsck_log.display()
+            ));
+        }
+        if sha256_file(e2fsck_log)? != log_sha256 {
+            return Err(format!(
+                "{}: e2fsck log sha256 mismatch for {}",
+                path.display(),
+                e2fsck_log.display()
+            ));
+        }
+        let exit_code = object
+            .get("exit_code")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| format!("{}: e2fsck check is missing exit_code", path.display()))
+            .and_then(|raw| {
+                i32::try_from(raw)
+                    .map_err(|_| format!("{}: e2fsck check exit_code out of range", path.display()))
+            })?;
+        if exit_code != 0 {
+            return Err(format!(
+                "{}: e2fsck check exit_code must be 0, found {exit_code}",
+                path.display()
+            ));
+        }
+    }
+    if !crash_image.is_file() {
+        return Err(format!(
+            "{}: crash image is missing: {}",
+            path.display(),
+            crash_image.display()
+        ));
+    }
+    if !replay_image.is_file() {
+        return Err(format!(
+            "{}: replay image is missing: {}",
+            path.display(),
+            replay_image.display()
+        ));
+    }
+    Ok(FaultJobResult { e2fsck_exit_code })
 }
 
 fn write_crash_cut_outcome_manifest(

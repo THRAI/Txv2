@@ -1,3 +1,22 @@
+- 2026-08-02 (ext4 Tier 1 fault evidence binding).
+  Advanced Task 16 crash-runner evidence without promoting final acceptance.
+  `run_live_tier1` now passes distinct TEST/SCRATCH/WORKLOAD images into each
+  per-cut fault job request, records job request/result/executor-plan/serial
+  log/e2fsck log/crash image/replay image artifacts in the run workspace, and
+  writes a durable `artifacts.json` for final and failed runs. The Rust result
+  parser now rejects unbound `tx.ext4.fault_job_result.v1` manifests unless
+  they match the current case, cut id, campaign-plan sha256, serial phase
+  marker, replay flag, e2fsck `-fn` record, e2fsck log sha256, and preserved
+  crash/replay images. Verification passed focused red/green fault-job tests,
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`,
+  `python3 tools/tests/test_ext4_fault_qemu_executor.py`,
+  `python3 tools/tests/test_ext4_fault_matrix_runners.py`,
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-evidence-binding-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, the full fresh
+  1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 fault executor shell-test contract).
   Advanced Task 16 crash-runner executability without promoting final
   acceptance. `cargo xtask shell-test` now supports `--serial-log PATH` for

@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    CrashCutCampaignEvidence, CrashCutCatalog, CrashCutOutcome, Tier1Authorities,
-    XfstestsSourceLock, crash_cut_shell_test_args, parse_tier1_args, parse_xfstests_summary,
-    run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args,
-    verify_xfstests_source_lock,
+    CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
+    CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
+    parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_crash_cut_campaign,
+    run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args, verify_xfstests_source_lock,
+    write_fault_job_request,
 };
 use crate::target::TxTarget;
 
@@ -20,6 +21,10 @@ fn run_workspace_finalizes_once_and_cleans_temporary_state() {
     assert!(receipt.exists());
     assert!(!run.temporary_path_for_test().exists());
     assert!(root.join("target/ext4/tier1/test-run").exists());
+    assert!(
+        root.join("target/ext4/tier1/test-run/artifacts.json")
+            .exists()
+    );
 }
 
 #[test]
@@ -51,6 +56,12 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         root.join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
             .exists()
     );
+    let artifacts: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(artifacts["schema"], "tx.ext4.tier1_artifacts.v1");
+    assert_eq!(artifacts["artifacts"][0]["name"], "crash-campaign-plan");
     assert!(!temp.exists());
 }
 
@@ -335,6 +346,207 @@ fn tier1_crash_cut_shell_matrix_uses_boot_and_cut_images_with_phase_marker() {
         vec![boot.display().to_string(), cut.display().to_string()]
     );
     assert_eq!(stop_marker.as_deref(), Some("tx.ext4.crash.phase.D7"));
+}
+
+#[test]
+fn tier1_fault_job_request_binds_repository_executor_inputs() {
+    let root = temp_root("fault-job-request");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let campaign_manifest = run.working_dir().join("crash-campaign-plan.json");
+    write_text(&campaign_manifest, "campaign-plan\n");
+    let test_image = root.join("test.img");
+    let scratch_image = root.join("scratch.img");
+    let workload_image = root.join("workload.img");
+    write_text(&test_image, "test-image\n");
+    write_text(&scratch_image, "scratch-image\n");
+    write_text(&workload_image, "workload-image\n");
+    let family = CrashCutFamily {
+        id: "D7".into(),
+        phase_marker: Some("tx.ext4.crash.phase.D7".into()),
+    };
+    let campaign = CrashCutCampaignPlan {
+        workload_script: PathBuf::from("tools/ext4/tier1/crash-workload.scn"),
+        workload_script_sha256: "a".repeat(64),
+        replay_script: PathBuf::from("tools/ext4/tier1/crash-replay.scn"),
+        replay_script_sha256: "b".repeat(64),
+        kill_policy: "deterministic-phase-marker-v1".into(),
+        e2fsck_mode: "immutable-copy".into(),
+    };
+
+    let job = write_fault_job_request(
+        &root,
+        &mut run,
+        &campaign_manifest,
+        "crash-cut-0007",
+        &family,
+        family.phase_marker.as_deref().unwrap(),
+        &campaign,
+        &test_image,
+        &scratch_image,
+        &workload_image,
+    )
+    .expect("write request");
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&job.request_path).unwrap()).unwrap();
+
+    assert_eq!(value["schema"], "tx.ext4.fault_job_request.v1");
+    assert_eq!(
+        value["campaign_plan_sha256"],
+        sha256_file(&campaign_manifest).unwrap()
+    );
+    assert_eq!(value["job"]["case"], "D7");
+    assert_eq!(value["job"]["cut"], "crash-cut-0007");
+    assert_eq!(value["qemu"]["cut_marker"], "tx.ext4.crash.phase.D7");
+    assert_eq!(
+        value["qemu"]["script"],
+        root.join("tools/ext4/tier1/crash-workload.scn")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        value["role_images"]["test"],
+        test_image.display().to_string()
+    );
+    assert_eq!(
+        value["role_images"]["scratch"],
+        scratch_image.display().to_string()
+    );
+    assert_eq!(
+        value["role_images"]["workload"],
+        workload_image.display().to_string()
+    );
+    assert_eq!(
+        value["job"]["checks"][0]["args"][1],
+        job.replay_image.display().to_string()
+    );
+    assert!(
+        run.working_dir()
+            .join("crash-cuts/crash-cut-0007/job-request.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn tier1_fault_job_result_requires_hard_kill_and_e2fsck_exit() {
+    let root = temp_root("fault-job-result");
+    let result = root.join("result.json");
+    let crash = root.join("crash.img");
+    let replay = root.join("replay.img");
+    let serial = root.join("serial.log");
+    let log = root.join("e2fsck-fn.log");
+    write_text(&crash, "crash-image\n");
+    write_text(&replay, "replay-image\n");
+    write_text(&serial, "boot...\ntx.ext4.crash.phase.D7\n");
+    write_text(&log, "clean\n");
+    let log_sha256 = sha256_file(&log).unwrap();
+    write_json(
+        &result,
+        &format!(
+            r#"{{
+          "schema":"tx.ext4.fault_job_result.v1",
+          "campaign_plan_sha256":"{plan_sha}",
+          "case":"D7",
+          "cut":"crash-cut-0007",
+          "hard_kill_observed":true,
+          "replay_attempted":true,
+          "e2fsck_exit":0,
+          "e2fsck_checks":[
+            {{
+              "tool":"e2fsck",
+              "args":["-fn","{replay}"],
+              "log":"{log}",
+              "log_sha256":"{log_sha256}",
+              "exit_code":0
+            }}
+          ]
+        }}"#,
+            plan_sha = "a".repeat(64),
+            replay = replay.display(),
+            log = log.display(),
+        ),
+    );
+    let parsed = parse_fault_job_result(
+        &result,
+        "D7",
+        "crash-cut-0007",
+        &"a".repeat(64),
+        &crash,
+        &replay,
+        &serial,
+        "tx.ext4.crash.phase.D7",
+        &log,
+    )
+    .expect("parse clean result");
+    assert_eq!(parsed.e2fsck_exit_code, 0);
+
+    write_json(
+        &result,
+        &format!(
+            r#"{{
+          "schema":"tx.ext4.fault_job_result.v1",
+          "campaign_plan_sha256":"{plan_sha}",
+          "case":"D7",
+          "cut":"crash-cut-0007",
+          "hard_kill_observed":false,
+          "replay_attempted":true,
+          "e2fsck_exit":0,
+          "e2fsck_checks":[
+            {{
+              "tool":"e2fsck",
+              "args":["-fn","{replay}"],
+              "log":"{log}",
+              "log_sha256":"{log_sha256}",
+              "exit_code":0
+            }}
+          ]
+        }}"#,
+            plan_sha = "a".repeat(64),
+            replay = replay.display(),
+            log = log.display(),
+        ),
+    );
+    let error = parse_fault_job_result(
+        &result,
+        "D7",
+        "crash-cut-0007",
+        &"a".repeat(64),
+        &crash,
+        &replay,
+        &serial,
+        "tx.ext4.crash.phase.D7",
+        &log,
+    )
+    .expect_err("hard kill is required");
+    assert!(error.contains("hard_kill_observed is not true"));
+}
+
+#[test]
+fn tier1_fault_job_result_rejects_unbound_manifest() {
+    let root = temp_root("fault-job-result-unbound");
+    let result = root.join("result.json");
+    write_json(
+        &result,
+        r#"{
+          "schema":"tx.ext4.fault_job_result.v1",
+          "campaign_plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "hard_kill_observed":true,
+          "e2fsck_exit":0
+        }"#,
+    );
+
+    let error = parse_fault_job_result(
+        &result,
+        "D7",
+        "crash-cut-0007",
+        &"a".repeat(64),
+        &root.join("crash.img"),
+        &root.join("replay.img"),
+        &root.join("serial.log"),
+        "tx.ext4.crash.phase.D7",
+        &root.join("e2fsck-fn.log"),
+    )
+    .expect_err("result must bind to a cut");
+    assert!(error.contains("missing case"));
 }
 
 #[test]
