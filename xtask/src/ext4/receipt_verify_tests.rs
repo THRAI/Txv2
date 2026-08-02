@@ -239,6 +239,22 @@ fn tier1_verify_receipt_rejects_missing_build_log_artifact() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_artifact_outside_run_directory() {
+    let root = temp_root("verify-receipt-external-artifact");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_path_and_contents(
+        &root,
+        "candidate-full-build-log",
+        "external-artifacts/full-build.log",
+        "$ cargo xtask full-build --target rv64-qemu --skip-doctor\nexit_code=0\nok\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("external artifact must fail");
+    assert!(error.contains("artifact candidate-full-build-log is outside receipt run directory"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_build_log_without_zero_exit() {
     let root = temp_root("verify-receipt-build-log-exit");
     let _cleanup = TempCleanup(root.clone());
@@ -1043,6 +1059,33 @@ fn rewrite_artifact_contents(root: &PathBuf, name: &str, contents: &str) {
         .unwrap_or_else(|| panic!("missing artifact {name}"));
     let path = PathBuf::from(artifact["path"].as_str().expect("artifact path"));
     write_text(&path, contents);
+    artifact["sha256"] = serde_json::Value::String(sha256_file(&path).expect("artifact sha"));
+    write_json(
+        &artifacts_path,
+        &serde_json::to_string_pretty(&manifest).expect("artifact manifest json"),
+    );
+    rewrite_receipt_artifact_manifest_sha(root);
+}
+
+fn rewrite_artifact_path_and_contents(
+    root: &PathBuf,
+    name: &str,
+    relative_path: &str,
+    contents: &str,
+) {
+    let artifacts_path = root.join("target/ext4/tier1/accepted-run/artifacts.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifacts_path).expect("read artifacts"))
+            .expect("parse artifacts");
+    let artifact = manifest["artifacts"]
+        .as_array_mut()
+        .expect("artifacts array")
+        .iter_mut()
+        .find(|artifact| artifact["name"] == name)
+        .unwrap_or_else(|| panic!("missing artifact {name}"));
+    let path = root.join(relative_path);
+    write_text(&path, contents);
+    artifact["path"] = serde_json::Value::String(path.display().to_string());
     artifact["sha256"] = serde_json::Value::String(sha256_file(&path).expect("artifact sha"));
     write_json(
         &artifacts_path,

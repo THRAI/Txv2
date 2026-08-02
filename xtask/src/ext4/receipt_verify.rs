@@ -35,6 +35,31 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
         "artifact manifest",
         receipt_path,
     )?;
+    let run_dir = receipt_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "{}: receipt has no parent directory",
+                receipt_path.display()
+            )
+        })?
+        .canonicalize()
+        .map_err(|err| {
+            format!(
+                "failed to canonicalize receipt run directory {}: {err}",
+                receipt_path.display()
+            )
+        })?;
+    let manifest_canonical =
+        canonical_existing_path(&manifest_path, "artifact manifest", receipt_path)?;
+    if manifest_canonical.parent() != Some(run_dir.as_path()) {
+        return Err(format!(
+            "{}: artifact manifest is outside receipt run directory {}: {}",
+            receipt_path.display(),
+            run_dir.display(),
+            manifest_path.display()
+        ));
+    }
 
     let lock_path = receipt_path
         .parent()
@@ -54,7 +79,8 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     )?;
 
     let artifact_manifest_json = read_json(&manifest_path)?;
-    let artifacts = verify_artifact_manifest(&artifact_manifest_json, &run_id, &manifest_path)?;
+    let artifacts =
+        verify_artifact_manifest(&artifact_manifest_json, &run_id, &manifest_path, &run_dir)?;
     verify_authority_digests(receipt_object, &artifacts, receipt_path)?;
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
@@ -550,6 +576,7 @@ fn verify_artifact_manifest(
     manifest: &serde_json::Value,
     run_id: &str,
     path: &Path,
+    run_dir: &Path,
 ) -> Result<BTreeMap<String, ArtifactRecord>> {
     require_schema(manifest, "tx.ext4.tier1_artifacts.v1", path)?;
     let object = json_object(manifest, "artifact manifest", path)?;
@@ -577,6 +604,16 @@ fn verify_artifact_manifest(
         let sha256 = required_json_string(artifact, "sha256", path)?;
         verify_real_sha(&format!("artifact {name} sha256"), &sha256, path)?;
         verify_file_digest(&artifact_path, &sha256, &format!("artifact {name}"), path)?;
+        let artifact_canonical =
+            canonical_existing_path(&artifact_path, &format!("artifact {name}"), path)?;
+        if !artifact_canonical.starts_with(run_dir) {
+            return Err(format!(
+                "{}: artifact {name} is outside receipt run directory {}: {}",
+                path.display(),
+                run_dir.display(),
+                artifact_path.display()
+            ));
+        }
         if by_name
             .insert(
                 name.clone(),
@@ -1539,6 +1576,16 @@ fn verify_file_digest(
         ));
     }
     Ok(())
+}
+
+fn canonical_existing_path(path: &Path, label: &str, context: &Path) -> Result<PathBuf> {
+    path.canonicalize().map_err(|err| {
+        format!(
+            "{}: failed to canonicalize {label} {}: {err}",
+            context.display(),
+            path.display()
+        )
+    })
 }
 
 #[derive(Debug)]
