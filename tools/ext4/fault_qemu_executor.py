@@ -32,6 +32,7 @@ class FaultQemuExecutorError(Exception):
 
 
 HOMEBREW_E2FSCK = Path("/opt/homebrew/opt/e2fsprogs/sbin/e2fsck")
+SHELL_TEST_MAX_ATTEMPTS = 3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -184,6 +185,11 @@ def write_executor_plan(request_path: Path, request: dict[str, Any]) -> Path:
             "replay_matrix": job.get("replay_matrix"),
             "semantic_oracles": job.get("semantic_oracles"),
         },
+        "role_images": {
+            "test": require_string(role_images, "test"),
+            "scratch": require_string(role_images, "scratch"),
+            "workload": require_string(role_images, "workload"),
+        },
         "staged_role_images": staged,
         "shell_test_command": shell_test_command,
         "runner": {
@@ -237,48 +243,16 @@ def execute_prepared_runner(plan_path: Path) -> None:
         if os.environ.get("TX_EXT4_FAULT_RUNNER_COMMAND")
         else "shell-test-command"
     )
-    runner["command"] = command
-    runner["command_source"] = command_source
-    runner["status"] = "running"
-    write_plan(plan_path, plan)
-
-    env = os.environ.copy()
-    env["TX_EXT4_FAULT_SERIAL_LOG"] = str(serial_log)
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=require_string(runner, "cwd"),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-    except OSError as err:
-        runner["status"] = "launch-failed"
-        runner["error"] = str(err)
-        write_plan(plan_path, plan)
-        raise FaultQemuExecutorError(f"runner launch failed: {err}") from err
-
     marker = require_string(runner, "cut_marker")
-    assert process.stdout is not None
     if command_source == "shell-test-command":
-        output, _ = process.communicate()
-        runner["output_tail"] = tail_text(output)
-        runner["exit_code"] = process.returncode
-        stop_line = f"shell-test: stop needle observed: {marker}"
-        if process.returncode != 0:
-            runner["status"] = "shell-test-failed-before-cut"
-            write_plan(plan_path, plan)
-            raise FaultQemuExecutorError(
-                f"shell-test exited with {process.returncode} before confirmed stop needle"
-            )
-        if stop_line not in output:
-            runner["status"] = "cut-not-observed"
-            write_plan(plan_path, plan)
-            raise FaultQemuExecutorError(f"shell-test did not confirm stop needle {marker!r}")
-        runner["status"] = "exited-after-cut"
+        run_shell_test_until_cut_with_retries(plan_path, plan, command, serial_log, marker)
     else:
+        runner["command"] = command
+        runner["command_source"] = command_source
+        runner["status"] = "running"
+        write_plan(plan_path, plan)
+        process = spawn_runner_process(command, runner, serial_log, plan_path, plan)
+        assert process.stdout is not None
         observed = False
         for line in process.stdout:
             if marker in line:
@@ -299,7 +273,7 @@ def execute_prepared_runner(plan_path: Path) -> None:
             process.kill()
             process.wait()
         runner["status"] = "terminated-after-cut"
-    runner["exit_code"] = process.returncode
+        runner["exit_code"] = process.returncode
     hard_kill = require_object(plan, "hard_kill")
     if command_source == "shell-test-command":
         hard_kill["status"] = "observed-by-shell-test"
@@ -318,6 +292,98 @@ def execute_prepared_runner(plan_path: Path) -> None:
     preserve_crash_and_replay_images(plan)
     produce_result_if_verified(plan_path, plan)
     write_plan(plan_path, plan)
+
+
+def spawn_runner_process(
+    command: list[str],
+    runner: dict[str, Any],
+    serial_log: Path,
+    plan_path: Path,
+    plan: dict[str, Any],
+) -> subprocess.Popen[str]:
+    env = os.environ.copy()
+    env["TX_EXT4_FAULT_SERIAL_LOG"] = str(serial_log)
+    try:
+        return subprocess.Popen(
+            command,
+            cwd=require_string(runner, "cwd"),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as err:
+        runner["status"] = "launch-failed"
+        runner["error"] = str(err)
+        write_plan(plan_path, plan)
+        raise FaultQemuExecutorError(f"runner launch failed: {err}") from err
+
+
+def run_shell_test_until_cut_with_retries(
+    plan_path: Path,
+    plan: dict[str, Any],
+    command: list[str],
+    serial_log: Path,
+    marker: str,
+) -> None:
+    runner = require_object(plan, "runner")
+    attempts: list[dict[str, Any]] = []
+    stop_line = f"shell-test: stop needle observed: {marker}"
+    last_error = f"shell-test did not confirm stop needle {marker!r}"
+    for attempt in range(1, SHELL_TEST_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            restage_role_images_for_retry(plan_path.parent, plan)
+            if serial_log.exists():
+                serial_log.unlink()
+        runner["command"] = command
+        runner["command_source"] = "shell-test-command"
+        runner["status"] = "running"
+        runner["attempt"] = attempt
+        write_plan(plan_path, plan)
+        process = spawn_runner_process(command, runner, serial_log, plan_path, plan)
+        output, _ = process.communicate()
+        attempt_record = {
+            "attempt": attempt,
+            "exit_code": process.returncode,
+            "output_tail": tail_text(output),
+        }
+        if process.returncode == 0 and stop_line in output:
+            attempt_record["status"] = "exited-after-cut"
+            attempts.append(attempt_record)
+            runner["attempts"] = attempts
+            runner["output_tail"] = tail_text(output)
+            runner["exit_code"] = process.returncode
+            runner["status"] = "exited-after-cut"
+            return
+        if process.returncode != 0:
+            attempt_record["status"] = "shell-test-failed-before-cut"
+            last_error = (
+                f"shell-test exited with {process.returncode} before confirmed stop needle"
+            )
+        else:
+            attempt_record["status"] = "cut-not-observed"
+            last_error = f"shell-test did not confirm stop needle {marker!r}"
+        attempts.append(attempt_record)
+        runner["attempts"] = attempts
+        runner["output_tail"] = tail_text(output)
+        runner["exit_code"] = process.returncode
+        runner["status"] = attempt_record["status"]
+        if attempt == SHELL_TEST_MAX_ATTEMPTS or "role_images" not in plan:
+            write_plan(plan_path, plan)
+            raise FaultQemuExecutorError(last_error)
+        runner["status"] = "retrying-before-cut"
+        write_plan(plan_path, plan)
+
+
+def restage_role_images_for_retry(job_dir: Path, plan: dict[str, Any]) -> None:
+    staged = require_object(plan, "staged_role_images")
+    for role in ("test", "scratch", "workload"):
+        path = Path(require_string(staged, role))
+        if path.exists():
+            path.unlink()
+    role_images = require_object(plan, "role_images")
+    plan["staged_role_images"] = stage_role_images(job_dir, role_images)
 
 
 def runner_command(plan: dict[str, Any]) -> list[str]:

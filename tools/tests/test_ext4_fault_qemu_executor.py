@@ -418,6 +418,79 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
         self.assertEqual(crash_bytes, b"scratch-after-cut")
         self.assertFalse(result_exists)
 
+    def test_shell_test_command_retries_before_cut_with_fresh_role_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = root / "out" / "write_fsync" / "after-commit" / "0001"
+            source_dir = root / "sources"
+            roles_dir = job_dir / "roles"
+            source_dir.mkdir(parents=True)
+            roles_dir.mkdir(parents=True)
+            for role in ("test", "scratch", "workload"):
+                (source_dir / f"{role}.img").write_bytes(f"{role}-seed".encode())
+                (roles_dir / f"{role}.img").write_bytes(b"stale")
+            marker = "tx-ext4-fault-cut:write_fsync:after-commit"
+            serial_log = job_dir / "serial.log"
+            attempts_file = job_dir / "attempts.txt"
+            runner_program = (
+                "import pathlib, sys; "
+                f"attempts = pathlib.Path({str(attempts_file)!r}); "
+                "count = int(attempts.read_text()) if attempts.exists() else 0; "
+                "attempts.write_text(str(count + 1)); "
+                "print('first attempt failed', flush=True) if count == 0 else "
+                f"(pathlib.Path({str(serial_log)!r}).write_text({marker!r}), "
+                f"print('shell-test: stop needle observed: {marker}', flush=True)); "
+                "sys.exit(1 if count == 0 else 0)"
+            )
+            plan = {
+                "schema": "tx.ext4.fault_qemu_executor_plan.v1",
+                "job": {
+                    "case": "write_fsync",
+                    "cut": "after-commit",
+                    "iteration": 1,
+                    "crash_image": str(job_dir / "crash.img"),
+                    "replay_image": str(job_dir / "replay.img"),
+                },
+                "role_images": {
+                    "test": str(source_dir / "test.img"),
+                    "scratch": str(source_dir / "scratch.img"),
+                    "workload": str(source_dir / "workload.img"),
+                },
+                "staged_role_images": {
+                    "test": str(roles_dir / "test.img"),
+                    "scratch": str(roles_dir / "scratch.img"),
+                    "workload": str(roles_dir / "workload.img"),
+                },
+                "shell_test_command": [sys.executable, "-c", runner_program],
+                "runner": {
+                    "cwd": str(ROOT),
+                    "serial_log": str(serial_log),
+                    "cut_marker": marker,
+                    "status": "prepared-not-run",
+                },
+                "hard_kill": {
+                    "required": True,
+                    "status": "not-implemented",
+                    "marker": marker,
+                },
+            }
+            plan_path = job_dir / "executor-plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+            module = load_executor_module()
+            module.execute_prepared_runner(plan_path)
+            executor_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(executor_plan["runner"]["status"], "exited-after-cut")
+        self.assertEqual([attempt["status"] for attempt in executor_plan["runner"]["attempts"]], [
+            "shell-test-failed-before-cut",
+            "exited-after-cut",
+        ])
+        self.assertEqual(executor_plan["hard_kill"]["status"], "observed-by-shell-test")
+        self.assertEqual(executor_plan["preserved_images"]["status"], "copied-after-runner-termination")
+        self.assertEqual(executor_plan["staged_role_images_retention"]["status"], "removed-after-digest-recorded")
+        self.assertFalse((roles_dir / "scratch.img").exists())
+
     def test_shell_test_command_requires_stop_needle_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

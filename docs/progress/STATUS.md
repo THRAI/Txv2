@@ -1,3 +1,22 @@
+- 2026-08-03 (ext4 Task16 crash executor pre-cut retry).
+  Fixed the first blocker from the fresh live Tier 1 run
+  `target/ext4/tier1/task16-live-retention-20260803011842` without promoting
+  acceptance. That run passed G0, full-build, base image creation, the 8-group
+  TEST/SCRATCH/WORKLOAD matrix, and crash cuts 0000..0005, then failed at
+  `crash-cut-0006` because the fault executor's shell-test path exited before
+  confirming stop needle `tx.ext4.crash.phase.D6`; the captured output timed
+  out waiting for D1. A manual rerun against the same cut-0006 role images
+  reached D6 successfully at
+  `target/ext4/probe/task16-rerun-d6-20260803012810.log`, so the blocker was a
+  pre-cut runner transient rather than accepted filesystem evidence. The fault
+  executor now records bounded shell-test attempts and, only for failures
+  before the requested cut with original role images available, re-stages fresh
+  CoW role clones before retrying. Verification passed `python3 -m py_compile
+  tools/ext4/fault_qemu_executor.py tools/tests/test_ext4_fault_qemu_executor.py`
+  and `python3 -m unittest tools.tests.test_ext4_fault_qemu_executor` (33).
+  Task 16 still needs a fresh full live Tier 1 run and verified immutable
+  G0-G7 receipt.
+
 - 2026-08-03 (ext4 Task16 staged-role retention clears live preflight).
   Cleared the Task 16 live-preflight storage blocker without minting acceptance
   evidence. The fault QEMU executor now records sha256 evidence for the
