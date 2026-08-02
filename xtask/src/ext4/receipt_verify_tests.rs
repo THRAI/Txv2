@@ -117,6 +117,28 @@ fn tier1_verify_receipt_rejects_xfstests_source_lock_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_xfstests_log_count_mismatch() {
+    let root = temp_root("verify-receipt-xfstests-log-count");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(&root, "xfstests-log", "Passed all 7 tests\n");
+
+    let error = verify_tier1_receipt(&receipt).expect_err("mismatched xfstests log must fail");
+    assert!(error.contains("xfstests log passed count 7 does not match receipt passed count 8"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_xfstests_log_failures() {
+    let root = temp_root("verify-receipt-xfstests-log-failures");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(&root, "xfstests-log", "Failures: generic/001\n");
+
+    let error = verify_tier1_receipt(&receipt).expect_err("failed xfstests log must fail");
+    assert!(error.contains("xfstests log reported failures"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_tampered_artifact() {
     let root = temp_root("verify-receipt-tampered");
     let _cleanup = TempCleanup(root.clone());
@@ -234,7 +256,16 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                 "revision": "0123456789abcdef0123456789abcdef01234567",
                 "check_sha256": "c".repeat(64)
             },
-            "selected": [{"case_id": "generic/001"}]
+            "selected": [
+                {"case_id": "generic/001"},
+                {"case_id": "generic/002"},
+                {"case_id": "generic/003"},
+                {"case_id": "generic/004"},
+                {"case_id": "generic/005"},
+                {"case_id": "generic/006"},
+                {"case_id": "generic/007"},
+                {"case_id": "generic/008"}
+            ]
         }))
         .expect("xfstests authority json"),
     );

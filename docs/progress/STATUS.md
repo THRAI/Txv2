@@ -1,3 +1,21 @@
+- 2026-08-02 (ext4 Tier 1 xfstests log/count receipt binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now parses the
+  run-owned `xfstests-log`, rejects `Not run:`/`Failures:` output, requires a
+  `Passed all N tests` summary, and binds that count to both the receipt
+  `xfstests.passed` field and the run-owned `authority-xfstests-selection`
+  selected-case count. The verifier fixture now carries eight selected
+  xfstests cases to match its accepted receipt, and new regressions reject a
+  log with only seven passed cases or an explicit failure line. Verification
+  passed `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify --
+  --test-threads=1` (13), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (56), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --dry-run`, and the expected fail-closed live preflight
+  `task16-xfstests-log-bind-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 xfstests source-lock evidence artifact).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. The live Tier 1 xfstests stage now records a run-owned

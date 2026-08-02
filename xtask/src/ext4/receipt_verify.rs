@@ -60,6 +60,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
     verify_xfstests_source_lock_evidence(&artifacts, receipt_path)?;
+    verify_xfstests_log_evidence(receipt_object, &artifacts, receipt_path)?;
     verify_crash_cut_outcome_manifest(&artifacts, receipt_path)?;
     verify_required_crash_cut_artifacts(&artifacts, receipt_path)?;
     Ok(())
@@ -469,6 +470,94 @@ fn verify_xfstests_source_lock_evidence(
         ));
     }
     Ok(())
+}
+
+fn verify_xfstests_log_evidence(
+    receipt: &serde_json::Map<String, serde_json::Value>,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let selected_count = authority_xfstests_selected_count(artifacts, path)?;
+    let xfstests = required_json_object(receipt, "xfstests", path)?;
+    let receipt_passed = required_json_usize(xfstests, "passed", path)?;
+    if receipt_passed != selected_count {
+        return Err(format!(
+            "{}: xfstests.passed {receipt_passed} does not match authority selected count {selected_count}",
+            path.display()
+        ));
+    }
+    let log_artifact = artifacts
+        .get("xfstests-log")
+        .ok_or_else(|| format!("{}: missing required artifact xfstests-log", path.display()))?;
+    let log = std::fs::read_to_string(&log_artifact.path)
+        .map_err(|err| format!("failed to read {}: {err}", log_artifact.path.display()))?;
+    let log_passed = parse_xfstests_passed_all(&log, &log_artifact.path)?;
+    if log_passed != receipt_passed {
+        return Err(format!(
+            "{}: xfstests log passed count {log_passed} does not match receipt passed count {receipt_passed}",
+            log_artifact.path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn authority_xfstests_selected_count(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<usize> {
+    let authority_path = artifacts
+        .get("authority-xfstests-selection")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing artifact authority-xfstests-selection",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let authority = read_json(&authority_path)?;
+    require_schema(
+        &authority,
+        "tx.ext4.xfstests_selection_ledger.v1",
+        &authority_path,
+    )?;
+    let authority_object = json_object(&authority, "xfstests selection", &authority_path)?;
+    let selected = require_non_empty_array(authority_object, "selected", &authority_path)?;
+    Ok(selected.len())
+}
+
+fn parse_xfstests_passed_all(log: &str, path: &Path) -> Result<usize> {
+    for line in log.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Not run:") {
+            return Err(format!(
+                "{}: xfstests log reported not-run cases: {trimmed}",
+                path.display()
+            ));
+        }
+        if trimmed.starts_with("Failures:") || trimmed.starts_with("Failed ") {
+            return Err(format!(
+                "{}: xfstests log reported failures: {trimmed}",
+                path.display()
+            ));
+        }
+    }
+    for line in log.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("Passed all ") else {
+            continue;
+        };
+        let Some(count) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if let Ok(count) = count.parse::<usize>() {
+            return Ok(count);
+        }
+    }
+    Err(format!(
+        "{}: xfstests log missing `Passed all N tests` summary",
+        path.display()
+    ))
 }
 
 fn verify_crash_cut_outcome_manifest(
