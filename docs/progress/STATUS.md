@@ -1,3 +1,22 @@
+- 2026-08-02 (ext4 Tier 1 receipt semantic verification).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now opens every
+  per-cut `job-request.json` and `result.json` artifact, checks the request's
+  campaign sha, cut id, phase marker, serial/crash/replay/e2fsck paths, and
+  then reuses the fault-result parser to verify hard-kill, replay, primary
+  `e2fsck -fn`, replay/remount matrix, semantic oracle, log sha, and image sha
+  bindings for all `crash-cut-0000..0999`. The verifier fixture now generates a
+  realistic per-cut directory package instead of placeholder result text.
+  Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify -- --test-threads=1`
+  (3), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`
+  (43), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the
+  expected fail-closed live preflight
+  `task16-receipt-parse-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 replay/oracle evidence binding).
   Advanced Task 16 crash evidence hardening without promoting final acceptance.
   Per-cut fault job requests now declare the repository-owned replay/remount

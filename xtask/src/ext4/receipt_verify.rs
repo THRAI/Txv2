@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 
-use super::{is_real_sha256, read_json, sha256_file};
+use super::{crash_campaign::parse_fault_job_result, is_real_sha256, read_json, sha256_file};
 
 pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     let receipt = read_json(receipt_path)?;
@@ -405,8 +405,155 @@ fn verify_required_crash_cut_artifacts(
                 ));
             }
         }
+        verify_crash_cut_job_result(&cut_id, artifacts, path)?;
     }
     Ok(())
+}
+
+fn verify_crash_cut_job_result(
+    cut_id: &str,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let job_request = crash_cut_artifact_path(cut_id, "job-request", artifacts, path)?;
+    let result = crash_cut_artifact_path(cut_id, "result", artifacts, path)?;
+    let request_json = read_json(&job_request)?;
+    require_schema(&request_json, "tx.ext4.fault_job_request.v1", &job_request)?;
+    let request = json_object(&request_json, "fault job request", &job_request)?;
+    let campaign_plan_sha256 = required_json_string(request, "campaign_plan_sha256", &job_request)?;
+    verify_real_sha(
+        "fault job campaign_plan_sha256",
+        &campaign_plan_sha256,
+        &job_request,
+    )?;
+    let job = required_json_object(request, "job", &job_request)?;
+    let case_id = required_json_string(job, "case", &job_request)?;
+    let request_cut = required_json_string(job, "cut", &job_request)?;
+    if request_cut != cut_id {
+        return Err(format!(
+            "{}: job request cut mismatch: expected {cut_id}, found {request_cut}",
+            job_request.display()
+        ));
+    }
+    let qemu = required_json_object(request, "qemu", &job_request)?;
+    let phase_marker = required_json_string(qemu, "cut_marker", &job_request)?;
+    let crash_image = required_bound_path(
+        job,
+        "crash_image",
+        &crash_cut_artifact_path(cut_id, "crash-image", artifacts, path)?,
+        &job_request,
+    )?;
+    let replay_image = required_bound_path(
+        job,
+        "replay_image",
+        &crash_cut_artifact_path(cut_id, "replay-image", artifacts, path)?,
+        &job_request,
+    )?;
+    let serial_log = required_bound_path(
+        job,
+        "serial_log",
+        &crash_cut_artifact_path(cut_id, "serial", artifacts, path)?,
+        &job_request,
+    )?;
+    let e2fsck_log = required_e2fsck_log_path(
+        job,
+        &replay_image,
+        &crash_cut_artifact_path(cut_id, "e2fsck-log", artifacts, path)?,
+        &job_request,
+    )?;
+    require_non_empty_array(job, "replay_matrix", &job_request)?;
+    require_non_empty_array(job, "semantic_oracles", &job_request)?;
+    parse_fault_job_result(
+        &result,
+        &case_id,
+        cut_id,
+        &campaign_plan_sha256,
+        &crash_image,
+        &replay_image,
+        &serial_log,
+        &phase_marker,
+        &e2fsck_log,
+    )?;
+    Ok(())
+}
+
+fn crash_cut_artifact_path(
+    cut_id: &str,
+    suffix: &str,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<PathBuf> {
+    let name = format!("{cut_id}-{suffix}");
+    artifacts
+        .get(&name)
+        .map(|artifact| artifact.path.clone())
+        .ok_or_else(|| {
+            format!(
+                "{}: missing required crash-cut artifact {name}",
+                path.display()
+            )
+        })
+}
+
+fn required_bound_path(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: &Path,
+    path: &Path,
+) -> Result<PathBuf> {
+    let actual = PathBuf::from(required_json_string(object, key, path)?);
+    if actual != expected {
+        return Err(format!(
+            "{}: job request {key} mismatch: expected {}, found {}",
+            path.display(),
+            expected.display(),
+            actual.display()
+        ));
+    }
+    Ok(actual)
+}
+
+fn required_e2fsck_log_path(
+    job: &serde_json::Map<String, serde_json::Value>,
+    replay_image: &Path,
+    expected_log: &Path,
+    path: &Path,
+) -> Result<PathBuf> {
+    let checks = require_non_empty_array(job, "checks", path)?;
+    let check = checks[0].as_object().ok_or_else(|| {
+        format!(
+            "{}: job request e2fsck check must be an object",
+            path.display()
+        )
+    })?;
+    if check.get("tool").and_then(|value| value.as_str()) != Some("e2fsck") {
+        return Err(format!(
+            "{}: job request e2fsck check tool must be e2fsck",
+            path.display()
+        ));
+    }
+    let args = check
+        .get("args")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: job request e2fsck check missing args", path.display()))?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                format!(
+                    "{}: job request e2fsck args must be strings",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if args != ["-fn", replay_image.display().to_string().as_str()] {
+        return Err(format!(
+            "{}: job request e2fsck check must run -fn against {}",
+            path.display(),
+            replay_image.display()
+        ));
+    }
+    required_bound_path(check, "log", expected_log, path)
 }
 
 fn require_schema(value: &serde_json::Value, expected: &str, path: &Path) -> Result<()> {
@@ -469,6 +616,21 @@ fn required_json_usize(
         .and_then(|raw| {
             usize::try_from(raw).map_err(|_| format!("{}: {key} out of range", path.display()))
         })
+}
+
+fn require_non_empty_array<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<&'a Vec<serde_json::Value>> {
+    let values = object
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing array {key}", path.display()))?;
+    if values.is_empty() {
+        return Err(format!("{}: array {key} is empty", path.display()));
+    }
+    Ok(values)
 }
 
 fn required_json_i32(
