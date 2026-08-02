@@ -1,3 +1,15 @@
+- 2026-08-02 (ext4 Tier 1 crash executor live path).
+  Wired the live crash-campaign executor into `run_live_tier1`: each cut now
+  stages a fresh immutable copy from SCRATCH, boots a two-drive QEMU
+  shell-test, kills on the manifest phase marker, runs host `e2fsck -fn`, and
+  replays the immutable image through the pinned crash-replay script before
+  aggregating outcome rows. The old outcome-manifest parser remains the receipt
+  boundary; the new path only feeds it real executor output. Verification
+  passed `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`,
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and local rustfmt on
+  touched files. Task 16 still needs a full 1000-cut fresh QEMU/e2fsck/xfstests
+  run and the immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 crash phase-marker contract).
   Advanced Task 15/16 deterministic crash-runner inputs without promoting final
   acceptance. `tools/ext4/tier1/crash-cuts.json` now gives every D0-D12 crash

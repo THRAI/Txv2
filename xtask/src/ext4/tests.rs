@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     CrashCutCampaignEvidence, CrashCutCatalog, CrashCutOutcome, Tier1Authorities,
-    XfstestsSourceLock, parse_tier1_args, parse_xfstests_summary, run_crash_cut_campaign,
-    run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args, verify_xfstests_source_lock,
+    XfstestsSourceLock, crash_cut_shell_test_args, parse_tier1_args, parse_xfstests_summary,
+    run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args,
+    verify_xfstests_source_lock,
 };
 use crate::target::TxTarget;
 
@@ -309,6 +310,31 @@ fn tier1_shell_matrix_passes_role_images_in_device_order() {
             workload.display().to_string()
         ]
     );
+}
+
+#[test]
+fn tier1_crash_cut_shell_matrix_uses_boot_and_cut_images_with_phase_marker() {
+    let boot = PathBuf::from("/tmp/tx/boot.img");
+    let cut = PathBuf::from("/tmp/tx/crash-cut-0007.img");
+    let script = PathBuf::from("/tmp/tx/tools/ext4/tier1/crash-workload.scn");
+    let args = crash_cut_shell_test_args(&boot, &cut, &script, Some("tx.ext4.crash.phase.D7"));
+
+    let mut extra_images = Vec::new();
+    let mut stop_marker = None;
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--extra-rv64-ext4" {
+            extra_images.push(args[idx + 1].clone());
+        }
+        if arg == "--stop-after-needle" {
+            stop_marker = args.get(idx + 1).cloned();
+        }
+    }
+
+    assert_eq!(
+        extra_images,
+        vec![boot.display().to_string(), cut.display().to_string()]
+    );
+    assert_eq!(stop_marker.as_deref(), Some("tx.ext4.crash.phase.D7"));
 }
 
 #[test]

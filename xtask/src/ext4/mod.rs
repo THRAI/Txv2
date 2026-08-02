@@ -119,7 +119,14 @@ fn run_live_tier1(
         ),
     )?;
 
-    let crash_campaign = run_crash_cut_campaign(run, &invocation.authorities.crash_cuts)?;
+    let crash_campaign = execute_crash_cut_campaign(
+        root,
+        run,
+        &invocation.authorities.crash_cuts,
+        &test_image,
+        &scratch_image,
+        &e2fsck,
+    )?;
     let mut e2fsck_results = Vec::new();
     for (role, path) in [
         ("test", &test_image),
@@ -352,6 +359,166 @@ fn run_crash_cut_campaign(
         crash_cuts.families.len(),
         crash_cuts.file.path.display()
     ))
+}
+
+fn execute_crash_cut_campaign(
+    root: &Path,
+    run: &mut run_workspace::RunWorkspace,
+    crash_cuts: &CrashCutCatalog,
+    boot_image: &Path,
+    source_image: &Path,
+    e2fsck: &str,
+) -> Result<CrashCutCampaignEvidence> {
+    let Some(campaign) = &crash_cuts.campaign else {
+        return Err(format!(
+            "deterministic crash-cut campaign runner is not implemented; refusing to synthesize completed={} across {} families from {}",
+            crash_cuts.expanded_cut_count,
+            crash_cuts.families.len(),
+            crash_cuts.file.path.display()
+        ));
+    };
+
+    let manifest = write_crash_cut_execution_manifest(run, crash_cuts, campaign)?;
+    run.record_artifact("crash-campaign-plan", manifest.clone())?;
+
+    let mut outcomes = Vec::with_capacity(crash_cuts.expanded_cut_count);
+    let mut families = Vec::new();
+    let mut seen_families = std::collections::BTreeSet::new();
+
+    for idx in 0..crash_cuts.expanded_cut_count {
+        let family = &crash_cuts.families[idx % crash_cuts.families.len()];
+        let phase_marker = family.phase_marker.as_deref().ok_or_else(|| {
+            format!(
+                "crash family {} missing phase_marker for live execution",
+                family.id
+            )
+        })?;
+        if seen_families.insert(family.id.clone()) {
+            families.push(family.id.clone());
+        }
+
+        let cut_id = format!("crash-cut-{idx:04}");
+        let cut_image = run.stage_copy(
+            format!("{cut_id}-image"),
+            source_image,
+            &format!("{cut_id}.img"),
+        )?;
+
+        let workload_args = crash_cut_shell_test_args(
+            boot_image,
+            &cut_image,
+            &campaign.workload_script,
+            Some(phase_marker),
+        );
+        shell_test::shell_test(root, workload_args)?;
+
+        let (e2fsck_exit_code, e2fsck_output) = run_capture(
+            root,
+            e2fsck,
+            &["-fn".into(), cut_image.display().to_string()],
+        )?;
+        if !e2fsck_output.trim().is_empty() {
+            println!("{e2fsck_output}");
+        }
+
+        let replay_args =
+            crash_cut_shell_test_args(boot_image, &cut_image, &campaign.replay_script, None);
+        let replay_exit_code = match shell_test::shell_test(root, replay_args) {
+            Ok(()) => 0,
+            Err(err) => {
+                println!("{err}");
+                1
+            }
+        };
+
+        let immutable_image_sha256 = sha256_file(&cut_image)?;
+        outcomes.push(CrashCutOutcome {
+            cut_id,
+            immutable_image_sha256,
+            e2fsck_exit_code,
+            replay_exit_code,
+        });
+        if e2fsck_exit_code != 0 {
+            return Err(format!(
+                "crash cut {} failed e2fsck with exit {}",
+                outcomes
+                    .last()
+                    .map(|outcome| outcome.cut_id.as_str())
+                    .unwrap_or("unknown"),
+                e2fsck_exit_code
+            ));
+        }
+        if replay_exit_code != 0 {
+            return Err(format!(
+                "crash cut {} failed replay with exit {}",
+                outcomes
+                    .last()
+                    .map(|outcome| outcome.cut_id.as_str())
+                    .unwrap_or("unknown"),
+                replay_exit_code
+            ));
+        }
+    }
+
+    let outcomes_path = write_crash_cut_outcome_manifest(
+        run,
+        crash_cuts.expanded_cut_count,
+        crash_cuts.expanded_cut_count,
+        families,
+        outcomes,
+    )?;
+    run.record_artifact("crash-cut-outcomes", outcomes_path.clone())?;
+    run_crash_cut_campaign(run, crash_cuts)
+}
+
+fn crash_cut_shell_test_args(
+    boot_image: &Path,
+    cut_image: &Path,
+    script: &Path,
+    stop_after_needle: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--target".into(),
+        TxTarget::Rv64Qemu.name().to_string(),
+        "--profile".into(),
+        "busybox".into(),
+        "--script".into(),
+        script.display().to_string(),
+        "--extra-rv64-ext4".into(),
+        boot_image.display().to_string(),
+        "--extra-rv64-ext4".into(),
+        cut_image.display().to_string(),
+    ];
+    if let Some(needle) = stop_after_needle {
+        args.push("--stop-after-needle".into());
+        args.push(needle.into());
+    }
+    args
+}
+
+fn write_crash_cut_outcome_manifest(
+    run: &run_workspace::RunWorkspace,
+    required: usize,
+    completed: usize,
+    families: Vec<String>,
+    outcomes: Vec<CrashCutOutcome>,
+) -> Result<PathBuf> {
+    let manifest = serde_json::json!({
+        "schema": "tx.ext4.crash_cut_outcome_manifest.v1",
+        "completed": completed,
+        "required": required,
+        "families": families,
+        "outcomes": outcomes.iter().map(|outcome| serde_json::json!({
+            "cut_id": &outcome.cut_id,
+            "immutable_image_sha256": &outcome.immutable_image_sha256,
+            "e2fsck_exit_code": outcome.e2fsck_exit_code,
+            "replay_exit_code": outcome.replay_exit_code
+        })).collect::<Vec<_>>()
+    });
+    let path = run.working_dir().join("crash-cut-outcomes.json");
+    let text = serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
+    fs::write(&path, text).map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
 }
 
 fn write_crash_cut_execution_manifest(
