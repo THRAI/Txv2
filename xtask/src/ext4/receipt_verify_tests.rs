@@ -73,6 +73,17 @@ fn tier1_verify_receipt_rejects_missing_guest_matrix_serial_log() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_missing_build_log_artifact() {
+    let root = temp_root("verify-receipt-missing-build-log");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    remove_artifact_record(&root, "candidate-full-build-log");
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing build log must fail");
+    assert!(error.contains("missing required artifact candidate-full-build-log"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_tampered_artifact() {
     let root = temp_root("verify-receipt-tampered");
     let _cleanup = TempCleanup(root.clone());
@@ -203,6 +214,21 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         "guest-matrix-serial-log",
         "guest-matrix-serial.log".into(),
         "shell-test: groups: 8 passed, 0 failed\nshell-test: ok\n".into(),
+    );
+    add_artifact(
+        "candidate-full-build-log",
+        "build/full-build.log".into(),
+        "$ cargo xtask full-build --target rv64-qemu --skip-doctor\nexit_code=0\nok\n".into(),
+    );
+    add_artifact(
+        "busybox-ext4-image-build-log",
+        "build/busybox-ext4-image.log".into(),
+        "$ cargo xtask image ext4 --profile busybox --target rv64-qemu\nexit_code=0\nok\n".into(),
+    );
+    add_artifact(
+        "busybox-base-image",
+        "base.img".into(),
+        "busybox base image\n".into(),
     );
 
     let (test_image, test_sha) =

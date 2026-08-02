@@ -1,3 +1,21 @@
+- 2026-08-02 (ext4 Tier 1 build/base-image evidence).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. Live Tier 1 now runs candidate `full-build` and busybox ext4 image
+  creation through captured commands, writes run-owned build logs, records
+  `candidate-full-build-log` and `busybox-ext4-image-build-log`, and stages the
+  produced busybox base image as `busybox-base-image` before deriving TEST,
+  SCRATCH, and WORKLOAD images. `--verify-receipt` now requires those artifacts,
+  so final G0-G7 receipts must retain same-run build/base-image evidence.
+  Verification passed `CARGO_INCREMENTAL=0 cargo test -p xtask
+  tier1_workspace_records_command_log_artifact -- --test-threads=1` (1),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify --
+  --test-threads=1` (9), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (52), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --dry-run`, and the expected fail-closed live preflight
+  `task16-build-log-preflight-20260802`. Task 16 still needs acceptance-ready
+  authority ledgers, a full fresh 1000-cut QEMU/e2fsck campaign, pinned xfstests
+  execution, and the verified immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 guest matrix serial evidence).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. The live Tier 1 guest matrix now runs `shell-test` with a

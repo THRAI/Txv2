@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::Result;
-use crate::full_build;
 use crate::image;
 use crate::shell_test;
 use crate::target::TxTarget;
@@ -116,36 +115,51 @@ fn run_live_tier1(
 
     run_g0_lints(root, run)?;
 
-    full_build::full_build(
+    run_and_record_command(
         root,
-        vec![
-            "--target".into(),
+        run,
+        "candidate-full-build-log",
+        "build/full-build.log",
+        "cargo",
+        &[
+            "xtask".to_string(),
+            "full-build".to_string(),
+            "--target".to_string(),
             base_target.name().to_string(),
-            "--skip-doctor".into(),
+            "--skip-doctor".to_string(),
         ],
+        "candidate full-build",
     )?;
-    image::image(
+    run_and_record_command(
         root,
-        vec![
-            "ext4".into(),
-            "--profile".into(),
-            "busybox".into(),
-            "--target".into(),
+        run,
+        "busybox-ext4-image-build-log",
+        "build/busybox-ext4-image.log",
+        "cargo",
+        &[
+            "xtask".to_string(),
+            "image".to_string(),
+            "ext4".to_string(),
+            "--profile".to_string(),
+            "busybox".to_string(),
+            "--target".to_string(),
             base_target.name().to_string(),
         ],
+        "busybox ext4 image build",
     )?;
 
-    let base_image = root
+    let base_image_source = root
         .join("target")
         .join("images")
         .join(image::busybox_root_ext4_name(base_target));
-    if !base_image.is_file() {
+    if !base_image_source.is_file() {
         return Err(format!(
             "missing busybox ext4 image {}",
-            base_image.display()
+            base_image_source.display()
         ));
     }
 
+    let base_image = run.stage_copy("busybox-base-image", &base_image_source, "base.img")?;
     let test_image = run.stage_copy("test-image", &base_image, "test.img")?;
     let scratch_image = run.stage_copy("scratch-image", &base_image, "scratch.img")?;
     let workload_image = run.stage_copy("workload-image", &base_image, "workload.img")?;
@@ -380,6 +394,34 @@ fn run_g0_lints(root: &Path, run: &mut run_workspace::RunWorkspace) -> Result<()
         if code != 0 {
             return Err(format!("G0 lint {rule} exited with {code}"));
         }
+    }
+    Ok(())
+}
+
+fn run_and_record_command(
+    cwd: &Path,
+    run: &mut run_workspace::RunWorkspace,
+    artifact_name: &str,
+    log_name: &str,
+    program: &str,
+    args: &[String],
+    failure_label: &str,
+) -> Result<()> {
+    let (code, output) = run_capture(cwd, program, args)?;
+    let log_path = run.working_dir().join(log_name);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let log = format!(
+        "$ {program} {}\nexit_code={code}\n{output}",
+        shell_join(args)
+    );
+    fs::write(&log_path, log)
+        .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
+    run.record_artifact(artifact_name, log_path)?;
+    if code != 0 {
+        return Err(format!("{failure_label} exited with {code}"));
     }
     Ok(())
 }

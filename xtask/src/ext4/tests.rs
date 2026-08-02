@@ -5,9 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::{
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
     CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
-    parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_crash_cut_campaign,
-    run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts, tier1_shell_test_args,
-    verify_xfstests_source_lock, write_fault_job_request,
+    parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_and_record_command,
+    run_crash_cut_campaign, run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts,
+    tier1_shell_test_args, verify_xfstests_source_lock, write_fault_job_request,
 };
 use crate::target::TxTarget;
 
@@ -181,6 +181,40 @@ fn tier1_workspace_stages_authority_artifacts() {
         assert_eq!(artifact["sha256"], expected_sha256);
         assert_eq!(sha256_file(&path).unwrap(), expected_sha256);
     }
+}
+
+#[test]
+fn tier1_workspace_records_command_log_artifact() {
+    let root = temp_root("command-log-artifact");
+    let mut run = RunWorkspace::create(&root, "command-log-run").unwrap();
+    run_and_record_command(
+        &root,
+        &mut run,
+        "candidate-full-build-log",
+        "build/full-build.log",
+        "sh",
+        &["-c".into(), "printf build-ok".into()],
+        "test command",
+    )
+    .expect("record command log");
+    let receipt = run.finalize().expect("finalize run");
+    assert!(receipt.exists());
+
+    let run_dir = root.join("target/ext4/tier1/command-log-run");
+    let log_path = run_dir.join("build/full-build.log");
+    let log = fs::read_to_string(&log_path).expect("read command log");
+    assert!(log.contains("exit_code=0"));
+    assert!(log.contains("build-ok"));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("artifacts.json")).unwrap()).unwrap();
+    let artifact = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["name"] == "candidate-full-build-log")
+        .expect("command log artifact");
+    assert_eq!(artifact["path"], log_path.display().to_string());
+    assert_eq!(artifact["sha256"], sha256_file(&log_path).unwrap());
 }
 
 #[test]
