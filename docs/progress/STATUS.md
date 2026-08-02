@@ -1,3 +1,22 @@
+- 2026-08-02 (ext4 Tier 1 shell scenario authority binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now opens the
+  run-owned `authority-shell-scenario` artifact and requires the TEST boot
+  sentinel, TEST role check, WORKLOAD read-only `/dev/block/vdc` mount/write
+  rejection, SCRATCH read-write `/dev/block/vdb` mount, and the data/setattr/
+  namespace/orphan/durability/remount/exec/detach expectation directives. This
+  closes the gap where a receipt could bind `shell_scenario_sha256` to a
+  same-hash placeholder script without proving the authority scenario actually
+  drives the Tier 1 role matrix. Verification passed `CARGO_INCREMENTAL=0 cargo
+  test -p xtask receipt_verify -- --test-threads=1` (24),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (67),
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, `git diff --check`,
+  and the expected fail-closed live preflight
+  `task16-shell-scenario-bind-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 capability ledger receipt binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now parses the

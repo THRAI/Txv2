@@ -59,6 +59,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_authority_ledger_evidence(&artifacts, receipt_path)?;
+    verify_shell_scenario_authority_evidence(&artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
     verify_g0_lint_log_evidence(&artifacts, receipt_path)?;
     verify_build_log_evidence(&artifacts, receipt_path)?;
@@ -171,6 +172,52 @@ fn verify_authority_ledger_evidence(
     verify_capability_ledger_evidence(artifacts, path)?;
     verify_xfstests_authority_acceptance_ready(artifacts, path)?;
     verify_crash_catalog_authority_acceptance_ready(artifacts, path)
+}
+
+fn verify_shell_scenario_authority_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let authority_path = artifacts
+        .get("authority-shell-scenario")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing artifact authority-shell-scenario",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let scenario = std::fs::read_to_string(&authority_path)
+        .map_err(|err| format!("failed to read {}: {err}", authority_path.display()))?;
+    verify_shell_scenario_authority(&scenario, &authority_path)
+}
+
+fn verify_shell_scenario_authority(scenario: &str, path: &Path) -> Result<()> {
+    for directive in [
+        "wait \":mount:sdcard:ext4:ok\"",
+        "expect \"tier1-test-role-status:0\"",
+        "mount -o ro -t ext4 /dev/block/vdc /musl",
+        "tier1-workload-ro-write:ok",
+        "mount -t ext4 /dev/block/vdb /musl",
+        "expect \"tier1-scratch-mount:0\"",
+        "expect \"tier1-data-write:0\"",
+        "expect \"tier1-setattr-status:0\"",
+        "expect \"tier1-namespace-status:0\"",
+        "expect \"tier1-orphan-status:0\"",
+        "expect \"tier1-durability-status:0\"",
+        "expect \"tier1-remount-status:0\"",
+        "expect \"tier1-exec-status:0\"",
+        "expect \"tier1-detach-status:0\"",
+    ] {
+        if !scenario.contains(directive) {
+            return Err(format!(
+                "{}: shell scenario authority missing directive `{directive}`",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_capability_ledger_evidence(

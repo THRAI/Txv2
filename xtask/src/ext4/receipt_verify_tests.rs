@@ -70,6 +70,35 @@ fn tier1_verify_receipt_rejects_capability_ledger_without_metadata_csum() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_shell_scenario_without_scratch_mount() {
+    let root = temp_root("verify-receipt-shell-scenario-scratch");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_authority_artifact_contents(
+        &root,
+        "authority-shell-scenario",
+        "shell_scenario_sha256",
+        "wait \":mount:sdcard:ext4:ok\" within 90000\n\
+expect \"tier1-test-role-status:0\" within 10000\n\
+send \"/bin/busybox mount -o ro -t ext4 /dev/block/vdc /musl; echo tier1-workload-ro-mount:$?\\n\"\n\
+expect \"tier1-workload-ro-write:ok\" within 10000\n\
+expect \"tier1-data-write:0\" within 10000\n\
+expect \"tier1-setattr-status:0\" within 10000\n\
+expect \"tier1-namespace-status:0\" within 10000\n\
+expect \"tier1-orphan-status:0\" within 10000\n\
+expect \"tier1-durability-status:0\" within 10000\n\
+expect \"tier1-remount-status:0\" within 30000\n\
+expect \"tier1-exec-status:0\" within 10000\n\
+expect \"tier1-detach-status:0\" within 30000\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("bad shell scenario must fail");
+    assert!(error.contains(
+        "shell scenario authority missing directive `mount -t ext4 /dev/block/vdb /musl`"
+    ));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_xfstests_authority_not_acceptance_ready() {
     let root = temp_root("verify-receipt-xfstests-authority-status");
     let _cleanup = TempCleanup(root.clone());
@@ -442,6 +471,25 @@ fn crash_catalog_families_json() -> Vec<serde_json::Value> {
     .collect()
 }
 
+fn shell_scenario_authority_fixture() -> String {
+    r#"wait ":mount:sdcard:ext4:ok" within 90000
+expect "tier1-test-role-status:0" within 10000
+send "/bin/busybox mount -o ro -t ext4 /dev/block/vdc /musl; echo tier1-workload-ro-mount:$?\n"
+expect "tier1-workload-ro-write:ok" within 10000
+send "/bin/busybox mount -t ext4 /dev/block/vdb /musl; echo tier1-scratch-mount:$?\n"
+expect "tier1-scratch-mount:0" within 30000
+expect "tier1-data-write:0" within 10000
+expect "tier1-setattr-status:0" within 10000
+expect "tier1-namespace-status:0" within 10000
+expect "tier1-orphan-status:0" within 10000
+expect "tier1-durability-status:0" within 10000
+expect "tier1-remount-status:0" within 30000
+expect "tier1-exec-status:0" within 10000
+expect "tier1-detach-status:0" within 30000
+"#
+    .to_string()
+}
+
 fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOptions) -> PathBuf {
     let run_dir = root.join("target/ext4/tier1/accepted-run");
     fs::create_dir_all(&run_dir).expect("create run dir");
@@ -511,7 +559,7 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     let (_shell_scenario, shell_scenario_sha256) = add_artifact(
         "authority-shell-scenario",
         "authorities/ext4-tier1.scn".into(),
-        "# ext4 tier1\n".into(),
+        shell_scenario_authority_fixture(),
     );
     for rule in [
         "ext4-lifecycle-ownership",
