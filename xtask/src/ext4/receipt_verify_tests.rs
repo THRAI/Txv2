@@ -546,6 +546,91 @@ fn tier1_verify_receipt_rejects_executor_plan_preserved_source_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_accepts_removed_staged_role_images_with_recorded_digests() {
+    let root = temp_root("verify-receipt-executor-plan-staged-retention");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let request_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/job-request.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    let request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&request_path).expect("read job request"))
+            .expect("parse job request");
+    let mut digests = serde_json::Map::new();
+    let mut removed = Vec::new();
+    for role in ["test", "scratch", "workload"] {
+        let staged_path = PathBuf::from(plan["staged_role_images"][role].as_str().unwrap());
+        let source_path = PathBuf::from(request["role_images"][role].as_str().unwrap());
+        fs::remove_file(&staged_path).expect("remove staged role image");
+        digests.insert(
+            role.into(),
+            serde_json::Value::String(sha256_file(&source_path).expect("role source sha")),
+        );
+        removed.push(serde_json::Value::String(staged_path.display().to_string()));
+    }
+    plan["staged_role_image_digests"] = serde_json::Value::Object(digests);
+    plan["staged_role_images_retention"] = serde_json::json!({
+        "status": "removed-after-digest-recorded",
+        "removed": removed
+    });
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    verify_tier1_receipt(&receipt).expect("removed staged role evidence verifies");
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_removed_staged_role_image_digest_mismatch() {
+    let root = temp_root("verify-receipt-executor-plan-staged-retention-drift");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let request_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/job-request.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    let request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&request_path).expect("read job request"))
+            .expect("parse job request");
+    let mut digests = serde_json::Map::new();
+    let mut removed = Vec::new();
+    for role in ["test", "scratch", "workload"] {
+        let staged_path = PathBuf::from(plan["staged_role_images"][role].as_str().unwrap());
+        let source_path = PathBuf::from(request["role_images"][role].as_str().unwrap());
+        fs::remove_file(&staged_path).expect("remove staged role image");
+        let digest = if role == "scratch" {
+            "0".repeat(64)
+        } else {
+            sha256_file(&source_path).expect("role source sha")
+        };
+        digests.insert(role.into(), serde_json::Value::String(digest));
+        removed.push(serde_json::Value::String(staged_path.display().to_string()));
+    }
+    plan["staged_role_image_digests"] = serde_json::Value::Object(digests);
+    plan["staged_role_images_retention"] = serde_json::json!({
+        "status": "removed-after-digest-recorded",
+        "removed": removed
+    });
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("staged digest drift must fail");
+    assert!(error.contains("staged role image digest mismatch for scratch"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_executor_plan_executed_checks_mismatch() {
     let root = temp_root("verify-receipt-executor-plan-executed-checks");
     let _cleanup = TempCleanup(root.clone());

@@ -14,7 +14,7 @@ use crate::util::{command_exists, command_or_candidates, run_cmd_owned_in};
 const XFSTESTS_SOURCE_URL: &str = "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git";
 const DEFAULT_TIER1_EXT4_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const TIER1_ROLE_IMAGE_COPY_COUNT: u64 = 4;
-const TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT: u64 = 8;
+const TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT: u64 = 5;
 const TIER1_COW_PER_IMAGE_WRITE_BUDGET_BYTES: u64 = 1024 * 1024;
 const TIER1_STORAGE_MIN_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TIER1_STORAGE_MARGIN_DIVISOR: u64 = 20;
@@ -360,7 +360,7 @@ pub(super) fn collect_storage_capacity_preflight_for_test(
             "ordinary image copies; CoW clone support was not proven on this host".into()
         };
         blockers.push(format!(
-            "insufficient free space for live Tier 1 crash campaign: available {} bytes, requires at least {} bytes (estimated {} byte ext4 images, {} role/base image copies plus {} image copies per crash cut)",
+            "insufficient free space for live Tier 1 crash campaign: available {} bytes, requires at least {} bytes (estimated {} byte ext4 images, {} role/base image copies plus {} retained image copies per crash cut)",
             available_bytes,
             required_bytes,
             estimated_image_bytes,

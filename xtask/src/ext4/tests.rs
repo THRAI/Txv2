@@ -589,7 +589,7 @@ fn tier1_live_storage_preflight_blocks_when_capacity_is_below_campaign_floor() {
     );
 
     assert_eq!(estimate.available_bytes, 13 * 1024 * 1024 * 1024);
-    assert!(estimate.required_bytes > 500 * 1024 * 1024 * 1024);
+    assert!(estimate.required_bytes > 300 * 1024 * 1024 * 1024);
     assert_eq!(blockers.len(), 1);
     assert!(blockers[0].contains("insufficient free space for live Tier 1 crash campaign"));
     assert!(blockers[0].contains("requires at least"));

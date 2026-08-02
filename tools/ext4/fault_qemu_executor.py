@@ -350,6 +350,44 @@ def preserve_crash_and_replay_images(plan: dict[str, Any]) -> None:
         "source": str(scratch),
         "status": "copied-after-runner-termination",
     }
+    record_and_remove_staged_role_images(plan)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def record_and_remove_staged_role_images(plan: dict[str, Any]) -> None:
+    staged = require_object(plan, "staged_role_images")
+    digests: dict[str, str] = {}
+    removed: list[str] = []
+    for role in ("test", "scratch", "workload"):
+        if role not in staged:
+            continue
+        path = Path(require_string(staged, role))
+        if not path.is_file():
+            raise FaultQemuExecutorError(
+                f"missing staged {role} role image before retention cleanup: {path}"
+            )
+        digests[role] = sha256_file(path)
+    for role in ("test", "scratch", "workload"):
+        if role not in staged:
+            continue
+        path = Path(require_string(staged, role))
+        try:
+            path.unlink()
+        except OSError as err:
+            raise FaultQemuExecutorError(f"failed to remove staged {role} role image {path}: {err}") from err
+        removed.append(str(path))
+    plan["staged_role_image_digests"] = digests
+    plan["staged_role_images_retention"] = {
+        "status": "removed-after-digest-recorded",
+        "removed": removed,
+    }
 
 
 def produce_result_if_verified(plan_path: Path, plan: dict[str, Any]) -> None:

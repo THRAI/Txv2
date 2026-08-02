@@ -1,3 +1,21 @@
+- 2026-08-03 (ext4 Task16 staged-role retention clears live preflight).
+  Cleared the Task 16 live-preflight storage blocker without minting acceptance
+  evidence. The fault QEMU executor now records sha256 evidence for the
+  per-cut staged TEST/SCRATCH/WORKLOAD role images after the hard-kill
+  preserve step, then removes those temporary clones; receipt verification
+  accepts this retention form only when the recorded staged digest matches the
+  retained role-source image, and rejects digest drift. Live storage preflight
+  now counts 5 retained image copies per crash cut instead of 8 temporary
+  clones. Fresh verification passed `python3 -m unittest
+  tools.tests.test_ext4_fault_qemu_executor` (32), focused receipt verifier
+  removed-staged-role tests (2), focused live storage-preflight tests (2), and
+  `cargo xtask ext4 tier1 --preflight-live --preflight-report
+  target/ext4/tier1/preflight/task16-retention-preflight-20260803011058.json`.
+  That report is ready with `blocker_count=0`, `available_bytes=7759519744`,
+  and `required_bytes=7662993408`. Task 16 still needs the full fresh live
+  Tier 1 run, pinned xfstests execution, verified 1000-cut QEMU/replay/e2fsck
+  evidence, and the immutable G0-G7 receipt.
+
 - 2026-08-03 (ext4 Task16 live preflight report accuracy).
   Advanced Task 16 live-readiness evidence without claiming final acceptance.
   The live preflight report now records `xfstests_source_prepared=true` when

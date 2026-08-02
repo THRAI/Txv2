@@ -1805,6 +1805,12 @@ fn verify_executor_plan_staged_roles_and_command(
     let job_dir = executor_plan
         .parent()
         .ok_or_else(|| format!("{}: executor plan has no parent", executor_plan.display()))?;
+    let staged_retention = plan
+        .get("staged_role_images_retention")
+        .and_then(|value| value.as_object());
+    let staged_digests = plan
+        .get("staged_role_image_digests")
+        .and_then(|value| value.as_object());
     for role in ["test", "scratch", "workload"] {
         let source = PathBuf::from(required_json_string(role_images, role, executor_plan)?);
         let expected_staged = job_dir.join("roles").join(format!("{role}.img"));
@@ -1816,14 +1822,36 @@ fn verify_executor_plan_staged_roles_and_command(
                 source.display()
             ));
         }
-        if !staged_path.is_file() {
-            return Err(format!(
-                "{}: staged role image is missing for {role}: {}",
-                executor_plan.display(),
-                staged_path.display()
-            ));
-        }
         let source_sha = sha256_file(&source)?;
+        if !staged_path.is_file() {
+            let Some(retention) = staged_retention else {
+                return Err(format!(
+                    "{}: staged role image is missing for {role}: {}",
+                    executor_plan.display(),
+                    staged_path.display()
+                ));
+            };
+            require_field_value(
+                retention,
+                "status",
+                "removed-after-digest-recorded",
+                executor_plan,
+            )?;
+            let Some(digests) = staged_digests else {
+                return Err(format!(
+                    "{}: missing staged_role_image_digests for removed staged role images",
+                    executor_plan.display()
+                ));
+            };
+            let staged_sha = required_json_string(digests, role, executor_plan)?;
+            if staged_sha != source_sha {
+                return Err(format!(
+                    "{}: staged role image digest mismatch for {role}",
+                    executor_plan.display()
+                ));
+            }
+            continue;
+        }
         let staged_sha = sha256_file(&staged_path)?;
         if source_sha != staged_sha {
             return Err(format!(
