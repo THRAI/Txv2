@@ -414,7 +414,28 @@ fn tier1_verify_receipt_rejects_job_request_replay_matrix_mismatch() {
     );
 
     let error = verify_tier1_receipt(&receipt).expect_err("mismatched request must fail");
-    assert!(error.contains("job request image mismatch"));
+    assert!(error.contains("executor plan replay_matrix mismatch"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_executor_plan_without_written_result() {
+    let root = temp_root("verify-receipt-executor-plan-result");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["result"]["status"] = "not-written".into();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("unwritten result plan must fail");
+    assert!(error.contains("status must be `written`, found `not-written`"));
 }
 
 struct TempCleanup(PathBuf);
@@ -799,12 +820,68 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
             }))
             .expect("semantic oracle request json"),
         );
+        let job_request_path = run_dir.join(format!("{cut_dir}/job-request.json"));
+        let result_path = run_dir.join(format!("{cut_dir}/result.json"));
         add_artifact(
             &format!("{cut_id}-executor-plan"),
             format!("{cut_dir}/executor-plan.json"),
-            format!(
-                "{{\"schema\":\"tx.ext4.fault_qemu_executor_plan.v1\",\"cut\":\"{cut_id}\"}}\n"
-            ),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "tx.ext4.fault_qemu_executor_plan.v1",
+                "request": job_request_path.display().to_string(),
+                "campaign_plan_sha256": per_cut_campaign_plan_sha256.clone(),
+                "job": {
+                    "case": "D7",
+                    "cut": &cut_id,
+                    "iteration": 1,
+                    "serial_log": serial_log.display().to_string(),
+                    "crash_image": crash_image.display().to_string(),
+                    "replay_image": replay_image.display().to_string(),
+                    "checks": [{
+                        "tool": "e2fsck",
+                        "args": ["-fn", replay_image.display().to_string()],
+                        "log": e2fsck_log.display().to_string()
+                    }],
+                    "replay_matrix": [
+                        {
+                            "id": "linux-rw-replay",
+                            "image": linux_replay_image.display().to_string(),
+                            "log": linux_log.display().to_string()
+                        },
+                        {
+                            "id": "linux-post-replay-e2fsck",
+                            "image": linux_replay_image.display().to_string(),
+                            "args": ["-fn", linux_replay_image.display().to_string()],
+                            "log": linux_e2fsck_log.display().to_string()
+                        },
+                        {
+                            "id": "tx-remount",
+                            "image": tx_remount_image.display().to_string(),
+                            "log": tx_remount_log.display().to_string()
+                        }
+                    ],
+                    "semantic_oracles": [{
+                        "id": "debugfs-file-hash-namespace",
+                        "image": semantic_oracle_image.display().to_string(),
+                        "log": semantic_oracle_log.display().to_string(),
+                        "expected": {"present": {"/": {}}}
+                    }]
+                },
+                "runner": {
+                    "serial_log": serial_log.display().to_string(),
+                    "cut_marker": "tx.ext4.crash.phase.D7",
+                    "command_source": "shell-test-command",
+                    "status": "exited-after-cut"
+                },
+                "hard_kill": {
+                    "required": true,
+                    "status": "observed-by-shell-test"
+                },
+                "result": {
+                    "path": result_path.display().to_string(),
+                    "status": "written"
+                }
+            }))
+            .expect("executor plan json"),
         );
         add_artifact(
             &format!("{cut_id}-job-request"),

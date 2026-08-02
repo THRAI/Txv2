@@ -1295,6 +1295,7 @@ fn verify_crash_cut_job_result(
     expected_campaign_plan_sha256: &str,
 ) -> Result<()> {
     let job_request = crash_cut_artifact_path(cut_id, "job-request", artifacts, path)?;
+    let executor_plan = crash_cut_artifact_path(cut_id, "executor-plan", artifacts, path)?;
     let result = crash_cut_artifact_path(cut_id, "result", artifacts, path)?;
     let request_json = read_json(&job_request)?;
     require_schema(&request_json, "tx.ext4.fault_job_request.v1", &job_request)?;
@@ -1322,6 +1323,14 @@ fn verify_crash_cut_job_result(
     }
     let qemu = required_json_object(request, "qemu", &job_request)?;
     let phase_marker = required_json_string(qemu, "cut_marker", &job_request)?;
+    verify_crash_cut_executor_plan(
+        cut_id,
+        &executor_plan,
+        &job_request,
+        request,
+        expected_campaign_plan_sha256,
+        &result,
+    )?;
     let crash_image = required_bound_path(
         job,
         "crash_image",
@@ -1359,6 +1368,92 @@ fn verify_crash_cut_job_result(
         &phase_marker,
         &e2fsck_log,
     )?;
+    Ok(())
+}
+
+fn verify_crash_cut_executor_plan(
+    cut_id: &str,
+    executor_plan: &Path,
+    job_request: &Path,
+    request: &serde_json::Map<String, serde_json::Value>,
+    expected_campaign_plan_sha256: &str,
+    result_path: &Path,
+) -> Result<()> {
+    let plan_json = read_json(executor_plan)?;
+    require_schema(
+        &plan_json,
+        "tx.ext4.fault_qemu_executor_plan.v1",
+        executor_plan,
+    )?;
+    let plan = json_object(&plan_json, "fault executor plan", executor_plan)?;
+    require_field_value(
+        plan,
+        "request",
+        &job_request.display().to_string(),
+        executor_plan,
+    )?;
+    require_field_value(
+        plan,
+        "campaign_plan_sha256",
+        expected_campaign_plan_sha256,
+        executor_plan,
+    )?;
+
+    let request_job = required_json_object(request, "job", job_request)?;
+    let plan_job = required_json_object(plan, "job", executor_plan)?;
+    for key in ["case", "cut", "crash_image", "replay_image", "serial_log"] {
+        require_matching_json_string(plan_job, request_job, key, executor_plan)?;
+    }
+    let plan_iteration = required_json_usize(plan_job, "iteration", executor_plan)?;
+    let request_iteration = required_json_usize(request_job, "iteration", job_request)?;
+    if plan_iteration != request_iteration {
+        return Err(format!(
+            "{}: executor plan iteration mismatch: expected {request_iteration}, found {plan_iteration}",
+            executor_plan.display()
+        ));
+    }
+    let plan_cut = required_json_string(plan_job, "cut", executor_plan)?;
+    if plan_cut != cut_id {
+        return Err(format!(
+            "{}: executor plan cut mismatch: expected {cut_id}, found {plan_cut}",
+            executor_plan.display()
+        ));
+    }
+    for key in ["checks", "replay_matrix", "semantic_oracles"] {
+        require_matching_json_value(plan_job, request_job, key, executor_plan)?;
+    }
+
+    let request_qemu = required_json_object(request, "qemu", job_request)?;
+    let runner = required_json_object(plan, "runner", executor_plan)?;
+    require_matching_json_string(runner, request_job, "serial_log", executor_plan)?;
+    require_field_value(
+        runner,
+        "command_source",
+        "shell-test-command",
+        executor_plan,
+    )?;
+    require_field_value(runner, "status", "exited-after-cut", executor_plan)?;
+    let plan_cut_marker = required_json_string(runner, "cut_marker", executor_plan)?;
+    let request_cut_marker = required_json_string(request_qemu, "cut_marker", job_request)?;
+    if plan_cut_marker != request_cut_marker {
+        return Err(format!(
+            "{}: executor plan runner cut_marker mismatch: expected {request_cut_marker}, found {plan_cut_marker}",
+            executor_plan.display()
+        ));
+    }
+
+    let hard_kill = required_json_object(plan, "hard_kill", executor_plan)?;
+    require_bool_value(hard_kill, "required", true, executor_plan)?;
+    require_field_value(hard_kill, "status", "observed-by-shell-test", executor_plan)?;
+
+    let result = required_json_object(plan, "result", executor_plan)?;
+    require_field_value(
+        result,
+        "path",
+        &result_path.display().to_string(),
+        executor_plan,
+    )?;
+    require_field_value(result, "status", "written", executor_plan)?;
     Ok(())
 }
 
@@ -1541,6 +1636,41 @@ fn require_job_request_observation_entry(
     }
     required_bound_path(entry, "image", expected_image, path)?;
     required_bound_path(entry, "log", expected_log, path)?;
+    Ok(())
+}
+
+fn require_matching_json_string(
+    actual: &serde_json::Map<String, serde_json::Value>,
+    expected: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<()> {
+    let actual = required_json_string(actual, key, path)?;
+    let expected = required_json_string(expected, key, path)?;
+    if actual != expected {
+        return Err(format!(
+            "{}: executor plan {key} mismatch: expected {expected}, found {actual}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_matching_json_value(
+    actual: &serde_json::Map<String, serde_json::Value>,
+    expected: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<()> {
+    let actual = actual
+        .get(key)
+        .ok_or_else(|| format!("{}: executor plan missing {key}", path.display()))?;
+    let expected = expected
+        .get(key)
+        .ok_or_else(|| format!("{}: job request missing {key}", path.display()))?;
+    if actual != expected {
+        return Err(format!("{}: executor plan {key} mismatch", path.display()));
+    }
     Ok(())
 }
 
