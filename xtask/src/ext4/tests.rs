@@ -939,6 +939,25 @@ fn tier1_xfstests_source_lock_checks_revision_and_check_hash() {
 }
 
 #[test]
+fn tier1_xfstests_source_lock_reports_local_status_without_network() {
+    let root = temp_root("xfstests-local-status");
+    let lock = XfstestsSourceLock {
+        path: PathBuf::from("external/xfstests"),
+        revision: "a".repeat(40),
+        check_sha256: "b".repeat(64),
+    };
+    let missing = lock.local_status(&root);
+    assert!(missing.contains("missing at"));
+    assert!(missing.contains("live runner will clone pinned source"));
+
+    let xfstests = root.join("external/xfstests");
+    fs::create_dir_all(&xfstests).unwrap();
+    let incomplete = lock.local_status(&root);
+    assert!(incomplete.contains("incomplete at"));
+    assert!(incomplete.contains("missing check script"));
+}
+
+#[test]
 fn tier1_crash_cut_campaign_refuses_synthetic_completion() {
     let root = temp_root("crash-cut-synthetic");
     let mut run = RunWorkspace::create(&root, "crash-run").unwrap();

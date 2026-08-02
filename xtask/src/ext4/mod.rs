@@ -51,7 +51,7 @@ fn tier1(root: &Path, args: &[String]) -> Result<()> {
     }
     let invocation = parse_tier1_args(root, args)?;
     if invocation.dry_run {
-        invocation.print_dry_run();
+        invocation.print_dry_run(root);
         return Ok(());
     }
     invocation.authorities.ensure_live_acceptance_ready()?;
@@ -248,7 +248,7 @@ struct Tier1Invocation {
 }
 
 impl Tier1Invocation {
-    fn print_dry_run(&self) {
+    fn print_dry_run(&self, root: &Path) {
         println!("ext4 tier1: dry-run");
         println!("ext4 tier1: run-id={}", self.run_id);
         println!(
@@ -270,6 +270,10 @@ impl Tier1Invocation {
             self.authorities.selection.source_lock.path.display(),
             self.authorities.selection.source_lock.revision,
             self.authorities.selection.source_lock.check_sha256
+        );
+        println!(
+            "ext4 tier1: xfstests local-source {}",
+            self.authorities.selection.source_lock.local_status(root)
         );
         println!(
             "ext4 tier1: crash-cuts {} sha256 {}",
@@ -608,6 +612,26 @@ impl XfstestsSourceLock {
 
     fn root_path(&self, root: &Path) -> PathBuf {
         root.join(&self.path)
+    }
+
+    fn local_status(&self, root: &Path) -> String {
+        let source_root = self.root_path(root);
+        if !source_root.exists() {
+            return format!(
+                "missing at {}; live runner will clone pinned source before execution",
+                source_root.display()
+            );
+        }
+        if !source_root.join("check").is_file() {
+            return format!(
+                "incomplete at {}; missing check script",
+                source_root.display()
+            );
+        }
+        match verify_xfstests_source_lock(&source_root, self) {
+            Ok(()) => format!("ready at {}", source_root.display()),
+            Err(err) => format!("stale at {}: {err}", source_root.display()),
+        }
     }
 }
 

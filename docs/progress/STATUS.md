@@ -1,3 +1,20 @@
+- 2026-08-02 (ext4 Tier 1 xfstests source-lock visibility).
+  Advanced Task 16 authority preflight visibility without promoting final
+  acceptance. `cargo xtask ext4 tier1 --dry-run` now reports the local pinned
+  xfstests source status in addition to the manifest revision/check sha: the
+  current checkout prints that `/Users/3y/Downloads/Tx/external/xfstests` is
+  missing and that the live runner will clone the pinned source before
+  execution. This keeps the placeholder authority status blocker separate from
+  the next external source-materialization step. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask xfstests_source_lock --
+  --test-threads=1` (2), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (45), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --dry-run`, and the expected fail-closed live preflight
+  `task16-xfstests-source-status-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 crash outcome digest binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. The final receipt verifier now parses `crash-cut-outcomes.json`
