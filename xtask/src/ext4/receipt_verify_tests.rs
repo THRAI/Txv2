@@ -26,6 +26,19 @@ fn tier1_verify_receipt_rejects_outcome_sha_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_campaign_plan_sha_mismatch() {
+    let root = temp_root("verify-receipt-campaign-sha");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture_with_bad_campaign_plan_sha(&root);
+
+    let error = verify_tier1_receipt(&receipt).expect_err("bad campaign plan sha must fail");
+    assert!(
+        error
+            .contains("fault job campaign_plan_sha256 does not match crash-campaign-plan artifact")
+    );
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_tampered_artifact() {
     let root = temp_root("verify-receipt-tampered");
     let _cleanup = TempCleanup(root.clone());
@@ -62,14 +75,36 @@ impl Drop for TempCleanup {
 }
 
 fn write_acceptance_receipt_fixture(root: &PathBuf) -> PathBuf {
-    write_acceptance_receipt_fixture_inner(root, false)
+    write_acceptance_receipt_fixture_inner(root, FixtureOptions::default())
 }
 
 fn write_acceptance_receipt_fixture_with_bad_outcome(root: &PathBuf) -> PathBuf {
-    write_acceptance_receipt_fixture_inner(root, true)
+    write_acceptance_receipt_fixture_inner(
+        root,
+        FixtureOptions {
+            bad_first_outcome: true,
+            ..FixtureOptions::default()
+        },
+    )
 }
 
-fn write_acceptance_receipt_fixture_inner(root: &PathBuf, bad_first_outcome: bool) -> PathBuf {
+fn write_acceptance_receipt_fixture_with_bad_campaign_plan_sha(root: &PathBuf) -> PathBuf {
+    write_acceptance_receipt_fixture_inner(
+        root,
+        FixtureOptions {
+            bad_first_campaign_plan_sha: true,
+            ..FixtureOptions::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct FixtureOptions {
+    bad_first_outcome: bool,
+    bad_first_campaign_plan_sha: bool,
+}
+
+fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOptions) -> PathBuf {
     let run_dir = root.join("target/ext4/tier1/accepted-run");
     fs::create_dir_all(&run_dir).expect("create run dir");
     let mut artifacts = Vec::new();
@@ -112,8 +147,13 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, bad_first_outcome: boo
         }));
     }
 
+    let (_campaign_plan, campaign_plan_sha256) = add_artifact(
+        "crash-campaign-plan",
+        "crash-campaign-plan.json".into(),
+        "{}\n".into(),
+    );
+
     for (name, file_name, contents) in [
-        ("crash-campaign-plan", "crash-campaign-plan.json", "{}\n"),
         ("e2fsck-test-log", "e2fsck-test.log", "test clean\n"),
         (
             "e2fsck-scratch-log",
@@ -133,6 +173,11 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, bad_first_outcome: boo
     for idx in 0..1000 {
         let cut_id = format!("crash-cut-{idx:04}");
         let cut_dir = format!("crash-cuts/{cut_id}");
+        let per_cut_campaign_plan_sha256 = if options.bad_first_campaign_plan_sha && idx == 0 {
+            "b".repeat(64)
+        } else {
+            campaign_plan_sha256.clone()
+        };
         let (crash_image, _) = add_artifact(
             &format!("{cut_id}-crash-image"),
             format!("{cut_dir}/crash.img"),
@@ -220,7 +265,7 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, bad_first_outcome: boo
             format!("{cut_dir}/job-request.json"),
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema": "tx.ext4.fault_job_request.v1",
-                "campaign_plan_sha256": "a".repeat(64),
+                "campaign_plan_sha256": per_cut_campaign_plan_sha256.clone(),
                 "job": {
                     "case": "D7",
                     "cut": &cut_id,
@@ -278,7 +323,7 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, bad_first_outcome: boo
             format!("{cut_dir}/result.json"),
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema": "tx.ext4.fault_job_result.v1",
-                "campaign_plan_sha256": "a".repeat(64),
+                "campaign_plan_sha256": per_cut_campaign_plan_sha256.clone(),
                 "case": "D7",
                 "cut": &cut_id,
                 "iteration": 1,
@@ -339,7 +384,7 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, bad_first_outcome: boo
         crash_outcomes.push(serde_json::json!({
             "cut_id": &cut_id,
             "immutable_image_sha256": replay_sha256,
-            "replay_serial_sha256": if bad_first_outcome && idx == 0 {
+            "replay_serial_sha256": if options.bad_first_outcome && idx == 0 {
                 "1".repeat(64)
             } else {
                 replay_serial_sha256

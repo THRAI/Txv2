@@ -492,6 +492,16 @@ fn verify_required_crash_cut_artifacts(
     artifacts: &BTreeMap<String, ArtifactRecord>,
     path: &Path,
 ) -> Result<()> {
+    let campaign_plan_sha256 = artifacts
+        .get("crash-campaign-plan")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing required artifact crash-campaign-plan",
+                path.display()
+            )
+        })?
+        .sha256
+        .clone();
     for idx in 0..1000 {
         let cut_id = format!("crash-cut-{idx:04}");
         for suffix in [
@@ -520,7 +530,7 @@ fn verify_required_crash_cut_artifacts(
                 ));
             }
         }
-        verify_crash_cut_job_result(&cut_id, artifacts, path)?;
+        verify_crash_cut_job_result(&cut_id, artifacts, path, &campaign_plan_sha256)?;
     }
     Ok(())
 }
@@ -529,6 +539,7 @@ fn verify_crash_cut_job_result(
     cut_id: &str,
     artifacts: &BTreeMap<String, ArtifactRecord>,
     path: &Path,
+    expected_campaign_plan_sha256: &str,
 ) -> Result<()> {
     let job_request = crash_cut_artifact_path(cut_id, "job-request", artifacts, path)?;
     let result = crash_cut_artifact_path(cut_id, "result", artifacts, path)?;
@@ -541,6 +552,12 @@ fn verify_crash_cut_job_result(
         &campaign_plan_sha256,
         &job_request,
     )?;
+    if campaign_plan_sha256 != expected_campaign_plan_sha256 {
+        return Err(format!(
+            "{}: fault job campaign_plan_sha256 does not match crash-campaign-plan artifact",
+            job_request.display()
+        ));
+    }
     let job = required_json_object(request, "job", &job_request)?;
     let case_id = required_json_string(job, "case", &job_request)?;
     let request_cut = required_json_string(job, "cut", &job_request)?;

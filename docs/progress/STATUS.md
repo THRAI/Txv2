@@ -1,3 +1,18 @@
+- 2026-08-02 (ext4 Tier 1 campaign-plan digest binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now requires each
+  per-cut `fault_job_request.v1` `campaign_plan_sha256` to match the actual
+  `crash-campaign-plan` artifact digest, so request/result pairs can no longer
+  self-consistently point at a different campaign manifest. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify --
+  --test-threads=1` (5), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (46), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --dry-run`, and the expected fail-closed live preflight
+  `task16-campaign-sha-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 xfstests source-lock visibility).
   Advanced Task 16 authority preflight visibility without promoting final
   acceptance. `cargo xtask ext4 tier1 --dry-run` now reports the local pinned
