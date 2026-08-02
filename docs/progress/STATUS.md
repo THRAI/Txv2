@@ -1,3 +1,21 @@
+- 2026-08-03 (ext4 Task16 secondary oracle image retention).
+  Reduced live Tier 1 retained crash-cut images from 5 to 2 per cut while
+  preserving immediate oracle verification. The Rust runner still lets the
+  fault executor create Linux replay, Tx remount, and semantic-oracle image
+  copies, then parses the result while those files exist so their image sha256
+  values and logs are verified. After parsing, the runner removes those
+  secondary oracle images and records only the result/log evidence in the final
+  artifact set; crash/replay images remain retained artifacts for immutable
+  e2fsck/replay receipt binding. Receipt verification no longer requires the
+  secondary image artifacts, but still validates the standard job-request
+  paths, result image sha fields, oracle logs, and replay-image outcome hash.
+  Verification passed focused storage-preflight tests (2), focused receipt
+  verifier tests (38), Python fault executor tests (33), and live preflight
+  `target/ext4/tier1/preflight/task16-secondary-retention-20260803014109.json`
+  with `blocker_count=0`, `available_bytes=5609730048`, and
+  `required_bytes=4517265408`. Task 16 still needs the fresh full live run and
+  final verified G0-G7 receipt.
+
 - 2026-08-03 (ext4 Task16 crash executor pre-cut retry).
   Fixed the first blocker from the fresh live Tier 1 run
   `target/ext4/tier1/task16-live-retention-20260803011842` without promoting

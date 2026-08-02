@@ -14,7 +14,7 @@ use crate::util::{command_exists, command_or_candidates, run_cmd_owned_in};
 const XFSTESTS_SOURCE_URL: &str = "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git";
 const DEFAULT_TIER1_EXT4_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const TIER1_ROLE_IMAGE_COPY_COUNT: u64 = 4;
-const TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT: u64 = 5;
+const TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT: u64 = 2;
 const TIER1_COW_PER_IMAGE_WRITE_BUDGET_BYTES: u64 = 1024 * 1024;
 const TIER1_STORAGE_MIN_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TIER1_STORAGE_MARGIN_DIVISOR: u64 = 20;

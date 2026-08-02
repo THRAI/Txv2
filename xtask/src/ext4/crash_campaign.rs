@@ -235,6 +235,7 @@ pub(crate) fn execute_crash_cut_campaign(
             phase_marker,
             &job.e2fsck_log,
         )?;
+        remove_secondary_oracle_images(&job)?;
 
         let replay_args = crash_cut_shell_test_args(
             boot_image,
@@ -483,21 +484,32 @@ fn record_existing_fault_job_artifacts(
         ("e2fsck-log", &job.e2fsck_log),
         ("crash-image", &job.crash_image),
         ("replay-image", &job.replay_image),
-        ("linux-rw-replay-image", &job.linux_replay_image),
         ("linux-rw-replay-log", &job.linux_rw_replay_log),
         (
             "linux-post-replay-e2fsck-log",
             &job.linux_post_replay_e2fsck_log,
         ),
-        ("tx-remount-image", &job.tx_remount_image),
         ("tx-remount-log", &job.tx_remount_log),
         ("semantic-oracle-request", &job.semantic_oracle_request),
-        ("semantic-oracle-image", &job.semantic_oracle_image),
         ("semantic-oracle-log", &job.semantic_oracle_log),
         ("fault-executor-log", &job.fault_executor_log),
     ] {
         if path.is_file() {
             run.record_artifact(format!("{cut_id}-{suffix}"), path.clone())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_secondary_oracle_images(job: &FaultJobPaths) -> Result<()> {
+    for path in [
+        &job.linux_replay_image,
+        &job.tx_remount_image,
+        &job.semantic_oracle_image,
+    ] {
+        if path.is_file() {
+            fs::remove_file(path)
+                .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
         }
     }
     Ok(())
@@ -978,14 +990,7 @@ fn verify_observation_entry(
             path.display()
         ));
     }
-    if !expected_image.is_file() {
-        return Err(format!(
-            "{}: {field} {expected_id} image is missing: {}",
-            path.display(),
-            expected_image.display()
-        ));
-    }
-    if sha256_file(expected_image)? != image_sha256 {
+    if expected_image.is_file() && sha256_file(expected_image)? != image_sha256 {
         return Err(format!(
             "{}: {field} {expected_id} image sha256 mismatch",
             path.display()

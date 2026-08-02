@@ -1543,13 +1543,10 @@ fn verify_required_crash_cut_artifacts(
             "e2fsck-log",
             "crash-image",
             "replay-image",
-            "linux-rw-replay-image",
             "linux-rw-replay-log",
             "linux-post-replay-e2fsck-log",
-            "tx-remount-image",
             "tx-remount-log",
             "semantic-oracle-request",
-            "semantic-oracle-image",
             "semantic-oracle-log",
             "fault-executor-log",
         ] {
@@ -2061,20 +2058,20 @@ fn verify_job_request_replay_matrix(
     job_request: &Path,
 ) -> Result<()> {
     let entries = require_non_empty_array(job, "replay_matrix", job_request)?;
+    let job_dir = job_request
+        .parent()
+        .ok_or_else(|| format!("{}: job request has no parent", job_request.display()))?;
+    let linux_image = job_dir.join("linux-rw-replay.img");
+    let tx_image = job_dir.join("tx-remount.img");
     let expected = [
-        (
-            "linux-rw-replay",
-            "linux-rw-replay-image",
-            None,
-            "linux-rw-replay-log",
-        ),
+        ("linux-rw-replay", &linux_image, None, "linux-rw-replay-log"),
         (
             "linux-post-replay-e2fsck",
-            "linux-rw-replay-image",
-            Some("linux-rw-replay-image"),
+            &linux_image,
+            Some(&linux_image),
             "linux-post-replay-e2fsck-log",
         ),
-        ("tx-remount", "tx-remount-image", None, "tx-remount-log"),
+        ("tx-remount", &tx_image, None, "tx-remount-log"),
     ];
     if entries.len() != expected.len() {
         return Err(format!(
@@ -2084,7 +2081,7 @@ fn verify_job_request_replay_matrix(
             expected.len()
         ));
     }
-    for (entry, (expected_id, image_suffix, args_image_suffix, log_suffix)) in
+    for (entry, (expected_id, expected_image, args_image, log_suffix)) in
         entries.iter().zip(expected)
     {
         let entry = entry.as_object().ok_or_else(|| {
@@ -2097,12 +2094,11 @@ fn verify_job_request_replay_matrix(
             entry,
             "replay_matrix",
             expected_id,
-            &crash_cut_artifact_path(cut_id, image_suffix, artifacts, path)?,
+            expected_image,
             &crash_cut_artifact_path(cut_id, log_suffix, artifacts, path)?,
             job_request,
         )?;
-        if let Some(args_image_suffix) = args_image_suffix {
-            let image = crash_cut_artifact_path(cut_id, args_image_suffix, artifacts, path)?;
+        if let Some(image) = args_image {
             let args = entry
                 .get("args")
                 .and_then(|value| value.as_array())
@@ -2153,7 +2149,10 @@ fn verify_job_request_semantic_oracle(
             entries.len()
         ));
     }
-    let expected_image = crash_cut_artifact_path(cut_id, "semantic-oracle-image", artifacts, path)?;
+    let job_dir = job_request
+        .parent()
+        .ok_or_else(|| format!("{}: job request has no parent", job_request.display()))?;
+    let expected_image = job_dir.join("semantic-oracle.img");
     let expected_log = crash_cut_artifact_path(cut_id, "semantic-oracle-log", artifacts, path)?;
     let entry = entries[0].as_object().ok_or_else(|| {
         format!(
