@@ -333,6 +333,7 @@ fn verify_e2fsck_summary(
         ("workload", "workload-image"),
     ] {
         verify_e2fsck_role_artifact(role, artifact_name, &by_role, artifacts, path)?;
+        verify_e2fsck_role_log_artifact(role, artifacts, path)?;
     }
     for idx in 0..1000 {
         let role = format!("crash-cut-{idx:04}");
@@ -358,6 +359,54 @@ fn verify_e2fsck_role_artifact(
     if &artifact.sha256 != image_sha {
         return Err(format!(
             "{}: artifact {artifact_name} sha256 does not match e2fsck role {role}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_e2fsck_role_log_artifact(
+    role: &str,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let artifact_name = format!("e2fsck-{role}-log");
+    let artifact = artifacts
+        .get(&artifact_name)
+        .ok_or_else(|| format!("{}: missing artifact {artifact_name}", path.display()))?;
+    let log = std::fs::read_to_string(&artifact.path)
+        .map_err(|err| format!("failed to read {}: {err}", artifact.path.display()))?;
+    verify_e2fsck_clean_log(role, &log, &artifact.path)
+}
+
+fn verify_e2fsck_clean_log(role: &str, log: &str, path: &Path) -> Result<()> {
+    let lower = log.to_ascii_lowercase();
+    for marker in [
+        "unexpected inconsistency",
+        "filesystem still has errors",
+        "file system still has errors",
+        "filesystem was modified",
+        "file system was modified",
+        "inode bitmap differences",
+        "block bitmap differences",
+        "free blocks count wrong",
+        "free inodes count wrong",
+        "directory corrupted",
+        "checksum does not match",
+    ] {
+        if lower.contains(marker) {
+            return Err(format!(
+                "{}: e2fsck {role} log contains dirty marker `{marker}`",
+                path.display()
+            ));
+        }
+    }
+    if !log.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains(": clean,") || trimmed.contains(" clean,")
+    }) {
+        return Err(format!(
+            "{}: e2fsck {role} log missing clean summary",
             path.display()
         ));
     }

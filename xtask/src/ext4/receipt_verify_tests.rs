@@ -84,6 +84,32 @@ fn tier1_verify_receipt_rejects_missing_build_log_artifact() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_dirty_role_e2fsck_log() {
+    let root = temp_root("verify-receipt-dirty-role-e2fsck-log");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "e2fsck-scratch-log",
+        "scratch.img: Inode bitmap differences: -58\nscratch.img: Free inodes count wrong\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("dirty e2fsck log must fail");
+    assert!(error.contains("e2fsck scratch log contains dirty marker"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_role_e2fsck_log_without_clean_summary() {
+    let root = temp_root("verify-receipt-role-e2fsck-missing-clean");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(&root, "e2fsck-test-log", "Pass 1: Checking inodes\n");
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing clean summary must fail");
+    assert!(error.contains("e2fsck test log missing clean summary"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_missing_xfstests_source_lock_evidence() {
     let root = temp_root("verify-receipt-missing-xfstests-source-lock");
     let _cleanup = TempCleanup(root.clone());
@@ -337,16 +363,20 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     );
 
     for (name, file_name, contents) in [
-        ("e2fsck-test-log", "e2fsck-test.log", "test clean\n"),
+        (
+            "e2fsck-test-log",
+            "e2fsck-test.log",
+            "test.img: clean, 12/1024 files, 256/4096 blocks\n",
+        ),
         (
             "e2fsck-scratch-log",
             "e2fsck-scratch.log",
-            "scratch clean\n",
+            "scratch.img: clean, 12/1024 files, 256/4096 blocks\n",
         ),
         (
             "e2fsck-workload-log",
             "e2fsck-workload.log",
-            "workload clean\n",
+            "workload.img: clean, 12/1024 files, 256/4096 blocks\n",
         ),
         ("xfstests-log", "xfstests.log", "Passed all 8 tests\n"),
     ] {
