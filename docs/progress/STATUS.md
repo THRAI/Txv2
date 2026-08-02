@@ -1,3 +1,24 @@
+- 2026-08-02 (ext4 Tier 1 crash outcome digest binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. The final receipt verifier now parses `crash-cut-outcomes.json`
+  and requires `completed=required=1000`, 1000 ordered unique rows, clean
+  `e2fsck_exit_code`/`replay_exit_code`, real nonzero outcome sha values, and
+  per-row `immutable_image_sha256`/`replay_serial_sha256` equality with the
+  corresponding `crash-cut-0000..0999` replay-image and replay-serial artifact
+  digests. A new verifier test rejects a receipt whose outcome manifest was
+  generated with a bad replay-serial sha while all artifact hashes remain
+  internally consistent, and the heavy 1000-cut verifier fixtures now clean
+  their temp roots on drop to avoid filling the host temp volume. Verification
+  passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify -- --test-threads=1`
+  (4), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`
+  (44), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the
+  expected fail-closed live preflight
+  `task16-outcome-bind-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 receipt semantic verification).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now opens every

@@ -59,6 +59,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
+    verify_crash_cut_outcome_manifest(&artifacts, receipt_path)?;
     verify_required_crash_cut_artifacts(&artifacts, receipt_path)?;
     Ok(())
 }
@@ -367,6 +368,120 @@ fn verify_required_log_artifacts(
             return Err(format!(
                 "{}: missing required artifact {name}",
                 path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_crash_cut_outcome_manifest(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let manifest_path = artifacts
+        .get("crash-cut-outcomes")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing required artifact crash-cut-outcomes",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let value = read_json(&manifest_path)?;
+    require_schema(
+        &value,
+        "tx.ext4.crash_cut_outcome_manifest.v1",
+        &manifest_path,
+    )?;
+    let object = json_object(&value, "crash-cut outcome manifest", &manifest_path)?;
+    let completed = required_json_usize(object, "completed", &manifest_path)?;
+    let required = required_json_usize(object, "required", &manifest_path)?;
+    if completed != 1000 || required != 1000 {
+        return Err(format!(
+            "{}: crash cut outcome counts are completed={completed} required={required}, expected 1000/1000",
+            manifest_path.display()
+        ));
+    }
+    require_non_empty_array(object, "families", &manifest_path)?;
+    let outcomes = require_non_empty_array(object, "outcomes", &manifest_path)?;
+    if outcomes.len() != 1000 {
+        return Err(format!(
+            "{}: crash cut outcome rows are {}, expected 1000",
+            manifest_path.display(),
+            outcomes.len()
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (idx, outcome) in outcomes.iter().enumerate() {
+        let outcome = outcome.as_object().ok_or_else(|| {
+            format!(
+                "{}: crash cut outcome row must be an object",
+                manifest_path.display()
+            )
+        })?;
+        let expected_cut_id = format!("crash-cut-{idx:04}");
+        let cut_id = required_json_string(outcome, "cut_id", &manifest_path)?;
+        if cut_id != expected_cut_id {
+            return Err(format!(
+                "{}: crash cut outcome row {idx} cut_id mismatch: expected {expected_cut_id}, found {cut_id}",
+                manifest_path.display()
+            ));
+        }
+        if !seen.insert(cut_id.clone()) {
+            return Err(format!(
+                "{}: duplicate crash cut outcome {cut_id}",
+                manifest_path.display()
+            ));
+        }
+        let image_sha = required_json_string(outcome, "immutable_image_sha256", &manifest_path)?;
+        let replay_serial_sha =
+            required_json_string(outcome, "replay_serial_sha256", &manifest_path)?;
+        verify_real_sha(
+            &format!("crash cut {cut_id} immutable_image_sha256"),
+            &image_sha,
+            &manifest_path,
+        )?;
+        verify_real_sha(
+            &format!("crash cut {cut_id} replay_serial_sha256"),
+            &replay_serial_sha,
+            &manifest_path,
+        )?;
+        for (field, expected) in [("e2fsck_exit_code", 0), ("replay_exit_code", 0)] {
+            let exit = required_json_i32(outcome, field, &manifest_path)?;
+            if exit != expected {
+                return Err(format!(
+                    "{}: crash cut {cut_id} {field} is {exit}, expected {expected}",
+                    manifest_path.display()
+                ));
+            }
+        }
+        let replay_artifact = artifacts
+            .get(&format!("{cut_id}-replay-image"))
+            .ok_or_else(|| {
+                format!(
+                    "{}: missing replay image artifact for {cut_id}",
+                    manifest_path.display()
+                )
+            })?;
+        if replay_artifact.sha256 != image_sha {
+            return Err(format!(
+                "{}: crash cut {cut_id} immutable_image_sha256 does not match replay-image artifact",
+                manifest_path.display()
+            ));
+        }
+        let replay_serial_artifact = artifacts
+            .get(&format!("{cut_id}-replay-serial"))
+            .ok_or_else(|| {
+                format!(
+                    "{}: missing replay serial artifact for {cut_id}",
+                    manifest_path.display()
+                )
+            })?;
+        if replay_serial_artifact.sha256 != replay_serial_sha {
+            return Err(format!(
+                "{}: crash cut {cut_id} replay_serial_sha256 does not match replay-serial artifact",
+                manifest_path.display()
             ));
         }
     }

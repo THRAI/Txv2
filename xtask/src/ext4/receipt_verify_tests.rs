@@ -7,14 +7,28 @@ use super::{temp_root, write_json, write_text};
 #[test]
 fn tier1_verify_receipt_accepts_locked_product_evidence() {
     let root = temp_root("verify-receipt-ok");
+    let _cleanup = TempCleanup(root.clone());
     let receipt = write_acceptance_receipt_fixture(&root);
 
     verify_tier1_receipt(&receipt).expect("locked product receipt verifies");
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_outcome_sha_mismatch() {
+    let root = temp_root("verify-receipt-outcome-sha");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture_with_bad_outcome(&root);
+
+    let error = verify_tier1_receipt(&receipt).expect_err("bad outcome sha must fail");
+    assert!(error.contains(
+        "crash cut crash-cut-0000 replay_serial_sha256 does not match replay-serial artifact"
+    ));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_tampered_artifact() {
     let root = temp_root("verify-receipt-tampered");
+    let _cleanup = TempCleanup(root.clone());
     let receipt = write_acceptance_receipt_fixture(&root);
     write_text(
         &root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/replay.img"),
@@ -28,6 +42,7 @@ fn tier1_verify_receipt_rejects_tampered_artifact() {
 #[test]
 fn tier1_verify_receipt_rejects_missing_per_cut_serial_artifact() {
     let root = temp_root("verify-receipt-missing-crash-serial");
+    let _cleanup = TempCleanup(root.clone());
     let receipt = write_acceptance_receipt_fixture(&root);
     fs::remove_file(
         root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/serial.log"),
@@ -38,11 +53,28 @@ fn tier1_verify_receipt_rejects_missing_per_cut_serial_artifact() {
     assert!(error.contains("artifact crash-cut-0000-serial is missing"));
 }
 
+struct TempCleanup(PathBuf);
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn write_acceptance_receipt_fixture(root: &PathBuf) -> PathBuf {
+    write_acceptance_receipt_fixture_inner(root, false)
+}
+
+fn write_acceptance_receipt_fixture_with_bad_outcome(root: &PathBuf) -> PathBuf {
+    write_acceptance_receipt_fixture_inner(root, true)
+}
+
+fn write_acceptance_receipt_fixture_inner(root: &PathBuf, bad_first_outcome: bool) -> PathBuf {
     let run_dir = root.join("target/ext4/tier1/accepted-run");
     fs::create_dir_all(&run_dir).expect("create run dir");
     let mut artifacts = Vec::new();
     let mut e2fsck_images = Vec::new();
+    let mut crash_outcomes = Vec::new();
 
     let mut add_artifact = |name: &str, file_name: String, contents: String| {
         let path = run_dir.join(file_name);
@@ -82,7 +114,6 @@ fn write_acceptance_receipt_fixture(root: &PathBuf) -> PathBuf {
 
     for (name, file_name, contents) in [
         ("crash-campaign-plan", "crash-campaign-plan.json", "{}\n"),
-        ("crash-cut-outcomes", "crash-cut-outcomes.json", "{}\n"),
         ("e2fsck-test-log", "e2fsck-test.log", "test clean\n"),
         (
             "e2fsck-scratch-log",
@@ -137,6 +168,9 @@ fn write_acceptance_receipt_fixture(root: &PathBuf) -> PathBuf {
             format!("{cut_dir}/replay-serial.log"),
             format!("{cut_id} replay serial\n"),
         );
+        let replay_serial_sha256 =
+            sha256_file(&run_dir.join(format!("{cut_dir}/replay-serial.log")))
+                .expect("replay serial sha");
         let (e2fsck_log, e2fsck_log_sha256) = add_artifact(
             &format!("{cut_id}-e2fsck-log"),
             format!("{cut_dir}/e2fsck-fn.log"),
@@ -298,11 +332,35 @@ fn write_acceptance_receipt_fixture(root: &PathBuf) -> PathBuf {
             .expect("fault job result json"),
         );
         e2fsck_images.push(serde_json::json!({
-            "role": cut_id,
-            "image_sha256": replay_sha256,
+            "role": &cut_id,
+            "image_sha256": replay_sha256.clone(),
             "exit_code": 0
         }));
+        crash_outcomes.push(serde_json::json!({
+            "cut_id": &cut_id,
+            "immutable_image_sha256": replay_sha256,
+            "replay_serial_sha256": if bad_first_outcome && idx == 0 {
+                "1".repeat(64)
+            } else {
+                replay_serial_sha256
+            },
+            "e2fsck_exit_code": 0,
+            "replay_exit_code": 0
+        }));
     }
+
+    add_artifact(
+        "crash-cut-outcomes",
+        "crash-cut-outcomes.json".into(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.crash_cut_outcome_manifest.v1",
+            "completed": 1000,
+            "required": 1000,
+            "families": ["D7"],
+            "outcomes": crash_outcomes
+        }))
+        .expect("crash outcome manifest json"),
+    );
 
     let artifacts_path = run_dir.join("artifacts.json");
     write_json(
