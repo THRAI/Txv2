@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use super::super::{sha256_file, verify_tier1_receipt};
+use super::super::{
+    sha256_file, sha256_tagged_lines, verify_tier1_receipt, xfstests_selected_cases_sha256,
+};
 use super::{temp_root, write_json, write_text};
 
 #[test]
@@ -137,6 +139,27 @@ fn tier1_verify_receipt_rejects_xfstests_authority_not_acceptance_ready() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_xfstests_authority_missing_readiness_evidence() {
+    let root = temp_root("verify-receipt-xfstests-readiness");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let mut authority = read_authority_artifact_json(&root, "authority-xfstests-selection");
+    authority
+        .as_object_mut()
+        .expect("xfstests authority object")
+        .remove("readiness_evidence");
+    rewrite_authority_artifact_contents(
+        &root,
+        "authority-xfstests-selection",
+        "xfstests_selection_sha256",
+        &serde_json::to_string_pretty(&authority).expect("xfstests authority json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing readiness evidence must fail");
+    assert!(error.contains("missing object readiness_evidence"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_crash_catalog_without_campaign() {
     let root = temp_root("verify-receipt-crash-catalog-campaign");
     let _cleanup = TempCleanup(root.clone());
@@ -156,6 +179,48 @@ fn tier1_verify_receipt_rejects_crash_catalog_without_campaign() {
 
     let error = verify_tier1_receipt(&receipt).expect_err("campaign-less crash catalog must fail");
     assert!(error.contains("missing object campaign"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_crash_catalog_missing_readiness_evidence() {
+    let root = temp_root("verify-receipt-crash-readiness");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let mut authority = read_authority_artifact_json(&root, "authority-crash-cut-catalog");
+    authority
+        .as_object_mut()
+        .expect("crash catalog object")
+        .remove("readiness_evidence");
+    rewrite_authority_artifact_contents(
+        &root,
+        "authority-crash-cut-catalog",
+        "crash_cut_catalog_sha256",
+        &serde_json::to_string_pretty(&authority).expect("crash catalog json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing readiness evidence must fail");
+    assert!(error.contains("missing object readiness_evidence"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_crash_readiness_mismatched_campaign_plan() {
+    let root = temp_root("verify-receipt-crash-readiness-campaign");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let mut authority = read_authority_artifact_json(&root, "authority-crash-cut-catalog");
+    authority["readiness_evidence"]["workload_script_sha256"] =
+        serde_json::Value::String("d".repeat(64));
+    rewrite_authority_artifact_contents(
+        &root,
+        "authority-crash-cut-catalog",
+        "crash_cut_catalog_sha256",
+        &serde_json::to_string_pretty(&authority).expect("crash catalog json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("mismatched campaign evidence must fail");
+    assert!(error.contains(
+        "crash-cut readiness_evidence.workload_script_sha256 does not match crash-campaign-plan"
+    ));
 }
 
 #[test]
@@ -673,6 +738,10 @@ expect "tier1-detach-status:0" within 30000
 fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOptions) -> PathBuf {
     let run_dir = root.join("target/ext4/tier1/accepted-run");
     let repo_root = std::env::current_dir().expect("current repo dir");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
     fs::create_dir_all(&run_dir).expect("create run dir");
     let mut artifacts = Vec::new();
     let mut e2fsck_images = Vec::new();
@@ -695,6 +764,24 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         "authorities/capability-ledger.json".into(),
         serde_json::to_string_pretty(&capability_ledger_json()).expect("capability ledger json"),
     );
+    let crash_families = crash_catalog_families_json();
+    let crash_phase_lines = crash_families
+        .iter()
+        .map(|family| {
+            let family = family.as_object().expect("family object");
+            format!(
+                "{}={}",
+                family["id"].as_str().expect("family id"),
+                family["phase_marker"].as_str().expect("phase marker")
+            )
+        })
+        .collect::<Vec<_>>();
+    let workload_script_sha256 =
+        sha256_file(&workspace_root.join("tools/ext4/tier1/crash-workload.scn"))
+            .expect("workload script sha");
+    let replay_script_sha256 =
+        sha256_file(&workspace_root.join("tools/ext4/tier1/crash-replay.scn"))
+            .expect("replay script sha");
     let (_crash_cut_catalog, crash_cut_catalog_sha256) = add_artifact(
         "authority-crash-cut-catalog",
         "authorities/crash-cuts.json".into(),
@@ -708,10 +795,33 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                 "kill_policy": "deterministic-phase-marker-v1",
                 "e2fsck_mode": "immutable-copy"
             },
-            "families": crash_catalog_families_json()
+            "families": crash_families,
+            "readiness_evidence": {
+                "expanded_cut_count": 1000,
+                "family_count": 13,
+                "phase_marker_count": 13,
+                "phase_markers_sha256": sha256_tagged_lines("tx.ext4.crash.phase-markers.v1", &crash_phase_lines),
+                "workload_script_sha256": workload_script_sha256,
+                "replay_script_sha256": replay_script_sha256,
+                "kill_policy": "deterministic-phase-marker-v1",
+                "e2fsck_mode": "immutable-copy"
+            }
         }))
         .expect("crash catalog json"),
     );
+    let selected_cases = [
+        "generic/001",
+        "generic/002",
+        "generic/003",
+        "generic/004",
+        "generic/005",
+        "generic/006",
+        "generic/007",
+        "generic/008",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
     let (_xfstests_selection, xfstests_selection_sha256) = add_artifact(
         "authority-xfstests-selection",
         "authorities/xfstests-selection.json".into(),
@@ -724,16 +834,17 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                 "revision": "0123456789abcdef0123456789abcdef01234567",
                 "check_sha256": "c".repeat(64)
             },
-            "selected": [
-                {"case_id": "generic/001"},
-                {"case_id": "generic/002"},
-                {"case_id": "generic/003"},
-                {"case_id": "generic/004"},
-                {"case_id": "generic/005"},
-                {"case_id": "generic/006"},
-                {"case_id": "generic/007"},
-                {"case_id": "generic/008"}
-            ]
+            "selected": selected_cases
+                .iter()
+                .map(|case| serde_json::json!({"case_id": case}))
+                .collect::<Vec<_>>(),
+            "readiness_evidence": {
+                "source_revision": "0123456789abcdef0123456789abcdef01234567",
+                "check_sha256": "c".repeat(64),
+                "selected_count": selected_cases.len(),
+                "selected_cases_sha256": xfstests_selected_cases_sha256(&selected_cases),
+                "selection_policy": "tier1-controlled-production-v1"
+            }
         }))
         .expect("xfstests authority json"),
     );
@@ -823,7 +934,19 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     let (_campaign_plan, campaign_plan_sha256) = add_artifact(
         "crash-campaign-plan",
         "crash-campaign-plan.json".into(),
-        "{}\n".into(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.crash_cut_execution_manifest.v1",
+            "expanded_cut_count": 1000,
+            "families": crash_families,
+            "workload_script": "tools/ext4/tier1/crash-workload.scn",
+            "workload_script_sha256": workload_script_sha256,
+            "replay_script": "tools/ext4/tier1/crash-replay.scn",
+            "replay_script_sha256": replay_script_sha256,
+            "kill_policy": "deterministic-phase-marker-v1",
+            "e2fsck_mode": "immutable-copy",
+            "cuts": []
+        }))
+        .expect("crash campaign plan json"),
     );
 
     for (name, file_name, contents) in [
@@ -1365,6 +1488,24 @@ fn rewrite_artifact_contents(root: &PathBuf, name: &str, contents: &str) {
         &serde_json::to_string_pretty(&manifest).expect("artifact manifest json"),
     );
     rewrite_receipt_artifact_manifest_sha(root);
+}
+
+fn read_authority_artifact_json(root: &PathBuf, name: &str) -> serde_json::Value {
+    let artifacts_path = root.join("target/ext4/tier1/accepted-run/artifacts.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifacts_path).expect("read artifacts"))
+            .expect("parse artifacts");
+    let path = manifest["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .find(|artifact| artifact["name"] == name)
+        .unwrap_or_else(|| panic!("missing artifact {name}"))["path"]
+        .as_str()
+        .expect("artifact path")
+        .to_string();
+    serde_json::from_str(&fs::read_to_string(path).expect("read authority"))
+        .expect("parse authority")
 }
 
 fn rewrite_artifact_path_and_contents(

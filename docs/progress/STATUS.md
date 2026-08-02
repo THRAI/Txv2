@@ -1,3 +1,19 @@
+- 2026-08-02 (ext4 Tier 1 authority readiness evidence gate).
+  Hardened Task 16 authority promotion without promoting final acceptance.
+  `acceptance-ready` xfstests and crash-cut authority ledgers now require
+  machine-checkable `readiness_evidence`: xfstests binds source revision,
+  `check` sha256, selected-case count, selected-case digest, and the Tier 1
+  selection policy; crash cuts bind 1000 cuts, 13 families/phase markers, the
+  phase-marker digest, workload/replay script sha256 values, kill policy, and
+  e2fsck mode, with receipt verification cross-checking those values against
+  the run-owned `crash-campaign-plan` artifact. Both live preflight and
+  receipt verification reject status-only authority promotion. The current live report
+  `target/ext4/tier1/preflight/task16-authority-readiness-evidence-20260802.json`
+  still shows only the expected two blocker statuses because the current
+  ledgers remain declared, not acceptance-ready. Task 16 still needs audited
+  authority ledgers, actual pinned xfstests execution, full fresh 1000-cut
+  QEMU/e2fsck evidence, and the verified immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 Docker-backed Linux replay preflight).
   Reduced the Task 16 live-preflight blocker set without promoting final
   acceptance. `tools/ext4/fault_linux_rw_replay.py` now supports

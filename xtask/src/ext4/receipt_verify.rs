@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 
-use super::{crash_campaign::parse_fault_job_result, is_real_sha256, read_json, sha256_file};
+use super::{
+    crash_campaign::parse_fault_job_result, is_real_sha256, read_json, sha256_file,
+    sha256_tagged_lines, xfstests_selected_cases_sha256,
+};
 
 pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     let receipt = read_json(receipt_path)?;
@@ -325,7 +328,14 @@ fn verify_xfstests_authority_acceptance_ready(
     )?;
     let authority_object = json_object(&authority, "xfstests selection", &authority_path)?;
     require_authority_status(authority_object, "xfstests selection", &authority_path)?;
-    required_json_string(authority_object, "tier", &authority_path)?;
+    let tier = required_json_string(authority_object, "tier", &authority_path)?;
+    if tier != "tier1" {
+        return Err(format!(
+            "{}: xfstests selection tier is `{tier}`; expected `tier1`",
+            authority_path.display()
+        ));
+    }
+    verify_xfstests_readiness_evidence(authority_object, &authority_path)?;
     Ok(())
 }
 
@@ -364,7 +374,274 @@ fn verify_crash_catalog_authority_acceptance_ready(
     require_field_value(campaign, "e2fsck_mode", "immutable-copy", &authority_path)?;
     required_json_string(campaign, "workload_script", &authority_path)?;
     required_json_string(campaign, "replay_script", &authority_path)?;
-    verify_crash_catalog_families(authority_object, &authority_path)
+    verify_crash_catalog_families(authority_object, &authority_path)?;
+    verify_crash_catalog_readiness_evidence(authority_object, artifacts, &authority_path)
+}
+
+fn verify_xfstests_readiness_evidence(
+    authority: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+) -> Result<()> {
+    let evidence = required_json_object(authority, "readiness_evidence", path)?;
+    require_field_value(
+        evidence,
+        "selection_policy",
+        "tier1-controlled-production-v1",
+        path,
+    )?;
+    let source_lock = required_json_object(authority, "source_lock", path)?;
+    let source_revision = required_json_string(source_lock, "revision", path)?;
+    let evidence_revision = required_json_string(evidence, "source_revision", path)?;
+    if evidence_revision != source_revision {
+        return Err(format!(
+            "{}: xfstests readiness_evidence.source_revision does not match source_lock.revision",
+            path.display()
+        ));
+    }
+    let check_sha = required_json_string(source_lock, "check_sha256", path)?;
+    let evidence_check_sha = required_json_string(evidence, "check_sha256", path)?;
+    if evidence_check_sha != check_sha {
+        return Err(format!(
+            "{}: xfstests readiness_evidence.check_sha256 does not match source_lock.check_sha256",
+            path.display()
+        ));
+    }
+    let selected = require_non_empty_array(authority, "selected", path)?;
+    let selected_count = required_json_usize(evidence, "selected_count", path)?;
+    if selected_count != selected.len() {
+        return Err(format!(
+            "{}: xfstests readiness_evidence.selected_count {selected_count} does not match selected case count {}",
+            path.display(),
+            selected.len()
+        ));
+    }
+    let cases = selected
+        .iter()
+        .map(|case| {
+            case.get("case_id")
+                .and_then(|value| value.as_str())
+                .or_else(|| case.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: selected case entry missing case_id", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected_cases_sha = required_json_string(evidence, "selected_cases_sha256", path)?;
+    verify_real_sha(
+        "xfstests readiness_evidence.selected_cases_sha256",
+        &selected_cases_sha,
+        path,
+    )?;
+    if selected_cases_sha != xfstests_selected_cases_sha256(&cases) {
+        return Err(format!(
+            "{}: xfstests readiness_evidence.selected_cases_sha256 mismatch",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_crash_catalog_readiness_evidence(
+    authority: &serde_json::Map<String, serde_json::Value>,
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let evidence = required_json_object(authority, "readiness_evidence", path)?;
+    let expanded = required_json_usize(authority, "expanded_cut_count", path)?;
+    let evidence_expanded = required_json_usize(evidence, "expanded_cut_count", path)?;
+    if evidence_expanded != expanded {
+        return Err(format!(
+            "{}: crash-cut readiness_evidence.expanded_cut_count {evidence_expanded} does not match catalog expanded_cut_count {expanded}",
+            path.display()
+        ));
+    }
+    let families = require_non_empty_array(authority, "families", path)?;
+    let family_count = required_json_usize(evidence, "family_count", path)?;
+    if family_count != families.len() {
+        return Err(format!(
+            "{}: crash-cut readiness_evidence.family_count {family_count} does not match family count {}",
+            path.display(),
+            families.len()
+        ));
+    }
+    let phase_lines = crash_phase_marker_lines(families, path)?;
+    let phase_marker_count = required_json_usize(evidence, "phase_marker_count", path)?;
+    if phase_marker_count != phase_lines.len() {
+        return Err(format!(
+            "{}: crash-cut readiness_evidence.phase_marker_count {phase_marker_count} does not match phase marker count {}",
+            path.display(),
+            phase_lines.len()
+        ));
+    }
+    let phase_sha = required_json_string(evidence, "phase_markers_sha256", path)?;
+    verify_real_sha(
+        "crash-cut readiness_evidence.phase_markers_sha256",
+        &phase_sha,
+        path,
+    )?;
+    if phase_sha != sha256_tagged_lines("tx.ext4.crash.phase-markers.v1", &phase_lines) {
+        return Err(format!(
+            "{}: crash-cut readiness_evidence.phase_markers_sha256 mismatch",
+            path.display()
+        ));
+    }
+    let campaign = required_json_object(authority, "campaign", path)?;
+    require_matching_string(
+        evidence,
+        campaign,
+        "kill_policy",
+        "crash-cut readiness_evidence",
+        path,
+    )?;
+    require_matching_string(
+        evidence,
+        campaign,
+        "e2fsck_mode",
+        "crash-cut readiness_evidence",
+        path,
+    )?;
+    let campaign_plan_path = artifacts
+        .get("crash-campaign-plan")
+        .ok_or_else(|| format!("{}: missing artifact crash-campaign-plan", path.display()))?
+        .path
+        .clone();
+    let campaign_plan = read_json(&campaign_plan_path)?;
+    require_schema(
+        &campaign_plan,
+        "tx.ext4.crash_cut_execution_manifest.v1",
+        &campaign_plan_path,
+    )?;
+    let campaign_plan = json_object(
+        &campaign_plan,
+        "crash campaign execution manifest",
+        &campaign_plan_path,
+    )?;
+    let plan_expanded =
+        required_json_usize(campaign_plan, "expanded_cut_count", &campaign_plan_path)?;
+    if plan_expanded != expanded {
+        return Err(format!(
+            "{}: crash-campaign-plan.expanded_cut_count {plan_expanded} does not match catalog expanded_cut_count {expanded}",
+            campaign_plan_path.display()
+        ));
+    }
+    let plan_families = require_non_empty_array(campaign_plan, "families", &campaign_plan_path)?;
+    if plan_families.len() != families.len() {
+        return Err(format!(
+            "{}: crash-campaign-plan family count {} does not match catalog family count {}",
+            campaign_plan_path.display(),
+            plan_families.len(),
+            families.len()
+        ));
+    }
+    let plan_phase_lines = crash_phase_marker_lines(plan_families, &campaign_plan_path)?;
+    let plan_phase_sha = sha256_tagged_lines("tx.ext4.crash.phase-markers.v1", &plan_phase_lines);
+    if plan_phase_sha != phase_sha {
+        return Err(format!(
+            "{}: crash-cut readiness_evidence.phase_markers_sha256 does not match crash-campaign-plan",
+            path.display()
+        ));
+    }
+    require_matching_string(
+        campaign_plan,
+        campaign,
+        "workload_script",
+        "crash-campaign-plan",
+        &campaign_plan_path,
+    )?;
+    require_matching_string(
+        campaign_plan,
+        campaign,
+        "replay_script",
+        "crash-campaign-plan",
+        &campaign_plan_path,
+    )?;
+    require_matching_string(
+        campaign_plan,
+        campaign,
+        "kill_policy",
+        "crash-campaign-plan",
+        &campaign_plan_path,
+    )?;
+    require_matching_string(
+        campaign_plan,
+        campaign,
+        "e2fsck_mode",
+        "crash-campaign-plan",
+        &campaign_plan_path,
+    )?;
+    let plan_workload_sha =
+        required_json_string(campaign_plan, "workload_script_sha256", &campaign_plan_path)?;
+    verify_real_sha(
+        "crash-campaign-plan.workload_script_sha256",
+        &plan_workload_sha,
+        &campaign_plan_path,
+    )?;
+    let plan_replay_sha =
+        required_json_string(campaign_plan, "replay_script_sha256", &campaign_plan_path)?;
+    verify_real_sha(
+        "crash-campaign-plan.replay_script_sha256",
+        &plan_replay_sha,
+        &campaign_plan_path,
+    )?;
+    let evidence_workload_sha = required_json_string(evidence, "workload_script_sha256", path)?;
+    verify_real_sha(
+        "crash-cut readiness_evidence.workload_script_sha256",
+        &evidence_workload_sha,
+        path,
+    )?;
+    if evidence_workload_sha != plan_workload_sha {
+        return Err(format!(
+            "{}: crash-cut readiness_evidence.workload_script_sha256 does not match crash-campaign-plan",
+            path.display()
+        ));
+    }
+    let evidence_replay_sha = required_json_string(evidence, "replay_script_sha256", path)?;
+    verify_real_sha(
+        "crash-cut readiness_evidence.replay_script_sha256",
+        &evidence_replay_sha,
+        path,
+    )?;
+    if evidence_replay_sha != plan_replay_sha {
+        return Err(format!(
+            "{}: crash-cut readiness_evidence.replay_script_sha256 does not match crash-campaign-plan",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn crash_phase_marker_lines(families: &[serde_json::Value], path: &Path) -> Result<Vec<String>> {
+    families
+        .iter()
+        .map(|family| {
+            let family = family.as_object().ok_or_else(|| {
+                format!(
+                    "{}: crash-cut catalog family must be an object",
+                    path.display()
+                )
+            })?;
+            let id = required_json_string(family, "id", path)?;
+            let marker = required_json_string(family, "phase_marker", path)?;
+            Ok(format!("{id}={marker}"))
+        })
+        .collect()
+}
+
+fn require_matching_string(
+    evidence: &serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    label: &str,
+    path: &Path,
+) -> Result<()> {
+    let actual = required_json_string(evidence, key, path)?;
+    let expected = required_json_string(source, key, path)?;
+    if actual != expected {
+        return Err(format!(
+            "{}: {label}.{key} does not match campaign.{key}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn require_authority_status(

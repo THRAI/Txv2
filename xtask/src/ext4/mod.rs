@@ -608,6 +608,7 @@ struct XfstestsSelection {
     pub(super) source_lock: XfstestsSourceLock,
     pub(super) case_count: usize,
     pub(super) cases: Vec<String>,
+    readiness_evidence: Option<XfstestsReadinessEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -623,6 +624,15 @@ struct XfstestsSourceLockEvidence {
     revision: String,
     check_path: PathBuf,
     check_sha256: String,
+}
+
+#[derive(Debug)]
+struct XfstestsReadinessEvidence {
+    source_revision: String,
+    check_sha256: String,
+    selected_count: usize,
+    selected_cases_sha256: String,
+    selection_policy: String,
 }
 
 impl XfstestsSelection {
@@ -664,23 +674,25 @@ impl XfstestsSelection {
         if cases.is_empty() {
             return Err(format!("{}: selected case list is empty", path.display()));
         }
+        let cases = cases
+            .iter()
+            .map(|case| {
+                case.get("case_id")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| case.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{}: selected case entry missing case_id", path_display))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let case_count = cases.len();
+        let readiness_evidence = XfstestsReadinessEvidence::load_optional(&value, &path)?;
         Ok(Self {
             file: AuthorityFile::load(path)?,
             status,
             source_lock,
-            case_count: cases.len(),
-            cases: cases
-                .iter()
-                .map(|case| {
-                    case.get("case_id")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| case.as_str())
-                        .map(str::to_string)
-                        .ok_or_else(|| {
-                            format!("{}: selected case entry missing case_id", path_display)
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?,
+            case_count,
+            cases,
+            readiness_evidence,
         })
     }
 
@@ -689,14 +701,96 @@ impl XfstestsSelection {
     }
 
     pub(super) fn live_acceptance_blocker(&self) -> Option<String> {
-        if self.status == "acceptance-ready" {
-            None
-        } else {
-            Some(format!(
+        if self.status != "acceptance-ready" {
+            return Some(format!(
                 "xfstests selection status is `{}`; expected `acceptance-ready`",
                 self.status
-            ))
+            ));
         }
+        self.readiness_evidence
+            .as_ref()
+            .ok_or_else(|| {
+                "xfstests selection is acceptance-ready but missing readiness_evidence".to_string()
+            })
+            .and_then(|evidence| evidence.verify(self))
+            .err()
+    }
+}
+
+impl XfstestsReadinessEvidence {
+    fn load_optional(value: &serde_json::Value, path: &Path) -> Result<Option<Self>> {
+        let Some(evidence) = value.get("readiness_evidence") else {
+            return Ok(None);
+        };
+        let evidence = evidence.as_object().ok_or_else(|| {
+            format!(
+                "{}: xfstests readiness_evidence must be an object",
+                path.display()
+            )
+        })?;
+        Ok(Some(Self {
+            source_revision: required_evidence_string(
+                evidence,
+                "source_revision",
+                "xfstests readiness_evidence",
+                path,
+            )?,
+            check_sha256: required_evidence_string(
+                evidence,
+                "check_sha256",
+                "xfstests readiness_evidence",
+                path,
+            )?,
+            selected_count: required_evidence_usize(
+                evidence,
+                "selected_count",
+                "xfstests readiness_evidence",
+                path,
+            )?,
+            selected_cases_sha256: required_evidence_string(
+                evidence,
+                "selected_cases_sha256",
+                "xfstests readiness_evidence",
+                path,
+            )?,
+            selection_policy: required_evidence_string(
+                evidence,
+                "selection_policy",
+                "xfstests readiness_evidence",
+                path,
+            )?,
+        }))
+    }
+
+    fn verify(&self, selection: &XfstestsSelection) -> Result<()> {
+        if self.source_revision != selection.source_lock.revision {
+            return Err(
+                "xfstests readiness_evidence.source_revision does not match source_lock.revision"
+                    .into(),
+            );
+        }
+        if self.check_sha256 != selection.source_lock.check_sha256 {
+            return Err(
+                "xfstests readiness_evidence.check_sha256 does not match source_lock.check_sha256"
+                    .into(),
+            );
+        }
+        if self.selected_count != selection.case_count {
+            return Err(format!(
+                "xfstests readiness_evidence.selected_count {} does not match selected case count {}",
+                self.selected_count, selection.case_count
+            ));
+        }
+        if self.selected_cases_sha256 != xfstests_selected_cases_sha256(&selection.cases) {
+            return Err("xfstests readiness_evidence.selected_cases_sha256 mismatch".into());
+        }
+        if self.selection_policy != "tier1-controlled-production-v1" {
+            return Err(format!(
+                "xfstests readiness_evidence.selection_policy is `{}`; expected `tier1-controlled-production-v1`",
+                self.selection_policy
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -780,6 +874,7 @@ pub(crate) struct CrashCutCatalog {
     pub(super) expanded_cut_count: usize,
     pub(super) families: Vec<CrashCutFamily>,
     pub(super) campaign: Option<CrashCutCampaignPlan>,
+    readiness_evidence: Option<CrashCutReadinessEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -793,6 +888,18 @@ pub(crate) struct CrashCutCampaignPlan {
     pub(super) workload_script: PathBuf,
     workload_script_sha256: String,
     replay_script: PathBuf,
+    replay_script_sha256: String,
+    kill_policy: String,
+    e2fsck_mode: String,
+}
+
+#[derive(Debug)]
+struct CrashCutReadinessEvidence {
+    expanded_cut_count: usize,
+    family_count: usize,
+    phase_marker_count: usize,
+    phase_markers_sha256: String,
+    workload_script_sha256: String,
     replay_script_sha256: String,
     kill_policy: String,
     e2fsck_mode: String,
@@ -869,12 +976,14 @@ impl CrashCutCatalog {
         if campaign.is_some() {
             validate_family_phase_markers(&families, &path)?;
         }
+        let readiness_evidence = CrashCutReadinessEvidence::load_optional(&value, &path)?;
         Ok(Self {
             file: AuthorityFile::load(path)?,
             status,
             expanded_cut_count: expanded_cut_count as usize,
             families,
             campaign,
+            readiness_evidence,
         })
     }
 
@@ -892,7 +1001,13 @@ impl CrashCutCatalog {
         if self.campaign.is_none() {
             return Some("crash-cut catalog is acceptance-ready but missing campaign plan".into());
         }
-        None
+        self.readiness_evidence
+            .as_ref()
+            .ok_or_else(|| {
+                "crash-cut catalog is acceptance-ready but missing readiness_evidence".to_string()
+            })
+            .and_then(|evidence| evidence.verify(self))
+            .err()
     }
 }
 
@@ -929,6 +1044,23 @@ fn validate_family_phase_markers(families: &[CrashCutFamily], path: &Path) -> Re
         }
     }
     Ok(())
+}
+
+pub(super) fn crash_phase_markers_sha256(families: &[CrashCutFamily]) -> Result<String> {
+    let mut lines = Vec::with_capacity(families.len());
+    for family in families {
+        let marker = family.phase_marker.as_deref().ok_or_else(|| {
+            format!(
+                "crash family {} missing phase_marker for phase marker digest",
+                family.id
+            )
+        })?;
+        lines.push(format!("{}={marker}", family.id));
+    }
+    Ok(sha256_tagged_lines(
+        "tx.ext4.crash.phase-markers.v1",
+        &lines,
+    ))
 }
 
 impl CrashCutCampaignPlan {
@@ -971,6 +1103,130 @@ impl CrashCutCampaignPlan {
             kill_policy,
             e2fsck_mode,
         }))
+    }
+}
+
+impl CrashCutReadinessEvidence {
+    fn load_optional(value: &serde_json::Value, path: &Path) -> Result<Option<Self>> {
+        let Some(evidence) = value.get("readiness_evidence") else {
+            return Ok(None);
+        };
+        let evidence = evidence.as_object().ok_or_else(|| {
+            format!(
+                "{}: crash-cut readiness_evidence must be an object",
+                path.display()
+            )
+        })?;
+        Ok(Some(Self {
+            expanded_cut_count: required_evidence_usize(
+                evidence,
+                "expanded_cut_count",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+            family_count: required_evidence_usize(
+                evidence,
+                "family_count",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+            phase_marker_count: required_evidence_usize(
+                evidence,
+                "phase_marker_count",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+            phase_markers_sha256: required_evidence_string(
+                evidence,
+                "phase_markers_sha256",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+            workload_script_sha256: required_evidence_string(
+                evidence,
+                "workload_script_sha256",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+            replay_script_sha256: required_evidence_string(
+                evidence,
+                "replay_script_sha256",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+            kill_policy: required_evidence_string(
+                evidence,
+                "kill_policy",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+            e2fsck_mode: required_evidence_string(
+                evidence,
+                "e2fsck_mode",
+                "crash-cut readiness_evidence",
+                path,
+            )?,
+        }))
+    }
+
+    fn verify(&self, catalog: &CrashCutCatalog) -> Result<()> {
+        let campaign = catalog
+            .campaign
+            .as_ref()
+            .ok_or_else(|| "crash-cut readiness_evidence requires a campaign plan".to_string())?;
+        if self.expanded_cut_count != catalog.expanded_cut_count {
+            return Err(format!(
+                "crash-cut readiness_evidence.expanded_cut_count {} does not match catalog expanded_cut_count {}",
+                self.expanded_cut_count, catalog.expanded_cut_count
+            ));
+        }
+        if self.family_count != catalog.families.len() {
+            return Err(format!(
+                "crash-cut readiness_evidence.family_count {} does not match family count {}",
+                self.family_count,
+                catalog.families.len()
+            ));
+        }
+        let marker_count = catalog
+            .families
+            .iter()
+            .filter(|family| family.phase_marker.is_some())
+            .count();
+        if self.phase_marker_count != marker_count {
+            return Err(format!(
+                "crash-cut readiness_evidence.phase_marker_count {} does not match phase marker count {}",
+                self.phase_marker_count, marker_count
+            ));
+        }
+        let expected_marker_sha = crash_phase_markers_sha256(&catalog.families)?;
+        if self.phase_markers_sha256 != expected_marker_sha {
+            return Err("crash-cut readiness_evidence.phase_markers_sha256 mismatch".into());
+        }
+        if self.workload_script_sha256 != campaign.workload_script_sha256 {
+            return Err(
+                "crash-cut readiness_evidence.workload_script_sha256 does not match campaign artifact"
+                    .into(),
+            );
+        }
+        if self.replay_script_sha256 != campaign.replay_script_sha256 {
+            return Err(
+                "crash-cut readiness_evidence.replay_script_sha256 does not match campaign artifact"
+                    .into(),
+            );
+        }
+        if self.kill_policy != campaign.kill_policy {
+            return Err(
+                "crash-cut readiness_evidence.kill_policy does not match campaign.kill_policy"
+                    .into(),
+            );
+        }
+        if self.e2fsck_mode != campaign.e2fsck_mode {
+            return Err(
+                "crash-cut readiness_evidence.e2fsck_mode does not match campaign.e2fsck_mode"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1052,6 +1308,58 @@ fn hex_string(bytes: [u8; 32]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+pub(super) fn xfstests_selected_cases_sha256(cases: &[String]) -> String {
+    sha256_tagged_lines("tx.ext4.xfstests.selected-cases.v1", cases)
+}
+
+pub(super) fn sha256_tagged_lines(tag: &str, lines: &[String]) -> String {
+    let mut payload = String::new();
+    payload.push_str(tag);
+    payload.push('\n');
+    for line in lines {
+        payload.push_str(line);
+        payload.push('\n');
+    }
+    hex_string(tx_ext4_format::capability::sha256(payload.as_bytes()))
+}
+
+fn required_evidence_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    label: &str,
+    path: &Path,
+) -> Result<String> {
+    let value = object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: missing {label}.{key}", path.display()))?;
+    if key.ends_with("_sha256") && !is_real_sha256(&value) {
+        return Err(format!(
+            "{}: {label}.{key} must be a nonzero 64-byte sha256",
+            path.display()
+        ));
+    }
+    Ok(value)
+}
+
+fn required_evidence_usize(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    label: &str,
+    path: &Path,
+) -> Result<usize> {
+    object
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| format!("{}: missing {label}.{key}", path.display()))
+        .and_then(|raw| {
+            usize::try_from(raw)
+                .map_err(|_| format!("{}: {label}.{key} out of range", path.display()))
+        })
 }
 
 fn run_capture(cwd: &Path, program: &str, args: &[String]) -> Result<(i32, String)> {

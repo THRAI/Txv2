@@ -8,7 +8,7 @@ use super::{
     parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_and_record_command,
     run_crash_cut_campaign, run_live_preflight, run_workspace::RunWorkspace, sha256_file,
     stage_authority_artifacts, tier1_shell_test_args, verify_xfstests_source_lock,
-    write_fault_job_request,
+    write_fault_job_request, xfstests_selected_cases_sha256,
 };
 use crate::target::TxTarget;
 
@@ -569,6 +569,135 @@ fn tier1_live_rejects_acceptance_ready_crash_catalog_without_campaign_plan() {
         .ensure_live_acceptance_ready()
         .expect_err("acceptance-ready crash catalog must be executable");
     assert!(error.contains("crash-cut catalog is acceptance-ready but missing campaign plan"));
+}
+
+#[test]
+fn tier1_live_rejects_acceptance_ready_xfstests_without_readiness_evidence() {
+    let root = temp_root("missing-xfstests-readiness");
+    write_json(
+        &root.join("tools/ext4/tier1/capability-ledger.json"),
+        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        r#"{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"acceptance-ready",
+          "tier":"tier1",
+          "source_lock":{
+            "path":"external/xfstests",
+            "revision":"acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509",
+            "check_sha256":"104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642"
+          },
+          "selected":[{"case_id":"generic/001"}]
+        }"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/crash-cuts.json"),
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"catalog-authority-declared",
+          "expanded_cut_count":1000,
+          "families":[
+            {"id":"D0"},{"id":"D1"},{"id":"D2"},{"id":"D3"},{"id":"D4"},
+            {"id":"D5"},{"id":"D6"},{"id":"D7"},{"id":"D8"},{"id":"D9"},
+            {"id":"D10"},{"id":"D11"},{"id":"D12"}
+          ]
+        }"#,
+    );
+    write_text(
+        &root.join("tools/shell-tests/ext4-tier1.scn"),
+        "# ext4 tier1\n",
+    );
+
+    let error = Tier1Authorities::load(&root)
+        .unwrap()
+        .ensure_live_acceptance_ready()
+        .expect_err("status-only xfstests readiness must fail");
+    assert!(
+        error.contains("xfstests selection is acceptance-ready but missing readiness_evidence")
+    );
+}
+
+#[test]
+fn tier1_live_rejects_acceptance_ready_crash_catalog_without_readiness_evidence() {
+    let root = temp_root("missing-crash-readiness");
+    let cases = vec!["generic/001".to_string()];
+    write_json(
+        &root.join("tools/ext4/tier1/capability-ledger.json"),
+        r#"{"schema":"tx.ext4.capability_ledger.v1"}"#,
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        &format!(
+            r#"{{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"acceptance-ready",
+          "tier":"tier1",
+          "source_lock":{{
+            "path":"external/xfstests",
+            "revision":"acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509",
+            "check_sha256":"104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642"
+          }},
+          "selected":[{{"case_id":"generic/001"}}],
+          "readiness_evidence":{{
+            "source_revision":"acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509",
+            "check_sha256":"104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642",
+            "selected_count":1,
+            "selected_cases_sha256":"{}",
+            "selection_policy":"tier1-controlled-production-v1"
+          }}
+        }}"#,
+            xfstests_selected_cases_sha256(&cases)
+        ),
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &root.join("tools/ext4/tier1/crash-cuts.json"),
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
+          ]
+        }"#,
+    );
+    write_text(
+        &root.join("tools/shell-tests/ext4-tier1.scn"),
+        "# ext4 tier1\n",
+    );
+
+    let error = Tier1Authorities::load(&root)
+        .unwrap()
+        .ensure_live_acceptance_ready()
+        .expect_err("status-only crash readiness must fail");
+    assert!(error.contains("crash-cut catalog is acceptance-ready but missing readiness_evidence"));
 }
 
 #[test]
