@@ -116,6 +116,38 @@ fn tier1_verify_receipt_rejects_missing_build_log_artifact() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_build_log_without_zero_exit() {
+    let root = temp_root("verify-receipt-build-log-exit");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "candidate-full-build-log",
+        "$ cargo xtask full-build --target rv64-qemu --skip-doctor\nexit_code=1\nbuild failed\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("bad build exit must fail");
+    assert!(error.contains("candidate full-build log missing exit_code=0"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_build_log_for_wrong_command() {
+    let root = temp_root("verify-receipt-build-log-wrong-command");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "busybox-ext4-image-build-log",
+        "$ cargo xtask image ext4 --profile busybox --target la64-qemu\nexit_code=0\nok\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("wrong build command must fail");
+    assert!(error.contains(
+        "busybox ext4 image build log missing command `$ cargo xtask image ext4 --profile busybox --target rv64-qemu`"
+    ));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_dirty_role_e2fsck_log() {
     let root = temp_root("verify-receipt-dirty-role-e2fsck-log");
     let _cleanup = TempCleanup(root.clone());

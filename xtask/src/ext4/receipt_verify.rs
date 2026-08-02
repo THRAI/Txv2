@@ -60,6 +60,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
     verify_g0_lint_log_evidence(&artifacts, receipt_path)?;
+    verify_build_log_evidence(&artifacts, receipt_path)?;
     verify_xfstests_source_lock_evidence(&artifacts, receipt_path)?;
     verify_xfstests_log_evidence(receipt_object, &artifacts, receipt_path)?;
     verify_crash_cut_outcome_manifest(&artifacts, receipt_path)?;
@@ -475,6 +476,58 @@ fn verify_g0_lint_log(rule: &str, log: &str, path: &Path) -> Result<()> {
     if !log.lines().any(|line| line.trim() == "exit_code=0") {
         return Err(format!(
             "{}: G0 lint {rule} log missing exit_code=0",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_build_log_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    verify_command_log_artifact(
+        artifacts,
+        "candidate-full-build-log",
+        "$ cargo xtask full-build --target rv64-qemu --skip-doctor",
+        "candidate full-build",
+        path,
+    )?;
+    verify_command_log_artifact(
+        artifacts,
+        "busybox-ext4-image-build-log",
+        "$ cargo xtask image ext4 --profile busybox --target rv64-qemu",
+        "busybox ext4 image build",
+        path,
+    )?;
+    Ok(())
+}
+
+fn verify_command_log_artifact(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    artifact_name: &str,
+    expected_command: &str,
+    label: &str,
+    path: &Path,
+) -> Result<()> {
+    let artifact = artifacts
+        .get(artifact_name)
+        .ok_or_else(|| format!("{}: missing artifact {artifact_name}", path.display()))?;
+    let log = std::fs::read_to_string(&artifact.path)
+        .map_err(|err| format!("failed to read {}: {err}", artifact.path.display()))?;
+    verify_command_log(label, expected_command, &log, &artifact.path)
+}
+
+fn verify_command_log(label: &str, expected_command: &str, log: &str, path: &Path) -> Result<()> {
+    if !log.lines().any(|line| line.trim() == expected_command) {
+        return Err(format!(
+            "{}: {label} log missing command `{expected_command}`",
+            path.display()
+        ));
+    }
+    if !log.lines().any(|line| line.trim() == "exit_code=0") {
+        return Err(format!(
+            "{}: {label} log missing exit_code=0",
             path.display()
         ));
     }
