@@ -1,3 +1,17 @@
+- 2026-08-02 (ext4 Tier 1 artifact manifest binding).
+  Advanced Task 16 receipt integrity without promoting final acceptance.
+  `artifacts.json` now records a sha256 for every registered run artifact, the
+  final/failed receipt binds the artifacts manifest path plus sha256, and the
+  live runner records per-role `e2fsck -fn` logs plus `xfstests.log` as
+  artifacts. This closes a receipt-drift gap: the immutable acceptance receipt
+  can no longer be separated from the concrete logs/manifests it summarizes.
+  Verification passed `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1`, `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`,
+  and the expected fail-closed live preflight
+  `task16-artifact-manifest-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, full fresh 1000-cut QEMU/e2fsck
+  execution, pinned xfstests execution, and the immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 replay serial evidence).
   Advanced Task 16 crash replay evidence without promoting final acceptance.
   Each live crash cut now runs the post-crash `crash-replay.scn` probe with a

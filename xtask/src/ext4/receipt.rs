@@ -8,6 +8,7 @@ pub(crate) struct Tier1AcceptanceReceipt {
     pub schema: String,
     pub candidate: CandidateCommit,
     pub authorities: Tier1Authorities,
+    pub artifact_manifest: ArtifactManifest,
     pub role_images: RoleImages,
     pub crash_cuts: CrashCuts,
     pub e2fsck: E2fsckSummary,
@@ -29,6 +30,12 @@ pub(crate) struct Tier1Authorities {
     pub crash_cut_catalog_sha256: String,
     pub xfstests_selection_sha256: String,
     pub shell_scenario_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ArtifactManifest {
+    pub path: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +128,7 @@ impl Tier1AcceptanceReceipt {
                 xfstests_selection_sha256: authorities.xfstests_selection_sha256,
                 shell_scenario_sha256: authorities.shell_scenario_sha256,
             },
+            artifact_manifest: ArtifactManifest::placeholder(),
             role_images: RoleImages {
                 test: RoleImage {
                     path: "target/ext4/tier1/<run-id>/test.img".into(),
@@ -211,6 +219,7 @@ impl Tier1AcceptanceReceipt {
                 xfstests_selection_sha256: authorities.xfstests_selection_sha256,
                 shell_scenario_sha256: authorities.shell_scenario_sha256,
             },
+            artifact_manifest: ArtifactManifest::placeholder(),
             role_images,
             crash_cuts,
             e2fsck,
@@ -221,12 +230,25 @@ impl Tier1AcceptanceReceipt {
         }
     }
 
+    pub(crate) fn bind_artifact_manifest(&mut self, path: String, sha256: String) {
+        self.artifact_manifest = ArtifactManifest { path, sha256 };
+    }
+
     pub(crate) fn write_json(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
         let text = serde_json::to_string_pretty(self).map_err(|err| err.to_string())?;
         fs::write(path, text).map_err(|err| err.to_string())
+    }
+}
+
+impl ArtifactManifest {
+    fn placeholder() -> Self {
+        Self {
+            path: "target/ext4/tier1/<run-id>/artifacts.json".into(),
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        }
     }
 }
 

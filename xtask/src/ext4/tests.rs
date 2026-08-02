@@ -15,15 +15,30 @@ use crate::target::TxTarget;
 fn run_workspace_finalizes_once_and_cleans_temporary_state() {
     let root = temp_root("finalize");
     let mut run = RunWorkspace::create(&root, "test-run").unwrap();
-    run.record_artifact("scratch", root.join("scratch.img"))
-        .unwrap();
+    let artifact = run.temporary_path_for_test().join("scratch.img");
+    write_text(&artifact, "scratch-image\n");
+    let artifact_sha = sha256_file(&artifact).unwrap();
+    run.record_artifact("scratch", artifact).unwrap();
     let receipt = run.finalize().unwrap();
     assert!(receipt.exists());
     assert!(!run.temporary_path_for_test().exists());
-    assert!(root.join("target/ext4/tier1/test-run").exists());
-    assert!(
-        root.join("target/ext4/tier1/test-run/artifacts.json")
-            .exists()
+    let run_dir = root.join("target/ext4/tier1/test-run");
+    let manifest_path = run_dir.join("artifacts.json");
+    assert!(run_dir.exists());
+    assert!(manifest_path.exists());
+    let artifacts: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(artifacts["artifacts"][0]["name"], "scratch");
+    assert_eq!(artifacts["artifacts"][0]["sha256"], artifact_sha);
+    let receipt_value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&receipt).unwrap()).unwrap();
+    assert_eq!(
+        receipt_value["artifact_manifest"]["path"],
+        manifest_path.display().to_string()
+    );
+    assert_eq!(
+        receipt_value["artifact_manifest"]["sha256"],
+        sha256_file(&manifest_path).unwrap()
     );
 }
 
@@ -62,6 +77,18 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
     .unwrap();
     assert_eq!(artifacts["schema"], "tx.ext4.tier1_artifacts.v1");
     assert_eq!(artifacts["artifacts"][0]["name"], "crash-campaign-plan");
+    assert_eq!(
+        artifacts["artifacts"][0]["sha256"],
+        sha256_file(&root.join("target/ext4/tier1/failed-run/crash-campaign-plan.json")).unwrap()
+    );
+    let receipt: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("target/ext4/tier1/failed-run/failed-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        receipt["artifact_manifest"]["sha256"],
+        sha256_file(&root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap()
+    );
     assert!(!temp.exists());
 }
 

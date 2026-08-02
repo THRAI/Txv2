@@ -136,6 +136,10 @@ fn run_live_tier1(
     ] {
         let (exit_code, output) =
             run_capture(root, &e2fsck, &["-fn".into(), path.display().to_string()])?;
+        let log_path = run.working_dir().join(format!("e2fsck-{role}.log"));
+        fs::write(&log_path, &output)
+            .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
+        run.record_artifact(format!("e2fsck-{role}-log"), log_path)?;
         e2fsck_results.push(receipt::E2fsckImageResult {
             role: role.into(),
             image_sha256: sha256_file(path)?,
@@ -1703,7 +1707,7 @@ fn verify_xfstests_source_lock(
 
 fn run_xfstests_selection(
     root: &Path,
-    run: &run_workspace::RunWorkspace,
+    run: &mut run_workspace::RunWorkspace,
     authorities: &Tier1Authorities,
 ) -> Result<receipt::XfstestsSummary> {
     let xfstests_root = ensure_xfstests_root(root, run, &authorities.selection.source_lock)?;
@@ -1728,6 +1732,7 @@ fn run_xfstests_selection(
     let log_path = run.working_dir().join("xfstests.log");
     fs::write(&log_path, &output)
         .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
+    run.record_artifact("xfstests-log", log_path)?;
     if code != 0 {
         return Err(format!(
             "xfstests selection exited with {code}\n{}",

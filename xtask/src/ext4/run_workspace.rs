@@ -111,13 +111,14 @@ impl RunWorkspace {
 
     pub(crate) fn finalize_with_receipt(
         &mut self,
-        receipt: Tier1AcceptanceReceipt,
+        mut receipt: Tier1AcceptanceReceipt,
     ) -> Result<PathBuf> {
         self.ensure_not_finalized()?;
+        let manifest = self.write_artifacts_manifest(&self.temporary)?;
+        self.bind_artifact_manifest(&mut receipt, &manifest)?;
         receipt
             .write_json(&self.temporary.join("acceptance-receipt.json"))
             .map_err(|err| format!("failed to write final receipt: {err}"))?;
-        self.write_artifacts_manifest(&self.temporary)?;
         if self.final_dir.exists() {
             fs::remove_dir_all(&self.final_dir).map_err(|err| {
                 format!(
@@ -192,14 +193,16 @@ impl RunWorkspace {
             "failed run; final receipt not produced; reason={reason}; artifacts={}",
             self.artifacts.len()
         );
-        let receipt =
+        let mut receipt =
             Tier1AcceptanceReceipt::from_dry_run(&self.run_id, commit, authorities, &[note]);
         let _ = fs::create_dir_all(dir);
-        let _ = self.write_artifacts_manifest(dir);
+        if let Ok(manifest) = self.write_artifacts_manifest(dir) {
+            let _ = self.bind_artifact_manifest(&mut receipt, &manifest);
+        }
         let _ = receipt.write_json(&dir.join("failed-receipt.json"));
     }
 
-    fn write_artifacts_manifest(&self, dir: &Path) -> Result<()> {
+    fn write_artifacts_manifest(&self, dir: &Path) -> Result<PathBuf> {
         let artifacts = self
             .artifacts
             .iter()
@@ -208,12 +211,14 @@ impl RunWorkspace {
                     .strip_prefix(&self.temporary)
                     .map(|relative| self.final_dir.join(relative))
                     .unwrap_or_else(|_| path.clone());
-                serde_json::json!({
+                let sha256 = sha256_file(path)?;
+                Ok(serde_json::json!({
                     "name": name,
-                    "path": stable_path.display().to_string()
-                })
+                    "path": stable_path.display().to_string(),
+                    "sha256": sha256
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let manifest = serde_json::json!({
             "schema": "tx.ext4.tier1_artifacts.v1",
             "run_id": self.run_id,
@@ -221,8 +226,22 @@ impl RunWorkspace {
         });
         let text = serde_json::to_string_pretty(&manifest)
             .map_err(|err| format!("failed to encode artifact manifest: {err}"))?;
-        fs::write(dir.join("artifacts.json"), text)
-            .map_err(|err| format!("failed to write artifact manifest: {err}"))
+        let path = dir.join("artifacts.json");
+        fs::write(&path, text)
+            .map_err(|err| format!("failed to write artifact manifest: {err}"))?;
+        Ok(path)
+    }
+
+    fn bind_artifact_manifest(
+        &self,
+        receipt: &mut Tier1AcceptanceReceipt,
+        manifest_path: &Path,
+    ) -> Result<()> {
+        receipt.bind_artifact_manifest(
+            self.final_dir.join("artifacts.json").display().to_string(),
+            sha256_file(manifest_path)?,
+        );
+        Ok(())
     }
 }
 
@@ -255,4 +274,20 @@ fn git_rev_parse_head() -> Result<String> {
     let commit = String::from_utf8(output.stdout)
         .map_err(|err| format!("git rev-parse HEAD produced invalid utf8: {err}"))?;
     Ok(commit.trim().to_string())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    Ok(hex_string(tx_ext4_format::capability::sha256(&bytes)))
+}
+
+fn hex_string(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
