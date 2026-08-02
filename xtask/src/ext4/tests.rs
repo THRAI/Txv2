@@ -6,8 +6,8 @@ use super::{
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
     CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
     parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_crash_cut_campaign,
-    run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args, verify_xfstests_source_lock,
-    write_fault_job_request,
+    run_workspace::RunWorkspace, sha256_file, tier1_shell_test_args, verify_tier1_receipt,
+    verify_xfstests_source_lock, write_fault_job_request,
 };
 use crate::target::TxTarget;
 
@@ -129,6 +129,27 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         sha256_file(&root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap()
     );
     assert!(!temp.exists());
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_locked_product_evidence() {
+    let root = temp_root("verify-receipt-ok");
+    let receipt = write_acceptance_receipt_fixture(&root);
+
+    verify_tier1_receipt(&receipt).expect("locked product receipt verifies");
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_tampered_artifact() {
+    let root = temp_root("verify-receipt-tampered");
+    let receipt = write_acceptance_receipt_fixture(&root);
+    write_text(
+        &root.join("target/ext4/tier1/accepted-run/crash-cut-0000-replay.img"),
+        "tampered\n",
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("tampered artifact must fail");
+    assert!(error.contains("artifact crash-cut-0000-replay-image sha256 mismatch"));
 }
 
 #[test]
@@ -1219,6 +1240,188 @@ fn write_text(path: &PathBuf, text: &str) {
         fs::create_dir_all(parent).expect("create parent");
     }
     fs::write(path, text).expect("write text fixture");
+}
+
+fn write_acceptance_receipt_fixture(root: &PathBuf) -> PathBuf {
+    let run_dir = root.join("target/ext4/tier1/accepted-run");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    let mut artifacts = Vec::new();
+    let mut e2fsck_images = Vec::new();
+
+    let mut add_artifact = |name: &str, file_name: String, contents: String| {
+        let path = run_dir.join(file_name);
+        write_text(&path, &contents);
+        let sha256 = sha256_file(&path).expect("artifact sha");
+        artifacts.push(serde_json::json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "sha256": sha256
+        }));
+        (path, sha256)
+    };
+
+    let (test_image, test_sha) =
+        add_artifact("test-image", "test.img".into(), "test image\n".into());
+    let (scratch_image, scratch_sha) = add_artifact(
+        "scratch-image",
+        "scratch.img".into(),
+        "scratch image\n".into(),
+    );
+    let (workload_image, workload_sha) = add_artifact(
+        "workload-image",
+        "workload.img".into(),
+        "workload image\n".into(),
+    );
+    for (role, sha256) in [
+        ("test", test_sha.clone()),
+        ("scratch", scratch_sha.clone()),
+        ("workload", workload_sha.clone()),
+    ] {
+        e2fsck_images.push(serde_json::json!({
+            "role": role,
+            "image_sha256": sha256,
+            "exit_code": 0
+        }));
+    }
+
+    add_artifact(
+        "crash-campaign-plan",
+        "crash-campaign-plan.json".into(),
+        "{}\n".into(),
+    );
+    add_artifact(
+        "crash-cut-outcomes",
+        "crash-cut-outcomes.json".into(),
+        "{}\n".into(),
+    );
+    add_artifact(
+        "e2fsck-test-log",
+        "e2fsck-test.log".into(),
+        "test clean\n".into(),
+    );
+    add_artifact(
+        "e2fsck-scratch-log",
+        "e2fsck-scratch.log".into(),
+        "scratch clean\n".into(),
+    );
+    add_artifact(
+        "e2fsck-workload-log",
+        "e2fsck-workload.log".into(),
+        "workload clean\n".into(),
+    );
+    add_artifact(
+        "xfstests-log",
+        "xfstests.log".into(),
+        "Passed all 8 tests\n".into(),
+    );
+
+    for idx in 0..1000 {
+        let cut_id = format!("crash-cut-{idx:04}");
+        let (_path, sha256) = add_artifact(
+            &format!("{cut_id}-replay-image"),
+            format!("{cut_id}-replay.img"),
+            format!("{cut_id} replay image\n"),
+        );
+        e2fsck_images.push(serde_json::json!({
+            "role": cut_id,
+            "image_sha256": sha256,
+            "exit_code": 0
+        }));
+    }
+
+    let artifacts_path = run_dir.join("artifacts.json");
+    write_json(
+        &artifacts_path,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.tier1_artifacts.v1",
+            "run_id": "accepted-run",
+            "artifacts": artifacts
+        }))
+        .expect("artifact manifest json"),
+    );
+    let artifacts_sha = sha256_file(&artifacts_path).expect("artifact manifest sha");
+
+    let receipt_path = run_dir.join("acceptance-receipt.json");
+    write_json(
+        &receipt_path,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.tier1_acceptance_receipt.v1",
+            "candidate": {
+                "commit": "0123456789abcdef0123456789abcdef01234567",
+                "run_id": "accepted-run"
+            },
+            "authorities": {
+                "capability_ledger_sha256": "1".repeat(64),
+                "crash_cut_catalog_sha256": "2".repeat(64),
+                "xfstests_selection_sha256": "3".repeat(64),
+                "shell_scenario_sha256": "4".repeat(64)
+            },
+            "artifact_manifest": {
+                "path": artifacts_path.display().to_string(),
+                "sha256": artifacts_sha
+            },
+            "role_images": {
+                "test": {
+                    "path": test_image.display().to_string(),
+                    "sha256": test_sha
+                },
+                "scratch": {
+                    "path": scratch_image.display().to_string(),
+                    "sha256": scratch_sha
+                },
+                "workload": {
+                    "path": workload_image.display().to_string(),
+                    "sha256": workload_sha
+                }
+            },
+            "crash_cuts": {
+                "completed": 1000,
+                "required": 1000,
+                "families": ["D0","D1","D2","D3","D4","D5","D6","D7","D8","D9","D10","D11","D12"]
+            },
+            "e2fsck": {
+                "immutable_images": e2fsck_images,
+                "failures": 0
+            },
+            "xfstests": {
+                "skipped": 0,
+                "not_run": 0,
+                "passed": 8,
+                "failed": 0
+            },
+            "gates": {
+                "G0": "passed",
+                "G1": "passed",
+                "G2": "passed",
+                "G3": "passed",
+                "G4": "passed",
+                "G5": "passed",
+                "G6": "passed",
+                "G7": "passed"
+            },
+            "planned_actions": ["test fixture"],
+            "notes": ["test fixture"]
+        }))
+        .expect("receipt json"),
+    );
+    let receipt_sha = sha256_file(&receipt_path).expect("receipt sha");
+    write_json(
+        &run_dir.join("receipt-lock.json"),
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.tier1_receipt_lock.v1",
+            "run_id": "accepted-run",
+            "receipt": {
+                "path": receipt_path.display().to_string(),
+                "sha256": receipt_sha
+            },
+            "artifact_manifest": {
+                "path": artifacts_path.display().to_string(),
+                "sha256": artifacts_sha
+            }
+        }))
+        .expect("receipt lock json"),
+    );
+    receipt_path
 }
 
 fn run_git(cwd: &PathBuf, args: &[&str]) {

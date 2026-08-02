@@ -1,3 +1,19 @@
+- 2026-08-02 (ext4 Tier 1 receipt verifier).
+  Advanced Task 16 final acceptance verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now validates a
+  produced receipt without launching QEMU: G0-G7 must all be `passed`,
+  crash-cuts must be 1000/1000, e2fsck and xfstests summaries must be clean,
+  `receipt-lock.json` must match the receipt and artifacts manifest digests,
+  every artifact file sha256 must match `artifacts.json`, and TEST/SCRATCH/
+  WORKLOAD plus every `crash-cut-0000..0999` replay image must be represented
+  in both e2fsck evidence and artifact records. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`,
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight `task16-verify-receipt-preflight-20260802`.
+  Task 16 still needs acceptance-ready authority ledgers, full fresh 1000-cut
+  QEMU/e2fsck execution, pinned xfstests execution, and the verified immutable
+  G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 receipt lock).
   Advanced Task 16 immutable-receipt evidence without promoting final
   acceptance. Final and failed Tier 1 run workspaces now write
