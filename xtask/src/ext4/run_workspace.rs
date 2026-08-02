@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 
 use super::receipt::{Tier1AcceptanceReceipt, Tier1AuthorityInputs, authority_input_summary};
 use crate::Result;
+use crate::util::shell_join;
 
 #[derive(Debug)]
 pub(crate) struct RunWorkspace {
@@ -76,6 +77,18 @@ impl RunWorkspace {
                 destination.display()
             )
         })?;
+        self.record_artifact(name, destination.clone())?;
+        Ok(destination)
+    }
+
+    pub(crate) fn stage_image_clone(
+        &mut self,
+        name: impl Into<String>,
+        source: &Path,
+        file_name: &str,
+    ) -> Result<PathBuf> {
+        let destination = self.temporary.join(file_name);
+        copy_image_cow(source, &destination)?;
         self.record_artifact(name, destination.clone())?;
         Ok(destination)
     }
@@ -297,6 +310,71 @@ impl Drop for RunWorkspace {
         } else {
             self.write_failed_receipt(&self.final_dir);
         }
+    }
+}
+
+pub(super) fn tier1_image_cow_clone_supported(root: &Path) -> bool {
+    let probe_dir = root
+        .join("target")
+        .join("ext4")
+        .join("tier1")
+        .join("preflight")
+        .join(format!(".cow-probe-{}", std::process::id()));
+    let source = probe_dir.join("source.img");
+    let target = probe_dir.join("target.img");
+    let result = (|| -> Result<()> {
+        fs::create_dir_all(&probe_dir)
+            .map_err(|err| format!("failed to create {}: {err}", probe_dir.display()))?;
+        fs::write(&source, [0u8; 4096])
+            .map_err(|err| format!("failed to write {}: {err}", source.display()))?;
+        copy_image_cow(&source, &target)
+    })();
+    let _ = fs::remove_dir_all(&probe_dir);
+    result.is_ok()
+}
+
+fn copy_image_cow(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        return Err(format!("missing image source: {}", source.display()));
+    }
+    if destination.exists() {
+        return Err(format!(
+            "refusing to overwrite existing image clone target: {}",
+            destination.display()
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let args = cow_clone_command_args(source, destination)?;
+    let status = Command::new(&args[0])
+        .args(&args[1..])
+        .status()
+        .map_err(|err| format!("failed to launch {}: {err}", shell_join(&args)))?;
+    if !status.success() {
+        return Err(format!("{} exited with {status}", shell_join(&args)));
+    }
+    Ok(())
+}
+
+fn cow_clone_command_args(source: &Path, destination: &Path) -> Result<Vec<String>> {
+    let source = source.display().to_string();
+    let destination = destination.display().to_string();
+    if cfg!(target_os = "macos") {
+        Ok(vec!["cp".into(), "-c".into(), source, destination])
+    } else if cfg!(target_os = "linux") {
+        Ok(vec![
+            "cp".into(),
+            "--reflink=always".into(),
+            source,
+            destination,
+        ])
+    } else {
+        Err(format!(
+            "CoW image clone is required for Tier 1 image staging on this host OS ({})",
+            std::env::consts::OS
+        ))
     }
 }
 

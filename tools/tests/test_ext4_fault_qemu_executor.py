@@ -70,6 +70,27 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                 with self.assertRaisesRegex(module.FaultQemuExecutorError, "no usable e2fsck command"):
                     module.e2fsck_command()
 
+    def test_image_copy_uses_cow_clone_command(self):
+        module = load_executor_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.img"
+            target = Path(tmp) / "target.img"
+            source.write_bytes(b"image")
+            completed = subprocess.CompletedProcess(
+                args=["cp"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+            with patch.object(module.subprocess, "run", return_value=completed) as run:
+                module.copy_image_cow(source, target)
+
+        command = run.call_args.args[0]
+        self.assertIn("cp", command[0])
+        self.assertIn(str(source), command)
+        self.assertIn(str(target), command)
+        self.assertIn("--reflink=always" if sys.platform.startswith("linux") else "-c", command)
+
     def test_stages_role_images_and_fails_before_fake_crash_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -356,7 +377,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
             runner_program = (
                 "import os, pathlib; "
                 "pathlib.Path(os.environ['TX_EXT4_FAULT_SERIAL_LOG']).write_text(" + repr(marker) + "); "
-                "print(" + repr(marker) + ", flush=True)"
+                "print(" + repr("shell-test: stop needle observed: " + marker) + ", flush=True)"
             )
             plan = {
                 "schema": "tx.ext4.fault_qemu_executor_plan.v1",
@@ -397,6 +418,52 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
         self.assertEqual(crash_bytes, b"scratch-after-cut")
         self.assertFalse(result_exists)
 
+    def test_shell_test_command_requires_stop_needle_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = root / "out" / "write_fsync" / "after-commit" / "0001"
+            job_dir.mkdir(parents=True)
+            marker = "tx-ext4-fault-cut:write_fsync:after-commit"
+            scratch = job_dir / "roles" / "scratch.img"
+            scratch.parent.mkdir()
+            scratch.write_bytes(b"scratch-after-cut")
+            runner_program = (
+                "print(" + repr('  [2] expect "' + marker + '" within 30000 ms') + ", flush=True)"
+            )
+            plan = {
+                "schema": "tx.ext4.fault_qemu_executor_plan.v1",
+                "job": {
+                    "case": "write_fsync",
+                    "cut": "after-commit",
+                    "iteration": 1,
+                    "crash_image": str(job_dir / "crash.img"),
+                    "replay_image": str(job_dir / "replay.img"),
+                },
+                "staged_role_images": {"scratch": str(scratch)},
+                "shell_test_command": [sys.executable, "-c", runner_program],
+                "runner": {
+                    "cwd": str(ROOT),
+                    "serial_log": str(job_dir / "serial.log"),
+                    "cut_marker": marker,
+                    "status": "prepared-not-run",
+                },
+                "hard_kill": {
+                    "required": True,
+                    "status": "not-implemented",
+                    "marker": marker,
+                },
+            }
+            plan_path = job_dir / "executor-plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+            module = load_executor_module()
+            with self.assertRaisesRegex(module.FaultQemuExecutorError, "did not confirm stop needle"):
+                module.execute_prepared_runner(plan_path)
+            executor_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(executor_plan["runner"]["status"], "cut-not-observed")
+        self.assertFalse((job_dir / "crash.img").exists())
+
     def test_shell_test_command_writes_result_after_replay_e2fsck(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -412,7 +479,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
             runner_program = (
                 "import os, pathlib; "
                 "pathlib.Path(os.environ['TX_EXT4_FAULT_SERIAL_LOG']).write_text(" + repr(marker) + "); "
-                "print(" + repr(marker) + ", flush=True)"
+                "print(" + repr("shell-test: stop needle observed: " + marker) + ", flush=True)"
             )
             e2fsck_program = (
                 "import sys; "
@@ -506,7 +573,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
             check_log = job_dir / "e2fsck-fn.log"
             runner_program = (
                 "import os, pathlib; "
-                "print(" + repr(marker) + ", flush=True); "
+                "print(" + repr("shell-test: stop needle observed: " + marker) + ", flush=True); "
                 "print('shell-test: serial log pending', flush=True); "
                 "pathlib.Path(os.environ['TX_EXT4_FAULT_SERIAL_LOG']).write_text("
                 + repr(marker + "\\n")
@@ -575,7 +642,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
             runner_program = (
                 "import os, pathlib; "
                 "pathlib.Path(os.environ['TX_EXT4_FAULT_SERIAL_LOG']).write_text(" + repr(marker) + "); "
-                "print(" + repr(marker) + ", flush=True)"
+                "print(" + repr("shell-test: stop needle observed: " + marker) + ", flush=True)"
             )
             e2fsck_program = "print('fake e2fsck ok')"
             plan = {

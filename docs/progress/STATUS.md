@@ -31510,3 +31510,28 @@
   cross-directory rename/overwrite/orphan/destroy, Task 14 G0 production
   cutover, Task 15 `cargo xtask ext4 tier1`, and Task 16 fresh
   QEMU/e2fsck/xfstests receipt.
+
+- 2026-08-02 (ext4 Task 16 CoW runner and orphan crash blocker).
+  Continued
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  The Tier 1 live runner now stages base/role/fault images with required CoW
+  clones (`cp -c` on macOS, `cp --reflink=always` on Linux) and the live
+  storage preflight accounts for CoW divergent-write budget instead of full
+  ordinary copies. The fault QEMU executor and replay/remount helpers now use
+  CoW image clones, preserve runner output tails, require shell-test stop-needle
+  confirmation, default Tx remount to BusyBox, and add prompt-settle sleeps in
+  the Tier 1 shell scenarios. Focused verification passed
+  `python3 tools/tests/test_ext4_fault_qemu_executor.py` (32),
+  `python3 tools/tests/test_ext4_fault_matrix_runners.py` (8),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (91),
+  `cargo xtask progress validate` (41 records), and `git diff --check`.
+  Product acceptance is still blocked: the fresh live campaign
+  `task16-live-cow-replay-settle-20260802` reached `crash-cut-0010`, then
+  failed because `e2fsck -fn` on the preserved replay image reported deleted
+  inode 21 with zero dtime plus block/inode bitmap differences. A local clone
+  experiment showed Linux RW mount/unmount replay leaves the same e2fsck
+  failure, so the blocker is the remaining open-unlink/orphan lifecycle gap
+  rather than only executor ordering. A later live preflight with CoW accounting
+  also remains storage-blocked on this checkout
+  (`available=9608380416`, `required=10808721408`). No fresh 1000-cut QEMU run,
+  pinned xfstests execution, or verified immutable G0-G7 receipt exists yet.

@@ -6,6 +6,7 @@
 
 wait ":mount:sdcard:ext4:ok" within 90000
 wait "/ # " within 90000
+sleep 250
 
 send "if [ -x /musl/musl/busybox ] || [ -x /musl/busybox ]; then echo tier1-test-role-status:0; else echo tier1-test-role-status:1; fi\n"
 expect "tier1-test-role-status:0" within 10000

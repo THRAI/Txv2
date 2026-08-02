@@ -4,7 +4,7 @@ use std::process::Command;
 
 use super::{
     CrashCutCampaignPlan, CrashCutFamily, Tier1Authorities, XfstestsSourceLock, resolve_repo_path,
-    verify_xfstests_source_lock,
+    run_workspace, verify_xfstests_source_lock,
 };
 use crate::Result;
 use crate::image;
@@ -15,6 +15,7 @@ const XFSTESTS_SOURCE_URL: &str = "https://git.kernel.org/pub/scm/fs/xfs/xfstest
 const DEFAULT_TIER1_EXT4_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const TIER1_ROLE_IMAGE_COPY_COUNT: u64 = 4;
 const TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT: u64 = 8;
+const TIER1_COW_PER_IMAGE_WRITE_BUDGET_BYTES: u64 = 1024 * 1024;
 const TIER1_STORAGE_MIN_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TIER1_STORAGE_MARGIN_DIVISOR: u64 = 20;
 
@@ -25,6 +26,8 @@ pub(super) struct StorageCapacityEstimate {
     pub(super) estimated_image_bytes: u64,
     pub(super) role_image_copy_count: u64,
     pub(super) per_crash_cut_image_copy_count: u64,
+    pub(super) cow_clone_supported: bool,
+    pub(super) cow_per_image_write_budget_bytes: u64,
 }
 
 pub(super) fn run_live_preflight(
@@ -173,6 +176,9 @@ fn write_live_preflight_report(
                 "estimated_image_bytes": estimate.estimated_image_bytes,
                 "role_image_copy_count": estimate.role_image_copy_count,
                 "per_crash_cut_image_copy_count": estimate.per_crash_cut_image_copy_count,
+                "cow_clone_supported": estimate.cow_clone_supported,
+                "cow_per_image_write_budget_bytes": estimate.cow_per_image_write_budget_bytes,
+                "copy_mode": if estimate.cow_clone_supported { "cow-clone-required" } else { "ordinary-copy-estimate" },
             })
         })
         .unwrap_or(serde_json::Value::Null);
@@ -315,6 +321,7 @@ fn collect_storage_capacity_preflight(
         available_bytes,
         authorities.crash_cuts.expanded_cut_count as u64,
         tier1_ext4_image_size_estimate(root),
+        run_workspace::tier1_image_cow_clone_supported(root),
         blockers,
     ))
 }
@@ -323,18 +330,32 @@ pub(super) fn collect_storage_capacity_preflight_for_test(
     available_bytes: u64,
     expanded_cut_count: u64,
     estimated_image_bytes: u64,
+    cow_clone_supported: bool,
     blockers: &mut Vec<String>,
 ) -> StorageCapacityEstimate {
-    let required_bytes =
-        required_live_tier1_workspace_bytes(expanded_cut_count, estimated_image_bytes);
+    let required_bytes = required_live_tier1_workspace_bytes(
+        expanded_cut_count,
+        estimated_image_bytes,
+        cow_clone_supported,
+    );
     let estimate = StorageCapacityEstimate {
         available_bytes,
         required_bytes,
         estimated_image_bytes,
         role_image_copy_count: TIER1_ROLE_IMAGE_COPY_COUNT,
         per_crash_cut_image_copy_count: TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT,
+        cow_clone_supported,
+        cow_per_image_write_budget_bytes: TIER1_COW_PER_IMAGE_WRITE_BUDGET_BYTES,
     };
     if available_bytes < required_bytes {
+        let copy_mode = if cow_clone_supported {
+            format!(
+                "CoW clone image staging, reserving {} bytes of divergent writes per cloned image",
+                TIER1_COW_PER_IMAGE_WRITE_BUDGET_BYTES
+            )
+        } else {
+            "ordinary image copies; CoW clone support was not proven on this host".into()
+        };
         blockers.push(format!(
             "insufficient free space for live Tier 1 crash campaign: available {} bytes, requires at least {} bytes (estimated {} byte ext4 images, {} role/base image copies plus {} image copies per crash cut)",
             available_bytes,
@@ -342,17 +363,28 @@ pub(super) fn collect_storage_capacity_preflight_for_test(
             estimated_image_bytes,
             TIER1_ROLE_IMAGE_COPY_COUNT,
             TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT
-        ));
+        ) + &format!("; copy mode: {copy_mode}"));
     }
     estimate
 }
 
-fn required_live_tier1_workspace_bytes(expanded_cut_count: u64, image_bytes: u64) -> u64 {
+fn required_live_tier1_workspace_bytes(
+    expanded_cut_count: u64,
+    image_bytes: u64,
+    cow_clone_supported: bool,
+) -> u64 {
     let image_copy_count = TIER1_ROLE_IMAGE_COPY_COUNT
         .saturating_add(expanded_cut_count.saturating_mul(TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT));
-    let image_bytes = image_bytes.saturating_mul(image_copy_count);
-    let margin = (image_bytes / TIER1_STORAGE_MARGIN_DIVISOR).max(TIER1_STORAGE_MIN_MARGIN_BYTES);
-    image_bytes.saturating_add(margin)
+    let estimated_bytes = if cow_clone_supported {
+        image_bytes
+            .saturating_mul(TIER1_ROLE_IMAGE_COPY_COUNT)
+            .saturating_add(TIER1_COW_PER_IMAGE_WRITE_BUDGET_BYTES.saturating_mul(image_copy_count))
+    } else {
+        image_bytes.saturating_mul(image_copy_count)
+    };
+    let margin =
+        (estimated_bytes / TIER1_STORAGE_MARGIN_DIVISOR).max(TIER1_STORAGE_MIN_MARGIN_BYTES);
+    estimated_bytes.saturating_add(margin)
 }
 
 fn tier1_ext4_image_size_estimate(root: &Path) -> u64 {

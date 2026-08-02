@@ -70,7 +70,13 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--extra-rv64-ext4") + 1], str(image))
         self.assertEqual(command[command.index("--script") + 1], str(TX_SCRIPT))
         self.assertEqual(command[command.index("--target") + 1], "rv64-qemu")
-        self.assertEqual(command[command.index("--profile") + 1], "alpine")
+        self.assertEqual(command[command.index("--profile") + 1], "busybox")
+
+    def test_tx_remount_script_uses_single_busybox_matrix_device(self):
+        text = TX_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("/dev/block/vda", text)
+        self.assertNotIn("/dev/block/vdb", text)
+        self.assertNotIn("fault-cut.txt", text)
 
     def test_tx_runner_rejects_missing_matrix_image_before_qemu(self):
         result = subprocess.run(

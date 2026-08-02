@@ -63,6 +63,44 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
+def copy_image_cow(source: Path, target: Path) -> None:
+    if not source.is_file():
+        raise FaultQemuExecutorError(f"missing image source: {source}")
+    if target.exists():
+        raise FaultQemuExecutorError(f"refusing to overwrite existing image clone target: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform.startswith("linux"):
+        command = ["cp", "--reflink=always", str(source), str(target)]
+    elif sys.platform == "darwin":
+        command = ["cp", "-c", str(source), str(target)]
+    else:
+        raise FaultQemuExecutorError(
+            f"CoW image clone is required for Tier 1 image staging on this host OS: {sys.platform}"
+        )
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as err:
+        raise FaultQemuExecutorError(f"failed to launch CoW image clone command: {err}") from err
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        if detail:
+            raise FaultQemuExecutorError(
+                f"CoW image clone failed with exit {completed.returncode}: {detail}"
+            )
+        raise FaultQemuExecutorError(f"CoW image clone failed with exit {completed.returncode}")
+
+
+def tail_text(text: str, max_lines: int = 80) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
 def load_request(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FaultQemuExecutorError(f"missing job request: {path}")
@@ -223,32 +261,37 @@ def execute_prepared_runner(plan_path: Path) -> None:
         raise FaultQemuExecutorError(f"runner launch failed: {err}") from err
 
     marker = require_string(runner, "cut_marker")
-    observed = False
     assert process.stdout is not None
-    for line in process.stdout:
-        if marker in line:
-            observed = True
-            break
-
-    if not observed:
-        process.wait()
-        runner["status"] = "cut-not-observed"
-        runner["exit_code"] = process.returncode
-        write_plan(plan_path, plan)
-        raise FaultQemuExecutorError(f"runner exited before cut marker {marker!r}")
-
     if command_source == "shell-test-command":
-        try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            runner["status"] = "shell-test-timeout-after-cut"
-            runner["exit_code"] = process.returncode
+        output, _ = process.communicate()
+        runner["output_tail"] = tail_text(output)
+        runner["exit_code"] = process.returncode
+        stop_line = f"shell-test: stop needle observed: {marker}"
+        if process.returncode != 0:
+            runner["status"] = "shell-test-failed-before-cut"
             write_plan(plan_path, plan)
-            raise FaultQemuExecutorError("shell-test did not exit after observing cut marker")
+            raise FaultQemuExecutorError(
+                f"shell-test exited with {process.returncode} before confirmed stop needle"
+            )
+        if stop_line not in output:
+            runner["status"] = "cut-not-observed"
+            write_plan(plan_path, plan)
+            raise FaultQemuExecutorError(f"shell-test did not confirm stop needle {marker!r}")
         runner["status"] = "exited-after-cut"
     else:
+        observed = False
+        for line in process.stdout:
+            if marker in line:
+                observed = True
+                break
+
+        if not observed:
+            process.wait()
+            runner["status"] = "cut-not-observed"
+            runner["exit_code"] = process.returncode
+            write_plan(plan_path, plan)
+            raise FaultQemuExecutorError(f"runner exited before cut marker {marker!r}")
+
         process.terminate()
         try:
             process.communicate(timeout=5)
@@ -300,7 +343,7 @@ def preserve_crash_and_replay_images(plan: dict[str, Any]) -> None:
         if path.exists():
             raise FaultQemuExecutorError(f"refusing to overwrite existing {label} image: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(scratch, path)
+        copy_image_cow(scratch, path)
     plan["preserved_images"] = {
         "crash": str(crash),
         "replay": str(replay),
@@ -467,7 +510,7 @@ def execute_semantic_oracles(
             result["reason"] = f"refusing to overwrite semantic oracle request: {request_path}"
             return None
         image.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(replay, image)
+        copy_image_cow(replay, image)
         request_path.write_text(
             json.dumps(
                 {
@@ -537,9 +580,6 @@ def execute_replay_matrix(
         if image.exists():
             result["reason"] = f"refusing to overwrite replay matrix image: {image}"
             return None
-        image.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(replay, image)
-        prepared_images.add(image)
 
     executed: list[dict[str, Any]] = []
     for entry in entries:
@@ -551,17 +591,20 @@ def execute_replay_matrix(
             command = matrix_command("TX_EXT4_FAULT_LINUX_REPLAY_COMMAND", result)
             if command is None:
                 return None
+            prepare_replay_matrix_image(replay, image, prepared_images)
             observation = run_matrix_command(command + [str(image)], entry, log, cwd, result)
         elif entry_id == "linux-post-replay-e2fsck":
             args = entry.get("args")
             if args != ["-fn", str(image)]:
                 result["reason"] = "post-replay e2fsck must run -fn against the Linux replay image"
                 return None
+            prepare_replay_matrix_image(replay, image, prepared_images)
             observation = run_matrix_command(e2fsck_command() + args, entry, log, cwd, result)
         elif entry_id == "tx-remount":
             command = matrix_command("TX_EXT4_FAULT_TX_REMOUNT_COMMAND", result)
             if command is None:
                 return None
+            prepare_replay_matrix_image(replay, image, prepared_images)
             observation = run_matrix_command(
                 command
                 + [require_string(job, "case"), require_string(job, "cut"), str(image)],
@@ -577,6 +620,13 @@ def execute_replay_matrix(
             return None
         executed.append(observation)
     return executed
+
+
+def prepare_replay_matrix_image(replay: Path, image: Path, prepared_images: set[Path]) -> None:
+    if image in prepared_images:
+        return
+    copy_image_cow(replay, image)
+    prepared_images.add(image)
 
 
 def preflight_replay_matrix(plan: dict[str, Any]) -> bool:
@@ -870,7 +920,7 @@ def stage_role_images(job_dir: Path, role_images: dict[str, Any]) -> dict[str, s
         if not source.is_file():
             raise FaultQemuExecutorError(f"missing {role.upper()} role image: {source}")
         target = roles_dir / f"{role}.img"
-        shutil.copyfile(source, target)
+        copy_image_cow(source, target)
         staged[role] = str(target)
     return staged
 

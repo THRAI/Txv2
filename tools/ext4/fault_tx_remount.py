@@ -42,7 +42,7 @@ def build_shell_test_command(image: Path, root: Path, env: dict[str, str]) -> li
     if shutil.which(cargo) is None:
         raise TxRemountError(f"missing cargo command: {cargo}")
     target = env.get("TX_EXT4_FAULT_TX_TARGET", "rv64-qemu")
-    profile = env.get("TX_EXT4_FAULT_TX_PROFILE", "alpine")
+    profile = env.get("TX_EXT4_FAULT_TX_PROFILE", "busybox")
     timeout = env.get("TX_EXT4_FAULT_TX_TIMEOUT_MS", "120000")
     if not timeout.isdigit() or int(timeout) <= 0:
         raise TxRemountError("TX_EXT4_FAULT_TX_TIMEOUT_MS must be positive")

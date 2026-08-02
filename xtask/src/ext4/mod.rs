@@ -158,7 +158,6 @@ fn run_live_tier1(
         ],
         "busybox ext4 image build",
     )?;
-
     let base_image_source = root
         .join("target")
         .join("images")
@@ -170,10 +169,10 @@ fn run_live_tier1(
         ));
     }
 
-    let base_image = run.stage_copy("busybox-base-image", &base_image_source, "base.img")?;
-    let test_image = run.stage_copy("test-image", &base_image, "test.img")?;
-    let scratch_image = run.stage_copy("scratch-image", &base_image, "scratch.img")?;
-    let workload_image = run.stage_copy("workload-image", &base_image, "workload.img")?;
+    let base_image = run.stage_image_clone("busybox-base-image", &base_image_source, "base.img")?;
+    let test_image = run.stage_image_clone("test-image", &base_image, "test.img")?;
+    let scratch_image = run.stage_image_clone("scratch-image", &base_image, "scratch.img")?;
+    let workload_image = run.stage_image_clone("workload-image", &base_image, "workload.img")?;
 
     let scenario = root.join("tools/shell-tests/ext4-tier1.scn");
     let guest_matrix_serial = run.working_dir().join("guest-matrix-serial.log");
