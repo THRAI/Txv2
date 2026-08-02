@@ -107,6 +107,14 @@ fn write_acceptance_receipt_fixture(root: &PathBuf) -> PathBuf {
             "replay-serial",
             "e2fsck-log",
             "crash-image",
+            "linux-rw-replay-image",
+            "linux-rw-replay-log",
+            "linux-post-replay-e2fsck-log",
+            "tx-remount-image",
+            "tx-remount-log",
+            "semantic-oracle-request",
+            "semantic-oracle-image",
+            "semantic-oracle-log",
         ] {
             add_artifact(
                 &format!("{cut_id}-{suffix}"),

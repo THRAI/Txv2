@@ -481,6 +481,32 @@ fn tier1_fault_job_request_binds_repository_executor_inputs() {
         value["job"]["checks"][0]["args"][1],
         job.replay_image.display().to_string()
     );
+    assert_eq!(value["job"]["replay_matrix"][0]["id"], "linux-rw-replay");
+    assert_eq!(
+        value["job"]["replay_matrix"][0]["image"],
+        job.linux_replay_image.display().to_string()
+    );
+    assert_eq!(
+        value["job"]["replay_matrix"][1]["args"][1],
+        job.linux_replay_image.display().to_string()
+    );
+    assert_eq!(value["job"]["replay_matrix"][2]["id"], "tx-remount");
+    assert_eq!(
+        value["job"]["replay_matrix"][2]["image"],
+        job.tx_remount_image.display().to_string()
+    );
+    assert_eq!(
+        value["job"]["semantic_oracles"][0]["id"],
+        "debugfs-file-hash-namespace"
+    );
+    assert_eq!(
+        value["job"]["semantic_oracles"][0]["image"],
+        job.semantic_oracle_image.display().to_string()
+    );
+    assert_eq!(
+        value["job"]["semantic_oracles"][0]["expected"]["present"]["/"],
+        serde_json::json!({})
+    );
     assert!(
         fixture
             .run
@@ -534,13 +560,34 @@ fn tier1_fault_job_result_requires_hard_kill_and_e2fsck_exit() {
     let result = root.join("result.json");
     let crash = root.join("crash.img");
     let replay = root.join("replay.img");
+    let linux_replay = root.join("linux-rw-replay.img");
+    let tx_remount = root.join("tx-remount.img");
+    let semantic_oracle = root.join("semantic-oracle.img");
     let serial = root.join("serial.log");
     let log = root.join("e2fsck-fn.log");
+    let linux_log = root.join("linux-rw-replay.log");
+    let linux_e2fsck_log = root.join("linux-post-replay-e2fsck.log");
+    let tx_remount_log = root.join("tx-remount.log");
+    let semantic_log = root.join("semantic-oracle.log");
     write_text(&crash, "crash-image\n");
     write_text(&replay, "replay-image\n");
+    write_text(&linux_replay, "linux-replay-image\n");
+    write_text(&tx_remount, "tx-remount-image\n");
+    write_text(&semantic_oracle, "semantic-oracle-image\n");
     write_text(&serial, "boot...\ntx.ext4.crash.phase.D7\n");
     write_text(&log, "clean\n");
+    write_text(&linux_log, "linux ok\n");
+    write_text(&linux_e2fsck_log, "linux e2fsck ok\n");
+    write_text(&tx_remount_log, "tx remount ok\n");
+    write_text(&semantic_log, "semantic ok\n");
     let log_sha256 = sha256_file(&log).unwrap();
+    let linux_log_sha256 = sha256_file(&linux_log).unwrap();
+    let linux_e2fsck_log_sha256 = sha256_file(&linux_e2fsck_log).unwrap();
+    let tx_remount_log_sha256 = sha256_file(&tx_remount_log).unwrap();
+    let semantic_log_sha256 = sha256_file(&semantic_log).unwrap();
+    let linux_replay_sha256 = sha256_file(&linux_replay).unwrap();
+    let tx_remount_sha256 = sha256_file(&tx_remount).unwrap();
+    let semantic_sha256 = sha256_file(&semantic_oracle).unwrap();
     write_json(
         &result,
         &format!(
@@ -560,11 +607,56 @@ fn tier1_fault_job_result_requires_hard_kill_and_e2fsck_exit() {
               "log_sha256":"{log_sha256}",
               "exit_code":0
             }}
+          ],
+          "replay_matrix":[
+            {{
+              "id":"linux-rw-replay",
+              "image":"{linux_replay}",
+              "log":"{linux_log}",
+              "log_sha256":"{linux_log_sha256}",
+              "image_sha256":"{linux_replay_sha256}",
+              "exit_code":0
+            }},
+            {{
+              "id":"linux-post-replay-e2fsck",
+              "image":"{linux_replay}",
+              "args":["-fn","{linux_replay}"],
+              "log":"{linux_e2fsck_log}",
+              "log_sha256":"{linux_e2fsck_log_sha256}",
+              "image_sha256":"{linux_replay_sha256}",
+              "exit_code":0
+            }},
+            {{
+              "id":"tx-remount",
+              "image":"{tx_remount}",
+              "log":"{tx_remount_log}",
+              "log_sha256":"{tx_remount_log_sha256}",
+              "image_sha256":"{tx_remount_sha256}",
+              "exit_code":0
+            }}
+          ],
+          "semantic_oracles":[
+            {{
+              "id":"debugfs-file-hash-namespace",
+              "image":"{semantic_oracle}",
+              "log":"{semantic_log}",
+              "expected":{{"present":{{"/":{{}}}}}},
+              "log_sha256":"{semantic_log_sha256}",
+              "image_sha256":"{semantic_sha256}",
+              "exit_code":0
+            }}
           ]
         }}"#,
             plan_sha = "a".repeat(64),
             replay = replay.display(),
             log = log.display(),
+            linux_replay = linux_replay.display(),
+            linux_log = linux_log.display(),
+            linux_e2fsck_log = linux_e2fsck_log.display(),
+            tx_remount = tx_remount.display(),
+            tx_remount_log = tx_remount_log.display(),
+            semantic_oracle = semantic_oracle.display(),
+            semantic_log = semantic_log.display(),
         ),
     );
     let parsed = parse_fault_job_result(
@@ -620,6 +712,61 @@ fn tier1_fault_job_result_requires_hard_kill_and_e2fsck_exit() {
     )
     .expect_err("hard kill is required");
     assert!(error.contains("hard_kill_observed is not true"));
+}
+
+#[test]
+fn tier1_fault_job_result_requires_replay_matrix_and_semantic_oracle() {
+    let root = temp_root("fault-job-result-missing-matrix");
+    let result = root.join("result.json");
+    let crash = root.join("crash.img");
+    let replay = root.join("replay.img");
+    let serial = root.join("serial.log");
+    let log = root.join("e2fsck-fn.log");
+    write_text(&crash, "crash-image\n");
+    write_text(&replay, "replay-image\n");
+    write_text(&serial, "boot...\ntx.ext4.crash.phase.D7\n");
+    write_text(&log, "clean\n");
+    let log_sha256 = sha256_file(&log).unwrap();
+    write_json(
+        &result,
+        &format!(
+            r#"{{
+          "schema":"tx.ext4.fault_job_result.v1",
+          "campaign_plan_sha256":"{plan_sha}",
+          "case":"D7",
+          "cut":"crash-cut-0007",
+          "hard_kill_observed":true,
+          "replay_attempted":true,
+          "e2fsck_exit":0,
+          "e2fsck_checks":[
+            {{
+              "tool":"e2fsck",
+              "args":["-fn","{replay}"],
+              "log":"{log}",
+              "log_sha256":"{log_sha256}",
+              "exit_code":0
+            }}
+          ]
+        }}"#,
+            plan_sha = "a".repeat(64),
+            replay = replay.display(),
+            log = log.display(),
+        ),
+    );
+
+    let error = parse_fault_job_result(
+        &result,
+        "D7",
+        "crash-cut-0007",
+        &"a".repeat(64),
+        &crash,
+        &replay,
+        &serial,
+        "tx.ext4.crash.phase.D7",
+        &log,
+    )
+    .expect_err("matrix evidence is required");
+    assert!(error.contains("missing replay_matrix"));
 }
 
 #[test]

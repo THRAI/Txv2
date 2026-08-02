@@ -21,6 +21,8 @@ class TxRemountError(Exception):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("case", nargs="?")
+    parser.add_argument("cut", nargs="?")
     parser.add_argument("image", type=Path)
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[2]

@@ -333,9 +333,17 @@ pub(crate) struct FaultJobPaths {
     pub(crate) executor_plan_path: PathBuf,
     pub(crate) crash_image: PathBuf,
     pub(crate) replay_image: PathBuf,
+    pub(crate) linux_replay_image: PathBuf,
+    pub(crate) tx_remount_image: PathBuf,
     pub(crate) serial_log: PathBuf,
     pub(crate) replay_serial_log: PathBuf,
     pub(crate) e2fsck_log: PathBuf,
+    pub(crate) linux_rw_replay_log: PathBuf,
+    pub(crate) linux_post_replay_e2fsck_log: PathBuf,
+    pub(crate) tx_remount_log: PathBuf,
+    pub(crate) semantic_oracle_request: PathBuf,
+    pub(crate) semantic_oracle_image: PathBuf,
+    pub(crate) semantic_oracle_log: PathBuf,
 }
 
 #[derive(Debug)]
@@ -361,11 +369,19 @@ pub(crate) fn write_fault_job_request(
     let request_path = job_dir.join("job-request.json");
     let crash_image = job_dir.join("crash.img");
     let replay_image = job_dir.join("replay.img");
+    let linux_replay_image = job_dir.join("linux-rw-replay.img");
+    let tx_remount_image = job_dir.join("tx-remount.img");
     let result_path = job_dir.join("result.json");
     let executor_plan_path = job_dir.join("executor-plan.json");
     let e2fsck_log = job_dir.join("e2fsck-fn.log");
+    let linux_rw_replay_log = job_dir.join("linux-rw-replay.log");
+    let linux_post_replay_e2fsck_log = job_dir.join("linux-post-replay-e2fsck.log");
+    let tx_remount_log = job_dir.join("tx-remount.log");
     let serial_log = job_dir.join("serial.log");
     let replay_serial_log = job_dir.join("replay-serial.log");
+    let semantic_oracle_request = job_dir.join("semantic-oracle-01-request.json");
+    let semantic_oracle_image = job_dir.join("semantic-oracle.img");
+    let semantic_oracle_log = job_dir.join("semantic-oracle.log");
     let manifest = serde_json::json!({
         "schema": "tx.ext4.fault_job_request.v1",
         "campaign_plan_sha256": sha256_file(campaign_manifest)?,
@@ -381,6 +397,36 @@ pub(crate) fn write_fault_job_request(
                     "tool": "e2fsck",
                     "args": ["-fn", replay_image.display().to_string()],
                     "log": e2fsck_log.display().to_string()
+                }
+            ],
+            "replay_matrix": [
+                {
+                    "id": "linux-rw-replay",
+                    "image": linux_replay_image.display().to_string(),
+                    "log": linux_rw_replay_log.display().to_string()
+                },
+                {
+                    "id": "linux-post-replay-e2fsck",
+                    "image": linux_replay_image.display().to_string(),
+                    "args": ["-fn", linux_replay_image.display().to_string()],
+                    "log": linux_post_replay_e2fsck_log.display().to_string()
+                },
+                {
+                    "id": "tx-remount",
+                    "image": tx_remount_image.display().to_string(),
+                    "log": tx_remount_log.display().to_string()
+                }
+            ],
+            "semantic_oracles": [
+                {
+                    "id": "debugfs-file-hash-namespace",
+                    "image": semantic_oracle_image.display().to_string(),
+                    "log": semantic_oracle_log.display().to_string(),
+                    "expected": {
+                        "present": {
+                            "/": {}
+                        }
+                    }
                 }
             ]
         },
@@ -407,9 +453,17 @@ pub(crate) fn write_fault_job_request(
         executor_plan_path,
         crash_image,
         replay_image,
+        linux_replay_image,
+        tx_remount_image,
         serial_log,
         replay_serial_log,
         e2fsck_log,
+        linux_rw_replay_log,
+        linux_post_replay_e2fsck_log,
+        tx_remount_log,
+        semantic_oracle_request,
+        semantic_oracle_image,
+        semantic_oracle_log,
     })
 }
 
@@ -425,6 +479,17 @@ fn record_existing_fault_job_artifacts(
         ("e2fsck-log", &job.e2fsck_log),
         ("crash-image", &job.crash_image),
         ("replay-image", &job.replay_image),
+        ("linux-rw-replay-image", &job.linux_replay_image),
+        ("linux-rw-replay-log", &job.linux_rw_replay_log),
+        (
+            "linux-post-replay-e2fsck-log",
+            &job.linux_post_replay_e2fsck_log,
+        ),
+        ("tx-remount-image", &job.tx_remount_image),
+        ("tx-remount-log", &job.tx_remount_log),
+        ("semantic-oracle-request", &job.semantic_oracle_request),
+        ("semantic-oracle-image", &job.semantic_oracle_image),
+        ("semantic-oracle-log", &job.semantic_oracle_log),
     ] {
         if path.is_file() {
             run.record_artifact(format!("{cut_id}-{suffix}"), path.clone())?;
@@ -649,7 +714,255 @@ pub(crate) fn parse_fault_job_result(
             replay_image.display()
         ));
     }
+    verify_replay_matrix_result(path, &value, replay_image)?;
+    verify_semantic_oracle_result(path, &value, replay_image)?;
     Ok(FaultJobResult { e2fsck_exit_code })
+}
+
+fn verify_replay_matrix_result(
+    path: &Path,
+    value: &serde_json::Value,
+    replay_image: &Path,
+) -> Result<()> {
+    let job_dir = replay_image
+        .parent()
+        .ok_or_else(|| format!("{}: replay image has no parent", path.display()))?;
+    let linux_image = job_dir.join("linux-rw-replay.img");
+    let tx_image = job_dir.join("tx-remount.img");
+    let expected = [
+        (
+            "linux-rw-replay",
+            &linux_image,
+            None,
+            job_dir.join("linux-rw-replay.log"),
+        ),
+        (
+            "linux-post-replay-e2fsck",
+            &linux_image,
+            Some(vec!["-fn".to_string(), linux_image.display().to_string()]),
+            job_dir.join("linux-post-replay-e2fsck.log"),
+        ),
+        (
+            "tx-remount",
+            &tx_image,
+            None,
+            job_dir.join("tx-remount.log"),
+        ),
+    ];
+    let entries = value
+        .get("replay_matrix")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing replay_matrix", path.display()))?;
+    if entries.len() != expected.len() {
+        return Err(format!(
+            "{}: replay_matrix has {}, expected {}",
+            path.display(),
+            entries.len(),
+            expected.len()
+        ));
+    }
+    for (entry, (expected_id, expected_image, expected_args, expected_log)) in
+        entries.iter().zip(expected)
+    {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| format!("{}: replay_matrix entry must be an object", path.display()))?;
+        verify_observation_entry(
+            path,
+            object,
+            "replay_matrix",
+            expected_id,
+            expected_image,
+            &expected_log,
+        )?;
+        match expected_args {
+            Some(expected_args) => {
+                let args = object
+                    .get("args")
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| {
+                        format!(
+                            "{}: replay_matrix {expected_id} missing args",
+                            path.display()
+                        )
+                    })?
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            format!(
+                                "{}: replay_matrix {expected_id} args must be strings",
+                                path.display()
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if args != expected_args {
+                    return Err(format!(
+                        "{}: replay_matrix {expected_id} args mismatch",
+                        path.display()
+                    ));
+                }
+            }
+            None => {
+                if object.contains_key("args") {
+                    return Err(format!(
+                        "{}: replay_matrix {expected_id} must not declare args",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_semantic_oracle_result(
+    path: &Path,
+    value: &serde_json::Value,
+    replay_image: &Path,
+) -> Result<()> {
+    let job_dir = replay_image
+        .parent()
+        .ok_or_else(|| format!("{}: replay image has no parent", path.display()))?;
+    let entries = value
+        .get("semantic_oracles")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("{}: missing semantic_oracles", path.display()))?;
+    if entries.len() != 1 {
+        return Err(format!(
+            "{}: semantic_oracles has {}, expected 1",
+            path.display(),
+            entries.len()
+        ));
+    }
+    let object = entries[0].as_object().ok_or_else(|| {
+        format!(
+            "{}: semantic_oracles entry must be an object",
+            path.display()
+        )
+    })?;
+    verify_observation_entry(
+        path,
+        object,
+        "semantic_oracles",
+        "debugfs-file-hash-namespace",
+        &job_dir.join("semantic-oracle.img"),
+        &job_dir.join("semantic-oracle.log"),
+    )?;
+    let expected = object.get("expected").ok_or_else(|| {
+        format!(
+            "{}: semantic_oracles debugfs-file-hash-namespace missing expected",
+            path.display()
+        )
+    })?;
+    if expected
+        != &serde_json::json!({
+            "present": {
+                "/": {}
+            }
+        })
+    {
+        return Err(format!(
+            "{}: semantic_oracles debugfs-file-hash-namespace expected mismatch",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_observation_entry(
+    path: &Path,
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    expected_id: &str,
+    expected_image: &Path,
+    expected_log: &Path,
+) -> Result<()> {
+    if object.get("id").and_then(|value| value.as_str()) != Some(expected_id) {
+        return Err(format!(
+            "{}: {field} entry id mismatch, expected {expected_id}",
+            path.display()
+        ));
+    }
+    if object.get("image").and_then(|value| value.as_str())
+        != Some(expected_image.display().to_string().as_str())
+    {
+        return Err(format!(
+            "{}: {field} {expected_id} image mismatch",
+            path.display()
+        ));
+    }
+    if object.get("log").and_then(|value| value.as_str())
+        != Some(expected_log.display().to_string().as_str())
+    {
+        return Err(format!(
+            "{}: {field} {expected_id} log mismatch",
+            path.display()
+        ));
+    }
+    if object.get("exit_code").and_then(|value| value.as_i64()) != Some(0) {
+        return Err(format!(
+            "{}: {field} {expected_id} exit_code must be 0",
+            path.display()
+        ));
+    }
+    let log_sha256 = object
+        .get("log_sha256")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            format!(
+                "{}: {field} {expected_id} missing log_sha256",
+                path.display()
+            )
+        })?;
+    if !is_real_sha256(log_sha256) {
+        return Err(format!(
+            "{}: {field} {expected_id} log_sha256 is not a real sha256",
+            path.display()
+        ));
+    }
+    if !expected_log.is_file() {
+        return Err(format!(
+            "{}: {field} {expected_id} log is missing: {}",
+            path.display(),
+            expected_log.display()
+        ));
+    }
+    if sha256_file(expected_log)? != log_sha256 {
+        return Err(format!(
+            "{}: {field} {expected_id} log sha256 mismatch",
+            path.display()
+        ));
+    }
+    let image_sha256 = object
+        .get("image_sha256")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            format!(
+                "{}: {field} {expected_id} missing image_sha256",
+                path.display()
+            )
+        })?;
+    if !is_real_sha256(image_sha256) {
+        return Err(format!(
+            "{}: {field} {expected_id} image_sha256 is not a real sha256",
+            path.display()
+        ));
+    }
+    if !expected_image.is_file() {
+        return Err(format!(
+            "{}: {field} {expected_id} image is missing: {}",
+            path.display(),
+            expected_image.display()
+        ));
+    }
+    if sha256_file(expected_image)? != image_sha256 {
+        return Err(format!(
+            "{}: {field} {expected_id} image sha256 mismatch",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn write_crash_cut_outcome_manifest(

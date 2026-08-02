@@ -988,6 +988,10 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
             manifest["semantic_oracles"][0]["log_sha256"],
             hashlib.sha256(b"semantic ok\n").hexdigest(),
         )
+        self.assertEqual(
+            manifest["semantic_oracles"][0]["image_sha256"],
+            hashlib.sha256(b"replay").hexdigest(),
+        )
 
     def test_matrix_preflight_blocks_before_primary_fault_runner(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1211,6 +1215,8 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
         ])
         self.assertEqual(result["campaign_plan_sha256"], "b" * 64)
         self.assertEqual([entry["exit_code"] for entry in result["replay_matrix"]], [0, 0, 0])
+        self.assertEqual(result["replay_matrix"][0]["image_sha256"], hashlib.sha256(b"replay").hexdigest())
+        self.assertEqual(result["replay_matrix"][2]["image_sha256"], hashlib.sha256(b"replay").hexdigest())
         self.assertEqual(linux_replay_bytes, b"replay")
         self.assertEqual(tx_remount_bytes, b"replay")
 

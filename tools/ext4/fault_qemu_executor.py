@@ -504,6 +504,7 @@ def execute_semantic_oracles(
             return None
         observation = dict(entry)
         observation["log_sha256"] = hashlib.sha256(log.read_bytes()).hexdigest()
+        observation["image_sha256"] = hashlib.sha256(image.read_bytes()).hexdigest()
         observation["exit_code"] = 0
         observations.append(observation)
         prepared_images.add(image)
@@ -771,6 +772,11 @@ def run_matrix_command(
     observation = dict(entry)
     observation["log_sha256"] = hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest()
     observation["exit_code"] = completed.returncode
+    image = Path(require_string(entry, "image"))
+    if not image.is_file():
+        result["reason"] = f"replay/remount matrix image is missing after run: {image}"
+        return None
+    observation["image_sha256"] = hashlib.sha256(image.read_bytes()).hexdigest()
     if completed.returncode != 0:
         result["reason"] = f"replay/remount matrix entry failed: {entry.get('id')}"
         return None

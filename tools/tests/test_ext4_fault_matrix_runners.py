@@ -65,6 +65,25 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing replay matrix image", result.stderr)
 
+    def test_tx_runner_accepts_executor_case_cut_image_shape(self):
+        result = subprocess.run(
+            [
+                "python3",
+                str(TX_RUNNER),
+                "D7",
+                "crash-cut-0007",
+                str(ROOT / "target" / "missing-remount.img"),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing replay matrix image", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

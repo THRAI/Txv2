@@ -388,6 +388,14 @@ fn verify_required_crash_cut_artifacts(
             "e2fsck-log",
             "crash-image",
             "replay-image",
+            "linux-rw-replay-image",
+            "linux-rw-replay-log",
+            "linux-post-replay-e2fsck-log",
+            "tx-remount-image",
+            "tx-remount-log",
+            "semantic-oracle-request",
+            "semantic-oracle-image",
+            "semantic-oracle-log",
         ] {
             let name = format!("{cut_id}-{suffix}");
             if !artifacts.contains_key(&name) {

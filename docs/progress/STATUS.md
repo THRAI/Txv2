@@ -1,3 +1,23 @@
+- 2026-08-02 (ext4 Tier 1 replay/oracle evidence binding).
+  Advanced Task 16 crash evidence hardening without promoting final acceptance.
+  Per-cut fault job requests now declare the repository-owned replay/remount
+  matrix (`linux-rw-replay`, `linux-post-replay-e2fsck`, `tx-remount`) plus a
+  debugfs semantic oracle over a copied replay image. The fault executor records
+  image sha256 values for matrix/oracle observations, `fault_tx_remount.py`
+  accepts the executor's `case cut image` invocation shape, the Rust
+  fault-result parser rejects manifests missing these observations, and the
+  receipt verifier requires the corresponding per-cut artifacts in addition to
+  the existing job/result/serial/e2fsck/crash/replay package. Verification
+  passed `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`
+  (43), `python3 tools/tests/test_ext4_fault_qemu_executor.py` (29),
+  `python3 tools/tests/test_ext4_fault_matrix_runners.py` (5),
+  `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`, and the expected
+  fail-closed live preflight
+  `task16-replay-matrix-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 per-cut receipt evidence).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now requires every
