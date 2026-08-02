@@ -1,3 +1,20 @@
+- 2026-08-03 (ext4 Task16 live preflight report accuracy).
+  Advanced Task 16 live-readiness evidence without claiming final acceptance.
+  The live preflight report now records `xfstests_source_prepared=true` when
+  an existing pinned `external/xfstests` checkout verifies successfully, even
+  when `--materialize-xfstests` was not requested. This removes a misleading
+  false value from blocker reports. Fresh verification passed the three G0
+  lints (`ext4-lifecycle-ownership`, `ext4-no-direct-home-write`, and
+  `ext4-durability-flags`, all 0 findings), focused xtask live-preflight
+  tests (5), focused storage-preflight tests (2), and a fresh live preflight
+  report at `target/ext4/tier1/preflight/task16-current-20260803005057.json`.
+  That report shows xfstests source prepared, selected cases verified, and
+  Linux replay ready; the only remaining live-preflight blocker is local
+  storage capacity: available `7825383424` bytes versus required
+  `10808721408` bytes for the CoW 1000-cut campaign. Task 16 still needs
+  enough live-run storage, the full fresh 1000-cut QEMU/replay/e2fsck
+  campaign, pinned xfstests execution, and a verified immutable G0-G7 receipt.
+
 - 2026-08-03 (ext4 Task16 orphan singleton cleanup probe).
   Fixed the live D10 blocker found in `task16-live-cow-replay-settle-20260802`
   without promoting final acceptance. Classic orphan planning now records

@@ -58,6 +58,9 @@ pub(super) fn run_live_preflight(
     }
     let xfstests_selected_cases_verified =
         collect_xfstests_preflight(root, authorities, &mut blockers);
+    if xfstests_selected_cases_verified {
+        xfstests_source_prepared = true;
+    }
     let linux_rw_replay_ready = collect_linux_replay_preflight(root, &mut blockers);
     let storage_capacity = collect_storage_capacity_preflight(root, authorities, &mut blockers);
     if let Some(report_path) = report_path {

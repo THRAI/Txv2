@@ -470,6 +470,66 @@ fn tier1_live_preflight_materialize_verifies_existing_pinned_source() {
 }
 
 #[test]
+fn tier1_live_preflight_reports_existing_pinned_source_without_materialize() {
+    let root = temp_root("preflight-existing-source-report");
+    write_tier1_authority_fixture(&root);
+    let xfstests = root.join("external/xfstests");
+    fs::create_dir_all(&xfstests).unwrap();
+    write_text(&xfstests.join("check"), "#!/bin/sh\nexit 0\n");
+    write_text(&xfstests.join("tests/generic/001"), "#!/bin/sh\nexit 0\n");
+    run_git(&xfstests, &["init"]);
+    run_git(&xfstests, &["add", "check", "tests/generic/001"]);
+    run_git(
+        &xfstests,
+        &[
+            "commit",
+            "-m",
+            "pin check",
+            "--author",
+            "Tx Test <tx@example.invalid>",
+        ],
+    );
+    let revision = git_output(&xfstests, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let check_sha256 = sha256_file(&xfstests.join("check")).unwrap();
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        &format!(
+            r#"{{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"selection-authority-declared",
+          "tier":"tier1",
+          "source_lock":{{
+            "path":"external/xfstests",
+            "revision":"{revision}",
+            "check_sha256":"{check_sha256}"
+          }},
+          "selected":[{{"case_id":"generic/001"}}]
+        }}"#
+        ),
+    );
+    let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
+    let report = root.join("target/ext4/tier1/preflight/existing-source.json");
+
+    let error = run_live_preflight(
+        &root,
+        "existing-source-run",
+        Some(&report),
+        false,
+        &authorities,
+    )
+    .expect_err("placeholder authorities still block");
+
+    assert!(!error.contains("pinned xfstests source is missing"));
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(value["preflight"]["materialize_xfstests_requested"], false);
+    assert_eq!(value["preflight"]["xfstests_source_prepared"], true);
+    assert_eq!(value["preflight"]["xfstests_selected_cases_verified"], true);
+}
+
+#[test]
 fn tier1_live_preflight_rejects_missing_selected_xfstests_case() {
     let root = temp_root("preflight-missing-selected-case");
     write_tier1_authority_fixture(&root);
