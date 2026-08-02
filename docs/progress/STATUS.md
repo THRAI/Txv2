@@ -1,3 +1,22 @@
+- 2026-08-02 (ext4 Tier 1 executor preflight contract).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. The fault QEMU executor now records `replay_matrix_preflight`
+  command entries with `command_source`, and `cargo xtask ext4 tier1
+  --verify-receipt PATH` now requires each final per-cut executor plan to show
+  replay preflight `status=ready` with repository-default Linux replay and Tx
+  remount runners plus e2fsck coverage. It also requires semantic-oracle
+  preflight `status=ready` with the repository-default semantic oracle command,
+  rejecting environment override drift in a final receipt. Verification passed
+  `python3 tools/tests/test_ext4_fault_qemu_executor.py` (29),
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify -- --test-threads=1`
+  (32), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`
+  (75), scoped rustfmt, `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run`,
+  `git diff --check`, and the expected fail-closed live preflight
+  `task16-preflight-contract-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 executor-plan contract binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now reconstructs

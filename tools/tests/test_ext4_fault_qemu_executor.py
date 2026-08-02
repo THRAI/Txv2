@@ -1074,6 +1074,16 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                 self.assertTrue(module.preflight_replay_matrix(plan))
 
         self.assertEqual(plan["replay_matrix_preflight"]["status"], "ready")
+        self.assertEqual(
+            plan["replay_matrix_preflight"]["commands"],
+            [
+                {
+                    "id": "tx-remount",
+                    "command_source": "repository-default",
+                    "command": [str(runner)],
+                }
+            ],
+        )
 
     def test_matrix_preflight_blocks_repository_linux_default_off_linux(self):
         module = load_executor_module()

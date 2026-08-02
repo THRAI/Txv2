@@ -1455,6 +1455,7 @@ fn verify_crash_cut_executor_plan(
 
     verify_executor_plan_preserved_images(plan, plan_job, executor_plan)?;
     verify_executor_plan_executed_checks(plan, result_path, executor_plan)?;
+    verify_executor_plan_preflights(plan, executor_plan)?;
 
     let result = required_json_object(plan, "result", executor_plan)?;
     require_field_value(
@@ -1623,6 +1624,84 @@ fn verify_executor_plan_executed_checks(
     if actual != expected {
         return Err(format!(
             "{}: executor plan executed_checks mismatch",
+            executor_plan.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_executor_plan_preflights(
+    plan: &serde_json::Map<String, serde_json::Value>,
+    executor_plan: &Path,
+) -> Result<()> {
+    let replay = required_json_object(plan, "replay_matrix_preflight", executor_plan)?;
+    require_field_value(replay, "status", "ready", executor_plan)?;
+    let commands = require_non_empty_array(replay, "commands", executor_plan)?;
+    let repo_root = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current repository directory: {err}"))?;
+    let expected = [
+        (
+            "linux-rw-replay",
+            Some(repo_root.join("tools/ext4/fault_linux_rw_replay.py")),
+            "repository-default",
+        ),
+        ("linux-post-replay-e2fsck", None, "e2fsck"),
+        (
+            "tx-remount",
+            Some(repo_root.join("tools/ext4/fault_tx_remount.py")),
+            "repository-default",
+        ),
+    ];
+    if commands.len() != expected.len() {
+        return Err(format!(
+            "{}: executor plan replay_matrix_preflight commands has {}, expected {}",
+            executor_plan.display(),
+            commands.len(),
+            expected.len()
+        ));
+    }
+    for (entry, (expected_id, expected_command, expected_source)) in commands.iter().zip(expected) {
+        let entry = entry.as_object().ok_or_else(|| {
+            format!(
+                "{}: executor plan replay_matrix_preflight command must be an object",
+                executor_plan.display()
+            )
+        })?;
+        require_field_value(entry, "id", expected_id, executor_plan)?;
+        require_field_value(entry, "command_source", expected_source, executor_plan)?;
+        let command = required_json_string_array(entry, "command", executor_plan)?;
+        if command.is_empty() {
+            return Err(format!(
+                "{}: executor plan replay_matrix_preflight command is empty",
+                executor_plan.display()
+            ));
+        }
+        if let Some(expected_command) = expected_command {
+            if command != vec![expected_command.display().to_string()] {
+                return Err(format!(
+                    "{}: executor plan replay_matrix_preflight {expected_id} command mismatch",
+                    executor_plan.display()
+                ));
+            }
+        }
+    }
+
+    let semantic = required_json_object(plan, "semantic_oracle_preflight", executor_plan)?;
+    require_field_value(semantic, "status", "ready", executor_plan)?;
+    require_field_value(
+        semantic,
+        "command_source",
+        "repository-default",
+        executor_plan,
+    )?;
+    let expected_semantic = repo_root
+        .join("tools/ext4/fault_semantic_oracle.py")
+        .display()
+        .to_string();
+    let command = required_json_string_array(semantic, "command", executor_plan)?;
+    if command != vec![expected_semantic] {
+        return Err(format!(
+            "{}: executor plan semantic_oracle_preflight command mismatch",
             executor_plan.display()
         ));
     }

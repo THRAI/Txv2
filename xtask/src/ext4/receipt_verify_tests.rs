@@ -501,6 +501,49 @@ fn tier1_verify_receipt_rejects_executor_plan_executed_checks_mismatch() {
     assert!(error.contains("executor plan executed_checks mismatch"));
 }
 
+#[test]
+fn tier1_verify_receipt_rejects_executor_plan_replay_preflight_mismatch() {
+    let root = temp_root("verify-receipt-executor-plan-replay-preflight");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["replay_matrix_preflight"]["commands"][0]["command_source"] =
+        "environment-override".into();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("replay preflight drift must fail");
+    assert!(error.contains("command_source must be `repository-default`"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_executor_plan_semantic_preflight_mismatch() {
+    let root = temp_root("verify-receipt-executor-plan-semantic-preflight");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["semantic_oracle_preflight"]["command_source"] = "environment-override".into();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("semantic preflight drift must fail");
+    assert!(error.contains("command_source must be `repository-default`"));
+}
+
 struct TempCleanup(PathBuf);
 
 impl Drop for TempCleanup {
@@ -614,6 +657,7 @@ expect "tier1-detach-status:0" within 30000
 
 fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOptions) -> PathBuf {
     let run_dir = root.join("target/ext4/tier1/accepted-run");
+    let repo_root = std::env::current_dir().expect("current repo dir");
     fs::create_dir_all(&run_dir).expect("create run dir");
     let mut artifacts = Vec::new();
     let mut e2fsck_images = Vec::new();
@@ -979,6 +1023,31 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                 "hard_kill": {
                     "required": true,
                     "status": "observed-by-shell-test"
+                },
+                "replay_matrix_preflight": {
+                    "status": "ready",
+                    "commands": [
+                        {
+                            "id": "linux-rw-replay",
+                            "command_source": "repository-default",
+                            "command": [repo_root.join("tools/ext4/fault_linux_rw_replay.py").display().to_string()]
+                        },
+                        {
+                            "id": "linux-post-replay-e2fsck",
+                            "command_source": "e2fsck",
+                            "command": ["e2fsck"]
+                        },
+                        {
+                            "id": "tx-remount",
+                            "command_source": "repository-default",
+                            "command": [repo_root.join("tools/ext4/fault_tx_remount.py").display().to_string()]
+                        }
+                    ]
+                },
+                "semantic_oracle_preflight": {
+                    "status": "ready",
+                    "command_source": "repository-default",
+                    "command": [repo_root.join("tools/ext4/fault_semantic_oracle.py").display().to_string()]
                 },
                 "preserved_images": {
                     "crash": crash_image.display().to_string(),

@@ -599,6 +599,7 @@ def preflight_replay_matrix(plan: dict[str, Any]) -> bool:
         preflight["reason"] = result["reason"]
         return False
 
+    commands: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
             result["reason"] = "replay/remount matrix entry is invalid"
@@ -626,8 +627,16 @@ def preflight_replay_matrix(plan: dict[str, Any]) -> bool:
             preflight["status"] = "blocked"
             preflight["reason"] = result["reason"]
             return False
+        commands.append(
+            {
+                "id": entry_id,
+                "command_source": replay_matrix_command_source(entry_id),
+                "command": command,
+            }
+        )
 
     preflight["status"] = "ready"
+    preflight["commands"] = commands
     return True
 
 
@@ -668,6 +677,14 @@ def preflight_semantic_oracles(plan: dict[str, Any]) -> bool:
     preflight["command_source"] = command_source
     preflight["command"] = command
     return True
+
+
+def replay_matrix_command_source(entry_id: str) -> str:
+    if entry_id in ("linux-rw-replay", "tx-remount"):
+        return "repository-default"
+    if entry_id == "linux-post-replay-e2fsck":
+        return "e2fsck"
+    return "unknown"
 
 
 def command_available(command: list[str]) -> bool:
