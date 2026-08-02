@@ -320,6 +320,24 @@ fn tier1_parse_accepts_live_preflight_mode() {
 }
 
 #[test]
+fn tier1_parse_rejects_preflight_report_without_live_preflight() {
+    let root = temp_root("preflight-report-without-live");
+    write_tier1_authority_fixture(&root);
+
+    let error = parse_tier1_args(
+        &root,
+        &[
+            "tier1".into(),
+            "--preflight-report".into(),
+            "target/ext4/tier1/preflight/report.json".into(),
+        ],
+    )
+    .expect_err("preflight report only applies to live preflight");
+
+    assert!(error.contains("--preflight-report requires --preflight-live"));
+}
+
+#[test]
 fn tier1_parse_rejects_dry_run_with_live_preflight() {
     let root = temp_root("preflight-live-exclusive");
     write_tier1_authority_fixture(&root);
@@ -343,12 +361,45 @@ fn tier1_live_preflight_reports_later_blockers_with_placeholder_authorities() {
     write_tier1_authority_fixture(&root);
     let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
 
-    let error =
-        run_live_preflight(&root, &authorities).expect_err("placeholder preflight must fail");
+    let error = run_live_preflight(&root, "preflight-placeholder", None, &authorities)
+        .expect_err("placeholder preflight must fail");
 
     assert!(error.contains("xfstests selection status is `selection-authority-declared`"));
     assert!(error.contains("crash-cut catalog status is `catalog-authority-declared`"));
     assert!(error.contains("pinned xfstests source is missing"));
+}
+
+#[test]
+fn tier1_live_preflight_writes_durable_blocker_report() {
+    let root = temp_root("preflight-live-report");
+    write_tier1_authority_fixture(&root);
+    let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
+    let report = root.join("target/ext4/tier1/preflight/report.json");
+
+    let error = run_live_preflight(&root, "report-run", Some(&report), &authorities)
+        .expect_err("placeholder preflight must fail");
+
+    assert!(error.contains("pinned xfstests source is missing"));
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(value["schema"], "tx.ext4.tier1_live_preflight.v1");
+    assert_eq!(value["run_id"], "report-run");
+    assert_eq!(value["result"]["ready"], false);
+    assert_eq!(value["result"]["acceptance_receipt_generated"], false);
+    assert_eq!(
+        value["authorities"]["xfstests_selection"]["status"],
+        "selection-authority-declared"
+    );
+    assert!(
+        value["result"]["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap()
+                .contains("pinned xfstests source is missing"))
+    );
 }
 
 #[test]

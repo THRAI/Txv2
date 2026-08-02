@@ -1,3 +1,20 @@
+- 2026-08-02 (ext4 Tier 1 preflight report artifact).
+  Advanced Task 16 live readiness auditing without promoting final acceptance.
+  `cargo xtask ext4 tier1 --preflight-live` now accepts
+  `--preflight-report PATH`, which writes a durable
+  `tx.ext4.tier1_live_preflight.v1` JSON report with run id, host identity,
+  authority paths/hashes/statuses, blocker list, and
+  `acceptance_receipt_generated=false`. The report is written even when the
+  preflight fails, so Linux/root readiness can be compared across hosts without
+  minting a Tier 1 receipt. Verification passed focused parse/preflight tests,
+  `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1` (81),
+  `CARGO_INCREMENTAL=0 cargo xtask --help | rg "ext4 tier1"`, and an expected
+  failing report run at
+  `target/ext4/tier1/preflight/task16-preflight-report-20260802.json` showing
+  four blockers. Task 16 still needs acceptance-ready authorities, full fresh
+  1000-cut QEMU/e2fsck evidence, pinned xfstests execution, and the verified
+  immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 live preflight readiness).
   Advanced Task 16 execution readiness without promoting final acceptance.
   `cargo xtask ext4 tier1 --preflight-live` now checks live prerequisites

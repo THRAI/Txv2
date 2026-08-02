@@ -446,6 +446,8 @@
         "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_parse -- --test-threads=1",
         "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_live_preflight -- --test-threads=1",
         "CARGO_INCREMENTAL=0 cargo xtask --help | rg \"ext4 tier1\"",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-preflight-report-20260802 --preflight-report target/ext4/tier1/preflight/task16-preflight-report-20260802.json",
+        "jq '{schema, run_id, ready: .result.ready, blocker_count: .result.blocker_count, receipt: .result.acceptance_receipt_generated, xfstests_status: .authorities.xfstests_selection.status, crash_status: .authorities.crash_cut_catalog.status}' target/ext4/tier1/preflight/task16-preflight-report-20260802.json",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-live-preflight-default-gate-20260802"
       ],
@@ -490,7 +492,8 @@
     "2026-08-02 close/dup3 visibility flush unblocked the previous `--group data,execute-from-scratch` QEMU failure, and a fresh wider QEMU run with `--group data,setattr,namespace,orphan,execute-from-scratch` passed 5 groups with 0 failures; do not promote Tier 1 until the remaining production cutover, FUA/recovery, live runner, crash-cut, e2fsck, xfstests, and immutable receipt gates close.",
     "Task 14 G0 lints now pass in the current checkout and the former `namespace.rs`/`pager.rs` direct-home-write allowlist has been retired, but production cutover still lacks FUA/recovery product gates and the final live Tier 1 acceptance evidence.",
     "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
-    "The public `cargo xtask ext4 tier1` command exists, verifies the manifest-pinned xfstests source lock, parses xfstests output fail-closed, refuses to synthesize crash-cut completion or unconditional passed gates, and now routes per-cut fault jobs through the repository executor with bound request/result/log/image evidence. Live execution still correctly fails closed while xfstests/crash authorities remain placeholder statuses; no full 1000-cut run, pinned xfstests execution, or immutable G0-G7 receipt has been produced."
+    "The public `cargo xtask ext4 tier1` command exists, verifies the manifest-pinned xfstests source lock, parses xfstests output fail-closed, refuses to synthesize crash-cut completion or unconditional passed gates, and now routes per-cut fault jobs through the repository executor with bound request/result/log/image evidence. Live execution still correctly fails closed while xfstests/crash authorities remain placeholder statuses; no full 1000-cut run, pinned xfstests execution, or immutable G0-G7 receipt has been produced.",
+    "2026-08-02 preflight-report slice: `cargo xtask ext4 tier1 --preflight-live --preflight-report PATH` writes a durable `tx.ext4.tier1_live_preflight.v1` blocker report with authority hashes/statuses, host identity, blockers, and `acceptance_receipt_generated=false` without creating a run workspace or receipt. The current macOS report remains blocked on placeholder authorities, missing local `external/xfstests`, and Linux/root replay requirements."
   ],
   "handoff": {
     "needed": false,

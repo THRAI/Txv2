@@ -54,7 +54,12 @@ fn tier1(root: &Path, args: &[String]) -> Result<()> {
         return Ok(());
     }
     if invocation.preflight_live {
-        return run_live_preflight(root, &invocation.authorities);
+        return run_live_preflight(
+            root,
+            &invocation.run_id,
+            invocation.preflight_report.as_deref(),
+            &invocation.authorities,
+        );
     }
     invocation.authorities.ensure_live_acceptance_ready()?;
 
@@ -299,6 +304,7 @@ struct Tier1Invocation {
     run_id: String,
     dry_run: bool,
     preflight_live: bool,
+    preflight_report: Option<PathBuf>,
     authorities: Tier1Authorities,
 }
 
@@ -377,13 +383,25 @@ impl Tier1Invocation {
     }
 }
 
-fn run_live_preflight(root: &Path, authorities: &Tier1Authorities) -> Result<()> {
+fn run_live_preflight(
+    root: &Path,
+    run_id: &str,
+    report_path: Option<&Path>,
+    authorities: &Tier1Authorities,
+) -> Result<()> {
     let mut blockers = Vec::new();
     println!("ext4 tier1: live-preflight");
     collect_authority_preflight(authorities, &mut blockers);
     collect_tool_preflight(root, authorities, &mut blockers);
     collect_xfstests_preflight(root, authorities, &mut blockers);
     collect_linux_replay_preflight(&mut blockers);
+    if let Some(report_path) = report_path {
+        write_live_preflight_report(root, run_id, authorities, &blockers, report_path)?;
+        println!(
+            "ext4 tier1: live-preflight report {}",
+            report_path.display()
+        );
+    }
     if blockers.is_empty() {
         println!("ext4 tier1: live-preflight ok");
         Ok(())
@@ -396,6 +414,71 @@ fn run_live_preflight(root: &Path, authorities: &Tier1Authorities) -> Result<()>
             blockers.join("; ")
         ))
     }
+}
+
+fn write_live_preflight_report(
+    root: &Path,
+    run_id: &str,
+    authorities: &Tier1Authorities,
+    blockers: &[String],
+    report_path: &Path,
+) -> Result<()> {
+    let path = resolve_repo_path(root, report_path.to_path_buf());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let generated_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let value = serde_json::json!({
+        "schema": "tx.ext4.tier1_live_preflight.v1",
+        "run_id": run_id,
+        "generated_unix_ms": generated_unix_ms,
+        "host": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "authorities": {
+            "capability_ledger": {
+                "path": authorities.capability.path.display().to_string(),
+                "sha256": authorities.capability.sha256,
+            },
+            "xfstests_selection": {
+                "path": authorities.selection.file.path.display().to_string(),
+                "sha256": authorities.selection.sha256(),
+                "status": authorities.selection.status,
+                "selected_count": authorities.selection.case_count,
+                "source_lock": {
+                    "path": authorities.selection.source_lock.path.display().to_string(),
+                    "revision": authorities.selection.source_lock.revision,
+                    "check_sha256": authorities.selection.source_lock.check_sha256,
+                },
+            },
+            "crash_cut_catalog": {
+                "path": authorities.crash_cuts.file.path.display().to_string(),
+                "sha256": authorities.crash_cuts.sha256(),
+                "status": authorities.crash_cuts.status,
+                "expanded_cut_count": authorities.crash_cuts.expanded_cut_count,
+                "campaign_declared": authorities.crash_cuts.campaign.is_some(),
+            },
+            "shell_scenario": {
+                "path": authorities.shell_scenario.path.display().to_string(),
+                "sha256": authorities.shell_scenario.sha256,
+            },
+        },
+        "result": {
+            "ready": blockers.is_empty(),
+            "blocker_count": blockers.len(),
+            "blockers": blockers,
+            "acceptance_receipt_generated": false,
+        },
+    });
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|err| format!("failed to encode live preflight report: {err}"))?;
+    fs::write(&path, text + "\n")
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 fn collect_authority_preflight(authorities: &Tier1Authorities, blockers: &mut Vec<String>) {
@@ -628,6 +711,15 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
         match args[idx].as_str() {
             "--dry-run" => idx += 1,
             "--preflight-live" => idx += 1,
+            "--preflight-report" => {
+                let Some(value) = args.get(idx + 1) else {
+                    return Err("option --preflight-report needs a value".into());
+                };
+                if value.starts_with("--") {
+                    return Err("option --preflight-report needs a value".into());
+                }
+                idx += 2;
+            }
             "--run-id" => {
                 let Some(value) = args.get(idx + 1) else {
                     return Err("option --run-id needs a value".into());
@@ -650,12 +742,19 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
     if dry_run && preflight_live {
         return Err("ext4 tier1 accepts only one of --dry-run or --preflight-live".into());
     }
+    let preflight_report = optional_option_value(args, "--preflight-report")
+        .map(PathBuf::from)
+        .map(|path| resolve_repo_path(root, path));
+    if preflight_report.is_some() && !preflight_live {
+        return Err("ext4 tier1 --preflight-report requires --preflight-live".into());
+    }
     let run_id = optional_option_value(args, "--run-id").unwrap_or_else(|| "tier1-dry-run".into());
     let authorities = Tier1Authorities::load(root)?;
     Ok(Tier1Invocation {
         run_id,
         dry_run,
         preflight_live,
+        preflight_report,
         authorities,
     })
 }
