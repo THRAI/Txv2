@@ -7,9 +7,25 @@ use super::{
     verify_xfstests_source_lock,
 };
 use crate::Result;
+use crate::image;
+use crate::target::TxTarget;
 use crate::util::{command_exists, command_or_candidates, run_cmd_owned_in};
 
 const XFSTESTS_SOURCE_URL: &str = "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git";
+const DEFAULT_TIER1_EXT4_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+const TIER1_ROLE_IMAGE_COPY_COUNT: u64 = 4;
+const TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT: u64 = 8;
+const TIER1_STORAGE_MIN_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const TIER1_STORAGE_MARGIN_DIVISOR: u64 = 20;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StorageCapacityEstimate {
+    pub(super) available_bytes: u64,
+    pub(super) required_bytes: u64,
+    pub(super) estimated_image_bytes: u64,
+    pub(super) role_image_copy_count: u64,
+    pub(super) per_crash_cut_image_copy_count: u64,
+}
 
 pub(super) fn run_live_preflight(
     root: &Path,
@@ -40,6 +56,7 @@ pub(super) fn run_live_preflight(
     let xfstests_selected_cases_verified =
         collect_xfstests_preflight(root, authorities, &mut blockers);
     let linux_rw_replay_ready = collect_linux_replay_preflight(root, &mut blockers);
+    let storage_capacity = collect_storage_capacity_preflight(root, authorities, &mut blockers);
     if let Some(report_path) = report_path {
         write_live_preflight_report(
             root,
@@ -51,6 +68,7 @@ pub(super) fn run_live_preflight(
             xfstests_source_prepared,
             xfstests_selected_cases_verified,
             linux_rw_replay_ready,
+            storage_capacity,
         )?;
         println!(
             "ext4 tier1: live-preflight report {}",
@@ -136,6 +154,7 @@ fn write_live_preflight_report(
     xfstests_source_prepared: bool,
     xfstests_selected_cases_verified: bool,
     linux_rw_replay_ready: bool,
+    storage_capacity: Option<StorageCapacityEstimate>,
 ) -> Result<()> {
     let path = resolve_repo_path(root, report_path.to_path_buf());
     if let Some(parent) = path.parent() {
@@ -146,6 +165,17 @@ fn write_live_preflight_report(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
+    let storage_capacity = storage_capacity
+        .map(|estimate| {
+            serde_json::json!({
+                "available_bytes": estimate.available_bytes,
+                "required_bytes": estimate.required_bytes,
+                "estimated_image_bytes": estimate.estimated_image_bytes,
+                "role_image_copy_count": estimate.role_image_copy_count,
+                "per_crash_cut_image_copy_count": estimate.per_crash_cut_image_copy_count,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
     let value = serde_json::json!({
         "schema": "tx.ext4.tier1_live_preflight.v1",
         "run_id": run_id,
@@ -187,6 +217,7 @@ fn write_live_preflight_report(
             "xfstests_source_prepared": xfstests_source_prepared,
             "xfstests_selected_cases_verified": xfstests_selected_cases_verified,
             "linux_rw_replay_ready": linux_rw_replay_ready,
+            "storage_capacity": storage_capacity,
         },
         "result": {
             "ready": blockers.is_empty(),
@@ -264,6 +295,113 @@ fn collect_tool_preflight(root: &Path, authorities: &Tier1Authorities, blockers:
             blockers.push(err);
         }
     }
+}
+
+fn collect_storage_capacity_preflight(
+    root: &Path,
+    authorities: &Tier1Authorities,
+    blockers: &mut Vec<String>,
+) -> Option<StorageCapacityEstimate> {
+    let available_bytes = match available_storage_bytes(root) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            blockers.push(format!(
+                "failed to inspect free space for live Tier 1 execution: {err}"
+            ));
+            return None;
+        }
+    };
+    Some(collect_storage_capacity_preflight_for_test(
+        available_bytes,
+        authorities.crash_cuts.expanded_cut_count as u64,
+        tier1_ext4_image_size_estimate(root),
+        blockers,
+    ))
+}
+
+pub(super) fn collect_storage_capacity_preflight_for_test(
+    available_bytes: u64,
+    expanded_cut_count: u64,
+    estimated_image_bytes: u64,
+    blockers: &mut Vec<String>,
+) -> StorageCapacityEstimate {
+    let required_bytes =
+        required_live_tier1_workspace_bytes(expanded_cut_count, estimated_image_bytes);
+    let estimate = StorageCapacityEstimate {
+        available_bytes,
+        required_bytes,
+        estimated_image_bytes,
+        role_image_copy_count: TIER1_ROLE_IMAGE_COPY_COUNT,
+        per_crash_cut_image_copy_count: TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT,
+    };
+    if available_bytes < required_bytes {
+        blockers.push(format!(
+            "insufficient free space for live Tier 1 crash campaign: available {} bytes, requires at least {} bytes (estimated {} byte ext4 images, {} role/base image copies plus {} image copies per crash cut)",
+            available_bytes,
+            required_bytes,
+            estimated_image_bytes,
+            TIER1_ROLE_IMAGE_COPY_COUNT,
+            TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT
+        ));
+    }
+    estimate
+}
+
+fn required_live_tier1_workspace_bytes(expanded_cut_count: u64, image_bytes: u64) -> u64 {
+    let image_copy_count = TIER1_ROLE_IMAGE_COPY_COUNT
+        .saturating_add(expanded_cut_count.saturating_mul(TIER1_PER_CRASH_CUT_IMAGE_COPY_COUNT));
+    let image_bytes = image_bytes.saturating_mul(image_copy_count);
+    let margin = (image_bytes / TIER1_STORAGE_MARGIN_DIVISOR).max(TIER1_STORAGE_MIN_MARGIN_BYTES);
+    image_bytes.saturating_add(margin)
+}
+
+fn tier1_ext4_image_size_estimate(root: &Path) -> u64 {
+    let built_image = root
+        .join("target/images")
+        .join(image::busybox_root_ext4_name(TxTarget::Rv64Qemu));
+    fs::metadata(built_image)
+        .map(|metadata| metadata.len())
+        .unwrap_or(DEFAULT_TIER1_EXT4_IMAGE_BYTES)
+}
+
+fn available_storage_bytes(path: &Path) -> Result<u64> {
+    let output = Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .map_err(|err| format!("failed to run df -Pk {}: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "df -Pk {} failed with status {}",
+            path.display(),
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .skip(1)
+        .next()
+        .ok_or_else(|| format!("df -Pk {} produced no data rows", path.display()))?;
+    let available_kib = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| {
+            format!(
+                "df -Pk {} output is missing Available column",
+                path.display()
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|err| {
+            format!(
+                "failed to parse df Available column for {}: {err}",
+                path.display()
+            )
+        })?;
+    available_kib
+        .checked_mul(1024)
+        .ok_or_else(|| format!("df Available column overflow for {}", path.display()))
 }
 
 fn collect_xfstests_preflight(

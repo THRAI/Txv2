@@ -1,3 +1,20 @@
+- 2026-08-02 (ext4 Tier 1 authority admission and storage-capacity gate).
+  Advanced Task 16 live admission without claiming final acceptance.
+  `tools/ext4/tier1/xfstests-selection.json` and
+  `tools/ext4/tier1/crash-cuts.json` are now `acceptance-ready` authority
+  inputs with reproducible `readiness_evidence` for the pinned xfstests
+  checkout, selected-case digest, crash D0-D12 phase-marker digest, and
+  workload/replay script hashes. `cargo xtask ext4 tier1 --preflight-live`
+  no longer blocks on authority status. The same preflight now estimates
+  live-run storage from the current ordinary-copy artifact plan: 4 base/role
+  image copies plus 8 image copies per crash cut, using 64MiB ext4 images and
+  a margin. On this checkout it fails before QEMU with exactly one blocker:
+  available `13775298560` bytes versus required `563996314828` bytes in
+  `target/ext4/tier1/preflight/task16-storage-capacity-20260802.json`.
+  Task 16 still needs either a large-enough runner or clone/reflink/sparse
+  image-copy support, then a full fresh 1000-cut QEMU/e2fsck campaign, pinned
+  xfstests execution, and a verified immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 authority readiness evidence gate).
   Hardened Task 16 authority promotion without promoting final acceptance.
   `acceptance-ready` xfstests and crash-cut authority ledgers now require

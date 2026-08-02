@@ -1,6 +1,6 @@
 {
   "schema": "tx.ext4.crash_cut_catalog.v1",
-  "status": "catalog-authority-declared",
+  "status": "acceptance-ready",
   "expanded_cut_count": 1000,
   "campaign": {
     "workload_script": "tools/ext4/tier1/crash-workload.scn",
@@ -33,5 +33,15 @@
       "applies_to": ["destroy", "truncate"]
     }
   ],
-  "notes": "Deterministic crash-cut catalog placeholder for the Tier 1 runner. The real acceptance campaign expands this catalog into the immutable per-cut campaign plan."
+  "readiness_evidence": {
+    "expanded_cut_count": 1000,
+    "family_count": 13,
+    "phase_marker_count": 13,
+    "phase_markers_sha256": "7b440cbef725d936ec6ebcada178cc2a2397e6311e332f46368af23678e19ade",
+    "workload_script_sha256": "bdf202b55042fcbdae56ff52c8fb96c616b27cd9484475816a666f1f06996d5d",
+    "replay_script_sha256": "22b3a00b29ee511163b2be4b3f0682c912ff1c625e87861a186c12b332f4af67",
+    "kill_policy": "deterministic-phase-marker-v1",
+    "e2fsck_mode": "immutable-copy"
+  },
+  "notes": "Deterministic crash-cut catalog authority for live runner admission. This ledger is input authority only; final acceptance still requires same-run expansion, QEMU crash/replay execution, immutable e2fsck evidence, artifact hashing, and receipt verification."
 }

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::live_preflight::collect_storage_capacity_preflight_for_test;
 use super::{
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
     CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
@@ -513,6 +514,24 @@ fn tier1_live_preflight_rejects_missing_selected_xfstests_case() {
         .expect_err("missing selected case must block preflight");
 
     assert!(error.contains("selected xfstests case generic/001 is missing"));
+}
+
+#[test]
+fn tier1_live_storage_preflight_blocks_when_capacity_is_below_campaign_floor() {
+    let mut blockers = Vec::new();
+
+    let estimate = collect_storage_capacity_preflight_for_test(
+        13 * 1024 * 1024 * 1024,
+        1000,
+        64 * 1024 * 1024,
+        &mut blockers,
+    );
+
+    assert_eq!(estimate.available_bytes, 13 * 1024 * 1024 * 1024);
+    assert!(estimate.required_bytes > 500 * 1024 * 1024 * 1024);
+    assert_eq!(blockers.len(), 1);
+    assert!(blockers[0].contains("insufficient free space for live Tier 1 crash campaign"));
+    assert!(blockers[0].contains("requires at least"));
 }
 
 #[test]
