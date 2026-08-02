@@ -421,8 +421,9 @@ fn tier1_live_preflight_materialize_verifies_existing_pinned_source() {
     let xfstests = root.join("external/xfstests");
     fs::create_dir_all(&xfstests).unwrap();
     write_text(&xfstests.join("check"), "#!/bin/sh\nexit 0\n");
+    write_text(&xfstests.join("tests/generic/001"), "#!/bin/sh\nexit 0\n");
     run_git(&xfstests, &["init"]);
-    run_git(&xfstests, &["add", "check"]);
+    run_git(&xfstests, &["add", "check", "tests/generic/001"]);
     run_git(
         &xfstests,
         &[
@@ -464,6 +465,54 @@ fn tier1_live_preflight_materialize_verifies_existing_pinned_source() {
         serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(value["preflight"]["materialize_xfstests_requested"], true);
     assert_eq!(value["preflight"]["xfstests_source_prepared"], true);
+    assert_eq!(value["preflight"]["xfstests_selected_cases_verified"], true);
+}
+
+#[test]
+fn tier1_live_preflight_rejects_missing_selected_xfstests_case() {
+    let root = temp_root("preflight-missing-selected-case");
+    write_tier1_authority_fixture(&root);
+    let xfstests = root.join("external/xfstests");
+    fs::create_dir_all(&xfstests).unwrap();
+    write_text(&xfstests.join("check"), "#!/bin/sh\nexit 0\n");
+    run_git(&xfstests, &["init"]);
+    run_git(&xfstests, &["add", "check"]);
+    run_git(
+        &xfstests,
+        &[
+            "commit",
+            "-m",
+            "pin check",
+            "--author",
+            "Tx Test <tx@example.invalid>",
+        ],
+    );
+    let revision = git_output(&xfstests, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let check_sha256 = sha256_file(&xfstests.join("check")).unwrap();
+    write_json(
+        &root.join("tools/ext4/tier1/xfstests-selection.json"),
+        &format!(
+            r#"{{
+          "schema":"tx.ext4.xfstests_selection_ledger.v1",
+          "status":"selection-authority-declared",
+          "tier":"tier1",
+          "source_lock":{{
+            "path":"external/xfstests",
+            "revision":"{revision}",
+            "check_sha256":"{check_sha256}"
+          }},
+          "selected":[{{"case_id":"generic/001"}}]
+        }}"#
+        ),
+    );
+    let authorities = Tier1Authorities::load(&root).expect("load authority fixture");
+
+    let error = run_live_preflight(&root, "missing-case-run", None, false, &authorities)
+        .expect_err("missing selected case must block preflight");
+
+    assert!(error.contains("selected xfstests case generic/001 is missing"));
 }
 
 #[test]

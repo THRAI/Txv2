@@ -607,7 +607,7 @@ struct XfstestsSelection {
     pub(super) status: String,
     pub(super) source_lock: XfstestsSourceLock,
     pub(super) case_count: usize,
-    cases: Vec<String>,
+    pub(super) cases: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

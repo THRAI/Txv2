@@ -455,6 +455,9 @@
         "git -C external/xfstests rev-parse HEAD",
         "shasum -a 256 external/xfstests/check",
         "git check-ignore -v external/xfstests external/xfstests/check",
+        "for case in generic/013 generic/035 generic/091 generic/095 generic/226 generic/301 generic/388 generic/475; do test -f external/xfstests/tests/$case && printf 'ok %s\\n' \"$case\" || printf 'missing %s\\n' \"$case\"; done",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-xfstests-cases-20260802 --preflight-report target/ext4/tier1/preflight/task16-xfstests-cases-20260802.json",
+        "jq '{ready: .result.ready, blocker_count: .result.blocker_count, selected_cases_verified: .preflight.xfstests_selected_cases_verified, blockers: .result.blockers}' target/ext4/tier1/preflight/task16-xfstests-cases-20260802.json",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-live-preflight-default-gate-20260802"
       ],
@@ -501,7 +504,8 @@
     "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
     "The public `cargo xtask ext4 tier1` command exists, verifies the manifest-pinned xfstests source lock, parses xfstests output fail-closed, refuses to synthesize crash-cut completion or unconditional passed gates, and now routes per-cut fault jobs through the repository executor with bound request/result/log/image evidence. Live execution still correctly fails closed while xfstests/crash authorities remain placeholder statuses; no full 1000-cut run, pinned xfstests execution, or immutable G0-G7 receipt has been produced.",
     "2026-08-02 preflight-report slice: `cargo xtask ext4 tier1 --preflight-live --preflight-report PATH` writes a durable `tx.ext4.tier1_live_preflight.v1` blocker report with authority hashes/statuses, host identity, blockers, and `acceptance_receipt_generated=false` without creating a run workspace or receipt. The current macOS report remains blocked on placeholder authorities, missing local `external/xfstests`, and Linux/root replay requirements.",
-    "2026-08-02 xfstests-materialize slice: `--materialize-xfstests` now clones/checks out the manifest-pinned source into ignored local `external/xfstests` state and verifies the pinned `check` sha256 before live preflight reports readiness. The current source is prepared at revision `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509`, so the live preflight blocker count dropped from four to three; authority statuses and Linux/root replay remain blocking, and no xfstests cases have been executed for acceptance."
+    "2026-08-02 xfstests-materialize slice: `--materialize-xfstests` now clones/checks out the manifest-pinned source into ignored local `external/xfstests` state and verifies the pinned `check` sha256 before live preflight reports readiness. The current source is prepared at revision `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509`, so the live preflight blocker count dropped from four to three; authority statuses and Linux/root replay remain blocking, and no xfstests cases have been executed for acceptance.",
+    "2026-08-02 xfstests-selected-case slice: live preflight now verifies the selected xfstests case files exist under the pinned checkout after source-lock verification and records `xfstests_selected_cases_verified` in the JSON report. The current checkout proves all eight selected `generic/*` case files exist, but the selection authority status remains placeholder and the cases have not been executed as acceptance evidence."
   ],
   "handoff": {
     "needed": false,

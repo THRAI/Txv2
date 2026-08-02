@@ -37,7 +37,8 @@ pub(super) fn run_live_preflight(
             )),
         }
     }
-    collect_xfstests_preflight(root, authorities, &mut blockers);
+    let xfstests_selected_cases_verified =
+        collect_xfstests_preflight(root, authorities, &mut blockers);
     collect_linux_replay_preflight(&mut blockers);
     if let Some(report_path) = report_path {
         write_live_preflight_report(
@@ -48,6 +49,7 @@ pub(super) fn run_live_preflight(
             report_path,
             materialize_xfstests,
             xfstests_source_prepared,
+            xfstests_selected_cases_verified,
         )?;
         println!(
             "ext4 tier1: live-preflight report {}",
@@ -131,6 +133,7 @@ fn write_live_preflight_report(
     report_path: &Path,
     materialize_xfstests: bool,
     xfstests_source_prepared: bool,
+    xfstests_selected_cases_verified: bool,
 ) -> Result<()> {
     let path = resolve_repo_path(root, report_path.to_path_buf());
     if let Some(parent) = path.parent() {
@@ -180,6 +183,7 @@ fn write_live_preflight_report(
         "preflight": {
             "materialize_xfstests_requested": materialize_xfstests,
             "xfstests_source_prepared": xfstests_source_prepared,
+            "xfstests_selected_cases_verified": xfstests_selected_cases_verified,
         },
         "result": {
             "ready": blockers.is_empty(),
@@ -263,19 +267,38 @@ fn collect_xfstests_preflight(
     root: &Path,
     authorities: &Tier1Authorities,
     blockers: &mut Vec<String>,
-) {
+) -> bool {
     let source_root = authorities.selection.source_lock.root_path(root);
     if !source_root.exists() {
         blockers.push(format!(
             "pinned xfstests source is missing at {}; run --materialize-xfstests before live acceptance",
             source_root.display()
         ));
-        return;
+        return false;
     }
     if let Err(err) = verify_xfstests_source_lock(&source_root, &authorities.selection.source_lock)
     {
         blockers.push(format!("pinned xfstests source is not ready: {err}"));
+        return false;
     }
+    if let Err(err) = verify_xfstests_selected_cases(&source_root, &authorities.selection.cases) {
+        blockers.push(err);
+        return false;
+    }
+    true
+}
+
+fn verify_xfstests_selected_cases(xfstests_root: &Path, cases: &[String]) -> Result<()> {
+    for case in cases {
+        let path = xfstests_root.join("tests").join(case);
+        if !path.is_file() {
+            return Err(format!(
+                "selected xfstests case {case} is missing at {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn collect_linux_replay_preflight(blockers: &mut Vec<String>) {

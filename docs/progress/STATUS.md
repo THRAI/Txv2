@@ -1,3 +1,18 @@
+- 2026-08-02 (ext4 Tier 1 xfstests selected-case preflight).
+  Advanced Task 16 xfstests authority readiness without promoting final
+  acceptance. Live preflight now verifies every selected case in
+  `tools/ext4/tier1/xfstests-selection.json` exists under the pinned
+  `external/xfstests/tests/` checkout after source-lock verification, and the
+  JSON preflight report records `xfstests_selected_cases_verified`. The current
+  pinned checkout contains all eight selected cases (`generic/013`,
+  `generic/035`, `generic/091`, `generic/095`, `generic/226`, `generic/301`,
+  `generic/388`, `generic/475`), and
+  `target/ext4/tier1/preflight/task16-xfstests-cases-20260802.json` records
+  `xfstests_selected_cases_verified=true` with the expected remaining three
+  blockers. Task 16 still needs acceptance-ready authority ledgers, actual
+  pinned xfstests execution, full fresh 1000-cut QEMU/e2fsck evidence, and the
+  verified immutable G0-G7 receipt.
+
 - 2026-08-02 (ext4 Tier 1 pinned xfstests source materialized).
   Reduced one Task 16 live-preflight blocker without promoting final
   acceptance. `cargo xtask ext4 tier1 --preflight-live` now supports
