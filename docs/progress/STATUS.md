@@ -1,3 +1,21 @@
+- 2026-08-02 (ext4 Tier 1 xfstests source-lock evidence artifact).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. The live Tier 1 xfstests stage now records a run-owned
+  `xfstests-source-lock-evidence` JSON artifact with the actual pinned source
+  root, git revision, `check` path, and `check` sha256 before executing the
+  selected cases. `cargo xtask ext4 tier1 --verify-receipt PATH` now binds that
+  evidence back to the run-owned `authority-xfstests-selection` artifact and
+  rejects missing or mismatched revision/check digests, so a final xfstests
+  receipt cannot rely only on an exit code or summary text. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify --
+  --test-threads=1` (11), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (54), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --dry-run`, and the expected fail-closed live preflight
+  `task16-xfstests-source-evidence-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 build/base-image evidence).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. Live Tier 1 now runs candidate `full-build` and busybox ext4 image

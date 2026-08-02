@@ -575,6 +575,14 @@ struct XfstestsSourceLock {
     check_sha256: String,
 }
 
+#[derive(Debug)]
+struct XfstestsSourceLockEvidence {
+    source_root: PathBuf,
+    revision: String,
+    check_path: PathBuf,
+    check_sha256: String,
+}
+
 impl XfstestsSelection {
     fn load(path: PathBuf) -> Result<Self> {
         let path_display = path.display().to_string();
@@ -1087,33 +1095,80 @@ fn verify_xfstests_source_lock(
     xfstests_root: &Path,
     source_lock: &XfstestsSourceLock,
 ) -> Result<()> {
-    let (code, output) = run_capture(xfstests_root, "git", &["rev-parse".into(), "HEAD".into()])?;
-    if code != 0 {
-        return Err(format!(
-            "failed to read xfstests revision at {}",
-            xfstests_root.display()
-        ));
-    }
-    let revision = output.trim().to_ascii_lowercase();
-    if revision != source_lock.revision {
+    let evidence = read_xfstests_source_lock_evidence(xfstests_root)?;
+    if evidence.revision != source_lock.revision {
         return Err(format!(
             "xfstests revision mismatch at {}: expected {}, found {}",
             xfstests_root.display(),
             source_lock.revision,
-            revision
+            evidence.revision
         ));
     }
-    let check = xfstests_root.join("check");
-    let check_sha256 = sha256_file(&check)?;
-    if check_sha256 != source_lock.check_sha256 {
+    if evidence.check_sha256 != source_lock.check_sha256 {
         return Err(format!(
             "xfstests check sha256 mismatch at {}: expected {}, found {}",
-            check.display(),
+            evidence.check_path.display(),
             source_lock.check_sha256,
-            check_sha256
+            evidence.check_sha256
         ));
     }
     Ok(())
+}
+
+fn read_xfstests_source_lock_evidence(xfstests_root: &Path) -> Result<XfstestsSourceLockEvidence> {
+    let revision = git_head(xfstests_root)
+        .map_err(|_| {
+            format!(
+                "failed to read xfstests revision at {}",
+                xfstests_root.display()
+            )
+        })?
+        .to_ascii_lowercase();
+    let check_path = xfstests_root.join("check");
+    let check_sha256 = sha256_file(&check_path)?;
+    Ok(XfstestsSourceLockEvidence {
+        source_root: xfstests_root.to_path_buf(),
+        revision,
+        check_path,
+        check_sha256,
+    })
+}
+
+fn record_xfstests_source_lock_evidence(
+    run: &mut run_workspace::RunWorkspace,
+    source_lock: &XfstestsSourceLock,
+    xfstests_root: &Path,
+) -> Result<()> {
+    let evidence = read_xfstests_source_lock_evidence(xfstests_root)?;
+    if evidence.revision != source_lock.revision
+        || evidence.check_sha256 != source_lock.check_sha256
+    {
+        verify_xfstests_source_lock(xfstests_root, source_lock)?;
+    }
+    let evidence_path = run.working_dir().join("xfstests-source-lock-evidence.json");
+    let value = serde_json::json!({
+        "schema": "tx.ext4.xfstests_source_lock_evidence.v1",
+        "source_root": evidence.source_root.display().to_string(),
+        "revision": evidence.revision,
+        "check_path": evidence.check_path.display().to_string(),
+        "check_sha256": evidence.check_sha256,
+    });
+    fs::write(
+        &evidence_path,
+        serde_json::to_string_pretty(&value).map_err(|err| {
+            format!(
+                "failed to encode xfstests source-lock evidence {}: {err}",
+                evidence_path.display()
+            )
+        })? + "\n",
+    )
+    .map_err(|err| {
+        format!(
+            "failed to write xfstests source-lock evidence {}: {err}",
+            evidence_path.display()
+        )
+    })?;
+    run.record_artifact("xfstests-source-lock-evidence", evidence_path)
 }
 
 fn run_xfstests_selection(
@@ -1122,6 +1177,7 @@ fn run_xfstests_selection(
     authorities: &Tier1Authorities,
 ) -> Result<receipt::XfstestsSummary> {
     let xfstests_root = ensure_xfstests_root(root, run, &authorities.selection.source_lock)?;
+    record_xfstests_source_lock_evidence(run, &authorities.selection.source_lock, &xfstests_root)?;
     let check = xfstests_root.join("check");
     if !check.is_file() {
         return Err(format!("missing xfstests check script {}", check.display()));

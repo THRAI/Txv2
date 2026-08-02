@@ -59,6 +59,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
+    verify_xfstests_source_lock_evidence(&artifacts, receipt_path)?;
     verify_crash_cut_outcome_manifest(&artifacts, receipt_path)?;
     verify_required_crash_cut_artifacts(&artifacts, receipt_path)?;
     Ok(())
@@ -379,6 +380,7 @@ fn verify_required_log_artifacts(
         "e2fsck-test-log",
         "e2fsck-scratch-log",
         "e2fsck-workload-log",
+        "xfstests-source-lock-evidence",
         "xfstests-log",
     ] {
         if !artifacts.contains_key(name) {
@@ -387,6 +389,84 @@ fn verify_required_log_artifacts(
                 path.display()
             ));
         }
+    }
+    Ok(())
+}
+
+fn verify_xfstests_source_lock_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let authority_path = artifacts
+        .get("authority-xfstests-selection")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing artifact authority-xfstests-selection",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let authority = read_json(&authority_path)?;
+    require_schema(
+        &authority,
+        "tx.ext4.xfstests_selection_ledger.v1",
+        &authority_path,
+    )?;
+    let authority_object = json_object(&authority, "xfstests selection", &authority_path)?;
+    let source_lock = required_json_object(authority_object, "source_lock", &authority_path)?;
+    let expected_revision = required_json_string(source_lock, "revision", &authority_path)?;
+    verify_hex_string(
+        "source_lock.revision",
+        &expected_revision,
+        40,
+        &authority_path,
+    )?;
+    let expected_check_sha = required_json_string(source_lock, "check_sha256", &authority_path)?;
+    verify_real_sha(
+        "source_lock.check_sha256",
+        &expected_check_sha,
+        &authority_path,
+    )?;
+
+    let evidence_path = artifacts
+        .get("xfstests-source-lock-evidence")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing required artifact xfstests-source-lock-evidence",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let evidence = read_json(&evidence_path)?;
+    require_schema(
+        &evidence,
+        "tx.ext4.xfstests_source_lock_evidence.v1",
+        &evidence_path,
+    )?;
+    let evidence_object = json_object(&evidence, "xfstests source-lock evidence", &evidence_path)?;
+    required_json_string(evidence_object, "source_root", &evidence_path)?;
+    required_json_string(evidence_object, "check_path", &evidence_path)?;
+    let revision = required_json_string(evidence_object, "revision", &evidence_path)?;
+    verify_hex_string("revision", &revision, 40, &evidence_path)?;
+    if revision != expected_revision {
+        return Err(format!(
+            "{}: xfstests source-lock revision mismatch: expected {}, found {}",
+            evidence_path.display(),
+            expected_revision,
+            revision
+        ));
+    }
+    let check_sha = required_json_string(evidence_object, "check_sha256", &evidence_path)?;
+    verify_real_sha("check_sha256", &check_sha, &evidence_path)?;
+    if check_sha != expected_check_sha {
+        return Err(format!(
+            "{}: xfstests source-lock check_sha256 mismatch: expected {}, found {}",
+            evidence_path.display(),
+            expected_check_sha,
+            check_sha
+        ));
     }
     Ok(())
 }
@@ -751,6 +831,16 @@ fn required_json_string(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| format!("{}: missing string {key}", path.display()))
+}
+
+fn verify_hex_string(label: &str, value: &str, len: usize, path: &Path) -> Result<()> {
+    if value.len() != len || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{}: {label} must be a {len}-byte hex string",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn required_json_usize(

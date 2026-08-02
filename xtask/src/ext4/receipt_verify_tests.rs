@@ -84,6 +84,39 @@ fn tier1_verify_receipt_rejects_missing_build_log_artifact() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_missing_xfstests_source_lock_evidence() {
+    let root = temp_root("verify-receipt-missing-xfstests-source-lock");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    remove_artifact_record(&root, "xfstests-source-lock-evidence");
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing xfstests source lock must fail");
+    assert!(error.contains("missing required artifact xfstests-source-lock-evidence"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_xfstests_source_lock_mismatch() {
+    let root = temp_root("verify-receipt-xfstests-source-lock-mismatch");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "xfstests-source-lock-evidence",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.xfstests_source_lock_evidence.v1",
+            "source_root": "external/xfstests",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "check_path": "external/xfstests/check",
+            "check_sha256": "d".repeat(64)
+        }))
+        .expect("source lock evidence json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("mismatched source lock must fail");
+    assert!(error.contains("xfstests source-lock check_sha256 mismatch"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_tampered_artifact() {
     let root = temp_root("verify-receipt-tampered");
     let _cleanup = TempCleanup(root.clone());
@@ -192,7 +225,18 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     let (_xfstests_selection, xfstests_selection_sha256) = add_artifact(
         "authority-xfstests-selection",
         "authorities/xfstests-selection.json".into(),
-        r#"{"schema":"tx.ext4.xfstests_selection_ledger.v1"}"#.into(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.xfstests_selection_ledger.v1",
+            "status": "acceptance-ready",
+            "tier": "tier1",
+            "source_lock": {
+                "path": "external/xfstests",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+                "check_sha256": "c".repeat(64)
+            },
+            "selected": [{"case_id": "generic/001"}]
+        }))
+        .expect("xfstests authority json"),
     );
     let (_shell_scenario, shell_scenario_sha256) = add_artifact(
         "authority-shell-scenario",
@@ -277,6 +321,18 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     ] {
         add_artifact(name, file_name.into(), contents.into());
     }
+    add_artifact(
+        "xfstests-source-lock-evidence",
+        "xfstests-source-lock-evidence.json".into(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.xfstests_source_lock_evidence.v1",
+            "source_root": "external/xfstests",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "check_path": "external/xfstests/check",
+            "check_sha256": "c".repeat(64)
+        }))
+        .expect("xfstests source lock evidence json"),
+    );
 
     for idx in 0..1000 {
         let cut_id = format!("crash-cut-{idx:04}");
@@ -623,6 +679,27 @@ fn remove_artifact_record(root: &PathBuf, name: &str) {
         .as_array_mut()
         .expect("artifacts array")
         .retain(|artifact| artifact["name"] != name);
+    write_json(
+        &artifacts_path,
+        &serde_json::to_string_pretty(&manifest).expect("artifact manifest json"),
+    );
+    rewrite_receipt_artifact_manifest_sha(root);
+}
+
+fn rewrite_artifact_contents(root: &PathBuf, name: &str, contents: &str) {
+    let artifacts_path = root.join("target/ext4/tier1/accepted-run/artifacts.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifacts_path).expect("read artifacts"))
+            .expect("parse artifacts");
+    let artifact = manifest["artifacts"]
+        .as_array_mut()
+        .expect("artifacts array")
+        .iter_mut()
+        .find(|artifact| artifact["name"] == name)
+        .unwrap_or_else(|| panic!("missing artifact {name}"));
+    let path = PathBuf::from(artifact["path"].as_str().expect("artifact path"));
+    write_text(&path, contents);
+    artifact["sha256"] = serde_json::Value::String(sha256_file(&path).expect("artifact sha"));
     write_json(
         &artifacts_path,
         &serde_json::to_string_pretty(&manifest).expect("artifact manifest json"),
