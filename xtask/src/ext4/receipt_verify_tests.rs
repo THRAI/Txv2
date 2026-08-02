@@ -51,6 +51,66 @@ fn tier1_verify_receipt_rejects_authority_artifact_sha_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_xfstests_authority_not_acceptance_ready() {
+    let root = temp_root("verify-receipt-xfstests-authority-status");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_authority_artifact_contents(
+        &root,
+        "authority-xfstests-selection",
+        "xfstests_selection_sha256",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.xfstests_selection_ledger.v1",
+            "status": "selection-authority-declared",
+            "tier": "tier1",
+            "source_lock": {
+                "path": "external/xfstests",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+                "check_sha256": "c".repeat(64)
+            },
+            "selected": [
+                {"case_id": "generic/001"},
+                {"case_id": "generic/002"},
+                {"case_id": "generic/003"},
+                {"case_id": "generic/004"},
+                {"case_id": "generic/005"},
+                {"case_id": "generic/006"},
+                {"case_id": "generic/007"},
+                {"case_id": "generic/008"}
+            ]
+        }))
+        .expect("xfstests authority json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("placeholder xfstests must fail");
+    assert!(error.contains(
+        "xfstests selection status is `selection-authority-declared`; expected `acceptance-ready`"
+    ));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_crash_catalog_without_campaign() {
+    let root = temp_root("verify-receipt-crash-catalog-campaign");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_authority_artifact_contents(
+        &root,
+        "authority-crash-cut-catalog",
+        "crash_cut_catalog_sha256",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.crash_cut_catalog.v1",
+            "status": "acceptance-ready",
+            "expanded_cut_count": 1000,
+            "families": crash_catalog_families_json()
+        }))
+        .expect("crash catalog json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("campaign-less crash catalog must fail");
+    assert!(error.contains("missing object campaign"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_missing_g0_log_artifact() {
     let root = temp_root("verify-receipt-missing-g0-log");
     let _cleanup = TempCleanup(root.clone());
@@ -320,6 +380,20 @@ struct FixtureOptions {
     bad_authority_sha: bool,
 }
 
+fn crash_catalog_families_json() -> Vec<serde_json::Value> {
+    [
+        "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12",
+    ]
+    .into_iter()
+    .map(|id| {
+        serde_json::json!({
+            "id": id,
+            "phase_marker": format!("tx.ext4.crash.phase.{id}")
+        })
+    })
+    .collect()
+}
+
 fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOptions) -> PathBuf {
     let run_dir = root.join("target/ext4/tier1/accepted-run");
     fs::create_dir_all(&run_dir).expect("create run dir");
@@ -347,7 +421,19 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
     let (_crash_cut_catalog, crash_cut_catalog_sha256) = add_artifact(
         "authority-crash-cut-catalog",
         "authorities/crash-cuts.json".into(),
-        r#"{"schema":"tx.ext4.crash_cut_catalog.v1"}"#.into(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.crash_cut_catalog.v1",
+            "status": "acceptance-ready",
+            "expanded_cut_count": 1000,
+            "campaign": {
+                "workload_script": "tools/ext4/tier1/crash-workload.scn",
+                "replay_script": "tools/ext4/tier1/crash-replay.scn",
+                "kill_policy": "deterministic-phase-marker-v1",
+                "e2fsck_mode": "immutable-copy"
+            },
+            "families": crash_catalog_families_json()
+        }))
+        .expect("crash catalog json"),
     );
     let (_xfstests_selection, xfstests_selection_sha256) = add_artifact(
         "authority-xfstests-selection",
@@ -869,6 +955,38 @@ fn rewrite_artifact_contents(root: &PathBuf, name: &str, contents: &str) {
     rewrite_receipt_artifact_manifest_sha(root);
 }
 
+fn rewrite_authority_artifact_contents(
+    root: &PathBuf,
+    name: &str,
+    receipt_key: &str,
+    contents: &str,
+) {
+    rewrite_artifact_contents(root, name, contents);
+    let artifacts_path = root.join("target/ext4/tier1/accepted-run/artifacts.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifacts_path).expect("read artifacts"))
+            .expect("parse artifacts");
+    let artifact_sha = manifest["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .find(|artifact| artifact["name"] == name)
+        .unwrap_or_else(|| panic!("missing artifact {name}"))["sha256"]
+        .as_str()
+        .expect("artifact sha")
+        .to_string();
+    let receipt_path = root.join("target/ext4/tier1/accepted-run/acceptance-receipt.json");
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).expect("read receipt"))
+            .expect("parse receipt");
+    receipt["authorities"][receipt_key] = serde_json::Value::String(artifact_sha);
+    write_json(
+        &receipt_path,
+        &serde_json::to_string_pretty(&receipt).expect("receipt json"),
+    );
+    rewrite_receipt_lock_receipt_sha(root);
+}
+
 fn rewrite_receipt_artifact_manifest_sha(root: &PathBuf) {
     let run_dir = root.join("target/ext4/tier1/accepted-run");
     let artifacts_path = run_dir.join("artifacts.json");
@@ -889,6 +1007,21 @@ fn rewrite_receipt_artifact_manifest_sha(root: &PathBuf) {
     .expect("parse lock");
     lock["receipt"]["sha256"] = serde_json::Value::String(receipt_sha);
     lock["artifact_manifest"]["sha256"] = serde_json::Value::String(artifacts_sha);
+    write_json(
+        &run_dir.join("receipt-lock.json"),
+        &serde_json::to_string_pretty(&lock).expect("lock json"),
+    );
+}
+
+fn rewrite_receipt_lock_receipt_sha(root: &PathBuf) {
+    let run_dir = root.join("target/ext4/tier1/accepted-run");
+    let receipt_path = run_dir.join("acceptance-receipt.json");
+    let receipt_sha = sha256_file(&receipt_path).expect("receipt sha");
+    let mut lock: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("receipt-lock.json")).expect("read lock"),
+    )
+    .expect("parse lock");
+    lock["receipt"]["sha256"] = serde_json::Value::String(receipt_sha);
     write_json(
         &run_dir.join("receipt-lock.json"),
         &serde_json::to_string_pretty(&lock).expect("lock json"),

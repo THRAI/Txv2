@@ -1,3 +1,22 @@
+- 2026-08-02 (ext4 Tier 1 authority status receipt binding).
+  Advanced Task 16 immutable receipt verification without promoting final
+  acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now parses the
+  run-owned xfstests selection and crash-cut catalog authority artifacts and
+  requires `status: acceptance-ready`; the crash catalog must also carry the
+  deterministic campaign plan, `kill_policy=deterministic-phase-marker-v1`,
+  `e2fsck_mode=immutable-copy`, and D0-D12 phase markers. This aligns the
+  immutable receipt verifier with the live runner's authority readiness gate,
+  so a G0-G7 passed receipt can no longer be verified against placeholder
+  authority ledgers whose hashes happen to match. Verification passed
+  `CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify --
+  --test-threads=1` (22), `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 --
+  --test-threads=1` (65), `CARGO_INCREMENTAL=0 cargo xtask ext4 tier1
+  --dry-run`, and the expected fail-closed live preflight
+  `task16-authority-status-bind-preflight-20260802`. Task 16 still needs
+  acceptance-ready authority ledgers, a full fresh 1000-cut QEMU/e2fsck
+  campaign, pinned xfstests execution, and the verified immutable G0-G7
+  receipt.
+
 - 2026-08-02 (ext4 Tier 1 guest matrix serial marker binding).
   Advanced Task 16 immutable receipt verification without promoting final
   acceptance. `cargo xtask ext4 tier1 --verify-receipt PATH` now parses the

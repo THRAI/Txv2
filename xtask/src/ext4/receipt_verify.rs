@@ -58,6 +58,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_authority_digests(receipt_object, &artifacts, receipt_path)?;
     verify_role_images(receipt_object, &artifacts, receipt_path)?;
     verify_e2fsck_summary(receipt_object, &artifacts, receipt_path)?;
+    verify_authority_ledger_evidence(&artifacts, receipt_path)?;
     verify_required_log_artifacts(&artifacts, receipt_path)?;
     verify_g0_lint_log_evidence(&artifacts, receipt_path)?;
     verify_build_log_evidence(&artifacts, receipt_path)?;
@@ -156,6 +157,145 @@ fn verify_gates_passed(
         if status != "passed" {
             return Err(format!(
                 "{}: gate {gate} is {status}, expected passed",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_authority_ledger_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    verify_xfstests_authority_acceptance_ready(artifacts, path)?;
+    verify_crash_catalog_authority_acceptance_ready(artifacts, path)
+}
+
+fn verify_xfstests_authority_acceptance_ready(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let authority_path = artifacts
+        .get("authority-xfstests-selection")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing artifact authority-xfstests-selection",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let authority = read_json(&authority_path)?;
+    require_schema(
+        &authority,
+        "tx.ext4.xfstests_selection_ledger.v1",
+        &authority_path,
+    )?;
+    let authority_object = json_object(&authority, "xfstests selection", &authority_path)?;
+    require_authority_status(authority_object, "xfstests selection", &authority_path)?;
+    required_json_string(authority_object, "tier", &authority_path)?;
+    Ok(())
+}
+
+fn verify_crash_catalog_authority_acceptance_ready(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let authority_path = artifacts
+        .get("authority-crash-cut-catalog")
+        .ok_or_else(|| {
+            format!(
+                "{}: missing artifact authority-crash-cut-catalog",
+                path.display()
+            )
+        })?
+        .path
+        .clone();
+    let authority = read_json(&authority_path)?;
+    require_schema(&authority, "tx.ext4.crash_cut_catalog.v1", &authority_path)?;
+    let authority_object = json_object(&authority, "crash-cut catalog", &authority_path)?;
+    require_authority_status(authority_object, "crash-cut catalog", &authority_path)?;
+    let expanded = required_json_usize(authority_object, "expanded_cut_count", &authority_path)?;
+    if expanded != 1000 {
+        return Err(format!(
+            "{}: crash-cut catalog expanded_cut_count must be 1000, found {expanded}",
+            authority_path.display()
+        ));
+    }
+    let campaign = required_json_object(authority_object, "campaign", &authority_path)?;
+    require_field_value(
+        campaign,
+        "kill_policy",
+        "deterministic-phase-marker-v1",
+        &authority_path,
+    )?;
+    require_field_value(campaign, "e2fsck_mode", "immutable-copy", &authority_path)?;
+    required_json_string(campaign, "workload_script", &authority_path)?;
+    required_json_string(campaign, "replay_script", &authority_path)?;
+    verify_crash_catalog_families(authority_object, &authority_path)
+}
+
+fn require_authority_status(
+    object: &serde_json::Map<String, serde_json::Value>,
+    label: &str,
+    path: &Path,
+) -> Result<()> {
+    let status = required_json_string(object, "status", path)?;
+    if status != "acceptance-ready" {
+        return Err(format!(
+            "{}: {label} status is `{status}`; expected `acceptance-ready`",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_field_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: &str,
+    path: &Path,
+) -> Result<()> {
+    let found = required_json_string(object, key, path)?;
+    if found != expected {
+        return Err(format!(
+            "{}: {key} must be `{expected}`, found `{found}`",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_crash_catalog_families(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+) -> Result<()> {
+    let families = require_non_empty_array(object, "families", path)?;
+    for family in [
+        "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12",
+    ] {
+        let Some(entry) = families.iter().find(|entry| {
+            entry
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|id| id == family)
+        }) else {
+            return Err(format!(
+                "{}: crash-cut catalog missing family {family}",
+                path.display()
+            ));
+        };
+        let entry = entry.as_object().ok_or_else(|| {
+            format!(
+                "{}: crash-cut catalog family {family} must be an object",
+                path.display()
+            )
+        })?;
+        let marker = required_json_string(entry, "phase_marker", path)?;
+        if marker != format!("tx.ext4.crash.phase.{family}") {
+            return Err(format!(
+                "{}: crash-cut catalog family {family} phase_marker mismatch",
                 path.display()
             ));
         }
