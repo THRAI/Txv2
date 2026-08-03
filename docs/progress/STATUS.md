@@ -1,3 +1,22 @@
+- 2026-08-04 (ext4 Task16 D5 Tx remount recovery retry).
+  The fresh current-source run
+  `task16-live-resume-complete-cut-20260803` failed at `crash-cut-0213`
+  (family D5) after completing 213 crash cuts with matching `result.json` and
+  `replay-serial.log` evidence. The executor rejected the cut before writing
+  `result.json` because `replay_image_recovery` ran the Tx remount/readback leg
+  once and timed out waiting for `tx-remount-readback-status:0`; the preserved
+  `replay.img` hash stayed unchanged, and five manual reruns of
+  `tools/ext4/fault_tx_remount.py D5 crash-cut-0213 .../replay.img` all passed.
+  Root cause for this blocker is therefore a retryable harness/TTY timing miss
+  in the recovery leg, not a deterministic D5 image corruption. The executor now
+  retries replay image recovery only while failed attempts leave the replay image
+  SHA unchanged, preserves per-attempt logs, and still fail-closes if a failed
+  attempt mutates the image. Verification passed
+  `python3 -m unittest tools.tests.test_ext4_fault_qemu_executor.Ext4FaultQemuExecutorTests.test_replay_image_recovery_retries_when_failed_attempt_keeps_image_unchanged tools.tests.test_ext4_fault_qemu_executor.Ext4FaultQemuExecutorTests.test_replay_image_recovery_does_not_retry_after_failed_attempt_mutates_image`
+  and `python3 -m unittest tools.tests.test_ext4_fault_qemu_executor`. Task 16
+  still needs a new fresh 1000-cut run, xfstests/e2fsck, and verified immutable
+  receipt.
+
 - 2026-08-03 (ext4 Task16 crash-cut resume completeness fix).
   Fixed the Task 16 live-run resume blocker found in
   `task16-live-raw-block-fsync-20260803`: a crash cut with `result.json` but

@@ -598,22 +598,49 @@ def recover_replay_image(
         require_string(job, "cut"),
         str(replay),
     ]
-    try:
-        completed = subprocess.run(
-            full_command,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
+    initial_image_sha256 = sha256_file(replay) if replay.is_file() else None
+    attempts: list[dict[str, Any]] = []
+    completed: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, 4):
+        try:
+            completed = subprocess.run(
+                full_command,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except OSError as err:
+            result["reason"] = f"replay image recovery launch failed: {err}"
+            return False
+        log.write_text(completed.stdout, encoding="utf-8")
+        if completed.returncode == 0:
+            break
+        failed_image_sha256 = sha256_file(replay) if replay.is_file() else None
+        attempts.append(
+            {
+                "attempt": attempt,
+                "exit_code": completed.returncode,
+                "image_sha256": failed_image_sha256,
+                "log": str(preserve_failed_matrix_log(log, attempt)),
+                "log_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
+                "reason": "replay image recovery failed",
+            }
         )
-    except OSError as err:
-        result["reason"] = f"replay image recovery launch failed: {err}"
+        if failed_image_sha256 != initial_image_sha256:
+            result["reason"] = "replay image recovery failed after mutating replay image"
+            break
+        if attempt == 3:
+            result["reason"] = "replay image recovery failed after retries"
+
+    if completed is None:
+        result["reason"] = "replay image recovery did not run"
         return False
-    log.write_text(completed.stdout, encoding="utf-8")
     observation = {
         "command": full_command,
         "command_source": "repository-default",
+        "attempt": len(attempts) + 1,
         "exit_code": completed.returncode,
         "image": str(replay),
         "image_sha256": sha256_file(replay) if replay.is_file() else None,
@@ -621,9 +648,11 @@ def recover_replay_image(
         "log_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
         "status": "ok" if completed.returncode == 0 else "failed",
     }
+    if attempts:
+        observation["attempts"] = attempts
     plan["replay_image_recovery"] = observation
     if completed.returncode != 0:
-        result["reason"] = "replay image recovery failed"
+        result.setdefault("reason", "replay image recovery failed")
         return False
     return True
 

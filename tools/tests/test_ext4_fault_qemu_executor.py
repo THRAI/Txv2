@@ -644,6 +644,66 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
         )
         self.assertIn(f"-fn {replay_image}", e2fsck_log)
 
+    def test_replay_image_recovery_retries_when_failed_attempt_keeps_image_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            replay_image = root / "replay.img"
+            replay_image.write_bytes(b"stable")
+            plan = {"runner": {"cwd": str(root)}}
+            job = {"case": "D5", "cut": "crash-cut-0213"}
+            result = {}
+
+            module = load_executor_module()
+            with mock.patch.object(
+                module,
+                "matrix_command",
+                return_value=[sys.executable, "-c", "unused"],
+            ), mock.patch.object(
+                module.subprocess,
+                "run",
+                side_effect=[
+                    subprocess.CompletedProcess(args=["retry"], returncode=1, stdout="first\n"),
+                    subprocess.CompletedProcess(args=["retry"], returncode=0, stdout="second\n"),
+                ],
+            ):
+                self.assertTrue(module.recover_replay_image(plan, job, replay_image, result))
+
+            recovery = plan["replay_image_recovery"]
+            recovery_log_text = Path(recovery["log"]).read_text(encoding="utf-8")
+
+        self.assertEqual(recovery["status"], "ok")
+        self.assertEqual(recovery["attempt"], 2)
+        self.assertEqual(recovery["attempts"][0]["attempt"], 1)
+        self.assertTrue(recovery["attempts"][0]["log"].endswith("replay-recovery.attempt-1.log"))
+        self.assertEqual(recovery_log_text, "second\n")
+
+    def test_replay_image_recovery_does_not_retry_after_failed_attempt_mutates_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            replay_image = root / "replay.img"
+            replay_image.write_bytes(b"before")
+            plan = {"runner": {"cwd": str(root)}}
+            job = {"case": "D5", "cut": "crash-cut-0213"}
+            result = {}
+
+            def mutate_then_fail(*_args, **_kwargs):
+                replay_image.write_bytes(b"after")
+                return subprocess.CompletedProcess(args=["retry"], returncode=1, stdout="mutated\n")
+
+            module = load_executor_module()
+            with mock.patch.object(
+                module,
+                "matrix_command",
+                return_value=[sys.executable, "-c", "unused"],
+            ), mock.patch.object(module.subprocess, "run", side_effect=mutate_then_fail) as run:
+                self.assertFalse(module.recover_replay_image(plan, job, replay_image, result))
+
+            recovery = plan["replay_image_recovery"]
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(recovery["status"], "failed")
+        self.assertEqual(result["reason"], "replay image recovery failed after mutating replay image")
+
     def test_shell_test_command_keeps_stdout_open_until_serial_log_is_written(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
