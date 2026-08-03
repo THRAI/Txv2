@@ -103,6 +103,12 @@ fn cached_child_retains_target(
         .is_some_and(|child| child.rnode().fs_object_id() == target)
 }
 
+fn open_fd_retains_target(ctx: &SyscallCtx<'_>, target: tx_subsystems::vfs::FsObjectId) -> bool {
+    ctx.process.open_fds().values().any(|file| {
+        matches!(file.backing(), OpenFileBacking::Rnode { rnode } if rnode.fs_object_id() == target)
+    })
+}
+
 fn maybe_destroy_zero_link_inode_after_namespace_remove(
     fs_ops: &Arc<dyn tx_subsystems::vfs::FsOps>,
     target: tx_subsystems::vfs::FsObjectId,
@@ -416,8 +422,9 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         Ok(()) => {
             let retained_by_live_dentry =
                 cached_child_retains_target(&parent_dentry, basename, target_id);
+            let retained_by_open_fd = open_fd_retains_target(ctx, target_id);
             parent_dentry.remove_cached_child_by_name(basename);
-            if !retained_by_live_dentry {
+            if !retained_by_live_dentry && !retained_by_open_fd {
                 maybe_destroy_zero_link_inode_after_namespace_remove(&fs_ops, target_id);
             }
             SyscallResult::Return(0)

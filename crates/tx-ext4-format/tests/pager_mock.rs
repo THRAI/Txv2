@@ -946,6 +946,38 @@ fn destroy_plan_removes_singleton_orphan_head_from_superblock_chain() {
 }
 
 #[test]
+fn recovery_cleans_singleton_classic_orphan_head() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.last_orphan = 12;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_block_bitmap_used(&mut image, 31);
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut victim = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    victim.links_count = 0;
+    victim.dtime = 0;
+    write_inode(&mut image, 12, &victim);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    assert_eq!(pager.recover_classic_orphan_chain().unwrap(), 1);
+
+    let image = pager.image();
+    let parsed_superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    assert_eq!(parsed_superblock.last_orphan, 0);
+    assert_eq!(parsed_superblock.free_blocks_count, 35);
+    assert_eq!(parsed_superblock.free_inodes_count, 53);
+    assert!(!BitmapView::new(image.block(2)).is_set(20));
+    assert!(!BitmapView::new(image.block(2)).is_set(21));
+    assert!(!BitmapView::new(image.block(2)).is_set(30));
+    assert!(!BitmapView::new(image.block(3)).is_set(11));
+    let deleted_inode = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    assert_eq!(deleted_inode.links_count, 0);
+    assert_eq!(deleted_inode.dtime, 1);
+}
+
+#[test]
 fn destroy_plan_frees_zero_link_empty_directory_and_decrements_used_dirs() {
     let mut image = mock_image();
     mark_block_bitmap_used(&mut image, 18);

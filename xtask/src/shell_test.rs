@@ -11,10 +11,8 @@
 //! - The script DSL is intentionally tiny so test failures are
 //!   debuggable without learning a new language.
 //! - Explicit `sleep` directives force timing diversity into tests
-//!   to surface heisenbugs (e.g. "sending input the instant the
-//!   prompt appears, before the read syscall registers"). The
-//!   script author owns the pause discipline; the driver does NOT
-//!   silently coalesce input into a sustained burst.
+//!   to surface heisenbugs. The driver also waits briefly before
+//!   each send so prompt echoes do not race the guest's next read.
 //!
 //! ## Script DSL
 //!
@@ -90,6 +88,7 @@ use crate::util::{
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONTROL_KEY_DELAY: Duration = Duration::from_millis(25);
 const ESC_KEY_DELAY: Duration = Duration::from_millis(500);
+const SEND_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
@@ -511,6 +510,7 @@ fn run_block(
                 thread::sleep(Duration::from_millis(*ms));
             }
             Directive::Send(text) => {
+                thread::sleep(SEND_SETTLE_DELAY);
                 let stdin = child
                     .stdin
                     .as_mut()

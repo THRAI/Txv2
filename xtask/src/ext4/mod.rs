@@ -66,7 +66,11 @@ fn tier1(root: &Path, args: &[String]) -> Result<()> {
     }
     invocation.authorities.ensure_live_acceptance_ready()?;
 
-    let mut run = run_workspace::RunWorkspace::create(root, &invocation.run_id)?;
+    let mut run = if invocation.resume {
+        run_workspace::RunWorkspace::resume(root, &invocation.run_id)?
+    } else {
+        run_workspace::RunWorkspace::create(root, &invocation.run_id)?
+    };
     run.record_authority_inputs(&invocation.authorities.as_input_summary())?;
     stage_authority_artifacts(&mut run, &invocation.authorities)?;
     run_live_tier1(root, invocation, &mut run)
@@ -190,9 +194,12 @@ fn run_live_tier1(
     if guest_matrix_serial.is_file() {
         run.record_artifact("guest-matrix-serial-log", guest_matrix_serial)?;
     }
-    shell_result?;
+    if let Err(err) = shell_result {
+        run.mark_failed(format!("guest-matrix shell-test failed: {err}"));
+        return Err(err);
+    }
 
-    let crash_campaign = execute_crash_cut_campaign(
+    let crash_campaign = match execute_crash_cut_campaign(
         root,
         run,
         &invocation.authorities.crash_cuts,
@@ -200,7 +207,13 @@ fn run_live_tier1(
         &scratch_image,
         &workload_image,
         &e2fsck,
-    )?;
+    ) {
+        Ok(campaign) => campaign,
+        Err(err) => {
+            run.mark_failed(format!("crash campaign failed: {err}"));
+            return Err(err);
+        }
+    };
     let mut e2fsck_results = Vec::new();
     for (role, path) in [
         ("test", &test_image),
@@ -308,6 +321,7 @@ struct Tier1Invocation {
     preflight_live: bool,
     preflight_report: Option<PathBuf>,
     materialize_xfstests: bool,
+    resume: bool,
     authorities: Tier1Authorities,
 }
 
@@ -447,6 +461,7 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
             "--dry-run" => idx += 1,
             "--preflight-live" => idx += 1,
             "--materialize-xfstests" => idx += 1,
+            "--resume" => idx += 1,
             "--preflight-report" => {
                 let Some(value) = args.get(idx + 1) else {
                     return Err("option --preflight-report needs a value".into());
@@ -476,8 +491,12 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
     let preflight_live = args.iter().any(|arg| arg == "--preflight-live");
     let materialize_xfstests = args.iter().any(|arg| arg == "--materialize-xfstests");
+    let resume = args.iter().any(|arg| arg == "--resume");
     if dry_run && preflight_live {
         return Err("ext4 tier1 accepts only one of --dry-run or --preflight-live".into());
+    }
+    if resume && (dry_run || preflight_live) {
+        return Err("ext4 tier1 --resume is only valid for live runs".into());
     }
     let preflight_report = optional_option_value(args, "--preflight-report")
         .map(PathBuf::from)
@@ -496,6 +515,7 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
         preflight_live,
         preflight_report,
         materialize_xfstests,
+        resume,
         authorities,
     })
 }

@@ -34,10 +34,8 @@ fn tier1_verify_receipt_rejects_campaign_plan_sha_mismatch() {
     let receipt = write_acceptance_receipt_fixture_with_bad_campaign_plan_sha(&root);
 
     let error = verify_tier1_receipt(&receipt).expect_err("bad campaign plan sha must fail");
-    assert!(
-        error
-            .contains("fault job campaign_plan_sha256 does not match crash-campaign-plan artifact")
-    );
+    assert!(error
+        .contains("fault job campaign_plan_sha256 does not match crash-campaign-plan artifact"));
 }
 
 #[test]
@@ -674,6 +672,27 @@ fn tier1_verify_receipt_rejects_executor_plan_replay_preflight_mismatch() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_executor_plan_replay_recovery_mismatch() {
+    let root = temp_root("verify-receipt-executor-plan-replay-recovery");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["replay_image_recovery"]["image_sha256"] = "1".repeat(64).into();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("replay recovery drift must fail");
+    assert!(error.contains("replay_image_recovery image_sha256 mismatch"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_executor_plan_semantic_preflight_mismatch() {
     let root = temp_root("verify-receipt-executor-plan-semantic-preflight");
     let _cleanup = TempCleanup(root.clone());
@@ -1113,6 +1132,11 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
         let replay_serial_sha256 =
             sha256_file(&run_dir.join(format!("{cut_dir}/replay-serial.log")))
                 .expect("replay serial sha");
+        let (replay_recovery_log, replay_recovery_log_sha256) = add_artifact(
+            &format!("{cut_id}-replay-recovery-log"),
+            format!("{cut_dir}/replay-recovery.log"),
+            format!("{cut_id} replay recovery ok\n"),
+        );
         let (e2fsck_log, e2fsck_log_sha256) = add_artifact(
             &format!("{cut_id}-e2fsck-log"),
             format!("{cut_dir}/e2fsck-fn.log"),
@@ -1283,6 +1307,21 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
                     "status": "ready",
                     "command_source": "repository-default",
                     "command": [repo_root.join("tools/ext4/fault_semantic_oracle.py").display().to_string()]
+                },
+                "replay_image_recovery": {
+                    "status": "ok",
+                    "command_source": "repository-default",
+                    "command": [
+                        repo_root.join("tools/ext4/fault_tx_remount.py").display().to_string(),
+                        "D7",
+                        &cut_id,
+                        replay_image.display().to_string()
+                    ],
+                    "image": replay_image.display().to_string(),
+                    "image_sha256": replay_sha256.clone(),
+                    "log": replay_recovery_log.display().to_string(),
+                    "log_sha256": replay_recovery_log_sha256,
+                    "exit_code": 0
                 },
                 "preserved_images": {
                     "crash": crash_image.display().to_string(),

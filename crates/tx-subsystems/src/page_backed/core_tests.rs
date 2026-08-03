@@ -4224,6 +4224,7 @@ fn vfs_fsync_op_calls_backing_once_after_an_empty_frontier_without_l4_fsync() {
         page_backing: fs.clone(),
         fs_object_id: FsObjectId::new(107),
         page_container: Some(pc.clone()),
+        raw_block_device: false,
         state: FileFsyncState::new(),
     };
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();

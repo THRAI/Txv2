@@ -1,3 +1,65 @@
+- 2026-08-03 (ext4 Task16 crash-cut resume completeness fix).
+  Fixed the Task 16 live-run resume blocker found in
+  `task16-live-raw-block-fsync-20260803`: a crash cut with `result.json` but
+  missing `replay-serial.log` was treated as complete during restore, then the
+  runner failed while re-registering evidence. The crash-campaign restore path
+  now treats Rust-side per-cut evidence as complete only after the replay serial
+  exists; stale or partial cut directories are removed and retried. Verification
+  passed
+  `cargo test -p xtask tier1_crash_cut_resume_discards_result_without_replay_serial -- --test-threads=1`,
+  `cargo test -p xtask ext4 -- --test-threads=1` (98), and local
+  `rustfmt --check` over the touched ext4 xtask files. Full-package
+  `cargo fmt --check --package xtask` remains blocked by broader pre-existing
+  xtask formatting drift outside this narrow fix. Task 16 remains open until a
+  fresh current-source 1000-cut run completes xfstests/e2fsck and verifies the
+  immutable receipt.
+
+- 2026-08-03 (ext4 Task16 live run past 0300 and worktree salvage).
+  Checked the idle ext4 worktrees before continuing Task 16. The clean
+  `codex/ext4-fault-interop` worktree still carried one useful, current-missing
+  durability slice: raw block-device fsync must flush dirty PageBacked frames
+  before issuing the bdevfs barrier. That slice has now been salvaged into the
+  active checkout with a focused bdevfs regression and sys_fsync raw-block
+  routing. `codex/ext4-tier1-lifecycle-convergence` is mostly superseded by
+  the current mount/file settlement code, while `codex/ext4-jbd2-revoke` and
+  `codex/ext4-journal-settlement` are broad dirty worktrees and are not safe
+  direct-merge candidates. Verification passed
+  `cargo test -p tx-fs bdevfs_flushes_dirty_frame_before_exactly_one_barrier -- --test-threads=1`,
+  `cargo test -p tx-subsystems --lib vfs_fsync_op_calls_backing_once_after_an_empty_frontier_without_l4_fsync -- --test-threads=1`,
+  `cargo check -p tx-shims -q`, the three G0 lints, `cargo xtask progress validate`,
+  and live preflight report
+  `target/ext4/tier1/preflight/task16-raw-block-current-20260803.json`. The
+  pre-salvage run `task16-live-after-tx-remount-retry-20260803` was stopped
+  after reaching 302 `result.json` files because it no longer represented the
+  current source tree. A fresh current-source run
+  `task16-live-raw-block-fsync-20260803` has started and passed G0,
+  full-build, image creation, and the initial role-scenario QEMU setup; it is
+  the active path toward the 1000-cut immutable receipt.
+
+- 2026-08-03 (ext4 Task16 live resume progressed to 0288).
+  The resumed fresh Tier 1 run `task16-live-after-tx-remount-retry-20260803`
+  is still not at receipt, but the resume path is now proven in motion: after
+  `--resume` was added, the interrupted tmp workspace stayed intact, completed
+  cuts were replayed, and the live run advanced from the original 0269 retry
+  through `crash-cut-0288`. The current tmp still only has a half-built
+  `crash-cut-0289` job dir with staged role images and no `result.json`, so
+  the next resume needs to clear that stale job dir and continue from 0289.
+  Verification since the reconnect still passes the focused resume tests and
+  `cargo test -p xtask ext4 -- --test-threads=1` from the earlier refresh.
+  Task 16 remains open pending the full immutable receipt.
+
+- 2026-08-03 (ext4 Task16 live resume reconnect).
+  Reconnected the interrupted fresh Tier 1 run
+  `task16-live-after-tx-remount-retry-20260803` by adding `--resume` support
+  to `cargo xtask ext4 tier1`, preserving `.task16-live-after-tx-remount-retry-20260803.tmp`,
+  and teaching the crash campaign to replay completed `result.json` cuts and
+  clear the first stale incomplete job dir before retrying. Verification
+  passed `cargo test -p xtask run_workspace_resume_preserves_existing_temporary_state -- --test-threads=1`,
+  `cargo test -p xtask tier1_parse_accepts_resume_for_live_runs -- --test-threads=1`,
+  and `cargo test -p xtask ext4 -- --test-threads=1` (96). The resumed live
+  run is active again and has advanced past the old 0269 retry into cuts 0270
+  through 0275; it is still running toward the immutable G0-G7 receipt.
+
 - 2026-08-03 (ext4 Task16 secondary oracle image retention).
   Reduced live Tier 1 retained crash-cut images from 5 to 2 per cut while
   preserving immediate oracle verification. The Rust runner still lets the

@@ -1291,12 +1291,21 @@ fn allocate_owned_page() -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use tx_subsystems::device::{
+        BlockDevice, BlockDeviceOps, BlockDurabilityCapabilities, PhysicalBlockNumber,
+    };
     use tx_subsystems::io_manager::block::{BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
     use tx_subsystems::mount::{DevId, MountOptions, SourceLabel};
     use tx_subsystems::page_backed::{read_exact_at, PageContainerKind};
 
     struct PatternBlockDevice;
+
+    static RECORDING_EVENT: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_WRITE_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_BARRIER_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_BARRIER_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_DEVICE_FIRST_BYTE: AtomicU8 = AtomicU8::new(0);
 
     impl BlockDeviceOps for PatternBlockDevice {
         fn read_blocks(
@@ -1321,14 +1330,38 @@ mod tests {
         fn write_blocks(
             &self,
             _block_id: PhysicalBlockNumber,
-            _source: &[Frame],
+            source: &[Frame],
             _guard: &Guard<'_>,
         ) -> StepOutcome<(), NoProgress> {
+            let Some(frame) = source.first() else {
+                return StepOutcome::err(Errno::EINVAL.into());
+            };
+            let address = match page_allocator::frame_kernel_addr(frame.ppn()) {
+                Ok(address) => address,
+                Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
+            };
+            RECORDING_DEVICE_FIRST_BYTE.store(unsafe { *address }, Ordering::SeqCst);
+            RECORDING_WRITE_ORDER.store(
+                RECORDING_EVENT.fetch_add(1, Ordering::SeqCst) + 1,
+                Ordering::SeqCst,
+            );
             StepOutcome::done(())
         }
 
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            RECORDING_BARRIER_COUNT.fetch_add(1, Ordering::SeqCst);
+            RECORDING_BARRIER_ORDER.store(
+                RECORDING_EVENT.fetch_add(1, Ordering::SeqCst) + 1,
+                Ordering::SeqCst,
+            );
             StepOutcome::done(())
+        }
+
+        fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+            BlockDurabilityCapabilities {
+                fua: false,
+                flush: true,
+            }
         }
     }
 
@@ -1362,6 +1395,11 @@ mod tests {
             device::register_block_devices(PATTERN_REGS),
             StepOutcome::Done(())
         );
+        RECORDING_EVENT.store(0, Ordering::SeqCst);
+        RECORDING_WRITE_ORDER.store(0, Ordering::SeqCst);
+        RECORDING_BARRIER_ORDER.store(0, Ordering::SeqCst);
+        RECORDING_BARRIER_COUNT.store(0, Ordering::SeqCst);
+        RECORDING_DEVICE_FIRST_BYTE.store(0, Ordering::SeqCst);
     }
 
     fn bdevfs_mount_payload(bdevfs: &Arc<BdevFsMountPayload>) -> Cap<MountPayload> {
@@ -1507,5 +1545,39 @@ mod tests {
         assert_eq!(barrier.lba, LbaRange::new(0, 0));
         assert!(barrier.vecs.is_empty());
         assert!(barrier.flags.contains(BlockFlags::BARRIER));
+    }
+
+    #[test]
+    fn bdevfs_flushes_dirty_frame_before_exactly_one_barrier() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bdevfs_test();
+        let guard = step_engine::guard();
+        let bdevfs = BdevFsMountPayload::new();
+        let fs_object_id = match bdevfs.lookup(BDEVFS_ROOT_ID, b"vdr", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup vdr failed: {other:?}"),
+        };
+        let owned = allocate_owned_page().expect("recording frame");
+        let frame = Frame::new(owned.ppn());
+        page_allocator::testing::write_frame_bytes_for_test(frame.ppn(), 0, &[0xa5]);
+
+        assert_eq!(
+            bdevfs.flush_page(fs_object_id, 0, &frame, &guard),
+            StepOutcome::done(())
+        );
+        assert_eq!(
+            bdevfs.fsync_file(fs_object_id, &guard),
+            StepOutcome::done(())
+        );
+
+        assert_eq!(RECORDING_DEVICE_FIRST_BYTE.load(Ordering::SeqCst), 0xa5);
+        assert_eq!(RECORDING_BARRIER_COUNT.load(Ordering::SeqCst), 1);
+        assert!(
+            RECORDING_WRITE_ORDER.load(Ordering::SeqCst)
+                < RECORDING_BARRIER_ORDER.load(Ordering::SeqCst),
+            "dirty frame write must precede the durability barrier"
+        );
     }
 }

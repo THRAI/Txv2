@@ -479,26 +479,18 @@ def produce_result_if_verified(plan_path: Path, plan: dict[str, Any]) -> None:
         result["reason"] = "required e2fsck checks are missing"
         return
 
-    e2fsck_seen = False
+    if not validate_e2fsck_checks(checks, replay, result):
+        return
+
+    if not recover_replay_image(plan, job, replay, result):
+        return
+
     executed_checks: list[dict[str, Any]] = []
     for check in checks:
-        if not isinstance(check, dict) or check.get("tool") != "e2fsck":
-            result["reason"] = "only declared e2fsck checks are supported"
-            return
         args = check.get("args")
         log_value = check.get("log")
-        if (
-            not isinstance(args, list)
-            or not all(isinstance(arg, str) and arg for arg in args)
-            or not isinstance(log_value, str)
-            or not log_value
-        ):
-            result["reason"] = "e2fsck checks must declare -fn and a log path"
-            return
-        if args != ["-fn", str(replay)]:
-            result["reason"] = "e2fsck check must run -fn against the replay image"
-            return
-        e2fsck_seen = True
+        assert isinstance(args, list)
+        assert isinstance(log_value, str)
         log_path = Path(log_value)
         command = e2fsck_command() + args
         try:
@@ -531,10 +523,6 @@ def produce_result_if_verified(plan_path: Path, plan: dict[str, Any]) -> None:
             plan["executed_checks"] = executed_checks
             return
 
-    if not e2fsck_seen:
-        result["reason"] = "required e2fsck checks are missing"
-        return
-
     replay_matrix = execute_replay_matrix(plan, job, result)
     if replay_matrix is None:
         return
@@ -565,6 +553,79 @@ def produce_result_if_verified(plan_path: Path, plan: dict[str, Any]) -> None:
     result["status"] = "written"
     result["reason"] = "shell-test hard-kill observation, replay, e2fsck, and semantic oracles succeeded"
     result["e2fsck_exit"] = 0
+
+
+def validate_e2fsck_checks(checks: list[Any], replay: Path, result: dict[str, Any]) -> bool:
+    e2fsck_seen = False
+    for check in checks:
+        if not isinstance(check, dict) or check.get("tool") != "e2fsck":
+            result["reason"] = "only declared e2fsck checks are supported"
+            return False
+        args = check.get("args")
+        log_value = check.get("log")
+        if (
+            not isinstance(args, list)
+            or not all(isinstance(arg, str) and arg for arg in args)
+            or not isinstance(log_value, str)
+            or not log_value
+        ):
+            result["reason"] = "e2fsck checks must declare -fn and a log path"
+            return False
+        if args != ["-fn", str(replay)]:
+            result["reason"] = "e2fsck check must run -fn against the replay image"
+            return False
+        e2fsck_seen = True
+    if not e2fsck_seen:
+        result["reason"] = "required e2fsck checks are missing"
+        return False
+    return True
+
+
+def recover_replay_image(
+    plan: dict[str, Any], job: dict[str, Any], replay: Path, result: dict[str, Any]
+) -> bool:
+    command = matrix_command("TX_EXT4_FAULT_TX_REMOUNT_COMMAND", result)
+    if command is None:
+        return False
+    runner = require_object(plan, "runner")
+    cwd = require_string(runner, "cwd")
+    log = replay.with_name("replay-recovery.log")
+    if log.exists():
+        result["reason"] = f"refusing to overwrite replay recovery log: {log}"
+        return False
+    full_command = command + [
+        require_string(job, "case"),
+        require_string(job, "cut"),
+        str(replay),
+    ]
+    try:
+        completed = subprocess.run(
+            full_command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    except OSError as err:
+        result["reason"] = f"replay image recovery launch failed: {err}"
+        return False
+    log.write_text(completed.stdout, encoding="utf-8")
+    observation = {
+        "command": full_command,
+        "command_source": "repository-default",
+        "exit_code": completed.returncode,
+        "image": str(replay),
+        "image_sha256": sha256_file(replay) if replay.is_file() else None,
+        "log": str(log),
+        "log_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
+        "status": "ok" if completed.returncode == 0 else "failed",
+    }
+    plan["replay_image_recovery"] = observation
+    if completed.returncode != 0:
+        result["reason"] = "replay image recovery failed"
+        return False
+    return True
 
 
 def execute_semantic_oracles(
@@ -708,14 +769,15 @@ def execute_replay_matrix(
             command = matrix_command("TX_EXT4_FAULT_TX_REMOUNT_COMMAND", result)
             if command is None:
                 return None
-            prepare_replay_matrix_image(replay, image, prepared_images)
-            observation = run_matrix_command(
+            observation = run_tx_remount_matrix_command(
                 command
                 + [require_string(job, "case"), require_string(job, "cut"), str(image)],
                 entry,
+                replay,
                 log,
                 cwd,
                 result,
+                prepared_images,
             )
         else:
             result["reason"] = f"unsupported replay/remount matrix entry: {entry_id}"
@@ -731,6 +793,48 @@ def prepare_replay_matrix_image(replay: Path, image: Path, prepared_images: set[
         return
     copy_image_cow(replay, image)
     prepared_images.add(image)
+
+
+def run_tx_remount_matrix_command(
+    command: list[str],
+    entry: dict[str, Any],
+    replay: Path,
+    log: Path,
+    cwd: str,
+    result: dict[str, Any],
+    prepared_images: set[Path],
+) -> dict[str, Any] | None:
+    image = Path(require_string(entry, "image"))
+    attempts = []
+    for attempt in range(1, 4):
+        prepare_replay_matrix_image(replay, image, prepared_images)
+        observation = run_matrix_command(command, entry, log, cwd, result)
+        if observation is not None:
+            observation["attempt"] = attempt
+            if attempts:
+                observation["attempts"] = attempts
+            return observation
+        attempts.append(
+            {
+                "attempt": attempt,
+                "reason": result.get("reason", "tx-remount failed"),
+                "log": str(preserve_failed_matrix_log(log, attempt)),
+            }
+        )
+        image.unlink(missing_ok=True)
+        log.unlink(missing_ok=True)
+        prepared_images.discard(image)
+    result["reason"] = "replay/remount matrix entry failed after retries: tx-remount"
+    result["tx_remount_attempts"] = attempts
+    return None
+
+
+def preserve_failed_matrix_log(log: Path, attempt: int) -> Path:
+    if not log.is_file():
+        return log
+    attempt_log = log.with_name(f"{log.stem}.attempt-{attempt}{log.suffix}")
+    log.replace(attempt_log)
+    return attempt_log
 
 
 def preflight_replay_matrix(plan: dict[str, Any]) -> bool:

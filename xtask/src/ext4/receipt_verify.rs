@@ -1540,6 +1540,7 @@ fn verify_required_crash_cut_artifacts(
             "result",
             "serial",
             "replay-serial",
+            "replay-recovery-log",
             "e2fsck-log",
             "crash-image",
             "replay-image",
@@ -1621,6 +1622,15 @@ fn verify_crash_cut_job_result(
         &crash_cut_artifact_path(cut_id, "replay-image", artifacts, path)?,
         &job_request,
     )?;
+    let replay_recovery_log =
+        crash_cut_artifact_path(cut_id, "replay-recovery-log", artifacts, path)?;
+    verify_executor_plan_replay_image_recovery(
+        &executor_plan,
+        &case_id,
+        cut_id,
+        &replay_image,
+        &replay_recovery_log,
+    )?;
     let serial_log = required_bound_path(
         job,
         "serial_log",
@@ -1646,6 +1656,80 @@ fn verify_crash_cut_job_result(
         &phase_marker,
         &e2fsck_log,
     )?;
+    Ok(())
+}
+
+fn verify_executor_plan_replay_image_recovery(
+    executor_plan: &Path,
+    case_id: &str,
+    cut_id: &str,
+    replay_image: &Path,
+    replay_recovery_log: &Path,
+) -> Result<()> {
+    let plan_json = read_json(executor_plan)?;
+    require_schema(
+        &plan_json,
+        "tx.ext4.fault_qemu_executor_plan.v1",
+        executor_plan,
+    )?;
+    let plan = json_object(&plan_json, "fault executor plan", executor_plan)?;
+    let recovery = required_json_object(plan, "replay_image_recovery", executor_plan)?;
+    require_field_value(recovery, "status", "ok", executor_plan)?;
+    require_field_value(
+        recovery,
+        "command_source",
+        "repository-default",
+        executor_plan,
+    )?;
+    required_bound_path(recovery, "image", replay_image, executor_plan)?;
+    required_bound_path(recovery, "log", replay_recovery_log, executor_plan)?;
+    let exit_code = required_json_i32(recovery, "exit_code", executor_plan)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "{}: replay_image_recovery exit_code must be 0, found {exit_code}",
+            executor_plan.display()
+        ));
+    }
+
+    let repo_root = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current repository directory: {err}"))?;
+    let expected_command = vec![
+        repo_root
+            .join("tools/ext4/fault_tx_remount.py")
+            .display()
+            .to_string(),
+        case_id.to_string(),
+        cut_id.to_string(),
+        replay_image.display().to_string(),
+    ];
+    let command = required_json_string_array(recovery, "command", executor_plan)?;
+    if command != expected_command {
+        return Err(format!(
+            "{}: replay_image_recovery command mismatch",
+            executor_plan.display()
+        ));
+    }
+
+    let image_sha = required_json_string(recovery, "image_sha256", executor_plan)?;
+    verify_real_sha(
+        "replay_image_recovery image_sha256",
+        &image_sha,
+        executor_plan,
+    )?;
+    if image_sha != sha256_file(replay_image)? {
+        return Err(format!(
+            "{}: replay_image_recovery image_sha256 mismatch",
+            executor_plan.display()
+        ));
+    }
+    let log_sha = required_json_string(recovery, "log_sha256", executor_plan)?;
+    verify_real_sha("replay_image_recovery log_sha256", &log_sha, executor_plan)?;
+    if log_sha != sha256_file(replay_recovery_log)? {
+        return Err(format!(
+            "{}: replay_image_recovery log_sha256 mismatch",
+            executor_plan.display()
+        ));
+    }
     Ok(())
 }
 

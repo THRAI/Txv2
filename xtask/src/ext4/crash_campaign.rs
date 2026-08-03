@@ -1,14 +1,15 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::Result;
 use crate::shell_test;
 use crate::target::TxTarget;
+use crate::Result;
 
 use super::{
-    CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily, is_real_sha256, read_json, receipt,
-    run_workspace, sha256_file,
+    is_real_sha256, read_json, receipt, run_workspace, sha256_file, CrashCutCampaignPlan,
+    CrashCutCatalog, CrashCutFamily,
 };
 
 #[derive(Debug)]
@@ -190,11 +191,12 @@ pub(crate) fn execute_crash_cut_campaign(
     let manifest = write_crash_cut_execution_manifest(run, crash_cuts, campaign)?;
     run.record_artifact("crash-campaign-plan", manifest.clone())?;
 
-    let mut outcomes = Vec::with_capacity(crash_cuts.expanded_cut_count);
-    let mut families = Vec::new();
-    let mut seen_families = std::collections::BTreeSet::new();
+    let campaign_plan_sha256 = sha256_file(&manifest)?;
+    let (next_idx, mut families, mut outcomes) =
+        restore_completed_crash_cut_state(run, crash_cuts, &campaign_plan_sha256)?;
+    let mut seen_families = families.iter().cloned().collect::<BTreeSet<_>>();
 
-    for idx in 0..crash_cuts.expanded_cut_count {
+    for idx in next_idx..crash_cuts.expanded_cut_count {
         let family = &crash_cuts.families[idx % crash_cuts.families.len()];
         let phase_marker = family.phase_marker.as_deref().ok_or_else(|| {
             format!(
@@ -289,13 +291,100 @@ pub(crate) fn execute_crash_cut_campaign(
 
     let outcomes_path = write_crash_cut_outcome_manifest(
         run,
-        crash_cuts.expanded_cut_count,
+        outcomes.len(),
         crash_cuts.expanded_cut_count,
         families,
         outcomes,
     )?;
     run.record_artifact("crash-cut-outcomes", outcomes_path.clone())?;
     run_crash_cut_campaign(run, crash_cuts)
+}
+
+pub(crate) fn restore_completed_crash_cut_state(
+    run: &mut run_workspace::RunWorkspace,
+    crash_cuts: &CrashCutCatalog,
+    campaign_plan_sha256: &str,
+) -> Result<(usize, Vec<String>, Vec<CrashCutOutcome>)> {
+    let mut outcomes = Vec::new();
+    let mut families = Vec::new();
+    let mut seen_families = BTreeSet::new();
+
+    for idx in 0..crash_cuts.expanded_cut_count {
+        let family = &crash_cuts.families[idx % crash_cuts.families.len()];
+        let phase_marker = family.phase_marker.as_deref().ok_or_else(|| {
+            format!(
+                "crash family {} missing phase_marker for live execution",
+                family.id
+            )
+        })?;
+        let cut_id = format!("crash-cut-{idx:04}");
+        let job_dir = run.working_dir().join("crash-cuts").join(&cut_id);
+        let result_path = job_dir.join("result.json");
+        if !result_path.is_file() {
+            if job_dir.exists() {
+                fs::remove_dir_all(&job_dir).map_err(|err| {
+                    format!("failed to remove stale {}: {err}", job_dir.display())
+                })?;
+            }
+            return Ok((idx, families, outcomes));
+        }
+        let replay_serial_log = job_dir.join("replay-serial.log");
+        if !replay_serial_log.is_file() {
+            fs::remove_dir_all(&job_dir)
+                .map_err(|err| format!("failed to remove stale {}: {err}", job_dir.display()))?;
+            return Ok((idx, families, outcomes));
+        }
+        if seen_families.insert(family.id.clone()) {
+            families.push(family.id.clone());
+        }
+        let fault_job = FaultJobPaths {
+            request_path: job_dir.join("job-request.json"),
+            result_path: result_path.clone(),
+            executor_plan_path: job_dir.join("executor-plan.json"),
+            crash_image: job_dir.join("crash.img"),
+            replay_image: job_dir.join("replay.img"),
+            linux_replay_image: job_dir.join("linux-rw-replay.img"),
+            tx_remount_image: job_dir.join("tx-remount.img"),
+            serial_log: job_dir.join("serial.log"),
+            replay_serial_log,
+            replay_recovery_log: job_dir.join("replay-recovery.log"),
+            e2fsck_log: job_dir.join("e2fsck-fn.log"),
+            linux_rw_replay_log: job_dir.join("linux-rw-replay.log"),
+            linux_post_replay_e2fsck_log: job_dir.join("linux-post-replay-e2fsck.log"),
+            tx_remount_log: job_dir.join("tx-remount.log"),
+            semantic_oracle_request: job_dir.join("semantic-oracle-01-request.json"),
+            semantic_oracle_image: job_dir.join("semantic-oracle.img"),
+            semantic_oracle_log: job_dir.join("semantic-oracle.log"),
+            fault_executor_log: job_dir.join("fault-executor.log"),
+        };
+        record_existing_fault_job_artifacts(run, &cut_id, &fault_job)?;
+        let fault_result = parse_fault_job_result(
+            &fault_job.result_path,
+            &family.id,
+            &cut_id,
+            campaign_plan_sha256,
+            &fault_job.crash_image,
+            &fault_job.replay_image,
+            &fault_job.serial_log,
+            phase_marker,
+            &fault_job.e2fsck_log,
+        )?;
+        let immutable_image_sha256 = sha256_file(&fault_job.replay_image)?;
+        let replay_serial_sha256 = sha256_file(&fault_job.replay_serial_log)?;
+        run.record_artifact(
+            format!("{cut_id}-replay-serial"),
+            fault_job.replay_serial_log.clone(),
+        )?;
+        outcomes.push(CrashCutOutcome {
+            cut_id,
+            immutable_image_sha256,
+            replay_serial_sha256,
+            e2fsck_exit_code: fault_result.e2fsck_exit_code,
+            replay_exit_code: 0,
+        });
+    }
+
+    Ok((outcomes.len(), families, outcomes))
 }
 
 pub(crate) fn crash_cut_shell_test_args(
@@ -339,6 +428,7 @@ pub(crate) struct FaultJobPaths {
     pub(crate) tx_remount_image: PathBuf,
     pub(crate) serial_log: PathBuf,
     pub(crate) replay_serial_log: PathBuf,
+    pub(crate) replay_recovery_log: PathBuf,
     pub(crate) e2fsck_log: PathBuf,
     pub(crate) linux_rw_replay_log: PathBuf,
     pub(crate) linux_post_replay_e2fsck_log: PathBuf,
@@ -377,6 +467,7 @@ pub(crate) fn write_fault_job_request(
     let result_path = job_dir.join("result.json");
     let executor_plan_path = job_dir.join("executor-plan.json");
     let e2fsck_log = job_dir.join("e2fsck-fn.log");
+    let replay_recovery_log = job_dir.join("replay-recovery.log");
     let linux_rw_replay_log = job_dir.join("linux-rw-replay.log");
     let linux_post_replay_e2fsck_log = job_dir.join("linux-post-replay-e2fsck.log");
     let tx_remount_log = job_dir.join("tx-remount.log");
@@ -461,6 +552,7 @@ pub(crate) fn write_fault_job_request(
         tx_remount_image,
         serial_log,
         replay_serial_log,
+        replay_recovery_log,
         e2fsck_log,
         linux_rw_replay_log,
         linux_post_replay_e2fsck_log,
@@ -482,6 +574,7 @@ fn record_existing_fault_job_artifacts(
         ("result", &job.result_path),
         ("serial", &job.serial_log),
         ("e2fsck-log", &job.e2fsck_log),
+        ("replay-recovery-log", &job.replay_recovery_log),
         ("crash-image", &job.crash_image),
         ("replay-image", &job.replay_image),
         ("linux-rw-replay-log", &job.linux_rw_replay_log),
@@ -493,6 +586,7 @@ fn record_existing_fault_job_artifacts(
         ("semantic-oracle-request", &job.semantic_oracle_request),
         ("semantic-oracle-log", &job.semantic_oracle_log),
         ("fault-executor-log", &job.fault_executor_log),
+        ("replay-serial", &job.replay_serial_log),
     ] {
         if path.is_file() {
             run.record_artifact(format!("{cut_id}-{suffix}"), path.clone())?;

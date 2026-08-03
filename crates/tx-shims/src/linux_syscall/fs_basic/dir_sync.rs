@@ -323,6 +323,7 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
         page_backing,
         fs_object_id,
         page_container,
+        raw_block_device: rnode.meta().kind() == tx_subsystems::vfs::InodeKind::BlockDevice,
         state: tx_subsystems::page_backed::FileFsyncState::from_frontier(
             generation_frontier.clone(),
         ),

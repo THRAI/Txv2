@@ -67,7 +67,10 @@ pub use direct_io::{
 };
 pub use error_seq::{ErrorCursor, ErrorSeq};
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
+pub use lifecycle::{
+    step_fallocate, step_fsync, step_raw_block_fsync, step_truncate, FallocateOp, FsyncOp,
+    TruncateOp,
+};
 use lifecycle::{FileIoPayload, FileIoTerminalResult, OwnedFileIoRequest, PageDataLease};
 pub use range::{
     PageRange, RangeReservation, RangeReservationError, RangeReservationId, RangeReservationKind,

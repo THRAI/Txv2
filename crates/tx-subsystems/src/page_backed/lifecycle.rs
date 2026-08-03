@@ -277,6 +277,26 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
 }
 
 pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), PageProgress> {
+    step_fsync_with_logical_size(pc, guard, true)
+}
+
+/// Flush dirty raw-block pages and submit their durability barrier.
+///
+/// A block device has no mutable logical file length, so this deliberately
+/// omits the ordinary-file `truncate` phase while retaining the matching-
+/// generation dirty completion and data-before-barrier ordering.
+pub fn step_raw_block_fsync(
+    pc: &PageContainer,
+    guard: &Guard<'_>,
+) -> StepOutcome<(), PageProgress> {
+    step_fsync_with_logical_size(pc, guard, false)
+}
+
+fn step_fsync_with_logical_size(
+    pc: &PageContainer,
+    guard: &Guard<'_>,
+    persist_logical_size: bool,
+) -> StepOutcome<(), PageProgress> {
     // observe
     // upgrade
     // reserve
@@ -302,7 +322,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
     // Persist the logical size once data blocks are written back:
     // `flush_page` writes data only, so without this a fresh reopen
     // sees the inode's stale (create-time) size and reads zero bytes.
-    if pages_so_far > 0 {
+    if persist_logical_size && pages_so_far > 0 {
         let size = pc.size_bytes();
         match mount
             .payload()

@@ -196,6 +196,48 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.superblock
     }
 
+    /// Complete bounded classic-orphan cleanup after journal replay.
+    ///
+    /// This mirrors the supported destroy lifecycle for zero-link regular files,
+    /// empty directories, and fast symlinks, but applies it during mount recovery
+    /// before the filesystem is exposed.
+    pub fn recover_classic_orphan_chain(&mut self) -> Result<u32> {
+        let mut recovered = 0u32;
+        loop {
+            let head = self.current_last_orphan()?;
+            if head == 0 {
+                return Ok(recovered);
+            }
+            if recovered >= self.superblock.inodes_count {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            let plan = self.plan_destroy_inode(InodeNo::new(head), FsyncStamp::new(1))?;
+            for block in &plan.metadata {
+                self.image.write_block(block.home, &block.after)?;
+                self.image.invalidate_block(block.home);
+            }
+            self.image.barrier()?;
+            self.refresh_layout_after_recovery_write()?;
+            recovered = recovered
+                .checked_add(1)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+        }
+    }
+
+    fn current_last_orphan(&self) -> Result<u32> {
+        let mut page = [0; BLOCK_SIZE];
+        self.read_block(0, &mut page)?;
+        Ok(Superblock::parse(&page[1024..2048])?.last_orphan)
+    }
+
+    fn refresh_layout_after_recovery_write(&mut self) -> Result<()> {
+        let mut page = [0; BLOCK_SIZE];
+        self.read_block(0, &mut page)?;
+        self.superblock = Superblock::parse(&page[1024..2048])?;
+        self.groups = read_group_descs(&self.image, &self.superblock)?;
+        Ok(())
+    }
+
     /// Persist ext4's recovery-required state before admitting a journalled
     /// read-write mount. A later clean detach is the only path allowed to
     /// clear it.

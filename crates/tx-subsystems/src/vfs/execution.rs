@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::Guard;
-use crate::page_backed::{FileFsyncFrontier, FsPageBacking};
+use crate::page_backed::{FileFsyncFrontier, FsPageBacking, PageContainerKind};
 use crate::tty;
 use crate::vfs::adapter::step_engine::{
     self, ByteProgress, Cap, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
@@ -1986,6 +1986,7 @@ pub struct FileFsyncOp {
     pub page_backing: alloc::sync::Arc<dyn crate::page_backed::FsPageBacking>,
     pub fs_object_id: super::structure::FsObjectId,
     pub page_container: Option<crate::adapter::step_engine::Cap<crate::page_backed::PageContainer>>,
+    pub raw_block_device: bool,
     pub state: crate::page_backed::FileFsyncState,
 }
 
@@ -1995,6 +1996,23 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
         if let Some(container) = &self.page_container {
+            let PageContainerKind::File { mount, .. } = container.kind() else {
+                return V3::Err(crate::execution::Errno::EINVAL.into());
+            };
+            if self.raw_block_device && mount.payload().backend_planner().is_none() {
+                let guard = step_engine::guard();
+                return match crate::page_backed::step_raw_block_fsync(container, &guard) {
+                    V3::Done(()) => V3::Done(()),
+                    V3::Err(e) => V3::Err(e),
+                    V3::Continue { .. } => V3::Continue {
+                        progress: NoProgress,
+                    },
+                    V3::Yield { shape, .. } => V3::Yield {
+                        progress: NoProgress,
+                        shape,
+                    },
+                };
+            }
             match self.state.advance(container) {
                 Err(errno) => V3::Err(errno.into()),
                 Ok(

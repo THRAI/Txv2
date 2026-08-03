@@ -39,7 +39,7 @@
     "phase_marker_count": 13,
     "phase_markers_sha256": "7b440cbef725d936ec6ebcada178cc2a2397e6311e332f46368af23678e19ade",
     "workload_script_sha256": "49f034c9d90975d12db84f7b68538afbc3a7b134cfbfbdcedb7c4e57d65a0ff2",
-    "replay_script_sha256": "e1decae32bbe82cd177853d9252e999ff05dd658c22fe96d9d93e408068eae4f",
+    "replay_script_sha256": "2d373199349a209bc91681876ecb7ae580bff719a079d5b31f0f5abd55bde69e",
     "kill_policy": "deterministic-phase-marker-v1",
     "e2fsck_mode": "immutable-copy"
   },

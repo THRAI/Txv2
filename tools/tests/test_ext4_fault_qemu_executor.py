@@ -555,10 +555,17 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                 "print(" + repr("shell-test: stop needle observed: " + marker) + ", flush=True)"
             )
             e2fsck_program = (
-                "import sys; "
+                "import pathlib, sys; "
                 "expected = " + repr(["-fn", str(replay_image)]) + "; "
                 "assert sys.argv[1:] == expected, (sys.argv[1:], expected); "
+                "assert pathlib.Path(sys.argv[-1]).read_bytes().endswith(b'-recovered'); "
                 "print('fake e2fsck', *sys.argv[1:])"
+            )
+            recovery_program = (
+                "import pathlib, sys; "
+                "path = pathlib.Path(sys.argv[-1]); "
+                "path.write_bytes(path.read_bytes() + b'-recovered'); "
+                "print('fake recovery', *sys.argv[1:])"
             )
             plan = {
                 "schema": "tx.ext4.fault_qemu_executor_plan.v1",
@@ -601,6 +608,10 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                     "TX_EXT4_FAULT_RUNNER_COMMAND": "",
                 },
                 clear=False,
+            ), mock.patch.object(
+                module,
+                "matrix_command",
+                return_value=[sys.executable, "-c", recovery_program],
             ):
                 module.execute_prepared_runner(plan_path)
             executor_plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -611,6 +622,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
 
         self.assertEqual(executor_plan["runner"]["command_source"], "shell-test-command")
         self.assertEqual(executor_plan["hard_kill"]["status"], "observed-by-shell-test")
+        self.assertEqual(executor_plan["replay_image_recovery"]["status"], "ok")
         self.assertEqual(result["schema"], "tx.ext4.fault_job_result.v1")
         self.assertEqual(result["case"], "write_fsync")
         self.assertEqual(result["cut"], "after-commit")
@@ -691,6 +703,10 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                 os.environ,
                 {"TX_EXT4_FAULT_E2FSCK_COMMAND": shlex.join([sys.executable, "-c", e2fsck_program])},
                 clear=False,
+            ), mock.patch.object(
+                module,
+                "matrix_command",
+                return_value=[sys.executable, "-c", "print('recover')"],
             ):
                 module.execute_prepared_runner(plan_path)
             executor_plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -815,6 +831,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                 module.subprocess,
                 "run",
                 side_effect=[
+                    subprocess.CompletedProcess(["tx-remount"], 0, "recover\n", ""),
                     subprocess.CompletedProcess(["e2fsck"], 0, "fsck\n", ""),
                     subprocess.CompletedProcess(
                         [
@@ -885,6 +902,10 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
                     "TX_EXT4_FAULT_SEMANTIC_ORACLE_COMMAND": "",
                 },
                 clear=False,
+            ), mock.patch.object(
+                module,
+                "matrix_command",
+                return_value=[sys.executable, "-c", "print('recover')"],
             ):
                 module.produce_result_if_verified(plan_path, plan)
 
@@ -1470,6 +1491,58 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
             command_calls,
             [["fault-tx-remount", "rename_replace", "after-commit", str(remount)]],
         )
+
+    def test_tx_remount_matrix_retries_with_fresh_replay_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            replay = root / "replay.img"
+            replay.write_bytes(b"replay")
+            remount = root / "tx-remount.img"
+            log = root / "tx-remount.log"
+            plan = {"runner": {"cwd": str(ROOT)}}
+            job = {
+                "case": "rename_replace",
+                "cut": "after-commit",
+                "replay_image": str(replay),
+                "replay_matrix": [
+                    {
+                        "id": "tx-remount",
+                        "image": str(remount),
+                        "log": str(log),
+                    }
+                ],
+            }
+            result = {}
+            module = load_executor_module()
+            calls = []
+
+            def flaky_command(command, entry, current_log, cwd, current_result):
+                calls.append(remount.read_bytes())
+                current_log.write_text(f"attempt {len(calls)}\n", encoding="utf-8")
+                if len(calls) == 1:
+                    current_result["reason"] = "transient tx-remount failure"
+                    return None
+                return {
+                    **entry,
+                    "exit_code": 0,
+                    "log_sha256": hashlib.sha256(current_log.read_bytes()).hexdigest(),
+                    "image_sha256": hashlib.sha256(remount.read_bytes()).hexdigest(),
+                }
+
+            with mock.patch.object(
+                module,
+                "matrix_command",
+                return_value=["fault-tx-remount"],
+            ), mock.patch.object(module, "run_matrix_command", side_effect=flaky_command):
+                observations = module.execute_replay_matrix(plan, job, result)
+
+            self.assertIsNotNone(observations)
+            assert observations is not None
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls, [b"replay", b"replay"])
+            self.assertEqual(observations[0]["attempt"], 2)
+            self.assertTrue((root / "tx-remount.attempt-1.log").is_file())
+            self.assertEqual(remount.read_bytes(), b"replay")
 
 
 if __name__ == "__main__":

@@ -2,14 +2,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::crash_campaign::restore_completed_crash_cut_state;
 use super::live_preflight::collect_storage_capacity_preflight_for_test;
 use super::{
+    crash_cut_shell_test_args, parse_fault_job_result, parse_tier1_args, parse_xfstests_summary,
+    run_and_record_command, run_crash_cut_campaign, run_live_preflight,
+    run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts, tier1_shell_test_args,
+    verify_xfstests_source_lock, write_fault_job_request, xfstests_selected_cases_sha256,
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
-    CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
-    parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_and_record_command,
-    run_crash_cut_campaign, run_live_preflight, run_workspace::RunWorkspace, sha256_file,
-    stage_authority_artifacts, tier1_shell_test_args, verify_xfstests_source_lock,
-    write_fault_job_request, xfstests_selected_cases_sha256,
+    CrashCutOutcome, Tier1Authorities, XfstestsSourceLock,
 };
 use crate::target::TxTarget;
 
@@ -85,18 +86,15 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         run.record_child(child);
         run.mark_failed_for_test("child-exit");
     }
-    assert!(
-        root.join("target/ext4/tier1/failed-run/failed-receipt.json")
-            .exists()
-    );
-    assert!(
-        root.join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
-            .exists()
-    );
-    assert!(
-        root.join("target/ext4/tier1/failed-run/receipt-lock.json")
-            .exists()
-    );
+    assert!(root
+        .join("target/ext4/tier1/failed-run/failed-receipt.json")
+        .exists());
+    assert!(root
+        .join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
+        .exists());
+    assert!(root
+        .join("target/ext4/tier1/failed-run/receipt-lock.json")
+        .exists());
     let artifacts: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap(),
     )
@@ -134,6 +132,20 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         sha256_file(&root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap()
     );
     assert!(!temp.exists());
+}
+
+#[test]
+fn run_workspace_resume_preserves_existing_temporary_state() {
+    let root = temp_root("resume");
+    let temp_dir = root.join("target/ext4/tier1/.resume-run.tmp");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let marker = temp_dir.join("marker.txt");
+    write_text(&marker, "keep-me\n");
+
+    let run = RunWorkspace::resume(&root, "resume-run").unwrap();
+
+    assert_eq!(run.temporary_path_for_test(), temp_dir);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "keep-me\n");
 }
 
 #[test]
@@ -322,6 +334,19 @@ fn tier1_parse_accepts_live_preflight_mode() {
 }
 
 #[test]
+fn tier1_parse_accepts_resume_for_live_runs() {
+    let root = temp_root("resume-parse");
+    write_tier1_authority_fixture(&root);
+
+    let invocation =
+        parse_tier1_args(&root, &["tier1".into(), "--resume".into()]).expect("parse resume");
+
+    assert!(invocation.resume);
+    assert!(!invocation.dry_run);
+    assert!(!invocation.preflight_live);
+}
+
+#[test]
 fn tier1_parse_rejects_preflight_report_without_live_preflight() {
     let root = temp_root("preflight-report-without-live");
     write_tier1_authority_fixture(&root);
@@ -403,16 +428,14 @@ fn tier1_live_preflight_writes_durable_blocker_report() {
         value["authorities"]["xfstests_selection"]["status"],
         "selection-authority-declared"
     );
-    assert!(
-        value["result"]["blockers"]
-            .as_array()
+    assert!(value["result"]["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|blocker| blocker
-                .as_str()
-                .unwrap()
-                .contains("pinned xfstests source is missing"))
-    );
+            .contains("pinned xfstests source is missing")));
 }
 
 #[test]
@@ -711,9 +734,7 @@ fn tier1_live_rejects_acceptance_ready_xfstests_without_readiness_evidence() {
         .unwrap()
         .ensure_live_acceptance_ready()
         .expect_err("status-only xfstests readiness must fail");
-    assert!(
-        error.contains("xfstests selection is acceptance-ready but missing readiness_evidence")
-    );
+    assert!(error.contains("xfstests selection is acceptance-ready but missing readiness_evidence"));
 }
 
 #[test]
@@ -1035,13 +1056,11 @@ fn tier1_fault_job_request_binds_repository_executor_inputs() {
         value["job"]["semantic_oracles"][0]["expected"]["present"]["/"],
         serde_json::json!({})
     );
-    assert!(
-        fixture
-            .run
-            .working_dir()
-            .join("crash-cuts/crash-cut-0007/job-request.json")
-            .is_file()
-    );
+    assert!(fixture
+        .run
+        .working_dir()
+        .join("crash-cuts/crash-cut-0007/job-request.json")
+        .is_file());
 }
 
 #[test]
@@ -1591,6 +1610,65 @@ fn tier1_crash_cut_campaign_writes_deterministic_manifest_before_executor_error(
         "tx.ext4.crash.phase.D0"
     );
     assert_eq!(cuts[999]["immutable_image"], "crash-cut-0999.img");
+}
+
+#[test]
+fn tier1_crash_cut_resume_discards_result_without_replay_serial() {
+    let root = temp_root("crash-cut-resume-missing-replay-serial");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
+    let stale_cut = run.working_dir().join("crash-cuts").join("crash-cut-0000");
+    fs::create_dir_all(&stale_cut).unwrap();
+    write_json(
+        &stale_cut.join("result.json"),
+        r#"{"schema":"tx.ext4.fault_job_result.v1"}"#,
+    );
+
+    let (next_idx, families, outcomes) =
+        restore_completed_crash_cut_state(&mut run, &catalog, &"a".repeat(64)).unwrap();
+
+    assert_eq!(next_idx, 0);
+    assert!(families.is_empty());
+    assert!(outcomes.is_empty());
+    assert!(!stale_cut.exists());
 }
 
 #[test]

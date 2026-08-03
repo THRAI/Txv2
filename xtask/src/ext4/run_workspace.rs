@@ -22,6 +22,14 @@ pub(crate) struct RunWorkspace {
 #[allow(dead_code)]
 impl RunWorkspace {
     pub(crate) fn create(root: &Path, run_id: &str) -> Result<Self> {
+        Self::create_with_mode(root, run_id, false)
+    }
+
+    pub(crate) fn resume(root: &Path, run_id: &str) -> Result<Self> {
+        Self::create_with_mode(root, run_id, true)
+    }
+
+    fn create_with_mode(root: &Path, run_id: &str, preserve_existing: bool) -> Result<Self> {
         let base = root.join("target/ext4/tier1");
         let final_dir = base.join(run_id);
         let temporary = base.join(format!(".{run_id}.tmp"));
@@ -31,7 +39,7 @@ impl RunWorkspace {
                 final_dir.display()
             ));
         }
-        if temporary.exists() {
+        if temporary.exists() && !preserve_existing {
             fs::remove_dir_all(&temporary)
                 .map_err(|err| format!("failed to remove stale {}: {err}", temporary.display()))?;
         }
@@ -70,6 +78,10 @@ impl RunWorkspace {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
+        if destination.is_file() {
+            fs::remove_file(&destination)
+                .map_err(|err| format!("failed to remove {}: {err}", destination.display()))?;
+        }
         fs::copy(source, &destination).map_err(|err| {
             format!(
                 "failed to copy {} -> {}: {err}",
@@ -88,6 +100,10 @@ impl RunWorkspace {
         file_name: &str,
     ) -> Result<PathBuf> {
         let destination = self.temporary.join(file_name);
+        if destination.is_file() {
+            fs::remove_file(&destination)
+                .map_err(|err| format!("failed to remove {}: {err}", destination.display()))?;
+        }
         copy_image_cow(source, &destination)?;
         self.record_artifact(name, destination.clone())?;
         Ok(destination)
@@ -111,6 +127,10 @@ impl RunWorkspace {
 
     pub(crate) fn record_child(&mut self, child: Child) {
         self.child_processes.push(child);
+    }
+
+    pub(crate) fn mark_failed(&mut self, reason: impl Into<String>) {
+        self.failure_reason = Some(reason.into());
     }
 
     pub(crate) fn mark_failed_for_test(&mut self, reason: &str) {

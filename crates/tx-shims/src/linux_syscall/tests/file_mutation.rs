@@ -784,6 +784,53 @@ fn dispatch_unlinkat_open_regular_file_defers_destroy() {
 }
 
 #[test]
+fn dispatch_unlinkat_open_regular_file_defers_destroy_without_cached_dentry() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"open-fd");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry.clone());
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/open-fd");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /open-fd: {other:?}"),
+    };
+    root_dentry.remove_cached_child_by_name(b"open-fd");
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"open-fd"),
+        "/open-fd name must be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "open fd must defer zero-link storage destroy even without cached dentry"
+    );
+    assert!(proc_cap.fd(fd as u32).is_some(), "fd remains open");
+    drop(path);
+}
+
+#[test]
 fn dispatch_close_last_unlinked_regular_file_destroys_inode() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
