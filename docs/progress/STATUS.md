@@ -1,3 +1,23 @@
+- 2026-08-04 (ext4 Task16 D10 replay restore retry).
+  Fixed the next Task 16 harness blocker from
+  `task16-live-recovery-retry-20260804` without promoting final acceptance.
+  `crash-cut-0725` preserved a valid `crash.img`, but the first Tx remount
+  recovery attempt timed out after recovery had already changed `replay.img`;
+  treating that mutated failed replay as the retry input was unsafe. The fault
+  executor now keeps the retry bound at three attempts, records the failed
+  attempt log and mutated-image evidence, restores `replay.img` from the
+  preserved `crash.img` with a fresh CoW clone, and only continues if that
+  crash-source restore succeeds. If no crash source exists or restoration
+  fails, it still fail-closes. Verification passed the focused new replay
+  restore tests, the full Python fault executor suite (37), and a real D10
+  single-cut Tx remount/readback/umount probe from
+  `target/ext4/tier1/.task16-live-recovery-retry-20260804.tmp/crash-cuts/crash-cut-0725/crash.img`
+  in about 7.7s. Task 16 remains open: use
+  `cargo xtask ext4 tier1 --start-cut crash-cut-0725` or the matching
+  `--resume --start-cut` diagnostic path to find the next blocker before any
+  expensive fresh 0..999 acceptance run, and do not claim G0-G7 until a full
+  fresh 1000-cut QEMU/e2fsck/xfstests receipt verifies.
+
 - 2026-08-04 (ext4 Task16 D10 start-cut recovery path).
   The fresh current-source run
   `task16-live-recovery-retry-20260804` advanced past the old D5

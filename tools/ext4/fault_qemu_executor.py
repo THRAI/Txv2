@@ -599,6 +599,8 @@ def recover_replay_image(
         str(replay),
     ]
     initial_image_sha256 = sha256_file(replay) if replay.is_file() else None
+    crash_value = job.get("crash_image")
+    crash = Path(crash_value) if isinstance(crash_value, str) and crash_value else None
     attempts: list[dict[str, Any]] = []
     completed: subprocess.CompletedProcess[str] | None = None
     for attempt in range(1, 4):
@@ -618,19 +620,21 @@ def recover_replay_image(
         if completed.returncode == 0:
             break
         failed_image_sha256 = sha256_file(replay) if replay.is_file() else None
-        attempts.append(
-            {
-                "attempt": attempt,
-                "exit_code": completed.returncode,
-                "image_sha256": failed_image_sha256,
-                "log": str(preserve_failed_matrix_log(log, attempt)),
-                "log_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
-                "reason": "replay image recovery failed",
-            }
-        )
+        attempt_observation = {
+            "attempt": attempt,
+            "exit_code": completed.returncode,
+            "image_sha256": failed_image_sha256,
+            "log": str(preserve_failed_matrix_log(log, attempt)),
+            "log_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
+            "reason": "replay image recovery failed",
+        }
         if failed_image_sha256 != initial_image_sha256:
-            result["reason"] = "replay image recovery failed after mutating replay image"
-            break
+            attempt_observation["mutated_replay_image"] = True
+            if not restore_replay_from_crash_image(crash, replay, attempt_observation, result):
+                attempts.append(attempt_observation)
+                break
+            initial_image_sha256 = sha256_file(replay) if replay.is_file() else None
+        attempts.append(attempt_observation)
         if attempt == 3:
             result["reason"] = "replay image recovery failed after retries"
 
@@ -654,6 +658,33 @@ def recover_replay_image(
     if completed.returncode != 0:
         result.setdefault("reason", "replay image recovery failed")
         return False
+    return True
+
+
+def restore_replay_from_crash_image(
+    crash: Path | None,
+    replay: Path,
+    attempt_observation: dict[str, Any],
+    result: dict[str, Any],
+) -> bool:
+    unavailable_reason = (
+        "replay image recovery failed after mutating replay image "
+        "and crash image restore is unavailable"
+    )
+    if crash is None or not crash.is_file():
+        result["reason"] = unavailable_reason
+        return False
+    try:
+        crash_sha256 = sha256_file(crash)
+        replay.unlink(missing_ok=True)
+        copy_image_cow(crash, replay)
+        restored_sha256 = sha256_file(replay)
+    except (FaultQemuExecutorError, OSError) as err:
+        result["reason"] = f"{unavailable_reason}: {err}"
+        return False
+    attempt_observation["restored_from_crash_image"] = str(crash)
+    attempt_observation["restored_from_crash_image_sha256"] = crash_sha256
+    attempt_observation["restored_replay_image_sha256"] = restored_sha256
     return True
 
 
