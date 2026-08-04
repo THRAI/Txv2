@@ -26,6 +26,8 @@ use live_preflight::run_live_preflight;
 pub(crate) use receipt_verify::verify_tier1_receipt;
 
 const XFSTESTS_DOCKER_IMAGE_ENV: &str = "TX_EXT4_XFSTESTS_DOCKER_IMAGE";
+const DEFAULT_XFSTESTS_DOCKER_IMAGE: &str = "tx-ext4-e2fsprogs:local";
+const XFSTESTS_DOCKER_WRAPPER: &str = "tools/ext4/tier1_xfstests_docker.py";
 const G0_EXT4_LINTS: &[&str] = &[
     "ext4-lifecycle-ownership",
     "ext4-no-direct-home-write",
@@ -129,6 +131,14 @@ fn run_live_tier1(
         }
     }
     let xfstests_backend = xfstests_execution_backend()?;
+    let xfstests_root =
+        ensure_xfstests_root(root, run, &invocation.authorities.selection.source_lock)?;
+    run_xfstests_execution_preflight(
+        root,
+        &xfstests_backend,
+        &xfstests_root,
+        &invocation.authorities.selection.cases,
+    )?;
 
     run_g0_lints(root, run)?;
 
@@ -1443,13 +1453,13 @@ fn run_capture(cwd: &Path, program: &str, args: &[String]) -> Result<(i32, Strin
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum XfstestsExecutionBackend {
+pub(super) enum XfstestsExecutionBackend {
     HostLinux,
     DockerLinux { image: String },
 }
 
 #[derive(Debug)]
-struct XfstestsCommand {
+pub(super) struct XfstestsCommand {
     cwd: PathBuf,
     program: String,
     args: Vec<String>,
@@ -1467,6 +1477,7 @@ impl XfstestsExecutionBackend {
         &self,
         root: &Path,
         xfstests_root: &Path,
+        work_dir: &Path,
         check_args: &[String],
     ) -> Result<XfstestsCommand> {
         match self {
@@ -1483,23 +1494,19 @@ impl XfstestsExecutionBackend {
                     )
                 })?;
                 let mut args = vec![
-                    "run".into(),
-                    "--rm".into(),
-                    "--privileged".into(),
-                    "--mount".into(),
-                    format!(
-                        "type=bind,source={},target=/xfstests",
-                        xfstests_root.display()
-                    ),
-                    "-w".into(),
-                    "/xfstests".into(),
+                    XFSTESTS_DOCKER_WRAPPER.into(),
+                    "--image".into(),
                     image.clone(),
-                    "./check".into(),
+                    "--xfstests-root".into(),
+                    xfstests_root.display().to_string(),
+                    "--work-dir".into(),
+                    work_dir.display().to_string(),
+                    "--".into(),
                 ];
                 args.extend(check_args.iter().cloned());
                 Ok(XfstestsCommand {
                     cwd: root.to_path_buf(),
-                    program: "docker".into(),
+                    program: "python3".into(),
                     args,
                 })
             }
@@ -1524,33 +1531,98 @@ fn xfstests_execution_backend_for_host(
     if host_os == "linux" {
         return Ok(XfstestsExecutionBackend::HostLinux);
     }
-    if let Some(image) = docker_image
+    let image = docker_image
         .map(str::trim)
         .filter(|image| !image.is_empty())
-    {
-        if !docker_available {
-            return Err(format!(
-                "xfstests requires Linux execution; {XFSTESTS_DOCKER_IMAGE_ENV} is set but docker is not available"
-            ));
-        }
-        return Ok(XfstestsExecutionBackend::DockerLinux {
-            image: image.to_string(),
-        });
+        .unwrap_or(DEFAULT_XFSTESTS_DOCKER_IMAGE);
+    if !docker_available {
+        return Err(format!(
+            "xfstests requires Linux execution; host OS is {host_os}; docker is not available for the repo-owned Linux wrapper"
+        ));
     }
-    Err(format!(
-        "xfstests requires Linux execution; host OS is {host_os}; set {XFSTESTS_DOCKER_IMAGE_ENV} to a prepared privileged Linux xfstests image"
-    ))
+    Ok(XfstestsExecutionBackend::DockerLinux {
+        image: image.to_string(),
+    })
 }
 
 fn run_xfstests_capture(
     root: &Path,
     backend: &XfstestsExecutionBackend,
     xfstests_root: &Path,
+    work_dir: &Path,
     args: &[String],
 ) -> Result<(i32, String, XfstestsCommand)> {
-    let command = backend.command(root, xfstests_root, args)?;
+    let command = backend.command(root, xfstests_root, work_dir, args)?;
     let (code, output) = run_capture(&command.cwd, &command.program, &command.args)?;
     Ok((code, output, command))
+}
+
+fn run_xfstests_execution_preflight(
+    root: &Path,
+    backend: &XfstestsExecutionBackend,
+    xfstests_root: &Path,
+    cases: &[String],
+) -> Result<()> {
+    let command = match xfstests_docker_preflight_command(root, backend, xfstests_root, cases) {
+        Ok(command) => command,
+        Err(err) if matches!(backend, XfstestsExecutionBackend::HostLinux) => {
+            let _ = err;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    let (code, output) = run_capture(&command.cwd, &command.program, &command.args)?;
+    if code == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "xfstests Docker preflight blocked: {}",
+        last_nonempty_output_line(&output)
+    ))
+}
+
+pub(super) fn xfstests_docker_preflight_command(
+    root: &Path,
+    backend: &XfstestsExecutionBackend,
+    xfstests_root: &Path,
+    cases: &[String],
+) -> Result<XfstestsCommand> {
+    let XfstestsExecutionBackend::DockerLinux { image } = backend else {
+        return Err("host-linux xfstests backend does not use the Docker wrapper".into());
+    };
+    let xfstests_root = xfstests_root.canonicalize().map_err(|err| {
+        format!(
+            "failed to canonicalize xfstests root {} for Docker execution: {err}",
+            xfstests_root.display()
+        )
+    })?;
+    let mut args = vec![
+        XFSTESTS_DOCKER_WRAPPER.into(),
+        "--preflight".into(),
+        "--image".into(),
+        image.clone(),
+        "--xfstests-root".into(),
+        xfstests_root.display().to_string(),
+    ];
+    for case in cases {
+        args.push("--case".into());
+        args.push(case.clone());
+    }
+    Ok(XfstestsCommand {
+        cwd: root.to_path_buf(),
+        program: "python3".into(),
+        args,
+    })
+}
+
+fn last_nonempty_output_line(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output")
+        .to_string()
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -1713,9 +1785,11 @@ fn run_xfstests_selection(
     }
 
     let tests = authorities.selection.cases.clone();
+    let xfstests_work_dir = run.working_dir().join("xfstests-docker");
     let mut args = Vec::with_capacity(tests.len() + 1);
     args.push("--help".into());
-    let (help_code, help_output, _) = run_xfstests_capture(root, backend, &xfstests_root, &args)?;
+    let (help_code, help_output, _) =
+        run_xfstests_capture(root, backend, &xfstests_root, &xfstests_work_dir, &args)?;
     if help_code != 0 && help_output.is_empty() {
         return Err(format!(
             "xfstests check helper at {} did not execute successfully",
@@ -1724,7 +1798,13 @@ fn run_xfstests_selection(
     }
 
     let case_args = tests.clone();
-    let (code, output, command) = run_xfstests_capture(root, backend, &xfstests_root, &case_args)?;
+    let (code, output, command) = run_xfstests_capture(
+        root,
+        backend,
+        &xfstests_root,
+        &xfstests_work_dir,
+        &case_args,
+    )?;
     let log_path = run.working_dir().join("xfstests.log");
     fs::write(&log_path, &output)
         .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;

@@ -1,3 +1,21 @@
+- 2026-08-04 (ext4 Task16 repo-owned xfstests Docker preflight).
+  Moved the non-Linux xfstests failure point ahead of G0/build/QEMU by adding a
+  repository-owned Docker wrapper for the pinned Tier 1 selection. Non-Linux
+  live runs now default to `tx-ext4-e2fsprogs:local` unless
+  `TX_EXT4_XFSTESTS_DOCKER_IMAGE` overrides it, run
+  `tools/ext4/tier1_xfstests_docker.py --preflight` before the long Tier 1
+  path, and execute Docker-backed xfstests through the same wrapper with
+  run-local TEST/SCRATCH loop images. Fresh short preflight
+  `target/ext4/tier1/preflight/task16-xfstests-wrapper-preflight-20260804.json`
+  fails in 3.5s with `xfstests_linux_execution_ready=false`; current blockers
+  are the unbuilt pinned xfstests helpers (`ltp/fsstress`, `ltp/fsx`,
+  `src/feature`, `src/godown`, `src/min_dio_alignment`,
+  `src/t_rename_overwrite`) and local storage
+  (`available=3400409088`, `required=4517265408`). This is a failure-point
+  runner improvement only: Task 16 still needs a Linux-capable built xfstests
+  source, enough storage, full fresh 1000-cut QEMU/e2fsck evidence, immutable
+  receipt generation, and `--verify-receipt`.
+
 - 2026-08-04 (ext4 Task16 failed-run start-cut resume).
   Tightened the failure-point resume path after
   `task16-d10-startcut-postfix-20260804` proved the old D10 blocker was fixed

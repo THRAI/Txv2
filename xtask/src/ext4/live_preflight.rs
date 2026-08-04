@@ -5,7 +5,7 @@ use std::process::Command;
 use super::{
     CrashCutCampaignPlan, CrashCutFamily, Tier1Authorities, XFSTESTS_DOCKER_IMAGE_ENV,
     XfstestsSourceLock, resolve_repo_path, run_workspace, verify_xfstests_source_lock,
-    xfstests_execution_backend_for_host,
+    xfstests_docker_preflight_command, xfstests_execution_backend_for_host,
 };
 use crate::Result;
 use crate::image;
@@ -63,7 +63,12 @@ pub(super) fn run_live_preflight(
         xfstests_source_prepared = true;
     }
     let linux_rw_replay_ready = collect_linux_replay_preflight(root, &mut blockers);
-    let xfstests_linux_execution_ready = collect_xfstests_execution_preflight(&mut blockers);
+    let xfstests_linux_execution_ready = collect_xfstests_execution_preflight(
+        root,
+        authorities,
+        xfstests_selected_cases_verified,
+        &mut blockers,
+    );
     let storage_capacity = collect_storage_capacity_preflight(root, authorities, &mut blockers);
     if let Some(report_path) = report_path {
         write_live_preflight_report(
@@ -502,19 +507,68 @@ fn collect_linux_replay_preflight(root: &Path, blockers: &mut Vec<String>) -> bo
     false
 }
 
-fn collect_xfstests_execution_preflight(blockers: &mut Vec<String>) -> bool {
+fn collect_xfstests_execution_preflight(
+    root: &Path,
+    authorities: &Tier1Authorities,
+    xfstests_source_ready: bool,
+    blockers: &mut Vec<String>,
+) -> bool {
     let docker_image = std::env::var(XFSTESTS_DOCKER_IMAGE_ENV).ok();
-    match xfstests_execution_backend_for_host(
+    let backend = match xfstests_execution_backend_for_host(
         std::env::consts::OS,
         docker_image.as_deref(),
         command_exists("docker"),
     ) {
-        Ok(_) => true,
+        Ok(backend) => backend,
         Err(err) => {
             blockers.push(err);
-            false
+            return false;
         }
+    };
+    if std::env::consts::OS == "linux" {
+        return true;
     }
+    if !xfstests_source_ready {
+        blockers.push(
+            "pinned xfstests source is not ready, cannot preflight Linux xfstests execution".into(),
+        );
+        return false;
+    }
+    let source_root = authorities.selection.source_lock.root_path(root);
+    let command = match xfstests_docker_preflight_command(
+        root,
+        &backend,
+        &source_root,
+        &authorities.selection.cases,
+    ) {
+        Ok(command) => command,
+        Err(err) => {
+            blockers.push(format!("xfstests Docker preflight blocked: {err}"));
+            return false;
+        }
+    };
+    let output = match Command::new(&command.program)
+        .current_dir(&command.cwd)
+        .args(&command.args)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            blockers.push(format!(
+                "failed to run xfstests Docker preflight {}: {err}",
+                command.program
+            ));
+            return false;
+        }
+    };
+    if output.status.success() {
+        return true;
+    }
+    blockers.push(format!(
+        "xfstests Docker preflight blocked: {}",
+        linux_replay_preflight_reason(&output)
+    ));
+    false
 }
 
 fn linux_replay_preflight_reason(output: &std::process::Output) -> String {

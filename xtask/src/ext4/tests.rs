@@ -15,8 +15,8 @@ use super::{
     crash_cut_shell_test_args, parse_fault_job_result, parse_tier1_args, parse_xfstests_summary,
     run_and_record_command, run_crash_cut_campaign, run_live_preflight,
     run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts, tier1_shell_test_args,
-    verify_xfstests_source_lock, write_fault_job_request, xfstests_execution_backend_for_host,
-    xfstests_selected_cases_sha256,
+    verify_xfstests_source_lock, write_fault_job_request, xfstests_docker_preflight_command,
+    xfstests_execution_backend_for_host, xfstests_selected_cases_sha256,
 };
 use crate::target::TxTarget;
 
@@ -2485,10 +2485,11 @@ fn tier1_xfstests_backend_uses_host_linux_direct_check() {
     assert_eq!(backend, XfstestsExecutionBackend::HostLinux);
     let root = temp_root("xfstests-host-linux-command");
     let xfstests_root = root.join("external/xfstests");
+    let work_dir = root.join("target/ext4/tier1/run/xfstests");
     fs::create_dir_all(&xfstests_root).unwrap();
 
     let command = backend
-        .command(&root, &xfstests_root, &["generic/013".into()])
+        .command(&root, &xfstests_root, &work_dir, &["generic/013".into()])
         .expect("host-linux command");
 
     assert_eq!(command.cwd, xfstests_root);
@@ -2497,16 +2498,29 @@ fn tier1_xfstests_backend_uses_host_linux_direct_check() {
 }
 
 #[test]
-fn tier1_xfstests_backend_requires_linux_or_explicit_docker() {
-    let error = xfstests_execution_backend_for_host("macos", None, true)
-        .expect_err("macos without docker image must fail before live run");
+fn tier1_xfstests_backend_defaults_to_repo_docker_wrapper_off_linux() {
+    let backend = xfstests_execution_backend_for_host("macos", None, true)
+        .expect("macos can use the repo-owned Docker wrapper");
 
-    assert!(error.contains("xfstests requires Linux execution"));
-    assert!(error.contains("TX_EXT4_XFSTESTS_DOCKER_IMAGE"));
+    assert_eq!(
+        backend,
+        XfstestsExecutionBackend::DockerLinux {
+            image: "tx-ext4-e2fsprogs:local".into()
+        }
+    );
 }
 
 #[test]
-fn tier1_xfstests_backend_builds_privileged_docker_check_command() {
+fn tier1_xfstests_backend_requires_docker_off_linux() {
+    let error = xfstests_execution_backend_for_host("macos", None, false)
+        .expect_err("macos without docker must fail before live run");
+
+    assert!(error.contains("xfstests requires Linux execution"));
+    assert!(error.contains("docker is not available"));
+}
+
+#[test]
+fn tier1_xfstests_backend_builds_repo_wrapper_command() {
     let backend = xfstests_execution_backend_for_host("macos", Some("tx/xfstests-tier1:pin"), true)
         .expect("explicit docker image enables Linux xfstests backend");
     assert_eq!(
@@ -2517,31 +2531,65 @@ fn tier1_xfstests_backend_builds_privileged_docker_check_command() {
     );
     let root = temp_root("xfstests-docker-command");
     let xfstests_root = root.join("external/xfstests");
+    let work_dir = root.join("target/ext4/tier1/run/xfstests");
     fs::create_dir_all(&xfstests_root).unwrap();
 
     let command = backend
         .command(
             &root,
             &xfstests_root,
+            &work_dir,
             &["generic/013".into(), "generic/035".into()],
         )
         .expect("docker xfstests command");
 
     assert_eq!(command.cwd, root);
-    assert_eq!(command.program, "docker");
-    assert!(command.args.contains(&"--privileged".into()));
+    assert_eq!(command.program, "python3");
     assert!(
         command
             .args
-            .iter()
-            .any(|arg| arg.starts_with("type=bind,source=") && arg.ends_with(",target=/xfstests"))
+            .ends_with(&["--".into(), "generic/013".into(), "generic/035".into()])
     );
+    assert!(
+        command
+            .args
+            .contains(&"tools/ext4/tier1_xfstests_docker.py".into())
+    );
+    assert!(command.args.contains(&"--xfstests-root".into()));
+    assert!(
+        command
+            .args
+            .contains(&xfstests_root.canonicalize().unwrap().display().to_string())
+    );
+    assert!(command.args.contains(&"--work-dir".into()));
+    assert!(command.args.contains(&work_dir.display().to_string()));
+    assert!(command.args.contains(&"--image".into()));
     assert!(command.args.contains(&"tx/xfstests-tier1:pin".into()));
-    assert!(command.args.ends_with(&[
-        "./check".into(),
-        "generic/013".into(),
-        "generic/035".into()
-    ]));
+}
+
+#[test]
+fn tier1_xfstests_docker_preflight_uses_repo_wrapper_and_cases() {
+    let root = temp_root("xfstests-docker-preflight");
+    let xfstests_root = root.join("external/xfstests");
+    fs::create_dir_all(&xfstests_root).unwrap();
+    let backend = XfstestsExecutionBackend::DockerLinux {
+        image: "tx-ext4-e2fsprogs:local".into(),
+    };
+
+    let command = xfstests_docker_preflight_command(
+        &root,
+        &backend,
+        &xfstests_root,
+        &["generic/013".into(), "generic/475".into()],
+    )
+    .expect("docker preflight command");
+
+    assert_eq!(command.cwd, root);
+    assert_eq!(command.program, "python3");
+    assert!(command.args.contains(&"--preflight".into()));
+    assert!(command.args.contains(&"--case".into()));
+    assert!(command.args.contains(&"generic/013".into()));
+    assert!(command.args.contains(&"generic/475".into()));
 }
 
 fn temp_root(suffix: &str) -> PathBuf {

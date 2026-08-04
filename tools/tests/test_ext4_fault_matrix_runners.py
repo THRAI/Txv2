@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LINUX_RUNNER = ROOT / "tools" / "ext4" / "fault_linux_rw_replay.py"
+XFSTESTS_DOCKER_RUNNER = ROOT / "tools" / "ext4" / "tier1_xfstests_docker.py"
 TX_RUNNER = ROOT / "tools" / "ext4" / "fault_tx_remount.py"
 TX_SCRIPT = ROOT / "tools" / "shell-tests" / "ext4-fault-tx-remount.txt"
 
@@ -24,8 +25,10 @@ def load_module(path: Path, name: str):
 class Ext4FaultMatrixRunnerTests(unittest.TestCase):
     def test_repository_owned_runners_and_tx_script_exist(self):
         self.assertTrue(LINUX_RUNNER.is_file())
+        self.assertTrue(XFSTESTS_DOCKER_RUNNER.is_file())
         self.assertTrue(TX_RUNNER.is_file())
         self.assertTrue(os.access(LINUX_RUNNER, os.X_OK))
+        self.assertTrue(os.access(XFSTESTS_DOCKER_RUNNER, os.X_OK))
         self.assertTrue(os.access(TX_RUNNER, os.X_OK))
         self.assertTrue(TX_SCRIPT.is_file())
 
@@ -57,6 +60,26 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(module.LinuxReplayError, "Docker fallback blocked"):
                 module.preflight_replay_environment()
+
+    def test_xfstests_docker_preflight_reports_unbuilt_selected_helpers(self):
+        module = load_module(XFSTESTS_DOCKER_RUNNER, "tier1_xfstests_docker")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "xfstests"
+            (root / "tests/generic").mkdir(parents=True)
+            (root / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (root / "tests/generic/013").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(module.XfstestsDockerError, "source is not built"):
+                module.validate_source(root, ["generic/013"])
+
+    def test_xfstests_docker_run_script_uses_loop_devices_in_local_config(self):
+        module = load_module(XFSTESTS_DOCKER_RUNNER, "tier1_xfstests_docker")
+        script = module.docker_run_script()
+
+        self.assertIn("losetup --find --show", script)
+        self.assertIn("export TEST_DEV=$testdev", script)
+        self.assertIn("export SCRATCH_DEV=$scratchdev", script)
+        self.assertIn("./check \"$@\"", script)
 
     def test_tx_runner_builds_shell_test_with_matrix_image_as_scratch(self):
         with tempfile.TemporaryDirectory() as tmp:
