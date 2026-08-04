@@ -1,3 +1,14 @@
+- 2026-08-04 (SMP scheduler and PELT design).
+  Added `docs/superpowers/specs/2026-08-04-smp-pelt-scheduler-design.md` with
+  the approved per-hart owner model, idle-first direct steal, migration-safe
+  userspace protocol, event-driven fixed-point PELT-lite, coalesced remote
+  wake/IPI path, forced-affinity migration, and measured S0-S5 rollout gates.
+  Verification passed `cargo xtask lint docs` and `git diff --check`;
+  placeholder and internal-consistency scans were also clean after tightening
+  the wake-lock and polling-idle race protocols. Next: written-spec review,
+  then produce the implementation plan in dependency order. Blocker: no
+  scheduler implementation starts until the written design is approved.
+
 - 2026-08-04 (ext4 Task16 repo-owned xfstests Docker preflight).
   Moved the non-Linux xfstests failure point ahead of G0/build/QEMU by adding a
   repository-owned Docker wrapper for the pinned Tier 1 selection. Non-Linux
