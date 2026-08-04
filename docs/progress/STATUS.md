@@ -31799,3 +31799,26 @@
   remains pending: this suffix is partial diagnostic evidence only, not the
   required fresh 1000-cut QEMU/e2fsck run, pinned xfstests execution, immutable
   receipt generation, or `--verify-receipt`.
+
+- 2026-08-04 (ext4 Task 16 xfstests Linux backend guard).
+  Continued
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  The Tier 1 live runner now resolves the xfstests execution backend before G0,
+  build, QEMU, or crash-campaign work: Linux hosts run the pinned `./check`
+  directly, while non-Linux hosts require an explicit prepared privileged
+  Docker image via `TX_EXT4_XFSTESTS_DOCKER_IMAGE`. Final receipt verification
+  now requires `xfstests-run-evidence.json` in addition to `xfstests.log` and
+  source-lock evidence; the evidence must declare `backend=host-linux` or
+  `backend=docker-linux`, `linux_environment=true`, matching selected-case
+  count/digest, `exit_code=0`, and the same `log_sha256` as the immutable
+  `xfstests-log` artifact. Short live probes verified the guard without
+  entering the long path: `cargo xtask ext4 tier1 --run-id
+  task16-xfstests-backend-guard-20260804` fails immediately on this macOS host
+  with `xfstests requires Linux execution`, and
+  `target/ext4/tier1/preflight/task16-xfstests-backend-20260804.json` records
+  `xfstests_linux_execution_ready=false`. Current live preflight blockers are
+  the missing Linux/Docker xfstests backend and limited storage
+  (`available=3442511872`, `required=4517265408`). Task 16 remains pending
+  until a Linux-capable xfstests backend, enough storage, a fresh full 1000-cut
+  crash/e2fsck run, pinned xfstests execution, immutable receipt, and
+  `--verify-receipt` all succeed.

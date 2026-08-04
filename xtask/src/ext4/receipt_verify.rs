@@ -94,6 +94,7 @@ pub(crate) fn verify_tier1_receipt(receipt_path: &Path) -> Result<()> {
     verify_build_log_evidence(&artifacts, receipt_path)?;
     verify_guest_matrix_serial_evidence(&artifacts, receipt_path)?;
     verify_xfstests_source_lock_evidence(&artifacts, receipt_path)?;
+    verify_xfstests_run_evidence(&artifacts, receipt_path)?;
     verify_xfstests_log_evidence(receipt_object, &artifacts, receipt_path)?;
     verify_crash_cut_outcome_manifest(&artifacts, receipt_path)?;
     verify_required_crash_cut_artifacts(&artifacts, receipt_path)?;
@@ -1091,6 +1092,7 @@ fn verify_required_log_artifacts(
         "e2fsck-scratch-log",
         "e2fsck-workload-log",
         "xfstests-source-lock-evidence",
+        "xfstests-run-evidence",
         "xfstests-log",
     ] {
         if !artifacts.contains_key(name) {
@@ -1345,10 +1347,101 @@ fn verify_xfstests_log_evidence(
     Ok(())
 }
 
+fn verify_xfstests_run_evidence(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<()> {
+    let selected_cases = authority_xfstests_selected_cases(artifacts, path)?;
+    let log_artifact = artifacts
+        .get("xfstests-log")
+        .ok_or_else(|| format!("{}: missing required artifact xfstests-log", path.display()))?;
+    let evidence_artifact = artifacts.get("xfstests-run-evidence").ok_or_else(|| {
+        format!(
+            "{}: missing required artifact xfstests-run-evidence",
+            path.display()
+        )
+    })?;
+    let evidence = read_json(&evidence_artifact.path)?;
+    require_schema(
+        &evidence,
+        "tx.ext4.xfstests_run_evidence.v1",
+        &evidence_artifact.path,
+    )?;
+    let object = json_object(&evidence, "xfstests run evidence", &evidence_artifact.path)?;
+    let backend = required_json_string(object, "backend", &evidence_artifact.path)?;
+    if !matches!(backend.as_str(), "host-linux" | "docker-linux") {
+        return Err(format!(
+            "{}: xfstests run backend `{backend}` is not a supported Linux execution backend",
+            evidence_artifact.path.display()
+        ));
+    }
+    if object
+        .get("linux_environment")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        return Err(format!(
+            "{}: xfstests run evidence must declare linux_environment=true",
+            evidence_artifact.path.display()
+        ));
+    }
+    let selected_count = required_json_usize(object, "selected_count", &evidence_artifact.path)?;
+    if selected_count != selected_cases.len() {
+        return Err(format!(
+            "{}: xfstests run selected_count {selected_count} does not match authority selected count {}",
+            evidence_artifact.path.display(),
+            selected_cases.len()
+        ));
+    }
+    let selected_cases_sha256 =
+        required_json_string(object, "selected_cases_sha256", &evidence_artifact.path)?;
+    if selected_cases_sha256 != xfstests_selected_cases_sha256(&selected_cases) {
+        return Err(format!(
+            "{}: xfstests run selected_cases_sha256 mismatch",
+            evidence_artifact.path.display()
+        ));
+    }
+    let log_sha256 = required_json_string(object, "log_sha256", &evidence_artifact.path)?;
+    if log_sha256 != log_artifact.sha256 {
+        return Err(format!(
+            "{}: xfstests run log_sha256 does not match xfstests-log artifact",
+            evidence_artifact.path.display()
+        ));
+    }
+    if required_json_usize(object, "exit_code", &evidence_artifact.path)? != 0 {
+        return Err(format!(
+            "{}: xfstests run evidence exit_code must be 0",
+            evidence_artifact.path.display()
+        ));
+    }
+    let command = required_json_object(object, "command", &evidence_artifact.path)?;
+    let program = required_json_string(command, "program", &evidence_artifact.path)?;
+    if backend == "host-linux" && program != "./check" {
+        return Err(format!(
+            "{}: host-linux xfstests evidence must run ./check",
+            evidence_artifact.path.display()
+        ));
+    }
+    if backend == "docker-linux" && program != "docker" {
+        return Err(format!(
+            "{}: docker-linux xfstests evidence must run docker",
+            evidence_artifact.path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn authority_xfstests_selected_count(
     artifacts: &BTreeMap<String, ArtifactRecord>,
     path: &Path,
 ) -> Result<usize> {
+    authority_xfstests_selected_cases(artifacts, path).map(|cases| cases.len())
+}
+
+fn authority_xfstests_selected_cases(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<Vec<String>> {
     let authority_path = artifacts
         .get("authority-xfstests-selection")
         .ok_or_else(|| {
@@ -1367,7 +1460,21 @@ fn authority_xfstests_selected_count(
     )?;
     let authority_object = json_object(&authority, "xfstests selection", &authority_path)?;
     let selected = require_non_empty_array(authority_object, "selected", &authority_path)?;
-    Ok(selected.len())
+    selected
+        .iter()
+        .map(|case| {
+            case.get("case_id")
+                .and_then(|value| value.as_str())
+                .or_else(|| case.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!(
+                        "{}: selected xfstests entry missing case_id",
+                        authority_path.display()
+                    )
+                })
+        })
+        .collect()
 }
 
 fn parse_xfstests_passed_all(log: &str, path: &Path) -> Result<usize> {

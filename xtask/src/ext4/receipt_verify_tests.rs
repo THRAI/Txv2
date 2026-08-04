@@ -389,6 +389,69 @@ fn tier1_verify_receipt_rejects_missing_xfstests_source_lock_evidence() {
 }
 
 #[test]
+fn tier1_verify_receipt_rejects_missing_xfstests_run_evidence() {
+    let root = temp_root("verify-receipt-missing-xfstests-run");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    remove_artifact_record(&root, "xfstests-run-evidence");
+
+    let error = verify_tier1_receipt(&receipt).expect_err("missing xfstests run must fail");
+    assert!(error.contains("missing required artifact xfstests-run-evidence"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_non_linux_xfstests_run_evidence() {
+    let root = temp_root("verify-receipt-xfstests-run-non-linux");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "xfstests-run-evidence",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.xfstests_run_evidence.v1",
+            "backend": "host-macos",
+            "linux_environment": false,
+            "host_os": "macos",
+            "xfstests_root": "external/xfstests",
+            "selected_count": 8,
+            "selected_cases_sha256": "1".repeat(64),
+            "command": {
+                "cwd": "external/xfstests",
+                "program": "./check",
+                "args": ["generic/001"]
+            },
+            "log_sha256": "2".repeat(64),
+            "exit_code": 0
+        }))
+        .expect("xfstests run evidence json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("non-linux xfstests run must fail");
+    assert!(error.contains("not a supported Linux execution backend"));
+}
+
+#[test]
+fn tier1_verify_receipt_rejects_xfstests_run_log_sha_mismatch() {
+    let root = temp_root("verify-receipt-xfstests-run-log-sha");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let mut evidence: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("target/ext4/tier1/accepted-run/xfstests-run-evidence.json"))
+            .expect("read xfstests run evidence"),
+    )
+    .expect("parse xfstests run evidence");
+    evidence["log_sha256"] = "1".repeat(64).into();
+    rewrite_artifact_contents(
+        &root,
+        "xfstests-run-evidence",
+        &serde_json::to_string_pretty(&evidence).expect("xfstests run evidence json"),
+    );
+
+    let error = verify_tier1_receipt(&receipt).expect_err("xfstests run log sha mismatch");
+    assert!(error.contains("xfstests run log_sha256 does not match xfstests-log artifact"));
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_xfstests_source_lock_mismatch() {
     let root = temp_root("verify-receipt-xfstests-source-lock-mismatch");
     let _cleanup = TempCleanup(root.clone());
@@ -415,7 +478,7 @@ fn tier1_verify_receipt_rejects_xfstests_log_count_mismatch() {
     let root = temp_root("verify-receipt-xfstests-log-count");
     let _cleanup = TempCleanup(root.clone());
     let receipt = write_acceptance_receipt_fixture(&root);
-    rewrite_artifact_contents(&root, "xfstests-log", "Passed all 7 tests\n");
+    rewrite_xfstests_log_contents(&root, "Passed all 7 tests\n");
 
     let error = verify_tier1_receipt(&receipt).expect_err("mismatched xfstests log must fail");
     assert!(error.contains("xfstests log passed count 7 does not match receipt passed count 8"));
@@ -426,7 +489,7 @@ fn tier1_verify_receipt_rejects_xfstests_log_failures() {
     let root = temp_root("verify-receipt-xfstests-log-failures");
     let _cleanup = TempCleanup(root.clone());
     let receipt = write_acceptance_receipt_fixture(&root);
-    rewrite_artifact_contents(&root, "xfstests-log", "Failures: generic/001\n");
+    rewrite_xfstests_log_contents(&root, "Failures: generic/001\n");
 
     let error = verify_tier1_receipt(&receipt).expect_err("failed xfstests log must fail");
     assert!(error.contains("xfstests log reported failures"));
@@ -1071,10 +1134,35 @@ fn write_acceptance_receipt_fixture_inner(root: &PathBuf, options: FixtureOption
             "e2fsck-workload.log",
             "workload.img: clean, 12/1024 files, 256/4096 blocks\n",
         ),
-        ("xfstests-log", "xfstests.log", "Passed all 8 tests\n"),
     ] {
         add_artifact(name, file_name.into(), contents.into());
     }
+    let (_xfstests_log, xfstests_log_sha256) = add_artifact(
+        "xfstests-log",
+        "xfstests.log".into(),
+        "Passed all 8 tests\n".into(),
+    );
+    add_artifact(
+        "xfstests-run-evidence",
+        "xfstests-run-evidence.json".into(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.xfstests_run_evidence.v1",
+            "backend": "host-linux",
+            "linux_environment": true,
+            "host_os": "linux",
+            "xfstests_root": "external/xfstests",
+            "selected_count": selected_cases.len(),
+            "selected_cases_sha256": xfstests_selected_cases_sha256(&selected_cases),
+            "command": {
+                "cwd": "external/xfstests",
+                "program": "./check",
+                "args": selected_cases
+            },
+            "log_sha256": xfstests_log_sha256,
+            "exit_code": 0
+        }))
+        .expect("xfstests run evidence json"),
+    );
     add_artifact(
         "xfstests-source-lock-evidence",
         "xfstests-source-lock-evidence.json".into(),
@@ -1614,6 +1702,41 @@ fn rewrite_artifact_contents(root: &PathBuf, name: &str, contents: &str) {
         &serde_json::to_string_pretty(&manifest).expect("artifact manifest json"),
     );
     rewrite_receipt_artifact_manifest_sha(root);
+}
+
+fn rewrite_xfstests_log_contents(root: &PathBuf, contents: &str) {
+    rewrite_artifact_contents(root, "xfstests-log", contents);
+    let artifacts_path = root.join("target/ext4/tier1/accepted-run/artifacts.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifacts_path).expect("read artifacts"))
+            .expect("parse artifacts");
+    let xfstests_log_sha = manifest["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .find(|artifact| artifact["name"] == "xfstests-log")
+        .expect("xfstests log artifact")["sha256"]
+        .as_str()
+        .expect("xfstests log sha")
+        .to_string();
+    let evidence_path = manifest["artifacts"]
+        .as_array()
+        .expect("artifacts array")
+        .iter()
+        .find(|artifact| artifact["name"] == "xfstests-run-evidence")
+        .expect("xfstests run evidence artifact")["path"]
+        .as_str()
+        .expect("xfstests run evidence path")
+        .to_string();
+    let mut evidence: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&evidence_path).expect("read xfstests evidence"))
+            .expect("parse xfstests evidence");
+    evidence["log_sha256"] = serde_json::Value::String(xfstests_log_sha);
+    rewrite_artifact_contents(
+        root,
+        "xfstests-run-evidence",
+        &serde_json::to_string_pretty(&evidence).expect("xfstests evidence json"),
+    );
 }
 
 fn read_authority_artifact_json(root: &PathBuf, name: &str) -> serde_json::Value {

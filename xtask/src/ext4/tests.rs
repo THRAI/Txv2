@@ -11,11 +11,12 @@ use super::crash_campaign::{
 use super::live_preflight::collect_storage_capacity_preflight_for_test;
 use super::{
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
-    CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
-    parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_and_record_command,
-    run_crash_cut_campaign, run_live_preflight, run_workspace::RunWorkspace, sha256_file,
-    stage_authority_artifacts, tier1_shell_test_args, verify_xfstests_source_lock,
-    write_fault_job_request, xfstests_selected_cases_sha256,
+    CrashCutOutcome, Tier1Authorities, XfstestsExecutionBackend, XfstestsSourceLock,
+    crash_cut_shell_test_args, parse_fault_job_result, parse_tier1_args, parse_xfstests_summary,
+    run_and_record_command, run_crash_cut_campaign, run_live_preflight,
+    run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts, tier1_shell_test_args,
+    verify_xfstests_source_lock, write_fault_job_request, xfstests_execution_backend_for_host,
+    xfstests_selected_cases_sha256,
 };
 use crate::target::TxTarget;
 
@@ -2475,6 +2476,72 @@ fn tier1_xfstests_parser_rejects_notrun_and_count_mismatch() {
     )
     .expect_err("count mismatch must fail closed");
     assert!(mismatch.contains("passed count mismatch"));
+}
+
+#[test]
+fn tier1_xfstests_backend_uses_host_linux_direct_check() {
+    let backend = xfstests_execution_backend_for_host("linux", None, false)
+        .expect("linux host can run xfstests directly");
+    assert_eq!(backend, XfstestsExecutionBackend::HostLinux);
+    let root = temp_root("xfstests-host-linux-command");
+    let xfstests_root = root.join("external/xfstests");
+    fs::create_dir_all(&xfstests_root).unwrap();
+
+    let command = backend
+        .command(&root, &xfstests_root, &["generic/013".into()])
+        .expect("host-linux command");
+
+    assert_eq!(command.cwd, xfstests_root);
+    assert_eq!(command.program, "./check");
+    assert_eq!(command.args, vec!["generic/013"]);
+}
+
+#[test]
+fn tier1_xfstests_backend_requires_linux_or_explicit_docker() {
+    let error = xfstests_execution_backend_for_host("macos", None, true)
+        .expect_err("macos without docker image must fail before live run");
+
+    assert!(error.contains("xfstests requires Linux execution"));
+    assert!(error.contains("TX_EXT4_XFSTESTS_DOCKER_IMAGE"));
+}
+
+#[test]
+fn tier1_xfstests_backend_builds_privileged_docker_check_command() {
+    let backend = xfstests_execution_backend_for_host("macos", Some("tx/xfstests-tier1:pin"), true)
+        .expect("explicit docker image enables Linux xfstests backend");
+    assert_eq!(
+        backend,
+        XfstestsExecutionBackend::DockerLinux {
+            image: "tx/xfstests-tier1:pin".into()
+        }
+    );
+    let root = temp_root("xfstests-docker-command");
+    let xfstests_root = root.join("external/xfstests");
+    fs::create_dir_all(&xfstests_root).unwrap();
+
+    let command = backend
+        .command(
+            &root,
+            &xfstests_root,
+            &["generic/013".into(), "generic/035".into()],
+        )
+        .expect("docker xfstests command");
+
+    assert_eq!(command.cwd, root);
+    assert_eq!(command.program, "docker");
+    assert!(command.args.contains(&"--privileged".into()));
+    assert!(
+        command
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("type=bind,source=") && arg.ends_with(",target=/xfstests"))
+    );
+    assert!(command.args.contains(&"tx/xfstests-tier1:pin".into()));
+    assert!(command.args.ends_with(&[
+        "./check".into(),
+        "generic/013".into(),
+        "generic/035".into()
+    ]));
 }
 
 fn temp_root(suffix: &str) -> PathBuf {

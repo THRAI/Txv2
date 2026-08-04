@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{
-    CrashCutCampaignPlan, CrashCutFamily, Tier1Authorities, XfstestsSourceLock, resolve_repo_path,
-    run_workspace, verify_xfstests_source_lock,
+    CrashCutCampaignPlan, CrashCutFamily, Tier1Authorities, XFSTESTS_DOCKER_IMAGE_ENV,
+    XfstestsSourceLock, resolve_repo_path, run_workspace, verify_xfstests_source_lock,
+    xfstests_execution_backend_for_host,
 };
 use crate::Result;
 use crate::image;
@@ -62,6 +63,7 @@ pub(super) fn run_live_preflight(
         xfstests_source_prepared = true;
     }
     let linux_rw_replay_ready = collect_linux_replay_preflight(root, &mut blockers);
+    let xfstests_linux_execution_ready = collect_xfstests_execution_preflight(&mut blockers);
     let storage_capacity = collect_storage_capacity_preflight(root, authorities, &mut blockers);
     if let Some(report_path) = report_path {
         write_live_preflight_report(
@@ -74,6 +76,7 @@ pub(super) fn run_live_preflight(
             xfstests_source_prepared,
             xfstests_selected_cases_verified,
             linux_rw_replay_ready,
+            xfstests_linux_execution_ready,
             storage_capacity,
         )?;
         println!(
@@ -160,6 +163,7 @@ fn write_live_preflight_report(
     xfstests_source_prepared: bool,
     xfstests_selected_cases_verified: bool,
     linux_rw_replay_ready: bool,
+    xfstests_linux_execution_ready: bool,
     storage_capacity: Option<StorageCapacityEstimate>,
 ) -> Result<()> {
     let path = resolve_repo_path(root, report_path.to_path_buf());
@@ -226,6 +230,7 @@ fn write_live_preflight_report(
             "xfstests_source_prepared": xfstests_source_prepared,
             "xfstests_selected_cases_verified": xfstests_selected_cases_verified,
             "linux_rw_replay_ready": linux_rw_replay_ready,
+            "xfstests_linux_execution_ready": xfstests_linux_execution_ready,
             "storage_capacity": storage_capacity,
         },
         "result": {
@@ -495,6 +500,21 @@ fn collect_linux_replay_preflight(root: &Path, blockers: &mut Vec<String>) -> bo
     let reason = linux_replay_preflight_reason(&output);
     blockers.push(format!("Linux RW replay preflight blocked: {reason}"));
     false
+}
+
+fn collect_xfstests_execution_preflight(blockers: &mut Vec<String>) -> bool {
+    let docker_image = std::env::var(XFSTESTS_DOCKER_IMAGE_ENV).ok();
+    match xfstests_execution_backend_for_host(
+        std::env::consts::OS,
+        docker_image.as_deref(),
+        command_exists("docker"),
+    ) {
+        Ok(_) => true,
+        Err(err) => {
+            blockers.push(err);
+            false
+        }
+    }
 }
 
 fn linux_replay_preflight_reason(output: &std::process::Output) -> String {

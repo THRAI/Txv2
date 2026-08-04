@@ -25,6 +25,7 @@ pub(crate) use crash_campaign::{
 use live_preflight::run_live_preflight;
 pub(crate) use receipt_verify::verify_tier1_receipt;
 
+const XFSTESTS_DOCKER_IMAGE_ENV: &str = "TX_EXT4_XFSTESTS_DOCKER_IMAGE";
 const G0_EXT4_LINTS: &[&str] = &[
     "ext4-lifecycle-ownership",
     "ext4-no-direct-home-write",
@@ -127,6 +128,7 @@ fn run_live_tier1(
             return Err(format!("{tool} is required for the live Tier 1 runner"));
         }
     }
+    let xfstests_backend = xfstests_execution_backend()?;
 
     run_g0_lints(root, run)?;
 
@@ -241,7 +243,8 @@ fn run_live_tier1(
         .iter()
         .filter(|image| image.exit_code != 0)
         .count();
-    let xfstests_summary = run_xfstests_selection(root, run, &invocation.authorities)?;
+    let xfstests_summary =
+        run_xfstests_selection(root, run, &invocation.authorities, &xfstests_backend)?;
     let role_images = receipt::RoleImages {
         test: receipt::RoleImage {
             path: test_image.display().to_string(),
@@ -1439,6 +1442,117 @@ fn run_capture(cwd: &Path, program: &str, args: &[String]) -> Result<(i32, Strin
     Ok((output.status.code().unwrap_or(-1), combined))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XfstestsExecutionBackend {
+    HostLinux,
+    DockerLinux { image: String },
+}
+
+#[derive(Debug)]
+struct XfstestsCommand {
+    cwd: PathBuf,
+    program: String,
+    args: Vec<String>,
+}
+
+impl XfstestsExecutionBackend {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::HostLinux => "host-linux",
+            Self::DockerLinux { .. } => "docker-linux",
+        }
+    }
+
+    fn command(
+        &self,
+        root: &Path,
+        xfstests_root: &Path,
+        check_args: &[String],
+    ) -> Result<XfstestsCommand> {
+        match self {
+            Self::HostLinux => Ok(XfstestsCommand {
+                cwd: xfstests_root.to_path_buf(),
+                program: "./check".into(),
+                args: check_args.to_vec(),
+            }),
+            Self::DockerLinux { image } => {
+                let xfstests_root = xfstests_root.canonicalize().map_err(|err| {
+                    format!(
+                        "failed to canonicalize xfstests root {} for Docker execution: {err}",
+                        xfstests_root.display()
+                    )
+                })?;
+                let mut args = vec![
+                    "run".into(),
+                    "--rm".into(),
+                    "--privileged".into(),
+                    "--mount".into(),
+                    format!(
+                        "type=bind,source={},target=/xfstests",
+                        xfstests_root.display()
+                    ),
+                    "-w".into(),
+                    "/xfstests".into(),
+                    image.clone(),
+                    "./check".into(),
+                ];
+                args.extend(check_args.iter().cloned());
+                Ok(XfstestsCommand {
+                    cwd: root.to_path_buf(),
+                    program: "docker".into(),
+                    args,
+                })
+            }
+        }
+    }
+}
+
+fn xfstests_execution_backend() -> Result<XfstestsExecutionBackend> {
+    let docker_image = std::env::var(XFSTESTS_DOCKER_IMAGE_ENV).ok();
+    xfstests_execution_backend_for_host(
+        std::env::consts::OS,
+        docker_image.as_deref(),
+        command_exists("docker"),
+    )
+}
+
+fn xfstests_execution_backend_for_host(
+    host_os: &str,
+    docker_image: Option<&str>,
+    docker_available: bool,
+) -> Result<XfstestsExecutionBackend> {
+    if host_os == "linux" {
+        return Ok(XfstestsExecutionBackend::HostLinux);
+    }
+    if let Some(image) = docker_image
+        .map(str::trim)
+        .filter(|image| !image.is_empty())
+    {
+        if !docker_available {
+            return Err(format!(
+                "xfstests requires Linux execution; {XFSTESTS_DOCKER_IMAGE_ENV} is set but docker is not available"
+            ));
+        }
+        return Ok(XfstestsExecutionBackend::DockerLinux {
+            image: image.to_string(),
+        });
+    }
+    Err(format!(
+        "xfstests requires Linux execution; host OS is {host_os}; set {XFSTESTS_DOCKER_IMAGE_ENV} to a prepared privileged Linux xfstests image"
+    ))
+}
+
+fn run_xfstests_capture(
+    root: &Path,
+    backend: &XfstestsExecutionBackend,
+    xfstests_root: &Path,
+    args: &[String],
+) -> Result<(i32, String, XfstestsCommand)> {
+    let command = backend.command(root, xfstests_root, args)?;
+    let (code, output) = run_capture(&command.cwd, &command.program, &command.args)?;
+    Ok((code, output, command))
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes =
         fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
@@ -1589,6 +1703,7 @@ fn run_xfstests_selection(
     root: &Path,
     run: &mut run_workspace::RunWorkspace,
     authorities: &Tier1Authorities,
+    backend: &XfstestsExecutionBackend,
 ) -> Result<receipt::XfstestsSummary> {
     let xfstests_root = ensure_xfstests_root(root, run, &authorities.selection.source_lock)?;
     record_xfstests_source_lock_evidence(run, &authorities.selection.source_lock, &xfstests_root)?;
@@ -1600,7 +1715,7 @@ fn run_xfstests_selection(
     let tests = authorities.selection.cases.clone();
     let mut args = Vec::with_capacity(tests.len() + 1);
     args.push("--help".into());
-    let (help_code, help_output) = run_capture(&xfstests_root, "./check", &args)?;
+    let (help_code, help_output, _) = run_xfstests_capture(root, backend, &xfstests_root, &args)?;
     if help_code != 0 && help_output.is_empty() {
         return Err(format!(
             "xfstests check helper at {} did not execute successfully",
@@ -1609,11 +1724,21 @@ fn run_xfstests_selection(
     }
 
     let case_args = tests.clone();
-    let (code, output) = run_capture(&xfstests_root, "./check", &case_args)?;
+    let (code, output, command) = run_xfstests_capture(root, backend, &xfstests_root, &case_args)?;
     let log_path = run.working_dir().join("xfstests.log");
     fs::write(&log_path, &output)
         .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
-    run.record_artifact("xfstests-log", log_path)?;
+    let log_sha256 = sha256_file(&log_path)?;
+    run.record_artifact_with_sha256("xfstests-log", log_path, log_sha256.clone())?;
+    record_xfstests_run_evidence(
+        run,
+        backend,
+        &xfstests_root,
+        &tests,
+        code,
+        &log_sha256,
+        &command,
+    )?;
     if code != 0 {
         return Err(format!(
             "xfstests selection exited with {code}\n{}",
@@ -1622,6 +1747,45 @@ fn run_xfstests_selection(
     }
 
     parse_xfstests_summary(&output, tests.len())
+}
+
+fn record_xfstests_run_evidence(
+    run: &mut run_workspace::RunWorkspace,
+    backend: &XfstestsExecutionBackend,
+    xfstests_root: &Path,
+    tests: &[String],
+    exit_code: i32,
+    log_sha256: &str,
+    command: &XfstestsCommand,
+) -> Result<()> {
+    let path = run.working_dir().join("xfstests-run-evidence.json");
+    let value = serde_json::json!({
+        "schema": "tx.ext4.xfstests_run_evidence.v1",
+        "backend": backend.name(),
+        "linux_environment": true,
+        "host_os": std::env::consts::OS,
+        "xfstests_root": xfstests_root.display().to_string(),
+        "selected_count": tests.len(),
+        "selected_cases_sha256": xfstests_selected_cases_sha256(tests),
+        "command": {
+            "cwd": command.cwd.display().to_string(),
+            "program": &command.program,
+            "args": &command.args,
+        },
+        "log_sha256": log_sha256,
+        "exit_code": exit_code,
+    });
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&value).map_err(|err| {
+            format!(
+                "failed to encode xfstests run evidence {}: {err}",
+                path.display()
+            )
+        })? + "\n",
+    )
+    .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    run.record_artifact("xfstests-run-evidence", path)
 }
 
 fn parse_xfstests_summary(output: &str, expected_cases: usize) -> Result<receipt::XfstestsSummary> {
