@@ -2,13 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::Result;
 use crate::image;
 use crate::shell_test;
 use crate::target::TxTarget;
 use crate::util::{
     command_exists, command_or_candidates, optional_option_value, run_cmd_owned_in, shell_join,
 };
+use crate::Result;
 
 mod crash_campaign;
 mod live_preflight;
@@ -19,14 +19,14 @@ mod run_workspace;
 pub(crate) use crash_campaign::execute_crash_cut_campaign;
 #[cfg(test)]
 pub(crate) use crash_campaign::{
-    CrashCutCampaignEvidence, CrashCutOutcome, crash_cut_shell_test_args, parse_fault_job_result,
-    run_crash_cut_campaign, write_fault_job_request,
+    crash_cut_shell_test_args, parse_fault_job_result, run_crash_cut_campaign,
+    write_fault_job_request, CrashCutCampaignEvidence, CrashCutOutcome,
 };
 use live_preflight::run_live_preflight;
 pub(crate) use receipt_verify::verify_tier1_receipt;
 
 const XFSTESTS_DOCKER_IMAGE_ENV: &str = "TX_EXT4_XFSTESTS_DOCKER_IMAGE";
-const DEFAULT_XFSTESTS_DOCKER_IMAGE: &str = "tx-ext4-e2fsprogs:local";
+const DEFAULT_XFSTESTS_DOCKER_IMAGE: &str = "tx-ext4-xfstests-tier1:local";
 const XFSTESTS_DOCKER_WRAPPER: &str = "tools/ext4/tier1_xfstests_docker.py";
 const G0_EXT4_LINTS: &[&str] = &[
     "ext4-lifecycle-ownership",
@@ -257,15 +257,15 @@ fn run_live_tier1(
         run_xfstests_selection(root, run, &invocation.authorities, &xfstests_backend)?;
     let role_images = receipt::RoleImages {
         test: receipt::RoleImage {
-            path: test_image.display().to_string(),
+            path: run.stable_path(&test_image).display().to_string(),
             sha256: sha256_file(&test_image)?,
         },
         scratch: receipt::RoleImage {
-            path: scratch_image.display().to_string(),
+            path: run.stable_path(&scratch_image).display().to_string(),
             sha256: sha256_file(&scratch_image)?,
         },
         workload: receipt::RoleImage {
-            path: workload_image.display().to_string(),
+            path: run.stable_path(&workload_image).display().to_string(),
             sha256: sha256_file(&workload_image)?,
         },
     };

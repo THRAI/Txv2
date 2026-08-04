@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use super::receipt::{Tier1AcceptanceReceipt, Tier1AuthorityInputs, authority_input_summary};
-use crate::Result;
+use super::receipt::{authority_input_summary, Tier1AcceptanceReceipt, Tier1AuthorityInputs};
 use crate::util::shell_join;
+use crate::Result;
 
 #[derive(Debug)]
 pub(crate) struct RunWorkspace {
@@ -106,6 +106,7 @@ impl RunWorkspace {
         if destination.is_file() {
             fs::remove_file(&destination)
                 .map_err(|err| format!("failed to remove {}: {err}", destination.display()))?;
+            self.artifact_sha256.remove(&destination);
         }
         fs::copy(source, &destination).map_err(|err| {
             format!(
@@ -128,6 +129,7 @@ impl RunWorkspace {
         if destination.is_file() {
             fs::remove_file(&destination)
                 .map_err(|err| format!("failed to remove {}: {err}", destination.display()))?;
+            self.artifact_sha256.remove(&destination);
         }
         copy_image_cow(source, &destination)?;
         self.record_artifact(name, destination.clone())?;
@@ -136,6 +138,12 @@ impl RunWorkspace {
 
     pub(crate) fn working_dir(&self) -> &Path {
         &self.temporary
+    }
+
+    pub(crate) fn stable_path(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.temporary)
+            .map(|relative| self.final_dir.join(relative))
+            .unwrap_or_else(|_| path.to_path_buf())
     }
 
     pub(crate) fn spawn_test_child(&mut self, command: &str) -> Result<Child> {
@@ -274,10 +282,7 @@ impl RunWorkspace {
             .artifacts
             .iter()
             .map(|(name, path)| {
-                let stable_path = path
-                    .strip_prefix(&self.temporary)
-                    .map(|relative| self.final_dir.join(relative))
-                    .unwrap_or_else(|_| path.clone());
+                let stable_path = self.stable_path(path);
                 let sha256 = if path.is_file() {
                     self.artifact_sha256
                         .get(path)

@@ -143,6 +143,16 @@ fn print_usage() {
 }
 
 fn workspace_root() -> PathBuf {
+    if let Ok(mut cwd) = env::current_dir() {
+        loop {
+            if cwd.join("Cargo.toml").is_file() && cwd.join("xtask/Cargo.toml").is_file() {
+                return cwd;
+            }
+            if !cwd.pop() {
+                break;
+            }
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask must live under workspace root")

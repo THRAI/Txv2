@@ -13,16 +13,16 @@
     {"case_id": "generic/091", "family": "namespace"},
     {"case_id": "generic/095", "family": "durability"},
     {"case_id": "generic/226", "family": "orphan"},
-    {"case_id": "generic/301", "family": "rename"},
-    {"case_id": "generic/388", "family": "detach"},
-    {"case_id": "generic/475", "family": "execute-from-scratch"}
+    {"case_id": "generic/109", "family": "rename"},
+    {"case_id": "generic/169", "family": "remount-size"},
+    {"case_id": "generic/023", "family": "renameat2"}
   ],
   "excluded": [],
   "readiness_evidence": {
     "source_revision": "acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509",
     "check_sha256": "104d9351e1b2d47f7992af650e0fed0054be0cecfd8fddd43e076e175ba80642",
     "selected_count": 8,
-    "selected_cases_sha256": "fe6a2d49d6833c2bbbf988e51ac0a7801ca3cc3863b58070f37f57a7ce4b6c16",
+    "selected_cases_sha256": "40e1bedaaf864db7b70dfe5090643cae861ca79b486bd7af6514c66cd1a16a91",
     "selection_policy": "tier1-controlled-production-v1"
   },
   "notes": "Pinned Tier 1 selected-case authority for live runner admission. This ledger is input authority only; final acceptance still requires same-run xfstests execution, log parsing, artifact hashing, and receipt verification."

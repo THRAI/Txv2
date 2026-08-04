@@ -34,10 +34,8 @@ fn tier1_verify_receipt_rejects_campaign_plan_sha_mismatch() {
     let receipt = write_acceptance_receipt_fixture_with_bad_campaign_plan_sha(&root);
 
     let error = verify_tier1_receipt(&receipt).expect_err("bad campaign plan sha must fail");
-    assert!(
-        error
-            .contains("fault job campaign_plan_sha256 does not match crash-campaign-plan artifact")
-    );
+    assert!(error
+        .contains("fault job campaign_plan_sha256 does not match crash-campaign-plan artifact"));
 }
 
 #[test]
@@ -293,6 +291,41 @@ fn tier1_verify_receipt_rejects_guest_matrix_serial_log_missing_marker() {
 }
 
 #[test]
+fn tier1_verify_receipt_accepts_concatenated_orphan_serial_marker() {
+    let root = temp_root("verify-receipt-guest-serial-orphan-concat");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "guest-matrix-serial-log",
+        [
+            ":mount:sdcard:ext4:ok",
+            "tier1-test-role-status:0",
+            "tier1-test-detach:0",
+            "tier1-workload-ro-mount:0",
+            "tier1-workload-ro-write:ok",
+            "tier1-scratch-mount:0",
+            "tier1-data-mkdir:0",
+            "tier1-data-write:0",
+            "alpha",
+            "tier1-data-read:0",
+            "tier1-setattr-status:0",
+            "tier1-namespace-status:0",
+            "orphantier1-orphan-status:0",
+            "tier1-durability-status:0",
+            "tier1-remount-status:0",
+            "tier1-exec-ok",
+            "tier1-exec-status:0",
+            "tier1-detach-status:0",
+        ]
+        .join("\n")
+        .as_str(),
+    );
+
+    verify_tier1_receipt(&receipt).expect("concatenated orphan serial marker should verify");
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_missing_build_log_artifact() {
     let root = temp_root("verify-receipt-missing-build-log");
     let _cleanup = TempCleanup(root.clone());
@@ -378,6 +411,20 @@ fn tier1_verify_receipt_rejects_role_e2fsck_log_without_clean_summary() {
 }
 
 #[test]
+fn tier1_verify_receipt_accepts_readonly_e2fsck_summary_without_clean_word() {
+    let root = temp_root("verify-receipt-role-e2fsck-readonly-summary");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    rewrite_artifact_contents(
+        &root,
+        "e2fsck-test-log",
+        "Warning: skipping journal recovery because doing a read-only filesystem check.\nPass 1: Checking inodes, blocks, and sizes\nPass 2: Checking directory structure\nPass 3: Checking directory connectivity\nPass 4: Checking reference counts\nPass 5: Checking group summary information\nTXROOT: 13/16384 files (7.7% non-contiguous), 2316/16384 blocks\ne2fsck 1.47.4 (6-Mar-2025)\n",
+    );
+
+    verify_tier1_receipt(&receipt).expect("readonly e2fsck summary should verify");
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_missing_xfstests_source_lock_evidence() {
     let root = temp_root("verify-receipt-missing-xfstests-source-lock");
     let _cleanup = TempCleanup(root.clone());
@@ -428,6 +475,58 @@ fn tier1_verify_receipt_rejects_non_linux_xfstests_run_evidence() {
 
     let error = verify_tier1_receipt(&receipt).expect_err("non-linux xfstests run must fail");
     assert!(error.contains("not a supported Linux execution backend"));
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_docker_xfstests_wrapper_evidence() {
+    let root = temp_root("verify-receipt-xfstests-docker-wrapper");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let evidence_path = root.join("target/ext4/tier1/accepted-run/xfstests-run-evidence.json");
+    let mut evidence: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&evidence_path).expect("read xfstests evidence"))
+            .expect("parse xfstests evidence");
+    let selected_cases = vec![
+        "generic/001",
+        "generic/002",
+        "generic/003",
+        "generic/004",
+        "generic/005",
+        "generic/006",
+        "generic/007",
+        "generic/008",
+    ];
+    evidence["backend"] = "docker-linux".into();
+    evidence["host_os"] = "macos".into();
+    evidence["command"] = serde_json::json!({
+        "cwd": "/repo",
+        "program": "python3",
+        "args": [
+            "tools/ext4/tier1_xfstests_docker.py",
+            "--image",
+            "tx-ext4-xfstests-tier1:local",
+            "--xfstests-root",
+            "/repo/external/xfstests",
+            "--work-dir",
+            "/repo/target/ext4/tier1/accepted-run/xfstests-docker",
+            "--",
+            selected_cases[0],
+            selected_cases[1],
+            selected_cases[2],
+            selected_cases[3],
+            selected_cases[4],
+            selected_cases[5],
+            selected_cases[6],
+            selected_cases[7]
+        ]
+    });
+    rewrite_artifact_contents(
+        &root,
+        "xfstests-run-evidence",
+        &serde_json::to_string_pretty(&evidence).expect("xfstests evidence json"),
+    );
+
+    verify_tier1_receipt(&receipt).expect("docker wrapper xfstests evidence should verify");
 }
 
 #[test]
@@ -791,6 +890,29 @@ fn tier1_verify_receipt_rejects_fault_executor_log_command_mismatch() {
 
     let error = verify_tier1_receipt(&receipt).expect_err("executor log drift must fail");
     assert!(error.contains("missing command line"));
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_fault_executor_log_temporary_job_path() {
+    let root = temp_root("verify-receipt-fault-executor-log-temp-path");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let repo_root = std::env::current_dir().expect("repo root");
+    let temp_job_request =
+        root.join("target/ext4/tier1/.accepted-run.tmp/crash-cuts/crash-cut-0000/job-request.json");
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-fault-executor-log",
+        &format!(
+            "$ python3 {} {}\nstatus=exit status: 0\n",
+            repo_root
+                .join("tools/ext4/fault_qemu_executor.py")
+                .display(),
+            temp_job_request.display()
+        ),
+    );
+
+    verify_tier1_receipt(&receipt).expect("temporary job-request path should verify");
 }
 
 struct TempCleanup(PathBuf);

@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 LINUX_RUNNER = ROOT / "tools" / "ext4" / "fault_linux_rw_replay.py"
 XFSTESTS_DOCKER_RUNNER = ROOT / "tools" / "ext4" / "tier1_xfstests_docker.py"
+XFSTESTS_DOCKERFILE = ROOT / "tools" / "ext4" / "Dockerfile.xfstests-tier1"
 TX_RUNNER = ROOT / "tools" / "ext4" / "fault_tx_remount.py"
 TX_SCRIPT = ROOT / "tools" / "shell-tests" / "ext4-fault-tx-remount.txt"
 
@@ -26,6 +27,7 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
     def test_repository_owned_runners_and_tx_script_exist(self):
         self.assertTrue(LINUX_RUNNER.is_file())
         self.assertTrue(XFSTESTS_DOCKER_RUNNER.is_file())
+        self.assertTrue(XFSTESTS_DOCKERFILE.is_file())
         self.assertTrue(TX_RUNNER.is_file())
         self.assertTrue(os.access(LINUX_RUNNER, os.X_OK))
         self.assertTrue(os.access(XFSTESTS_DOCKER_RUNNER, os.X_OK))
@@ -43,6 +45,7 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
 
     def test_linux_runner_can_preflight_with_docker_fallback_off_linux(self):
         module = load_module(LINUX_RUNNER, "fault_linux_rw_replay")
+        self.assertEqual(module.DOCKER_IMAGE, "tx-ext4-xfstests-tier1:local")
         completed = subprocess.CompletedProcess(["docker"], 0, "", "")
         with mock.patch.object(module.platform, "system", return_value="Darwin"), mock.patch.object(
             module.shutil, "which", return_value="/usr/bin/docker"
@@ -77,9 +80,38 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         script = module.docker_run_script()
 
         self.assertIn("losetup --find --show", script)
+        self.assertIn('mke2fs -q -t ext4 -F -b 4096 "$testdev"', script)
+        self.assertIn('mke2fs -q -t ext4 -F -b 4096 "$scratchdev"', script)
         self.assertIn("export TEST_DEV=$testdev", script)
         self.assertIn("export SCRATCH_DEV=$scratchdev", script)
         self.assertIn("./check \"$@\"", script)
+
+    def test_xfstests_docker_wrapper_uses_repo_runner_image(self):
+        module = load_module(XFSTESTS_DOCKER_RUNNER, "tier1_xfstests_docker")
+        dockerfile = XFSTESTS_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertEqual(module.DEFAULT_IMAGE, "tx-ext4-xfstests-tier1:local")
+        self.assertIn("FROM debian:bookworm-slim", dockerfile)
+        self.assertIn("bc", dockerfile)
+        self.assertIn("build-essential", dockerfile)
+        self.assertIn("fio", dockerfile)
+        self.assertIn("procps", dockerfile)
+        self.assertIn("xfsprogs", dockerfile)
+        self.assertIn("xfslibs-dev", dockerfile)
+        self.assertIn("dmsetup", dockerfile)
+
+    def test_xfstests_docker_prepare_script_configures_glibc_helpers(self):
+        module = load_module(XFSTESTS_DOCKER_RUNNER, "tier1_xfstests_docker")
+        script = module.docker_prepare_script(["generic/013", "generic/091"])
+
+        self.assertIn('CFLAGS="-D_GNU_SOURCE ${CFLAGS:-}" ./configure', script)
+        self.assertIn("--libexecdir=/usr/lib", script)
+        self.assertIn("--exec_prefix=/var/lib", script)
+        self.assertIn("make -j2", script)
+        self.assertIn("'ltp/fsstress'", script)
+        self.assertIn("'ltp/fsx'", script)
+        self.assertIn("'src/feature'", script)
+        self.assertIn("'src/min_dio_alignment'", script)
 
     def test_tx_runner_builds_shell_test_with_matrix_image_as_scratch(self):
         with tempfile.TemporaryDirectory() as tmp:

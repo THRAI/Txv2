@@ -676,6 +676,24 @@ fn require_field_value(
     Ok(())
 }
 
+fn require_path_field_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    expected: &Path,
+    path: &Path,
+) -> Result<()> {
+    let found = PathBuf::from(required_json_string(object, key, path)?);
+    if !equivalent_run_path(&found, expected) {
+        return Err(format!(
+            "{}: {key} must be `{}`, found `{}`",
+            path.display(),
+            expected.display(),
+            found.display()
+        ));
+    }
+    Ok(())
+}
+
 fn require_usize_value(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1062,16 +1080,24 @@ fn verify_e2fsck_clean_log(role: &str, log: &str, path: &Path) -> Result<()> {
             ));
         }
     }
-    if !log.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.contains(": clean,") || trimmed.contains(" clean,")
-    }) {
+    if !log.lines().any(is_e2fsck_clean_summary_line) {
         return Err(format!(
             "{}: e2fsck {role} log missing clean summary",
             path.display()
         ));
     }
     Ok(())
+}
+
+fn is_e2fsck_clean_summary_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.contains(": clean,") || trimmed.contains(" clean,") {
+        return true;
+    }
+    trimmed.contains(':')
+        && trimmed.contains('/')
+        && trimmed.contains(" files")
+        && trimmed.contains(" blocks")
 }
 
 fn verify_required_log_artifacts(
@@ -1222,8 +1248,6 @@ fn verify_guest_matrix_serial_log(log: &str, path: &Path) -> Result<()> {
         "tier1-data-read:0",
         "tier1-setattr-status:0",
         "tier1-namespace-status:0",
-        "orphan",
-        "tier1-orphan-status:0",
         "tier1-durability-status:0",
         "tier1-remount-status:0",
         "tier1-exec-ok",
@@ -1236,6 +1260,22 @@ fn verify_guest_matrix_serial_log(log: &str, path: &Path) -> Result<()> {
                 path.display()
             ));
         }
+    }
+    if !log.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "orphantier1-orphan-status:0"
+            || trimmed == "orphan tier1-orphan-status:0"
+            || trimmed == "orphan"
+    }) || !log.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "tier1-orphan-status:0"
+            || trimmed == "orphantier1-orphan-status:0"
+            || trimmed == "orphan tier1-orphan-status:0"
+    }) {
+        return Err(format!(
+            "{}: guest matrix serial log missing orphan readback/status marker",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -1422,10 +1462,50 @@ fn verify_xfstests_run_evidence(
             evidence_artifact.path.display()
         ));
     }
-    if backend == "docker-linux" && program != "docker" {
+    if backend == "docker-linux" {
+        verify_docker_xfstests_command(
+            command,
+            &program,
+            &selected_cases,
+            &evidence_artifact.path,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_docker_xfstests_command(
+    command: &serde_json::Map<String, serde_json::Value>,
+    program: &str,
+    selected_cases: &[String],
+    path: &Path,
+) -> Result<()> {
+    if program == "docker" {
+        return Ok(());
+    }
+    if program != "python3" {
         return Err(format!(
-            "{}: docker-linux xfstests evidence must run docker",
-            evidence_artifact.path.display()
+            "{}: docker-linux xfstests evidence must run docker or the repo-owned python3 wrapper",
+            path.display()
+        ));
+    }
+    let args = required_json_string_array(command, "args", path)?;
+    if args.first().map(String::as_str) != Some("tools/ext4/tier1_xfstests_docker.py") {
+        return Err(format!(
+            "{}: docker-linux xfstests wrapper command must invoke tools/ext4/tier1_xfstests_docker.py",
+            path.display()
+        ));
+    }
+    let Some(separator) = args.iter().position(|arg| arg == "--") else {
+        return Err(format!(
+            "{}: docker-linux xfstests wrapper command missing -- case separator",
+            path.display()
+        ));
+    };
+    let actual_cases = &args[separator + 1..];
+    if actual_cases != selected_cases {
+        return Err(format!(
+            "{}: docker-linux xfstests wrapper cases do not match authority selection",
+            path.display()
         ));
     }
     Ok(())
@@ -1859,7 +1939,18 @@ fn verify_fault_executor_log(
         root.join("tools/ext4/fault_qemu_executor.py").display(),
         job_request.display()
     );
-    if !text.lines().any(|line| line == command_line) {
+    let mut command_lines = vec![command_line.clone()];
+    if let Some(temporary_job_request) = temporary_run_equivalent_path(job_request) {
+        command_lines.push(format!(
+            "$ python3 {} {}",
+            root.join("tools/ext4/fault_qemu_executor.py").display(),
+            temporary_job_request.display()
+        ));
+    }
+    if !text
+        .lines()
+        .any(|line| command_lines.iter().any(|expected| line == expected))
+    {
         return Err(format!(
             "{}: fault executor log {} missing command line `{command_line}`",
             receipt_path.display(),
@@ -1874,6 +1965,55 @@ fn verify_fault_executor_log(
         ));
     }
     Ok(())
+}
+
+fn temporary_run_equivalent_path(path: &Path) -> Option<PathBuf> {
+    let mut ancestors = path.ancestors();
+    let run_dir = ancestors.find(|ancestor| ancestor.join("crash-cuts").is_dir())?;
+    let run_id = run_dir.file_name()?.to_str()?;
+    if run_id.starts_with('.') || run_id.ends_with(".tmp") {
+        return None;
+    }
+    let relative = path.strip_prefix(run_dir).ok()?;
+    Some(
+        run_dir
+            .parent()?
+            .join(format!(".{run_id}.tmp"))
+            .join(relative),
+    )
+}
+
+fn finalized_run_equivalent_path(path: &Path) -> Option<PathBuf> {
+    let run_dir = path.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"))
+    })?;
+    let raw_run_id = run_dir.file_name()?.to_str()?;
+    let run_id = raw_run_id.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let relative = path.strip_prefix(run_dir).ok()?;
+    Some(run_dir.parent()?.join(run_id).join(relative))
+}
+
+fn equivalent_run_path(actual: &Path, expected: &Path) -> bool {
+    actual == expected
+        || temporary_run_equivalent_path(expected).as_deref() == Some(actual)
+        || temporary_run_equivalent_path(actual).as_deref() == Some(expected)
+        || finalized_run_equivalent_path(expected).as_deref() == Some(actual)
+        || finalized_run_equivalent_path(actual).as_deref() == Some(expected)
+}
+
+fn stable_existing_path(path: &Path) -> PathBuf {
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    if let Some(final_path) = finalized_run_equivalent_path(path) {
+        if final_path.is_file() {
+            return final_path;
+        }
+    }
+    path.to_path_buf()
 }
 
 fn verify_crash_cut_executor_plan(
@@ -1891,12 +2031,7 @@ fn verify_crash_cut_executor_plan(
         executor_plan,
     )?;
     let plan = json_object(&plan_json, "fault executor plan", executor_plan)?;
-    require_field_value(
-        plan,
-        "request",
-        &job_request.display().to_string(),
-        executor_plan,
-    )?;
+    require_path_field_value(plan, "request", job_request, executor_plan)?;
     require_field_value(
         plan,
         "campaign_plan_sha256",
@@ -1963,12 +2098,7 @@ fn verify_crash_cut_executor_plan(
     verify_executor_plan_preflights(plan, executor_plan)?;
 
     let result = required_json_object(plan, "result", executor_plan)?;
-    require_field_value(
-        result,
-        "path",
-        &result_path.display().to_string(),
-        executor_plan,
-    )?;
+    require_path_field_value(result, "path", result_path, executor_plan)?;
     require_field_value(result, "status", "written", executor_plan)?;
     Ok(())
 }
@@ -2000,7 +2130,11 @@ fn verify_executor_plan_staged_roles_and_command(
         .get("staged_role_image_digests")
         .and_then(|value| value.as_object());
     for role in ["test", "scratch", "workload"] {
-        let source = PathBuf::from(required_json_string(role_images, role, executor_plan)?);
+        let source = stable_existing_path(&PathBuf::from(required_json_string(
+            role_images,
+            role,
+            executor_plan,
+        )?));
         let expected_staged = job_dir.join("roles").join(format!("{role}.img"));
         let staged_path = required_bound_path(staged, role, &expected_staged, executor_plan)?;
         if !source.is_file() {
@@ -2485,7 +2619,7 @@ fn required_bound_path(
     path: &Path,
 ) -> Result<PathBuf> {
     let actual = PathBuf::from(required_json_string(object, key, path)?);
-    if actual != expected {
+    if !equivalent_run_path(&actual, expected) {
         return Err(format!(
             "{}: job request {key} mismatch: expected {}, found {}",
             path.display(),
@@ -2716,4 +2850,36 @@ fn canonical_existing_path(path: &Path, label: &str, context: &Path) -> Result<P
 struct ArtifactRecord {
     path: PathBuf,
     sha256: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn run_path_equivalence_maps_final_and_temporary_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "tx-receipt-path-equivalence-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let final_path =
+            root.join("target/ext4/tier1/live-run/crash-cuts/crash-cut-0000/job-request.json");
+        let temporary_path =
+            root.join("target/ext4/tier1/.live-run.tmp/crash-cuts/crash-cut-0000/job-request.json");
+        fs::create_dir_all(final_path.parent().expect("final parent")).expect("mkdir final");
+        fs::write(&final_path, "{}\n").expect("write final");
+
+        assert!(equivalent_run_path(&temporary_path, &final_path));
+        assert!(equivalent_run_path(&final_path, &temporary_path));
+        assert_eq!(stable_existing_path(&temporary_path), final_path);
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

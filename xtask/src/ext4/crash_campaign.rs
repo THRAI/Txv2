@@ -3,13 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::Result;
 use crate::shell_test;
 use crate::target::TxTarget;
+use crate::Result;
 
 use super::{
-    CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily, is_real_sha256, read_json, receipt,
-    run_workspace, sha256_file,
+    is_real_sha256, read_json, receipt, run_workspace, sha256_file, CrashCutCampaignPlan,
+    CrashCutCatalog, CrashCutFamily,
 };
 
 const REPLAY_PROBE_MAX_ATTEMPTS: usize = 3;
@@ -203,12 +203,8 @@ pub(crate) fn execute_crash_cut_campaign(
     run.record_artifact("crash-campaign-plan", manifest.clone())?;
 
     let campaign_plan_sha256 = sha256_file(&manifest)?;
-    let (next_idx, mut families, mut outcomes) = restore_completed_crash_cut_state_from(
-        run,
-        crash_cuts,
-        &campaign_plan_sha256,
-        start_cut.unwrap_or(0),
-    )?;
+    let (next_idx, mut families, mut outcomes) =
+        restore_completed_crash_cut_state_from(run, crash_cuts, &campaign_plan_sha256, 0)?;
     let next_idx = campaign_start_index(next_idx, start_cut);
     let mut seen_families = families.iter().cloned().collect::<BTreeSet<_>>();
 
@@ -770,6 +766,7 @@ fn record_existing_fault_job_artifacts(
 ) -> Result<()> {
     let cached_hashes = fault_job_large_artifact_hashes(job)?;
     for (suffix, path) in [
+        ("job-request", &job.request_path),
         ("executor-plan", &job.executor_plan_path),
         ("result", &job.result_path),
         ("serial", &job.serial_log),

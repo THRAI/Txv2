@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 DEFAULT_IMAGE = os.environ.get(
-    "TX_EXT4_XFSTESTS_DOCKER_IMAGE", "tx-ext4-e2fsprogs:local"
+    "TX_EXT4_XFSTESTS_DOCKER_IMAGE", "tx-ext4-xfstests-tier1:local"
 )
 IMAGE_SIZE_MIB = int(os.environ.get("TX_EXT4_XFSTESTS_IMAGE_MIB", "512"))
 
@@ -41,6 +41,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = args.xfstests_root.resolve()
         cases = selected_cases(args.case, args.check_args)
+        validate_source_layout(root)
+        preflight_docker_image(args.image)
+        prepare_source(args.image, root, cases)
         validate_source(root, cases)
         preflight_docker(args.image, root, cases)
         if args.preflight:
@@ -73,19 +76,26 @@ def strip_remainder_separator(args: list[str]) -> list[str]:
 
 
 def validate_source(root: Path, cases: list[str]) -> None:
-    check = root / "check"
-    if not check.is_file():
-        raise XfstestsDockerError(f"missing xfstests check script: {check}")
-    missing = [
-        str(path)
-        for path in required_helper_paths(root, cases)
-        if not path.is_file() or not os.access(path, os.X_OK)
-    ]
+    validate_source_layout(root)
+    missing = missing_helper_paths(root, cases)
     if missing:
         raise XfstestsDockerError(
             "pinned xfstests source is not built; missing executable helpers: "
-            + ", ".join(missing)
+            + ", ".join(str(path) for path in missing)
         )
+
+
+def validate_source_layout(root: Path) -> None:
+    check = root / "check"
+    if not check.is_file():
+        raise XfstestsDockerError(f"missing xfstests check script: {check}")
+
+
+def missing_helper_paths(root: Path, cases: list[str]) -> list[Path]:
+    return [
+        path for path in required_helper_paths(root, cases)
+        if not path.is_file() or not os.access(path, os.X_OK)
+    ]
 
 
 def required_helper_paths(root: Path, cases: list[str]) -> list[Path]:
@@ -95,7 +105,7 @@ def required_helper_paths(root: Path, cases: list[str]) -> list[Path]:
     return [root / helper for helper in sorted(helpers)]
 
 
-def preflight_docker(image: str, root: Path, cases: list[str]) -> None:
+def preflight_docker_image(image: str) -> None:
     docker = shutil.which("docker")
     if docker is None:
         raise XfstestsDockerError("docker is unavailable")
@@ -108,6 +118,55 @@ def preflight_docker(image: str, root: Path, cases: list[str]) -> None:
     )
     if inspect.returncode != 0:
         raise XfstestsDockerError(f"Docker image {image} is unavailable")
+
+
+def prepare_source(image: str, root: Path, cases: list[str]) -> None:
+    if not missing_helper_paths(root, cases):
+        return
+    docker = shutil.which("docker")
+    if docker is None:
+        raise XfstestsDockerError("docker is unavailable")
+    prepare = subprocess.run(
+        [
+            docker,
+            "run",
+            "--rm",
+            "--mount",
+            f"type=bind,source={root},target=/xfstests",
+            image,
+            "bash",
+            "-lc",
+            docker_prepare_script(cases),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if prepare.returncode != 0:
+        raise XfstestsDockerError(
+            f"Docker Linux xfstests source prepare failed: {last_stderr_line(prepare.stderr)}"
+        )
+
+
+def docker_prepare_script(cases: list[str]) -> str:
+    targets = sorted({helper for case in cases for helper in CASE_HELPERS.get(case, ())})
+    make_targets = " ".join(shell_quote(target) for target in targets)
+    if not make_targets:
+        make_targets = "ltp/fsstress src/t_rename_overwrite src/feature src/min_dio_alignment ltp/fsx src/godown"
+    return (
+        "set -eu; "
+        "cd /xfstests; "
+        'CFLAGS="-D_GNU_SOURCE ${CFLAGS:-}" ./configure --libexecdir=/usr/lib --exec_prefix=/var/lib; '
+        f"make -j2 {make_targets}"
+    )
+
+
+def preflight_docker(image: str, root: Path, cases: list[str]) -> None:
+    preflight_docker_image(image)
+    docker = shutil.which("docker")
+    if docker is None:
+        raise XfstestsDockerError("docker is unavailable")
     probe = subprocess.run(
         [
             docker,
@@ -130,6 +189,10 @@ def preflight_docker(image: str, root: Path, cases: list[str]) -> None:
         raise XfstestsDockerError(
             f"Docker Linux xfstests preflight failed: {last_stderr_line(probe.stderr)}"
         )
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
 def docker_preflight_script(cases: list[str]) -> str:
@@ -165,7 +228,10 @@ def run_check(image: str, root: Path, work_dir: Path, check_args: list[str]) -> 
     scratch_img = work_dir / "xfstests-scratch.img"
     ensure_image(test_img)
     ensure_image(scratch_img)
-    for path in (work_dir / "mnt" / "test", work_dir / "mnt" / "scratch", work_dir / "results"):
+    results_dir = work_dir / "results"
+    if results_dir.exists():
+        shutil.rmtree(results_dir)
+    for path in (work_dir / "mnt" / "test", work_dir / "mnt" / "scratch", results_dir):
         path.mkdir(parents=True, exist_ok=True)
     docker = shutil.which("docker")
     if docker is None:
@@ -216,6 +282,8 @@ cleanup() {
     losetup -d "$scratchdev" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+mke2fs -q -t ext4 -F -b 4096 "$testdev"
+mke2fs -q -t ext4 -F -b 4096 "$scratchdev"
 cat > /xfstests/local.config <<EOF
 export FSTYP=ext4
 export TEST_DEV=$testdev

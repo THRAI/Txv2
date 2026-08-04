@@ -1,0 +1,35 @@
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        acl \
+        attr \
+        autoconf \
+        automake \
+        bash \
+        build-essential \
+        bc \
+        ca-certificates \
+        coreutils \
+        dmsetup \
+        e2fsprogs \
+        file \
+        fio \
+        libacl1-dev \
+        libaio-dev \
+        libattr1-dev \
+        libblkid-dev \
+        libtool \
+        libtool-bin \
+        liburing-dev \
+        libuuid1 \
+        make \
+        pkg-config \
+        procps \
+        uuid-dev \
+        util-linux \
+        xfsprogs \
+        xfslibs-dev \
+    && rm -rf /var/lib/apt/lists/*

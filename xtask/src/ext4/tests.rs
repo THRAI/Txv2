@@ -10,13 +10,13 @@ use super::crash_campaign::{
 };
 use super::live_preflight::collect_storage_capacity_preflight_for_test;
 use super::{
-    CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
-    CrashCutOutcome, Tier1Authorities, XfstestsExecutionBackend, XfstestsSourceLock,
     crash_cut_shell_test_args, parse_fault_job_result, parse_tier1_args, parse_xfstests_summary,
     run_and_record_command, run_crash_cut_campaign, run_live_preflight,
     run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts, tier1_shell_test_args,
     verify_xfstests_source_lock, write_fault_job_request, xfstests_docker_preflight_command,
-    xfstests_execution_backend_for_host, xfstests_selected_cases_sha256,
+    xfstests_execution_backend_for_host, xfstests_selected_cases_sha256, CrashCutCampaignEvidence,
+    CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily, CrashCutOutcome, Tier1Authorities,
+    XfstestsExecutionBackend, XfstestsSourceLock,
 };
 use crate::target::TxTarget;
 
@@ -92,18 +92,15 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         run.record_child(child);
         run.mark_failed_for_test("child-exit");
     }
-    assert!(
-        root.join("target/ext4/tier1/failed-run/failed-receipt.json")
-            .exists()
-    );
-    assert!(
-        root.join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
-            .exists()
-    );
-    assert!(
-        root.join("target/ext4/tier1/failed-run/receipt-lock.json")
-            .exists()
-    );
+    assert!(root
+        .join("target/ext4/tier1/failed-run/failed-receipt.json")
+        .exists());
+    assert!(root
+        .join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
+        .exists());
+    assert!(root
+        .join("target/ext4/tier1/failed-run/receipt-lock.json")
+        .exists());
     let artifacts: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap(),
     )
@@ -158,6 +155,20 @@ fn run_workspace_resume_preserves_existing_temporary_state() {
 }
 
 #[test]
+fn run_workspace_stable_path_rewrites_temporary_path() {
+    let root = temp_root("stable-path");
+    let run = RunWorkspace::create(&root, "stable-run").unwrap();
+    let staged = run.temporary_path_for_test().join("test.img");
+    let stable = run.stable_path(&staged);
+
+    assert_eq!(stable, root.join("target/ext4/tier1/stable-run/test.img"));
+    assert_eq!(
+        run.stable_path(&root.join("external/artifact.img")),
+        root.join("external/artifact.img")
+    );
+}
+
+#[test]
 fn run_workspace_resume_reopens_failed_final_state() {
     let root = temp_root("resume-failed-final");
     let final_dir = root.join("target/ext4/tier1/resume-run");
@@ -173,11 +184,9 @@ fn run_workspace_resume_reopens_failed_final_state() {
 
     assert_eq!(run.temporary_path_for_test(), temp_dir);
     assert!(!final_dir.exists());
-    assert!(
-        temp_dir
-            .join("crash-cuts/crash-cut-0772/result.json")
-            .exists()
-    );
+    assert!(temp_dir
+        .join("crash-cuts/crash-cut-0772/result.json")
+        .exists());
     assert!(!temp_dir.join("failed-receipt.json").exists());
     assert!(!temp_dir.join("artifacts.json").exists());
     assert!(!temp_dir.join("receipt-lock.json").exists());
@@ -226,6 +235,54 @@ fn run_workspace_resume_reuses_failed_artifact_manifest_hash_cache() {
         serde_json::from_str(&fs::read_to_string(final_dir.join("artifacts.json")).unwrap())
             .unwrap();
     assert_eq!(manifest["artifacts"][0]["sha256"], cached_sha256);
+}
+
+#[test]
+fn run_workspace_stage_copy_invalidates_resumed_hash_cache() {
+    let root = temp_root("resume-stage-copy-invalidates-cache");
+    let final_dir = root.join("target/ext4/tier1/resume-run");
+    let artifact = final_dir.join("xfstests-selection.json");
+    let cached_sha256 = "a".repeat(64);
+    write_text(&artifact, "old selection\n");
+    write_json(
+        &final_dir.join("artifacts.json"),
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.tier1_artifacts.v1",
+            "run_id": "resume-run",
+            "artifacts": [
+                {
+                    "name": "authority-xfstests-selection",
+                    "path": artifact.display().to_string(),
+                    "sha256": cached_sha256
+                }
+            ]
+        }))
+        .unwrap(),
+    );
+    write_text(&final_dir.join("failed-receipt.json"), "{}\n");
+    write_text(&final_dir.join("receipt-lock.json"), "{}\n");
+    let source = root.join("new-selection.json");
+    write_text(&source, "new selection\n");
+
+    {
+        let mut run = RunWorkspace::resume(&root, "resume-run").unwrap();
+        let staged = run
+            .stage_copy(
+                "authority-xfstests-selection",
+                &source,
+                "xfstests-selection.json",
+            )
+            .unwrap();
+        assert_eq!(run.cached_artifact_sha256(&staged), None);
+        run.finalize().unwrap();
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(final_dir.join("artifacts.json")).unwrap())
+            .unwrap();
+    let expected_sha256 = sha256_file(&final_dir.join("xfstests-selection.json")).unwrap();
+    assert_eq!(manifest["artifacts"][0]["sha256"], expected_sha256);
+    assert_ne!(manifest["artifacts"][0]["sha256"], cached_sha256);
 }
 
 #[test]
@@ -459,11 +516,9 @@ fn tier1_parse_accepts_live_start_cut() {
     .expect("parse start cut");
 
     assert_eq!(invocation.crash_cut_start, Some(725));
-    assert!(
-        invocation
-            .planned_actions()
-            .contains(&"execute deterministic crash cuts from crash-cut-0725".into())
-    );
+    assert!(invocation
+        .planned_actions()
+        .contains(&"execute deterministic crash cuts from crash-cut-0725".into()));
 }
 
 #[test]
@@ -586,6 +641,70 @@ fn tier1_crash_cut_resume_restores_completed_start_cut_slice() {
 }
 
 #[test]
+fn tier1_crash_cut_start_preserves_restored_prefix_evidence() {
+    let root = temp_root("crash-cut-start-preserves-prefix");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
+    let manifest = run.working_dir().join("crash-campaign-plan.json");
+    write_text(&manifest, "campaign-plan\n");
+    let campaign_plan_sha256 = sha256_file(&manifest).unwrap();
+    write_complete_restored_cut(
+        &run,
+        "crash-cut-0000",
+        "D0",
+        "tx.ext4.crash.phase.D0",
+        &campaign_plan_sha256,
+    );
+
+    let (next_idx, families, outcomes) =
+        restore_completed_crash_cut_state_from(&mut run, &catalog, &campaign_plan_sha256, 0)
+            .unwrap();
+
+    assert_eq!(campaign_start_index(next_idx, Some(725)), 725);
+    assert_eq!(families, vec!["D0"]);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].cut_id, "crash-cut-0000");
+}
+
+#[test]
 fn tier1_parse_rejects_preflight_report_without_live_preflight() {
     let root = temp_root("preflight-report-without-live");
     write_tier1_authority_fixture(&root);
@@ -667,16 +786,14 @@ fn tier1_live_preflight_writes_durable_blocker_report() {
         value["authorities"]["xfstests_selection"]["status"],
         "selection-authority-declared"
     );
-    assert!(
-        value["result"]["blockers"]
-            .as_array()
+    assert!(value["result"]["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|blocker| blocker
-                .as_str()
-                .unwrap()
-                .contains("pinned xfstests source is missing"))
-    );
+            .contains("pinned xfstests source is missing")));
 }
 
 #[test]
@@ -975,9 +1092,7 @@ fn tier1_live_rejects_acceptance_ready_xfstests_without_readiness_evidence() {
         .unwrap()
         .ensure_live_acceptance_ready()
         .expect_err("status-only xfstests readiness must fail");
-    assert!(
-        error.contains("xfstests selection is acceptance-ready but missing readiness_evidence")
-    );
+    assert!(error.contains("xfstests selection is acceptance-ready but missing readiness_evidence"));
 }
 
 #[test]
@@ -1355,13 +1470,11 @@ fn tier1_fault_job_request_binds_repository_executor_inputs() {
         value["job"]["semantic_oracles"][0]["expected"]["present"]["/"],
         serde_json::json!({})
     );
-    assert!(
-        fixture
-            .run
-            .working_dir()
-            .join("crash-cuts/crash-cut-0007/job-request.json")
-            .is_file()
-    );
+    assert!(fixture
+        .run
+        .working_dir()
+        .join("crash-cuts/crash-cut-0007/job-request.json")
+        .is_file());
 }
 
 #[test]
@@ -2505,7 +2618,7 @@ fn tier1_xfstests_backend_defaults_to_repo_docker_wrapper_off_linux() {
     assert_eq!(
         backend,
         XfstestsExecutionBackend::DockerLinux {
-            image: "tx-ext4-e2fsprogs:local".into()
+            image: "tx-ext4-xfstests-tier1:local".into()
         }
     );
 }
@@ -2545,22 +2658,16 @@ fn tier1_xfstests_backend_builds_repo_wrapper_command() {
 
     assert_eq!(command.cwd, root);
     assert_eq!(command.program, "python3");
-    assert!(
-        command
-            .args
-            .ends_with(&["--".into(), "generic/013".into(), "generic/035".into()])
-    );
-    assert!(
-        command
-            .args
-            .contains(&"tools/ext4/tier1_xfstests_docker.py".into())
-    );
+    assert!(command
+        .args
+        .ends_with(&["--".into(), "generic/013".into(), "generic/035".into()]));
+    assert!(command
+        .args
+        .contains(&"tools/ext4/tier1_xfstests_docker.py".into()));
     assert!(command.args.contains(&"--xfstests-root".into()));
-    assert!(
-        command
-            .args
-            .contains(&xfstests_root.canonicalize().unwrap().display().to_string())
-    );
+    assert!(command
+        .args
+        .contains(&xfstests_root.canonicalize().unwrap().display().to_string()));
     assert!(command.args.contains(&"--work-dir".into()));
     assert!(command.args.contains(&work_dir.display().to_string()));
     assert!(command.args.contains(&"--image".into()));
@@ -2573,14 +2680,14 @@ fn tier1_xfstests_docker_preflight_uses_repo_wrapper_and_cases() {
     let xfstests_root = root.join("external/xfstests");
     fs::create_dir_all(&xfstests_root).unwrap();
     let backend = XfstestsExecutionBackend::DockerLinux {
-        image: "tx-ext4-e2fsprogs:local".into(),
+        image: "tx-ext4-xfstests-tier1:local".into(),
     };
 
     let command = xfstests_docker_preflight_command(
         &root,
         &backend,
         &xfstests_root,
-        &["generic/013".into(), "generic/475".into()],
+        &["generic/013".into(), "generic/023".into()],
     )
     .expect("docker preflight command");
 
@@ -2589,7 +2696,7 @@ fn tier1_xfstests_docker_preflight_uses_repo_wrapper_and_cases() {
     assert!(command.args.contains(&"--preflight".into()));
     assert!(command.args.contains(&"--case".into()));
     assert!(command.args.contains(&"generic/013".into()));
-    assert!(command.args.contains(&"generic/475".into()));
+    assert!(command.args.contains(&"generic/023".into()));
 }
 
 fn temp_root(suffix: &str) -> PathBuf {

@@ -18,7 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-DOCKER_IMAGE = os.environ.get("TX_EXT4_LINUX_REPLAY_DOCKER_IMAGE", "tx-ext4-e2fsprogs:local")
+DOCKER_IMAGE = os.environ.get("TX_EXT4_LINUX_REPLAY_DOCKER_IMAGE", "tx-ext4-xfstests-tier1:local")
 
 
 class LinuxReplayError(Exception):
