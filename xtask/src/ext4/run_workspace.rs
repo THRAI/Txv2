@@ -14,6 +14,7 @@ pub(crate) struct RunWorkspace {
     temporary: PathBuf,
     child_processes: Vec<Child>,
     artifacts: BTreeMap<String, PathBuf>,
+    artifact_sha256: BTreeMap<PathBuf, String>,
     authorities: Option<Tier1AuthorityInputs>,
     failure_reason: Option<String>,
     finalized: bool,
@@ -33,9 +34,10 @@ impl RunWorkspace {
         let base = root.join("target/ext4/tier1");
         let final_dir = base.join(run_id);
         let temporary = base.join(format!(".{run_id}.tmp"));
+        let mut artifact_sha256 = BTreeMap::new();
         if final_dir.exists() {
             if preserve_existing {
-                reopen_failed_final_workspace(&final_dir, &temporary)?;
+                artifact_sha256 = reopen_failed_final_workspace(&final_dir, &temporary)?;
             } else {
                 return Err(format!(
                     "run workspace already exists: {}",
@@ -55,6 +57,7 @@ impl RunWorkspace {
             temporary,
             child_processes: Vec::new(),
             artifacts: BTreeMap::new(),
+            artifact_sha256,
             authorities: None,
             failure_reason: None,
             finalized: false,
@@ -69,6 +72,24 @@ impl RunWorkspace {
     pub(crate) fn record_artifact(&mut self, name: impl Into<String>, path: PathBuf) -> Result<()> {
         self.artifacts.insert(name.into(), path);
         Ok(())
+    }
+
+    pub(crate) fn record_artifact_with_sha256(
+        &mut self,
+        name: impl Into<String>,
+        path: PathBuf,
+        sha256: impl Into<String>,
+    ) -> Result<()> {
+        let sha256 = sha256.into();
+        if !is_real_sha256(&sha256) {
+            return Err(format!("invalid artifact sha256 for {}", path.display()));
+        }
+        self.artifact_sha256.insert(path.clone(), sha256);
+        self.record_artifact(name, path)
+    }
+
+    pub(crate) fn cached_artifact_sha256(&self, path: &Path) -> Option<&str> {
+        self.artifact_sha256.get(path).map(String::as_str)
     }
 
     pub(crate) fn stage_copy(
@@ -257,7 +278,15 @@ impl RunWorkspace {
                     .strip_prefix(&self.temporary)
                     .map(|relative| self.final_dir.join(relative))
                     .unwrap_or_else(|_| path.clone());
-                let sha256 = sha256_file(path)?;
+                let sha256 = if path.is_file() {
+                    self.artifact_sha256
+                        .get(path)
+                        .cloned()
+                        .map(Ok)
+                        .unwrap_or_else(|| sha256_file(path))?
+                } else {
+                    sha256_file(path)?
+                };
                 Ok(serde_json::json!({
                     "name": name,
                     "path": stable_path.display().to_string(),
@@ -357,7 +386,10 @@ pub(super) fn tier1_image_cow_clone_supported(root: &Path) -> bool {
     result.is_ok()
 }
 
-fn reopen_failed_final_workspace(final_dir: &Path, temporary: &Path) -> Result<()> {
+fn reopen_failed_final_workspace(
+    final_dir: &Path,
+    temporary: &Path,
+) -> Result<BTreeMap<PathBuf, String>> {
     let acceptance_receipt = final_dir.join("acceptance-receipt.json");
     if acceptance_receipt.exists() {
         return Err(format!(
@@ -372,6 +404,7 @@ fn reopen_failed_final_workspace(final_dir: &Path, temporary: &Path) -> Result<(
             temporary.display()
         ));
     }
+    let artifact_sha256 = load_failed_artifact_sha256_cache(final_dir, temporary)?;
     fs::rename(final_dir, temporary).map_err(|err| {
         format!(
             "failed to reopen failed run workspace {} -> {}: {err}",
@@ -386,10 +419,48 @@ fn reopen_failed_final_workspace(final_dir: &Path, temporary: &Path) -> Result<(
                 .map_err(|err| format!("failed to remove stale {}: {err}", stale.display()))?;
         }
     }
-    Ok(())
+    Ok(artifact_sha256)
 }
 
-fn copy_image_cow(source: &Path, destination: &Path) -> Result<()> {
+fn load_failed_artifact_sha256_cache(
+    final_dir: &Path,
+    temporary: &Path,
+) -> Result<BTreeMap<PathBuf, String>> {
+    let manifest_path = final_dir.join("artifacts.json");
+    if !manifest_path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let Ok(text) = fs::read_to_string(&manifest_path) else {
+        return Ok(BTreeMap::new());
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(artifacts) = value.get("artifacts").and_then(|value| value.as_array()) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut cache = BTreeMap::new();
+    for artifact in artifacts {
+        let Some(path) = artifact.get("path").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(sha256) = artifact.get("sha256").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !is_real_sha256(sha256) {
+            continue;
+        }
+        let path = PathBuf::from(path);
+        let runtime_path = path
+            .strip_prefix(final_dir)
+            .map(|relative| temporary.join(relative))
+            .unwrap_or(path);
+        cache.insert(runtime_path, sha256.to_string());
+    }
+    Ok(cache)
+}
+
+pub(super) fn copy_image_cow(source: &Path, destination: &Path) -> Result<()> {
     if !source.is_file() {
         return Err(format!("missing image source: {}", source.display()));
     }
@@ -451,6 +522,10 @@ fn sha256_file(path: &Path) -> Result<String> {
     let bytes =
         fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     Ok(hex_string(tx_ext4_format::capability::sha256(&bytes)))
+}
+
+fn is_real_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn hex_string(bytes: [u8; 32]) -> String {

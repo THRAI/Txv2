@@ -1,9 +1,12 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::crash_campaign::{
-    campaign_start_index, restore_completed_crash_cut_state, restore_completed_crash_cut_state_from,
+    campaign_start_index, restore_completed_crash_cut_state,
+    restore_completed_crash_cut_state_from, run_replay_probe_with_retries_for_test,
+    write_crash_cut_outcome_manifest,
 };
 use super::live_preflight::collect_storage_capacity_preflight_for_test;
 use super::{
@@ -177,6 +180,51 @@ fn run_workspace_resume_reopens_failed_final_state() {
     assert!(!temp_dir.join("failed-receipt.json").exists());
     assert!(!temp_dir.join("artifacts.json").exists());
     assert!(!temp_dir.join("receipt-lock.json").exists());
+}
+
+#[test]
+fn run_workspace_resume_reuses_failed_artifact_manifest_hash_cache() {
+    let root = temp_root("resume-artifact-hash-cache");
+    let final_dir = root.join("target/ext4/tier1/resume-run");
+    let artifact = final_dir.join("crash-cuts/crash-cut-0999/replay.img");
+    let cached_sha256 = "a".repeat(64);
+    write_text(&artifact, "existing replay image\n");
+    write_json(
+        &final_dir.join("artifacts.json"),
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.tier1_artifacts.v1",
+            "run_id": "resume-run",
+            "artifacts": [
+                {
+                    "name": "crash-cut-0999-replay-image",
+                    "path": artifact.display().to_string(),
+                    "sha256": cached_sha256
+                }
+            ]
+        }))
+        .unwrap(),
+    );
+    write_text(&final_dir.join("failed-receipt.json"), "{}\n");
+    write_text(&final_dir.join("receipt-lock.json"), "{}\n");
+
+    {
+        let mut run = RunWorkspace::resume(&root, "resume-run").unwrap();
+        let temp_artifact = run
+            .temporary_path_for_test()
+            .join("crash-cuts/crash-cut-0999/replay.img");
+        assert_eq!(
+            run.cached_artifact_sha256(&temp_artifact),
+            Some(cached_sha256.as_str())
+        );
+        run.record_artifact("crash-cut-0999-replay-image", temp_artifact)
+            .unwrap();
+        run.mark_failed_for_test("cache-rewrite");
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(final_dir.join("artifacts.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["artifacts"][0]["sha256"], cached_sha256);
 }
 
 #[test]
@@ -1173,6 +1221,62 @@ fn tier1_crash_cut_shell_matrix_uses_boot_and_cut_images_with_phase_marker() {
 }
 
 #[test]
+fn tier1_replay_probe_retries_from_retained_crash_image_after_timeout() {
+    let root = temp_root("replay-probe-retry");
+    let boot_image = root.join("boot.img");
+    let crash_image = root.join("crash.img");
+    let replay_image = root.join("replay.img");
+    let replay_script = root.join("tools/ext4/tier1/crash-replay.scn");
+    let replay_serial_log = root.join("replay-serial.log");
+    write_text(&boot_image, "boot-image\n");
+    write_text(&crash_image, "clean-crash-image\n");
+    write_text(&replay_image, "mutated-after-failed-probe\n");
+    write_text(&replay_script, "# replay\n");
+    let attempts: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
+
+    let result = run_replay_probe_with_retries_for_test(
+        &root,
+        &boot_image,
+        &replay_image,
+        &crash_image,
+        &replay_script,
+        &replay_serial_log,
+        |_, args| {
+            let attempt = attempts.borrow().len() + 1;
+            let serial = shell_arg_value(&args, "--serial-log");
+            write_text(
+                &PathBuf::from(&serial),
+                &format!("replay attempt {attempt}\n"),
+            );
+            attempts.borrow_mut().push(args);
+            if attempt == 1 {
+                Err("timed out after 10000 ms waiting for \"crash-replay-inspect:0\"".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .expect("second replay attempt should pass");
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.attempts, 2);
+    assert_eq!(attempts.borrow().len(), 2);
+    assert_eq!(
+        fs::read_to_string(&replay_image).unwrap(),
+        "clean-crash-image\n"
+    );
+    assert!(root.join("replay-serial-attempt-1.log").is_file());
+    assert_eq!(
+        fs::read_to_string(&replay_serial_log).unwrap(),
+        "replay attempt 2\n"
+    );
+    assert_eq!(
+        shell_arg_value(&attempts.borrow()[1], "--serial-log"),
+        replay_serial_log.display().to_string()
+    );
+}
+
+#[test]
 fn tier1_fault_job_request_binds_repository_executor_inputs() {
     let mut fixture = fault_request_fixture("fault-job-request");
 
@@ -1868,6 +1972,169 @@ fn tier1_crash_cut_resume_discards_result_without_replay_serial() {
 }
 
 #[test]
+fn tier1_crash_cut_resume_discards_result_without_replay_success_marker() {
+    let root = temp_root("crash-cut-resume-failed-replay-serial");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
+    let campaign_plan_sha256 = "a".repeat(64);
+    write_complete_restored_cut(
+        &run,
+        "crash-cut-0000",
+        "D0",
+        "tx.ext4.crash.phase.D0",
+        &campaign_plan_sha256,
+    );
+    let stale_cut = run.working_dir().join("crash-cuts").join("crash-cut-0000");
+    write_text(
+        &stale_cut.join("replay-serial.log"),
+        "crash-replay-mount:0\n/ # \n",
+    );
+
+    let (next_idx, families, outcomes) =
+        restore_completed_crash_cut_state(&mut run, &catalog, &campaign_plan_sha256).unwrap();
+
+    assert_eq!(next_idx, 0);
+    assert!(families.is_empty());
+    assert!(outcomes.is_empty());
+    assert!(!stale_cut.exists());
+}
+
+#[test]
+fn tier1_crash_cut_resume_restores_large_image_hashes_from_executor_plan() {
+    let root = temp_root("crash-cut-resume-executor-plan-hashes");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
+    let campaign_plan_sha256 = "a".repeat(64);
+    write_complete_restored_cut(
+        &run,
+        "crash-cut-0000",
+        "D0",
+        "tx.ext4.crash.phase.D0",
+        &campaign_plan_sha256,
+    );
+    let job_dir = run.working_dir().join("crash-cuts/crash-cut-0000");
+    let crash_image = job_dir.join("crash.img");
+    let replay_image = job_dir.join("replay.img");
+    let crash_sha256 = sha256_file(&crash_image).unwrap();
+    let replay_sha256 = sha256_file(&replay_image).unwrap();
+    let replay_recovery_log = job_dir.join("replay-recovery.log");
+    write_text(&replay_recovery_log, "replay recovery ok\n");
+    write_json(
+        &job_dir.join("executor-plan.json"),
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "tx.ext4.fault_qemu_executor_plan.v1",
+            "preserved_images": {
+                "crash": crash_image.display().to_string(),
+                "replay": replay_image.display().to_string(),
+                "source": job_dir.join("roles/scratch.img").display().to_string(),
+                "status": "copied-after-runner-termination"
+            },
+            "staged_role_image_digests": {
+                "scratch": crash_sha256
+            },
+            "replay_image_recovery": {
+                "image": replay_image.display().to_string(),
+                "image_sha256": replay_sha256,
+                "log": replay_recovery_log.display().to_string(),
+                "log_sha256": sha256_file(&replay_recovery_log).unwrap(),
+                "exit_code": 0,
+                "status": "ok"
+            }
+        }))
+        .unwrap(),
+    );
+
+    let (_next_idx, _families, outcomes) =
+        restore_completed_crash_cut_state(&mut run, &catalog, &campaign_plan_sha256).unwrap();
+
+    assert_eq!(outcomes[0].immutable_image_sha256, replay_sha256);
+    assert_eq!(
+        run.cached_artifact_sha256(&crash_image),
+        Some(crash_sha256.as_str())
+    );
+    assert_eq!(
+        run.cached_artifact_sha256(&replay_image),
+        Some(replay_sha256.as_str())
+    );
+}
+
+#[test]
 fn tier1_crash_cut_campaign_consumes_executor_outcome_manifest() {
     let root = temp_root("crash-cut-outcome-consume");
     let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
@@ -2074,6 +2341,31 @@ fn tier1_crash_cut_outcome_manifest_parses_into_clean_evidence() {
     assert_eq!(evidence.summary.families, vec!["D0", "D1"]);
     assert_eq!(evidence.immutable_images.len(), 2);
     assert_eq!(evidence.immutable_images[0].role, "crash-cut-0000");
+}
+
+#[test]
+fn tier1_crash_cut_outcome_manifest_writes_completed_before_required() {
+    let root = temp_root("crash-outcome-manifest-field-order");
+    let run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let path = write_crash_cut_outcome_manifest(
+        &run,
+        1000,
+        116,
+        vec!["D0".into()],
+        vec![CrashCutOutcome {
+            cut_id: "crash-cut-0884".into(),
+            immutable_image_sha256: "1".repeat(64),
+            replay_serial_sha256: "2".repeat(64),
+            e2fsck_exit_code: 0,
+            replay_exit_code: 0,
+        }],
+    )
+    .expect("write outcome manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+
+    assert_eq!(manifest["completed"], 116);
+    assert_eq!(manifest["required"], 1000);
 }
 
 #[test]
@@ -2299,6 +2591,14 @@ fn write_text(path: &PathBuf, text: &str) {
     fs::write(path, text).expect("write text fixture");
 }
 
+fn shell_arg_value(args: &[String], flag: &str) -> String {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|idx| args.get(idx + 1))
+        .cloned()
+        .unwrap_or_else(|| panic!("missing {flag} in args: {args:?}"))
+}
+
 fn write_complete_restored_cut(
     run: &RunWorkspace,
     cut_id: &str,
@@ -2321,7 +2621,10 @@ fn write_complete_restored_cut(
     write_text(&crash_image, "crash-image\n");
     write_text(&replay_image, "replay-image\n");
     write_text(&serial_log, &format!("{phase_marker}\n"));
-    write_text(&replay_serial_log, "replay-ok\n");
+    write_text(
+        &replay_serial_log,
+        "crash-replay-mount:0\ncrash-replay-inspect:0\n",
+    );
     write_text(&e2fsck_log, "e2fsck-ok\n");
     write_text(&linux_rw_log, "linux-rw-ok\n");
     write_text(&linux_post_log, "linux-post-ok\n");

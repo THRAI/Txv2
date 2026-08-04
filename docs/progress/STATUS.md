@@ -31772,3 +31772,30 @@
   also remains storage-blocked on this checkout
   (`available=9608380416`, `required=10808721408`). No fresh 1000-cut QEMU run,
   pinned xfstests execution, or verified immutable G0-G7 receipt exists yet.
+
+- 2026-08-04 (ext4 Task 16 resume/hash-cache frontier).
+  Continued
+  `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`.
+  The diagnostic resumed run
+  `cargo xtask ext4 tier1 --run-id task16-d10-startcut-postfix-20260804 --resume --start-cut crash-cut-0725`
+  successfully reopened the failed final run directory, skipped the known
+  expensive prefix, and advanced the preserved diagnostic suffix to 275
+  retained `result.json` files covering `crash-cut-0725..0999`. All 275
+  `replay-serial.log` files contain `crash-replay-inspect:0`, the resumed
+  guest matrix passed 8 groups, and offline `e2fsck -fn` passed for TEST,
+  SCRATCH, and WORKLOAD role images. The final blocker in this macOS checkout
+  is pinned xfstests execution: `./check generic/013 generic/035 generic/091
+  generic/095 generic/226 generic/301 generic/388 generic/475` failed with
+  `fstests only supports Linux`. The old `crash-cut-0884` replay timeout was a
+  transient resolved by replay retry/resume and is no longer the active
+  failure point. The runner now preserves failed replay attempt logs, discards
+  resumed cuts without the replay success marker, writes
+  `crash-cut-outcomes.json` with `completed=275` and `required=1000`, and
+  caches artifact SHA256 values from failed-run `artifacts.json` plus executor
+  plan crash/replay image digests so the next continuation can reuse retained
+  evidence instead of rehashing large image artifacts for another slow failed
+  receipt. Next continuation should move to a Linux-capable xfstests host or
+  Linux container path and produce the fresh full G0-G7 receipt. Task 16
+  remains pending: this suffix is partial diagnostic evidence only, not the
+  required fresh 1000-cut QEMU/e2fsck run, pinned xfstests execution, immutable
+  receipt generation, or `--verify-receipt`.

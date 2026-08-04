@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +11,8 @@ use super::{
     CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily, is_real_sha256, read_json, receipt,
     run_workspace, sha256_file,
 };
+
+const REPLAY_PROBE_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 pub(crate) struct CrashCutCampaignEvidence {
@@ -25,6 +27,14 @@ pub(crate) struct CrashCutOutcome {
     pub(crate) replay_serial_sha256: String,
     pub(crate) e2fsck_exit_code: i32,
     pub(crate) replay_exit_code: i32,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplayProbeRun {
+    pub(crate) exit_code: i32,
+    #[allow(dead_code)]
+    pub(crate) attempts: usize,
+    pub(crate) attempt_logs: Vec<PathBuf>,
 }
 
 impl CrashCutCampaignEvidence {
@@ -245,26 +255,37 @@ pub(crate) fn execute_crash_cut_campaign(
         )?;
         remove_secondary_oracle_images(&job)?;
 
-        let replay_args = crash_cut_shell_test_args(
+        let replay_probe = run_replay_probe_with_retries(
+            root,
             boot_image,
             &job.replay_image,
+            &job.crash_image,
             &campaign.replay_script,
-            None,
-            Some(&job.replay_serial_log),
-        );
-        let replay_exit_code = match shell_test::shell_test(root, replay_args) {
-            Ok(()) => 0,
-            Err(err) => {
-                println!("{err}");
-                1
-            }
-        };
+            &job.replay_serial_log,
+        )?;
+        let replay_exit_code = replay_probe.exit_code;
+        for (idx, attempt_log) in replay_probe.attempt_logs.iter().enumerate() {
+            run.record_artifact(
+                format!("{cut_id}-replay-serial-attempt-{}", idx + 1),
+                attempt_log.clone(),
+            )?;
+        }
 
-        let immutable_image_sha256 = sha256_file(&job.replay_image)?;
+        let immutable_image_sha256 = if replay_probe.attempts > 1 {
+            sha256_file(&job.replay_image)?
+        } else {
+            cached_or_file_sha256(run, &job.replay_image)?
+        };
         let replay_serial_sha256 = sha256_file(&job.replay_serial_log)?;
-        run.record_artifact(
+        run.record_artifact_with_sha256(
+            format!("{cut_id}-replay-image"),
+            job.replay_image.clone(),
+            immutable_image_sha256.clone(),
+        )?;
+        run.record_artifact_with_sha256(
             format!("{cut_id}-replay-serial"),
             job.replay_serial_log.clone(),
+            replay_serial_sha256.clone(),
         )?;
         outcomes.push(CrashCutOutcome {
             cut_id,
@@ -297,8 +318,8 @@ pub(crate) fn execute_crash_cut_campaign(
 
     let outcomes_path = write_crash_cut_outcome_manifest(
         run,
-        outcomes.len(),
         crash_cuts.expanded_cut_count,
+        outcomes.len(),
         families,
         outcomes,
     )?;
@@ -357,6 +378,11 @@ pub(crate) fn restore_completed_crash_cut_state_from(
                 .map_err(|err| format!("failed to remove stale {}: {err}", job_dir.display()))?;
             return Ok((idx, families, outcomes));
         }
+        if !replay_serial_has_success_marker(&replay_serial_log)? {
+            fs::remove_dir_all(&job_dir)
+                .map_err(|err| format!("failed to remove stale {}: {err}", job_dir.display()))?;
+            return Ok((idx, families, outcomes));
+        }
         if seen_families.insert(family.id.clone()) {
             families.push(family.id.clone());
         }
@@ -392,11 +418,17 @@ pub(crate) fn restore_completed_crash_cut_state_from(
             phase_marker,
             &fault_job.e2fsck_log,
         )?;
-        let immutable_image_sha256 = sha256_file(&fault_job.replay_image)?;
+        let immutable_image_sha256 = cached_or_file_sha256(run, &fault_job.replay_image)?;
         let replay_serial_sha256 = sha256_file(&fault_job.replay_serial_log)?;
-        run.record_artifact(
+        run.record_artifact_with_sha256(
+            format!("{cut_id}-replay-image"),
+            fault_job.replay_image.clone(),
+            immutable_image_sha256.clone(),
+        )?;
+        run.record_artifact_with_sha256(
             format!("{cut_id}-replay-serial"),
             fault_job.replay_serial_log.clone(),
+            replay_serial_sha256.clone(),
         )?;
         outcomes.push(CrashCutOutcome {
             cut_id,
@@ -408,6 +440,150 @@ pub(crate) fn restore_completed_crash_cut_state_from(
     }
 
     Ok((start_idx + outcomes.len(), families, outcomes))
+}
+
+fn run_replay_probe_with_retries(
+    root: &Path,
+    boot_image: &Path,
+    replay_image: &Path,
+    crash_image: &Path,
+    replay_script: &Path,
+    replay_serial_log: &Path,
+) -> Result<ReplayProbeRun> {
+    run_replay_probe_with_retries_inner(
+        root,
+        boot_image,
+        replay_image,
+        crash_image,
+        replay_script,
+        replay_serial_log,
+        shell_test::shell_test,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_replay_probe_with_retries_for_test<F>(
+    root: &Path,
+    boot_image: &Path,
+    replay_image: &Path,
+    crash_image: &Path,
+    replay_script: &Path,
+    replay_serial_log: &Path,
+    run_shell_test: F,
+) -> Result<ReplayProbeRun>
+where
+    F: FnMut(&Path, Vec<String>) -> Result<()>,
+{
+    run_replay_probe_with_retries_inner(
+        root,
+        boot_image,
+        replay_image,
+        crash_image,
+        replay_script,
+        replay_serial_log,
+        run_shell_test,
+    )
+}
+
+fn run_replay_probe_with_retries_inner<F>(
+    root: &Path,
+    boot_image: &Path,
+    replay_image: &Path,
+    crash_image: &Path,
+    replay_script: &Path,
+    replay_serial_log: &Path,
+    mut run_shell_test: F,
+) -> Result<ReplayProbeRun>
+where
+    F: FnMut(&Path, Vec<String>) -> Result<()>,
+{
+    let mut attempt_logs = Vec::new();
+    for attempt in 1..=REPLAY_PROBE_MAX_ATTEMPTS {
+        if attempt > 1 {
+            restore_replay_image_from_crash(crash_image, replay_image)?;
+        }
+        let replay_args = crash_cut_shell_test_args(
+            boot_image,
+            replay_image,
+            replay_script,
+            None,
+            Some(replay_serial_log),
+        );
+        match run_shell_test(root, replay_args) {
+            Ok(()) => {
+                return Ok(ReplayProbeRun {
+                    exit_code: 0,
+                    attempts: attempt,
+                    attempt_logs,
+                });
+            }
+            Err(err) => {
+                println!("{err}");
+                if attempt < REPLAY_PROBE_MAX_ATTEMPTS {
+                    if replay_serial_log.is_file() {
+                        let attempt_log = replay_attempt_log_path(replay_serial_log, attempt);
+                        if attempt_log.exists() {
+                            fs::remove_file(&attempt_log).map_err(|err| {
+                                format!("failed to remove stale {}: {err}", attempt_log.display())
+                            })?;
+                        }
+                        fs::rename(replay_serial_log, &attempt_log).map_err(|err| {
+                            format!(
+                                "failed to preserve replay attempt log {} -> {}: {err}",
+                                replay_serial_log.display(),
+                                attempt_log.display()
+                            )
+                        })?;
+                        attempt_logs.push(attempt_log);
+                    }
+                } else {
+                    return Ok(ReplayProbeRun {
+                        exit_code: 1,
+                        attempts: attempt,
+                        attempt_logs,
+                    });
+                }
+            }
+        }
+    }
+    unreachable!("bounded replay probe loop always returns");
+}
+
+fn restore_replay_image_from_crash(crash_image: &Path, replay_image: &Path) -> Result<()> {
+    if replay_image.exists() {
+        fs::remove_file(replay_image)
+            .map_err(|err| format!("failed to remove {}: {err}", replay_image.display()))?;
+    }
+    run_workspace::copy_image_cow(crash_image, replay_image)
+}
+
+fn replay_attempt_log_path(replay_serial_log: &Path, attempt: usize) -> PathBuf {
+    let parent = replay_serial_log.parent().unwrap_or_else(|| Path::new(""));
+    let stem = replay_serial_log
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("replay-serial");
+    let extension = replay_serial_log
+        .extension()
+        .and_then(|extension| extension.to_str());
+    let file_name = match extension {
+        Some(extension) => format!("{stem}-attempt-{attempt}.{extension}"),
+        None => format!("{stem}-attempt-{attempt}"),
+    };
+    parent.join(file_name)
+}
+
+fn replay_serial_has_success_marker(path: &Path) -> Result<bool> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    Ok(text.contains("crash-replay-inspect:0"))
+}
+
+fn cached_or_file_sha256(run: &run_workspace::RunWorkspace, path: &Path) -> Result<String> {
+    run.cached_artifact_sha256(path)
+        .map(str::to_string)
+        .map(Ok)
+        .unwrap_or_else(|| sha256_file(path))
 }
 
 pub(crate) fn crash_cut_shell_test_args(
@@ -592,6 +768,7 @@ fn record_existing_fault_job_artifacts(
     cut_id: &str,
     job: &FaultJobPaths,
 ) -> Result<()> {
+    let cached_hashes = fault_job_large_artifact_hashes(job)?;
     for (suffix, path) in [
         ("executor-plan", &job.executor_plan_path),
         ("result", &job.result_path),
@@ -612,10 +789,85 @@ fn record_existing_fault_job_artifacts(
         ("replay-serial", &job.replay_serial_log),
     ] {
         if path.is_file() {
-            run.record_artifact(format!("{cut_id}-{suffix}"), path.clone())?;
+            if let Some(sha256) = cached_hashes.get(path) {
+                run.record_artifact_with_sha256(
+                    format!("{cut_id}-{suffix}"),
+                    path.clone(),
+                    sha256.clone(),
+                )?;
+            } else {
+                run.record_artifact(format!("{cut_id}-{suffix}"), path.clone())?;
+            }
         }
     }
     Ok(())
+}
+
+fn fault_job_large_artifact_hashes(job: &FaultJobPaths) -> Result<BTreeMap<PathBuf, String>> {
+    if !job.executor_plan_path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let Ok(value) = read_json(&job.executor_plan_path) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut hashes = BTreeMap::new();
+    if let Some(sha256) = scratch_image_sha256_from_plan(&value) {
+        insert_if_path_matches(
+            &mut hashes,
+            &value,
+            ["preserved_images", "crash"],
+            &job.crash_image,
+            sha256,
+        );
+    }
+    if let Some(sha256) = replay_recovery_image_sha256_from_plan(&value, &job.replay_image) {
+        hashes.insert(job.replay_image.clone(), sha256);
+    }
+    Ok(hashes)
+}
+
+fn scratch_image_sha256_from_plan(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("staged_role_image_digests")
+        .and_then(|value| value.get("scratch"))
+        .and_then(|value| value.as_str())
+        .filter(|value| is_real_sha256(value))
+        .map(str::to_string)
+}
+
+fn replay_recovery_image_sha256_from_plan(
+    value: &serde_json::Value,
+    replay_image: &Path,
+) -> Option<String> {
+    let recovery = value.get("replay_image_recovery")?;
+    let image = recovery.get("image").and_then(|value| value.as_str())?;
+    if Path::new(image) != replay_image {
+        return None;
+    }
+    recovery
+        .get("image_sha256")
+        .and_then(|value| value.as_str())
+        .filter(|value| is_real_sha256(value))
+        .map(str::to_string)
+}
+
+fn insert_if_path_matches<const N: usize>(
+    hashes: &mut BTreeMap<PathBuf, String>,
+    value: &serde_json::Value,
+    fields: [&str; N],
+    expected_path: &Path,
+    sha256: String,
+) {
+    let mut current = value;
+    for field in fields {
+        let Some(next) = current.get(field) else {
+            return;
+        };
+        current = next;
+    }
+    if current.as_str().map(Path::new) == Some(expected_path) {
+        hashes.insert(expected_path.to_path_buf(), sha256);
+    }
 }
 
 fn remove_secondary_oracle_images(job: &FaultJobPaths) -> Result<()> {
@@ -1116,7 +1368,7 @@ fn verify_observation_entry(
     Ok(())
 }
 
-fn write_crash_cut_outcome_manifest(
+pub(crate) fn write_crash_cut_outcome_manifest(
     run: &run_workspace::RunWorkspace,
     required: usize,
     completed: usize,
