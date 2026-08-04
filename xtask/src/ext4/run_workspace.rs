@@ -34,10 +34,14 @@ impl RunWorkspace {
         let final_dir = base.join(run_id);
         let temporary = base.join(format!(".{run_id}.tmp"));
         if final_dir.exists() {
-            return Err(format!(
-                "run workspace already exists: {}",
-                final_dir.display()
-            ));
+            if preserve_existing {
+                reopen_failed_final_workspace(&final_dir, &temporary)?;
+            } else {
+                return Err(format!(
+                    "run workspace already exists: {}",
+                    final_dir.display()
+                ));
+            }
         }
         if temporary.exists() && !preserve_existing {
             fs::remove_dir_all(&temporary)
@@ -351,6 +355,38 @@ pub(super) fn tier1_image_cow_clone_supported(root: &Path) -> bool {
     })();
     let _ = fs::remove_dir_all(&probe_dir);
     result.is_ok()
+}
+
+fn reopen_failed_final_workspace(final_dir: &Path, temporary: &Path) -> Result<()> {
+    let acceptance_receipt = final_dir.join("acceptance-receipt.json");
+    if acceptance_receipt.exists() {
+        return Err(format!(
+            "run workspace already finalized with acceptance receipt: {}",
+            final_dir.display()
+        ));
+    }
+    if temporary.exists() {
+        return Err(format!(
+            "cannot resume {}; temporary workspace also exists: {}",
+            final_dir.display(),
+            temporary.display()
+        ));
+    }
+    fs::rename(final_dir, temporary).map_err(|err| {
+        format!(
+            "failed to reopen failed run workspace {} -> {}: {err}",
+            final_dir.display(),
+            temporary.display()
+        )
+    })?;
+    for name in ["failed-receipt.json", "artifacts.json", "receipt-lock.json"] {
+        let stale = temporary.join(name);
+        if stale.exists() {
+            fs::remove_file(&stale)
+                .map_err(|err| format!("failed to remove stale {}: {err}", stale.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_image_cow(source: &Path, destination: &Path) -> Result<()> {

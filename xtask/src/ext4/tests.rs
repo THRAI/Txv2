@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::crash_campaign::{campaign_start_index, restore_completed_crash_cut_state};
+use super::crash_campaign::{
+    campaign_start_index, restore_completed_crash_cut_state, restore_completed_crash_cut_state_from,
+};
 use super::live_preflight::collect_storage_capacity_preflight_for_test;
 use super::{
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
@@ -149,6 +151,47 @@ fn run_workspace_resume_preserves_existing_temporary_state() {
 
     assert_eq!(run.temporary_path_for_test(), temp_dir);
     assert_eq!(fs::read_to_string(&marker).unwrap(), "keep-me\n");
+}
+
+#[test]
+fn run_workspace_resume_reopens_failed_final_state() {
+    let root = temp_root("resume-failed-final");
+    let final_dir = root.join("target/ext4/tier1/resume-run");
+    fs::create_dir_all(&final_dir).unwrap();
+    write_text(&final_dir.join("failed-receipt.json"), "{}\n");
+    write_text(&final_dir.join("artifacts.json"), "{}\n");
+    write_text(&final_dir.join("receipt-lock.json"), "{}\n");
+    let marker = final_dir.join("crash-cuts/crash-cut-0772/result.json");
+    write_text(&marker, "{\"schema\":\"tx.ext4.fault_job_result.v1\"}\n");
+
+    let run = RunWorkspace::resume(&root, "resume-run").unwrap();
+    let temp_dir = root.join("target/ext4/tier1/.resume-run.tmp");
+
+    assert_eq!(run.temporary_path_for_test(), temp_dir);
+    assert!(!final_dir.exists());
+    assert!(
+        temp_dir
+            .join("crash-cuts/crash-cut-0772/result.json")
+            .exists()
+    );
+    assert!(!temp_dir.join("failed-receipt.json").exists());
+    assert!(!temp_dir.join("artifacts.json").exists());
+    assert!(!temp_dir.join("receipt-lock.json").exists());
+}
+
+#[test]
+fn run_workspace_resume_rejects_accepted_final_state() {
+    let root = temp_root("resume-accepted-final");
+    let final_dir = root.join("target/ext4/tier1/resume-run");
+    fs::create_dir_all(&final_dir).unwrap();
+    write_text(&final_dir.join("acceptance-receipt.json"), "{}\n");
+
+    let error = RunWorkspace::resume(&root, "resume-run")
+        .expect_err("accepted receipts must not be reopened");
+
+    assert!(error.contains("already finalized with acceptance receipt"));
+    assert!(final_dir.exists());
+    assert!(!root.join("target/ext4/tier1/.resume-run.tmp").exists());
 }
 
 #[test]
@@ -428,6 +471,69 @@ fn tier1_crash_cut_start_uses_later_of_resume_prefix_and_requested_cut() {
     assert_eq!(campaign_start_index(0, Some(725)), 725);
     assert_eq!(campaign_start_index(724, Some(725)), 725);
     assert_eq!(campaign_start_index(800, Some(725)), 800);
+}
+
+#[test]
+fn tier1_crash_cut_resume_restores_completed_start_cut_slice() {
+    let root = temp_root("crash-cut-start-slice-resume");
+    let mut run = RunWorkspace::create(&root, "crash-run").unwrap();
+    let catalog_path = root.join("tools/ext4/tier1/crash-cuts.json");
+    write_text(
+        &root.join("tools/ext4/tier1/crash-workload.scn"),
+        "# workload\n",
+    );
+    write_text(
+        &root.join("tools/ext4/tier1/crash-replay.scn"),
+        "# replay\n",
+    );
+    write_json(
+        &catalog_path,
+        r#"{
+          "schema":"tx.ext4.crash_cut_catalog.v1",
+          "status":"acceptance-ready",
+          "expanded_cut_count":1000,
+          "campaign":{
+            "workload_script":"tools/ext4/tier1/crash-workload.scn",
+            "replay_script":"tools/ext4/tier1/crash-replay.scn",
+            "kill_policy":"deterministic-phase-marker-v1",
+            "e2fsck_mode":"immutable-copy"
+          },
+          "families":[
+            {"id":"D0","phase_marker":"tx.ext4.crash.phase.D0"},
+            {"id":"D1","phase_marker":"tx.ext4.crash.phase.D1"},
+            {"id":"D2","phase_marker":"tx.ext4.crash.phase.D2"},
+            {"id":"D3","phase_marker":"tx.ext4.crash.phase.D3"},
+            {"id":"D4","phase_marker":"tx.ext4.crash.phase.D4"},
+            {"id":"D5","phase_marker":"tx.ext4.crash.phase.D5"},
+            {"id":"D6","phase_marker":"tx.ext4.crash.phase.D6"},
+            {"id":"D7","phase_marker":"tx.ext4.crash.phase.D7"},
+            {"id":"D8","phase_marker":"tx.ext4.crash.phase.D8"},
+            {"id":"D9","phase_marker":"tx.ext4.crash.phase.D9"},
+            {"id":"D10","phase_marker":"tx.ext4.crash.phase.D10"},
+            {"id":"D11","phase_marker":"tx.ext4.crash.phase.D11"},
+            {"id":"D12","phase_marker":"tx.ext4.crash.phase.D12"}
+          ]
+        }"#,
+    );
+    let catalog = CrashCutCatalog::load_with_root(catalog_path, &root).unwrap();
+    let manifest = run.working_dir().join("crash-campaign-plan.json");
+    write_text(&manifest, "campaign-plan\n");
+    let campaign_plan_sha256 = sha256_file(&manifest).unwrap();
+    write_complete_restored_cut(
+        &run,
+        "crash-cut-0725",
+        "D10",
+        "tx.ext4.crash.phase.D10",
+        &campaign_plan_sha256,
+    );
+
+    let (next_idx, families, outcomes) =
+        restore_completed_crash_cut_state_from(&mut run, &catalog, &campaign_plan_sha256, 725)
+            .unwrap();
+
+    assert_eq!(campaign_start_index(next_idx, Some(725)), 726);
+    assert_eq!(families, vec!["D10"]);
+    assert_eq!(outcomes[0].cut_id, "crash-cut-0725");
 }
 
 #[test]
@@ -2191,6 +2297,106 @@ fn write_text(path: &PathBuf, text: &str) {
         fs::create_dir_all(parent).expect("create parent");
     }
     fs::write(path, text).expect("write text fixture");
+}
+
+fn write_complete_restored_cut(
+    run: &RunWorkspace,
+    cut_id: &str,
+    case_id: &str,
+    phase_marker: &str,
+    campaign_plan_sha256: &str,
+) {
+    let job_dir = run.working_dir().join("crash-cuts").join(cut_id);
+    fs::create_dir_all(&job_dir).unwrap();
+    let crash_image = job_dir.join("crash.img");
+    let replay_image = job_dir.join("replay.img");
+    let serial_log = job_dir.join("serial.log");
+    let replay_serial_log = job_dir.join("replay-serial.log");
+    let e2fsck_log = job_dir.join("e2fsck-fn.log");
+    let linux_rw_log = job_dir.join("linux-rw-replay.log");
+    let linux_post_log = job_dir.join("linux-post-replay-e2fsck.log");
+    let tx_remount_log = job_dir.join("tx-remount.log");
+    let semantic_log = job_dir.join("semantic-oracle.log");
+
+    write_text(&crash_image, "crash-image\n");
+    write_text(&replay_image, "replay-image\n");
+    write_text(&serial_log, &format!("{phase_marker}\n"));
+    write_text(&replay_serial_log, "replay-ok\n");
+    write_text(&e2fsck_log, "e2fsck-ok\n");
+    write_text(&linux_rw_log, "linux-rw-ok\n");
+    write_text(&linux_post_log, "linux-post-ok\n");
+    write_text(&tx_remount_log, "tx-remount-ok\n");
+    write_text(&semantic_log, "semantic-ok\n");
+
+    let replay_arg = replay_image.display().to_string();
+    let linux_image = job_dir.join("linux-rw-replay.img");
+    let tx_image = job_dir.join("tx-remount.img");
+    let semantic_image = job_dir.join("semantic-oracle.img");
+    let result = serde_json::json!({
+        "schema": "tx.ext4.fault_job_result.v1",
+        "campaign_plan_sha256": campaign_plan_sha256,
+        "case": case_id,
+        "cut": cut_id,
+        "hard_kill_observed": true,
+        "replay_attempted": true,
+        "e2fsck_exit": 0,
+        "e2fsck_checks": [
+            {
+                "tool": "e2fsck",
+                "args": ["-fn", replay_arg],
+                "log": e2fsck_log.display().to_string(),
+                "log_sha256": sha256_file(&e2fsck_log).unwrap(),
+                "exit_code": 0
+            }
+        ],
+        "replay_matrix": [
+            {
+                "id": "linux-rw-replay",
+                "image": linux_image.display().to_string(),
+                "image_sha256": "1".repeat(64),
+                "log": linux_rw_log.display().to_string(),
+                "log_sha256": sha256_file(&linux_rw_log).unwrap(),
+                "exit_code": 0
+            },
+            {
+                "id": "linux-post-replay-e2fsck",
+                "image": linux_image.display().to_string(),
+                "image_sha256": "2".repeat(64),
+                "args": ["-fn", linux_image.display().to_string()],
+                "log": linux_post_log.display().to_string(),
+                "log_sha256": sha256_file(&linux_post_log).unwrap(),
+                "exit_code": 0
+            },
+            {
+                "id": "tx-remount",
+                "image": tx_image.display().to_string(),
+                "image_sha256": "3".repeat(64),
+                "log": tx_remount_log.display().to_string(),
+                "log_sha256": sha256_file(&tx_remount_log).unwrap(),
+                "exit_code": 0
+            }
+        ],
+        "semantic_oracles": [
+            {
+                "id": "debugfs-file-hash-namespace",
+                "image": semantic_image.display().to_string(),
+                "image_sha256": "4".repeat(64),
+                "log": semantic_log.display().to_string(),
+                "log_sha256": sha256_file(&semantic_log).unwrap(),
+                "exit_code": 0,
+                "expected": {
+                    "present": {
+                        "/": {}
+                    }
+                }
+            }
+        ]
+    });
+    fs::write(
+        job_dir.join("result.json"),
+        serde_json::to_string_pretty(&result).unwrap(),
+    )
+    .unwrap();
 }
 
 fn run_git(cwd: &PathBuf, args: &[&str]) {

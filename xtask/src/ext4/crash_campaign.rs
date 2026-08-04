@@ -193,8 +193,12 @@ pub(crate) fn execute_crash_cut_campaign(
     run.record_artifact("crash-campaign-plan", manifest.clone())?;
 
     let campaign_plan_sha256 = sha256_file(&manifest)?;
-    let (next_idx, mut families, mut outcomes) =
-        restore_completed_crash_cut_state(run, crash_cuts, &campaign_plan_sha256)?;
+    let (next_idx, mut families, mut outcomes) = restore_completed_crash_cut_state_from(
+        run,
+        crash_cuts,
+        &campaign_plan_sha256,
+        start_cut.unwrap_or(0),
+    )?;
     let next_idx = campaign_start_index(next_idx, start_cut);
     let mut seen_families = families.iter().cloned().collect::<BTreeSet<_>>();
 
@@ -309,16 +313,26 @@ pub(crate) fn campaign_start_index(
     restored_next_idx.max(requested_start.unwrap_or(0))
 }
 
+#[cfg(test)]
 pub(crate) fn restore_completed_crash_cut_state(
     run: &mut run_workspace::RunWorkspace,
     crash_cuts: &CrashCutCatalog,
     campaign_plan_sha256: &str,
 ) -> Result<(usize, Vec<String>, Vec<CrashCutOutcome>)> {
+    restore_completed_crash_cut_state_from(run, crash_cuts, campaign_plan_sha256, 0)
+}
+
+pub(crate) fn restore_completed_crash_cut_state_from(
+    run: &mut run_workspace::RunWorkspace,
+    crash_cuts: &CrashCutCatalog,
+    campaign_plan_sha256: &str,
+    start_idx: usize,
+) -> Result<(usize, Vec<String>, Vec<CrashCutOutcome>)> {
     let mut outcomes = Vec::new();
     let mut families = Vec::new();
     let mut seen_families = BTreeSet::new();
 
-    for idx in 0..crash_cuts.expanded_cut_count {
+    for idx in start_idx..crash_cuts.expanded_cut_count {
         let family = &crash_cuts.families[idx % crash_cuts.families.len()];
         let phase_marker = family.phase_marker.as_deref().ok_or_else(|| {
             format!(
@@ -393,7 +407,7 @@ pub(crate) fn restore_completed_crash_cut_state(
         });
     }
 
-    Ok((outcomes.len(), families, outcomes))
+    Ok((start_idx + outcomes.len(), families, outcomes))
 }
 
 pub(crate) fn crash_cut_shell_test_args(

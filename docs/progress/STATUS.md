@@ -1,3 +1,23 @@
+- 2026-08-04 (ext4 Task16 failed-run start-cut resume).
+  Tightened the failure-point resume path after
+  `task16-d10-startcut-postfix-20260804` proved the old D10 blocker was fixed
+  but then failed in a rerun of the pre-crash guest matrix. `RunWorkspace::resume`
+  can now reopen a failed final directory by moving
+  `target/ext4/tier1/<run-id>` back to `.<run-id>.tmp` state while refusing to
+  reopen a directory that already has `acceptance-receipt.json`; stale
+  `failed-receipt.json`, `artifacts.json`, and `receipt-lock.json` are removed
+  so the resumed run writes fresh bindings. Crash-cut restore also now scans
+  from the requested `--start-cut`, so a diagnostic run that completed
+  `crash-cut-0725..0772` and failed can resume with
+  `--resume --start-cut crash-cut-0725` and continue at `crash-cut-0773`
+  instead of paying the prefix again. Verification passed focused resume tests,
+  `cargo test -p xtask ext4 -- --test-threads=1` (105),
+  `cargo -q xtask unit` (`655 + 114 + 66 + 167`), and scoped rustfmt.
+  `cargo fmt --package xtask --check` remains blocked by pre-existing xtask
+  formatting drift outside the touched ext4 files. Task 16 remains open: this
+  is a harness recovery improvement, not a fresh 1000-cut/e2fsck/xfstests
+  receipt.
+
 - 2026-08-04 (ext4 Task16 D10 replay restore retry).
   Fixed the next Task 16 harness blocker from
   `task16-live-recovery-retry-20260804` without promoting final acceptance.
