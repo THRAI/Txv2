@@ -1,3 +1,19 @@
+- 2026-08-05 (SMP scheduler and PELT implementation plan).
+  Added `docs/superpowers/plans/2026-08-04-smp-pelt-scheduler.md` and
+  `docs/progress/plans/2026-08-04-smp-pelt-scheduler.json` for the approved
+  unified rollout. The plan orders canonical contract alignment, authoritative
+  `TaskControl`/run-token transitions, queue and wake linearization,
+  Reschedule-IPI/WFI race closure, static AP userspace, full userspace-token
+  unwind, direct stealing, forced affinity migration, S3 guest acceptance,
+  PELT shadow/matched S4 A/B, and measurement-gated S5 sharding. No scheduler
+  implementation changed in this planning step. Verification passed
+  `cargo xtask lint docs` (seven pre-existing discussion-only stale-vocabulary
+  warnings), `cargo xtask progress validate` (42 JSON records), plan
+  placeholder/type/spec-coverage scans, and `git diff --check`. Next: execute
+  Task 1 with TDD checkpoints and stage-specific commits. Blockers: active
+  PELT and segmented storage remain conditional on their declared evidence
+  gates.
+
 - 2026-08-04 (SMP scheduler and PELT design).
   Added `docs/superpowers/specs/2026-08-04-smp-pelt-scheduler-design.md` with
   the approved per-hart owner model, idle-first direct steal, migration-safe
