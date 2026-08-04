@@ -2,15 +2,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::crash_campaign::restore_completed_crash_cut_state;
+use super::crash_campaign::{campaign_start_index, restore_completed_crash_cut_state};
 use super::live_preflight::collect_storage_capacity_preflight_for_test;
 use super::{
-    crash_cut_shell_test_args, parse_fault_job_result, parse_tier1_args, parse_xfstests_summary,
-    run_and_record_command, run_crash_cut_campaign, run_live_preflight,
-    run_workspace::RunWorkspace, sha256_file, stage_authority_artifacts, tier1_shell_test_args,
-    verify_xfstests_source_lock, write_fault_job_request, xfstests_selected_cases_sha256,
     CrashCutCampaignEvidence, CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
-    CrashCutOutcome, Tier1Authorities, XfstestsSourceLock,
+    CrashCutOutcome, Tier1Authorities, XfstestsSourceLock, crash_cut_shell_test_args,
+    parse_fault_job_result, parse_tier1_args, parse_xfstests_summary, run_and_record_command,
+    run_crash_cut_campaign, run_live_preflight, run_workspace::RunWorkspace, sha256_file,
+    stage_authority_artifacts, tier1_shell_test_args, verify_xfstests_source_lock,
+    write_fault_job_request, xfstests_selected_cases_sha256,
 };
 use crate::target::TxTarget;
 
@@ -86,15 +86,18 @@ fn run_workspace_failure_kills_children_writes_receipt_and_cleans_on_drop() {
         run.record_child(child);
         run.mark_failed_for_test("child-exit");
     }
-    assert!(root
-        .join("target/ext4/tier1/failed-run/failed-receipt.json")
-        .exists());
-    assert!(root
-        .join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
-        .exists());
-    assert!(root
-        .join("target/ext4/tier1/failed-run/receipt-lock.json")
-        .exists());
+    assert!(
+        root.join("target/ext4/tier1/failed-run/failed-receipt.json")
+            .exists()
+    );
+    assert!(
+        root.join("target/ext4/tier1/failed-run/crash-campaign-plan.json")
+            .exists()
+    );
+    assert!(
+        root.join("target/ext4/tier1/failed-run/receipt-lock.json")
+            .exists()
+    );
     let artifacts: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(root.join("target/ext4/tier1/failed-run/artifacts.json")).unwrap(),
     )
@@ -347,6 +350,87 @@ fn tier1_parse_accepts_resume_for_live_runs() {
 }
 
 #[test]
+fn tier1_parse_accepts_live_start_cut() {
+    let root = temp_root("start-cut-parse");
+    write_tier1_authority_fixture(&root);
+
+    let invocation = parse_tier1_args(
+        &root,
+        &[
+            "tier1".into(),
+            "--run-id".into(),
+            "diagnose-cut".into(),
+            "--start-cut".into(),
+            "crash-cut-0725".into(),
+        ],
+    )
+    .expect("parse start cut");
+
+    assert_eq!(invocation.crash_cut_start, Some(725));
+    assert!(
+        invocation
+            .planned_actions()
+            .contains(&"execute deterministic crash cuts from crash-cut-0725".into())
+    );
+}
+
+#[test]
+fn tier1_parse_rejects_start_cut_outside_campaign() {
+    let root = temp_root("start-cut-outside-campaign");
+    write_tier1_authority_fixture(&root);
+
+    let error = parse_tier1_args(
+        &root,
+        &[
+            "tier1".into(),
+            "--start-cut".into(),
+            "crash-cut-1000".into(),
+        ],
+    )
+    .expect_err("start cut must be within expanded campaign");
+
+    assert!(error.contains("outside expanded crash cut count 1000"));
+}
+
+#[test]
+fn tier1_parse_rejects_start_cut_for_non_live_modes() {
+    let root = temp_root("start-cut-live-only");
+    write_tier1_authority_fixture(&root);
+
+    let dry_run_error = parse_tier1_args(
+        &root,
+        &[
+            "tier1".into(),
+            "--dry-run".into(),
+            "--start-cut".into(),
+            "725".into(),
+        ],
+    )
+    .expect_err("start cut is live-only");
+    assert!(dry_run_error.contains("--start-cut is only valid for live runs"));
+
+    let preflight_error = parse_tier1_args(
+        &root,
+        &[
+            "tier1".into(),
+            "--preflight-live".into(),
+            "--start-cut".into(),
+            "725".into(),
+        ],
+    )
+    .expect_err("start cut is live-only");
+    assert!(preflight_error.contains("--start-cut is only valid for live runs"));
+}
+
+#[test]
+fn tier1_crash_cut_start_uses_later_of_resume_prefix_and_requested_cut() {
+    assert_eq!(campaign_start_index(0, None), 0);
+    assert_eq!(campaign_start_index(0, Some(725)), 725);
+    assert_eq!(campaign_start_index(724, Some(725)), 725);
+    assert_eq!(campaign_start_index(800, Some(725)), 800);
+}
+
+#[test]
 fn tier1_parse_rejects_preflight_report_without_live_preflight() {
     let root = temp_root("preflight-report-without-live");
     write_tier1_authority_fixture(&root);
@@ -428,14 +512,16 @@ fn tier1_live_preflight_writes_durable_blocker_report() {
         value["authorities"]["xfstests_selection"]["status"],
         "selection-authority-declared"
     );
-    assert!(value["result"]["blockers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|blocker| blocker
-            .as_str()
+    assert!(
+        value["result"]["blockers"]
+            .as_array()
             .unwrap()
-            .contains("pinned xfstests source is missing")));
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap()
+                .contains("pinned xfstests source is missing"))
+    );
 }
 
 #[test]
@@ -734,7 +820,9 @@ fn tier1_live_rejects_acceptance_ready_xfstests_without_readiness_evidence() {
         .unwrap()
         .ensure_live_acceptance_ready()
         .expect_err("status-only xfstests readiness must fail");
-    assert!(error.contains("xfstests selection is acceptance-ready but missing readiness_evidence"));
+    assert!(
+        error.contains("xfstests selection is acceptance-ready but missing readiness_evidence")
+    );
 }
 
 #[test]
@@ -1056,11 +1144,13 @@ fn tier1_fault_job_request_binds_repository_executor_inputs() {
         value["job"]["semantic_oracles"][0]["expected"]["present"]["/"],
         serde_json::json!({})
     );
-    assert!(fixture
-        .run
-        .working_dir()
-        .join("crash-cuts/crash-cut-0007/job-request.json")
-        .is_file());
+    assert!(
+        fixture
+            .run
+            .working_dir()
+            .join("crash-cuts/crash-cut-0007/job-request.json")
+            .is_file()
+    );
 }
 
 #[test]

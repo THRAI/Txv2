@@ -1,3 +1,26 @@
+- 2026-08-04 (ext4 Task16 D10 start-cut recovery path).
+  The fresh current-source run
+  `task16-live-recovery-retry-20260804` advanced past the old D5
+  `crash-cut-0213` blocker and reached `crash-cut-0725` before failing in the
+  D10 orphan family. The executor observed the hard cut marker, but the Tx
+  remount recovery leg timed out waiting for `tx-remount-readback-status:0`
+  after the replay image had changed, so the retry logic correctly fail-closed
+  instead of writing `result.json`. The old runner was then stopped during
+  `write_failed_receipt` artifact-manifest hashing after stack sampling showed
+  it was only hashing the failed workspace; no final failed receipt exists, but
+  the `.task16-live-recovery-retry-20260804.tmp` evidence directory is retained.
+  To avoid paying the 0..724 prefix cost during diagnosis,
+  `cargo xtask ext4 tier1` now accepts live-only
+  `--start-cut crash-cut-NNNN`; combined with `--resume` it preserves any
+  completed prefix evidence and starts at the later of the restored frontier
+  and requested cut, while fresh partial runs still cannot satisfy the
+  1000-cut receipt. Verification passed focused `tier1_parse_accepts_live_start_cut`,
+  `tier1_parse_rejects_start_cut_*`, `tier1_crash_cut_start_uses_later_of_resume_prefix_and_requested_cut`,
+  `cargo fmt --package xtask`, and `cargo test -p xtask ext4 -- --test-threads=1`
+  (102). Task 16 remains open: next step is a focused D10/orphan replay
+  diagnosis from `crash-cut-0725`, followed by a full fresh G0-G7 receipt run
+  only after that blocker is fixed.
+
 - 2026-08-04 (ext4 Task16 D5 Tx remount recovery retry).
   The fresh current-source run
   `task16-live-resume-complete-cut-20260803` failed at `crash-cut-0213`

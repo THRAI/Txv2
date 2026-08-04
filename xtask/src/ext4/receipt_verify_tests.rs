@@ -34,8 +34,10 @@ fn tier1_verify_receipt_rejects_campaign_plan_sha_mismatch() {
     let receipt = write_acceptance_receipt_fixture_with_bad_campaign_plan_sha(&root);
 
     let error = verify_tier1_receipt(&receipt).expect_err("bad campaign plan sha must fail");
-    assert!(error
-        .contains("fault job campaign_plan_sha256 does not match crash-campaign-plan artifact"));
+    assert!(
+        error
+            .contains("fault job campaign_plan_sha256 does not match crash-campaign-plan artifact")
+    );
 }
 
 #[test]

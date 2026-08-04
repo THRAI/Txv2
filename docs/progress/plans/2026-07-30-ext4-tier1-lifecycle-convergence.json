@@ -412,7 +412,7 @@
     {
       "id": "task-16-acceptance",
       "title": "Close G0-G7 with fresh product evidence",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": [
         "task-15-tier1-runner"
       ],
@@ -423,7 +423,10 @@
         "tools/ext4/fault_qemu_executor.py",
         "tools/tests/test_ext4_fault_matrix_runners.py",
         "tools/tests/test_ext4_fault_qemu_executor.py",
+        ".agents/skills/tx-xtask/SKILL.md",
+        "xtask/src/lib.rs",
         "xtask/src/ext4/mod.rs",
+        "xtask/src/ext4/crash_campaign.rs",
         "xtask/src/ext4/receipt_verify.rs",
         "xtask/src/ext4/receipt_verify_tests.rs",
         "xtask/src/ext4/tests.rs",
@@ -439,6 +442,10 @@
         "cargo xtask lint docs",
         "CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify -- --test-threads=1",
         "CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1",
+        "cargo test -p xtask tier1_parse_accepts_live_start_cut -- --test-threads=1",
+        "cargo test -p xtask tier1_parse_rejects_start_cut -- --test-threads=1",
+        "cargo test -p xtask tier1_crash_cut_start_uses_later_of_resume_prefix_and_requested_cut -- --test-threads=1",
+        "cargo test -p xtask ext4 -- --test-threads=1",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run",
         "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-shell-scenario-bind-preflight-20260802",
         "git diff --check",

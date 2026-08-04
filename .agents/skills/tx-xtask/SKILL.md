@@ -25,6 +25,7 @@ binary disagree, the binary wins.
 | Inspect ext4 Tier 1 plan/authorities | `cargo xtask ext4 tier1 --dry-run` |
 | Check ext4 Tier 1 live prerequisites without QEMU | `cargo xtask ext4 tier1 --preflight-live [--materialize-xfstests] [--preflight-report PATH]` |
 | Verify an ext4 Tier 1 receipt/lock/artifacts set | `cargo xtask ext4 tier1 --verify-receipt PATH` |
+| Resume a long ext4 Tier 1 crash campaign at a known cut | `cargo xtask ext4 tier1 --run-id RUN_ID --resume --start-cut crash-cut-NNNN` |
 | Validate progress JSON records | `cargo xtask progress validate` |
 | Run an architecture / docs / boundary lint | `cargo xtask lint arch\|docs\|unused\|boundary\|invariants` |
 | Decode a `.txtrace` file → JSON | `cargo xtask observe replay --file PATH` |
@@ -162,7 +163,7 @@ Runs guest shell scenarios from a script file. Flags:
 - `--list-groups` — print available group names from the script.
 - `--keep-going` — don't stop on first failure.
 
-### `cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run] [--preflight-live] [--materialize-xfstests] [--preflight-report PATH] [--verify-receipt PATH]`
+### `cargo xtask ext4 tier1 [--run-id RUN_ID] [--dry-run] [--preflight-live] [--materialize-xfstests] [--preflight-report PATH] [--resume] [--start-cut crash-cut-NNNN] [--verify-receipt PATH]`
 
 Runs the ext4 Tier 1 acceptance planner/runner. `--dry-run` prints the
 ordered action list and resolved authority hashes without launching QEMU or
@@ -179,6 +180,12 @@ authority `source_lock.path`, then verifies the pinned `check` digest.
 `--preflight-report PATH` is only valid with `--preflight-live`; it writes a
 durable JSON report with the authority hashes, host identity, blockers, and
 `acceptance_receipt_generated=false`, even when the preflight fails.
+`--resume` is only valid for live runs; it reuses the existing temporary run
+workspace for the same `--run-id` and discards incomplete crash-cut evidence.
+`--start-cut crash-cut-NNNN` is also live-only and starts the deterministic
+crash campaign at the named cut. On a resumed workspace, already-complete
+prefix cuts are preserved; on a fresh workspace this is diagnostic partial
+evidence and cannot satisfy the 1000-cut acceptance receipt by itself.
 `--verify-receipt PATH` checks a produced acceptance receipt without launching
 QEMU: G0-G7 must be passed, the receipt lock and artifact manifest digests
 must match, registered artifact files must hash cleanly, and every required

@@ -207,6 +207,7 @@ fn run_live_tier1(
         &scratch_image,
         &workload_image,
         &e2fsck,
+        invocation.crash_cut_start,
     ) {
         Ok(campaign) => campaign,
         Err(err) => {
@@ -322,6 +323,7 @@ struct Tier1Invocation {
     preflight_report: Option<PathBuf>,
     materialize_xfstests: bool,
     resume: bool,
+    crash_cut_start: Option<usize>,
     authorities: Tier1Authorities,
 }
 
@@ -382,16 +384,23 @@ impl Tier1Invocation {
             "ext4 tier1: deterministic crash cuts {}",
             self.authorities.crash_cuts.expanded_cut_count
         );
+        if let Some(start) = self.crash_cut_start {
+            println!("ext4 tier1: crash cut start crash-cut-{start:04}");
+        }
     }
 
     fn planned_actions(&self) -> Vec<String> {
+        let crash_action = match self.crash_cut_start {
+            Some(start) => format!("execute deterministic crash cuts from crash-cut-{start:04}"),
+            None => "execute deterministic crash cuts".into(),
+        };
         vec![
             "run G0 ext4 ownership and durability lints".into(),
             "build candidate".into(),
             "build busybox ext4 base image".into(),
             "create fresh TEST/SCRATCH/WORKLOAD images".into(),
             "run guest matrix".into(),
-            "execute deterministic crash cuts".into(),
+            crash_action,
             "replay and collect immutable image copies".into(),
             "run e2fsck -fn on every immutable image".into(),
             "run pinned xfstests selection".into(),
@@ -462,6 +471,15 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
             "--preflight-live" => idx += 1,
             "--materialize-xfstests" => idx += 1,
             "--resume" => idx += 1,
+            "--start-cut" => {
+                let Some(value) = args.get(idx + 1) else {
+                    return Err("option --start-cut needs a value".into());
+                };
+                if value.starts_with("--") {
+                    return Err("option --start-cut needs a value".into());
+                }
+                idx += 2;
+            }
             "--preflight-report" => {
                 let Some(value) = args.get(idx + 1) else {
                     return Err("option --preflight-report needs a value".into());
@@ -492,11 +510,17 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
     let preflight_live = args.iter().any(|arg| arg == "--preflight-live");
     let materialize_xfstests = args.iter().any(|arg| arg == "--materialize-xfstests");
     let resume = args.iter().any(|arg| arg == "--resume");
+    let crash_cut_start = optional_option_value(args, "--start-cut")
+        .map(|value| parse_crash_cut_start(&value))
+        .transpose()?;
     if dry_run && preflight_live {
         return Err("ext4 tier1 accepts only one of --dry-run or --preflight-live".into());
     }
     if resume && (dry_run || preflight_live) {
         return Err("ext4 tier1 --resume is only valid for live runs".into());
+    }
+    if crash_cut_start.is_some() && (dry_run || preflight_live) {
+        return Err("ext4 tier1 --start-cut is only valid for live runs".into());
     }
     let preflight_report = optional_option_value(args, "--preflight-report")
         .map(PathBuf::from)
@@ -509,6 +533,14 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
     }
     let run_id = optional_option_value(args, "--run-id").unwrap_or_else(|| "tier1-dry-run".into());
     let authorities = Tier1Authorities::load(root)?;
+    if let Some(start) = crash_cut_start {
+        if start >= authorities.crash_cuts.expanded_cut_count {
+            return Err(format!(
+                "ext4 tier1 --start-cut crash-cut-{start:04} is outside expanded crash cut count {}",
+                authorities.crash_cuts.expanded_cut_count
+            ));
+        }
+    }
     Ok(Tier1Invocation {
         run_id,
         dry_run,
@@ -516,8 +548,21 @@ fn parse_tier1_args(root: &Path, args: &[String]) -> Result<Tier1Invocation> {
         preflight_report,
         materialize_xfstests,
         resume,
+        crash_cut_start,
         authorities,
     })
+}
+
+fn parse_crash_cut_start(value: &str) -> Result<usize> {
+    let digits = value.strip_prefix("crash-cut-").unwrap_or(value);
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!(
+            "option --start-cut expects crash-cut-NNNN or a numeric index, found '{value}'"
+        ));
+    }
+    digits
+        .parse::<usize>()
+        .map_err(|err| format!("invalid --start-cut value '{value}': {err}"))
 }
 
 fn strip_optional_tier1(args: &[String]) -> &[String] {

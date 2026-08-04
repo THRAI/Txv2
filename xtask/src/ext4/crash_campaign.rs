@@ -3,13 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::Result;
 use crate::shell_test;
 use crate::target::TxTarget;
-use crate::Result;
 
 use super::{
-    is_real_sha256, read_json, receipt, run_workspace, sha256_file, CrashCutCampaignPlan,
-    CrashCutCatalog, CrashCutFamily,
+    CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily, is_real_sha256, read_json, receipt,
+    run_workspace, sha256_file,
 };
 
 #[derive(Debug)]
@@ -178,6 +178,7 @@ pub(crate) fn execute_crash_cut_campaign(
     source_image: &Path,
     workload_image: &Path,
     e2fsck: &str,
+    start_cut: Option<usize>,
 ) -> Result<CrashCutCampaignEvidence> {
     let Some(campaign) = &crash_cuts.campaign else {
         return Err(format!(
@@ -194,6 +195,7 @@ pub(crate) fn execute_crash_cut_campaign(
     let campaign_plan_sha256 = sha256_file(&manifest)?;
     let (next_idx, mut families, mut outcomes) =
         restore_completed_crash_cut_state(run, crash_cuts, &campaign_plan_sha256)?;
+    let next_idx = campaign_start_index(next_idx, start_cut);
     let mut seen_families = families.iter().cloned().collect::<BTreeSet<_>>();
 
     for idx in next_idx..crash_cuts.expanded_cut_count {
@@ -298,6 +300,13 @@ pub(crate) fn execute_crash_cut_campaign(
     )?;
     run.record_artifact("crash-cut-outcomes", outcomes_path.clone())?;
     run_crash_cut_campaign(run, crash_cuts)
+}
+
+pub(crate) fn campaign_start_index(
+    restored_next_idx: usize,
+    requested_start: Option<usize>,
+) -> usize {
+    restored_next_idx.max(requested_start.unwrap_or(0))
 }
 
 pub(crate) fn restore_completed_crash_cut_state(
