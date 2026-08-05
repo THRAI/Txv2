@@ -180,6 +180,7 @@ class Ext4FaultQemuExecutorTests(unittest.TestCase):
         self.assertEqual(
             executor_plan["job"]["replay_matrix"], request["job"]["replay_matrix"]
         )
+        self.assertEqual(executor_plan["job"]["serial_log"], str(job_dir / "serial.log"))
         self.assertEqual(executor_plan["runner"]["serial_log"], str(job_dir / "serial.log"))
         self.assertEqual(executor_plan["runner"]["cwd"], str(ROOT))
         self.assertEqual(executor_plan["hard_kill"]["marker"], "tx-ext4-fault-cut:write_fsync:after-commit")

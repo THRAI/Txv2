@@ -666,6 +666,29 @@ fn tier1_verify_receipt_rejects_executor_plan_without_written_result() {
 }
 
 #[test]
+fn tier1_verify_receipt_accepts_legacy_executor_plan_without_job_serial_log() {
+    let root = temp_root("verify-receipt-executor-plan-legacy-job-serial");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    plan["job"]
+        .as_object_mut()
+        .expect("executor plan job object")
+        .remove("serial_log");
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    verify_tier1_receipt(&receipt).expect("legacy executor plan verifies via runner serial log");
+}
+
+#[test]
 fn tier1_verify_receipt_rejects_executor_plan_shell_command_mismatch() {
     let root = temp_root("verify-receipt-executor-plan-shell-command");
     let _cleanup = TempCleanup(root.clone());
@@ -746,6 +769,53 @@ fn tier1_verify_receipt_accepts_removed_staged_role_images_with_recorded_digests
     );
 
     verify_tier1_receipt(&receipt).expect("removed staged role evidence verifies");
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_removed_scratch_staged_digest_after_source_drift() {
+    let root = temp_root("verify-receipt-staged-scratch-source-drift");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let request_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/job-request.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    let request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&request_path).expect("read job request"))
+            .expect("parse job request");
+    let mut digests = serde_json::Map::new();
+    let mut removed = Vec::new();
+    for role in ["test", "scratch", "workload"] {
+        let staged_path = PathBuf::from(plan["staged_role_images"][role].as_str().unwrap());
+        let source_path = PathBuf::from(request["role_images"][role].as_str().unwrap());
+        fs::remove_file(&staged_path).expect("remove staged role image");
+        let digest_source = if role == "scratch" {
+            PathBuf::from(plan["preserved_images"]["crash"].as_str().unwrap())
+        } else {
+            source_path
+        };
+        digests.insert(
+            role.into(),
+            serde_json::Value::String(sha256_file(&digest_source).expect("role source sha")),
+        );
+        removed.push(serde_json::Value::String(staged_path.display().to_string()));
+    }
+    plan["staged_role_image_digests"] = serde_json::Value::Object(digests);
+    plan["staged_role_images_retention"] = serde_json::json!({
+        "status": "removed-after-digest-recorded",
+        "removed": removed
+    });
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    verify_tier1_receipt(&receipt)
+        .expect("removed scratch staged digest should allow source drift");
 }
 
 #[test]
@@ -854,6 +924,151 @@ fn tier1_verify_receipt_rejects_executor_plan_replay_recovery_mismatch() {
 
     let error = verify_tier1_receipt(&receipt).expect_err("replay recovery drift must fail");
     assert!(error.contains("replay_image_recovery image_sha256 mismatch"));
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_replay_recovery_sha_bound_to_derived_observation() {
+    let root = temp_root("verify-receipt-replay-recovery-derived-sha");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let result_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/result.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    let result: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&result_path).expect("read fault result"))
+            .expect("parse fault result");
+    plan["replay_image_recovery"]["image_sha256"] =
+        result["replay_matrix"][2]["image_sha256"].clone();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    verify_tier1_receipt(&receipt)
+        .expect("replay recovery sha may bind to the derived Tx remount observation");
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_replay_recovery_temporary_artifact_paths() {
+    let root = temp_root("verify-receipt-replay-recovery-temp-paths");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    for key in ["image", "log"] {
+        let path = plan["replay_image_recovery"][key]
+            .as_str()
+            .expect("replay recovery path");
+        plan["replay_image_recovery"][key] =
+            path.replace("/accepted-run/", "/.accepted-run.tmp/").into();
+    }
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    verify_tier1_receipt(&receipt).expect("temporary replay recovery paths should verify");
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_replay_matrix_temporary_e2fsck_arg_path() {
+    let root = temp_root("verify-receipt-replay-matrix-temp-arg");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let request_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/job-request.json");
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&request_path).expect("read job request"))
+            .expect("parse job request");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    let arg = request["job"]["replay_matrix"][1]["args"][1]
+        .as_str()
+        .expect("linux e2fsck image arg");
+    let temporary_arg = arg.replace("/accepted-run/", "/.accepted-run.tmp/");
+    request["job"]["replay_matrix"][1]["args"][1] = temporary_arg.clone().into();
+    plan["job"]["replay_matrix"][1]["args"][1] = temporary_arg.into();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-job-request",
+        &serde_json::to_string_pretty(&request).expect("job request json"),
+    );
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    verify_tier1_receipt(&receipt).expect("temporary replay matrix e2fsck arg should verify");
+}
+
+#[test]
+fn tier1_verify_receipt_accepts_result_temporary_bound_artifact_paths() {
+    let root = temp_root("verify-receipt-result-temp-bound-paths");
+    let _cleanup = TempCleanup(root.clone());
+    let receipt = write_acceptance_receipt_fixture(&root);
+    let request_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/job-request.json");
+    let plan_path =
+        root.join("target/ext4/tier1/accepted-run/crash-cuts/crash-cut-0000/executor-plan.json");
+    let mut request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&request_path).expect("read job request"))
+            .expect("parse job request");
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read executor plan"))
+            .expect("parse executor plan");
+    for key in ["crash_image", "replay_image", "serial_log"] {
+        let path = request["job"][key].as_str().expect("job bound path");
+        let temporary_path = path.replace("/accepted-run/", "/.accepted-run.tmp/");
+        request["job"][key] = temporary_path.clone().into();
+        plan["job"][key] = temporary_path.into();
+    }
+    plan["runner"]["serial_log"] = request["job"]["serial_log"].clone();
+    let serial_arg = plan["shell_test_command"]
+        .as_array()
+        .expect("shell command")
+        .iter()
+        .position(|value| value.as_str() == Some("--serial-log"))
+        .expect("serial log arg")
+        + 1;
+    plan["shell_test_command"][serial_arg] = request["job"]["serial_log"].clone();
+    let e2fsck_arg = request["job"]["checks"][0]["args"][1]
+        .as_str()
+        .expect("e2fsck replay path");
+    let temporary_arg = e2fsck_arg.replace("/accepted-run/", "/.accepted-run.tmp/");
+    request["job"]["checks"][0]["args"][1] = temporary_arg.clone().into();
+    plan["job"]["checks"][0]["args"][1] = temporary_arg.into();
+    let e2fsck_log = request["job"]["checks"][0]["log"]
+        .as_str()
+        .expect("e2fsck log");
+    let temporary_log = e2fsck_log.replace("/accepted-run/", "/.accepted-run.tmp/");
+    request["job"]["checks"][0]["log"] = temporary_log.clone().into();
+    plan["job"]["checks"][0]["log"] = temporary_log.into();
+    plan["replay_image_recovery"]["command"][3] = request["job"]["replay_image"].clone();
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-job-request",
+        &serde_json::to_string_pretty(&request).expect("job request json"),
+    );
+    rewrite_artifact_contents(
+        &root,
+        "crash-cut-0000-executor-plan",
+        &serde_json::to_string_pretty(&plan).expect("executor plan json"),
+    );
+
+    verify_tier1_receipt(&receipt).expect("temporary result-bound paths should verify");
 }
 
 #[test]

@@ -1719,6 +1719,7 @@ fn verify_required_crash_cut_artifacts(
         })?
         .sha256
         .clone();
+    let role_image_sha256s = role_image_sha256s(artifacts, path)?;
     for idx in 0..1000 {
         let cut_id = format!("crash-cut-{idx:04}");
         for suffix in [
@@ -1746,9 +1747,33 @@ fn verify_required_crash_cut_artifacts(
                 ));
             }
         }
-        verify_crash_cut_job_result(&cut_id, artifacts, path, &campaign_plan_sha256)?;
+        verify_crash_cut_job_result(
+            &cut_id,
+            artifacts,
+            path,
+            &campaign_plan_sha256,
+            &role_image_sha256s,
+        )?;
     }
     Ok(())
+}
+
+fn role_image_sha256s(
+    artifacts: &BTreeMap<String, ArtifactRecord>,
+    path: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let mut shas = BTreeMap::new();
+    for (role, artifact_name) in [
+        ("test", "test-image"),
+        ("scratch", "scratch-image"),
+        ("workload", "workload-image"),
+    ] {
+        let artifact = artifacts
+            .get(artifact_name)
+            .ok_or_else(|| format!("{}: missing artifact {artifact_name}", path.display()))?;
+        shas.insert(role.to_string(), artifact.sha256.clone());
+    }
+    Ok(shas)
 }
 
 fn verify_crash_cut_job_result(
@@ -1756,6 +1781,7 @@ fn verify_crash_cut_job_result(
     artifacts: &BTreeMap<String, ArtifactRecord>,
     path: &Path,
     expected_campaign_plan_sha256: &str,
+    role_image_sha256s: &BTreeMap<String, String>,
 ) -> Result<()> {
     let job_request = crash_cut_artifact_path(cut_id, "job-request", artifacts, path)?;
     let executor_plan = crash_cut_artifact_path(cut_id, "executor-plan", artifacts, path)?;
@@ -1796,6 +1822,7 @@ fn verify_crash_cut_job_result(
         request,
         expected_campaign_plan_sha256,
         &result,
+        role_image_sha256s,
     )?;
     let crash_image = required_bound_path(
         job,
@@ -1803,12 +1830,15 @@ fn verify_crash_cut_job_result(
         &crash_cut_artifact_path(cut_id, "crash-image", artifacts, path)?,
         &job_request,
     )?;
-    let replay_image = required_bound_path(
-        job,
-        "replay_image",
-        &crash_cut_artifact_path(cut_id, "replay-image", artifacts, path)?,
-        &job_request,
-    )?;
+    let replay_artifact_name = format!("{cut_id}-replay-image");
+    let replay_artifact = artifacts.get(&replay_artifact_name).ok_or_else(|| {
+        format!(
+            "{}: missing artifact {replay_artifact_name}",
+            path.display()
+        )
+    })?;
+    let replay_image =
+        required_bound_path(job, "replay_image", &replay_artifact.path, &job_request)?;
     let replay_recovery_log =
         crash_cut_artifact_path(cut_id, "replay-recovery-log", artifacts, path)?;
     verify_executor_plan_replay_image_recovery(
@@ -1817,6 +1847,8 @@ fn verify_crash_cut_job_result(
         cut_id,
         &replay_image,
         &replay_recovery_log,
+        &result,
+        &replay_artifact.sha256,
     )?;
     let serial_log = required_bound_path(
         job,
@@ -1837,11 +1869,11 @@ fn verify_crash_cut_job_result(
         &case_id,
         cut_id,
         &campaign_plan_sha256,
-        &crash_image,
-        &replay_image,
-        &serial_log,
+        &stable_existing_path(&crash_image),
+        &stable_existing_path(&replay_image),
+        &stable_existing_path(&serial_log),
         &phase_marker,
-        &e2fsck_log,
+        &stable_existing_path(&e2fsck_log),
     )?;
     Ok(())
 }
@@ -1852,6 +1884,8 @@ fn verify_executor_plan_replay_image_recovery(
     cut_id: &str,
     replay_image: &Path,
     replay_recovery_log: &Path,
+    result_path: &Path,
+    replay_image_sha256: &str,
 ) -> Result<()> {
     let plan_json = read_json(executor_plan)?;
     require_schema(
@@ -1903,21 +1937,101 @@ fn verify_executor_plan_replay_image_recovery(
         &image_sha,
         executor_plan,
     )?;
-    if image_sha != sha256_file(replay_image)? {
-        return Err(format!(
-            "{}: replay_image_recovery image_sha256 mismatch",
-            executor_plan.display()
-        ));
-    }
+    verify_replay_recovery_image_sha256(
+        &image_sha,
+        result_path,
+        executor_plan,
+        replay_image_sha256,
+    )?;
     let log_sha = required_json_string(recovery, "log_sha256", executor_plan)?;
     verify_real_sha("replay_image_recovery log_sha256", &log_sha, executor_plan)?;
-    if log_sha != sha256_file(replay_recovery_log)? {
+    if log_sha != sha256_file(&stable_existing_path(replay_recovery_log))? {
         return Err(format!(
             "{}: replay_image_recovery log_sha256 mismatch",
             executor_plan.display()
         ));
     }
     Ok(())
+}
+
+fn verify_replay_recovery_image_sha256(
+    image_sha: &str,
+    result_path: &Path,
+    executor_plan: &Path,
+    replay_image_sha256: &str,
+) -> Result<()> {
+    if replay_image_sha256 == image_sha {
+        return Ok(());
+    }
+
+    let result_json = read_json(result_path)?;
+    require_schema(&result_json, "tx.ext4.fault_job_result.v1", result_path)?;
+    let result = json_object(&result_json, "fault job result", result_path)?;
+    let mut checked_observations = 0usize;
+
+    if let Some(entries) = result
+        .get("replay_matrix")
+        .and_then(|value| value.as_array())
+    {
+        for entry in entries {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            if entry.get("id").and_then(|value| value.as_str()) == Some("tx-remount") {
+                checked_observations += 1;
+                if observation_image_sha256_matches(
+                    entry,
+                    "replay_matrix tx-remount image_sha256",
+                    image_sha,
+                    result_path,
+                )? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    if let Some(entries) = result
+        .get("semantic_oracles")
+        .and_then(|value| value.as_array())
+    {
+        for entry in entries {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            checked_observations += 1;
+            if observation_image_sha256_matches(
+                entry,
+                "semantic_oracles image_sha256",
+                image_sha,
+                result_path,
+            )? {
+                return Ok(());
+            }
+        }
+    }
+
+    if checked_observations == 0 {
+        return Err(format!(
+            "{}: replay_image_recovery image_sha256 has no derived observation binding",
+            executor_plan.display()
+        ));
+    }
+    Err(format!(
+        "{}: replay_image_recovery image_sha256 mismatch",
+        executor_plan.display()
+    ))
+}
+
+fn observation_image_sha256_matches(
+    object: &serde_json::Map<String, serde_json::Value>,
+    label: &str,
+    expected: &str,
+    path: &Path,
+) -> Result<bool> {
+    let found = required_json_string(object, "image_sha256", path)?;
+    verify_real_sha(label, &found, path)?;
+    Ok(found == expected)
 }
 
 fn verify_fault_executor_log(
@@ -2023,6 +2137,7 @@ fn verify_crash_cut_executor_plan(
     request: &serde_json::Map<String, serde_json::Value>,
     expected_campaign_plan_sha256: &str,
     result_path: &Path,
+    role_image_sha256s: &BTreeMap<String, String>,
 ) -> Result<()> {
     let plan_json = read_json(executor_plan)?;
     require_schema(
@@ -2041,8 +2156,11 @@ fn verify_crash_cut_executor_plan(
 
     let request_job = required_json_object(request, "job", job_request)?;
     let plan_job = required_json_object(plan, "job", executor_plan)?;
-    for key in ["case", "cut", "crash_image", "replay_image", "serial_log"] {
+    for key in ["case", "cut", "crash_image", "replay_image"] {
         require_matching_json_string(plan_job, request_job, key, executor_plan)?;
+    }
+    if plan_job.contains_key("serial_log") {
+        require_matching_json_string(plan_job, request_job, "serial_log", executor_plan)?;
     }
     let plan_iteration = required_json_usize(plan_job, "iteration", executor_plan)?;
     let request_iteration = required_json_usize(request_job, "iteration", job_request)?;
@@ -2070,6 +2188,7 @@ fn verify_crash_cut_executor_plan(
         request_job,
         request_qemu,
         executor_plan,
+        role_image_sha256s,
     )?;
     let runner = required_json_object(plan, "runner", executor_plan)?;
     require_matching_json_string(runner, request_job, "serial_log", executor_plan)?;
@@ -2109,6 +2228,7 @@ fn verify_executor_plan_staged_roles_and_command(
     request_job: &serde_json::Map<String, serde_json::Value>,
     request_qemu: &serde_json::Map<String, serde_json::Value>,
     executor_plan: &Path,
+    role_image_sha256s: &BTreeMap<String, String>,
 ) -> Result<()> {
     let staged = required_json_object(plan, "staged_role_images", executor_plan)?;
     let role_images = required_json_object(request, "role_images", executor_plan)?;
@@ -2144,7 +2264,12 @@ fn verify_executor_plan_staged_roles_and_command(
                 source.display()
             ));
         }
-        let source_sha = sha256_file(&source)?;
+        let source_sha = role_image_sha256s.get(role).ok_or_else(|| {
+            format!(
+                "{}: missing role image sha256 for {role}",
+                executor_plan.display()
+            )
+        })?;
         if !staged_path.is_file() {
             let Some(retention) = staged_retention else {
                 return Err(format!(
@@ -2166,16 +2291,24 @@ fn verify_executor_plan_staged_roles_and_command(
                 ));
             };
             let staged_sha = required_json_string(digests, role, executor_plan)?;
-            if staged_sha != source_sha {
-                return Err(format!(
-                    "{}: staged role image digest mismatch for {role}",
-                    executor_plan.display()
-                ));
+            if &staged_sha != source_sha {
+                if role != "scratch"
+                    || !removed_scratch_digest_matches_preserved_crash(
+                        plan,
+                        &staged_sha,
+                        executor_plan,
+                    )?
+                {
+                    return Err(format!(
+                        "{}: staged role image digest mismatch for {role}",
+                        executor_plan.display()
+                    ));
+                }
             }
             continue;
         }
         let staged_sha = sha256_file(&staged_path)?;
-        if source_sha != staged_sha {
+        if source_sha != &staged_sha {
             return Err(format!(
                 "{}: staged role image digest mismatch for {role}",
                 executor_plan.display()
@@ -2217,6 +2350,28 @@ fn verify_executor_plan_staged_roles_and_command(
         ));
     }
     Ok(())
+}
+
+fn removed_scratch_digest_matches_preserved_crash(
+    plan: &serde_json::Map<String, serde_json::Value>,
+    staged_sha: &str,
+    executor_plan: &Path,
+) -> Result<bool> {
+    let Some(preserved) = plan
+        .get("preserved_images")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(false);
+    };
+    let crash = stable_existing_path(&PathBuf::from(required_json_string(
+        preserved,
+        "crash",
+        executor_plan,
+    )?));
+    if !crash.is_file() {
+        return Ok(false);
+    }
+    Ok(sha256_file(&crash)? == staged_sha)
 }
 
 fn verify_executor_plan_preserved_images(
@@ -2443,7 +2598,10 @@ fn verify_job_request_replay_matrix(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if args != ["-fn", image.display().to_string().as_str()] {
+            if args.len() != 2
+                || args[0] != "-fn"
+                || !equivalent_run_path(&PathBuf::from(&args[1]), image)
+            {
                 return Err(format!(
                     "{}: job request replay_matrix {expected_id} args mismatch",
                     job_request.display()

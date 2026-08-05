@@ -179,6 +179,7 @@ def write_executor_plan(request_path: Path, request: dict[str, Any]) -> Path:
             "case": require_string(job, "case"),
             "cut": require_string(job, "cut"),
             "iteration": require_positive_int(job, "iteration"),
+            "serial_log": serial_log,
             "crash_image": require_string(job, "crash_image"),
             "replay_image": require_string(job, "replay_image"),
             "checks": job.get("checks"),

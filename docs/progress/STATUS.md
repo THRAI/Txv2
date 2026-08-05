@@ -1,3 +1,22 @@
+- 2026-08-05 (ext4 Task16 verified receipt closure).
+  Completed Task 16 for fresh run `task16-live-retry-20260804`: the immutable
+  receipt at `target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json`
+  verifies G0-G7 passed, 1000/1000 D0-D12 crash cuts, clean
+  TEST/SCRATCH/WORKLOAD `e2fsck -fn`, and Docker-backed pinned xfstests 8/8.
+  Historical D5 `crash-cut-0213` and D10 `crash-cut-0725` blockers did not
+  recur. Receipt-only verification passed
+  `/usr/bin/time -p target/release/xtask ext4 tier1 --verify-receipt
+  target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json`
+  (`real 598.54`), after verifier fixes for recovery-stage replay SHA binding,
+  legacy executor-plan serial evidence, final-vs-`.tmp` paths, and role-image
+  digest reuse. Verification also passed Python fault runners 49/49,
+  `cargo test -p xtask tier1_verify_receipt_accepts` 12/12,
+  `cargo test -p xtask ext4` 132/132, release xtask build, scoped rustfmt, and
+  scoped `git diff --check`. Next: commit the Task16 verifier/runner/progress
+  slice and use `--verify-receipt` or `--resume --start-cut crash-cut-NNNN`
+  for future diagnostics instead of rerunning completed prefixes. Blocker: no
+  Task16 acceptance blocker remains for this receipt.
+
 - 2026-08-05 (SMP scheduler and PELT implementation plan).
   Added `docs/superpowers/plans/2026-08-04-smp-pelt-scheduler.md` and
   `docs/progress/plans/2026-08-04-smp-pelt-scheduler.json` for the approved

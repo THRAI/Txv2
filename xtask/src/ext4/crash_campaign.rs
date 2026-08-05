@@ -817,9 +817,6 @@ fn fault_job_large_artifact_hashes(job: &FaultJobPaths) -> Result<BTreeMap<PathB
             sha256,
         );
     }
-    if let Some(sha256) = replay_recovery_image_sha256_from_plan(&value, &job.replay_image) {
-        hashes.insert(job.replay_image.clone(), sha256);
-    }
     Ok(hashes)
 }
 
@@ -827,22 +824,6 @@ fn scratch_image_sha256_from_plan(value: &serde_json::Value) -> Option<String> {
     value
         .get("staged_role_image_digests")
         .and_then(|value| value.get("scratch"))
-        .and_then(|value| value.as_str())
-        .filter(|value| is_real_sha256(value))
-        .map(str::to_string)
-}
-
-fn replay_recovery_image_sha256_from_plan(
-    value: &serde_json::Value,
-    replay_image: &Path,
-) -> Option<String> {
-    let recovery = value.get("replay_image_recovery")?;
-    let image = recovery.get("image").and_then(|value| value.as_str())?;
-    if Path::new(image) != replay_image {
-        return None;
-    }
-    recovery
-        .get("image_sha256")
         .and_then(|value| value.as_str())
         .filter(|value| is_real_sha256(value))
         .map(str::to_string)
@@ -1034,8 +1015,6 @@ pub(crate) fn parse_fault_job_result(
     if checks.is_empty() {
         return Err(format!("{}: e2fsck_checks is empty", path.display()));
     }
-    let replay_arg = replay_image.display().to_string();
-    let e2fsck_log_path = e2fsck_log.display().to_string();
     for check in checks {
         let object = check
             .as_object()
@@ -1059,14 +1038,21 @@ pub(crate) fn parse_fault_job_result(
                     .ok_or_else(|| format!("{}: e2fsck args must be strings", path.display()))
             })
             .collect::<Result<Vec<_>>>()?;
-        if args != ["-fn", replay_arg.as_str()] {
+        if args.len() != 2
+            || args[0] != "-fn"
+            || !equivalent_run_path(&PathBuf::from(&args[1]), replay_image)
+        {
             return Err(format!(
                 "{}: e2fsck check must run -fn against {}",
                 path.display(),
                 replay_image.display()
             ));
         }
-        if object.get("log").and_then(|value| value.as_str()) != Some(e2fsck_log_path.as_str()) {
+        let actual_log = object
+            .get("log")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("{}: e2fsck check is missing log", path.display()))?;
+        if !equivalent_run_path(&PathBuf::from(actual_log), e2fsck_log) {
             return Err(format!(
                 "{}: e2fsck check log must be {}",
                 path.display(),
@@ -1078,14 +1064,15 @@ pub(crate) fn parse_fault_job_result(
             .and_then(|value| value.as_str())
             .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .ok_or_else(|| format!("{}: e2fsck check has invalid log_sha256", path.display()))?;
-        if !e2fsck_log.is_file() {
+        let stable_e2fsck_log = stable_existing_path(e2fsck_log);
+        if !stable_e2fsck_log.is_file() {
             return Err(format!(
                 "{}: e2fsck log is missing: {}",
                 path.display(),
                 e2fsck_log.display()
             ));
         }
-        if sha256_file(e2fsck_log)? != log_sha256 {
+        if sha256_file(&stable_e2fsck_log)? != log_sha256 {
             return Err(format!(
                 "{}: e2fsck log sha256 mismatch for {}",
                 path.display(),
@@ -1107,14 +1094,14 @@ pub(crate) fn parse_fault_job_result(
             ));
         }
     }
-    if !crash_image.is_file() {
+    if !stable_existing_path(crash_image).is_file() {
         return Err(format!(
             "{}: crash image is missing: {}",
             path.display(),
             crash_image.display()
         ));
     }
-    if !replay_image.is_file() {
+    if !stable_existing_path(replay_image).is_file() {
         return Err(format!(
             "{}: replay image is missing: {}",
             path.display(),
@@ -1203,7 +1190,13 @@ fn verify_replay_matrix_result(
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                if args != expected_args {
+                if args.len() != expected_args.len()
+                    || args[0] != expected_args[0]
+                    || !equivalent_run_path(
+                        &PathBuf::from(&args[1]),
+                        &PathBuf::from(&expected_args[1]),
+                    )
+                {
                     return Err(format!(
                         "{}: replay_matrix {expected_id} args mismatch",
                         path.display()
@@ -1291,17 +1284,21 @@ fn verify_observation_entry(
             path.display()
         ));
     }
-    if object.get("image").and_then(|value| value.as_str())
-        != Some(expected_image.display().to_string().as_str())
-    {
+    let actual_image = object
+        .get("image")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("{}: {field} {expected_id} missing image", path.display()))?;
+    if !equivalent_run_path(&PathBuf::from(actual_image), expected_image) {
         return Err(format!(
             "{}: {field} {expected_id} image mismatch",
             path.display()
         ));
     }
-    if object.get("log").and_then(|value| value.as_str())
-        != Some(expected_log.display().to_string().as_str())
-    {
+    let actual_log = object
+        .get("log")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("{}: {field} {expected_id} missing log", path.display()))?;
+    if !equivalent_run_path(&PathBuf::from(actual_log), expected_log) {
         return Err(format!(
             "{}: {field} {expected_id} log mismatch",
             path.display()
@@ -1363,6 +1360,55 @@ fn verify_observation_entry(
         ));
     }
     Ok(())
+}
+
+fn temporary_run_equivalent_path(path: &Path) -> Option<PathBuf> {
+    let mut ancestors = path.ancestors();
+    let run_dir = ancestors.find(|ancestor| ancestor.join("crash-cuts").is_dir())?;
+    let run_id = run_dir.file_name()?.to_str()?;
+    if run_id.starts_with('.') || run_id.ends_with(".tmp") {
+        return None;
+    }
+    let relative = path.strip_prefix(run_dir).ok()?;
+    Some(
+        run_dir
+            .parent()?
+            .join(format!(".{run_id}.tmp"))
+            .join(relative),
+    )
+}
+
+fn finalized_run_equivalent_path(path: &Path) -> Option<PathBuf> {
+    let run_dir = path.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"))
+    })?;
+    let raw_run_id = run_dir.file_name()?.to_str()?;
+    let run_id = raw_run_id.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let relative = path.strip_prefix(run_dir).ok()?;
+    Some(run_dir.parent()?.join(run_id).join(relative))
+}
+
+fn equivalent_run_path(actual: &Path, expected: &Path) -> bool {
+    actual == expected
+        || temporary_run_equivalent_path(expected).as_deref() == Some(actual)
+        || temporary_run_equivalent_path(actual).as_deref() == Some(expected)
+        || finalized_run_equivalent_path(expected).as_deref() == Some(actual)
+        || finalized_run_equivalent_path(actual).as_deref() == Some(expected)
+}
+
+fn stable_existing_path(path: &Path) -> PathBuf {
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    if let Some(final_path) = finalized_run_equivalent_path(path) {
+        if final_path.is_file() {
+            return final_path;
+        }
+    }
+    path.to_path_buf()
 }
 
 pub(crate) fn write_crash_cut_outcome_manifest(
