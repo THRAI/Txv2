@@ -1,3 +1,24 @@
+- 2026-08-05 (I/O SubmissionManager and file-data performance design).
+  Added
+  `docs/superpowers/specs/2026-08-05-io-submission-manager-performance-design.md`
+  for the approved B rollout: independent L4 `PageIoSubmissionManager`,
+  device-scoped L6 `BlockSubmissionManager`, separate resident/PageSlot/range
+  owner domains, bounded `Published<ResidentRoot>` publication, multi-page
+  reads, extent clustering, device-limit-aware split/merge, short plugging,
+  real readahead, trace-backed performance receipts, and measurement-gated
+  multi-queue. The design keeps PageSlot/range/queue/tag/DMA/journal state out
+  of RCU, requires exactly-one owned terminal settlement, and makes ext4
+  production fsync/frontier reconciliation a pre-performance gate without
+  rerunning the six-hour crash prefix at every stage. No implementation changed
+  in this step. `2026-07-11-io-manager-phase0-landing` remains a stale active
+  ledger and must be canceled as superseded before a new overlapping plan is
+  activated. Verification passed `cargo xtask lint docs` (seven existing
+  warning-only stale-vocabulary mentions), placeholder/type/coverage
+  self-review, `cargo xtask progress validate` (42 records), and scoped diff
+  checking. Next: written-spec review, then create the implementation plan and
+  reconcile the old JSON ledger. Blocker: no implementation starts before
+  written-spec approval.
+
 - 2026-08-05 (ext4 Tier 1 lifecycle plan closure).
   Closed `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
   as complete: Tasks 1-16 are now marked complete after auditing Task 11-15
