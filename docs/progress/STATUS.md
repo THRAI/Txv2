@@ -1,3 +1,22 @@
+- 2026-08-05 (ext4 Tier 1 lifecycle plan closure).
+  Closed `docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json`
+  as complete: Tasks 1-16 are now marked complete after auditing Task 11-15
+  against current code, G0 lints, the public Tier 1 runner, and the verified
+  `task16-live-retry-20260804` receipt. The only real stale Task 11 gap found
+  during the closure audit was truncate-before-flush buffered-write reservation
+  cleanup; `FsPageBacking::truncate` now clears same-inode buffered write
+  reservations at or beyond the new EOF after successful journal mutation
+  admission, with a focused regression test. Added
+  `docs/progress/research/2026-07-30-ext4-tier1-acceptance.md` with the
+  receipt path, SHA-256, candidate commit, verifier evidence, Tier 2 entry
+  point, and the rule to use `--verify-receipt` or
+  `--resume --start-cut crash-cut-NNNN` instead of replaying completed
+  multi-hour prefixes. Verification passed focused truncate-before-flush,
+  full tx-ext4 lib (67), `target/release/xtask progress validate` (42 records),
+  `target/release/xtask lint docs` (7 existing warning-only stale-vocabulary
+  mentions), `cargo -q xtask unit` (`655 + 114 + 67 + 167`), scoped rustfmt,
+  and scoped diff-check. Blocker: none known for Tier 1.
+
 - 2026-08-05 (ext4 Task16 verified receipt closure).
   Completed Task 16 for fresh run `task16-live-retry-20260804`: the immutable
   receipt at `target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json`

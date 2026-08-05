@@ -1376,6 +1376,29 @@ fn ext4_close_visibility_flush_clears_buffered_write_reservation_for_next_write(
 }
 
 #[test]
+fn ext4_truncate_before_flush_clears_buffered_write_reservation() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_truncate_free_fs(26);
+    let pc = page_container_for_mounted_file(&mounted, FsObjectId::new(12), BLOCK_SIZE as u64, 8);
+    let of = open_file_for_page_container(&pc);
+
+    of.set_offset(4 * BLOCK_SIZE as u64);
+    assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
+
+    assert_eq!(
+        mounted
+            .fs_page_backing()
+            .truncate(FsObjectId::new(12), 0, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 0);
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
 fn ext4_metadata_mutation_settles_prior_ordered_data_transaction_before_admission() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();

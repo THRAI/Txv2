@@ -1,13 +1,13 @@
 use step_engine::Guard;
 use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
-use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Page4K};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking};
+use tx_subsystems::page_backed::{Frame, FsPageBacking, reserve_frame_with_reclaim};
 use tx_subsystems::vfs::structure::FsObjectId;
 
-use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome, page_allocator};
 use crate::namespace::journal_mutation_runtime_errno;
-use crate::read_backend::{inode_no, Ext4FsInstance};
+use crate::read_backend::{Ext4FsInstance, inode_no};
 
 use page_allocator::ZeroPolicy;
 
@@ -231,7 +231,12 @@ where
             Err(err) => return StepOutcome::err(err.into()),
         };
         match self.begin_metadata_mutation(&runtime, &mutation, guard) {
-            Ok(()) => StepOutcome::done(()),
+            Ok(()) => {
+                let first_removed_page =
+                    new_size.saturating_add(BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+                self.clear_buffered_write_reservations_from(inode, first_removed_page);
+                StepOutcome::done(())
+            }
             Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }

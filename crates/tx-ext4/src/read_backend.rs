@@ -8,12 +8,12 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec;
 use alloc::vec::Vec;
+use tx_ext4_format::Ext4FormatError;
 use tx_ext4_format::capability::CapabilityProfileHash;
 use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
 use tx_ext4_format::pager::{
-    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, BLOCK_SIZE,
+    BLOCK_SIZE, BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo,
 };
-use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner, IoDataSource};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
@@ -333,6 +333,18 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         self.buffered_write_reservations
             .lock()
             .remove(&(inode.get(), file_page_index));
+    }
+
+    pub(crate) fn clear_buffered_write_reservations_from(
+        &self,
+        inode: InodeNo,
+        first_removed_page: u64,
+    ) {
+        self.buffered_write_reservations
+            .lock()
+            .retain(|(reserved_inode, file_page_index), _| {
+                *reserved_inode != inode.get() || *file_page_index < first_removed_page
+            });
     }
 
     #[cfg(test)]
