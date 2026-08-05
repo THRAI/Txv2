@@ -2,11 +2,11 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-07-11-io-manager-phase0-landing",
   "title": "I/O manager phase-0 landing",
-  "status": "active",
+  "status": "canceled",
   "created": "2026-07-11",
-  "updated": "2026-07-12",
+  "updated": "2026-08-05",
   "owner": "codex",
-  "summary": "Land the first implementation slice for the I/O manager without changing live filesystem semantics: introduce staged request/plan/queue values, PageSlot and RangeReservation scaffolding, focused tests, and a compatibility path that keeps current FsPageBacking implementations valid.",
+  "summary": "Historical Phase 0 I/O-manager staging plan. Phases 0-5 remain completed evidence for request, PageSlot/range, block queue, bdev-fs adapter, and PageContainer compatibility scaffolding. The pending phase6-ext4-planning step is canceled and superseded by 2026-08-05-io-submission-manager-performance, which owns the production L4/L6, ext4 frontier, multi-page, readahead, and performance convergence work.",
   "scope": {
     "in": [
       "crates/tx-subsystems/src/io_manager/",
@@ -89,7 +89,8 @@
     ],
     "progress_refs": [
       "docs/progress/STATUS.md",
-      "docs/progress/research/2026-07-11-io-manager-implementation-readiness.md"
+      "docs/progress/research/2026-07-11-io-manager-implementation-readiness.md",
+      "docs/progress/plans/2026-08-05-io-submission-manager-performance.json"
     ],
     "external_refs": []
   },
@@ -215,7 +216,7 @@
     {
       "id": "phase6-ext4-planning",
       "title": "Refactor ext4 fetch/flush toward PageIoPlan/BioPlan",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": [
         "phase4-bdevfs-plan-adapter",
         "phase5-page-service-compat"
@@ -227,7 +228,7 @@
         "cargo test -p tx-ext4 --lib -- --nocapture",
         "cargo check -p tx-ext4"
       ],
-      "notes": "Ext4 remains the mapping, metadata, and journal backend. Generic file-data readahead stays in L4/PageContainer."
+      "notes": "Canceled as superseded by docs/progress/plans/2026-08-05-io-submission-manager-performance.json. Completed Phase 0-5 staging remains historical evidence; the new plan owns ext4 production lowering, generic L4 readahead, L4/L6 cutover, and final receipts."
     }
   ],
   "verification": [
@@ -1702,7 +1703,7 @@
     "Changing FsPageBacking directly would churn every filesystem backend before the neutral plan values are tested.",
     "Moving to RCU/TxArray before PageSlot generation semantics exist would make completion races harder to prove.",
     "bdev-fs still keeps the old direct FsPageBacking executor as the compatibility oracle; remove it only after the planned L4/L6 path covers the same behavior.",
-    "Ext4 planning remains a separate Phase 6 claim; do not pull ext4 metadata/journal work into io_manager or bdevfs closeout slices."
+    "The former Phase 6 ext4 claim is canceled and superseded by 2026-08-05-io-submission-manager-performance; retain ext4 metadata and journal authority while executing that plan."
   ],
   "blockers": [],
   "handoff": {

@@ -1,3 +1,23 @@
+- 2026-08-05 (I/O SubmissionManager performance implementation plan).
+  Added the approved 19-task implementation plan at
+  `docs/superpowers/plans/2026-08-05-io-submission-manager-performance.md`
+  and the proposed 13-stage ledger at
+  `docs/progress/plans/2026-08-05-io-submission-manager-performance.json`.
+  The dependency order is C0 correctness/frontier repair, bounded baseline,
+  L4 and device-scoped L6 custody, PageState/Range domain split, bounded
+  `Published<ResidentRoot>`, multi-page reads, limit-aware split/merge/plug,
+  real adaptive and explicit readahead, one final candidate-bound ext4 Tier 1
+  campaign, matched performance selection, and an evidence-gated multi-queue
+  decision. Canceled `2026-07-11-io-manager-phase0-landing` as superseded while
+  retaining its completed Phase 0-5 staging as historical evidence. No
+  implementation changed in this planning step. Verification passed task/spec
+  coverage, placeholder and type-family self-review, `cargo xtask lint docs`
+  (seven existing warning-only stale-vocabulary mentions), `cargo xtask
+  progress validate` (43 records), and scoped `git diff --check`. Next: choose
+  subagent-driven or inline task execution, then activate and claim only Task
+  1. Blocker: multi-queue remains conditional on accepted P8 saturation
+  evidence and may close with a measured negative result.
+
 - 2026-08-05 (I/O SubmissionManager and file-data performance design).
   Added
   `docs/superpowers/specs/2026-08-05-io-submission-manager-performance-design.md`
