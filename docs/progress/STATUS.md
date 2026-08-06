@@ -1,3 +1,16 @@
+- 2026-08-06 (**精简 LA QEMU 镜像副本与启动步骤**).
+  **Changed**：修正 `tools/tx-shell.sh` 生成 Guest DHCP 脚本时过早展开变量的
+  问题，并设置 Alpine 镜像中的 CA 证书路径；将本机知识库第 09 章的 LA QEMU
+  手工变量、`if [ -e ... ]` 防覆盖分支和整段 QEMU 参数替换为
+  `cargo xtask build --target la64-qemu` 与 `bash tools/tx-shell.sh la64`；说明
+  启动脚本会自动使用 `/tmp` 临时镜像副本，不修改母盘，也不需要手工创建
+  `la-run.ext4`。
+  **Verification**：实际启动脚本后出现 `boot:ok`、DHCP 获得 `10.0.2.15`
+  以及 `txKernel interactive shell — git ready`；`git diff --check` 通过。
+  **Next**：继续在该 LA QEMU Shell 中完成网页修改后的 `git pull` 验证。
+  **Blocker**：`git pull` 需要用户先在 GitHub 的 `riscv` 分支手工修改并提交
+  README；LA 实板不在本阶段范围内。
+
 - 2026-08-06 (**提交 portable-network/VF2 既有成果并交接 LA 2K1000 实板 Git 链路**).
   **Changed**：将当前 125 个文件的 portable device resource、静态 binder、
   per-device IRQ、DWMAC/VF2、AF_PACKET/DHCP、QEMU 网络场景及相关文档提交为

@@ -55,6 +55,7 @@ esac
   cat <<G
 export PATH=/musl/usr/bin:/musl/bin:/musl/usr/sbin:/musl/sbin:/usr/bin:/bin
 export HOME=/musl/root GIT_EXEC_PATH=/musl/usr/libexec/git-core GIT_TEMPLATE_DIR=
+export SSL_CERT_FILE=/musl/etc/ssl/cert.pem GIT_SSL_CAINFO=/musl/etc/ssl/cert.pem
 export HTTPS_PROXY=$PROXY HTTP_PROXY=$PROXY ALL_PROXY=$PROXY
 export GIT_AUTHOR_NAME=txkernel GIT_AUTHOR_EMAIL=tx@txkernel.local
 export GIT_COMMITTER_NAME=txkernel GIT_COMMITTER_EMAIL=tx@txkernel.local
@@ -62,11 +63,11 @@ export GIT_TERMINAL_PROMPT=0
 /bin/busybox mkdir -p /etc /musl/root
 iface=""
 for net_path in /sys/class/net/*; do
-  candidate="${net_path##*/}"
-  if [ "$candidate" != lo ]; then iface="$candidate"; break; fi
+  candidate="\${net_path##*/}"
+  if [ "\$candidate" != lo ]; then iface="\$candidate"; break; fi
 done
-if [ -n "$iface" ]; then
-  /bin/busybox udhcpc -i "$iface" -q -n || /bin/busybox echo "warning: DHCP failed on $iface"
+if [ -n "\$iface" ]; then
+  /bin/busybox udhcpc -i "\$iface" -q -n || /bin/busybox echo "warning: DHCP failed on \$iface"
 fi
 G
   if [ -n "$TOKEN" ]; then
