@@ -1676,10 +1676,17 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
-            let caller = make_ioctl_caller(ctx);
+            // TTY signal dispatch retains a typed Weak<ProcessGroup>, not just
+            // the user-visible pgid. Resolve the canonical group before the
+            // mutation so tcsetpgrp updates both views atomically; otherwise
+            // VINTR would continue delivering SIGINT to the stale foreground
+            // group even though TIOCGPGRP reported the new numeric pgid.
+            let Some(new_pgrp) = process_group_by_pgid(Pgid(new_pgrp)) else {
+                return SyscallResult::Error(ESRCH_VALUE);
+            };
             let outcome = {
                 let guard = step_engine::guard();
-                step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard)
+                step_ioctl_tiocspgrp_for_process(&tty, &ctx.process, &new_pgrp, &guard)
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),

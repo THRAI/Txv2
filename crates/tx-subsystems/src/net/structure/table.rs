@@ -12,6 +12,7 @@ const LOCAL_ENDPOINT_SLOTS: usize = 256;
 const LISTENER_SLOTS: usize = 128;
 const CONNECTION_SLOTS: usize = 256;
 const RAW_ICMP_SLOTS: usize = 128;
+const PACKET_SOCKET_SLOTS: usize = 128;
 const UNIX_PATH_NODE_SLOTS: usize = 256;
 const UNIX_BOUND_SLOTS: usize = 256;
 // hackbench (cyclictest's stress phase) creates hundreds of AF_UNIX
@@ -86,6 +87,11 @@ pub struct RawIcmpSocketKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketSocketKey {
+    pub socket_raw: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnixStreamPeerKey {
     pub socket_raw: u32,
 }
@@ -125,6 +131,7 @@ pub struct SocketTable {
     udp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     udp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     raw_icmp: Index<RawIcmpSocketKey, Cap<SocketIdentity>, RAW_ICMP_SLOTS>,
+    packet_sockets: Index<PacketSocketKey, Cap<SocketIdentity>, PACKET_SOCKET_SLOTS>,
     unix_path_nodes: Index<UnixSocketPath, (), UNIX_PATH_NODE_SLOTS>,
     unix_bound: Index<UnixSocketPath, Cap<SocketIdentity>, UNIX_BOUND_SLOTS>,
     unix_stream_peers: Index<UnixStreamPeerKey, Cap<SocketIdentity>, UNIX_STREAM_PEER_SLOTS>,
@@ -199,6 +206,7 @@ impl SocketTable {
             udp_bound: Index::new(),
             udp_connections: Index::new(),
             raw_icmp: Index::new(),
+            packet_sockets: Index::new(),
             unix_path_nodes: Index::new(),
             unix_bound: Index::new(),
             unix_stream_peers: Index::new(),
@@ -316,6 +324,15 @@ impl SocketTable {
     pub fn register_raw_icmp(&self, socket: Cap<SocketIdentity>) -> Result<(), IndexError> {
         self.raw_icmp
             .reserve(RawIcmpSocketKey {
+                socket_raw: socket.raw(),
+            })?
+            .commit(socket);
+        Ok(())
+    }
+
+    pub fn register_packet_socket(&self, socket: Cap<SocketIdentity>) -> Result<(), IndexError> {
+        self.packet_sockets
+            .reserve(PacketSocketKey {
                 socket_raw: socket.raw(),
             })?
             .commit(socket);
@@ -494,6 +511,13 @@ impl SocketTable {
 
     pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
         mutation::withdraw(&self.raw_icmp, &RawIcmpSocketKey { socket_raw })
+    }
+
+    pub fn withdraw_packet_socket(
+        &self,
+        socket_raw: u32,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.packet_sockets, &PacketSocketKey { socket_raw })
     }
 
     pub fn withdraw_unix_bound(
@@ -860,6 +884,11 @@ impl SocketTable {
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 
+    pub fn snapshot_packet_sockets(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.packet_sockets
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
     pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.unix_bound
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
@@ -962,6 +991,10 @@ impl InitialSocketTableProxy {
         self.with_table(|table| table.register_raw_icmp(socket))
     }
 
+    pub fn register_packet_socket(&self, socket: Cap<SocketIdentity>) -> Result<(), IndexError> {
+        self.with_table(|table| table.register_packet_socket(socket))
+    }
+
     pub fn bind_unix(
         &self,
         path: UnixSocketPath,
@@ -1027,6 +1060,13 @@ impl InitialSocketTableProxy {
 
     pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
         self.with_table(|table| table.withdraw_raw_icmp(socket_raw))
+    }
+
+    pub fn withdraw_packet_socket(
+        &self,
+        socket_raw: u32,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_packet_socket(socket_raw))
     }
 
     pub fn withdraw_unix_bound(
@@ -1171,6 +1211,10 @@ impl InitialSocketTableProxy {
 
     pub fn snapshot_raw_icmp(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.with_table(|table| table.snapshot_raw_icmp(guard))
+    }
+
+    pub fn snapshot_packet_sockets(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_packet_sockets(guard))
     }
 
     pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {

@@ -48,7 +48,7 @@ mod tokens;
 
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use tx_hal::{PhysAddr, Ppn, PtNode};
+use tx_hal::{DmaConstraints, DmaDomain, DmaTranslation, PhysAddr, Ppn, PtNode};
 
 pub use bitmap_backend::BitmapPageAllocator;
 pub use diagnostics::{AllocatorBackendKind, AllocatorDiagnostics, FrameRoleDiagnostics};
@@ -57,6 +57,12 @@ pub use tokens::{
     CachePin, DeviceFrame, DmaPin, FrameReservation, FrameRunReservation, GiftPin, MapPin,
     MapPinRun, OwnedFrame, OwnedFrameRun, OwnedFrameRunIter, PermanentFrame, PtFrame,
 };
+
+/// The page substrate owns fixed 4 KiB base frames.
+///
+/// Huge pages are pmap compositions of these frames; DMA run counts and
+/// alignments below are therefore expressed in 4 KiB frame units.
+pub const FRAME_SIZE: usize = 4096;
 
 /// Allocation failures surfaced by the page allocator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +89,24 @@ pub enum AllocError {
     CounterUnderflow,
     /// A bitmap bit was already free at a return-to-pool linearization point.
     DoubleFree,
+}
+
+/// A physically contiguous DMA run request, in 4 KiB frame units.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaRunRequest {
+    pub count: usize,
+    pub align: usize,
+}
+
+/// Failures from constrained DMA frame reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DmaAllocError {
+    /// The page backend or its content-safety hook failed.
+    Alloc(AllocError),
+    /// The request or effective constraint set is invalid or widens the domain.
+    InvalidRequest,
+    /// No currently free run satisfies all effective constraints.
+    UnsatisfiedConstraints,
 }
 
 /// Content-safety policy for a freshly reserved frame.
@@ -221,6 +245,175 @@ pub trait PageAllocator: Sized {
     #[doc(hidden)]
     /// Release pmap-owned page-table storage through explicit teardown.
     fn release_page_table_frame(&self, ppn: Ppn);
+}
+
+impl BitmapPageAllocator<'_> {
+    /// Reserve a DMA-capable run from this concrete backend.
+    ///
+    /// Normal production callers use the installed [`reserve_dma_run`] facade.
+    /// Keeping this backend form public also lets host tests exercise sparse and
+    /// high-address allocator fixtures without replacing the installed global
+    /// allocator.
+    pub fn reserve_dma_run(
+        &self,
+        domain: &DmaDomain,
+        effective: DmaConstraints,
+        request: DmaRunRequest,
+        policy: ZeroPolicy,
+    ) -> Result<FrameRunReservation<'_, Self>, DmaAllocError> {
+        let byte_len = validate_dma_request(domain, effective, request)?;
+        self.reserve_run_matching(request.count, request.align, policy, |base| {
+            dma_candidate_matches(base, byte_len, domain, effective)
+        })
+        .map_err(|err| match err {
+            AllocError::Exhausted => DmaAllocError::UnsatisfiedConstraints,
+            AllocError::InvalidRequest => DmaAllocError::InvalidRequest,
+            other => DmaAllocError::Alloc(other),
+        })
+    }
+}
+
+fn validate_dma_request(
+    domain: &DmaDomain,
+    effective: DmaConstraints,
+    request: DmaRunRequest,
+) -> Result<u64, DmaAllocError> {
+    if request.count == 0 || request.align == 0 {
+        return Err(DmaAllocError::InvalidRequest);
+    }
+    let byte_len = request
+        .count
+        .checked_mul(FRAME_SIZE)
+        .and_then(|len| u64::try_from(len).ok())
+        .ok_or(DmaAllocError::InvalidRequest)?;
+    request
+        .align
+        .checked_mul(FRAME_SIZE)
+        .ok_or(DmaAllocError::InvalidRequest)?;
+
+    let narrowed = domain
+        .constraints
+        .strict_intersection(effective)
+        .map_err(|_| DmaAllocError::InvalidRequest)?;
+    if narrowed != effective {
+        return Err(DmaAllocError::InvalidRequest);
+    }
+    Ok(byte_len)
+}
+
+fn dma_candidate_matches(
+    base: Ppn,
+    byte_len: u64,
+    domain: &DmaDomain,
+    constraints: DmaConstraints,
+) -> bool {
+    let Some(phys_start) = u64::try_from(base.0)
+        .ok()
+        .and_then(|ppn| ppn.checked_mul(FRAME_SIZE as u64))
+    else {
+        return false;
+    };
+    if checked_range_end(phys_start, byte_len).is_none()
+        || !is_aligned(phys_start, constraints.min_alignment)
+    {
+        return false;
+    }
+
+    match domain.translation {
+        DmaTranslation::Direct { offset } => {
+            let Some(device_start) = checked_add_signed(phys_start, offset) else {
+                return false;
+            };
+            let Some(device_end) = checked_range_end(device_start, byte_len) else {
+                return false;
+            };
+            if !fits_address_bits(device_end, constraints.dma_address_bits)
+                || !is_aligned(device_start, constraints.min_alignment)
+            {
+                return false;
+            }
+            segments_fit(phys_start, Some(device_start), byte_len, constraints)
+        }
+        DmaTranslation::Managed { .. } => {
+            // The IOVA is not known until DmaIf::map_dma.  Only the physical
+            // alignment, boundary, segment length, and segment-count facts can
+            // be proven at frame-reservation time.
+            segments_fit(phys_start, None, byte_len, constraints)
+        }
+    }
+}
+
+fn checked_add_signed(value: u64, offset: i64) -> Option<u64> {
+    if offset >= 0 {
+        value.checked_add(offset as u64)
+    } else {
+        value.checked_sub(offset.unsigned_abs())
+    }
+}
+
+fn checked_range_end(start: u64, len: u64) -> Option<u64> {
+    start.checked_add(len.checked_sub(1)?)
+}
+
+fn fits_address_bits(end: u64, bits: u8) -> bool {
+    bits == u64::BITS as u8 || end < (1u64 << bits)
+}
+
+fn is_aligned(address: u64, alignment: usize) -> bool {
+    u64::try_from(alignment)
+        .ok()
+        .is_some_and(|alignment| address % alignment == 0)
+}
+
+fn boundary_room(address: u64, boundary: Option<u64>) -> u64 {
+    match boundary {
+        Some(boundary) => boundary - address % boundary,
+        None => u64::MAX,
+    }
+}
+
+fn segments_fit(
+    mut phys_start: u64,
+    mut device_start: Option<u64>,
+    mut remaining: u64,
+    constraints: DmaConstraints,
+) -> bool {
+    let Some(max_segment_len) = u64::try_from(constraints.max_segment_len).ok() else {
+        return false;
+    };
+    let mut segments = 0u16;
+
+    while remaining != 0 {
+        if segments == constraints.max_segments {
+            return false;
+        }
+        let mut segment_len = remaining
+            .min(max_segment_len)
+            .min(boundary_room(phys_start, constraints.segment_boundary));
+        if let Some(device) = device_start {
+            segment_len = segment_len.min(boundary_room(device, constraints.segment_boundary));
+        }
+        if segment_len == 0 {
+            return false;
+        }
+
+        segments += 1;
+        remaining -= segment_len;
+        if remaining == 0 {
+            return true;
+        }
+        let Some(next_phys) = phys_start.checked_add(segment_len) else {
+            return false;
+        };
+        phys_start = next_phys;
+        if let Some(device) = device_start {
+            let Some(next_device) = device.checked_add(segment_len) else {
+                return false;
+            };
+            device_start = Some(next_device);
+        }
+    }
+    true
 }
 
 static INSTALLED_BITMAP_ALLOCATOR: AtomicPtr<BitmapPageAllocator<'static>> =
@@ -395,6 +588,23 @@ pub fn reserve_run(
     })
 }
 
+/// Reserve a contiguous frame run satisfying one device-selected DMA domain.
+///
+/// `effective` must be equal to or stricter than the domain's published
+/// constraints. Direct translations are checked before reservation; managed
+/// domains defer device-address validation to `DmaIf::map_dma`.
+pub fn reserve_dma_run(
+    domain: &'static DmaDomain,
+    effective: DmaConstraints,
+    request: DmaRunRequest,
+    policy: ZeroPolicy,
+) -> Result<FrameRunReservation<'static, BitmapPageAllocator<'static>>, DmaAllocError> {
+    measure_page_allocator!(b"debug.ds.substrate.page_allocator.reserve_dma_run", {
+        let allocator = installed_bitmap_allocator().map_err(DmaAllocError::Alloc)?;
+        allocator.reserve_dma_run(domain, effective, request, policy)
+    })
+}
+
 /// Free-frame count from the installed backend.
 pub fn free_count() -> Result<usize, AllocError> {
     Ok(installed_bitmap_allocator()?.free_count())
@@ -430,7 +640,7 @@ pub fn reserve_page_table_node() -> Result<PtNode, tx_hal::AllocError> {
                 .map_err(|_| tx_hal::AllocError::Exhausted)?
                 .commit();
             let pt_frame = frame.into_page_table_frame();
-            let phys = PhysAddr(pt_frame.ppn().0 * 4096);
+            let phys = PhysAddr(pt_frame.ppn().0 * FRAME_SIZE);
             core::mem::forget(pt_frame);
             Ok(PtNode::typed_frame(phys, release_page_table_node))
         }
@@ -491,7 +701,7 @@ pub fn claim_permanent_frame(
 
 unsafe fn release_page_table_node(phys: PhysAddr) {
     if let Ok(allocator) = installed_bitmap_allocator() {
-        allocator.release_page_table_frame(Ppn(phys.0 / 4096));
+        allocator.release_page_table_frame(Ppn(phys.0 / FRAME_SIZE));
     }
 }
 

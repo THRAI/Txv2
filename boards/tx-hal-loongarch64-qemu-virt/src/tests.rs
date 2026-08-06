@@ -204,6 +204,15 @@ fn qemu_la64_pci_windows_are_published_for_virtio_pci_devices() {
 }
 
 #[test]
+fn qemu_la64_static_pci_resource_seed_is_self_consistent() {
+    let graph = Platform::platform_info().device_resources;
+
+    tx_hal::DeviceGraphBuilder::from_seed(graph).expect("valid LA64 PCI resource seed");
+    assert_eq!(graph.devices, &LA64_PCI_HOST_DEVICES);
+    assert_eq!(graph.dma_domains, &LA64_PCI_DMA_DOMAINS);
+}
+
+#[test]
 fn qemu_la64_mmio_regions_include_ls7a_rtc() {
     let regions = Platform::platform_info().mmio_regions;
     let rtc = regions
@@ -1370,29 +1379,112 @@ fn irq_dispatch_table_routes_handlers_and_masks_spurious() {
 #[test]
 fn la64_platform_overrides_uart_irq_constant() {
     assert_eq!(<Platform as IrqIf>::UART_IRQ, QEMU_LA64_UART0_IRQ);
+    assert_eq!(<Platform as IrqIf>::uart_irq(), QEMU_LA64_UART0_IRQ);
 }
 
 #[test]
 fn la64_platform_overrides_rtc_irq_constant() {
     assert_eq!(<Platform as IrqIf>::RTC_IRQ, QEMU_LA64_RTC_IRQ);
+    assert_eq!(<Platform as IrqIf>::rtc_irq(), QEMU_LA64_RTC_IRQ);
     assert_eq!(QEMU_LA64_RTC_IRQ, 70);
 }
 
 #[test]
-fn la64_platform_routes_slot_two_inta_to_pch_pic_input_eighteen() {
-    assert_eq!(QEMU_LA64_NET_IRQ, 82);
-    assert_eq!(<Platform as IrqIf>::NET_IRQ, QEMU_LA64_NET_IRQ);
+fn la64_pci_intx_irq_follows_the_actual_function_and_interrupt_pin() {
+    let slot_two_inta = <Platform as IrqIf>::pci_intx_irq(
+        PciFunctionId {
+            segment: 0,
+            bus: 0,
+            device: 2,
+            function: 0,
+        },
+        1,
+    )
+    .expect("slot 2 INTA");
+    let slot_five_inta = <Platform as IrqIf>::pci_intx_irq(
+        PciFunctionId {
+            segment: 0,
+            bus: 0,
+            device: 5,
+            function: 0,
+        },
+        1,
+    )
+    .expect("slot 5 INTA");
+    let slot_five_intd = <Platform as IrqIf>::pci_intx_irq(
+        PciFunctionId {
+            segment: 0,
+            bus: 0,
+            device: 5,
+            function: 0,
+        },
+        4,
+    )
+    .expect("slot 5 INTD");
+
+    assert_eq!(slot_two_inta.line, 82);
+    assert_eq!(slot_five_inta.line, 81);
+    assert_eq!(slot_five_intd.line, 80);
+    assert_ne!(slot_two_inta.line, slot_five_inta.line);
+    assert_eq!(slot_five_inta.trigger, IrqTrigger::Level);
+    assert_eq!(slot_five_inta.polarity, IrqPolarity::Low);
+    assert_eq!(slot_five_inta.sharing, IrqSharing::Shared);
+}
+
+#[test]
+fn la64_pci_intx_irq_rejects_addresses_outside_the_host_bridge() {
+    assert!(<Platform as IrqIf>::pci_intx_irq(
+        PciFunctionId {
+            segment: 1,
+            bus: 0,
+            device: 5,
+            function: 0,
+        },
+        1,
+    )
+    .is_none());
+    assert!(<Platform as IrqIf>::pci_intx_irq(
+        PciFunctionId {
+            segment: 0,
+            bus: 1,
+            device: 5,
+            function: 0,
+        },
+        1,
+    )
+    .is_none());
+    assert!(<Platform as IrqIf>::pci_intx_irq(
+        PciFunctionId {
+            segment: 0,
+            bus: 0,
+            device: 5,
+            function: 0,
+        },
+        0,
+    )
+    .is_none());
 }
 
 #[test]
 #[cfg(not(target_arch = "loongarch64"))]
-fn la64_net_irq_unmask_programs_pch_vector_eighteen() {
+fn la64_pci_irq_unmask_programs_the_resolved_pch_vector() {
     let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
     reset_la64_host_irq_controller_for_test();
-    let ext_irq = QEMU_LA64_NET_IRQ - QEMU_LA64_GSI_BASE;
+    let irq = <Platform as IrqIf>::pci_intx_irq(
+        PciFunctionId {
+            segment: 0,
+            bus: 0,
+            device: 5,
+            function: 0,
+        },
+        1,
+    )
+    .expect("slot 5 INTA")
+    .line;
+    let ext_irq = irq - QEMU_LA64_GSI_BASE;
     let bit = 1u64 << ext_irq;
 
-    <Platform as IrqIf>::unmask(QEMU_LA64_NET_IRQ);
+    <Platform as IrqIf>::unmask(irq);
 
     assert_eq!(LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire), bit);
     assert_eq!(LA64_HOST_PCH_PIC_MASK.load(Ordering::Acquire) & bit, 0);

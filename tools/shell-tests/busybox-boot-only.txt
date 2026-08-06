@@ -1,0 +1,5 @@
+# Architecture-neutral BusyBox boot witness with no device assumptions.
+
+wait "/ # " within 30000
+sleep 500
+quit

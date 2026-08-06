@@ -95,6 +95,7 @@ static TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: TestPlatform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };

@@ -462,7 +462,7 @@ pub fn init<P: TxPlatform>() {
     // order); the emit is a no-op in that case.
     let phase_span = emit_phase_span_begin(
         tx_observe_types::BootPhaseKind::SubstrateBsp,
-        0, // BSP is always hart 0
+        <P as tx_hal::PercpuIf>::current_cpu_id().0 as u8,
     );
 
     let _ = P::platform_info();

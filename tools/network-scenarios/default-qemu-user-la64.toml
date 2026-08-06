@@ -1,0 +1,26 @@
+schema = "tx.network-scenario.v1"
+name = "default-qemu-user-la64"
+target = "qemu-la64"
+
+[device]
+transport = "virtio-pci"
+
+[device.selector]
+kind = "device-id"
+value = "boot-nic"
+
+[device.placement]
+kind = "virtio-pci"
+slot = 2
+function = 0
+
+[backend]
+kind = "qemu-user"
+id = "net0"
+network = "10.0.2.0/24"
+dhcp_start = "10.0.2.15"
+gateway = "10.0.2.2"
+dns = "10.0.2.3"
+
+[guest]
+kind = "kernel-default"

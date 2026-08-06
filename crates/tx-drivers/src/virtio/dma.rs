@@ -1,9 +1,10 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::adapter::step_engine::{
-    page_allocator, BitmapPageAllocator, DmaPin, OwnedFrameRun, SpinMutex, ZeroPolicy,
+    page_allocator, BitmapPageAllocator, DmaPin, DmaRunRequest, OwnedFrameRun, SpinMutex,
+    ZeroPolicy,
 };
-use tx_hal::{DmaDirection, DmaIf, PhysAddr, Ppn, TxPlatform};
+use tx_hal::{DmaDirection, DmaDomain, DmaIf, DmaTranslation, PhysAddr, Ppn, TxPlatform};
 use virtio_drivers::{BufferDirection, PhysAddr as VirtioPhysAddr};
 
 const PAGE_SIZE: usize = virtio_drivers::PAGE_SIZE;
@@ -18,6 +19,7 @@ struct DmaAllocation {
     pages: usize,
     owned: OwnedFrameRun<'static, BitmapPageAllocator<'static>>,
     pins: alloc::vec::Vec<DmaPin<'static, BitmapPageAllocator<'static>>>,
+    domain: Option<&'static DmaDomain>,
 }
 
 struct SharedBuffer {
@@ -37,6 +39,31 @@ static DMA_ALLOCATIONS: SpinMutex<alloc::vec::Vec<DmaAllocation>> =
     SpinMutex::new(alloc::vec::Vec::new());
 static SHARED_BUFFERS: SpinMutex<alloc::vec::Vec<SharedBuffer>> =
     SpinMutex::new(alloc::vec::Vec::new());
+static CONFIGURED_DMA_DOMAIN: SpinMutex<Option<&'static DmaDomain>> = SpinMutex::new(None);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VirtioDmaDomainError {
+    ManagedTranslationUnsupported,
+    ConflictingDomain,
+}
+
+/// Install the explicit DMA domain consumed by the statically bound VirtIO
+/// devices. Reinstalling the same immutable graph record is harmless; mixing
+/// different domains behind one `virtio_drivers::Hal` type is rejected.
+pub fn configure_dma_domain(domain: &'static DmaDomain) -> Result<(), VirtioDmaDomainError> {
+    if matches!(domain.translation, DmaTranslation::Managed { .. }) {
+        return Err(VirtioDmaDomainError::ManagedTranslationUnsupported);
+    }
+    let mut configured = CONFIGURED_DMA_DOMAIN.lock();
+    match *configured {
+        Some(current) if current != domain => Err(VirtioDmaDomainError::ConflictingDomain),
+        Some(_) => Ok(()),
+        None => {
+            *configured = Some(domain);
+            Ok(())
+        }
+    }
+}
 
 fn virtio_direction(direction: BufferDirection) -> DmaDirection {
     match direction {
@@ -54,9 +81,26 @@ fn alloc_dma_pages<P: TxPlatform>(
         return Err(());
     }
 
-    let owned = page_allocator::reserve_run(pages, 1, ZeroPolicy::Zeroed)
-        .map_err(|_| ())?
-        .commit();
+    let domain = *CONFIGURED_DMA_DOMAIN.lock();
+    let owned = match domain {
+        Some(domain) => {
+            let page_align = domain.constraints.min_alignment.div_ceil(PAGE_SIZE).max(1);
+            page_allocator::reserve_dma_run(
+                domain,
+                domain.constraints,
+                DmaRunRequest {
+                    count: pages,
+                    align: page_align,
+                },
+                ZeroPolicy::Zeroed,
+            )
+            .map_err(|_| ())?
+            .commit()
+        }
+        None => page_allocator::reserve_run(pages, 1, ZeroPolicy::Zeroed)
+            .map_err(|_| ())?
+            .commit(),
+    };
     let base = owned.base();
     let paddr = PhysAddr(base.0 * PAGE_SIZE);
     let vaddr = page_allocator::frame_kernel_addr(base).map_err(|_| ())?;
@@ -79,6 +123,7 @@ fn alloc_dma_pages<P: TxPlatform>(
         pages,
         owned,
         pins,
+        domain,
     })
 }
 
@@ -92,7 +137,17 @@ unsafe fn copy_from_dma(src: NonNull<u8>, dst: NonNull<[u8]>, len: usize) {
 
 impl DmaAllocation {
     fn dma_addr<P: TxPlatform>(&self) -> VirtioPhysAddr {
-        <P as DmaIf>::phys_to_dma(self.paddr).0 as usize
+        match self.domain.map(|domain| domain.translation) {
+            Some(DmaTranslation::Direct { offset }) => self
+                .paddr
+                .0
+                .checked_add_signed(offset as isize)
+                .expect("validated direct DMA translation overflow"),
+            Some(DmaTranslation::Managed { .. }) => {
+                unreachable!("managed DMA domains are rejected during configuration")
+            }
+            None => <P as DmaIf>::phys_to_dma(self.paddr).0 as usize,
+        }
     }
 }
 
@@ -117,15 +172,19 @@ unsafe impl<P: TxPlatform> virtio_drivers::Hal for TxVirtioHal<P> {
     }
 
     unsafe fn dma_dealloc(paddr: VirtioPhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
-        let phys = <P as DmaIf>::dma_to_phys(tx_hal::DmaAddr(paddr as u64));
-        <P as DmaIf>::sync_for_cpu(phys, pages * PAGE_SIZE, DmaDirection::Bidirectional);
         let mut allocations = DMA_ALLOCATIONS.lock();
         let Some(index) = allocations.iter().position(|entry| {
             entry.dma_addr::<P>() == paddr && entry.vaddr == vaddr && entry.pages == pages
         }) else {
             return -1;
         };
-        allocations.swap_remove(index);
+        let allocation = allocations.swap_remove(index);
+        drop(allocations);
+        <P as DmaIf>::sync_for_cpu(
+            allocation.paddr,
+            pages * PAGE_SIZE,
+            DmaDirection::Bidirectional,
+        );
         0
     }
 

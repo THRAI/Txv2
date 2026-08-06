@@ -3,10 +3,14 @@
 #[cfg_attr(not(test), allow(unused_extern_crates))]
 extern crate alloc;
 
+pub mod device_resource;
 pub mod hart_local;
+mod irq;
 pub mod time;
 
+pub use device_resource::*;
 pub use hart_local::{HartLocal, MAX_HARTS};
+pub use irq::*;
 
 use core::marker::PhantomData;
 
@@ -302,6 +306,7 @@ pub struct PlatformInfo {
     pub board: &'static str,
     pub spi_sd: Option<SpiSdInfo>,
     pub mmio_regions: &'static [MmioRegion],
+    pub device_resources: &'static DeviceResourceGraph,
     pub timebase_frequency_hz: u64,
     pub possible_cpu_count: usize,
 }
@@ -313,9 +318,22 @@ pub struct PlatformInfo {
 pub enum DeviceKind {
     Uart,
     IntController,
+    /// Firmware-described clock-controller register bank mapped for a
+    /// platform device's clock/reset preparation hook.
+    ClockController,
+    /// Firmware-described outer-cache controller used for non-coherent DMA
+    /// maintenance. Platforms without such a controller simply omit it.
+    CacheController,
+    /// QEMU's `google,goldfish-rtc` register model.
+    ///
+    /// Keep this backend-specific: a board-local RTC such as the JH7110 RTC
+    /// is not register-compatible and must not be routed through Goldfish
+    /// MMIO merely because both devices are clocks.
+    GoldfishRtc,
     VirtioMmio,
     PciEcam,
     SdController,
+    Dwmac,
 }
 
 /// One statically published platform-device fact.
@@ -413,12 +431,39 @@ pub trait BootInfoIf {
 pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
 
+    /// Make firmware-described platform controls (for example clocks and
+    /// resets) usable before a concrete driver touches its device MMIO.
+    fn prepare_platform_device(
+        _device: &'static PlatformDevice,
+    ) -> Result<(), PlatformDevicePrepareError> {
+        Ok(())
+    }
+
     /// Platform devices discovered before the heap becomes available.
     ///
     /// Boards without a firmware device table may keep the empty default and
     /// let their generic-device setup use its documented legacy fallback.
     fn devices() -> &'static [DeviceInfo] {
         &[]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformDevicePrepareError {
+    MissingFirmwareNode,
+    MalformedFirmwareProperty,
+    UnsupportedProvider,
+    ControlTimeout,
+}
+
+impl PlatformDevicePrepareError {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MissingFirmwareNode => "missing-firmware-node",
+            Self::MalformedFirmwareProperty => "malformed-firmware-property",
+            Self::UnsupportedProvider => "unsupported-provider",
+            Self::ControlTimeout => "control-timeout",
+        }
     }
 }
 
@@ -1288,119 +1333,6 @@ pub trait EntropyIf {
     }
 }
 
-pub trait IrqIf {
-    const MAX_IRQ: u32 = 0;
-
-    /// Platform-specific IRQ number for the boot console UART.
-    ///
-    /// The kernel's `install_irq_handlers` reads this through
-    /// `<P as IrqIf>::UART_IRQ` to register the UART RX dispatcher
-    /// without naming a board constant directly. Boards that have no
-    /// dedicated UART IRQ (or run on a host-only test platform) keep
-    /// the `0` sentinel default; production boards override.
-    /// See `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
-    /// §"Open questions #6".
-    const UART_IRQ: u32 = 0;
-
-    /// Runtime UART IRQ number. Boards with firmware discovery can override
-    /// this while retaining `UART_IRQ` as a static fallback.
-    fn uart_irq() -> u32 {
-        Self::UART_IRQ
-    }
-
-    /// Platform-specific IRQ number for the boot network device.
-    const NET_IRQ: u32 = 0;
-
-    /// Runtime network IRQ number. A zero value means polling-only.
-    fn net_irq() -> u32 {
-        Self::NET_IRQ
-    }
-
-    /// Platform-specific IRQ number for a wake-capable persistent-clock RTC.
-    ///
-    /// Boards without a hardware RTC alarm interrupt keep the `0` sentinel
-    /// default. The generic kernel may use this to register an IRQ handler that
-    /// publishes an RTC device event; HAL itself must not know devfs or RTC
-    /// userspace state.
-    const RTC_IRQ: u32 = 0;
-
-    fn in_irq_context() -> bool {
-        false
-    }
-
-    /// Return whether the current execution is using an architecture trap
-    /// stack.
-    ///
-    /// Synchronous exceptions such as syscalls are not IRQ context, but they
-    /// still run on a small per-hart trap stack on stackless platforms.
-    /// Substrates use this fact to defer destructor-heavy maintenance until
-    /// control has returned to a normal kernel/reactor stack.
-    fn in_trap_context() -> bool {
-        Self::in_irq_context()
-    }
-
-    fn interrupts_enabled() -> bool {
-        true
-    }
-
-    /// Save maskable local interrupt admission and disable it until the returned
-    /// guard is dropped. This does not provide CPU affinity or NMI exclusion.
-    fn exclude_local_execution() -> LocalExecutionGuard;
-
-    fn claim() -> u32 {
-        0
-    }
-
-    fn complete(_irq: u32) {}
-
-    fn mask(_irq: u32) {}
-
-    fn unmask(_irq: u32) {}
-
-    fn set_priority(_irq: u32, _priority: u8) {}
-
-    fn install_dispatch_table(_table: &'static IrqDispatchTable) {}
-
-    fn dispatch_irq(_irq: u32) -> IrqHandled {
-        IrqHandled::Done
-    }
-}
-
-pub const IRQ_DISPATCH_TABLE_SIZE: usize = 1024;
-
-pub type IrqHandlerFn = fn(irq: u32) -> IrqHandled;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IrqHandled {
-    Done,
-    Wake,
-    /// The handler requested a reactor wake and retained ownership of the
-    /// controller completion. It must later call [`IrqIf::complete`] exactly
-    /// once from the same controller context that performed the claim.
-    DeferredWake,
-    NotMine,
-}
-
-pub struct IrqDispatchTable {
-    pub entries: [Option<IrqHandlerFn>; IRQ_DISPATCH_TABLE_SIZE],
-}
-
-impl IrqDispatchTable {
-    pub const SIZE: usize = IRQ_DISPATCH_TABLE_SIZE;
-
-    pub const fn new() -> Self {
-        Self {
-            entries: [None; IRQ_DISPATCH_TABLE_SIZE],
-        }
-    }
-}
-
-impl Default for IrqDispatchTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The instruction or architectural source a vDSO may read without entering
 /// the kernel. `None` keeps the vDSO on its syscall fallback path.
 #[repr(u32)]
@@ -1615,6 +1547,16 @@ pub trait DmaIf: PlatformConfig {
     fn sync_for_device(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
 
     fn sync_for_cpu(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+
+    /// Order descriptor/buffer publication before a following device MMIO
+    /// notification such as a DMA tail-pointer write.
+    ///
+    /// The default is sufficient for coherent host mocks. Real platforms
+    /// whose architecture distinguishes normal-memory and device-I/O ordering
+    /// must override this with the architecture's DMA/MMIO write barrier.
+    fn publish_to_device() {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    }
 }
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;

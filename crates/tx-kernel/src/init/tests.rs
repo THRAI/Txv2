@@ -68,6 +68,7 @@ static TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: TestPlatform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };
@@ -346,6 +347,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
     tx_subsystems::device::reset_block_registry_for_test();
+    tx_subsystems::net::device::reset_net_registry_for_test();
     tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
     CONSOLE_CAPTURED_BYTES
@@ -386,6 +388,7 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_rtc_device();
     CoreInit::<TestPlatform>::init_block_devices();
+    CoreInit::<TestPlatform>::init_net_devices();
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
@@ -395,6 +398,15 @@ fn drive_boot_wiring() {
 }
 
 // --- tests --------------------------------------------------------
+
+#[test]
+fn zero_network_registry_does_not_publish_a_staging_device() {
+    let _setup = setup();
+
+    CoreInit::<TestPlatform>::init_net_devices();
+
+    assert!(tx_subsystems::net::net_device_snapshot().is_empty());
+}
 
 struct FileIoRuntimeTestBlockDevice;
 

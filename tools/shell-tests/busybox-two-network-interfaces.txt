@@ -1,0 +1,24 @@
+# Verify that every firmware-described VirtIO network device is published.
+# Interface names are discovered from sysfs instead of assumed by the script.
+
+wait "/ # " within 30000
+
+sleep 500
+send "count=0; names=; "
+sleep 100
+send "for p in /sys/class/net/*; do "
+sleep 100
+send "n=${p##*/}; "
+sleep 100
+send "if [ \"$n\" != lo ]; then "
+sleep 100
+send "count=$((count+1)); "
+sleep 100
+send "names=\"$names $n\"; fi; done; "
+sleep 100
+send "echo TX_NET_INTERFACES=$count:$names\n"
+expect "TX_NET_INTERFACES=2:" within 5000
+expect "/ # " within 5000
+
+sleep 500
+quit

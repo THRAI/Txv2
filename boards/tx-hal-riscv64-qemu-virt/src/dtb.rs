@@ -18,18 +18,57 @@ type FallibleFdt<'a> = fdt::Fdt<
 >;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DtbDeviceError {
+    LegacyDeviceCapacityExceeded { capacity: usize, required: usize },
+    LegacyMmioCapacityExceeded { capacity: usize, required: usize },
+    LegacyMmioNameCapacityExceeded { kind: DeviceKind, required: usize },
+    PlatformMmioCapacityExceeded { capacity: usize, required: usize },
+    PlatformDeviceCapacityExceeded { capacity: usize, required: usize },
+    DeviceMatchCapacityExceeded { capacity: usize, required: usize },
+    DeviceResourceCapacityExceeded { capacity: usize, required: usize },
+    StringArenaCapacityExceeded { capacity: usize, required: usize },
+    MalformedNodeName,
+    MalformedCompatible,
+    InvalidIrq(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DtbDeviceClass {
+    PlatformMmio(Option<DeviceKind>),
+    PlatformDevice(DeviceKind),
+}
+
+impl DtbDeviceClass {
+    const fn legacy_kind(self) -> Option<DeviceKind> {
+        match self {
+            Self::PlatformMmio(kind) => kind,
+            Self::PlatformDevice(kind) => Some(kind),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DtbDeviceFact<'a> {
+    pub(crate) class: DtbDeviceClass,
+    pub(crate) node_name: &'a str,
+    pub(crate) unit_address: Option<&'a str>,
+    pub(crate) compatible: &'a [u8],
+    pub(crate) mmio: PhysRange,
+    pub(crate) irq: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DtbBootInfo {
     pub(crate) memory_region_count: usize,
     pub(crate) initrd: Option<PhysRange>,
     pub(crate) cmdline_len: usize,
     pub(crate) timebase_frequency_hz: Option<u64>,
     pub(crate) possible_cpu_count: usize,
-    /// Bit per hart id for cpus that can run S-mode, Linux-style:
-    /// only /cpus children carrying an `mmu-type` property qualify.
-    /// VF2's hart0 is an S7 monitor core without one — HSM-starting
-    /// it wedges the firmware in a trap-error loop that shreds the
-    /// boot console (2026-07-02 on-board find). 0 = no data, caller
-    /// falls back to counting.
+    /// Bit per hart id for CPUs that can run S-mode. Linux-style DT
+    /// properties provide the generic filter; SoC topology normalization
+    /// removes firmware-described harts that the hardware cannot run as
+    /// supervisor application CPUs. 0 = no data, caller falls back to
+    /// counting.
     pub(crate) startable_harts: u64,
 }
 
@@ -96,12 +135,10 @@ pub(crate) unsafe fn parse_boot_info_from_fdt(
     })
 }
 
-/// Bitmap of hart ids that can run S-mode, Linux's rule: /cpus
-/// children with device_type = "cpu", status not "disabled", and an
-/// `mmu-type` property. Both exclusion mechanisms are needed in the
-/// wild: mainline jh7110 dts omits mmu-type on the S7 hart0, while
-/// the vendor v1.3b dtb gives every hart mmu-type but marks hart0
-/// status = "disabled".
+/// Bitmap of hart ids that can run S-mode. The generic Linux rule requires
+/// `/cpus` children with `device_type = "cpu"`, status not `disabled`, and an
+/// `mmu-type` property. `normalize_startable_harts` then cross-checks those
+/// candidates against interrupt-controller topology when the DTB provides it.
 fn collect_startable_harts(fdt: &FallibleFdt<'_>) -> u64 {
     let Some(cpus) = fdt.find_node("/cpus").ok().flatten() else {
         return 0;
@@ -137,7 +174,40 @@ fn collect_startable_harts(fdt: &FallibleFdt<'_>) -> u64 {
             mask |= 1u64 << hart;
         }
     }
-    mask
+    normalize_startable_harts(fdt, mask)
+}
+
+/// Correct incomplete or inaccurate CPU nodes with interrupt topology facts.
+///
+/// A PLIC platform's `interrupts-extended` property identifies exactly which
+/// harts have an S-mode external-interrupt context. If that information is
+/// present, a hart advertised by `/cpus` but lacking an S-mode context cannot
+/// be used as a supervisor application hart and is removed from the candidate
+/// mask. This handles the VF2 U-Boot control FDT that misdescribes its S7
+/// monitor core without encoding a board name, a particular hart id, or a
+/// contiguous topology. DTBs without usable PLIC context data retain the
+/// generic CPU-node result, which also keeps AIA-only platforms working.
+fn normalize_startable_harts(fdt: &FallibleFdt<'_>, mask: u64) -> u64 {
+    let mut contexts = [None; MAX_PLIC_HARTS];
+    let resolved = collect_plic_scontexts(fdt, &mut contexts);
+    filter_harts_by_plic_scontexts(mask, &contexts, resolved)
+}
+
+fn filter_harts_by_plic_scontexts(
+    mask: u64,
+    contexts: &[Option<u32>; MAX_PLIC_HARTS],
+    resolved: usize,
+) -> u64 {
+    if resolved == 0 {
+        return mask;
+    }
+
+    let supervisor_harts = contexts
+        .iter()
+        .enumerate()
+        .filter_map(|(hart, context)| context.map(|_| 1u64 << hart))
+        .fold(0u64, |acc, bit| acc | bit);
+    mask & supervisor_harts
 }
 
 fn copy_memory_regions(fdt: &FallibleFdt<'_>, out: &mut [MemoryRegion]) -> Option<usize> {
@@ -233,45 +303,141 @@ fn count_cpu_nodes(fdt: &FallibleFdt<'_>) -> usize {
         .count()
 }
 
-/// Walk `/soc` children and collect devices the kernel knows how to
-/// drive, classified by `compatible`. Fills `out` in tree order and
-/// returns the count. Unknown nodes are skipped; a missing or
-/// unparseable tree yields 0 (callers keep their fallbacks).
-pub(crate) unsafe fn parse_devices_from_fdt(dtb_addr: usize, out: &mut [DeviceInfo]) -> usize {
+/// Walk `/soc` children and collect the legacy compatibility projection.
+/// Unknown nodes are skipped; a missing or unparseable tree yields an empty
+/// projection. Capacity exhaustion is a boot error rather than truncation.
+#[cfg(test)]
+pub(crate) unsafe fn parse_devices_from_fdt(
+    dtb_addr: usize,
+    out: &mut [DeviceInfo],
+) -> Result<usize, DtbDeviceError> {
+    unsafe { parse_devices_from_fdt_with(dtb_addr, out, |_| Ok(())) }
+}
+
+/// Perform the single firmware device walk used by both the legacy
+/// [`DeviceInfo`] projection and the typed resource-seed publisher.
+pub(crate) unsafe fn parse_devices_from_fdt_with(
+    dtb_addr: usize,
+    out: &mut [DeviceInfo],
+    mut visit: impl FnMut(DtbDeviceFact<'_>) -> Result<(), DtbDeviceError>,
+) -> Result<usize, DtbDeviceError> {
     if dtb_addr == 0 {
-        return 0;
+        return Ok(0);
     }
     let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr_unaligned_fallible(dtb_addr as *const u8) }) else {
-        return 0;
+        return Ok(0);
     };
     let Some(soc) = fdt.find_node("/soc").ok().flatten() else {
-        return 0;
+        return Ok(0);
     };
     let Ok(children) = soc.children() else {
-        return 0;
+        return Ok(0);
     };
 
     let mut count = 0usize;
     for child in children.iter().filter_map(Result::ok) {
-        if count == out.len() {
-            break;
+        if !device_node_is_available(&child) {
+            continue;
         }
-        let Some(kind) = classify_device(&child) else {
+        let Some((class, compatible)) = classify_device_fact(&child) else {
             continue;
         };
-        let Some(mmio) = first_reg_range(&child) else {
-            continue;
-        };
-        out[count] = DeviceInfo {
+        let name = child
+            .name()
+            .map_err(|_| DtbDeviceError::MalformedNodeName)?;
+        let irq = read_u32_property(&child, "interrupts");
+
+        if matches!(
+            class,
+            DtbDeviceClass::PlatformMmio(Some(DeviceKind::ClockController))
+        ) {
+            let Some(reg) = child.reg().ok().flatten() else {
+                continue;
+            };
+            for entry in reg.iter::<u64, u64>() {
+                let entry = entry.ok().ok_or(DtbDeviceError::MalformedNodeName)?;
+                let Some(mmio) = phys_range_from_reg(entry.address, entry.len) else {
+                    continue;
+                };
+                emit_device_fact(
+                    &child,
+                    class,
+                    compatible,
+                    name.name,
+                    name.unit_address,
+                    mmio,
+                    irq,
+                    out,
+                    &mut count,
+                    &mut visit,
+                )?;
+            }
+        } else if let Some(mmio) = first_reg_range(&child) {
+            emit_device_fact(
+                &child,
+                class,
+                compatible,
+                name.name,
+                name.unit_address,
+                mmio,
+                irq,
+                out,
+                &mut count,
+                &mut visit,
+            )?;
+        }
+    }
+    Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_device_fact<'a>(
+    node: &FallibleFdtNode<'a>,
+    class: DtbDeviceClass,
+    compatible: &'a [u8],
+    node_name: &'a str,
+    unit_address: Option<&'a str>,
+    mmio: PhysRange,
+    irq: Option<u32>,
+    out: &mut [DeviceInfo],
+    count: &mut usize,
+    visit: &mut impl FnMut(DtbDeviceFact<'a>) -> Result<(), DtbDeviceError>,
+) -> Result<(), DtbDeviceError> {
+    visit(DtbDeviceFact {
+        class,
+        node_name,
+        unit_address,
+        compatible,
+        mmio,
+        irq,
+    })?;
+
+    if let Some(kind) = class.legacy_kind() {
+        if *count == out.len() {
+            return Err(DtbDeviceError::LegacyDeviceCapacityExceeded {
+                capacity: out.len(),
+                required: *count + 1,
+            });
+        }
+        out[*count] = DeviceInfo {
             kind,
             mmio,
-            irq: read_u32_property(&child, "interrupts"),
-            reg_shift: read_u32_property(&child, "reg-shift").unwrap_or(0) as u8,
-            reg_io_width: read_u32_property(&child, "reg-io-width").unwrap_or(1) as u8,
+            irq,
+            reg_shift: read_u32_property(node, "reg-shift").unwrap_or(0) as u8,
+            reg_io_width: read_u32_property(node, "reg-io-width").unwrap_or(1) as u8,
         };
-        count += 1;
+        *count += 1;
     }
-    count
+    Ok(())
+}
+
+/// Devicetree status rule: absent, `okay`, and `ok` are available; every
+/// other value is disabled/reserved and must not become a runtime capability.
+fn device_node_is_available(node: &FallibleFdtNode<'_>) -> bool {
+    let Ok(Some(status)) = node.raw_property("status") else {
+        return true;
+    };
+    matches!(status.value, b"okay\0" | b"ok\0")
 }
 
 /// Collect firmware-reserved RAM ranges as `Reserved` memory regions.
@@ -372,8 +538,6 @@ pub(crate) unsafe fn parse_plic_scontexts_from_fdt(
     dtb_addr: usize,
     out: &mut [Option<u32>; MAX_PLIC_HARTS],
 ) -> usize {
-    const IRQ_S_EXTERNAL: u32 = 9;
-
     out.fill(None);
     if dtb_addr == 0 {
         return 0;
@@ -381,6 +545,13 @@ pub(crate) unsafe fn parse_plic_scontexts_from_fdt(
     let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr_unaligned_fallible(dtb_addr as *const u8) }) else {
         return 0;
     };
+    collect_plic_scontexts(&fdt, out)
+}
+
+fn collect_plic_scontexts(fdt: &FallibleFdt<'_>, out: &mut [Option<u32>; MAX_PLIC_HARTS]) -> usize {
+    const IRQ_S_EXTERNAL: u32 = 9;
+
+    out.fill(None);
 
     // Pass 1: map each cpu's interrupt-controller phandle -> hart id.
     let mut intc_harts = [(0u32, 0usize); MAX_PLIC_HARTS];
@@ -461,45 +632,71 @@ pub(crate) unsafe fn parse_plic_scontexts_from_fdt(
 }
 
 fn classify_device(node: &FallibleFdtNode<'_>) -> Option<DeviceKind> {
+    classify_device_fact(node).and_then(|(class, _)| class.legacy_kind())
+}
+
+fn classify_device_fact<'a>(node: &FallibleFdtNode<'a>) -> Option<(DtbDeviceClass, &'a [u8])> {
     let compatible = node.raw_property("compatible").ok().flatten()?;
     for name in compatible
         .value
         .split(|&byte| byte == 0)
         .filter(|entry| !entry.is_empty())
     {
-        let kind = match name {
-            b"virtio,mmio" => Some(DeviceKind::VirtioMmio),
-            b"ns16550a" | b"snps,dw-apb-uart" | b"sifive,uart0" => Some(DeviceKind::Uart),
-            b"riscv,plic0" | b"sifive,plic-1.0.0" => Some(DeviceKind::IntController),
-            b"pci-host-ecam-generic" => Some(DeviceKind::PciEcam),
-            // Vendor 5.15 dtb (v1.3b) says jh7110-sdio; mainline says
-            // jh7110-mmc. Same DesignWare MSHC either way.
-            b"starfive,jh7110-sdio" | b"starfive,jh7110-mmc" | b"snps,dw-mshc" => {
-                Some(DeviceKind::SdController)
-            }
-            _ => None,
-        };
-        if kind.is_some() {
-            return kind;
+        if let Some(class) = classify_compatible(name) {
+            return Some((class, compatible.value));
         }
     }
     None
+}
+
+fn classify_compatible(name: &[u8]) -> Option<DtbDeviceClass> {
+    match name {
+        b"virtio,mmio" => Some(DtbDeviceClass::PlatformDevice(DeviceKind::VirtioMmio)),
+        b"ns16550a" | b"snps,dw-apb-uart" | b"sifive,uart0" => {
+            Some(DtbDeviceClass::PlatformMmio(Some(DeviceKind::Uart)))
+        }
+        b"riscv,plic0" | b"sifive,plic-1.0.0" => Some(DtbDeviceClass::PlatformMmio(Some(
+            DeviceKind::IntController,
+        ))),
+        b"sifive,clint0" | b"riscv,clint0" => Some(DtbDeviceClass::PlatformMmio(None)),
+        b"google,goldfish-rtc" => Some(DtbDeviceClass::PlatformMmio(Some(DeviceKind::GoldfishRtc))),
+        b"starfive,jh7110-clkgen" => Some(DtbDeviceClass::PlatformMmio(Some(
+            DeviceKind::ClockController,
+        ))),
+        b"starfive,jh7110-ccache" | b"sifive,fu740-c000-ccache" | b"sifive,ccache0" => Some(
+            DtbDeviceClass::PlatformMmio(Some(DeviceKind::CacheController)),
+        ),
+        b"pci-host-ecam-generic" => Some(DtbDeviceClass::PlatformDevice(DeviceKind::PciEcam)),
+        // Vendor 5.15 dtb (v1.3b) says jh7110-sdio; mainline says
+        // jh7110-mmc. Same DesignWare MSHC either way.
+        b"starfive,jh7110-sdio" | b"starfive,jh7110-mmc" | b"snps,dw-mshc" => {
+            Some(DtbDeviceClass::PlatformDevice(DeviceKind::SdController))
+        }
+        b"starfive,dwmac" | b"starfive,jh7110-eqos-5.20" | b"snps,dwmac-5.10a" => {
+            Some(DtbDeviceClass::PlatformDevice(DeviceKind::Dwmac))
+        }
+        _ => None,
+    }
 }
 
 fn first_reg_range(node: &FallibleFdtNode<'_>) -> Option<PhysRange> {
     let reg = node.reg().ok().flatten()?;
     for entry in reg.iter::<u64, u64>() {
         let entry = entry.ok()?;
-        let base = usize::try_from(entry.address).ok()?;
-        let size = usize::try_from(entry.len).ok()?;
-        if size > 0 {
-            return Some(PhysRange {
-                start: PhysAddr(base),
-                size,
-            });
+        if let Some(range) = phys_range_from_reg(entry.address, entry.len) {
+            return Some(range);
         }
     }
     None
+}
+
+fn phys_range_from_reg(address: u64, len: u64) -> Option<PhysRange> {
+    let base = usize::try_from(address).ok()?;
+    let size = usize::try_from(len).ok()?;
+    (size > 0).then_some(PhysRange {
+        start: PhysAddr(base),
+        size,
+    })
 }
 
 fn read_u32_property(node: &FallibleFdtNode<'_>, name: &str) -> Option<u32> {
@@ -531,9 +728,17 @@ mod tests {
         PhysRange, PlatformInfoIf,
     };
 
-    use super::{parse_boot_info_from_fdt, DtbBootInfo};
-    use crate::boot_static::{BootStaticBag, IdentityLive};
+    use super::{DtbBootInfo, DtbDeviceClass, classify_compatible, parse_boot_info_from_fdt};
     use crate::Platform;
+    use crate::boot_static::{BootStaticBag, IdentityLive};
+
+    #[test]
+    fn classifies_visionfive2_vendor_eqos_as_dwmac() {
+        assert_eq!(
+            classify_compatible(b"starfive,jh7110-eqos-5.20"),
+            Some(DtbDeviceClass::PlatformDevice(tx_hal::DeviceKind::Dwmac))
+        );
+    }
 
     #[test]
     fn parses_qemu_memory_chosen_cmdline_and_initrd_from_fdt() {
@@ -688,6 +893,43 @@ mod tests {
     }
 
     #[test]
+    fn plic_topology_filters_firmware_misdescribed_supervisor_harts() {
+        let vf2 = unsafe {
+            fdt::Fdt::from_ptr_unaligned_fallible(JH7110_VF2_DTB.as_ptr())
+                .expect("visionfive2 dtb should parse")
+        };
+        let qemu = unsafe {
+            fdt::Fdt::from_ptr_unaligned_fallible(QEMU_RV64_VIRT_DTB.as_ptr())
+                .expect("qemu virt dtb should parse")
+        };
+
+        // Model the faulty U-Boot control FDT's CPU nodes by supplying all five
+        // harts as candidates. The PLIC topology still identifies only the
+        // four harts that have supervisor external-interrupt contexts.
+        assert_eq!(super::normalize_startable_harts(&vf2, 0b11111), 0b11110);
+        // Every QEMU hart has a supervisor PLIC context, so none are removed.
+        assert_eq!(super::normalize_startable_harts(&qemu, 0b1111), 0b1111);
+    }
+
+    #[test]
+    fn plic_topology_filter_falls_back_when_contexts_are_unavailable() {
+        let no_contexts = [None; super::MAX_PLIC_HARTS];
+        assert_eq!(
+            super::filter_harts_by_plic_scontexts(0b1010, &no_contexts, 0),
+            0b1010,
+        );
+
+        let mut contexts = no_contexts;
+        contexts[0] = Some(1);
+        contexts[1] = Some(3);
+        assert_eq!(
+            super::filter_harts_by_plic_scontexts(0b0001, &contexts, 2),
+            0b0001,
+            "PLIC evidence must not add a CPU rejected by its CPU node",
+        );
+    }
+
+    #[test]
     fn discovers_devices_from_real_qemu_virt_dtb() {
         let mut devices = [tx_hal::DeviceInfo {
             kind: tx_hal::DeviceKind::Uart,
@@ -702,7 +944,8 @@ mod tests {
 
         let count = unsafe {
             super::parse_devices_from_fdt(QEMU_RV64_VIRT_DTB.as_ptr() as usize, &mut devices)
-        };
+        }
+        .expect("QEMU fixture device projection should fit");
         let devices = &devices[..count];
 
         let uarts: Vec<_> = devices
@@ -720,6 +963,25 @@ mod tests {
             .collect();
         assert_eq!(plics.len(), 1);
         assert_eq!(plics[0].mmio.start, PhysAddr(0x0c00_0000));
+        assert_eq!(
+            devices
+                .iter()
+                .filter(|d| d.kind == tx_hal::DeviceKind::CacheController)
+                .count(),
+            0,
+            "QEMU coherent DMA must not gain a synthetic cache controller",
+        );
+
+        let rtc = devices
+            .iter()
+            .find(|d| d.kind == tx_hal::DeviceKind::GoldfishRtc)
+            .expect("qemu goldfish rtc discovered");
+        assert_eq!(rtc.mmio.start, PhysAddr(0x0010_1000));
+        assert_eq!(rtc.mmio.size, 0x1000);
+        assert_eq!(rtc.irq, Some(11));
+        assert!(crate::goldfish_rtc_available_from_devices(devices));
+        assert_eq!(crate::uart_irq_from_devices(devices), 10);
+        assert_eq!(crate::goldfish_rtc_irq_from_devices(devices), 11);
 
         let virtio_count = devices
             .iter()
@@ -733,6 +995,27 @@ mod tests {
                 .filter(|d| d.kind == tx_hal::DeviceKind::PciEcam)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn device_projection_capacity_exhaustion_is_not_truncated() {
+        let mut devices = [tx_hal::DeviceInfo {
+            kind: tx_hal::DeviceKind::Uart,
+            mmio: PhysRange::empty(),
+            irq: None,
+            reg_shift: 0,
+            reg_io_width: 1,
+        }; 1];
+
+        assert_eq!(
+            unsafe {
+                super::parse_devices_from_fdt(QEMU_RV64_VIRT_DTB.as_ptr() as usize, &mut devices)
+            },
+            Err(super::DtbDeviceError::LegacyDeviceCapacityExceeded {
+                capacity: 1,
+                required: 2,
+            })
         );
     }
 
@@ -751,7 +1034,8 @@ mod tests {
 
         let count = unsafe {
             super::parse_devices_from_fdt(JH7110_VF2_DTB.as_ptr() as usize, &mut devices)
-        };
+        }
+        .expect("VF2 fixture device projection should fit");
         let devices = &devices[..count];
 
         // dw-apb UART with 32-bit regs at stride 4 — the exact quirk the
@@ -760,6 +1044,14 @@ mod tests {
             .iter()
             .find(|d| d.kind == tx_hal::DeviceKind::Uart && d.mmio.start == PhysAddr(0x1000_0000))
             .expect("vf2 uart0 discovered");
+        assert_eq!(
+            devices
+                .iter()
+                .filter(|d| d.kind == tx_hal::DeviceKind::Uart)
+                .count(),
+            1,
+            "disabled VF2 UART nodes must not become runtime devices",
+        );
         assert_eq!(uart0.irq, Some(32));
         assert_eq!(uart0.reg_shift, 2);
         assert_eq!(uart0.reg_io_width, 4);
@@ -771,15 +1063,23 @@ mod tests {
             .expect("vf2 plic discovered");
         assert_eq!(plic.mmio.start, PhysAddr(0x0c00_0000));
 
+        let cache = devices
+            .iter()
+            .find(|d| d.kind == tx_hal::DeviceKind::CacheController)
+            .expect("vf2 cache controller discovered");
+        assert_eq!(cache.mmio.start, PhysAddr(0x0201_0000));
+        assert_eq!(cache.mmio.size, 0x4000);
+
         // Two DesignWare MMC hosts; SD card slot is mmc@16020000, IRQ 75.
         let sd: Vec<_> = devices
             .iter()
             .filter(|d| d.kind == tx_hal::DeviceKind::SdController)
             .collect();
         assert_eq!(sd.len(), 2);
-        assert!(sd
-            .iter()
-            .any(|d| d.mmio.start == PhysAddr(0x1602_0000) && d.irq == Some(75)));
+        assert!(
+            sd.iter()
+                .any(|d| d.mmio.start == PhysAddr(0x1602_0000) && d.irq == Some(75))
+        );
 
         // No virtio anywhere on real hardware.
         assert_eq!(
@@ -789,6 +1089,17 @@ mod tests {
                 .count(),
             0
         );
+        assert_eq!(
+            devices
+                .iter()
+                .filter(|d| d.kind == tx_hal::DeviceKind::GoldfishRtc)
+                .count(),
+            0,
+            "JH7110 RTC must not be routed through the Goldfish backend",
+        );
+        assert!(!crate::goldfish_rtc_available_from_devices(devices));
+        assert_eq!(crate::uart_irq_from_devices(devices), 32);
+        assert_eq!(crate::goldfish_rtc_irq_from_devices(devices), 0);
     }
 
     #[test]

@@ -28,9 +28,14 @@
 set -u
 ARCH="${1:-rv64}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROXY="${TX_PROXY-http://10.0.2.2:7897}"
+PROXY="${TX_PROXY-}"
 TOKEN="${TX_GH_TOKEN-}"
 WORK="$(mktemp -d /tmp/txshell-XXXXXX)"
+
+if [[ "$PROXY" =~ [[:space:]] ]]; then
+  echo "TX_PROXY must not contain whitespace" >&2
+  exit 2
+fi
 
 case "$ARCH" in
   rv64)
@@ -49,13 +54,20 @@ esac
 {
   cat <<G
 export PATH=/musl/usr/bin:/musl/bin:/musl/usr/sbin:/musl/sbin:/usr/bin:/bin
-export HOME=/musl/root GIT_EXEC_PATH=/musl/usr/libexec/git-core GIT_TEMPLATE_DIR= GIT_SSL_NO_VERIFY=true
+export HOME=/musl/root GIT_EXEC_PATH=/musl/usr/libexec/git-core GIT_TEMPLATE_DIR=
 export HTTPS_PROXY=$PROXY HTTP_PROXY=$PROXY ALL_PROXY=$PROXY
 export GIT_AUTHOR_NAME=txkernel GIT_AUTHOR_EMAIL=tx@txkernel.local
 export GIT_COMMITTER_NAME=txkernel GIT_COMMITTER_EMAIL=tx@txkernel.local
 export GIT_TERMINAL_PROMPT=0
 /bin/busybox mkdir -p /etc /musl/root
-echo "nameserver 10.0.2.3" > /etc/resolv.conf
+iface=""
+for net_path in /sys/class/net/*; do
+  candidate="${net_path##*/}"
+  if [ "$candidate" != lo ]; then iface="$candidate"; break; fi
+done
+if [ -n "$iface" ]; then
+  /bin/busybox udhcpc -i "$iface" -q -n || /bin/busybox echo "warning: DHCP failed on $iface"
+fi
 G
   if [ -n "$TOKEN" ]; then
     cat <<G
@@ -68,8 +80,7 @@ G
 cd /musl/root
 /bin/busybox echo ""
 /bin/busybox echo "=== txKernel interactive shell — git ready (auth auto). Try:"
-/bin/busybox echo "===   git clone https://github.com/LLLPPPS/tx-push-test.git"
-/bin/busybox echo "===   git clone https://github.com/oscomp/xv6-riscv.git   (read-only)"
+/bin/busybox echo "===   git clone <repository-url>"
 /bin/busybox echo "=== quit: exit  (or Ctrl-A X)"
 exec /bin/busybox sh -i
 G
@@ -86,13 +97,13 @@ if [ "$ARCH" = rv64 ]; then
     -global virtio-mmio.force-legacy=false \
     -drive "file=$WORK/disk.img,if=none,format=raw,id=x0,file.locking=off" \
     -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
-    -device virtio-net-device,netdev=net,bus=virtio-mmio-bus.1 -netdev user,id=net \
+    -device virtio-net-device,netdev=net -netdev user,id=net \
     -no-reboot -rtc base=utc -append "tx.runsh=/musl/tx-run.sh console=ttyS0"
 else
   exec qemu-system-loongarch64 -machine virt -cpu la464 -kernel "$K" -m 1152M -nographic -smp 1 \
     -drive "file=$WORK/disk.img,if=none,format=raw,id=x0,file.locking=off" \
     -device virtio-blk-pci-non-transitional,drive=x0,addr=1 \
-    -device virtio-net-pci,netdev=net,addr=2 -netdev user,id=net \
+    -device virtio-net-pci,netdev=net -netdev user,id=net \
     -rtc base=utc \
     -fw_cfg "name=opt/tx.cmdline,string=tx.runsh=/musl/tx-run.sh console=ttyS0" \
     -append "tx.runsh=/musl/tx-run.sh console=ttyS0"

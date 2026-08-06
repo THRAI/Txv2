@@ -6,16 +6,20 @@ extern crate std;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
-    CpuPinGuard, DeadlineTimerIf, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf,
-    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink,
-    LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, MonotonicCounterIf,
-    ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr, PhysRange,
-    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
-    PmapPermissions, PmapReservation, PmapReservationIntermediates, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator, SavedSignalFrame, SecondaryEntry,
-    SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf, TrapAction, TrapClass, TrapFrameMut,
-    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext,
-    UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
+    CpuPinGuard, DeadlineTimerIf, DeviceId, DeviceLocalId, DeviceMatchId, DeviceResource,
+    DeviceResourceGraph, DeviceStatus, DmaCoherency, DmaConstraints, DmaDomain, DmaDomainId,
+    DmaDomainRef, DmaIf, DmaTranslation, EntropyIf, FaultInfo, FpSimdIf, InitIf,
+    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, IrqPolarity, IrqResource,
+    IrqSharing, IrqTrigger, KernelTrapSink, LocalExecutionGuard, MemoryRegion, MemoryRegionKind,
+    MmioFlags, MmioRegion, MmioResource, MonotonicCounterIf, ObserverIf, PciFunctionId, PercpuIf,
+    PersistentClockError, PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
+    PtNodeAllocator, ResourceOrigin, ResourceOriginKind, ResourceProviderId, ResourceRole,
+    SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf,
+    TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView,
+    TrapIf, TrapPreviousMode, UserFpContext, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
+    VirtRange,
 };
 
 pub use boot_args::capture_loongarch64_qemu_boot_args;
@@ -109,15 +113,9 @@ const QEMU_LA64_PCH_PIC_IRQS: u32 = 64;
 const QEMU_LA64_UART0_IRQ: u32 = 66;
 const QEMU_LA64_RTC_IRQ: u32 = QEMU_LA64_GSI_BASE + 6;
 // QEMU's LoongArch `virt` GPEX host routes PCI INTx outputs to PCH-PIC
-// inputs 16..19. The board profile pins virtio-net-pci at slot 2 and the
-// device uses INTA (pin index 0), so the standard PCI swizzle selects input
-// 16 + ((0 + 2) % 4) = 18. Public PCH-PIC IRQs carry the GSI base.
+// inputs 16..19. `IrqIf::pci_intx_irq` swizzles the actual enumerated
+// function and pin; no network-device slot is fixed here.
 const QEMU_LA64_PCI_INTX_BASE: u32 = 16;
-const QEMU_LA64_VIRTIO_NET_PCI_SLOT: u32 = 2;
-const QEMU_LA64_VIRTIO_NET_PCI_PIN: u32 = 0;
-const QEMU_LA64_NET_IRQ: u32 = QEMU_LA64_GSI_BASE
-    + QEMU_LA64_PCI_INTX_BASE
-    + ((QEMU_LA64_VIRTIO_NET_PCI_PIN + QEMU_LA64_VIRTIO_NET_PCI_SLOT) % 4);
 const QEMU_LA64_PCIE_ECAM_BASE: usize = 0x2000_0000;
 const QEMU_LA64_PCIE_ECAM_SIZE: usize = 0x0800_0000;
 const QEMU_LA64_PCIE_MMIO32_BASE: usize = 0x4000_0000;
@@ -991,6 +989,87 @@ static MMIO_REGIONS: &[MmioRegion] = &[
             .union(MmioFlags::WRITE),
     },
 ];
+
+const LA64_PCI_HOST_PROVIDER: ResourceProviderId = ResourceProviderId("la64-pci-host");
+const LA64_PCI_HOST_ORIGIN: ResourceOrigin = ResourceOrigin {
+    provider: LA64_PCI_HOST_PROVIDER,
+    record: "pci-host0",
+    kind: ResourceOriginKind::PlatformStatic,
+};
+const LA64_PCI_DMA_DOMAIN_ID: DmaDomainId = DmaDomainId {
+    provider: LA64_PCI_HOST_PROVIDER,
+    local: 0,
+};
+static LA64_PCI_DMA_DOMAINS: [DmaDomain; 1] = [DmaDomain {
+    id: LA64_PCI_DMA_DOMAIN_ID,
+    translation: DmaTranslation::Direct { offset: 0 },
+    constraints: DmaConstraints {
+        dma_address_bits: <Platform as PlatformConfig>::PHYS_ADDR_BITS,
+        min_alignment: 1,
+        segment_boundary: None,
+        max_segment_len: usize::MAX,
+        max_segments: u16::MAX,
+    },
+    coherency: if <Platform as PlatformConfig>::DMA_COHERENT {
+        DmaCoherency::Coherent
+    } else {
+        DmaCoherency::NonCoherent
+    },
+    origin: LA64_PCI_HOST_ORIGIN,
+}];
+static LA64_PCI_HOST_MATCHES: [DeviceMatchId; 1] =
+    [DeviceMatchId::FirmwareCompatible("pci-host-ecam-generic")];
+static LA64_PCI_HOST_RESOURCES: [DeviceResource; 3] = [
+    DeviceResource::Mmio(MmioResource {
+        role: ResourceRole::Named("ecam"),
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_PCIE_ECAM_BASE),
+            size: QEMU_LA64_PCIE_ECAM_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_ECAM_BASE)),
+            size: QEMU_LA64_PCIE_ECAM_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+        origin: LA64_PCI_HOST_ORIGIN,
+    }),
+    DeviceResource::Mmio(MmioResource {
+        role: ResourceRole::Named("mmio32"),
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_PCIE_MMIO32_BASE),
+            size: QEMU_LA64_PCIE_MMIO32_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_MMIO32_BASE)),
+            size: QEMU_LA64_PCIE_MMIO32_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+        origin: LA64_PCI_HOST_ORIGIN,
+    }),
+    DeviceResource::DmaDomain(DmaDomainRef {
+        role: ResourceRole::Index(0),
+        domain: LA64_PCI_DMA_DOMAIN_ID,
+    }),
+];
+static LA64_PCI_HOST_DEVICES: [tx_hal::PlatformDevice; 1] = [tx_hal::PlatformDevice {
+    id: DeviceId {
+        provider: LA64_PCI_HOST_PROVIDER,
+        local: DeviceLocalId::PlatformKey("pci-host0"),
+    },
+    status: DeviceStatus::Enabled,
+    matches: &LA64_PCI_HOST_MATCHES,
+    resources: &LA64_PCI_HOST_RESOURCES,
+    origin: LA64_PCI_HOST_ORIGIN,
+}];
+static LA64_DEVICE_RESOURCE_GRAPH: DeviceResourceGraph = DeviceResourceGraph {
+    platform_mmio: &[],
+    devices: &LA64_PCI_HOST_DEVICES,
+    dma_domains: &LA64_PCI_DMA_DOMAINS,
+};
 
 fn ls7a_toy_registers_from_unix_ns(ns: u64) -> Result<(u32, u32), PersistentClockError> {
     let seconds = ns / NANOS_PER_SEC;

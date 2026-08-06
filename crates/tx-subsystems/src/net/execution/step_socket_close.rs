@@ -168,9 +168,10 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_unix_stream_peer(socket.raw()));
         }
         SocketProtocol::UnixStream(UnixStreamState::Init | UnixStreamState::Closed) => {}
-        SocketProtocol::NetlinkRoute(_)
-        | SocketProtocol::NetlinkNetfilter(_)
-        | SocketProtocol::Packet(_) => {}
+        SocketProtocol::Packet(_) => {
+            bindings_withdrawn += withdraw_ok(table.withdraw_packet_socket(socket.raw()));
+        }
+        SocketProtocol::NetlinkRoute(_) | SocketProtocol::NetlinkNetfilter(_) => {}
     }
 
     if deferred_tcp_close {

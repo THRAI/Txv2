@@ -96,6 +96,18 @@ impl<P: TxPlatform> CoreInit<P> {
         };
         shims_ok &= symlink_into(fs_ops, usr_bin_id, b"env", b"/musl/musl/busybox", &cred);
 
+        // `tx.runsh` overlays an Alpine image's top-level directories onto
+        // this tmpfs skeleton.  Keep `/sbin` available as a mountpoint just
+        // like `/bin`, `/usr`, and `/lib`: standard administration tools such
+        // as `ip` and `udhcpc` live there, and their scripts use absolute
+        // `/sbin/...` paths.  Creating the empty directory is harmless for
+        // non-runsh boots; the image overlay remains explicitly runsh-gated.
+        if mkdir_or_find(fs_ops, root_fs_object_id, b"sbin", 0o755, &cred).is_none() {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-sbin\n");
+            return;
+        }
+
         // The official OSComp binaries keep Linux-compatible PT_INTERP
         // names, while the actual loaders live inside the sdcard trees.
         // Create only the current architecture's namespace compatibility;

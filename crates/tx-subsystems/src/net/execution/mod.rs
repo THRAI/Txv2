@@ -12,6 +12,7 @@ mod step_flush_pending_arp;
 mod step_icmp_loopback;
 mod step_listen;
 mod step_loopback_pending;
+mod step_packet_io;
 mod step_poll;
 mod step_process_network_events;
 mod step_recv;
@@ -48,6 +49,7 @@ pub use step_loopback_pending::{
     step_process_loopback_pending_zero, LoopbackPendingOutcome, LoopbackPollBudget,
     LOOPBACK_POLL_BUDGET_DEFAULT,
 };
+pub use step_packet_io::{step_packet_ingress_fanout, step_packet_send, PacketIngressOutcome};
 pub use step_poll::{step_poll_ready, step_poll_wait_token};
 pub use step_process_network_events::{
     step_process_network_events, step_process_network_events_at,

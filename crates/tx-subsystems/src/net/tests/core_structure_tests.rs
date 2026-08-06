@@ -122,6 +122,7 @@ fn socket_type_validation_maps_to_kind() {
     let dgram_udplite = ValidSocketType::validate(2, 2, 136).expect("udplite socket");
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let raw_icmp = ValidSocketType::validate(2, 3, 1).expect("raw icmp socket");
+    let raw_ipv4 = ValidSocketType::validate(2, 3, 255).expect("raw ipv4 control socket");
     let xfrm = ValidSocketType::validate(16, 3, 6).expect("netlink xfrm socket");
     let nft = ValidSocketType::validate(16, 3, 12).expect("netlink netfilter socket");
     let packet = ValidSocketType::validate(17, 3, 0x0300).expect("packet socket");
@@ -162,6 +163,10 @@ fn socket_type_validation_maps_to_kind() {
     assert_eq!(raw_icmp.sock_type, SocketType::Raw);
     assert_eq!(
         SocketKind::from_valid_socket_type(raw_icmp),
+        Ok(SocketKind::RawIcmp)
+    );
+    assert_eq!(
+        SocketKind::from_valid_socket_type(raw_ipv4),
         Ok(SocketKind::RawIcmp)
     );
     assert_eq!(
@@ -228,6 +233,37 @@ fn raw_icmp_socket_identity_payload_split() {
     );
     assert!(SOCKET_TABLE
         .snapshot_raw_icmp(&guard)
+        .iter()
+        .any(|candidate| candidate.raw() == socket.raw()));
+}
+
+#[test]
+fn packet_socket_registers_and_close_withdraws_from_namespace_table() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let valid =
+        ValidSocketType::validate(17, 2, i32::from(u16::to_be(0x0800))).expect("packet dgram");
+    let socket = match step_socket_create(valid, &guard) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("unexpected packet create outcome: {other:?}"),
+    };
+
+    assert_eq!(socket.kind, SocketKind::Packet);
+    assert!(SOCKET_TABLE
+        .snapshot_packet_sockets(&guard)
+        .iter()
+        .any(|candidate| candidate.raw() == socket.raw()));
+
+    let close = match step_socket_close(&socket, &guard) {
+        StepOutcome::Done(close) => close,
+        other => panic!("unexpected packet close outcome: {other:?}"),
+    };
+    assert_eq!(close.bindings_withdrawn, 1);
+    assert!(!SOCKET_TABLE
+        .snapshot_packet_sockets(&guard)
         .iter()
         .any(|candidate| candidate.raw() == socket.raw()));
 }

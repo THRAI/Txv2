@@ -102,7 +102,14 @@ How work runs: the step primitive and the runtime that drives it.
 
 <!-- txdoc:INDEX-DEVICES-1 -->
 
-- [`DEVICE.md`](06_devices/DEVICE.md) — three-tier device subsystem; tier 1 in HAL, tier 2 statically composed, tier 3 deferred; four routes to userspace via VFS.
+- [`DEVICE.md`](06_devices/DEVICE.md) — three-tier device subsystem; tier 1 in
+  HAL, tier 2 uses link-time provider/driver selection plus one-shot boot
+  binding and static lifetime, tier 3 runtime lifecycle deferred; four routes
+  to userspace via VFS.
+- [`NET_DEVICE_v1.md`](06_devices/NET_DEVICE_v1.md) — immutable platform/final
+  resource graphs, static driver binder, per-device IRQ/DMA, network
+  registration/projection, authoritative boot configuration, and the deferred
+  LA real-board hook.
 - [`TTY.md`](06_devices/TTY.md) — terminal subsystem; hardware TTY, ptys, line discipline, job control, devpts; `TtyIdentity` / `TtyPayload` / `TtyTransport`.
 
 ---
@@ -115,6 +122,9 @@ How work runs: the step primitive and the runtime that drives it.
 
 **For VM work.** 00 01_CONCEPTS_v5, 02_INVARIANTS_v5, object_model_v2, SUBSYSTEM_ANATOMY_v2_1 → 01 PAGE_SUBSTRATE → 03 PAGE_BACKED → 03 VM.
 
-**For filesystem / driver work.** 00 (all) → 01 HAL → 01 BUS → 03 PAGE_BACKED → 05 MOUNT → 05 VFS_CHECKS → 05 IO_MANAGER → 05 BDEV_FS → 05 bringup_fs_specs → 05 TX_EXT4_PLAN; for block drivers add 06 DEVICE; for char devices add 06 DEVICE → 06 TTY.
+**For filesystem / driver work.** 00 (all) → 01 HAL → 01 PAGE_SUBSTRATE → 01
+BUS → 03 PAGE_BACKED → 05 MOUNT → 05 VFS_CHECKS → 05 IO_MANAGER → 05 BDEV_FS →
+05 bringup_fs_specs → 05 TX_EXT4_PLAN; for block/char drivers add 06 DEVICE; for
+network drivers add 06 DEVICE → 06 NET_DEVICE; for TTY add 06 DEVICE → 06 TTY.
 
 **For process / signal work.** 00 (all) → 02 03_STEP_MODEL_v2 → 02 THREAD_RUNTIME → 02 cred_service / rlimit_service → 04 PROCESS → 04 SIGNAL → 04 SIGNAL_ATTACHMENTS → 02 EXEC.

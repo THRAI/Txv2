@@ -71,7 +71,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
             return TrapAction::Resume;
         }
 
-        let handled = P::dispatch_irq(irq);
+        let handled = crate::irq::dispatch_external_irq::<P>(irq);
         // Most handlers finish their controller transaction in the trap.
         // A deferred handler keeps the claim outstanding so a task-context
         // bottom half can clear a level-triggered device source first. That

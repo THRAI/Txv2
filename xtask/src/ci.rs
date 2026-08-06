@@ -134,6 +134,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
         ),
         ci_run(
             root,
+            "network portability lint",
+            "cargo",
+            &["xtask", "lint", "net-portability"],
+            "txdoc:CI-GATE-NET-PORTABILITY",
+        ),
+        ci_run(
+            root,
             "kernel-user musl layouts",
             "cargo",
             &["xtask", "lint", "kernel-user-layouts"],

@@ -66,6 +66,7 @@ static PLATFORM_INFO2: PlatformInfo = PlatformInfo {
     board: "tx-substrate-obs4-conv-test",
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 1_000_000_000,
     possible_cpu_count: 1,
 };

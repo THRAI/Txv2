@@ -573,7 +573,24 @@ impl IrqIf for Platform {
     const MAX_IRQ: u32 = QEMU_LA64_GSI_BASE + QEMU_LA64_PCH_PIC_IRQS;
     const UART_IRQ: u32 = QEMU_LA64_UART0_IRQ;
     const RTC_IRQ: u32 = QEMU_LA64_RTC_IRQ;
-    const NET_IRQ: u32 = QEMU_LA64_NET_IRQ;
+
+    fn pci_intx_irq(function: PciFunctionId, pin: u8) -> Option<IrqResource> {
+        if function.segment != 0 || function.bus != 0 || !(1..=4).contains(&pin) {
+            return None;
+        }
+        let pin_index = u32::from(pin - 1);
+        let line = QEMU_LA64_GSI_BASE
+            + QEMU_LA64_PCI_INTX_BASE
+            + ((pin_index + u32::from(function.device)) % 4);
+        Some(IrqResource {
+            role: ResourceRole::Index(0),
+            line,
+            trigger: IrqTrigger::Level,
+            polarity: IrqPolarity::Low,
+            sharing: IrqSharing::Shared,
+            origin: LA64_PCI_HOST_ORIGIN,
+        })
+    }
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0
@@ -840,7 +857,11 @@ impl CacheIf for Platform {
         la64_ibar();
     }
 }
-impl DmaIf for Platform {}
+impl DmaIf for Platform {
+    fn publish_to_device() {
+        la64_dbar();
+    }
+}
 impl SmpIf for Platform {
     fn current_cpu_id() -> CpuId {
         la64_current_cpu_id()

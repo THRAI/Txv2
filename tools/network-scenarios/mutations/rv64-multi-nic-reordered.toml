@@ -1,0 +1,32 @@
+schema = "tx.network-scenario.v1"
+name = "rv64-multi-nic-reordered"
+target = "qemu-rv64"
+
+[device]
+transport = "virtio-mmio"
+selector = { kind = "firmware-path", value = "/soc/virtio_mmio@10001000" }
+placement = { kind = "virtio-mmio", bus = "virtio-mmio-bus.7" }
+
+[[auxiliary]]
+id = "old-location-decoy"
+kind = "virtio-rng-mmio"
+order = "before-network"
+placement = { kind = "virtio-mmio", bus = "virtio-mmio-bus.1" }
+
+[[auxiliary]]
+id = "secondary-network-device"
+kind = "virtio-net-mmio"
+order = "after-network"
+placement = { kind = "virtio-mmio", bus = "virtio-mmio-bus.5" }
+backend = { kind = "qemu-user", id = "secondary-network", network = "172.30.55.0/24", dhcp_start = "172.30.55.77", gateway = "172.30.55.9", dns = "172.30.55.10" }
+
+[backend]
+kind = "qemu-user"
+id = "primary-network"
+network = "172.31.44.0/24"
+dhcp_start = "172.31.44.77"
+gateway = "172.31.44.9"
+dns = "172.31.44.10"
+
+[guest]
+kind = "dhcp"

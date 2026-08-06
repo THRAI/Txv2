@@ -12,6 +12,7 @@ use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
     self as step_engine, init, init_on_ap, spin_mutex, ByteProgress, Cap, SpinMutex, StepOutcome,
 };
+use crate::devices::binder::{publish_static_devices, EmptyDeviceBundle, StaticDeviceBundle};
 use crate::init::boot_plan::{BootPlan, RootfsSetup};
 use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
@@ -678,8 +679,8 @@ impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
 /// smoke task, the board boot sentinel, and shutdown. VFS, device, scheduler,
 /// process, and userspace init are intentionally deferred until their
 /// substrate contracts exist.
-pub struct CoreInit<P: TxPlatform> {
-    _platform: PhantomData<P>,
+pub struct CoreInit<P: TxPlatform, D: StaticDeviceBundle<P> = EmptyDeviceBundle> {
+    _composition: PhantomData<fn() -> (P, D)>,
 }
 
 mod boot_args;
@@ -688,6 +689,53 @@ mod exec;
 mod helpers;
 mod net;
 mod reactor_submit;
+
+impl<P, D> CoreInit<P, D>
+where
+    P: TxPlatform + 'static,
+    D: StaticDeviceBundle<P>,
+{
+    /// Instantiate the compile-time platform/device composition witness.
+    pub const fn new() -> Self {
+        Self {
+            _composition: PhantomData,
+        }
+    }
+
+    /// Enter the legacy-compatible boot flow with a monomorphized binder hook
+    /// for the board-selected device bundle.
+    ///
+    /// Only the two orchestration methods carry the function item; the many
+    /// `CoreInit<P>` helper modules remain platform-generic and need not grow a
+    /// second type parameter.
+    pub fn boot(handoff: BootHandoff) -> ! {
+        let _composition = Self::new();
+        CoreInit::<P, EmptyDeviceBundle>::boot_legacy(handoff, Self::bind_device_bundle)
+    }
+
+    fn bind_device_bundle() {
+        let outcome = publish_static_devices::<P, D>()
+            .expect("compile-time device bundle binding transaction failed");
+        CoreInit::<P>::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":devices:bind:graph=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.graph.devices.len());
+        tx_hal::console_write_str::<P>(":bound=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.report.bound.len());
+        tx_hal::console_write_str::<P>(":unsupported=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.report.unsupported.len());
+        tx_hal::console_write_str::<P>(":failed=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.report.failed.len());
+        tx_hal::console_write_str::<P>("\n");
+        for failure in outcome.report.failed {
+            CoreInit::<P>::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":devices:bind:failed:");
+            tx_hal::console_write_str::<P>(
+                failure.driver.map(|driver| driver.0).unwrap_or("no-driver"),
+            );
+            tx_hal::console_write_str::<P>("\n");
+        }
+    }
+}
 
 impl<P: TxPlatform> CoreInit<P> {
     fn monotonic_now_ns() -> u64 {
@@ -698,9 +746,9 @@ impl<P: TxPlatform> CoreInit<P> {
         HalDeadlineTimer::<P>::new()
     }
 
-    pub fn boot(handoff: BootHandoff) -> ! {
+    fn boot_legacy(handoff: BootHandoff, bind_device_bundle: fn()) -> ! {
         Self::init_early(handoff);
-        Self::init_substrate_if_ready(handoff);
+        Self::init_substrate_if_ready(handoff, bind_device_bundle);
         // Unpack boot media and drive `exec_script` synchronously so
         // the init leader's `saved_user_context` is seeded with the
         // selected userspace image's entry-point + initial stack
@@ -749,7 +797,7 @@ impl<P: TxPlatform> CoreInit<P> {
         P::init_early(handoff);
     }
 
-    fn init_substrate_if_ready(handoff: BootHandoff) {
+    fn init_substrate_if_ready(handoff: BootHandoff, bind_device_bundle: fn()) {
         if P::SUBSTRATE_BOOT_READY {
             // PROBE(proxy-push segv hunt): the vmwatch page-lifecycle probes
             // in tx-subsystems::vm are compiled in but quiet by default.
@@ -809,6 +857,10 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::register_console_hardware();
             Self::install_irq_handlers();
             Self::init_rtc_device();
+            // Execute the board-selected static providers and drivers at the
+            // device-init seam. The separate legacy block path remains until
+            // block transports migrate to the typed resource graph.
+            bind_device_bundle();
             Self::init_block_devices();
             Self::init_net_devices();
             Self::mount_rootfs_from_boot_media();
@@ -1041,7 +1093,7 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Delegates to `crate::irq::install_irq_handlers::<P>` which
     /// registers the UART RX handler under
-    /// `<P as IrqIf>::UART_IRQ`, publishes
+    /// `<P as IrqIf>::uart_irq()`, publishes
     /// `IRQ_DISPATCH_TABLE` to the platform via
     /// `<P as IrqIf>::install_dispatch_table`, then unmasks. The
     /// UART RX handler reads the boot console TTY from `CONSOLE_TTY`,
@@ -1063,12 +1115,14 @@ impl<P: TxPlatform> CoreInit<P> {
     /// registry. LA64 QEMU currently wires a static VirtIO-PCI disk here; other
     /// boards may legitimately publish no block devices.
     pub(crate) fn init_block_devices() {
-        let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
-            crate::devices::KernelBlockDevices::<P>::new(),
-        ));
-        match devices.init_and_register() {
-            StepOutcome::Done(()) => {}
-            other => panic!("init_block_devices: registration failed: {other:?}"),
+        if tx_subsystems::device::block_device_snapshot().is_empty() {
+            let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                crate::devices::KernelBlockDevices::<P>::new(),
+            ));
+            match devices.init_and_register() {
+                StepOutcome::Done(()) => {}
+                other => panic!("init_block_devices: registration failed: {other:?}"),
+            }
         }
 
         Self::write_board_sentinel_prefix();
@@ -1107,22 +1161,12 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
-    /// Initialize tier-2 net devices before boot net runtime selection.
-    /// Boards without a present virtio-net device legitimately publish
-    /// no net devices; `submit_net_runtime_tasks` will keep using the
-    /// staging registration in that case.
+    /// Report the immutable network registry published by the static binder.
+    /// Zero devices is valid and leaves only loopback in the initial namespace.
     pub(crate) fn init_net_devices() {
-        let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
-            crate::devices::KernelNetDevices::<P>::new(),
-        ));
-        match devices.init_and_register() {
-            StepOutcome::Done(()) => {}
-            other => panic!("init_net_devices: registration failed: {other:?}"),
-        }
-
         Self::write_board_sentinel_prefix();
-        if tx_subsystems::net::net_device_by_name(b"eth0").is_some() {
-            tx_hal::console_write_str::<P>(":devices:net:eth0:ok\n");
+        if !tx_subsystems::net::net_device_snapshot().is_empty() {
+            tx_hal::console_write_str::<P>(":devices:net:bound:ok\n");
             Self::write_board_sentinel_prefix();
         }
         tx_hal::console_write_str::<P>(":devices:net:ok\n");

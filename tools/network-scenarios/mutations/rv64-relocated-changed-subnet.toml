@@ -1,0 +1,43 @@
+schema = "tx.network-scenario.v1"
+name = "rv64-relocated-changed-subnet"
+target = "qemu-rv64"
+
+[device]
+transport = "virtio-mmio"
+
+[device.selector]
+kind = "device-id"
+value = "boot-nic"
+
+[device.placement]
+kind = "virtio-mmio"
+bus = "virtio-mmio-bus.7"
+
+[[auxiliary]]
+id = "old-location-decoy"
+kind = "virtio-rng-mmio"
+order = "before-network"
+
+[auxiliary.placement]
+kind = "virtio-mmio"
+bus = "virtio-mmio-bus.1"
+
+[[auxiliary]]
+id = "post-network-rng"
+kind = "virtio-rng-mmio"
+order = "after-network"
+
+[auxiliary.placement]
+kind = "virtio-mmio"
+bus = "virtio-mmio-bus.6"
+
+[backend]
+kind = "qemu-user"
+id = "mutation-net"
+network = "172.31.44.0/24"
+dhcp_start = "172.31.44.77"
+gateway = "172.31.44.9"
+dns = "172.31.44.10"
+
+[guest]
+kind = "dhcp"

@@ -1,8 +1,8 @@
 //! IRQ dispatch plus deferred UART and virtio-net bottom halves.
 //!
 //! tx-kernel owns one global `IrqDispatchTable`. Boot-time
-//! `install_irq_handlers::<P>()` populates the platform-declared UART, RTC,
-//! and network slots, then publishes the table to the platform via
+//! `install_irq_handlers::<P>()` populates the platform-declared UART and RTC
+//! slots, then publishes the table to the platform via
 //! `<P as IrqIf>::install_dispatch_table`.
 //!
 //! Per Open Q #4 (`docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
@@ -10,9 +10,8 @@
 //! subset, boot ordering is preserved, and IRQ dispatch stays out of
 //! linker-section magic.
 //!
-//! Per Open Q #6 the UART IRQ number flows through
-//! `<P as IrqIf>::UART_IRQ`; tx-kernel never names a board constant
-//! directly.
+//! Tier-2 device IRQs flow through the boot-frozen typed device table rather
+//! than platform-global accessors. tx-kernel never names a board constant.
 //!
 //! # IRQ-context safety
 //!
@@ -28,8 +27,10 @@
 //! half ACKs the level-triggered device before completing the original claim
 //! on its claimant hart.
 
+pub mod device;
+
 use crate::adapter::step_engine::{spin_mutex, SpinMutex};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use tx_hal::{
     ConsoleIf, CpuId, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, TxPlatform,
     IRQ_DISPATCH_TABLE_SIZE,
@@ -37,6 +38,20 @@ use tx_hal::{
 use tx_services::time::{platform::HalRtcDevice, RtcDeviceOps as TimeRtcDeviceOps};
 use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::device::RtcEventMask;
+use tx_subsystems::device_binding::{BoundDeviceKey, BoundDeviceRegistration, DeviceIrqContext};
+use tx_subsystems::net::NetDeviceRegistration;
+
+/// Dispatch through the boot-frozen typed table first, then retain the legacy
+/// HAL table as a migration fallback for UART, RTC, and not-yet-bound devices.
+pub(crate) fn dispatch_external_irq<P: TxPlatform>(irq: u32) -> IrqHandled {
+    if let Some(runtime) = crate::devices::runtime::device_runtime_snapshot() {
+        let handled = runtime.outcome.irq_table.dispatch_irq(irq);
+        if !matches!(handled, IrqHandled::NotMine) {
+            return handled;
+        }
+    }
+    P::dispatch_irq(irq)
+}
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -84,18 +99,19 @@ const DEFERRED_IRQ_IDLE: u8 = 0;
 const DEFERRED_IRQ_PUBLISHING: u8 = 1;
 const DEFERRED_IRQ_PENDING: u8 = 2;
 const DEFERRED_IRQ_DRAINING: u8 = 3;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct DeferredIrqClaim {
     irq: u32,
     owner: CpuId,
+    bound: BoundDeviceKey,
+    registration: &'static NetDeviceRegistration,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 enum DeferredIrqDrain {
     Idle,
     Owned(DeferredIrqClaim),
-    WrongHart { owner: CpuId },
+    WrongHart,
 }
 
 /// One hart's lock-free deferred controller claim.
@@ -108,6 +124,8 @@ struct DeferredIrqSlot {
     phase: AtomicU8,
     irq: AtomicU32,
     owner: AtomicUsize,
+    bound: AtomicU32,
+    registration: AtomicPtr<NetDeviceRegistration>,
 }
 
 impl DeferredIrqSlot {
@@ -116,6 +134,8 @@ impl DeferredIrqSlot {
             phase: AtomicU8::new(DEFERRED_IRQ_IDLE),
             irq: AtomicU32::new(0),
             owner: AtomicUsize::new(0),
+            bound: AtomicU32::new(0),
+            registration: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -133,6 +153,12 @@ impl DeferredIrqSlot {
         );
         self.irq.store(claim.irq, Ordering::Relaxed);
         self.owner.store(claim.owner.0, Ordering::Relaxed);
+        self.bound
+            .store(u32::from(claim.bound.0), Ordering::Relaxed);
+        self.registration.store(
+            core::ptr::from_ref(claim.registration).cast_mut(),
+            Ordering::Relaxed,
+        );
         self.phase.store(DEFERRED_IRQ_PENDING, Ordering::Release);
     }
 
@@ -142,7 +168,7 @@ impl DeferredIrqSlot {
         }
         let owner = CpuId(self.owner.load(Ordering::Relaxed));
         if owner != current {
-            return DeferredIrqDrain::WrongHart { owner };
+            return DeferredIrqDrain::WrongHart;
         }
         if self
             .phase
@@ -156,15 +182,20 @@ impl DeferredIrqSlot {
         {
             return DeferredIrqDrain::Idle;
         }
+        let registration = self.registration.load(Ordering::Relaxed);
+        assert!(
+            !registration.is_null(),
+            "published deferred IRQ claim has no device registration"
+        );
         DeferredIrqDrain::Owned(DeferredIrqClaim {
             irq: self.irq.load(Ordering::Relaxed),
             owner,
+            bound: BoundDeviceKey(
+                u16::try_from(self.bound.load(Ordering::Relaxed))
+                    .expect("published bound-device key fits u16"),
+            ),
+            registration: unsafe { &*registration },
         })
-    }
-
-    fn retry(&self, claim: DeferredIrqClaim) {
-        self.assert_draining(claim);
-        self.phase.store(DEFERRED_IRQ_PENDING, Ordering::Release);
     }
 
     /// Release software ownership immediately before controller completion.
@@ -177,6 +208,9 @@ impl DeferredIrqSlot {
         self.assert_draining(claim);
         self.irq.store(0, Ordering::Relaxed);
         self.owner.store(0, Ordering::Relaxed);
+        self.bound.store(0, Ordering::Relaxed);
+        self.registration
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
         self.phase.store(DEFERRED_IRQ_IDLE, Ordering::Release);
     }
 
@@ -184,12 +218,20 @@ impl DeferredIrqSlot {
         debug_assert_eq!(self.phase.load(Ordering::Acquire), DEFERRED_IRQ_DRAINING);
         debug_assert_eq!(self.irq.load(Ordering::Relaxed), claim.irq);
         debug_assert_eq!(self.owner.load(Ordering::Relaxed), claim.owner.0);
+        debug_assert_eq!(self.bound.load(Ordering::Relaxed), u32::from(claim.bound.0));
+        debug_assert_eq!(
+            self.registration.load(Ordering::Relaxed).cast_const(),
+            core::ptr::from_ref(claim.registration),
+        );
     }
 
     #[cfg(test)]
     fn reset(&self) {
         self.irq.store(0, Ordering::Relaxed);
         self.owner.store(0, Ordering::Relaxed);
+        self.bound.store(0, Ordering::Relaxed);
+        self.registration
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
         self.phase.store(DEFERRED_IRQ_IDLE, Ordering::Release);
     }
 }
@@ -202,13 +244,14 @@ static NET_RX_DEFERRED_CLAIMS: [DeferredIrqSlot; tx_hal::MAX_HARTS] =
 static NET_IRQ_CLAIMS: AtomicU64 = AtomicU64::new(0);
 static NET_IRQ_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static NET_IRQ_WRONG_HART_DRAINS: AtomicU64 = AtomicU64::new(0);
-static NET_IRQ_MISSING_DEVICE_DRAINS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NetIrqStats {
     pub claims: u64,
     pub completions: u64,
     pub wrong_hart_drains: u64,
+    /// Retained for the observation record layout. Typed top halves resolve
+    /// the registration before publishing a claim, so this remains zero.
     pub missing_device_drains: u64,
 }
 
@@ -217,7 +260,7 @@ pub(crate) fn net_irq_stats() -> NetIrqStats {
         claims: NET_IRQ_CLAIMS.load(Ordering::Acquire),
         completions: NET_IRQ_COMPLETIONS.load(Ordering::Acquire),
         wrong_hart_drains: NET_IRQ_WRONG_HART_DRAINS.load(Ordering::Acquire),
-        missing_device_drains: NET_IRQ_MISSING_DEVICE_DRAINS.load(Ordering::Acquire),
+        missing_device_drains: 0,
     }
 }
 
@@ -268,7 +311,6 @@ pub fn reset_pending_net_irq_for_test() {
     NET_IRQ_CLAIMS.store(0, Ordering::Release);
     NET_IRQ_COMPLETIONS.store(0, Ordering::Release);
     NET_IRQ_WRONG_HART_DRAINS.store(0, Ordering::Release);
-    NET_IRQ_MISSING_DEVICE_DRAINS.store(0, Ordering::Release);
 }
 
 /// Snapshot the handler currently registered for `irq`, if any.
@@ -312,48 +354,66 @@ fn dispatch_table_static() -> &'static IrqDispatchTable {
 /// the platform. One-shot; called from `init.rs` after
 /// `register_console_hardware` has populated the `CONSOLE_TTY` slot.
 pub(crate) fn install_irq_handlers<P: TxPlatform>() {
-    let uart_irq = <P as IrqIf>::UART_IRQ;
-    register_irq_handler(uart_irq, uart_rx_irq_handler::<P>);
-    let rtc_irq = <P as IrqIf>::RTC_IRQ;
+    let uart_irq = <P as IrqIf>::uart_irq();
+    if uart_irq != 0 {
+        register_irq_handler(uart_irq, uart_rx_irq_handler::<P>);
+    }
+    let rtc_irq = <P as IrqIf>::rtc_irq();
     if rtc_irq != 0 {
         tx_fs::devfs::rtc_event_source_id();
         register_irq_handler(rtc_irq, rtc_alarm_irq_handler::<P>);
     }
-    let net_irq = <P as IrqIf>::NET_IRQ;
-    if net_irq != 0 {
-        register_irq_handler(net_irq, net_rx_irq_handler::<P>);
-    }
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
-    <P as IrqIf>::set_priority(uart_irq, 1);
-    <P as IrqIf>::unmask(uart_irq);
+    if uart_irq != 0 {
+        <P as IrqIf>::set_priority(uart_irq, 1);
+        <P as IrqIf>::unmask(uart_irq);
+    }
     if rtc_irq != 0 {
         <P as IrqIf>::set_priority(rtc_irq, 1);
         <P as IrqIf>::unmask(rtc_irq);
     }
-    if net_irq != 0 {
-        <P as IrqIf>::set_priority(net_irq, 1);
-        <P as IrqIf>::unmask(net_irq);
-    }
 }
 
-/// Virtio-net IRQ top half.
-///
-/// The driver ACK path takes locks, so IRQ context only publishes the claimed
-/// IRQ and claimant hart. `DeferredWake` tells the trap dispatcher to leave
-/// controller completion outstanding; the controller gateway then throttles
-/// this source until [`drain_net_rx_irq`] clears the device and completes the
-/// claim from the same hart.
-pub fn net_rx_irq_handler<P: TxPlatform>(irq: u32) -> IrqHandled {
+/// Per-device network top half used by the boot-frozen typed IRQ table.
+/// Device ACK and queue polling remain in task context; the retained bound key
+/// selects the exact registration without a namespace-name lookup.
+pub fn typed_net_rx_irq_handler<P: TxPlatform>(
+    context: &'static DeviceIrqContext,
+    irq: u32,
+) -> IrqHandled {
     assert_eq!(
-        irq,
-        <P as IrqIf>::NET_IRQ,
-        "network handler received the wrong IRQ",
+        irq, context.route.resource.line,
+        "typed network handler received the wrong IRQ",
     );
+    let Some(registration) = crate::devices::runtime::device_runtime_snapshot()
+        .and_then(|runtime| runtime.outcome.bound_devices.get(context.bound))
+        .and_then(|bound| match bound.registration {
+            BoundDeviceRegistration::Net(registration) => Some(registration),
+            BoundDeviceRegistration::Char(_)
+            | BoundDeviceRegistration::Block(_)
+            | BoundDeviceRegistration::Controller => None,
+        })
+    else {
+        return IrqHandled::NotMine;
+    };
+    publish_deferred_net_claim::<P>(irq, context.bound, registration)
+}
+
+fn publish_deferred_net_claim<P: TxPlatform>(
+    irq: u32,
+    bound: BoundDeviceKey,
+    registration: &'static NetDeviceRegistration,
+) -> IrqHandled {
     let owner = <P as tx_hal::SmpIf>::current_cpu_id();
     let slot = NET_RX_DEFERRED_CLAIMS
         .get(owner.0)
         .expect("network IRQ claimant hart exceeds MAX_HARTS");
-    slot.publish(DeferredIrqClaim { irq, owner });
+    slot.publish(DeferredIrqClaim {
+        irq,
+        owner,
+        bound,
+        registration,
+    });
     NET_IRQ_CLAIMS.fetch_add(1, Ordering::AcqRel);
     IrqHandled::DeferredWake
 }
@@ -370,20 +430,14 @@ pub(crate) fn drain_net_rx_irq<P: TxPlatform>() -> bool {
     };
     let claim = match slot.begin_drain(current) {
         DeferredIrqDrain::Idle => return false,
-        DeferredIrqDrain::WrongHart { .. } => {
+        DeferredIrqDrain::WrongHart => {
             NET_IRQ_WRONG_HART_DRAINS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         DeferredIrqDrain::Owned(claim) => claim,
     };
 
-    let Some(registration) = tx_subsystems::net::net_device_by_name(b"eth0") else {
-        NET_IRQ_MISSING_DEVICE_DRAINS.fetch_add(1, Ordering::Relaxed);
-        slot.retry(claim);
-        return false;
-    };
-
-    let _ = registration.ops.ack_interrupt_and_fire();
+    let _ = claim.registration.ops.ack_interrupt_and_fire();
     slot.release_before_completion(claim);
     <P as IrqIf>::complete(claim.irq);
     NET_IRQ_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
@@ -482,4 +536,4 @@ pub(crate) fn drain_uart_rx_pending<P: tx_hal::TxPlatform>() -> usize {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

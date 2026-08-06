@@ -76,7 +76,7 @@ By the time this substrate begins, HAL has delivered:
 | `BootInfo` (static) | HAL_v1 §7 | Published; `memory_regions`, `kernel_image`, `initrd` populated |
 | Bootstrap page table (satp/DMW live) | HAL_v1 §5.2, §10.5 | MMU on; kernel direct map covers first 1 GiB in the high half; kernel image has a high alias; RV64 QEMU enters Rust through the high alias and removes the temporary low identity bridge after BootInfo consumes the firmware DTB |
 | `PT_NODE_POOL` / early PT nodes | HAL_v1 §10.1 | Static early page-table nodes available for pmap intermediate-table allocation; `PmapIf::alloc_pt_node()` callable |
-| `PlatformInfo` | HAL_v1 §8 | Published; MMIO region table ready for mapping |
+| `PlatformInfo` | HAL_v1 §8 | Published; immutable resource seed and all seed MMIO records ready for mapping |
 | Early UART + logger | HAL_v1 §9 | Usable for diagnostics during substrate bring-up |
 | Minimal trap infrastructure | HAL_v1 §5.2, §11 | Minimal panic vector installed; full kernel trap vector installed later in H3 |
 | `PmapReservation` / `PmapUnmapResult` / shootdown surface | HAL_v1 §10 | Available for kernel pmap mutations; post-shootdown frame accounting remains substrate-owned |
@@ -145,7 +145,8 @@ and SMP/global shootdown aggregation.
 - The `FrameMeta` array, one dense entry per covered RAM PPN, placed in direct-mapped memory.
 - The current direct map has been extended or validated to cover all RAM needed
   by allocator metadata, allocator-free RAM, and direct-map zeroing.
-- Platform MMIO regions have kernel mappings installed from `PlatformInfo`.
+- HAL-owned and enabled-device MMIO records from the immutable platform
+  resource seed have kernel mappings installed. Mapping does not bind drivers.
 - Pmap intermediate allocation uses typed page-table frames first and retains
   `PT_NODE_POOL` as an exhaustion fallback.
 - A zeroed permanent frame is claimed as the kernel zero frame and recorded as
@@ -364,7 +365,20 @@ After phase 2, every physical byte of RAM is addressable via the kernel direct m
 ### 4.3 Phase 3: Map additional platform regions
 <!-- txdoc:PAGE-SUBSTRATE-BRING-UP-SEQUENCE-PHASE-3-MAP-ADDITIONAL-PLATFORM-REGIONS-1 -->
 
-Consume `PlatformInfo.mmio_regions` (device MMIO windows not already in the early MMIO window). For each page-covered region, install a mapping in the kernel portion of the bootstrap page table using `PmapIf::reserve_kernel_mapping()` followed immediately by `PmapIf::commit_kernel_mapping()`.
+Consume `PlatformInfo.device_resources.platform_mmio` and every enabled
+`PlatformDevice`'s `DeviceResource::Mmio`. Validate range arithmetic, reject
+conflicting aliases/attributes, and coalesce exact duplicate mappings. For each
+remaining page-covered region not already in the early MMIO window, install a
+mapping in the kernel portion of the bootstrap page table using
+`PmapIf::reserve_kernel_mapping()` followed immediately by
+`PmapIf::commit_kernel_mapping()`.
+
+Substrate consumes only `phys`, `virt`, and mapping flags. It does not match
+compatible/bus IDs, interpret `ResourceRole`, select a driver, or dereference
+clock/PHY/syscon dependencies. After this phase a device-layer one-shot
+resource provider may enumerate a now-accessible bus and freeze the final
+resource graph; see
+[`NET_DEVICE_v1.md §2.3`](../06_devices/NET_DEVICE_v1.md).
 
 Granularity: prefer 2 MB pages when the physical address, virtual address, and remaining length are all 2 MB aligned. Fall back to 4 KB pages for aligned tails or small device windows. Intermediate page-table pages come from `PT_NODE_POOL` (HAL §7.4.2) because this phase runs before the frame allocator and slab exist.
 
@@ -608,6 +622,55 @@ Finds `count` consecutive set bits in the bitmap at an `align`-aligned PPN bound
 
 Contiguous allocation is rare (DMA buffers at driver init; pmap batches). Slow-path performance is acceptable.
 
+`reserve_run(count, align, policy)` is the ordinary physical-contiguity API. It
+does **not** prove suitability for a device. DMA callers use the constrained
+surface below with the selected device's domain and the strict intersection of
+firmware/platform constraints and capability-register refinements:
+
+```rust
+pub struct DmaRunRequest {
+    pub count: usize,
+    pub align: usize,
+}
+
+pub enum DmaAllocError {
+    Alloc(AllocError),
+    InvalidRequest,
+    UnsatisfiedConstraints,
+}
+
+pub fn reserve_dma_run(
+    domain: &'static DmaDomain,
+    effective: DmaConstraints,
+    request: DmaRunRequest,
+    policy: ZeroPolicy,
+) -> Result<FrameRunReservation<'static, BitmapPageAllocator<'static>>, DmaAllocError>;
+```
+
+The function first rejects an `effective` constraint set that widens its
+`DmaDomain`. It then checks nonzero count, PPN alignment, byte-length overflow,
+minimum alignment, maximum segment length/count, and every physical/direct-DMA
+boundary that can be proven before mapping. It searches until it finds a run
+that satisfies those checks or exhausts candidates; it never returns the first
+contiguous run and asks the driver to truncate its address.
+
+Here `segment_boundary` has the same meaning as NET_DEVICE: a power-of-two
+window size, not a mask. A segment may end at a window boundary but may not
+cross it; several segments may cover one run only when `max_segments` permits
+them.
+
+For `DmaTranslation::Direct`, address-width and segment-boundary checks include
+the translated device address. For `Managed`, the page reservation checks
+physical constraints and `DmaIf::map_dma` later reserves/validates the IOVA. If
+mapping fails, the still-unpublished frame reservation/owner rolls back. The
+device binder retains every fallible token until its global commit is known to
+be infallible.
+
+`FrameRunReservation::commit()` still returns `OwnedFrameRun`; DMA suitability
+does not change ordinary frame ownership. Concrete driver state must retain the
+run, a `DmaPin` for every page, and the `DmaMapping` for the whole hardware-use
+lifetime.
+
 ### 5.4 Special frame classes
 <!-- txdoc:PAGE-SUBSTRATE-FRAME-ALLOCATOR-API-ZERO-THE-PAGE-VS-TRUST-THE-CALLER-1 -->
 
@@ -621,6 +684,11 @@ pub struct DeviceFrame { /* MMIO/device PPN, not allocator-owned */ }
 - Permanent frames (zero frame, kernel metadata anchors) hold `refcount = 1` and `reserved = true`; dropping the Rust token does not return them to the pool.
 - Page-table intermediates are produced by consuming `OwnedFrame` into `PtFrame`, which sets `reserved | direct_mapped`. They release only through the pmap teardown path.
 - Device/MMIO frames are represented separately and never carry allocator ownership.
+- A `DmaPin` proves only that allocator-owned RAM remains resident. It does not
+  prove device addressability, alignment, segment-boundary compliance,
+  translation, or coherency; those proofs come from the constrained reservation
+  plus live `DmaMapping`.
+- `DeviceFrame` is a non-RAM MMIO PPN and is never a DMA-buffer allocation.
 
 ### 5.5 Accessor helpers
 <!-- txdoc:PAGE-SUBSTRATE-FRAME-ALLOCATOR-API-ACCESSOR-HELPERS-1 -->
@@ -1018,6 +1086,8 @@ HAL §7.4.2 marks `PT_NODE_POOL` as an "intermediate mechanism." This spec retai
 | FrameMeta counter underflow (debug) | Panic; indicates a reference-counting bug |
 | Double-free of a PPN | Caught by the bitmap CAS; second free is a no-op in release; panic in debug |
 | Reserved frame freed | Panic in debug through the typed owner path; ignored by the normal allocator return path in release |
+| Invalid/widened DMA request | `DmaAllocError::InvalidRequest`; no frame reserved |
+| No run satisfies effective DMA constraints | `DmaAllocError::UnsatisfiedConstraints`; no truncated/fallback address |
 
 After substrate init returns, failures are expected to flow through `Result` return values, not panics. The substrate is panic-heavy only during bring-up, where there is no recoverable state.
 
@@ -1060,6 +1130,8 @@ Everything on top of this — `PageContainer`, `RNodeBacking`, user AddressSpace
 <!-- txdoc:PAGE-SUBSTRATE-REFERENCES-1 -->
 
 - [`HAL_v1.md`](HAL_v1.md) — boot sequence, trap, pmap primitives, TLB shootdown.
+- [`NET_DEVICE_v1.md`](../06_devices/NET_DEVICE_v1.md) — immutable resource
+  graph, device DMA domains/constraints, mapping ownership, and binder rollback.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) — foundation/HAL layout.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3.3 (compound payload predicates), §5 (reference hierarchy), §6 (reclamation), §7.5 (operational contributions).
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, ARCH-*.

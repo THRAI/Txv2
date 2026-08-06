@@ -43,10 +43,11 @@ pub use device::{
 pub use execution::{
     socket_accept_wait_token, socket_open_file_from_identity, socket_recv_wait_token,
     socket_send_wait_token, socket_urgent_wait_token, step_accept, step_bind, step_connect,
-    step_flush_pending_arp, step_listen, step_poll_ready, step_poll_wait_token,
-    step_process_device_tx_pending, step_process_device_tx_pending_at,
-    step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending_in_namespace,
-    step_process_loopback_udp, step_process_network_events, step_process_network_events_at,
+    step_flush_pending_arp, step_listen, step_packet_ingress_fanout, step_packet_send,
+    step_poll_ready, step_poll_wait_token, step_process_device_tx_pending,
+    step_process_device_tx_pending_at, step_process_device_tx_pending_in_namespace_at,
+    step_process_loopback_pending_in_namespace, step_process_loopback_udp,
+    step_process_network_events, step_process_network_events_at,
     step_process_network_events_in_namespace_at, step_process_network_tick,
     step_process_network_tick_in_namespace, step_process_network_tick_loopback,
     step_process_network_tick_loopback_in_namespace, step_recv_kernel_bytes, step_sctp_peeloff,
@@ -57,8 +58,9 @@ pub use execution::{
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
     step_unix_socketpair_connect, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
     LoopbackTcpConnectOutcome, LoopbackTcpTransferOutcome, NetworkBacklogTickOutcome,
-    NetworkStepOutcome, ShutdownOutcome, SocketCloseOutcome, SocketOpenFileOutput,
-    ARP_FLUSH_BUDGET_DEFAULT, DEVICE_TX_BUDGET_DEFAULT, NET_BACKLOG_SCAN_BUDGET, NET_EVENT_BUDGET,
+    NetworkStepOutcome, PacketIngressOutcome, ShutdownOutcome, SocketCloseOutcome,
+    SocketOpenFileOutput, ARP_FLUSH_BUDGET_DEFAULT, DEVICE_TX_BUDGET_DEFAULT,
+    NET_BACKLOG_SCAN_BUDGET, NET_EVENT_BUDGET,
 };
 pub use facade::{
     drive_socket_connect_waiting, drive_socket_nonblocking, socket_bind_facade,

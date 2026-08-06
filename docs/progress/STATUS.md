@@ -1,3 +1,626 @@
+- 2026-08-06 (**区分 QEMU 虚拟 DNS 与 VF2 实机上游 DNS**).
+  **Changed**：第 09 章说明 QEMU `10.0.2.3` 是 `-netdev user` 提供的
+  稳定虚拟 DNS 端点，不应默认硬编码宿主机当前的
+  `10.248.98.30`；第 07 章加入 `resolvectl dns wlp0s20f3`，明确
+  VF2 在比赛现场换 Wi-Fi 后必须重新查询并替换真实上游 DNS。
+  **Verification**：QEMU 官方 user-mode 网络说明列出 Guest `10.0.2.15`、
+  网关/DHCP `10.0.2.2` 和 DNS `10.0.2.3`；当前实机
+  `resolvectl dns wlp0s20f3` 输出 `10.248.98.30`。
+  **Next**：QEMU 继续使用 `10.0.2.3`；VF2 按现场 Wi-Fi 查询结果填写。
+  **Blocker**：无；本次未改 JSON。
+
+- 2026-08-06 (**记录 VF2 网卡在 U-Boot 与 txKernel 之间的接管关系**).
+  **Changed**：第 08 章补充同一 RJ45/PHY/DWMAC 先由 U-Boot、后由
+  txKernel 接管；说明 IP 配置不继承，MAC 也不保证相同。
+  **Verification**：用户实测 U-Boot MAC 为 `6c:cf:39:00:3a:ee`、
+  txKernel MAC 为 `9a:42:8a:10:91:7b`；源码核对确认 DWMAC 寄存器
+  MAC 无效时使用本地备用 MAC。**Next**：继续分别使用 `.50` 和 `.10`。
+  **Blocker**：无；本次未改 JSON。
+
+- 2026-08-06 (**将 VF2 Git 章改为从 `/ #` 开始的最短现场流程**).
+  **Changed**：重写第 07 章，删除多组环境变量、自动探测和条件
+  分支；统一为“命令→成功输出→失败含义”。按当前实机固定为
+  `enx207bd2887d55`/`wlp0s20f3`、宿主机 `192.168.1.100`、
+  VF2 `192.168.1.10`，从已进入 txKernel `/ #` 后依次给出宿主机
+  转发/NAT、板端静态网络、时间、Git Task0/1/2 命令。宿主机
+  网络再分为绕过 Clash 从 `wlp0s20f3` 直连和通过 `Mihomo` TUN
+  出网两种模式，说明各自的简单规则、出口检查与切换方法。
+  **Verification**：只读核对宿主机当前网卡、IPv4、Mihomo 规则、
+  主路由、DNS 和 `ip_forward=1`；三条 iptables 命令均通过
+  `iptables-translate` 语法解析；新增的 Mihomo 三条规则也通过同样
+  解析。当前实机 `ip route get` 证明无 `pref 1000` 时 VF2 流量实际
+  选择 `via 28.0.0.2 dev Mihomo table 2022`，主路由默认出口则是
+  `wlp0s20f3`。用临时 qcow2 覆盖层启动 txKernel +
+  Alpine，确认 `/usr/bin/git` 2.49.1、静态 IP/默认路由/DNS 命令、
+  Task1 提交，以及本地等价的 push→远程提交→pull 闭环全部成功；
+  临时覆盖层已删除，母盘未修改。
+  **Next**：用户从第 1 节的本地电脑命令开始，然后在 VF2 使用
+  静态 IP 完成 Git 评分闭环。
+  **Blocker**：真实 VF2 外网、TLS 和 GitHub PAT 写入不能在隔离的 QEMU
+  网络及本地裸仓库中代替，需用户按章内成功/失败标志在实机验证；
+  本次未改 JSON。
+
+- 2026-08-06 (**补全 VF2 每轮换内核的最短启动链路**).
+  **Changed**：第 08 章第 13 节补全本地电脑直连网卡
+  `enx207bd2887d55` 的 `192.168.1.100/24` 地址、链路和路由检查，
+  以及 `picocom` 打开命令、VF2 复位/上电、`Ctrl+C` 打断
+  U-Boot 和 `StarFive #` 成功标志；同时用当前 `/srv/tftp`
+  实际路径精简重复构建流程，并标明本地 Linux 与 VF2 U-Boot
+  命令的边界。
+  **Verification**：核对 xtask 实现，确认 `build` 生成 ELF，
+  `image vf2-uimage` 只包装已有 ELF，两步不能合并省略；串口
+  by-id 路径与本章前文当前设备一致。
+  **Next**：用户按第 13 节从本地构建一直执行到 VF2 `/ #`。
+  **Blocker**：实机复位和串口观察需用户在 VF2 旁执行；本次未改 JSON。
+
+- 2026-08-06 (**标清 VF2 写卡、U-Boot 和 Guest 命令的执行位置**).
+  **Changed**：第 09 章 VF2 主线新增三终端对照和时序；明确
+  VF2.1～VF2.3 的 `lsblk`/`findmnt`/`e2fsck`/`dd` 全部在本地电脑
+  Linux 终端执行，VF2.4 的 `setenv`/`tftpboot`/`iminfo`/`bootm`
+  才在 VF2 U-Boot 串口的 `StarFive #` 执行，启动后检查在 `/ #`。
+  **Verification**：逐节核对 VF2.1～VF2.4 命令类型与执行位置，Markdown
+  围栏成对，新增的本地链接仍指向现有第 08 章。
+  **Next**：用户先在本地电脑识别 microSD 整盘设备并完成写卡校验，
+  再进入 VF2 串口 TFTP 启动。
+  **Blocker**：写卡前必须由用户根据插拔、型号和容量确认真实
+  `SD_DEVICE`；本次未改 JSON。
+
+- 2026-08-06 (**精简 Guest 的 GitHub HTTPS push 改为测试仓库快速流程**).
+  **Changed**：第 09 章删除临时 askpass 脚本、变量与清理流程；对只能
+  访问一个空测试仓库的短期 PAT，直接把凭据写入 `me` HTTPS URL 后
+  push。同时确认旧 `local-images/git/launch-shell.sh` 把凭据写到
+  `/musl/root/.git-credentials`，不会被当前完整 Alpine 根盘的 `/root` 配置读取。
+  **Verification**：用户日志证明 clone/TLS 已通过且失败发生在 Username
+  读取阶段；以遮罩方式检查旧脚本，未输出或改写其 PAT。
+  **Next**：用户执行两条 `remote set-url` + `push` 命令，再继续网页修改
+  与 pull 评分闭环。
+  **Blocker**：需要用户在 Guest 中自行填入已有 PAT；本次未改 JSON。
+
+- 2026-08-06 (**补充 QEMU 经 Clash TUN 出站与 Git TLS 分层排障**).
+  **Changed**：第 09 章新增 Clash/Mihomo TUN、系统代理和 QEMU user 网络的
+  边界说明，并加入 IP/路由、DNS、UTC、CA bundle、Guest/Git 代理配置到
+  `GIT_CURL_VERBOSE` 的 TLS 排障梯；同时纠正手工 `init=/bin/sh` 流程：
+  QEMU 命令不需要 `tx.net.mode=dhcp`，Guest 配网由手工执行的 `udhcpc`
+  及 `default.script` 完成。具体证据记录在
+  `docs/progress/research/2026-08-06-qemu-clash-tun-tls.md`。
+  **Verification**：只读检查 RV Alpine 母盘确认 `/etc/resolv.conf` 初始为空，
+  `/etc/ssl/certs/ca-certificates.crt` 为 212585 字节，`/etc/ssl/cert.pem`
+  指向该 bundle，APK 安装记录为 `ca-certificates-bundle 20250619-r0`；同时确认
+  当前镜像没有 `update-ca-certificates`、OpenSSL/curl 和自定义 CA 目录；
+  源码搜索也确认当前内核没有 `tx.net.mode` 参数消费者。本次
+  复用同日已通过的真实 GitHub `git ls-remote` 见证，未重跑 QEMU。
+  **Next**：TLS 失败时按 IP/路由→DNS→UTC→CA→Git/代理逐层定位，只有确认存在
+  可信 TLS 重签代理时才扩充自定义 CA 管理能力。
+  **Blocker**：公开 GitHub HTTPS 无阻塞；当前最小镜像不能直接照抄通用 Alpine
+  `update-ca-certificates` 流程；本次未改动 JSON 进度记录。
+
+- 2026-08-06 (**修复前台 BusyBox `ping` 无法被 Ctrl-C 终止**).
+  **Changed**：Linux `sys_ioctl(TIOCSPGRP)` 不再只更新数字 pgid，而是先用
+  `process_group_by_pgid` 解析 canonical `ProcessGroup`，再调用 process-aware
+  TTY helper 同步发布 typed 前台组；新增 syscall 回归和
+  `tools/shell-tests/busybox-ping-ctrl-c.txt`，并刷新
+  `local-images/rv-submit/kernel-rv` release 产物。原因与证据见
+  `docs/progress/research/2026-08-06-tty-tiocspgrp-ctrl-c.md`。第 09 章同时补充
+  QEMU user 网络拓扑，明确 `10.0.2.2/.3` 是 Guest 可见的虚拟网关/DNS，
+  `tx.net.mode=dhcp` 不会代替手工 `udhcpc`。
+  **Verification**：focused `TIOCSPGRP` host 测试 2/2；debug shell-test 中
+  `ping` 收到 `0x03` 后回到 `/ #`；刷新后的 release `kernel-rv` 又以四核
+  QEMU、Alpine ext4 临时 qcow2 覆盖层复测通过，母盘未修改且覆盖层已删除。
+  **Next**：结束仍载入旧 ELF 的 QEMU，再用已刷新的 `kernel-rv` 重启。
+  **Blocker**：focused 功能无阻塞；当前 dirty worktree 的整仓 unit 基线仍红，
+  全量 serial tx-shims 有 44 个无关失败，tx-kernel unit 有 3 个无关失败；本次
+  未改动 JSON 进度记录。
+
+- 2026-08-06 (**补充 DHCP 范围与 QEMU 静态网络配置**).
+  **Changed**：在 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  中说明 DHCP 不只分配 IP，还可下发前缀、默认网关、DNS 和租约，并补充当前
+  QEMU `-netdev user` 网络的完全手动配置方案；手动方案使用
+  `tx.net.mode=none`，避免与 `udhcpc` 混用。
+  **Verification**：使用临时 qcow2 覆盖层和四核 RV64 QEMU 实测，客户机成功
+  配置 `10.0.2.15/24`、默认路由 `10.0.2.2`、DNS `10.0.2.3`，且
+  `nslookup github.com 10.0.2.3` 返回状态码 0；母盘未修改。
+  **Next**：每次启动只选择 DHCP 或静态配置一种方式，再继续 Git HTTPS/SSH
+  验证。
+  **Blocker**：无；本次未改动 JSON 进度记录。
+
+- 2026-08-06 (**说清 Guest 代理变量继承与 QEMU 重启持久性**).
+  **Changed**：调整 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的 Git Guest 环境段，不再把 `unset http_proxy ...` 写成无条件必做步骤；改为先用
+  `env | grep` 检查，仅在 Guest 当前 shell 确实存在代理变量时清除，并明确环境
+  继承只发生在 Guest 父子进程之间，宿主机变量不会自动穿透 QEMU。新增持久性
+  对照：同一个可写 `rv-run.ext4` 中的目录、仓库、`.gitconfig` 和磁盘文件保留，
+  地址/路由/网卡状态与 shell 变量重启即失效；`resolv.conf` 虽是持久文件，仍会
+  被下一次 `udhcpc` 按租约刷新。退出流程补充先 `sync` 再关闭 QEMU，并说明
+  raw 副本、复用/新建 qcow2、`-snapshot` 和误写母盘的差异；同时修复 RV 内核/
+  根盘三项路径表的多余 Markdown 列。
+  **Verification**：核对 RV QEMU 命令使用可写 raw `RUN_IMAGE` 且没有
+  `-snapshot`；另以同一临时 qcow2 覆盖层连续启动两次，确认 `sync` 后创建的
+  marker 与写入的 `resolv.conf` 内容仍在，而第一轮 `export HTTP_PROXY=...`
+  没有进入第二轮 shell（代理 grep RC=1），未重新 DHCP 的 `eth0` 没有 IPv4。
+  代理检查、条件清除、重启持久性表和 `sync` 均可定位；章节
+  Markdown 围栏成对，本地链接存在，无尾随空白，`git diff --check` 通过。
+  **Next**：用户每次启动后重新设置 shell 环境并运行 DHCP；需要保留文件时复用
+  同一 `rv-run.ext4`，退出前执行 `sync`。
+  **Blocker**：无。
+
+- 2026-08-06 (**为 RV QEMU 补齐 Git 赛题 Task0～Task2 全流程**).
+  **Changed**：扩写 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的 RV Guest 段：QEMU 启动参数加入 `tx.net.mode=dhcp`，并按环境、DHCP、地址、
+  默认路由、DNS、UTC 时间、CA、`git ls-remote` 的顺序列出联网命令和最小输出；
+  补齐 Task0 帮助、Task1 `init/add/commit/log`、Task2 HTTPS shallow clone、README
+  修改、自己的 `me` remote、交互式 PAT push、网页手工修改和 fast-forward pull。
+  明确当前镜像缺少 SSH client，所以不能照抄题目的 `git@github.com` 地址；网页
+  建仓、PAT 和远端 README 修改均保留为用户手工操作，不伪造命令行步骤。
+  **Verification**：只读镜像确认 `ip`、`udhcpc`、DHCP hook、Git HTTPS helper、
+  CA bundle 存在，`ssh`/`ssh-keygen` 和 `/proj` 不存在；四核 RV QEMU 使用临时
+  qcow2 覆盖层实测 DHCP 获得 `10.0.2.15`、默认路由 `10.0.2.2`、DNS
+  `10.0.2.3`、UTC/CA 正常，沙箱外 `nslookup github.com` RC=0，真实 HTTPS
+  `git ls-remote` 返回 HEAD `f5dea58cc1057f2b076cdb90b446c2c21d91171e`；另一
+  临时覆盖层实测 `git -h`/`git help` RC=0，`init/add/commit/log` 完整通过。
+  章节 Markdown 围栏成对，本地链接存在，无尾随空白，`git diff --check` 通过。
+  **Next**：用户在自己的 GitHub 账号手工准备 fork/空仓库与最小权限短期 PAT，
+  再按手册执行真实账户的 push、网页 README 提交和 pull 评分闭环。
+  **Blocker**：公开 clone 前置无 blocker；认证 push/pull 需要用户自己的远端仓库
+  和凭据，未在本次诊断中代替用户执行外部写操作。
+
+- 2026-08-06 (**补充 Alpine 根目录地图与 Guest 程序查找方法**).
+  **Changed**：在 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的 RV Guest 段加入根文件系统导览，重点区分 `/bin`、`/usr/bin`、`/sbin`、
+  `/usr/sbin` 和 `/usr/local/bin`；以 `command -v`、限定四目录的 `find` 和
+  `readlink` 给出找程序及辨认 BusyBox 链接的方法，并简述 `/etc`、库目录、
+  用户目录、虚拟文件系统、运行数据和挂载点的用途。
+  **Verification**：只读检查实际 RV ext4 镜像，确认 `/bin/sh`、`/bin/ls`、
+  `/bin/mount` 和 `/sbin/init` 均链接到 `/bin/busybox`，`/usr/bin/git` 为
+  0755 普通文件，`/sbin/apk` 存在，`/usr/local/bin` 当前为空；章节 Markdown
+  围栏成对，本地链接存在，无尾随空白，`git diff --check` 通过。
+  **Next**：用户可在 RV Guest 中先用 `command -v` 定位目标程序，再按程序或
+  配置、库、设备的性质进入对应目录检查。
+  **Blocker**：无。
+
+- 2026-08-06 (**为 RV Guest 验收命令补充最小关键输出**).
+  **Changed**：在 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的 RV QEMU Guest 检查段，为 `export PATH`、`mount` 和 `git --version`
+  逐项补充重点输出；明确 `export` 成功时无输出，裸 `mount` 只列出已有挂载，
+  重点判断 `/dev/vda on / type ext4 (rw,...)`，并给出当前镜像对应的
+  `git version 2.49.1`，不再要求读者从整屏挂载信息中自行猜测。
+  **Verification**：从 RV ext4 镜像的 APK 数据库只读确认 Git 包版本为
+  `2.49.1-r0`；章节 Markdown 围栏成对，本地链接存在，无尾随空白，
+  `git diff --check` 通过。
+  **Next**：用户可按三条重点输出判断 RV Guest 的 PATH、根盘挂载和 Git
+  执行是否正常。
+  **Blocker**：无。
+
+- 2026-08-06 (**说清 `rv-submit` 内核输出目录与 `rv-run.ext4` 根盘的区别**).
+  **Changed**：在 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的 RV QEMU 准备段加入三项对照：`SUBMIT_DIR` 是内核输出目录，
+  `KERNEL` 是其中由 `oscomp submit` 生成的 `kernel-rv` RISC-V ELF，
+  `RUN_IMAGE` 是另行复制的 Alpine ext4 根盘；明确前两者分别由 QEMU
+  `-kernel` 和 `-drive` 消费，不能相互替代。
+  **Verification**：只读确认 `local-images/rv-submit/` 已存在，且只含
+  8,863,832-byte `kernel-rv`；源码确认 `oscomp submit` 通过 `fs::copy`
+  将 `target/riscv64gc-unknown-none-elf/release/tx-kernel-riscv64-qemu-virt`
+  复制为 `kernel-rv`，没有格式转换；当前两文件的 SHA-256 均为
+  `c62e17fcec39afdd1ad3abe529305c27527d7bb87a047f04072c1bde3bd8c5b0`，
+  `cmp` 判定逐字节相同，`file` 均识别为静态链接的 RISC-V 64-bit ELF。
+  章节 Markdown 围栏成对，两个本地链接存在；
+  `rv-submit`/`kernel-rv`/`rv-run.ext4` 对照项及 `-kernel`/`-drive` 用途
+  均可定位，无尾随空白，`git diff --check` 通过。
+  **Next**：保留已有 `rv-submit/kernel-rv`；用户仍需创建尚不存在的
+  `rv-run.ext4` 根盘副本，然后才启动 RV QEMU。
+  **Blocker**：`rv-run.ext4` 尚未创建；`rv-submit` 本身无 blocker。
+
+- 2026-08-06 (**说清 `RUN_IMAGE` 变量与 `rv-run.ext4` 实体文件的区别**).
+  **Changed**：重写 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的 RV QEMU 副本准备段，明确 `RUN_IMAGE="$WORK_DIR/rv-run.ext4"` 只保存
+  预定路径，不会创建文件；只读确认当前 `local-images/rv-run.ext4`
+  确实不存在。主线不再用 `cp --reflink=auto` 脚本，改为用文件管理器复制
+  RV `.img` 并将副本命名为 `rv-run.ext4`；补充后缀改名不会转换 raw ext4
+  内容，以及复制后使用 `file` + `e2fsck -fn` 只读验收。
+  **Verification**：章节 90 个 Markdown 围栏成对，两个本地链接存在；
+  RV QEMU 准备段已无 `cp --reflink`/`if [ -e`/防覆盖 shell 分支，
+  只保留 `RUN_IMAGE` 路径定义及 `file`/`e2fsck -fn` 只读验收；
+  无尾随空白，`git diff --check` 通过。
+  **Next**：用户在文件管理器中创建 `rv-run.ext4` 后，执行两条只读验收命令，
+  再继续 RV QEMU 启动。
+  **Blocker**：当前 `rv-run.ext4` 尚未创建；这是未完成的用户文件复制步骤，
+  不是内核或镜像格式故障。
+
+- 2026-08-06 (**纠正 RV 镜像 `debugfs stat` 路径归属并关闭临时分页屏**).
+  **Changed**：在 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的完整根盘判断步骤中，纠正先前将 inode 273 错归给 `/init` 的说明：
+  实际 `/init` 不存在，inode 273 是指向 `/bin/busybox` 的 `/sbin/init`；
+  `/bin/sh` 也指向 BusyBox，BusyBox 和 Git 本体则是 0755 普通文件。五条命令
+  加入 `PAGER=cat`，让成功的 `stat` 正文保留在终端主屏；同时解释未加该
+  前缀时 `(END)` 临时屏退出后只剩 `debugfs` 版本行的原因。
+  **Verification**：以同一 RV `.img` 逐条执行 `PAGER=cat debugfs -R 'stat ...'`，
+  确认 `/init` 缺失、`/sbin/init` inode 273 和 `/bin/sh` inode 82 均链接
+  BusyBox、BusyBox 大小 829168 字节、Git 大小 2801304 字节；章节
+  86 个 Markdown 围栏成对，两个本地链接存在，无“`/init` 存在/
+  inode 273”旧错误说法或尾随空白，`git diff --check` 通过。
+  **Next**：使用已确认存在的 `init=/bin/sh` 继续 RV QEMU 主线。
+  **Blocker**：无。
+
+- 2026-08-06 (**比赛镜像手册改为当前 RV 实例主线与其他格式分支**).
+  **Changed**：重排 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  的识别部分，以现有 `alpine-linux-riscv64-ext4fs.img` 为唯一主线；
+  先给出压缩状态、容器、盘内布局、文件系统、内容用途和 ELF 架构六层
+  确定结论，再用实际命令/输出解释 raw、裸 ext4、完整 Alpine 根盘与
+  RISC-V64；将压缩包、qcow2、cpio 和 MBR/GPT 明确降为“当前结果不同时才看”
+  的 A–D 分支，并在平台表和末尾检查卡中单独标识当前 RV 样本。
+  **Verification**：只读 `file`/`fdisk -l`/`dumpe2fs -h`/`e2fsck -fn`/
+  `debugfs` 确认镜像为 690 MiB raw 裸 ext4，无 MBR/GPT，4096-byte block +
+  extents，根目录和 shell/BusyBox/Git/musl loader 完整，BusyBox 为 RISC-V64 ELF；
+  章节 84 个 Markdown 围栏成对，两个本地链接存在，无旧 LA 主线/旧步骤引用/
+  退役词汇/尾随空白，`git diff --check` 通过。
+  **Next**：后续讲解和操作从当前 RV 识别卡继续进入 RV QEMU；LA 和其他格式
+  只在用户切换样本或实际输出不同时进入。
+  **Blocker**：无。
+
+- 2026-08-06 (**比赛镜像手册曾改为从当前 LA 镜像开始；已被上条 RV 主线重排取代**).
+  **Changed**：`msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`
+  删除当前机器已不需要的下载、建目录、复制原包及对应 shell 脚本；
+  手册现在直接指向 `local-images/` 中现有的 LoongArch64 `.img.xz`
+  和 `.img`，明确两者均已存在时不得再解压，本次直接进入裸 ext4/
+  分区布局检查；仅保留“`.img` 缺失时才解压”的后备分支，并修正
+  压缩格式/解压命令表的 Markdown 空列错位。
+  **Verification**：只读 `ls`/`file`/`xz --list` 确认当前 `.img.xz` 为
+  136 MiB XZ，同名 `.img` 为 690 MiB ext4；章节现有 78 个 Markdown
+  围栏且成对，两个本地链接目标均存在，旧下载/建目录/复制脚本无残留，
+  尾随空白与 `git diff --check` 检查通过。
+  **Next**：从第二步对现有 `.img` 执行只读布局和文件系统检查。
+  **Blocker**：无。
+
+- 2026-08-06 (**补全比赛镜像从压缩包到四平台的识别与接入手册**).
+  **Changed**：新增 `msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md`，
+  以 2025 现场赛官方 `.img.xz` Alpine 镜像为主线，给出解压、识别 raw/qcow2/
+  cpio/tar、识别裸 ext4 与 MBR/GPT、判断完整根盘/数据盘、从 ELF 确认
+  RV/LA 架构的命令链；增加带分区镜像的只读映射与提取方法、RV/LA QEMU
+  将完整根盘作为 `vda` 直接挂载的对称命令、VF2 动态识别 microSD 并安全
+  写盘后以 `tx.root=mmcblk0` 启动的流程，并明确 LA 2K1000 尚未接板时必须
+  留作输入的存储/块设备/固件 hook。同时给第 05 章加上范围边界，避免将
+  OSComp `sdcard-rv.img` / `sdcard-la.img` 数据盘与现场赛完整 Alpine 根盘混淆。
+  **Verification**：对本地对应 RV/LA Alpine 镜像执行 `file`、`fdisk -l`、
+  `dumpe2fs -h`、`e2fsck -fn`、`debugfs` 与镜像内 BusyBox ELF 架构检查，确认两者
+  均为 690 MiB、4 KiB block + extents 的裸 ext4 完整 Alpine 根盘，ELF 分别为
+  RISC-V64/LoongArch64。新章节 76 个 Markdown 围栏平衡，`git diff --check`
+  通过；`cargo xtask lint docs` 未报告新章节断链，仓库整体仍被与本次无关的
+  31 个已有断链阻断。RV/LA 两条四核 QEMU 命令均通过参数解析；进一步
+  用临时 qcow2 覆盖层实际启动，两者均报告 `possible=4:online=4`、
+  `mount:rootfs:ext4:vda:ok`、`bootstrap-exec:ok`、`boot:ok` 并进入 `/ #`；
+  测试未写入母盘。
+  **Next**：接入 LA 2K1000 实板时补全其物理存储、块设备名、内核加载
+  地址和串口参数；如需让“任意数据盘”在 QEMU/板卡共用，实现非硬编码的
+  `tx.data=<device>` 启动参数。
+  **Blocker**：LA 2K1000 板级存储与启动资源尚未实机发现；不影响 RV/LA
+  QEMU 和 VF2 完整根盘流程。
+
+- 2026-08-06 (**VF2 startable-hart discovery now uses PLIC S-mode topology**).
+  **Changed**：RV64 DTB topology discovery no longer trusts the VF2 U-Boot
+  control FDT's false `cpu@0` U74/Sv39 description. When a PLIC
+  `interrupts-extended` topology is available, the HAL intersects CPU-node
+  candidates with the harts that actually own an S-mode external-interrupt
+  context. This selects VF2 U74 harts 1–4 and preserves all QEMU harts without
+  encoding a board compatible, hart0 exception, or contiguous-ID assumption;
+  DTBs without usable PLIC context data retain the generic CPU-node result.
+  `tx.maxcpus` remains only an optional cap, so the normal VF2 competition boot
+  needs no CPU-count argument. Added regressions for the false five-hart VF2
+  candidate mask, unchanged QEMU topology, missing-context fallback, and the
+  rule that PLIC evidence cannot re-add a CPU rejected by its CPU node. The
+  detailed diagnosis is in
+  `msp/debug-logs/2026-08-06-vf2-jh7110-hart0-opensbi-trap.md`, and the VF2
+  knowledge chapter now defines hart, BSP/AP, automatic SMP discovery, and the
+  fixed-image/old-image behavior.
+  **Verification**：RV64 HAL **119/119** passes; focused PLIC normalization
+  regressions **2/2** pass; RV64 release build and `vf2-uimage` packaging pass.
+  New image
+  SHA-256 is
+  `8d6e47d1ce855f53b7e9af6edb8c15fc0ecb8efbd14ef311733eae6d88080538`.
+  QEMU `-smp 4` reports `possible=4:online-aps=3:online=4`, no `WARN-partial`,
+  and reaches `boot:ok`. `cargo -q xtask unit` remains red only on the existing
+  tx-shims shared-state set, two libctest `chmod` assertions, and the 2624-byte
+  thread-future budget.
+  The earlier root-`compatible` image
+  `5964ce6301c5a1673b0a4f6084a43e8e6ce675d4c7536e22369466ee32f9be5f`
+  was deployed and reproduced the original hart0 trap, proving that U-Boot's
+  control FDT cannot be identified by the fixture's root compatible alone.
+  **Next**：deploy the PLIC-based uImage to `/srv/tftp`, reset VF2, and require
+  the same
+  four-hart summary with no hart0 `sbi_trap_error` before closing the hardware
+  witness.
+  **Blocker**：only the physical VF2 reset/serial observation remains.
+
+- 2026-08-06 (**知识手册补清 TFTP 路径与宿主机/板子文件系统边界**).
+  **Changed**：在 `msp/knowledge-handbook/08-VF2内核下载与启动链路.md` 补充
+  `srv` 作为命令、相对路径 `srv`/`./srv`、绝对路径 `/srv` 的区别，并明确
+  `/srv/tftp` 是宿主机服务目录，不会由 TFTP 挂载到 U-Boot 或 VF2 根文件系统；
+  同时补清 `ip -br link` 只能发现接口，`HOST_TFTP_IP` 是避开现有路由后主动选择的
+  静态地址，`PREFIX_LEN=24` 是与 `255.255.255.0` 等价的子网设计输入；补充
+  picocom `-b` 的含义、115200 8N1 无流控配置及其板级来源。
+  **Verification**：只读检查当前宿主机接口和主路由：直连接口存在但尚无 IPv4，
+  Wi-Fi/Docker/Mihomo 分别使用 `10.250.0.0/16`、`172.17.0.0/16`、
+  `28.0.0.0/30`，未占用 `192.168.1.0/24`；解码 VF2 DTB 确认
+  `stdout-path = "serial0:115200"`，实机 115200 下 OpenSBI/U-Boot 日志可读；新增
+  代码围栏完成结构检查；另对板子复位后的真实 ARP/TFTP 失败做分层说明：宿主机
+  直连接口有 carrier 但缺少 `192.168.1.100/24` 和直连路由，UDP 69 已监听，TFTP
+  目录仅有 `txv2-vf2*.uimage` 而自动 bootcmd 请求 `uImage@0x40200000`。手册补入
+  ARP 先于 TFTP、`.100` 宿主机/`.50` U-Boot/`.10` txKernel 的阶段归属，以及
+  停止自动循环后显式下载 `txv2-vf2.uimage@0x80200000` 的恢复步骤。
+  另补充宿主机重启后的持久性边界：ext4 上的 `/srv/tftp/*.uimage` 保留，而 shell
+  变量、手工 `ip addr` 和板端 RAM 状态消失；区分绝对路径、宿主机/板子文件系统，
+  以及 U-Boot 请求 `uImage` 与实际 `txv2-vf2.uimage` 的文件名不匹配。
+  补清 picocom 仅连接串口而不复位 VF2：自动启动倒计时/ARP-TFTP 重试才需
+  `Ctrl+C`，已位于 `StarFive #` 时直接输入命令，并区分板端 `Ctrl+C` 与 picocom
+  本地退出键 `Ctrl+A Ctrl+X`。进一步记录 VF2 `sbi_trap_error` 的分层判断：
+  `mcause=5` 是 OpenSBI M-mode 在 hart0 上的 load access fault；U-Boot control FDT
+  错把 S7 管理核 hart0 标为可启动，故 SBI HSM 尝试启动它。当前日志的
+  `possible=5:online-aps=3:online=4:WARN-partial` 表示 hart1–4 四个 U74 均已在线，
+  错误候选 hart0 未上线，不阻塞本次根文件系统/网络/Git 使用；手册同时要求以
+  `boot:ok`、`userspace:submitted` 和最终 `/ #` 判断是否确实可继续，不能把所有
+  `sbi_trap_error` 一概忽略，并区分第二个 DWMAC 端口 `link-down` 与固件异常；记录
+  修复 FDT 前可用 `tx.maxcpus=1` 获得稳定单核启动，同时明确不能用
+  `tx.maxcpus=4` 代替 hart0 过滤，因为当前限额按低 hart ID 选择候选。
+  **Next**：继续按用户的具体疑问补充同一启动链路章节。
+  **Blocker**：无。
+
+- 2026-08-05 (**VF2 内核从构建到 TFTP/bootm 启动的知识章节完成**).
+  **Changed**：新增 `msp/knowledge-handbook/08-VF2内核下载与启动链路.md` 并加入
+  手册索引；面向初学者拆分 kernel ELF、裸 binary、legacy uImage、U-Boot DTB、
+  OpenSBI、RAM 内核与 SD/ext4 用户态，给出构建、包装、TFTP 部署、直连网络、串口、
+  `tftpboot`、`bootm`、根文件系统挂载和复位持久性的完整命令链；进一步区分
+  TFTP 协议、宿主机 `tftpd-hpa` 服务、服务根目录和 U-Boot 客户端，说明
+  `install` 是宿主机内复制、`tftpboot` 才是板子主动拉取。部署地址与接口名明确
+  区分为运行时输入和当前已验证示例。**Verification**：以当前
+  `xtask/src/image.rs` 实现核对 `vf2-uimage --release`：RV64 ELF 经 objcopy 转成裸
+  binary，再由 mkimage 生成 uncompressed RISC-V kernel uImage；对实际镜像执行
+  `mkimage -l`，确认数据大小 4.71 MiB、load/entry 均为 `0x80200000`；代码围栏平衡，
+  `cargo xtask lint docs` 未报告新文件问题，仍被 31 个既有断链阻断。**Next**：后续
+  疑问继续按单一主题追加知识章节；实际迭代继续使用手册第 13 节的宿主机/U-Boot
+  两段命令。**Blocker**：本章节无 blocker；全仓 docs lint 的既有断链不在本次范围。
+
+- 2026-08-05 (**VF2 Git 比赛从宿主机重启到 push/pull 的现场手册完成**).
+  **Changed**：新增 `msp/knowledge-handbook/07-VF2-Git比赛完整流程.md` 并加入知识
+  手册索引；把宿主机直连地址、上联网卡、DNS、策略规则、转发/NAT、TFTP、串口、
+  U-Boot、板端静态网络和 UTC 时间设置串成一次完整冷启动流程，再逐项覆盖题目的
+  `git help`、`proj` 本地仓库和真实 GitHub clone/commit/push/pull。部署相关数值集中
+  为显式输入或运行时探测；说明 QEMU `boot.sh`/`launch-shell.sh` 不能在 VF2 复用，
+  当前板端缺少 SSH 客户端与密钥，因此使用不落盘的 HTTPS + 短期 PAT，并禁止复制
+  既有脚本中的明文凭据。**Verification**：当前 VF2 串口实测 `git -h` 与
+  `git help` 均 RC=0；既有真实浅克隆位于 `/dev/shm`，板端根文件系统仍有 24 MiB
+  可用；`cargo xtask lint docs` 未报告新手册断链，但全量门仍被 31 个既有断链阻断。
+  **Next**：用户准备自己的 GitHub fork 和短期 fine-grained PAT 后，按手册执行
+  Task1，并由用户在隐藏的密码提示处亲自输入 PAT，完成真实 push、网页修改和 pull。
+  **Blocker**：公开 clone 无 blocker；实际 push 只等待用户私有凭据与自己的公开
+  仓库选择，PAT 不应提供给代理或写入仓库。
+
+- 2026-08-05 (**VF2 真实 GitHub shallow clone 闭环；portable-network 计划完成**).
+  **Changed**：DWMAC 的 Linux exclusive-tail/refill/restart 序列保留；公网 HTTPS
+  卡住的最终根因不在 RX ring，而在通用 smoltcp 适配层：
+  `RawTcpSocket::process_segment` 丢弃了 smoltcp 为乱序数据直接返回的立即 ACK，
+  但 smoltcp 在构造该 ACK 时已经推进 `remote_last_ack`，后续普通 egress 因而不会
+  重建它。现在 `TcpInner` 合并保存最新立即回复，`poll_at` 将其报告为即时工作，
+  `dispatch_segment_via` 仅在 sink 接受后清除，backpressure 时保留。新增回归覆盖
+  乱序缺口 ACK、拒绝后重试和缺口补齐后的累计 ACK。**Verification**：电脑侧 pcap
+  记录 GitHub 在一个 1436-byte 缺口后 0.6/1.3/2.4/5.2/35/76 秒重复重传而旧内核
+  0 ACK；聚焦回归 1/1、`cargo check -p tx-subsystems`、changed-file rustfmt、
+  RV64 release build 和 VF2 uImage 构建通过。新镜像
+  `253459e8504a230bc482c236b015bc091fc6eba3b0be532b6ca4c75e4c68e096`
+  在 VF2 上通过公网 ping 2/2、GitHub HTTPS `wget` RC=0、`git ls-remote` RC=0；
+  `git clone --depth 1 https://github.com/oscomp/xv6-riscv.git` 完成 84 个对象，
+  HEAD `f5dea58cc1057f2b076cdb90b446c2c21d91171e`，`git fsck --full` RC=0。
+  `cargo -q xtask unit` 仍仅有既有 tx-shims 共享状态失败、两条 libctest `chmod`
+  断言和 thread-future 2624-byte 预算失败；原有 `timer_tick`/乱序 FIN 聚焦测试也
+  可独立复现，与本修复无关。**Next**：整理 diff 后提交/发 PR；若继续产品化，
+  把板端地址、网关、DNS/时间获取交给已规划的用户态静态配置或 `udhcpc` 启动流程。
+  **Blocker**：VF2 真实 GitHub clone 无 blocker；只剩仓库既有 host-test、docs-lint
+  与旧 progress JSON schema 基线。
+  详细实验链见 `msp/debug-logs/2026-08-04-vf2-git-clone-operation-ledger.md`。
+
+- 2026-08-04 (**portable network hardcoding cleanup closed; VF2 DWMAC phase
+  started**). **Changed**：删除旧的架构分支网络初始化、staging NIC、固定启动
+  IP/路由、全局 `NET_IRQ`、按名称/第一设备兜底和生产 QEMU 固定网卡位置；typed IRQ
+  top/bottom half 现在携带同一 bound key 与 registration。启动网络配置由 namespace/FIB
+  及用户态 `ip`/`udhcpc` 负责。固定拓扑脚本仅保留为显式 fixture；
+  `txdoc:CI-GATE-NET-PORTABILITY` 已加入 fast CI。HAL IRQ 类型拆到独立模块，
+  `tx-hal/src/lib.rs` 从 1874 行降至 1761 行，没有抬高架构 ratchet。
+  **Verification**：`cargo xtask lint net-portability` 为 0 findings；RV HAL 112/112、
+  LA HAL 65/65、M1 mock HAL 14/14、kernel IRQ 8/8 通过；RV/LA `full-build
+  --no-image` 通过；两架构真实 QEMU 均通过 relocated + changed-subnet gateway ping、
+  zero-NIC boot 和 reordered two-NIC publication。tx-kernel 全量仍仅有已知两条
+  libctest `chmod` 与 thread-future 大小预算失败；arch/unused/docs lint 仍只报告既有
+  96 项、4 项和 23 个断链/6 个词汇警告。**Next**：在已上电 VF2 上验证 DTB
+  resource decode，完成 generic DWMAC + StarFive glue 的 probe、PHY、DMA、IRQ 和数据面。
+  **Blocker**：本阶段无新增 blocker；VF2 串口/网络实测可能需要用户在物理端配合复位。
+
+- 2026-08-04 (**portable network Phase 4 LA64 QEMU closed; Phase 5 hardcoding
+  cleanup started**). **Changed**：LA64 平台发布包含 ECAM、MMIO32 与显式 DMA domain
+  的 typed PCI host seed；provider 枚举所有 VirtIO network function，把准确的 BDF、
+  PCI identity、config window、BAR、动态 INTx IRQ 与 DMA-domain reference 冻结在同一个
+  `PlatformDevice`。驱动只重开该 function，不再扫描“第一张网卡”。无网络场景现在向
+  QEMU 显式发送 `-nic none`，避免机器模型偷偷补一张默认网卡；长 shell 命令分块发送，
+  避免 LA 串口粘贴丢字符。**Verification**：真实 LA QEMU 已通过 slot 2 RNG decoy、
+  网卡迁移到 slot 5、后置 decoy、改变子网后的 gateway ping、zero-NIC 启动与 two-NIC
+  同时发布；`cargo xtask full-build --target la64-qemu --no-image` 通过。PCI adapter
+  4/4、LA HAL 66/66、driver PCI 1/1、scenario 12/12 均通过；tx-kernel 为 148/151，
+  仅剩原有两条 libctest `chmod` 与 thread-future 大小预算失败。公共 binder 的
+  failed-first rollback 测试继续作为“前一个候选失败、后一个设备健康”的架构无关见证。
+  **Next**：删除旧固定 PCI slot/NET_IRQ、固定接口名与 legacy fallback，直到
+  `cargo xtask lint net-portability` 通过，再进入 VF2。**Blocker**：本阶段无新增
+  blocker；Git 验收仍按约定留到 VF2 之后。
+
+- 2026-08-04 (**比赛方 RV/LA 镜像进入 QEMU 的命令手册已补齐；真板章节不重复
+  新建**). **Changed**：新增 `msp/knowledge-handbook/05-比赛镜像进入QEMU.md`，
+  区分宿主机只读挂载、QEMU `-drive/-device` 接盘和 txKernel Guest ext4 挂载；
+  说明 QEMU 不内置 BusyBox，普通 BusyBox profile 的用户态来自项目镜像，而
+  OSComp 路径由 txKernel 内核、最小 test-init initramfs 和比赛方架构镜像共同
+  组成。手册使用外部 `<比赛数据目录>`，只保留工具协议要求的
+  `sdcard-rv.img`/`sdcard-la.img` 名称，要求母盘校验后复制为可写工作副本，并
+  记录 prepare、list-suites、标准 oscomp test、RV/LA QEMU 磁盘参数和现场检查
+  顺序。根据使用者反馈不再重复写板子章节，总索引改为指向已有
+  `msp/board/05-上板操作手册.md` 与 `06-VF2零基础上手教程.md`。
+  **Verification**：本地两个 4 GiB 比赛镜像均经 `file` 识别为裸 ext4；
+  `cargo xtask oscomp list-suites --target rv64-qemu` 成功列出 22 组；RV/LA 两次
+  `cargo xtask oscomp test ... --dry-run` 均在启动 QEMU 前稳定复现既有缺口
+  `missing tools/test-init/tx-test-init.sh`。手册因此没有虚报标准入口可用，并记录
+  临时 `OSCOMP_TEST_INIT=0 OSCOMP_KERNEL_PROFILE=` Make 入口；两架构 `make -n`
+  均确认使用对应 sdcard、debug kernel、OSComp cmdline 和 judge。Markdown fence
+  成对、无新增环境绝对路径或尾随空白；`cargo xtask lint docs` 未命中新手册，仍
+  仅报告仓库既有 23 个断链和 6 个退役词汇警告。
+  **Next**：若要恢复统一标准入口，补回并验证 `tools/test-init/tx-test-init.sh`，同时
+  让 `cargo xtask build --release` 真正传递 release 或取消 Makefile 的不一致默认；
+  之后分别用干净 RV/LA 工作镜像跑一个小组见证。
+  **Blocker**：当前 `cargo xtask oscomp test` 被缺失 test-init 资源阻断；临时 Make
+  入口仅完成命令展开验证，本轮未重跑耗时 QEMU 测试。VF2/LA 真板说明继续由已有
+  `msp/board/` 文档负责。
+
+- 2026-08-04 (**首版 txKernel 现场命令知识手册已建立**). **Changed**：新增
+  `msp/knowledge-handbook/`，以统一命令卡格式记录执行位置、用途、占位符语法、
+  参数逐项解释、操作顺序、成功表现、验证、常见错误、重启后是否重做与撤销方式；
+  当前分类覆盖内核环境检查/构建、交互与自动 QEMU 启动、ext4 镜像识别/制作/
+  只读挂载/`debugfs` 副本写入，以及网卡、静态 IP、默认网关、DNS、真实
+  BusyBox `udhcpc`、分层连通性与公开 HTTPS Git shallow clone。所有环境相关的
+  仓库路径、接口、IP、前缀、网关、DNS、镜像和 remote 均作为输入；具体值只在
+  明确标注不可照抄的示例中出现。**Verification**：两组 RV64 BusyBox QEMU
+  `--dry-run`（基础启动、`--net user` + `tx.net.mode=dhcp`）均成功渲染预期参数；
+  本地 Git ext4 母盘经 `file` 识别为 ext4，`debugfs -R 'stat /usr/bin/git'` 只读
+  查询成功；`git diff --check -- msp/knowledge-handbook` 通过；`cargo xtask lint docs`
+  未命中新手册，仍仅报告仓库既有 23 个断链和 6 个退役词汇警告。
+  **Next**：由使用者按首次查阅体验评审命令卡密度、分类和措辞，再按实际现场需要
+  增补串口/U-Boot/TFTP、宿主机转发/NAT 或把网络长章拆成更细文件。
+  **Blocker**：手册本身无 blocker；LA64 DHCP 端到端和 VF2 DWMAC 仍是已有实现/
+  硬件能力缺口，手册未把尚未验证的路径写成已可用。
+
+- 2026-08-04 (**真实 userspace DHCP + RV64 QEMU GitHub clone 已打通；通用 AF_PACKET
+  数据面落地**). **Changed**：新增详细中文方案
+  `research/2026-08-04-userspace-dhcp-client-plan.md` 与 operational plan
+  `plans/2026-08-04-userspace-dhcp-client.json`。net namespace 现在登记并按 close
+  撤销 packet socket；真实设备 ingress 对匹配 RAW/DGRAM socket 做独立 fanout，
+  UP 但尚无 IPv4 的接口也会轮询；packet `sendto` 按 namespace ifindex 选择真实
+  device，RAW 发送完整 frame，DGRAM 补 Ethernet header，旧 synthetic ARP
+  self-reply 已删除。补齐 BusyBox `udhcpc` 在接口 ioctl 前使用的
+  `AF_INET/SOCK_RAW/IPPROTO_RAW` socket，以及 `tx.runsh` 缺失的 `/sbin`
+  overlay mountpoint。boot network delegate 不再抢读物理 RX 或保有私有
+  `EtherIface`；`tx.net.mode=dhcp|none` 只发布设备，不注入地址、路由或静态邻居，
+  地址/FIB 由 userspace netlink 配置成为唯一真值。修复 `shell-test --net` 未进入
+  QEMU 参数的问题，并新增 `tools/verify-udhcpc-rv64.sh` + guest probe：镜像、内核、
+  子网、lease、接口 selector、超时和 public Git remote 均为外部输入，多 NIC
+  无 selector 明确失败，带凭据 URL 明确拒绝，TLS 校验不关闭。
+  **Verification**：packet registry/RX/TX 与 shim RAW/DGRAM wire 窄测试全部通过；
+  `AF_INET/SOCK_RAW/IPPROTO_RAW` create+ioctl 测试通过；`xtask` shell-test 网络参数
+  5/5 通过；`cargo xtask full-build --target rv64-qemu --no-image` 通过。参数化
+  QEMU fixture 使用 `172.31.44.0/24`（与旧默认网段不同），真实 BusyBox 1.37
+  `udhcpc` 获得 `172.31.44.20`/网关 `172.31.44.2`/DNS `172.31.44.3`，网关 ping
+  与 GitHub DNS 均通过；在开启 TLS 验证和 HTTP/1.1 下，真实 shallow clone 用户
+  输入的 `https://github.com/oscomp/xv6-riscv.git` 成功，guest HEAD `f5dea58`。
+  `cargo -q xtask unit` 的 build 阶段通过，仍有既有 tx-shims 37 项与 tx-kernel
+  3 项失败（两个 init chmod 断言、ThreadFuture size budget），与本 slice 无关。
+  `cargo xtask lint docs` 仍仅报告既有 23 个断链和 6 个退役词汇警告，未命中新
+  DHCP 文档；`cargo xtask progress validate` 仍先被既有
+  `2026-07-24-network-time-integration.json` 的非法 `completed` 状态阻断，本计划
+  记录已用 `jq` 单独验证。
+  **Next**：把兼容静态模式剩余的 QEMU 地址迁入统一 scenario renderer；随后在
+  LA64 QEMU 复用同一 DHCP witness 并补无 server/down/busy/bad-ifindex 负面矩阵；
+  VF2 等 DWMAC/StarFive 驱动就绪后接同一真板 hook。
+  **Blocker**：LA64 witness/负面矩阵尚未执行；VF2 外网仍被 DWMAC/StarFive
+  驱动阻塞，未知 LA 真板仍等待型号和固件事实。`local-images/git/launch-shell.sh`
+  中发现的明文 GitHub PAT 未被读取或使用，必须在 GitHub 侧撤销/轮换。
+
+- 2026-08-04 (**网络计划收敛为四种模式；LA 真板当前只保留受测试的静态 hook**).
+  **Changed**：无驱动代码改动；旧的单控制器、单 IRQ、固定接口和固定网络拓扑
+  计划已标记为 superseded。新增详细方案
+  `research/2026-08-04-portable-network-device-plan.md` 与 operational plan
+  `plans/2026-08-04-portable-network-device.json`，并新增面向内核初学者的
+  `research/2026-08-04-portable-network-before-after-explained.md`，用 Git 到物理
+  网口的分层图、当前假设表和三路线取舍解释旧 VF2 抢修方案与当前四模式方案的
+  差异，明确新方案尚未实现且不是重写整个内核。该说明现已删去房屋/门铃类比，
+  补充一次 RV QEMU `git clone` 的启动、DNS、TX/DMA、RX/IRQ 全链路，以及
+  DWMAC/VirtIO、MMIO、`net_irq()`、`eth0`、virtio-mmio bus、PCI slot、
+  IP/route/neighbor/SLIRP 的十节定义和关系图，并单列 VF2 真板路径。方案要求
+  静态平台轴只发布启动期
+  不可变的 typed resource graph，静态驱动集按 compatible/bus identity 一次性
+  绑定；IRQ、DMA、接口投影和网络配置全部按设备或外部场景提供，不在通用内核、
+  驱动或共享测试脚本里猜测板级数值。目标范围明确为 RV QEMU、LA QEMU、VF2
+  真板和未来 LA 真板四种模式；前三种进入当前实现/验收，LA 真板型号未知期间只
+  定义 compile/link-time platform resource provider + static driver set + xtask
+  target-profile seam，并用 synthetic provider 证明无需修改 generic kernel。
+  不注册虚假的 LA board target，也不猜它的启动协议、NIC、MMIO 或 IRQ。
+  **Verification**：CodeGraph 与三路只读反证审计确认当前共同失败点为：
+  `DeviceInfo` 仅有单 MMIO/IRQ、通用设备初始化按架构分支、RV64 固定 virtio
+  位置、LA64 固定 PCI 拓扑、全局 `net_irq()`、bottom half 查固定接口，以及通用
+  boot runtime 内置 QEMU 网络策略。详细计划已覆盖设备顺序/位置变异、零/多 NIC、
+  per-device IRQ/DMA、namespace/FIB 权威状态、hermetic HTTPS 与真机远端 clone。
+  新增通俗说明经源码行号抽查，覆盖当前 `DeviceInfo`、按架构分支、固定 `eth0`、
+  单例网络 IRQ、QEMU 固定 placement 与 SLIRP 参数；概念说明同时对照 StarFive
+  JH7110 datasheet、Linux stmmac、OASIS VirtIO 与 QEMU 官方设备/网络资料；48 个
+  Markdown fence 成对，`git diff --check` 通过。
+  新 JSON 经 `jq` 结构/状态断言通过，三份计划文件的部署数值扫描无命中，
+  `cargo xtask lint docs` 仍只有既有 23 个断链与 6 个退役词汇警告，未命中新文件。
+  `cargo xtask progress validate` 仍先被既有
+  `plans/2026-07-24-network-time-integration.json` 的非法 `completed` 状态阻断，
+  本轮未修改该无关记录。
+  **Next**：先执行 Phase 0，修订 active HAL/DEVICE/PAGE/INVARIANTS 契约，新增
+  canonical net-device/boot-network 规范并冻结 LA 真板 hook；readiness 复核为
+  ready 后才进入 lint、资源模型、两种 QEMU、VF2 DWMAC 和真机验收阶段。实际
+  LA board port 等板子接入、型号与固件事实可读后再追加，不阻塞当前三种模式。
+  **Blocker**：当前 implementation readiness 为 no；active `DEVICE.md` 仍把启动期
+  发现/匹配全部归入 deferred tier 3，HAL 也缺少多资源、per-device IRQ/DMA 契约。
+  这些文档缺口关闭前不应开始 VF2 驱动实现。
+
+- 2026-08-03 (**VF2 Alpine Git 镜像已完成本地能力验证；外网 clone 等待板载 GMAC 驱动**).
+  **Changed**：无代码改动；澄清 `local-images/git/boot.sh` 是当前启用 LA64 的
+  QEMU 启动器，不能在 U-Boot 或 txKernel shell 中运行。VF2 应将裸 ext4 镜像
+  作为 SD 整盘并以 `tx.root=mmcblk0 init=/bin/sh` 直接挂根；此时使用根目录
+  `/usr`、`/lib`，不使用 QEMU `tx.runsh` lane 的 `/musl`、`10.0.2.x` DNS/代理。
+  **Verification**：真机 `/dev/block/mmcblk0` 存在；只读 ext4 挂载成功，镜像内
+  `/usr/bin/git`、`git-remote-https`、CA bundle 均存在；用镜像 musl loader 实际
+  执行得到 `git version 2.49.1`，随后成功卸载诊断挂载。`/proc/net/dev` 虽显示
+  逻辑 `eth0`，收发计数均为零；当前 RV64 设备初始化仅绑定 virtio-net，DTB/HAL
+  没有 JH7110 GMAC/DWMAC 分类和驱动，故宿主 `192.168.1.100` 的 U-Boot TFTP
+  通路不能延续到 txKernel 用户态。
+  **Next**：先用单核 Alpine 根盘启动验证 `git init/add/commit/status` 本地闭环；
+  若目标是真机 `git clone https://github.com/...`，需先实现并验证 JH7110 GMAC、
+  真实 LAN 地址/路由/DNS，再处理 VF2 无持久 RTC 时的 TLS 时间来源。
+  **Blocker**：Git 二进制与 SD/ext4 无 blocker；VF2 外网 Git 被缺失的板载以太网
+  驱动阻塞，无法通过 shell 网络配置绕过。
+
+- 2026-08-03 (**VF2 单核 BusyBox 真机上板闭环；稀疏 hart 与缺失 RTC 已正确处理**).
+  **Changed**：共享 RV64 HAL 现在从启用的 DTB 节点识别
+  `google,goldfish-rtc`，仅在真实存在时映射 MMIO 并开放持久时钟操作；VF2
+  缺少该设备时五个 RTC 操作均返回 `Unsupported`，不会触碰 QEMU 专用
+  `0x0010_1000`。UART/RTC/net IRQ 安装与通知改为运行时 getter，零值表示能力
+  缺失并跳过。补齐 QEMU/VF2 真实 DTB、MMIO、动态 IRQ 和无 RTC 副作用回归，
+  同步 `HAL_v1.md`。首次 TFTP 的两个 `iminfo` CRC 均通过，`bootm` 成功搬运
+  kernel/initrd/control DTB 并进入 txKernel，随后在 substrate BSP init 报
+  `epoch initialization failed: InvalidCpu`。根因是 VF2 U74 使用 raw hart 1–4，
+  而 epoch/zone 把 `possible_cpu_count()` 的 popcount 错当 raw `CpuId` 上界；
+  `tx.maxcpus=1` 形成 `{1}` 后 `CpuId(1) >= count(1)`。epoch/zone 现保存并扫描
+  原始 `CpuMask`，按成员关系与固定 64 槽边界验证；epoch 完整安装后才发布
+  initialized，zone AP 等待 Running；substrate BSP observation 也记录真实 hart。
+  第二版 release VF2 uImage 已生成并经 TFTP 启动：内核 load/entry
+  `0x80200000`、4.58 MiB，initrd 1.02 MiB；仍未 `saveenv` 或写 SD 卡。详见本地日志
+  `msp/debug-logs/2026-08-03-vf2-sparse-hart-invalid-cpu.md`。
+  **Verification**：RV64 HAL **108/108**、kernel IRQ **8/8**、M1Dock mock
+  **14/14**、LA64 新增 getter 定向 **5/5**；changed-file rustfmt 通过；
+  稀疏 BSP/AP/EBR **6/6**、substrate lib **41/41**、epoch **4/4**、zone
+  **10/10**；`cargo xtask build --target rv64-qemu --release` 通过；QEMU `-smp 4`
+  BusyBox 启动观察到 `txkernel:qemu-riscv64-virt:boot:ok`。真机 OpenSBI 明确报告
+  `Domain0 Boot HART: 1`/`Boot HART ID: 1`；第二版 kernel/initrd 的 TFTP、
+  `iminfo` CRC 均通过。临时 bootargs 使用
+  `tx.maxcpus=1 tx.profile=busybox tx.boot.mode=busybox console=ttyS0` 后，串口依次
+  观察到 `possible=1:online=1`、`boot:ok`、`userspace:submitted` 和 BusyBox
+  `/ #`；`echo TXVF2_SHELL_OK`、`pwd`、`ls /` 均通过。仅设 `tx.maxcpus=1` 时
+  BusyBox 报缺少 `/etc/init.d/rcS`，已确认是未选择 `tx.profile=busybox` 导致
+  `/init` 以 init applet 运行，不是 syscall 或内核回归。完整 substrate 测试仍被
+  既有 `tests/epoch_publication_zone.rs` 的陈旧 `tx_substrate::Published` import
+  挡在编译期；`cargo -q xtask unit` 仍为既有 tx-shims 37 项与 tx-kernel 3 项
+  失败；标准 smoke 夹具缺少
+  `tools/test-init/tx-test-init.sh`，故改用已有 BusyBox sentinel 等价验证；docs
+  lint 仍为既有 23 个断链与 6 个退役词汇警告，本次 HAL/STATUS 改动未新增命中。
+  **Next**：当前真机继续保持单核临时启动；后续先修正或替换 U-Boot control FDT
+  中虚假的 hart0 描述，再补真实多核启动见证，并视需要把这套命令固化为受控的
+  board-run 流程。
+  **Blocker**：单核 BusyBox shell 无 blocker。真实 SMP 验证仍被 control FDT 的
+  hart0 错误描述阻塞；在修正前不解除 `tx.maxcpus=1`、不 `saveenv`、不启动 hart0。
+
 - 2026-08-01 (**main 合入 network recovery，RV64/LA64 GitHub 与网络基准双架构闭环**).
   将 `main@5cd2f8de` 以显式 merge 合入
   `feature-network-refactor-recovery@66a846de`；Phase 1～8 继续搁置。三处

@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize
 mod boot_static;
 mod boot_trampoline;
 mod debug_trace;
+mod device_control;
 mod dtb;
 mod pmap;
 mod sbi;
@@ -83,7 +84,6 @@ const PLIC_ENABLE_CONTEXT_STRIDE: usize = 0x80;
 const PLIC_CONTEXT_BASE: usize = 0x20_0000;
 const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const PLIC_CLAIM_COMPLETE: usize = 0x4;
-#[cfg(any(target_arch = "riscv64", test))]
 const GOLDFISH_RTC_PHYS_BASE: usize = 0x0010_1000;
 #[cfg(target_arch = "riscv64")]
 const GOLDFISH_RTC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + GOLDFISH_RTC_PHYS_BASE;
@@ -412,6 +412,12 @@ impl PlatformInfoIf for Platform {
     fn devices() -> &'static [tx_hal::DeviceInfo] {
         BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref()
     }
+
+    fn prepare_platform_device(
+        device: &'static tx_hal::PlatformDevice,
+    ) -> Result<(), tx_hal::PlatformDevicePrepareError> {
+        device_control::prepare_platform_device(device)
+    }
 }
 
 impl AuxvIf for Platform {
@@ -651,16 +657,14 @@ impl IrqIf for Platform {
     /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
     const UART_IRQ: u32 = 10;
     fn uart_irq() -> u32 {
-        uart_device_info()
-            .and_then(|uart| uart.irq)
-            .unwrap_or(Self::UART_IRQ)
+        uart_irq_from_devices(<Self as PlatformInfoIf>::devices())
     }
 
     /// QEMU `virt` machine's goldfish RTC is wired at PLIC IRQ 11.
     const RTC_IRQ: u32 = GOLDFISH_RTC_IRQ;
-    /// `virtio1@0x1000_2000` is MMIO slot 1; QEMU wires slot N to
-    /// `VIRTIO_IRQ + N`, so the boot network device uses PLIC IRQ 2.
-    const NET_IRQ: u32 = 2;
+    fn rtc_irq() -> u32 {
+        goldfish_rtc_irq()
+    }
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
@@ -771,28 +775,45 @@ impl DeadlineTimerIf for Platform {
 
 impl PersistentClockIf for Platform {
     fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        if !goldfish_rtc_available() {
+            return Err(PersistentClockError::Unsupported);
+        }
         Ok(goldfish_rtc_read_time_ns())
     }
 
     fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError> {
+        if !goldfish_rtc_available() {
+            return Err(PersistentClockError::Unsupported);
+        }
         goldfish_rtc_write_time_ns(ns);
         Ok(())
     }
 
     fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError> {
+        let irq = goldfish_rtc_irq();
+        if irq == 0 {
+            return Err(PersistentClockError::Unsupported);
+        }
         goldfish_rtc_program_alarm_ns(ns);
-        Self::set_priority(GOLDFISH_RTC_IRQ, 1);
-        Self::unmask(GOLDFISH_RTC_IRQ);
+        Self::set_priority(irq, 1);
+        Self::unmask(irq);
         Ok(())
     }
 
     fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        let irq = goldfish_rtc_irq();
+        if irq == 0 {
+            return Err(PersistentClockError::Unsupported);
+        }
         goldfish_rtc_disable_alarm();
-        Self::mask(GOLDFISH_RTC_IRQ);
+        Self::mask(irq);
         Ok(())
     }
 
     fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        if !goldfish_rtc_available() {
+            return Err(PersistentClockError::Unsupported);
+        }
         goldfish_rtc_ack_alarm_irq();
         Ok(())
     }
@@ -843,6 +864,59 @@ fn rv64_unpin_cpu(cpu: CpuId) {
         .fetch_sub(1, Ordering::Release);
     assert!(previous != 0, "RV64 CPU pin nesting underflow");
 }
+
+const SIFIVE_CCACHE_LINE_SIZE: usize = 64;
+#[cfg(target_arch = "riscv64")]
+const SIFIVE_CCACHE_FLUSH64: usize = 0x200;
+
+fn outer_cache_line_span(start: PhysAddr, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let end = start.0.checked_add(len)?;
+    Some((start.0 & !(SIFIVE_CCACHE_LINE_SIZE - 1), end))
+}
+
+/// Maintain a firmware-described SiFive-compatible outer cache.
+///
+/// JH7110 exposes a single FLUSH64 operation for writeback, invalidate, and
+/// writeback+invalidate. QEMU has no matching DT node, so the same portable
+/// HAL implementation naturally becomes a no-op there.
+#[cfg(target_arch = "riscv64")]
+fn sifive_outer_cache_flush_range(start: PhysAddr, len: usize) {
+    let Some((mut line, end)) = outer_cache_line_span(start, len) else {
+        return;
+    };
+    let Some(cache) = platform_device_info(tx_hal::DeviceKind::CacheController) else {
+        return;
+    };
+    let Some(region) = <Platform as PlatformInfoIf>::platform_info()
+        .mmio_regions
+        .iter()
+        .find(|region| region.phys == cache.mmio)
+    else {
+        return;
+    };
+    if region.virt.size < SIFIVE_CCACHE_FLUSH64 + core::mem::size_of::<u64>() {
+        return;
+    }
+
+    rv64_dma_fence();
+    let flush = (region.virt.start.0 + SIFIVE_CCACHE_FLUSH64) as *mut u64;
+    while line < end {
+        unsafe {
+            core::ptr::write_volatile(flush, line as u64);
+        }
+        // The controller consumes one physical line address at a time. Wait
+        // for that MMIO command before reusing the command register.
+        rv64_dma_fence();
+        line += SIFIVE_CCACHE_LINE_SIZE;
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn sifive_outer_cache_flush_range(_start: PhysAddr, _len: usize) {}
+
 impl CacheIf for Platform {
     fn fence_all() {
         rv64_fence_all();
@@ -860,11 +934,17 @@ impl CacheIf for Platform {
         rv64_fence_i();
     }
 
-    fn dcache_clean_range(_start: PhysAddr, _len: usize) {}
+    fn dcache_clean_range(start: PhysAddr, len: usize) {
+        sifive_outer_cache_flush_range(start, len);
+    }
 
-    fn dcache_invalidate_range(_start: PhysAddr, _len: usize) {}
+    fn dcache_invalidate_range(start: PhysAddr, len: usize) {
+        sifive_outer_cache_flush_range(start, len);
+    }
 
-    fn dcache_clean_invalidate_range(_start: PhysAddr, _len: usize) {}
+    fn dcache_clean_invalidate_range(start: PhysAddr, len: usize) {
+        sifive_outer_cache_flush_range(start, len);
+    }
 }
 
 impl DmaIf for Platform {
@@ -878,9 +958,27 @@ impl DmaIf for Platform {
         PhysAddr(daddr.0 as usize)
     }
 
-    fn sync_for_device(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+    fn sync_for_device(paddr: PhysAddr, len: usize, dir: DmaDirection) {
+        match dir {
+            DmaDirection::ToDevice => Self::dcache_clean_range(paddr, len),
+            DmaDirection::FromDevice | DmaDirection::Bidirectional => {
+                Self::dcache_clean_invalidate_range(paddr, len)
+            }
+        }
+    }
 
-    fn sync_for_cpu(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+    fn sync_for_cpu(paddr: PhysAddr, len: usize, dir: DmaDirection) {
+        match dir {
+            DmaDirection::ToDevice => {}
+            DmaDirection::FromDevice | DmaDirection::Bidirectional => {
+                Self::dcache_invalidate_range(paddr, len)
+            }
+        }
+    }
+
+    fn publish_to_device() {
+        rv64_dma_fence();
+    }
 }
 impl SmpIf for Platform {
     fn current_cpu_id() -> CpuId {
@@ -1414,12 +1512,10 @@ fn valid_plic_irq(irq: u32) -> bool {
 /// (host tests, missing chosen node) get `None`, so the firmware topology is
 /// used without an additional cap.
 ///
-/// The VF2 U-Boot control FDT MISDESCRIBES hart0 (claims
-/// u74-mc + mmu-type sv39 + status okay for what is physically an
-/// MMU-less S7 monitor core — verified with `fdt print /cpus/cpu@0`
-/// on the board, 2026-07-02). Real-board boot commands should therefore keep
-/// passing an explicit `tx.maxcpus` policy; QEMU's generated FDT is the
-/// authoritative default for the final SMP lane.
+/// `tx.maxcpus` is an optional diagnostic/policy cap, not a board-topology
+/// workaround. The DTB parser normalizes the VF2 U-Boot control FDT's false
+/// hart0 description from the JH7110 SoC identity, so an uncapped VF2 boot
+/// selects U74 harts 1..4 while QEMU selects every generated virt hart.
 fn max_cpus_from_cmdline() -> Option<usize> {
     let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
         .boot_info_ref()
@@ -1654,12 +1750,87 @@ fn plic_write_u32(offset: usize, value: u32) {
 ///
 /// Idempotent: writing IER and `csrs` instructions just set the
 /// same bits.
+#[cfg(target_arch = "riscv64")]
+fn platform_device_info(kind: tx_hal::DeviceKind) -> Option<tx_hal::DeviceInfo> {
+    platform_device_info_from(
+        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref(),
+        kind,
+    )
+}
+
+fn platform_device_info_from(
+    devices: &[tx_hal::DeviceInfo],
+    kind: tx_hal::DeviceKind,
+) -> Option<tx_hal::DeviceInfo> {
+    devices.iter().copied().find(|device| device.kind == kind)
+}
+
+fn uart_irq_from_devices(devices: &[tx_hal::DeviceInfo]) -> u32 {
+    platform_device_info_from(devices, tx_hal::DeviceKind::Uart)
+        .and_then(|device| device.irq)
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "riscv64")]
 fn uart_device_info() -> Option<tx_hal::DeviceInfo> {
-    BootStaticBag::<IdentityDropped>::global_ref()
-        .platform_devices_ref()
-        .iter()
-        .copied()
-        .find(|device| device.kind == tx_hal::DeviceKind::Uart)
+    platform_device_info(tx_hal::DeviceKind::Uart)
+}
+
+fn goldfish_rtc_device_info_from(devices: &[tx_hal::DeviceInfo]) -> Option<tx_hal::DeviceInfo> {
+    platform_device_info_from(devices, tx_hal::DeviceKind::GoldfishRtc).filter(|device| {
+        device.mmio.start.0 == GOLDFISH_RTC_PHYS_BASE && device.mmio.size >= 0x1000
+    })
+}
+
+fn goldfish_rtc_available_from_devices(devices: &[tx_hal::DeviceInfo]) -> bool {
+    goldfish_rtc_device_info_from(devices).is_some()
+}
+
+fn goldfish_rtc_irq_from_devices(devices: &[tx_hal::DeviceInfo]) -> u32 {
+    goldfish_rtc_device_info_from(devices)
+        .and_then(|device| device.irq)
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn goldfish_rtc_available() -> bool {
+    goldfish_rtc_available_from_devices(
+        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref(),
+    )
+}
+
+#[cfg(target_arch = "riscv64")]
+fn goldfish_rtc_irq() -> u32 {
+    goldfish_rtc_irq_from_devices(
+        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref(),
+    )
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn goldfish_rtc_available() -> bool {
+    HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state")
+        .present
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn goldfish_rtc_irq() -> u32 {
+    if goldfish_rtc_available() {
+        GOLDFISH_RTC_IRQ
+    } else {
+        0
+    }
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn goldfish_rtc_available() -> bool {
+    false
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn goldfish_rtc_irq() -> u32 {
+    0
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -1860,6 +2031,7 @@ static HOST_PLIC_STATE: std::sync::Mutex<HostPlicState> =
 
 #[cfg(all(not(target_arch = "riscv64"), test))]
 struct HostGoldfishRtcState {
+    present: bool,
     registers: [u32; 8],
     read_offsets: [usize; 16],
     read_len: usize,
@@ -1872,6 +2044,7 @@ struct HostGoldfishRtcState {
 impl HostGoldfishRtcState {
     const fn new() -> Self {
         Self {
+            present: true,
             registers: [0; 8],
             read_offsets: [0; 16],
             read_len: 0,
@@ -1883,6 +2056,10 @@ impl HostGoldfishRtcState {
 
     fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    fn set_present(&mut self, present: bool) {
+        self.present = present;
     }
 
     fn set_time_ns(&mut self, ns: u64) {
@@ -2472,6 +2649,16 @@ fn rv64_fence_all() {
     }
 }
 
+fn rv64_dma_fence() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::fence(Ordering::Release);
+}
+
 fn rv64_fence_i() {
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -2517,9 +2704,9 @@ impl BootStaticBag<IdentityLive> {
 
         let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
 
-        let devices = unsafe { self.platform_devices_mut() };
-        let device_count = unsafe { dtb::parse_devices_from_fdt(dtb_addr, &mut devices[..]) };
-        self.publish_platform_device_count(device_count);
+        let device_count = unsafe { self.publish_device_facts_from_fdt(dtb_addr) }
+            .expect("firmware device/resource seed exceeds boot-static capacity");
+        let devices = self.platform_devices_ref();
 
         if let Some(plic) = devices[..device_count]
             .iter()
@@ -2553,6 +2740,8 @@ impl BootStaticBag<IdentityLive> {
         if let Some(parsed) = parsed {
             self.publish_startable_harts(parsed.startable_harts);
         }
+        self.publish_platform_info()
+            .expect("platform MMIO compatibility projection exceeds boot-static capacity");
 
         let reserved_count = unsafe {
             dtb::parse_reserved_regions_from_fdt(

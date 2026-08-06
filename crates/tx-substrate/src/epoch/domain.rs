@@ -76,8 +76,10 @@ pub(crate) struct EpochDomain {
     global_epoch: CachePadded<AtomicU64>,
     /// Debug/accounting counter for currently pinned CPU participants.
     active_guards: CachePadded<AtomicUsize>,
-    /// Number of CPUs the platform says may participate in EBR.
-    possible_cpus: CachePadded<AtomicUsize>,
+    /// Raw CPU-ID mask for CPUs that may participate in EBR. Hardware hart
+    /// IDs may be sparse (for example, VF2 application harts are 1..=4), so
+    /// the population count is not a valid per-CPU array bound.
+    possible_cpu_mask: CachePadded<AtomicU64>,
     /// Set by retirement/pin hot paths and consumed at a normal-stack drain
     /// point. Trap/IRQ paths may request collection but never execute
     /// destructor callbacks themselves.
@@ -105,7 +107,7 @@ impl EpochDomain {
             initialized: AtomicBool::new(false),
             global_epoch: CachePadded::new(AtomicU64::new(INITIAL_EPOCH)),
             active_guards: CachePadded::new(AtomicUsize::new(0)),
-            possible_cpus: CachePadded::new(AtomicUsize::new(1)),
+            possible_cpu_mask: CachePadded::new(AtomicU64::new(1)),
             collection_requested: AtomicBool::new(false),
             hooks: UnsafeCell::new(PlatformHooks::default()),
             cpu_states: [const { CpuLocalEpochState::new() }; MAX_EPOCH_CPUS],
@@ -120,21 +122,28 @@ impl EpochDomain {
     where
         P: PercpuIf + SmpIf + IrqIf,
     {
-        let possible_cpus = P::possible_cpu_count();
-        if possible_cpus == 0 || possible_cpus > MAX_EPOCH_CPUS {
+        let possible_cpu_mask = P::possible_cpus();
+        let possible_cpu_count = possible_cpu_mask.count();
+        if possible_cpu_count == 0 || possible_cpu_count > MAX_EPOCH_CPUS {
             return Err(EpochError::TooManyCpus);
         }
+        let current_cpu = <P as PercpuIf>::current_cpu_id();
+        if current_cpu.0 >= MAX_EPOCH_CPUS || !possible_cpu_mask.contains(current_cpu) {
+            return Err(EpochError::InvalidCpu);
+        }
 
-        self.initialized
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| EpochError::AlreadyInitialized)?;
+        let _guard = self.lock.lock();
+        if self.initialized.load(Ordering::Acquire) {
+            return Err(EpochError::AlreadyInitialized);
+        }
 
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
         self.active_guards.0.store(0, Ordering::Release);
-        self.possible_cpus.0.store(possible_cpus, Ordering::Release);
+        self.possible_cpu_mask
+            .0
+            .store(possible_cpu_mask.bits(), Ordering::Release);
         self.collection_requested.store(false, Ordering::Release);
 
-        let _guard = self.lock.lock();
         unsafe {
             *self.hooks.get() = PlatformHooks::for_platform::<P>();
             (*self.state.get()).reset();
@@ -144,17 +153,22 @@ impl EpochDomain {
             self.cpu_states[cpu].reset();
         }
 
-        self.init_cpu(<P as PercpuIf>::current_cpu_id())
+        self.init_cpu(current_cpu)?;
+        // Publish only after the mask, hooks, queue, and BSP-local state are
+        // fully installed. AP initialization and guard acquisition use
+        // Acquire loads of this flag.
+        self.initialized.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn init_for_test(&'static self) {
-        self.initialized.store(true, Ordering::Release);
+        let _guard = self.lock.lock();
+        self.initialized.store(false, Ordering::Release);
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
         self.active_guards.0.store(0, Ordering::Release);
-        self.possible_cpus.0.store(1, Ordering::Release);
+        self.possible_cpu_mask.0.store(1, Ordering::Release);
         self.collection_requested.store(false, Ordering::Release);
 
-        let _guard = self.lock.lock();
         unsafe {
             *self.hooks.get() = PlatformHooks::default();
             (*self.state.get()).reset();
@@ -164,6 +178,7 @@ impl EpochDomain {
             self.cpu_states[cpu].reset();
         }
         self.cpu_states[0].init();
+        self.initialized.store(true, Ordering::Release);
     }
 
     fn init_on_ap(&'static self, cpu: CpuId) -> Result<(), EpochError> {
@@ -174,7 +189,7 @@ impl EpochDomain {
     }
 
     fn init_cpu(&'static self, cpu: CpuId) -> Result<(), EpochError> {
-        if cpu.0 >= self.possible_cpus.0.load(Ordering::Acquire) {
+        if !self.is_possible_cpu(cpu) {
             return Err(EpochError::InvalidCpu);
         }
         self.cpu_states[cpu.0].init();
@@ -388,7 +403,7 @@ impl EpochDomain {
 
         let cpu_pin = (hooks.pin_current_cpu)();
         let cpu_id = cpu_pin.cpu_id();
-        if cpu_id.0 >= self.possible_cpus.0.load(Ordering::Acquire)
+        if !self.is_possible_cpu(cpu_id)
             || !(hooks.is_cpu_online)(cpu_id)
             || !self.cpu_states[cpu_id.0].is_initialized()
         {
@@ -503,9 +518,13 @@ impl EpochDomain {
 
         // Epoch advance is allowed only if every online initialized CPU is
         // either outside a guard (`local == 0`) or already in the current epoch.
-        for cpu in 0..self.possible_cpus.0.load(Ordering::Acquire) {
+        let possible_cpu_mask = self.possible_cpu_mask();
+        for cpu in 0..MAX_EPOCH_CPUS {
             let cpu_id = CpuId(cpu);
-            if !(hooks.is_cpu_online)(cpu_id) || !self.cpu_states[cpu].is_initialized() {
+            if !possible_cpu_mask.contains(cpu_id)
+                || !(hooks.is_cpu_online)(cpu_id)
+                || !self.cpu_states[cpu].is_initialized()
+            {
                 continue;
             }
 
@@ -527,17 +546,27 @@ impl EpochDomain {
     }
 
     fn total_retired_count(&self) -> usize {
-        (0..self.possible_cpus.0.load(Ordering::Acquire))
+        let possible_cpu_mask = self.possible_cpu_mask();
+        (0..MAX_EPOCH_CPUS)
+            .filter(|cpu| possible_cpu_mask.contains(CpuId(*cpu)))
             .map(|cpu| self.cpu_states[cpu].retired_count())
             .sum()
     }
 
     fn cpu_state(&'static self, cpu: CpuId) -> Option<&'static CpuLocalEpochState> {
-        if cpu.0 < self.possible_cpus.0.load(Ordering::Acquire) {
+        if self.is_possible_cpu(cpu) {
             Some(&self.cpu_states[cpu.0])
         } else {
             None
         }
+    }
+
+    fn possible_cpu_mask(&self) -> tx_hal::CpuMask {
+        tx_hal::CpuMask::from_bits(self.possible_cpu_mask.0.load(Ordering::Acquire))
+    }
+
+    fn is_possible_cpu(&self, cpu: CpuId) -> bool {
+        cpu.0 < MAX_EPOCH_CPUS && self.possible_cpu_mask().contains(cpu)
     }
 
     fn hooks(&'static self) -> PlatformHooks {
@@ -545,12 +574,12 @@ impl EpochDomain {
     }
 
     unsafe fn reset_for_test(&'static self) {
+        let _guard = self.lock.lock();
         self.initialized.store(false, Ordering::Release);
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
         self.active_guards.0.store(0, Ordering::Release);
-        self.possible_cpus.0.store(1, Ordering::Release);
+        self.possible_cpu_mask.0.store(1, Ordering::Release);
         self.collection_requested.store(false, Ordering::Release);
-        let _guard = self.lock.lock();
         *self.hooks.get() = PlatformHooks::default();
         (*self.state.get()).reset();
         for cpu in 0..MAX_EPOCH_CPUS {
@@ -563,7 +592,7 @@ impl EpochDomain {
             initialized: self.initialized.load(Ordering::Acquire),
             global_epoch: self.global_epoch.0.load(Ordering::Acquire),
             active_guards: self.active_guards.0.load(Ordering::Acquire),
-            possible_cpus: self.possible_cpus.0.load(Ordering::Acquire),
+            possible_cpus: self.possible_cpu_mask().count(),
             retired_count: self.total_retired_count(),
             collection_requested: self.collection_requested.load(Ordering::Acquire),
         }
