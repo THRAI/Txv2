@@ -1,3 +1,15 @@
+- 2026-08-06 (**记录 LA QEMU 手动 Git 比赛验证链路**).
+  **Changed**：本机知识库第 09 章改为不用启动脚本的逐条命令，覆盖宿主机
+  LA 内核构建、`/tmp` 运行盘副本、四核 QEMU 启动，以及 Guest 的 DHCP、
+  DNS、时间、CA、Git Task0/1/2、测试仓库 push、网页修改和 pull；只保留
+  成功重点与五类常见失败，PAT 仅使用占位符。
+  **Verification**：章节 Markdown 围栏总数为 236（成对）；LA 小节不再引用
+  `tools/tx-shell.sh`，未写入真实 PAT，`git diff --check` 通过。
+  **Next**：用户按 LA 小节逐条完成本次手动 `la-qemu-manual` 分支的 push，
+  网页修改后再执行 `git pull --ff-only me la-qemu-manual`。
+  **Blocker**：最终 pull 仍需用户先在 GitHub 网页提交远端 README 修改；
+  LA 实板不在当前阶段范围内。
+
 - 2026-08-06 (**精简 LA QEMU 镜像副本与启动步骤**).
   **Changed**：修正 `tools/tx-shell.sh` 生成 Guest DHCP 脚本时过早展开变量的
   问题，并设置 Alpine 镜像中的 CA 证书路径；将本机知识库第 09 章的 LA QEMU
