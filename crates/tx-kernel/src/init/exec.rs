@@ -753,7 +753,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // path handles it. The IRQ path stays in place so a quiescent
         // WFI still wakes promptly when bytes arrive.
         let mut buf = [0u8; 512];
-        let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
+        let n = crate::irq::try_read_console_bytes::<P>(&mut buf);
         if n == 0 {
             return 0;
         }

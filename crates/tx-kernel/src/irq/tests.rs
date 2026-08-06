@@ -28,7 +28,7 @@ use tx_hal::{
 use crate::init::{console_tty, CoreInit};
 use crate::irq::{
     drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats, publish_deferred_net_claim,
-    register_irq_handler, rtc_alarm_irq_handler, uart_rx_irq_handler,
+    register_irq_handler, rtc_alarm_irq_handler, try_read_console_bytes, uart_rx_irq_handler,
 };
 use crate::test_serialise::KERNEL_TEST_LOCK as IRQ_TEST_LOCK;
 use tx_subsystems::device_binding::BoundDeviceKey;
@@ -72,6 +72,46 @@ static IRQ_TEST_NET_ACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_ACK_ORDER: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_COMPLETE_ORDER: AtomicUsize = AtomicUsize::new(0);
+
+static REENTRANT_CONSOLE_READS: AtomicUsize = AtomicUsize::new(0);
+
+struct ReentrantConsole;
+
+impl ConsoleIf for ReentrantConsole {
+    fn write_bytes(_bytes: &[u8]) {}
+
+    fn read_bytes(buf: &mut [u8]) -> usize {
+        REENTRANT_CONSOLE_READS.fetch_add(1, Ordering::AcqRel);
+        let mut nested = [0u8; 1];
+        assert_eq!(
+            try_read_console_bytes::<Self>(&mut nested),
+            0,
+            "an IRQ-style nested reader must not re-enter the console source",
+        );
+        buf[0] = b'R';
+        1
+    }
+}
+
+static BLOCKING_CONSOLE_ENTERED: AtomicBool = AtomicBool::new(false);
+static BLOCKING_CONSOLE_RELEASE: AtomicBool = AtomicBool::new(false);
+static BLOCKING_CONSOLE_READS: AtomicUsize = AtomicUsize::new(0);
+
+struct BlockingConsole;
+
+impl ConsoleIf for BlockingConsole {
+    fn write_bytes(_bytes: &[u8]) {}
+
+    fn read_bytes(buf: &mut [u8]) -> usize {
+        BLOCKING_CONSOLE_READS.fetch_add(1, Ordering::AcqRel);
+        BLOCKING_CONSOLE_ENTERED.store(true, Ordering::Release);
+        while !BLOCKING_CONSOLE_RELEASE.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        buf[0] = b'S';
+        1
+    }
+}
 
 struct IrqTestNetDevice;
 
@@ -331,6 +371,10 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     IRQ_TEST_SEQUENCE.store(0, Ordering::Release);
     IRQ_TEST_ACK_ORDER.store(0, Ordering::Release);
     IRQ_TEST_COMPLETE_ORDER.store(0, Ordering::Release);
+    REENTRANT_CONSOLE_READS.store(0, Ordering::Release);
+    BLOCKING_CONSOLE_ENTERED.store(false, Ordering::Release);
+    BLOCKING_CONSOLE_RELEASE.store(false, Ordering::Release);
+    BLOCKING_CONSOLE_READS.store(0, Ordering::Release);
     tx_fs::devfs::reset_rtc_backend_for_test();
     guard
 }
@@ -354,6 +398,47 @@ fn init_has_pending_sigint() -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn console_rx_reader_rejects_nested_and_cross_hart_consumers() {
+    let _setup = setup();
+
+    let mut byte = [0u8; 1];
+    assert_eq!(try_read_console_bytes::<ReentrantConsole>(&mut byte), 1);
+    assert_eq!(byte, [b'R']);
+    assert_eq!(
+        REENTRANT_CONSOLE_READS.load(Ordering::Acquire),
+        1,
+        "the nested contender must not call the platform reader",
+    );
+
+    let owner = std::thread::spawn(|| {
+        let mut byte = [0u8; 1];
+        let n = try_read_console_bytes::<BlockingConsole>(&mut byte);
+        (n, byte)
+    });
+    while !BLOCKING_CONSOLE_ENTERED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let mut contender_byte = [0u8; 1];
+    assert_eq!(
+        try_read_console_bytes::<BlockingConsole>(&mut contender_byte),
+        0,
+        "a concurrent hart must skip instead of reading the UART twice",
+    );
+    assert_eq!(contender_byte, [0]);
+    BLOCKING_CONSOLE_RELEASE.store(true, Ordering::Release);
+
+    let (n, owner_byte) = owner.join().expect("console owner thread");
+    assert_eq!(n, 1);
+    assert_eq!(owner_byte, [b'S']);
+    assert_eq!(
+        BLOCKING_CONSOLE_READS.load(Ordering::Acquire),
+        1,
+        "only one concurrent consumer may reach ConsoleIf::read_bytes",
+    );
+}
 
 /// `register_irq_handler(VIRT_UART_IRQ, fake_handler)` populates the
 /// global dispatch table at the slot indexed by the IRQ number.

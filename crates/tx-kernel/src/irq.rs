@@ -30,7 +30,9 @@
 pub mod device;
 
 use crate::adapter::step_engine::{spin_mutex, SpinMutex};
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use tx_hal::{
     ConsoleIf, CpuId, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, TxPlatform,
     IRQ_DISPATCH_TABLE_SIZE,
@@ -94,6 +96,43 @@ impl UartRxPending {
 
 static UART_RX_PENDING: SpinMutex<UartRxPending> =
     spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
+
+/// Non-blocking single-reader ownership for the platform console RX source.
+///
+/// The UART IRQ top half and the reactor's polling fallback both call
+/// `ConsoleIf::read_bytes`.  On a 16550-style UART, checking `LSR.DR` and
+/// consuming `RBR` are separate MMIO accesses.  Without one shared owner an
+/// IRQ (or another hart) can consume `RBR` after a poller observed `DR`, then
+/// the resumed poller reads the stale receive register and submits the byte a
+/// second time.  IRQ context must never wait for task context, so contenders
+/// skip this drain and let the current owner consume the FIFO.
+static CONSOLE_RX_READER_OWNED: AtomicBool = AtomicBool::new(false);
+
+struct ConsoleRxReaderGuard;
+
+impl Drop for ConsoleRxReaderGuard {
+    fn drop(&mut self) {
+        CONSOLE_RX_READER_OWNED.store(false, Ordering::Release);
+    }
+}
+
+/// Try to drain bytes from the one platform console RX source.
+///
+/// Returns zero when another IRQ/hart/reactor poll currently owns the source.
+/// Polling therefore remains available as a firmware/IRQ fallback without
+/// allowing two consumers to overlap the platform's hardware read sequence.
+pub(crate) fn try_read_console_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
+    if buf.is_empty()
+        || CONSOLE_RX_READER_OWNED
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+    {
+        return 0;
+    }
+
+    let _reader = ConsoleRxReaderGuard;
+    <P as ConsoleIf>::read_bytes(buf)
+}
 
 const DEFERRED_IRQ_IDLE: u8 = 0;
 const DEFERRED_IRQ_PUBLISHING: u8 = 1;
@@ -301,6 +340,7 @@ pub fn reset_dispatch_table_for_test() {
 pub fn reset_pending_uart_rx_for_test() {
     let mut pending = UART_RX_PENDING.lock();
     pending.len = 0;
+    CONSOLE_RX_READER_OWNED.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -479,7 +519,7 @@ pub fn rtc_alarm_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
 /// (defensive check against a stray pre-boot IRQ).
 pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
     let mut buf = [0u8; UART_RX_DRAIN_MAX];
-    let n = <P as ConsoleIf>::read_bytes(&mut buf);
+    let n = try_read_console_bytes::<P>(&mut buf);
     if n == 0 {
         // Spurious IRQ or FIFO already drained.
         return IrqHandled::Done;
