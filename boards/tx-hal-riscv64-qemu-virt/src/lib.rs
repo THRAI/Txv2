@@ -1910,7 +1910,7 @@ impl BootStaticBag<IdentityLive> {
     }
 
     unsafe fn publish_boot_info_from_fdt(&mut self) {
-        let dtb_addr = self.firmware_dtb().addr();
+        let dtb_addr = self.firmware_dtb().mapped_addr();
         let memory_regions = unsafe { self.memory_regions_mut() };
         let cmdline = unsafe { self.cmdline_mut() };
         memory_regions.fill(reserved_region());

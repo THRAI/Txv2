@@ -126,8 +126,15 @@ pub(super) fn extend_direct_map_from_bag<State>(
     let mut phys = align_up(current_end, SUPERPAGE_1G_SIZE).ok_or(PmapError::InvalidRequest)?;
     let target = align_up(phys_end.0, SUPERPAGE_1G_SIZE).ok_or(PmapError::InvalidRequest)?;
     while phys < target {
-        if let Some(reservation) = reserve_direct_map_1g_from_bag(bag, PhysAddr(phys))? {
-            commit_direct_map_1g_from_bag(bag, reservation);
+        match reserve_direct_map_1g_from_bag(bag, PhysAddr(phys))? {
+            Some(reservation) => commit_direct_map_1g_from_bag(bag, reservation),
+            // The boot trampoline may have installed the leaf that contains
+            // the firmware DTB before BootInfo reveals the full RAM span.
+            // Once lower contiguous leaves have been committed, publish that
+            // already-valid leaf as part of the canonical direct-map range.
+            None => unsafe {
+                extend_bootstrap_direct_map_info(bag, phys + SUPERPAGE_1G_SIZE);
+            },
         }
         phys = phys
             .checked_add(SUPERPAGE_1G_SIZE)
