@@ -1,0 +1,165 @@
+{
+  "schema": "tx.progress.handoff.v1",
+  "id": "2026-08-06-la2k1000-real-board-git",
+  "title": "Loongson 2K1000 real-board Git validation",
+  "created": "2026-08-06",
+  "from": "Codex",
+  "status": "open",
+  "plan": null,
+  "current_state": [
+    "Work continues on branch feature/portable-net-vf2-dwmac from commit c6b5f5f1 (feat: complete portable networking and VF2 Git validation).",
+    "RV64 and LA64 QEMU boot with the competition Alpine root filesystems; VF2 has completed real-board boot, networking, DNS, TLS, and public GitHub clone validation.",
+    "The Loongson 2K1000 Nebula board is powered and its onboard USB_DEBUG serial console has reached the U-Boot => prompt through /dev/ttyUSB0 at 115200 baud.",
+    "The available LA root filesystem is local-images/alpine-linux-loongarch64-ext4fs.img: a raw bare ext4 full Alpine root filesystem with LoongArch64 userspace and Git, not a partitioned disk image.",
+    "The repository currently exposes la64-qemu only; there is no la64-2k1000 target. Existing LA QEMU success is not evidence of 2K1000 board support.",
+    "The current LA linker uses physical load base 0x00200000, while xtask packages txv2-la.uimage for 0x90000000. The existing LA uImage must not be treated as a verified 2K1000 boot artifact.",
+    "The 2K1000 platform still needs board-specific UART/boot facts, ICU interrupt routing, AHCI storage, and ls,ls-gmac / snps,dwmac-3.70a network support before the Alpine root filesystem and Git can be validated on hardware.",
+    "The required end state is a real 2K1000 boot into the Alpine root filesystem followed by git help, local init/add/commit/log, HTTPS clone, commit, push, manual remote README edit, and pull.",
+    "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
+  ],
+  "changed_files": [
+    {
+      "path": "crates/tx-hal/src/device_resource.rs",
+      "reason": "Commit c6b5f5f1 adds the typed platform device-resource model used by portable binding."
+    },
+    {
+      "path": "crates/tx-kernel/src/devices/binder.rs",
+      "reason": "Commit c6b5f5f1 adds the static device binding path shared by current QEMU and VF2 network devices."
+    },
+    {
+      "path": "crates/tx-drivers/src/dwmac/mod.rs",
+      "reason": "Commit c6b5f5f1 adds the DWMAC5/EQoS driver used for the verified VF2 path; it does not yet cover the 2K1000 GMAC compatible."
+    },
+    {
+      "path": "xtask/src/network_scenario.rs",
+      "reason": "Commit c6b5f5f1 adds versioned QEMU network scenarios and mutation coverage."
+    },
+    {
+      "path": "docs/progress/plans/2026-08-04-portable-network-device.json",
+      "reason": "Records completion evidence for portable QEMU networking and VF2 real-board Git clone."
+    },
+    {
+      "path": "docs/progress/plans/2026-08-04-userspace-dhcp-client.json",
+      "reason": "Records the active AF_PACKET and userspace DHCP work; LA64 and real-board items remain incomplete."
+    },
+    {
+      "path": "docs/progress/handoffs/2026-08-06-la2k1000-real-board-git.json",
+      "reason": "Defines the authoritative continuation boundary for LA 2K1000 hardware work."
+    }
+  ],
+  "verification": [
+    {
+      "command": "git show --stat --oneline --summary c6b5f5f1",
+      "status": "passed",
+      "notes": "The existing 125-file change set is committed as c6b5f5f1."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "No whitespace errors were reported before the commit."
+    },
+    {
+      "command": "bash -n tools/tx-shell.sh tools/verify-git-net-la64.sh tools/verify-git-net.sh tools/udhcpc-guest-probe.sh tools/verify-udhcpc-rv64.sh tools/network-scenarios/fixtures/legacy/verify-git-net-la64.sh tools/network-scenarios/fixtures/legacy/verify-git-net-rv64.sh tools/network-scenarios/fixtures/legacy/verify-udhcpc-rv64.sh",
+      "status": "passed",
+      "notes": "All changed shell helpers parsed successfully."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "The current checkpoint is not host-unit green: tx-shims has multiple failing dispatch tests; tx-kernel fails two libctest command assertions and the run_thread_future clone-submit size budget (2624 bytes). tx-ext4 and tx-scripts pass."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "Validation stops at untouched record docs/progress/plans/2026-07-24-network-time-integration.json because it uses step status completed instead of complete."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "failed",
+      "notes": "The repository currently reports 31 existing broken links plus stale-vocabulary warnings; the new handoff JSON itself is accepted by cargo xtask progress list handoffs --json."
+    },
+    {
+      "command": "picocom -b 115200 /dev/ttyUSB0",
+      "status": "passed",
+      "notes": "The connected 2K1000 board reached a clean U-Boot => prompt through onboard USB_DEBUG."
+    }
+  ],
+  "next_actions": [
+    {
+      "id": "next-1",
+      "title": "Capture the minimum immutable U-Boot and firmware facts",
+      "paths": [
+        "boards/dtbs/ls2k1000-dp-v10.dts",
+        "xtask/src/target.rs",
+        "xtask/src/image.rs"
+      ],
+      "notes": "Run only short read-only U-Boot commands first: version, bdinfo, printenv loadaddr bootargs, and FDT chosen/memory inspection. State whether each command runs on the host or at the U-Boot => prompt, and retain only key output."
+    },
+    {
+      "id": "next-2",
+      "title": "Create a distinct 2K1000 platform and obtain the first serial boot",
+      "paths": [
+        "boards/tx-hal-loongarch64-qemu-virt",
+        "boards/tx-kernel-loongarch64-qemu-virt",
+        "xtask/src/target.rs",
+        "xtask/src/image.rs"
+      ],
+      "notes": "Keep QEMU and hardware constants separate. First acceptance point is a correctly loaded 2K1000 kernel that emits early serial output; do not claim rootfs or SMP completion at this stage."
+    },
+    {
+      "id": "next-3",
+      "title": "Reach a shell, then attach persistent Alpine storage",
+      "paths": [
+        "crates/tx-kernel/src/devices/block.rs",
+        "boards/dtbs/ls2k1000-dp-v10.dts"
+      ],
+      "notes": "Use a RAM-backed minimal userspace for the first / # if necessary. The persistent target is the existing raw LA ext4 image through the board's actual AHCI/SATA path; do not pass the ext4 image to bootm as a kernel."
+    },
+    {
+      "id": "next-4",
+      "title": "Bring up 2K1000 GMAC and external connectivity",
+      "paths": [
+        "crates/tx-drivers/src/dwmac",
+        "crates/tx-kernel/src/devices/dwmac_net.rs",
+        "boards/dtbs/ls2k1000-dp-v10.dts"
+      ],
+      "notes": "Acceptance requires link, IPv4 address, default route, DNS, correct time, TLS, and HTTPS access on the real board. Host and board commands must be clearly separated."
+    },
+    {
+      "id": "next-5",
+      "title": "Complete the real-board Git scoring flow",
+      "paths": [
+        "local-images/alpine-linux-loongarch64-ext4fs.img"
+      ],
+      "notes": "Verify git -h/help; /proj init/add/commit/log; clone https://github.com/oscomp/xv6-riscv.git; commit a README change; push to https://github.com/LLLPPPS/tx-push-test.git; after the user edits README in the GitHub web UI, pull it back. Report only commands, key success output, and failure meaning."
+    },
+    {
+      "id": "next-6",
+      "title": "Write the LA hardware documentation only after end-to-end success",
+      "paths": [
+        "msp/knowledge-handbook",
+        "msp/board"
+      ],
+      "notes": "Wait for explicit user direction. Reuse RV/VF2 material by reference where possible and record final facts rather than the development or repair chronology."
+    }
+  ],
+  "caveats": [
+    "Never print, log, document, stage, or commit the PAT stored in local-images/git/launch-shell.sh. The local-images directory is ignored and the helper is not tracked.",
+    "Do not modify the competition LA rootfs mother image during experiments; use a copy or a disposable overlay when the transport permits it.",
+    "QEMU 10.0.2.2/10.0.2.3 networking values are QEMU user-network endpoints and must not be copied to the physical 2K1000 network configuration.",
+    "U-Boot and txKernel may program different IP and MAC values while taking turns controlling the same physical Ethernet hardware; U-Boot network state does not automatically carry into txKernel.",
+    "Keep commands short: avoid unnecessary shell variables, if branches, printf scaffolding, generated helper scripts, and destructive cleanup commands.",
+    "For every hardware step, identify the execution context, show the shortest command, show only the key success output, and state what failure means.",
+    "Do not describe intermediate repair history in user-facing knowledge documents. Record the final working chain and durable constraints only."
+  ],
+  "links": [
+    "commit:c6b5f5f1",
+    "docs/progress/STATUS.md",
+    "docs/progress/plans/2026-08-04-portable-network-device.json",
+    "docs/progress/plans/2026-08-04-userspace-dhcp-client.json",
+    "docs/progress/research/2026-08-01-la64-virtio-net-irq-route.md",
+    "boards/dtbs/ls2k1000-dp-v10.dts",
+    "msp/knowledge-handbook/08-VF2内核下载与启动链路.md",
+    "msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md"
+  ]
+}

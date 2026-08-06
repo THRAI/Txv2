@@ -1,3 +1,19 @@
+- 2026-08-06 (**提交 portable-network/VF2 既有成果并交接 LA 2K1000 实板 Git 链路**).
+  **Changed**：将当前 125 个文件的 portable device resource、静态 binder、
+  per-device IRQ、DWMAC/VF2、AF_PACKET/DHCP、QEMU 网络场景及相关文档提交为
+  `c6b5f5f1`；新增
+  `docs/progress/handoffs/2026-08-06-la2k1000-real-board-git.json`，只记录
+  LA 实板当前事实、目标、边界、下一步和验收条件，不记录调试过程。
+  **Verification**：`git diff --check` 与已改 Shell 脚本的 `bash -n` 通过；
+  2K1000 已由 `/dev/ttyUSB0`、115200 baud 进入 U-Boot `=>`。当前
+  `cargo -q xtask unit` 仍有 tx-shims/tx-kernel 失败；
+  `cargo xtask progress validate` 仍被旧记录中的 `completed` 状态阻断；
+  `cargo xtask lint docs` 仍报告仓库已有的 31 个断链。
+  **Next**：从交接文件 `next-1` 开始读取最小 U-Boot/固件事实，建立独立
+  2K1000 平台，依次打通串口启动、存储根盘、GMAC 联网和 Git push/pull。
+  **Blocker**：当前无 `la64-2k1000` target，且 ICU、AHCI、板载 GMAC 尚未闭环；
+  在完整链路打通前不写 LA 知识手册。
+
 - 2026-08-06 (**区分 QEMU 虚拟 DNS 与 VF2 实机上游 DNS**).
   **Changed**：第 09 章说明 QEMU `10.0.2.3` 是 `-netdev user` 提供的
   稳定虚拟 DNS 端点，不应默认硬编码宿主机当前的
