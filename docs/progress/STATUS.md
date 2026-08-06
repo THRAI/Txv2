@@ -1,3 +1,16 @@
+- 2026-08-06 (**将 LA Git clone 失败收敛到 SMP4 TLB shootdown**).
+  **Changed**：新增本机操作账本
+  `msp/debug-logs/2026-08-06-la64-git-smp4-tlb-stall-operation-ledger.md`，记录
+  用户四核完整 clone 的 `requested=0x4d8/completed=0x4d7/servicing=0` 见证，
+  以及干净临时盘上的单核 A/B 对照。
+  **Verification**：SMP1 使用相同公开仓库完成 7812 个对象、17.47 MiB、
+  4137 个 delta 的完整 clone，`rev-parse --is-inside-work-tree` 返回 `true`；
+  clone 前约有 1.1 GiB 可用。CodeGraph 确认 SMP4 sender 在未完成 generation
+  上无期限等待，而 SMP1 会直接绕过远程 shootdown。
+  **Next**：立即评分流程将 LA QEMU 改为 `-smp 1`；四核恢复需单独修复目标
+  hart 未服务 TLB mailbox 的进度问题，并用相同完整 clone 回归。
+  **Blocker**：SMP4 根因尚未修复；当前会在 Git `index-pack` 压力下永久卡住。
+
 - 2026-08-06 (**记录 LA QEMU 手动 Git 比赛验证链路**).
   **Changed**：本机知识库第 09 章改为不用启动脚本的逐条命令，覆盖宿主机
   LA 内核构建、`/tmp` 运行盘副本、四核 QEMU 启动，以及 Guest 的 DHCP、
