@@ -1,3 +1,31 @@
+- 2026-08-07 (**修复 LA64 SMP4 TLB shootdown 永久等待**).
+  **Changed**：提交四阶段中的前三段：
+  `57aeefcd` 增加确定性 ownership/MapPin 见证和 offline index-pack runner，
+  `521c2114` 在 substrate/LA64 等待路径安装有界 TLB mailbox progress callback，
+  `0811e354` 增加 mailbox 竞态测试与 stale-map 一致性 oracle。根因证据收敛为
+  三 CPU 闭环：sender 持 `VmPmap.state` 等待目标 generation，目标 hart 已有硬件
+  IPI pending 但 IE=0，卡在无 progress hook 的 futex/锁等待上，导致
+  `requested=N/completed=N-1/servicing=0` 永久保持。
+  **Verification**：LA64 mailbox focused tests 11/11、LA board host tests 74/74、
+  `tx-substrate --lib sync` 通过，`tx-reactor --lib userspace` 最新 filter
+  命令返回 0 个测试；生产 LA ELF 无 host-only test hook 符号。
+  `/tmp/la64-index-pack-witness-crkNTD` 在
+  `-smp 4`/`tx.maxcpus=4` 下完成 8 个 stale-map epoch
+  (`validated_writes=8/stale_writes=0/stale_reads=0`) 和 8 轮
+  `index-pack + fsck --full`。三次 fresh-image/fresh-QEMU GitHub full clone
+  `/tmp/la64-github-clone-smp4-{ODAGtl,j1onmX,5Kdl0h}` 连续通过，每次均有
+  `Receiving objects: 100% (7812/7812)`、`Resolving deltas: 100% (4137/4137), done.`、
+  `git fsck --full` 和 `rev-parse=true`。LA64 SMP4 本地
+  `git init/add/commit/log` 通过 `/tmp/la64-local-git-smp4-Jv74Ja`。LA64
+  busybox SMP1、SMP4(`ipi:ok`/`shootdown:ok`)、LA UART single-byte、RV64 full-build
+  与 busybox smoke 通过。
+  **Next**：由用户在 LA QEMU guest 中输入自己的短期 PAT 并完成 GitHub push、
+  网页端提交修改、再 `pull --ff-only`；该步骤需要真实凭据和网页操作，不能由代理
+  读取或输出 `local-images/git/launch-shell.sh` 中的 PAT。
+  **Blocker**：GitHub push/web-pull 尚未自动验收；`cargo -q xtask unit` 仍被既有
+  tx-shims syscall failures 和 3 个 tx-kernel unit failures 阻断；
+  `cargo xtask progress validate` 仍被既有 JSON 状态值 `completed` 阻断。
+
 - 2026-08-06 (**将 LA Git clone 失败收敛到 SMP4 TLB shootdown**).
   **Changed**：新增本机操作账本
   `msp/debug-logs/2026-08-06-la64-git-smp4-tlb-stall-operation-ledger.md`，记录
