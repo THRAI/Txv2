@@ -6,12 +6,15 @@ core::arch::global_asm!(
     .section .text.boot.phys, "ax"
     .equ TX_LA64_DMW_CACHED,   0x9000000000000011
     .equ TX_LA64_DMW_UNCACHED, 0x8000000000000001
-    .equ TX_LA64_HIGH_START,   0x9000000090001000
+    .equ TX_LA64_HIGH_START,   0x9000000098001000
     .equ TX_LA64_CSR_DMW0, 0x180
     .equ TX_LA64_CSR_DMW1, 0x181
     .equ TX_LA64_CSR_DMW2, 0x182
     .equ TX_LA64_CSR_DMW3, 0x183
     .equ TX_LA64_CSR_CRMD, 0x0
+    .equ TX_LA64_CSR_ECFG, 0x4
+    .equ TX_LA64_CSR_TCFG, 0x41
+    .equ TX_LA64_CSR_TICLR, 0x44
 
     .globl _start
 _start:
@@ -61,6 +64,14 @@ tx_la2k1000_high_start:
     b       1b
 
 2:
+    // U-Boot may leave controller and timer admission state behind. Stage 2
+    // starts with every external source masked and admits only the local timer
+    // after the full kernel vector is installed.
+    csrwr   $zero, TX_LA64_CSR_TCFG
+    li.w    $t0, 1
+    csrwr   $t0, TX_LA64_CSR_TICLR
+    csrwr   $zero, TX_LA64_CSR_ECFG
+
     move    $a0, $s4
     move    $a1, $s0
     move    $a2, $s1

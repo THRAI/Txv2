@@ -593,6 +593,7 @@ version = "0.1.0"
 name = "tx-hal-loongarch64-2k1000"
 version = "0.1.0"
 dependencies = [
+ "fdt",
  "tx-hal",
 ]
 
@@ -644,7 +645,9 @@ dependencies = [
 name = "tx-kernel-loongarch64-2k1000"
 version = "0.1.0"
 dependencies = [
+ "tx-hal",
  "tx-hal-loongarch64-2k1000",
+ "tx-kernel",
 ]
 
 [[package]]

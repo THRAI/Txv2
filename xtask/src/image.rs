@@ -183,9 +183,18 @@ fn image_vf2_uimage(root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The legacy uImage header stores 32-bit physical addresses. The 2K1000
-/// U-Boot maps this address through the cached DMW before jumping to it.
-const LA2K1000_LOAD_ADDR: &str = "0x90000000";
+/// The legacy uImage header stores a 32-bit physical address. Place the
+/// 64-byte header immediately before that address. The vendor U-Boot still
+/// enters its relocation path because it compares the low load address with
+/// the high DMW transport address, but both map to the same cached pointer so
+/// the copy is in place.
+const LEGACY_UIMAGE_HEADER_SIZE: u64 = 64;
+const LA64_PHYS_ADDR_MASK: u64 = (1 << 48) - 1;
+const LA2K1000_LOAD_ADDR: u64 = 0x9800_0000;
+const LA2K1000_UIMAGE_HEADER_ADDR: u64 = 0x9000_0000_97ff_ffc0;
+const LA2K1000_INITRD_HEADER_ADDR: u64 = 0x9000_0000_9880_0000;
+const LA2K1000_FDT_ADDR: u64 = 0x9000_0000_0a00_0000;
+const LA2K1000_RAM1_END: u64 = 0xc000_0000;
 
 /// Package the la64 kernel ELF as an LS2K1000 boot artifact: strip to
 /// a raw binary, then wrap as a U-Boot uImage (mkimage -T kernel).
@@ -193,8 +202,9 @@ const LA2K1000_LOAD_ADDR: &str = "0x90000000";
 ///   cargo xtask build --target la64-2k1000 [--release]
 ///   cargo xtask image la2k1000-uimage [--release]
 ///   cp target/images/txv2-la2k1000.uimage /srv/tftp/
-///   # U-Boot:  tftpboot txv2-la2k1000.uimage   (default $loadaddr)
-///   #          bootm                     (relocates to -a and jumps)
+///   # U-Boot loads the transport images at the validated second-bank
+///   # addresses, copies its control FDT into writable low RAM, then bootm
+///   # strips both legacy headers and publishes the raw CPIO range in /chosen.
 fn image_la2k1000_uimage(root: &Path, args: &[String]) -> Result<()> {
     let release = args.iter().any(|arg| arg == "--release");
     let kernel = TxTarget::La64Ls2k1000.kernel_path_for_profile(root, release);
@@ -255,9 +265,9 @@ fn image_la2k1000_uimage(root: &Path, args: &[String]) -> Result<()> {
             "-C".to_string(),
             "none".to_string(),
             "-a".to_string(),
-            LA2K1000_LOAD_ADDR.to_string(),
+            format!("{LA2K1000_LOAD_ADDR:#x}"),
             "-e".to_string(),
-            LA2K1000_LOAD_ADDR.to_string(),
+            format!("{LA2K1000_LOAD_ADDR:#x}"),
             "-n".to_string(),
             "Txv2-la2k1000".to_string(),
             "-d".to_string(),
@@ -294,15 +304,45 @@ fn image_la2k1000_uimage(root: &Path, args: &[String]) -> Result<()> {
     println!("2k1000 uimage ready: {}", uimage.display());
     if have_initrd {
         println!("la initrd ready: {}", initrd_uimage.display());
-        println!(
-            "stage 1 recipe is kernel-only; do not load the initrd until its board RAM address is validated"
-        );
     }
-    println!("next: cp target/images/txv2-la2k1000*.uimage /srv/tftp/");
-    println!("U-Boot> tftpboot txv2-la2k1000.uimage");
-    println!(
-        "U-Boot> bootm    # maps physical {LA2K1000_LOAD_ADDR} through the cached DMW and jumps"
-    );
+    println!("next: cp target/images/txv2-la2k1000*.uimage /srv/tftp/txv2/");
+    println!("U-Boot> tftpboot {LA2K1000_UIMAGE_HEADER_ADDR:#x} txv2/txv2-la2k1000.uimage");
+    if have_initrd {
+        let initrd_file_size = fs::metadata(&initrd_uimage)
+            .map_err(|err| err.to_string())?
+            .len();
+        let initrd_header_phys = LA2K1000_INITRD_HEADER_ADDR & LA64_PHYS_ADDR_MASK;
+        let initrd_start = initrd_header_phys + LEGACY_UIMAGE_HEADER_SIZE;
+        let initrd_size = initrd_file_size
+            .checked_sub(LEGACY_UIMAGE_HEADER_SIZE)
+            .ok_or("2K1000 initrd uImage is smaller than its legacy header")?;
+        let initrd_end = initrd_start
+            .checked_add(initrd_size)
+            .ok_or("2K1000 initrd range overflow")?;
+        if initrd_end > LA2K1000_RAM1_END {
+            return Err(format!(
+                "2K1000 initrd ends at {initrd_end:#x}, beyond RAM1 end {LA2K1000_RAM1_END:#x}"
+            ));
+        }
+
+        println!(
+            "U-Boot> tftpboot {LA2K1000_INITRD_HEADER_ADDR:#x} txv2/txv2-la2k1000-initrd.uimage"
+        );
+        println!("U-Boot> fdt addr ${{fdtcontroladdr}}");
+        println!("U-Boot> fdt move ${{fdtcontroladdr}} {LA2K1000_FDT_ADDR:#x} 10000");
+        println!("U-Boot> fdt addr {LA2K1000_FDT_ADDR:#x}");
+        println!("U-Boot> fdt set /chosen linux,initrd-start <0x0 {initrd_start:#x}>");
+        println!("U-Boot> fdt set /chosen linux,initrd-end <0x0 {initrd_end:#x}>");
+        println!("U-Boot> setenv fdt_addr {LA2K1000_FDT_ADDR:#x}");
+        println!("U-Boot> setenv fdt_high 0xffffffffffffffff");
+        println!("U-Boot> setenv initrd_high 0xffffffffffffffff");
+        println!(
+            "U-Boot> setenv bootargs tx.profile=busybox tx.board=ls2k1000 console=ttyS0 rd_start={initrd_start:#x} rd_size={initrd_size:#x}"
+        );
+        println!("U-Boot> bootm {LA2K1000_UIMAGE_HEADER_ADDR:#x} {LA2K1000_INITRD_HEADER_ADDR:#x}");
+    } else {
+        println!("U-Boot> bootm {LA2K1000_UIMAGE_HEADER_ADDR:#x}");
+    }
     Ok(())
 }
 
@@ -1014,6 +1054,15 @@ mod tests {
 
     #[test]
     fn la2k1000_uimage_uses_legacy_header_physical_address() {
-        assert_eq!(LA2K1000_LOAD_ADDR, "0x90000000");
+        assert_eq!(LA2K1000_LOAD_ADDR, 0x9800_0000);
+        assert_eq!(
+            (LA2K1000_UIMAGE_HEADER_ADDR & LA64_PHYS_ADDR_MASK) + LEGACY_UIMAGE_HEADER_SIZE,
+            LA2K1000_LOAD_ADDR
+        );
+        assert_eq!(
+            LA2K1000_INITRD_HEADER_ADDR & LA64_PHYS_ADDR_MASK,
+            0x9880_0000
+        );
+        assert_eq!(LA2K1000_FDT_ADDR & LA64_PHYS_ADDR_MASK, 0x0a00_0000);
     }
 }

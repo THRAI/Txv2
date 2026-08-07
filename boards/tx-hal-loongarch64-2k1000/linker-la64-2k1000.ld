@@ -1,11 +1,11 @@
 OUTPUT_ARCH(loongarch64)
 ENTRY(_start)
 
-KERNEL_LOAD_BASE = 0x90000000;
-KERNEL_LINK_BASE = 0x9000000090000000;
+KERNEL_LOAD_BASE = 0x98000000;
+KERNEL_LINK_BASE = 0x9000000098000000;
 KERNEL_BOOT_PHYS_SIZE = 0x1000;
 KERNEL_LINK_OFFSET = KERNEL_LINK_BASE - KERNEL_LOAD_BASE;
-KERNEL_TRANSPORT_BASE = 0x98000000;
+INITRD_TRANSPORT_BASE = 0x98800000;
 
 SECTIONS
 {
@@ -60,8 +60,8 @@ SECTIONS
     . = ALIGN(4K);
     __kernel_end = .;
 
-    ASSERT((__kernel_end - KERNEL_LINK_OFFSET) <= KERNEL_TRANSPORT_BASE,
-           "2K1000 kernel overlaps U-Boot TFTP transport address")
+    ASSERT((__kernel_end - KERNEL_LINK_OFFSET) <= INITRD_TRANSPORT_BASE,
+           "2K1000 kernel overlaps validated initrd transport address")
 
     /DISCARD/ : {
         *(.eh_frame .eh_frame.*)

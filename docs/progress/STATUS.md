@@ -1,3 +1,31 @@
+- 2026-08-07 (**Loongson 2K1000 Stage 2 已在实板进入最小 `/ #`**).
+  **Changed**：将 LA 页表、ASID、trap、per-CPU 和 TLB shootdown 机制移入中立的
+  `tx-hal-loongarch64-common` 源目录，QEMU 与 2K1000 通过各自平台 crate 复用；
+  QEMU 专属 ExtIOI/PCH 留在 `tx-hal-loongarch64-qemu-virt`。2K1000 target 现在
+  发布真实双 bank RAM、保留 FDT scratch/framebuffer/bootparam，解析 U-Boot BPI
+  EFI FDT，校验固件 DMW 地址、FDT totalsize、UTF-8 cmdline、initrd 边界及重叠，
+  并接入 CPU0 exception、100 MHz stable counter、one-shot timer 和通用 kernel
+  initramfs 启动。kernel 改为物理 load/entry `0x98000000`、cached VMA
+  `0x9000000098000000`；uImage header 置于 `0x97ffffc0`，避免 vendor U-Boot 对
+  6.7 MiB payload 做跨物理地址的大块复制。boot recipe 使用两参数 `bootm`，在
+  RAM 中复制 control FDT、写入 raw CPIO 范围并易失设置 `fdt_addr`/
+  `fdt_high`/`initrd_high`，不写持久环境。
+  **Real hardware**：kernel/initrd TFTP 与 `iminfo` CRC 均通过；U-Boot 越过原
+  `Loading Kernel Image` TLB exception，txKernel 输出两条 UART marker、
+  `timebase-hz=100000000`、`initrd-start=0x98800040`、`size=0x163600` 和
+  `boot:ok`，BusyBox 最终进入 `/ #`。节流串口执行
+  `echo TXV2_LA2K_STAGE2_OK` 与 `sleep 1; echo TIMER_OK` 均通过。
+  **Verification**：2K HAL 9/9、LA QEMU HAL 74/74；最终 LA QEMU `-smp 4`
+  观察到 possible/online=4、shootdown/IPI 和 boot sentinel；2K full-build、ELF/
+  uImage 布局检查、TFTP 发布哈希核对和 `git diff --check` 通过。完整
+  `cargo -q xtask unit` 仍被既有 tx-shims dispatch、两项 libctest assertion 和
+  thread-future 2624-byte budget 失败阻断；`lint arch` 的 97 项均不在本阶段文件。
+  **Accepted/rejected**：接受实板 BPI EFI FDT + 两参数 legacy bootm；拒绝显式第三
+  FDT 参数的未初始化 cmdline 风险、任意高位地址掩码和未保留 framebuffer。
+  **Next**：Stage 3 接入 2K1000 ICU、CPU1、IPI 和实板 generation shootdown 压力。
+  **Blocker**：Stage 2 无硬件 blocker；burst 串口输入在 polling RX 下会丢字节，且
+  `/proc/cpuinfo` 仍显示既有 RV64 placeholder，须在最终 SMP 报告前修正。
+
 - 2026-08-07 (**Loongson 2K1000 独立 target 与最早串口通过实板 Stage 1**).
   **Changed**：新增独立的 `tx-hal-loongarch64-2k1000` / `tx-kernel-loongarch64-2k1000`
   crate 和 `la64-2k1000` xtask target，没有向 `la64-qemu` 注入实板常量。legacy

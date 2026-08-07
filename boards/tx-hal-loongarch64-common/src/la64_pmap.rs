@@ -62,35 +62,6 @@ fn run_la64_test_service_released_hook() {
     }
 }
 
-pub(crate) fn uart_put_byte(byte: u8) {
-    let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
-    let mut wait = TlbProgressSpinWait::new();
-
-    unsafe {
-        while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
-            spin_with_la64_tlb_progress(&mut wait);
-        }
-        core::ptr::write_volatile(base.add(UART_THR), byte);
-    }
-}
-
-pub(crate) fn uart_try_get_byte() -> Option<u8> {
-    #[cfg(target_arch = "loongarch64")]
-    unsafe {
-        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *const u8;
-        if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_DR == 0 {
-            return None;
-        }
-
-        Some(core::ptr::read_volatile(base.add(UART_RBR)))
-    }
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        None
-    }
-}
-
 pub(crate) const fn la64_cached_virt(phys: usize) -> usize {
     LA64_DMW_CACHED_BASE | phys
 }
@@ -102,14 +73,14 @@ pub(crate) const fn la64_uncached_virt(phys: usize) -> usize {
 pub(crate) const fn la64_dmw_direct_map() -> VirtRange {
     VirtRange {
         start: VirtAddr(LA64_DMW_CACHED_BASE),
-        size: QEMU_LA64_DIRECT_MAP_SIZE,
+        size: LA64_DIRECT_MAP_SIZE,
     }
 }
 
 pub(crate) const fn la64_dmw_mapped_phys() -> PhysRange {
     PhysRange {
-        start: PhysAddr(QEMU_LA64_RAM_BASE),
-        size: QEMU_LA64_DIRECT_MAP_SIZE,
+        start: PhysAddr(LA64_DMW_MAPPED_PHYS_BASE),
+        size: LA64_DIRECT_MAP_SIZE,
     }
 }
 
@@ -728,38 +699,38 @@ pub(crate) fn la64_remote_tlb_shootdown(targets: CpuMask) {
 }
 
 pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:activate:start\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:activate:start\n");
     let switch = prepare_la64_pmap_switch(root)?;
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh=0x");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:pgdh=0x");
     trace_pmap_hex(switch.pgdh);
     trace_pmap_literal(b"\n");
     if !switch.switch_required {
-        trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:switch:skip\n");
+        trace_pmap_literal(b"txkernel:loongarch64:pmap:switch:skip\n");
         return Ok(());
     }
     let previous_crmd = read_la64_csr(LA64_CSR_CRMD);
     write_la64_csr(LA64_CSR_CRMD, previous_crmd & !LA64_CRMD_IE);
     tx_la64_begin_pmap_switch(switch.asid, switch.pgdl);
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pwcl:ok\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:pwcl:ok\n");
 
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:root=0x");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:root=0x");
     trace_pmap_hex(switch.pgdl);
     trace_pmap_literal(b":asid=0x");
     trace_pmap_hex(switch.asid);
     trace_pmap_literal(b"\n");
     write_la64_csr(LA64_CSR_ASID, switch.asid);
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:asid:ok\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:asid:ok\n");
     write_la64_csr(LA64_CSR_PGDL, switch.pgdl);
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdl:ok\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:pgdl:ok\n");
     write_la64_csr(LA64_CSR_PGDH, switch.pgdh);
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:pgdh-write:ok\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:pgdh-write:ok\n");
 
     let crmd = LA64_CRMD_PG | LA64_CRMD_DATF_CC | LA64_CRMD_DATM_CC;
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd-new=0x00000000000000b0\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:crmd-new=0x00000000000000b0\n");
     write_la64_csr(LA64_CSR_CRMD, crmd);
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:crmd:ok\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:crmd:ok\n");
     la64_invtlb_all();
-    trace_pmap_literal(b"txkernel:qemu-loongarch64-virt:pmap:invtlb:ok\n");
+    trace_pmap_literal(b"txkernel:loongarch64:pmap:invtlb:ok\n");
 
     tx_la64_finish_pmap_switch(switch.asid, switch.pgdl, switch.pgdh);
     if previous_crmd & LA64_CRMD_IE != 0 {

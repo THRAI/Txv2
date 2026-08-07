@@ -24,12 +24,14 @@ use tx_hal::{
 
 pub use boot_args::capture_loongarch64_qemu_boot_args;
 use boot_facts::ensure_static_boot_facts;
+#[cfg(test)]
+use la64_extioi::reset_la64_extioi_claim_state_for_test;
 use la64_irq_trap::classify_la64_trap;
 pub use la64_irq_trap::{dispatch_trap_frame, return_to_userspace};
 pub(crate) use la64_percpu::la64_current_cpu_id;
 #[cfg(target_arch = "loongarch64")]
 use la64_pmap::la64_kernel_addr_to_phys;
-use la64_pmap::{la64_cached_virt, la64_uncached_virt, uart_put_byte, uart_try_get_byte};
+use la64_pmap::{la64_cached_virt, la64_uncached_virt};
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
@@ -98,6 +100,8 @@ const QEMU_LA64_HIGH_RAM_BASE: usize = 0x9000_0000;
 // (`direct_map_covers_phys_end`, `extend_direct_map`); the actual frame-metadata
 // span is still carved from the real firmware memory map, not from this size.
 const QEMU_LA64_DIRECT_MAP_SIZE: usize = LA64_PHYS_ADDR_MASK + 1;
+const LA64_DIRECT_MAP_SIZE: usize = QEMU_LA64_DIRECT_MAP_SIZE;
+const LA64_DMW_MAPPED_PHYS_BASE: usize = QEMU_LA64_RAM_BASE;
 const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
@@ -802,8 +806,8 @@ fn la64_rewind_pc(raw: NonNull<()>, bytes: usize) {
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
-    fn tx_la64_qemu_fp_save_context(ctx: *mut UserFpContext) -> usize;
-    fn tx_la64_qemu_fp_restore_context(ctx: *const UserFpContext);
+    fn tx_la64_fp_save_context(ctx: *mut UserFpContext) -> usize;
+    fn tx_la64_fp_restore_context(ctx: *const UserFpContext);
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -846,7 +850,7 @@ fn la64_set_fpu_enabled(_enabled: bool) {}
 
 #[cfg(target_arch = "loongarch64")]
 fn la64_save_fp_context(state: &mut UserFpContext) {
-    let saved = unsafe { tx_la64_qemu_fp_save_context(core::ptr::addr_of_mut!(*state)) };
+    let saved = unsafe { tx_la64_fp_save_context(core::ptr::addr_of_mut!(*state)) };
     if saved == 0 {
         *state = UserFpContext::empty();
     }
@@ -859,7 +863,7 @@ fn la64_save_fp_context(state: &mut UserFpContext) {
 
 #[cfg(target_arch = "loongarch64")]
 fn la64_restore_fp_context_raw(state: &UserFpContext) {
-    unsafe { tx_la64_qemu_fp_restore_context(core::ptr::addr_of!(*state)) };
+    unsafe { tx_la64_fp_restore_context(core::ptr::addr_of!(*state)) };
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
@@ -912,6 +916,36 @@ const UART_LSR: usize = 0x05;
 #[cfg(target_arch = "loongarch64")]
 const UART_LSR_DR: u8 = 1 << 0;
 const UART_LSR_THRE: u8 = 1 << 5;
+
+fn uart_put_byte(byte: u8) {
+    let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
+    let mut wait = tx_hal::TlbProgressSpinWait::new();
+
+    unsafe {
+        while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
+            wait.spin_with(|| {
+                la64_pmap::service_la64_pending_tlb_shootdown();
+            });
+        }
+        core::ptr::write_volatile(base.add(UART_THR), byte);
+    }
+}
+
+fn uart_try_get_byte() -> Option<u8> {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *const u8;
+        if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_DR == 0 {
+            return None;
+        }
+        Some(core::ptr::read_volatile(base.add(UART_RBR)))
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        None
+    }
+}
 
 // The early UART is reachable through QEMU's current direct/identity execution
 // convention. Phase-3 substrate MMIO mapping treats this exact page as already
@@ -1344,11 +1378,17 @@ mod boot_facts;
 mod boot_firmware;
 mod boot_smp;
 mod dtb;
+mod la64_extioi;
+#[path = "../../tx-hal-loongarch64-common/src/la64_irq_trap.rs"]
 mod la64_irq_trap;
+#[path = "../../tx-hal-loongarch64-common/src/la64_percpu.rs"]
 mod la64_percpu;
+#[path = "../../tx-hal-loongarch64-common/src/la64_pmap.rs"]
 mod la64_pmap;
+#[path = "../../tx-hal-loongarch64-common/src/la64_unaligned.rs"]
 mod la64_unaligned;
 mod platform_impls;
+#[path = "../../tx-hal-loongarch64-common/src/trap_asm.rs"]
 mod trap_asm;
 
 #[cfg(test)]

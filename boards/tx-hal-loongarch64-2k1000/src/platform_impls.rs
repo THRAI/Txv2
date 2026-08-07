@@ -1,5 +1,3 @@
-use super::boot_smp;
-use super::la64_extioi::*;
 use super::la64_irq_trap::*;
 use super::la64_percpu::{
     la64_current_cpu_id, la64_install_kernel_stack, la64_read_kernel_tls, la64_read_stable_counter,
@@ -7,9 +5,6 @@ use super::la64_percpu::{
 };
 use super::la64_pmap::*;
 use super::*;
-
-#[cfg(all(not(target_arch = "loongarch64"), test))]
-use core::sync::atomic::AtomicU8;
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
@@ -25,41 +20,8 @@ unsafe extern "C" {
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn enable_uart_rx_irq() {
-    unsafe {
-        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
-        core::ptr::write_volatile(base.add(UART_IER), UART_IER_ERBFI);
-    }
-
-    let ecfg = read_la64_csr(LA64_CSR_ECFG) | LA64_ESTAT_IS_HWI_MASK;
-    write_la64_csr(LA64_CSR_ECFG, ecfg);
-
-    let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
-    write_la64_csr(LA64_CSR_CRMD, crmd);
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-fn enable_uart_rx_irq() {
-    #[cfg(test)]
-    LA64_HOST_UART_IER.store(UART_IER_ERBFI, Ordering::Release);
-}
-
-#[cfg(all(not(target_arch = "loongarch64"), test))]
-static LA64_HOST_UART_IER: AtomicU8 = AtomicU8::new(0);
-
-#[cfg(target_arch = "loongarch64")]
 static LA64_USER_ENTRY_PROBE_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(all(not(target_arch = "loongarch64"), test))]
-pub(crate) fn la64_reset_host_uart_ier_for_test() {
-    LA64_HOST_UART_IER.store(0, Ordering::Release);
-}
-
-#[cfg(all(not(target_arch = "loongarch64"), test))]
-pub(crate) fn la64_host_uart_ier_for_test() -> u8 {
-    LA64_HOST_UART_IER.load(Ordering::Acquire)
-}
 
 pub(crate) unsafe fn la64_copy_from_user_raw(
     _dst: *mut u8,
@@ -192,7 +154,7 @@ impl PmapIf for Platform {
         // space, so no page-table work is needed to reach any RAM the firmware
         // reports — including high RAM above the MMIO hole. Succeed for anything
         // inside the DMW-mapped limit.
-        if phys_end.0 <= QEMU_LA64_RAM_BASE.saturating_add(QEMU_LA64_DIRECT_MAP_SIZE) {
+        if phys_end.0 <= LA64_DMW_MAPPED_PHYS_BASE.saturating_add(LA64_DIRECT_MAP_SIZE) {
             Ok(())
         } else {
             Err(PmapError::Unsupported)
@@ -353,11 +315,6 @@ impl TrapIf for Platform {
 
     fn install_kernel_trap_vector() {
         install_la64_trap_vectors();
-        // The full kernel trap vector is now live, so this hart can safely
-        // accept runtime IPIs.  This must happen here for both the BSP and
-        // APs: the generic AP entry enables IPIs again before publishing
-        // itself online, while the BSP has no later per-CPU enable step.
-        boot_smp::enable_ipi_wakeups();
     }
 
     fn install_user_trap_vector() {
@@ -425,7 +382,7 @@ fn trace_la64_user_entry_probe(
         return;
     }
 
-    console_write_literal(b"txkernel:qemu-loongarch64-virt:probe:user-entry");
+    console_write_literal(b"txkernel:loongson-2k1000:probe:user-entry");
     console_write_literal(b":idx=0x");
     console_write_hex(probe_index);
     console_write_literal(b":cpu=0x");
@@ -570,28 +527,11 @@ impl FpSimdIf for Platform {
         la64_restore_fp_context_raw(state);
     }
 }
-impl IrqIf for Platform {
-    const MAX_IRQ: u32 = QEMU_LA64_GSI_BASE + QEMU_LA64_PCH_PIC_IRQS;
-    const UART_IRQ: u32 = QEMU_LA64_UART0_IRQ;
-    const RTC_IRQ: u32 = QEMU_LA64_RTC_IRQ;
 
-    fn pci_intx_irq(function: PciFunctionId, pin: u8) -> Option<IrqResource> {
-        if function.segment != 0 || function.bus != 0 || !(1..=4).contains(&pin) {
-            return None;
-        }
-        let pin_index = u32::from(pin - 1);
-        let line = QEMU_LA64_GSI_BASE
-            + QEMU_LA64_PCI_INTX_BASE
-            + ((pin_index + u32::from(function.device)) % 4);
-        Some(IrqResource {
-            role: ResourceRole::Index(0),
-            line,
-            trigger: IrqTrigger::Level,
-            polarity: IrqPolarity::Low,
-            sharing: IrqSharing::Shared,
-            origin: LA64_PCI_HOST_ORIGIN,
-        })
-    }
+impl IrqIf for Platform {
+    const MAX_IRQ: u32 = 0;
+    const UART_IRQ: u32 = 0;
+    const RTC_IRQ: u32 = 0;
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0
@@ -607,42 +547,6 @@ impl IrqIf for Platform {
 
     fn exclude_local_execution() -> LocalExecutionGuard {
         exclude_la64_interrupts()
-    }
-
-    fn claim() -> u32 {
-        la64_extioi_claim()
-    }
-
-    fn complete(irq: u32) {
-        la64_complete_external_irq(irq);
-    }
-
-    fn mask(irq: u32) {
-        la64_mask_external_irq(irq);
-    }
-
-    fn unmask(irq: u32) {
-        la64_unmask_external_irq(irq);
-    }
-
-    fn set_priority(_irq: u32, _priority: u8) {}
-
-    fn install_dispatch_table(table: &'static IrqDispatchTable) {
-        LA64_IRQ_DISPATCH_TABLE.store(table as *const IrqDispatchTable as usize, Ordering::Release);
-        enable_uart_rx_irq();
-    }
-
-    fn dispatch_irq(irq: u32) -> IrqHandled {
-        let table = LA64_IRQ_DISPATCH_TABLE.load(Ordering::Acquire);
-        let Some(handler) = (table != 0)
-            .then(|| unsafe { &*(table as *const IrqDispatchTable) })
-            .and_then(|table| table.entries.get(irq as usize).copied().flatten())
-        else {
-            Self::mask(irq);
-            return IrqHandled::Done;
-        };
-
-        handler(irq)
     }
 }
 
@@ -661,7 +565,6 @@ fn exclude_la64_interrupts() -> LocalExecutionGuard {
             LocalExecutionGuard::new(saved & LA64_CRMD_IE, restore_la64_interrupts)
         }
     }
-
     #[cfg(not(target_arch = "loongarch64"))]
     unsafe {
         LocalExecutionGuard::new(0, restore_la64_interrupts)
@@ -680,10 +583,10 @@ unsafe fn restore_la64_interrupts(saved: usize) {
             options(nostack)
         );
     }
-
     #[cfg(not(target_arch = "loongarch64"))]
     let _ = saved;
 }
+
 impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
         tx_hal::time::ticks_to_ns(
@@ -700,14 +603,10 @@ impl MonotonicCounterIf for Platform {
 impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
         let frequency_hz = <Self as MonotonicCounterIf>::frequency_hz();
-        if frequency_hz == 0 {
-            return;
-        }
-
+        assert_ne!(frequency_hz, 0, "2K1000 CPUCFG timebase is unavailable");
         let now = la64_read_stable_counter();
         let target = tx_hal::time::deadline_ns_to_ticks(deadline, frequency_hz);
         let delta = target.saturating_sub(now).max(1);
-
         write_la64_csr(LA64_CSR_TICLR, LA64_TICLR_CLEAR_TIMER);
         write_la64_csr(LA64_CSR_TCFG, la64_deadline_tcfg(delta));
     }
@@ -718,91 +617,15 @@ impl DeadlineTimerIf for Platform {
     }
 
     fn enable_timer_wakeups() {
-        let ecfg = read_la64_csr(LA64_CSR_ECFG) | LA64_ESTAT_IS_TIMER;
-        write_la64_csr(LA64_CSR_ECFG, ecfg);
-
+        // Stage 2 admits only the CPU-local timer. Do not preserve firmware
+        // HWI/IPI bits until the 2K1000 ICU and IPI transport are validated.
+        write_la64_csr(LA64_CSR_ECFG, LA64_ESTAT_IS_TIMER);
         let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
         write_la64_csr(LA64_CSR_CRMD, crmd);
     }
 }
 
-fn ls7a_rtc_ensure_toy_enabled() {
-    let ctrl = ls7a_rtc_read_u32(LS7A_RTC_CTRL);
-    let required = LS7A_RTC_CTRL_EO | LS7A_RTC_CTRL_TOYEN;
-    if ctrl & required != required {
-        ls7a_rtc_write_u32(LS7A_RTC_CTRL, ctrl | required);
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn ls7a_rtc_read_u32(offset: usize) -> u32 {
-    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *const u32).read_volatile() }
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn ls7a_rtc_write_u32(offset: usize, value: u32) {
-    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *mut u32).write_volatile(value) }
-}
-
-#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
-fn ls7a_rtc_read_u32(_offset: usize) -> u32 {
-    0
-}
-
-#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
-fn ls7a_rtc_write_u32(_offset: usize, _value: u32) {}
-
-#[cfg(all(not(target_arch = "loongarch64"), test))]
-fn ls7a_rtc_read_u32(offset: usize) -> u32 {
-    LA64_HOST_LS7A_RTC_STATE
-        .lock()
-        .expect("host ls7a rtc state")
-        .read_u32(offset)
-}
-
-#[cfg(all(not(target_arch = "loongarch64"), test))]
-fn ls7a_rtc_write_u32(offset: usize, value: u32) {
-    LA64_HOST_LS7A_RTC_STATE
-        .lock()
-        .expect("host ls7a rtc state")
-        .write_u32(offset, value);
-}
-
-impl PersistentClockIf for Platform {
-    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
-        ls7a_rtc_ensure_toy_enabled();
-        let toy0 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD0);
-        let toy1 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD1);
-        ls7a_unix_ns_from_toy_registers(toy0, toy1)
-    }
-
-    fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError> {
-        let (toy0, toy1) = ls7a_toy_registers_from_unix_ns(ns)?;
-        ls7a_rtc_ensure_toy_enabled();
-        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE1, toy1);
-        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE0, toy0);
-        Ok(())
-    }
-
-    fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError> {
-        let toymatch = ls7a_toymatch_from_unix_ns(ns)?;
-        ls7a_rtc_ensure_toy_enabled();
-        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, toymatch);
-        Self::set_priority(QEMU_LA64_RTC_IRQ, 1);
-        Self::unmask(QEMU_LA64_RTC_IRQ);
-        Ok(())
-    }
-
-    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
-        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, 0);
-        Self::mask(QEMU_LA64_RTC_IRQ);
-        Ok(())
-    }
-
-    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
-        Ok(())
-    }
-}
+impl PersistentClockIf for Platform {}
 
 impl PercpuIf for Platform {
     fn current_cpu_id() -> CpuId {
@@ -863,49 +686,18 @@ impl DmaIf for Platform {
         la64_dbar();
     }
 }
+
 impl SmpIf for Platform {
     fn current_cpu_id() -> CpuId {
         la64_current_cpu_id()
     }
 
     fn possible_cpus() -> CpuMask {
-        // QEMU publishes its `-smp` count through the firmware FDT. Use that
-        // topology by default and treat `tx.maxcpus=N` as an explicit upper
-        // bound. Missing firmware topology falls back to one CPU in
-        // `LA64_DEFAULT_POSSIBLE_CPUS`.
-        let discovered = LA64_POSSIBLE_CPU_COUNT
-            .load(Ordering::Acquire)
-            .clamp(1, LA64_MAX_BOOT_CPUS);
-        let requested = crate::boot_facts::max_cpus_from_cmdline()
-            .unwrap_or(discovered)
-            .clamp(1, LA64_MAX_BOOT_CPUS);
-        CpuMask::first(discovered.min(requested))
+        CpuMask::single(CpuId(0))
     }
 
     fn online_cpus() -> CpuMask {
-        CpuMask::from_bits(LA64_ONLINE_CPUS.load(Ordering::Acquire) & Self::possible_cpus().bits())
-    }
-
-    fn mark_cpu_online(cpu: CpuId) {
-        if Self::possible_cpus().contains(cpu) {
-            // Accept synchronous work before scheduler-visible online
-            // publication, so no observer can target a CPU that is unable to
-            // acquire a shootdown pin.
-            mark_la64_tlb_cpu_online(cpu);
-            LA64_ONLINE_CPUS.fetch_or(CpuMask::single(cpu).bits(), Ordering::AcqRel);
-        }
-    }
-
-    fn prepare_cpu_offline() {
-        prepare_la64_tlb_cpu_offline();
-    }
-
-    fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
-        boot_smp::boot_secondary_cpus(Self::possible_cpus(), entry)
-    }
-
-    fn enable_ipi_wakeups() {
-        boot_smp::enable_ipi_wakeups();
+        CpuMask::single(CpuId(0))
     }
 
     fn wait_for_interrupt_once() {
@@ -929,11 +721,6 @@ impl SmpIf for Platform {
     }
 
     fn wait_for_interrupt_prepared(state: InterruptWaitState) {
-        // `prepare_interrupt_wait` left IE clear while the kernel performed
-        // its final runnable-work check. The assembly helper below enables IE
-        // adjacent to `idle`; the trap dispatcher redirects an interrupt from
-        // that tiny window to the instruction after `idle`, so the just-served
-        // wake cannot be followed by an indefinite sleep.
         la64_wait_for_interrupt_once();
         if state.raw() & LA64_CRMD_IE == 0 {
             let crmd = read_la64_csr(LA64_CSR_CRMD);
@@ -941,24 +728,10 @@ impl SmpIf for Platform {
         }
     }
 
-    fn pending_ipi(kind: IpiKind) -> bool {
-        boot_smp::pending_ipi(kind)
-    }
-
     fn quiesce_this_cpu() -> ! {
         <Self as DeadlineTimerIf>::cancel_deadline();
-        debug_assert_eq!(
-            LA64_TLB_TARGET_USERS[la64_current_cpu_id().0].load(Ordering::Acquire),
-            0
-        );
-        #[cfg(target_arch = "loongarch64")]
-        {
-            // Disable every local interrupt source before publishing a
-            // permanently parked AP to the shutdown coordinator.
-            write_la64_csr(LA64_CSR_ECFG, 0);
-            let crmd = read_la64_csr(LA64_CSR_CRMD) & !LA64_CRMD_IE;
-            write_la64_csr(LA64_CSR_CRMD, crmd);
-        }
+        write_la64_csr(LA64_CSR_ECFG, 0);
+        write_la64_csr(LA64_CSR_CRMD, read_la64_csr(LA64_CSR_CRMD) & !LA64_CRMD_IE);
         loop {
             #[cfg(target_arch = "loongarch64")]
             unsafe {
@@ -968,38 +741,11 @@ impl SmpIf for Platform {
             core::hint::spin_loop();
         }
     }
-
-    fn send_ipi(target: CpuId, kind: IpiKind) {
-        boot_smp::send_ipi(target, kind);
-    }
-
-    fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-        boot_smp::broadcast_ipi(mask, kind);
-    }
-
-    fn ack_ipi(kind: IpiKind) {
-        boot_smp::ack_ipi(kind);
-    }
-
-    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
-        boot_smp::clear_ipi_ack_cpus(kind, mask);
-    }
-
-    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
-        boot_smp::ipi_ack_cpus(kind)
-    }
 }
 
 impl PowerIf for Platform {
     fn system_off() -> ! {
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            // QEMU loongarch virt exposes poweroff via the ACPI GED sleep
-            // control byte in direct-kernel/FDT boots.
-            let sleep_ctl = la64_uncached_virt(QEMU_LA64_GED_SLEEP_CTL) as *mut u8;
-            core::ptr::write_volatile(sleep_ctl, QEMU_LA64_GED_SLEEP_VALUE_S5);
-        }
-
+        <Platform as DeadlineTimerIf>::cancel_deadline();
         loop {
             #[cfg(target_arch = "loongarch64")]
             unsafe {

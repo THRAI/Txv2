@@ -51,7 +51,7 @@ pub extern "C" fn rust_entry(
 }
 
 #[no_mangle]
-pub extern "C" fn tx_kernel_loongarch64_qemu_trap_dispatch(
+pub extern "C" fn tx_kernel_loongarch64_trap_dispatch(
     frame: *mut tx_hal_loongarch64_qemu_virt::La64TrapFrame,
 ) -> tx_hal::TrapAction {
     let Some(frame) = (unsafe { frame.as_mut() }) else {

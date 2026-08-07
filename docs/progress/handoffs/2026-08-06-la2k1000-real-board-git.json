@@ -8,15 +8,17 @@
   "plan": null,
   "current_state": [
     "Work continues on branch feature/portable-net-vf2-dwmac from the LA QEMU SMP4 shootdown checkpoint 0f8b3315; commits 521c2114 and 0811e354 remain the shared Pmap/TLB baseline and were not reverted or duplicated.",
-    "Stage 1 is complete on real Loongson 2K1000 Nebula hardware: the repository now has independent tx-hal-loongarch64-2k1000 and tx-kernel-loongarch64-2k1000 crates plus the la64-2k1000 xtask target.",
+    "Stages 1 and 2 are complete on real Loongson 2K1000 Nebula hardware: the independent la64-2k1000 target now boots CPU0 through the common kernel path into a BusyBox initramfs / #.",
     "U-Boot 2022.04-v2.1.0-00579-g3bcf8c7d reports 1 GiB DDR in two banks: 0x9000000000000000+256 MiB and 0x9000000090000000+768 MiB. Its TFTP staging loadaddr is 0x9000000098000000.",
-    "The verified legacy uImage is Txv2-la2k1000 with 8281 bytes of payload and 32-bit physical load/entry 0x90000000. The old la-uimage command is rejected because it mixed the LA QEMU ELF with board addresses.",
-    "A real bootm run verified the image CRC, reported 1024 MiB, and printed txkernel:loongson-2k1000:h1:uart-inherited:ok followed by txkernel:loongson-2k1000:h1:uart-reinit:ok.",
-    "The stage-1 entry installs VSEG9 cached and VSEG8 uncached DMWs, sets CRMD IE=0/DA=0/PG=1, invalidates TLB only after reaching the high DMW, parks nonzero CPUs before using the BSP stack, and drives the NS16550A at physical 0x1fe20000 from the 125 MHz APB clock.",
+    "The Stage 2 legacy uImage contains 7016376 payload bytes with 32-bit physical load/entry 0x98000000. Its 64-byte header is transported at cached alias 0x9000000097ffffc0, so the vendor U-Boot relocation maps source and destination to the same pointer. The linked kernel ends at physical 0x9874d000 before the initrd header at 0x98800000.",
+    "The real-board two-argument bootm run verified both image CRCs, reported 1024 MiB, printed the inherited/reinitialized UART markers, recovered a 100 MHz CPUCFG timebase and raw CPIO range 0x98800040..0x98963640 from the BPI EFI FDT, emitted boot:ok, and entered / #.",
+    "The board entry installs VSEG9 cached and VSEG8 uncached DMWs, sets CRMD IE=0/DA=0/PG=1, invalidates TLB only after reaching the high DMW, parks nonzero CPUs before using the BSP stack, and drives the NS16550A at physical 0x1fe20000 from the 125 MHz APB clock. Stage 2 then installs the common LA exception path and enables only the CPU-local timer interrupt.",
+    "BootInfo publishes physical RAM banks 0..0x10000000 and 0x90000000..0xc0000000 while reserving the fixed FDT scratch, framebuffer shared-dma-pool, bootparam area, linked kernel, and initrd. Firmware pointers accept only raw physical or known cached/uncached DMW forms; FDT totalsize, UTF-8 cmdline, and initrd overlaps are checked before unsafe parsing or publication.",
     "The live control FDT, not the empty SPI dtb partition, is the current hardware source of truth. Confirmed nodes include the 2K1000 ICU, ls-ahci at 0x400e0000 IRQ19, and two DWMAC 3.70a controllers; GMAC1 at 0x40050000 is the U-Boot path that links at 1000/full.",
     "The SATA device is a Kingchuxing 32GB disk containing a raw ext4 filesystem at LBA0 with no partition table; U-Boot ext4ls scsi 0:0 / succeeds. No disk image or mother rootfs was modified.",
-    "LA QEMU remains independent and passed a fresh four-vCPU BusyBox boot sentinel after the target split. The repaired generation-based shootdown protocol remains the baseline for later board SMP work.",
-    "Stage 2 is next: consume the bootm command line/FDT path, establish CPU0 exceptions and timer, validate a non-overlapping initrd load address, and enter a minimal / #. The generated initrd must not be loaded until that address is proven on the board.",
+    "The LA page-table, ASID, trap, per-CPU, unaligned-access, and generation-based TLB shootdown sources now live in a platform-neutral tx-hal-loongarch64-common source directory. QEMU keeps its ExtIOI/PCH implementation separate and passed a fresh four-vCPU BusyBox run with online=4 plus shootdown/IPI and boot sentinels.",
+    "Paced real-board shell input passed echo TXV2_LA2K_STAGE2_OK and sleep 1; echo TIMER_OK. Burst input can overrun the Stage 2 polling UART RX path, and /proc/cpuinfo still exposes the repository's RV64 placeholder instead of LoongArch facts.",
+    "Stage 3 is next: implement the real 2K1000 ICU and CPU1 startup/IPI path, then run bidirectional generation shootdown, masked-interrupt recovery, ASID switching, permanent-wait, and stale-mapping witnesses without replacing the repaired protocol or serializing all cores.",
     "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
   ],
   "changed_files": [
@@ -50,11 +52,19 @@
     },
     {
       "path": "boards/tx-hal-loongarch64-2k1000",
-      "reason": "Adds the board-specific Stage 1 linker, U-Boot entry, DMW transition, CPU park, and NS16550A early console."
+      "reason": "Adds the board-specific linker/layout, U-Boot BPI/FDT facts, reserved-memory publication, CPU0 exception/timer integration, DMW transition, CPU park, and NS16550A console."
     },
     {
       "path": "boards/tx-kernel-loongarch64-2k1000",
-      "reason": "Adds the independent board kernel binary and Stage 1 Rust entry point."
+      "reason": "Runs the independent board binary through the generic txKernel main path with an empty Stage 2 device bundle."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-common",
+      "reason": "Owns platform-neutral LA page-table, ASID, trap, per-CPU, unaligned-access, and repaired generation shootdown mechanisms shared by QEMU and the real board."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-qemu-virt",
+      "reason": "Consumes the shared LA mechanisms while keeping QEMU-only ExtIOI/PCH hardware in the QEMU platform."
     },
     {
       "path": "xtask/src/target.rs",
@@ -62,7 +72,7 @@
     },
     {
       "path": "xtask/src/image.rs",
-      "reason": "Packages the independent board ELF with verified legacy uImage physical load and entry address 0x90000000."
+      "reason": "Packages the full board ELF at physical load/entry 0x98000000, validates initrd placement, and prints the volatile two-argument U-Boot/FDT recipe."
     }
   ],
   "verification": [
@@ -120,28 +130,48 @@
       "command": "CARGO_TARGET_DIR=/home/msp/learning/Txv2/target/la2k-stage1-isolated cargo test -p xtask --lib",
       "status": "failed",
       "notes": "266 of 274 tests pass. The eight failures are the pre-existing time-layering/time-wake failures already recorded in STATUS; all new target/image/rejection tests pass."
+    },
+    {
+      "command": "cargo test -p tx-hal-loongarch64-2k1000",
+      "status": "passed",
+      "notes": "All 9 board HAL tests pass, including known-DMW address normalization, full FDT header sizing, confirmed-bank bounds, overlap rejection, and reserved-memory publication."
+    },
+    {
+      "command": "cargo test -p tx-hal-loongarch64-qemu-virt",
+      "status": "passed",
+      "notes": "All 74 LA QEMU HAL tests pass after moving platform-neutral LA mechanisms into the common source directory."
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/home/msp/learning/Txv2/target/la2k-stage2-qemu cargo xtask qemu --target la64-qemu --profile busybox --expect-sentinel --timeout-ms 120000",
+      "status": "passed",
+      "notes": "The final four-vCPU regression reports possible=4, online=4, shootdown/IPI success, and txkernel:qemu-loongarch64-virt:boot:ok."
+    },
+    {
+      "command": "cargo xtask full-build --target la64-2k1000 --skip-doctor",
+      "status": "passed",
+      "notes": "Built the CPU0 kernel, BusyBox CPIO, and legacy kernel/ramdisk images. ELF entry is 0x98000000, __kernel_end is physical 0x9874d000, and both published TFTP files match their local SHA-256."
+    },
+    {
+      "command": "U-Boot: bootm 0x9000000097ffffc0 0x9000000098800000",
+      "status": "passed",
+      "notes": "Both CRCs passed; txKernel published the 100 MHz timebase and exact initrd range, reached boot:ok, entered / #, and completed paced echo and one-second timer wake commands. No SATA write or saveenv occurred."
+    },
+    {
+      "command": "cargo xtask lint arch",
+      "status": "failed",
+      "notes": "The repository reports 97 existing issues; none point into the changed LoongArch board/common/xtask files."
     }
   ],
   "next_actions": [
-    {
-      "id": "next-1",
-      "title": "Reach a CPU0 minimal initramfs shell",
-      "paths": [
-        "boards/tx-hal-loongarch64-2k1000",
-        "boards/tx-kernel-loongarch64-2k1000",
-        "boards/dtbs/ls2k1000-dp-v10.dts"
-      ],
-      "notes": "Stage 2 must parse the U-Boot command line/FDT carrier, install CPU0 exception and timer state, prove a safe initrd load address, and enter a minimal / #. Do not claim SMP, SATA, or networking yet."
-    },
     {
       "id": "next-2",
       "title": "Bring up the 2K1000 ICU, IPI, and SMP",
       "paths": [
         "boards/tx-hal-loongarch64-2k1000",
-        "boards/tx-hal-loongarch64-qemu-virt/src/la64_pmap.rs",
+        "boards/tx-hal-loongarch64-common/src/la64_pmap.rs",
         "crates/tx-hal/src/lib.rs"
       ],
-      "notes": "Stage 3 must verify board-specific interrupt routing, CPU startup, bidirectional IPI, masked-interrupt progress, ASID switching, and generation-based TLB shootdown without copying QEMU mailbox hardware or serializing all cores."
+      "notes": "Stage 3 must verify board-specific interrupt routing, CPU1 startup, bidirectional IPI, masked-interrupt progress, ASID switching, permanent-wait freedom, and stale-map rejection without copying QEMU mailbox hardware or serializing all cores. It must also replace the incorrect RV64 /proc/cpuinfo placeholder before final SMP reporting."
     },
     {
       "id": "next-3",
@@ -186,6 +216,8 @@
     "QEMU 10.0.2.2/10.0.2.3 networking values are QEMU user-network endpoints and must not be copied to the physical 2K1000 network configuration.",
     "U-Boot and txKernel may program different IP and MAC values while taking turns controlling the same physical Ethernet hardware; U-Boot network state does not automatically carry into txKernel.",
     "Keep commands short: avoid unnecessary shell variables, if branches, printf scaffolding, generated helper scripts, and destructive cleanup commands.",
+    "Until the real ICU/UART RX interrupt route exists, pace serial input in small chunks; burst writes can overrun the polling receive path.",
+    "The current /proc/cpuinfo text is an existing RV64 placeholder on LA64 and is not evidence for the board ISA or MMU mode.",
     "For every hardware step, identify the execution context, show the shortest command, show only the key success output, and state what failure means.",
     "Do not describe intermediate repair history in user-facing knowledge documents. Record the final working chain and durable constraints only."
   ],

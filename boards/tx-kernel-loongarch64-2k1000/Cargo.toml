@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tx-hal = { path = "../../crates/tx-hal" }
 tx-hal-loongarch64-2k1000 = { path = "../tx-hal-loongarch64-2k1000" }
+tx-kernel = { path = "../../crates/tx-kernel" }
 
 [[bin]]
 name = "tx-kernel-loongarch64-2k1000"
