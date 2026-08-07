@@ -1193,15 +1193,18 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::probe_ext4_superblock_smoke();
     }
 
-    /// If a `vda` block device is registered, read its first 4 KiB through the
-    /// `tx_fs::tx_ext4::BlockDeviceImage` adapter and emit a sentinel reporting
-    /// whether the bytes at offset 1024+56 spell the ext4 magic (`0x53 0xef`).
-    /// Boards without a block device (e.g. m1dock-mock) silently no-op.
+    /// If the selected root block device is registered, read its first 4 KiB
+    /// through the `tx_fs::tx_ext4::BlockDeviceImage` adapter and emit a
+    /// sentinel reporting whether the bytes at offset 1024+56 spell the ext4
+    /// magic (`0x53 0xef`). Boards without a selected block root silently no-op.
     fn probe_ext4_superblock_smoke() {
         use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
         use tx_subsystems::device::block_device_by_name;
 
-        let Some(reg) = block_device_by_name(b"vda") else {
+        let Some(root_name) = Self::root_device_name() else {
+            return;
+        };
+        let Some(reg) = block_device_by_name(root_name.as_bytes()) else {
             return;
         };
         let image = BlockDeviceImage::new(reg.ops);
@@ -1305,7 +1308,7 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
+        use tx_fs::tx_ext4::{mount_ext4_read_only, mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
@@ -1315,9 +1318,18 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>(":missing\n");
             return false;
         };
+        // The parsed cmdline token may live in firmware-owned storage. Use the
+        // registry's static name for every long-lived mount label and for
+        // diagnostics emitted after filesystem allocation has started.
+        let dev_name = reg.name;
 
+        let read_only = Self::root_mount_is_read_only();
         let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_write(image) {
+        let mount_output = match if read_only {
+            mount_ext4_read_only(image)
+        } else {
+            mount_ext4_read_write(image)
+        } {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -1359,7 +1371,11 @@ impl<P: TxPlatform> CoreInit<P> {
             ext4_root_rnode,
             None,
             ext4_payload,
-            MountFlags::empty(),
+            if read_only {
+                MountFlags::READ_ONLY
+            } else {
+                MountFlags::empty()
+            },
         )
         .expect("mount_sdcard_as_root_if_requested: mount identity reservation");
 
@@ -1373,7 +1389,8 @@ impl<P: TxPlatform> CoreInit<P> {
         *ROOT_MOUNT.lock() = Some(mount);
         ROOTFS_FROM_BOOT_MEDIA.store(true, Ordering::Release);
 
-        note_mount_line(&alloc::format!("/dev/{dev_name} / ext4 rw 0 0"));
+        let mode = if read_only { "ro" } else { "rw" };
+        note_mount_line(&alloc::format!("/dev/{dev_name} / ext4 {mode} 0 0"));
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
         tx_hal::console_write_str::<P>(dev_name);
@@ -1383,9 +1400,9 @@ impl<P: TxPlatform> CoreInit<P> {
 
     /// Resolve the root block device to mount from the boot cmdline, the way
     /// Linux's `root=` parameter works. `tx.root=<name>` names the block
-    /// device directly (`vda` for the QEMU virtio disk, `mmcblk0` for the
-    /// SD card on the board, …). The legacy `tx.root=sdcard` alias resolves to
-    /// `vda`.  Explicit `tx.root=` always wins.  Initramfs/busybox and
+    /// device directly (`vda` for the QEMU virtio disk, `sda` for the 2K1000
+    /// SATA disk, or `mmcblk0` for an SD card). The legacy `tx.root=sdcard`
+    /// alias resolves to `vda`. Explicit `tx.root=` always wins. Initramfs/busybox and
     /// `tx.profile=pretest`, legacy `tx.runsh=`, and typed compatibility modes
     /// whose boot plan installs kernel rootfs shims retain the tmpfs-root
     /// layout; otherwise QEMU defaults to `vda` so a judge does not need a
@@ -1396,6 +1413,23 @@ impl<P: TxPlatform> CoreInit<P> {
             boot_info.cmdline.unwrap_or(""),
             boot_info.initrd.is_some(),
         )
+    }
+
+    fn root_mount_is_read_only() -> bool {
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        Self::root_mount_is_read_only_from_boot(cmdline)
+    }
+
+    fn root_mount_is_read_only_from_boot(cmdline: &str) -> bool {
+        let mut read_only = false;
+        for token in cmdline.split_ascii_whitespace() {
+            match token {
+                "ro" => read_only = true,
+                "rw" => read_only = false,
+                _ => {}
+            }
+        }
+        read_only
     }
 
     fn root_device_name_from_boot(cmdline: &'static str, has_initrd: bool) -> Option<&'static str> {
@@ -1543,7 +1577,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
             {
                 V3::Done(out) => out,
-                V3::Err(step_engine::Errno::EEXIST) => {
+                V3::Err(step_engine::Errno::EEXIST) | V3::Err(step_engine::Errno::EROFS) => {
                     let dev_object_id =
                         match root_payload
                             .fs_ops
@@ -1568,7 +1602,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     );
                     (dev_object_id, dev_meta)
                 }
-                V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                V3::Err(step_engine::Errno::ENOSYS) => {
                     (root_fs_object_id, root_mount.root().meta())
                 }
                 other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
@@ -1690,7 +1724,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 .mkdir(root_fs_object_id, b"proc", 0o555, &cred, &guard)
             {
                 V3::Done(out) => out,
-                V3::Err(step_engine::Errno::EEXIST) => {
+                V3::Err(step_engine::Errno::EEXIST) | V3::Err(step_engine::Errno::EROFS) => {
                     let id = match rootfs_payload
                         .fs_ops
                         .lookup(root_fs_object_id, b"proc", &guard)
@@ -1706,7 +1740,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     };
                     (id, meta)
                 }
-                V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                V3::Err(step_engine::Errno::ENOSYS) => {
                     (root_fs_object_id, root_mount.root().meta())
                 }
                 other => panic!("mount_procfs_at_proc: mkdir(/proc) failed: {other:?}"),
@@ -1797,7 +1831,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 .mkdir(root_fs_object_id, b"sys", 0o755, &cred, &guard)
             {
                 V3::Done(out) => out,
-                V3::Err(step_engine::Errno::EEXIST) => {
+                V3::Err(step_engine::Errno::EEXIST) | V3::Err(step_engine::Errno::EROFS) => {
                     let id = match rootfs_payload
                         .fs_ops
                         .lookup(root_fs_object_id, b"sys", &guard)

@@ -6,16 +6,20 @@ extern crate std;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
-    CpuPinGuard, DeadlineTimerIf, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf,
-    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink,
-    LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, MonotonicCounterIf,
-    ObserverIf, PercpuIf, PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    CpuPinGuard, DeadlineTimerIf, DeviceId, DeviceLocalId, DeviceMatchId, DeviceResource,
+    DeviceResourceGraph, DeviceStatus, DmaCoherency, DmaConstraints, DmaDomain, DmaDomainId,
+    DmaDomainRef, DmaIf, DmaTranslation, EntropyIf, FaultInfo, FpSimdIf, InitIf,
+    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, IrqPolarity, IrqResource,
+    IrqSharing, IrqTrigger, KernelTrapSink, LocalExecutionGuard, MemoryRegion, MemoryRegionKind,
+    MmioFlags, MmioRegion, MmioResource, MonotonicCounterIf, ObserverIf, PercpuIf,
+    PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
+    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
-    PtNodeAllocator, SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite,
-    SignalHandlerRegs, SmpIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
-    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext, UserPtr,
-    UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange, EMPTY_DEVICE_RESOURCE_GRAPH,
+    PtNodeAllocator, ResourceOrigin, ResourceOriginKind, ResourceProviderId, ResourceRole,
+    SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf,
+    TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView,
+    TrapIf, TrapPreviousMode, UserFpContext, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
+    VirtRange,
 };
 
 use boot_facts::ensure_static_boot_facts;
@@ -83,6 +87,8 @@ const LA2K1000_BOOTPARAM_BASE: usize = 0x0f00_0000;
 const LA2K1000_BOOTPARAM_SIZE: usize = 0x0100_0000;
 const LA2K1000_UART_BASE: usize = 0x1fe2_0000;
 const LA2K1000_UART_SIZE: usize = 0x100;
+const LA2K1000_AHCI_BASE: usize = 0x400e_0000;
+const LA2K1000_AHCI_SIZE: usize = 0x0001_0000;
 const LA64_MAX_BOOT_CPUS: usize = 2;
 const LA64_DEFAULT_POSSIBLE_CPUS: usize = LA64_MAX_BOOT_CPUS;
 const LA64_DMW_CACHED_BASE: usize = 0x9000_0000_0000_0000;
@@ -805,7 +811,7 @@ pub fn initialize_early_board() {
     early_console_write(b"txkernel:loongson-2k1000:h2:uart-reinit:ok\n");
 }
 
-static MMIO_REGIONS: [MmioRegion; 2] = [
+static MMIO_REGIONS: [MmioRegion; 3] = [
     MmioRegion {
         name: "uart0",
         phys: PhysRange {
@@ -834,7 +840,91 @@ static MMIO_REGIONS: [MmioRegion; 2] = [
             .union(MmioFlags::READ)
             .union(MmioFlags::WRITE),
     },
+    MmioRegion {
+        name: "ahci0",
+        phys: PhysRange {
+            start: PhysAddr(LA2K1000_AHCI_BASE),
+            size: LA2K1000_AHCI_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_AHCI_BASE),
+            size: LA2K1000_AHCI_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+    },
 ];
+
+const LA2K1000_SOC_PROVIDER: ResourceProviderId = ResourceProviderId("loongson-2k1000-soc");
+const LA2K1000_AHCI_ORIGIN: ResourceOrigin = ResourceOrigin {
+    provider: LA2K1000_SOC_PROVIDER,
+    record: "/2k1000-soc/ahci@400e0000",
+    kind: ResourceOriginKind::PlatformStatic,
+};
+const LA2K1000_SOC_DMA_DOMAIN_ID: DmaDomainId = DmaDomainId {
+    provider: LA2K1000_SOC_PROVIDER,
+    local: 0,
+};
+static LA2K1000_DMA_DOMAINS: [DmaDomain; 1] = [DmaDomain {
+    id: LA2K1000_SOC_DMA_DOMAIN_ID,
+    translation: DmaTranslation::Direct { offset: 0 },
+    constraints: DmaConstraints {
+        dma_address_bits: 32,
+        min_alignment: 1,
+        segment_boundary: None,
+        max_segment_len: usize::MAX,
+        max_segments: u16::MAX,
+    },
+    coherency: DmaCoherency::Coherent,
+    origin: LA2K1000_AHCI_ORIGIN,
+}];
+static LA2K1000_AHCI_MATCHES: [DeviceMatchId; 1] =
+    [DeviceMatchId::FirmwareCompatible("loongson,ls-ahci")];
+static LA2K1000_AHCI_RESOURCES: [DeviceResource; 3] = [
+    DeviceResource::Mmio(MmioResource {
+        role: ResourceRole::Index(0),
+        phys: PhysRange {
+            start: PhysAddr(LA2K1000_AHCI_BASE),
+            size: LA2K1000_AHCI_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_AHCI_BASE),
+            size: LA2K1000_AHCI_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+        origin: LA2K1000_AHCI_ORIGIN,
+    }),
+    DeviceResource::Irq(IrqResource {
+        role: ResourceRole::Index(0),
+        line: la2k1000_liointc::AHCI_PUBLIC_IRQ,
+        trigger: IrqTrigger::Level,
+        polarity: IrqPolarity::High,
+        sharing: IrqSharing::Exclusive,
+        origin: LA2K1000_AHCI_ORIGIN,
+    }),
+    DeviceResource::DmaDomain(DmaDomainRef {
+        role: ResourceRole::Index(0),
+        domain: LA2K1000_SOC_DMA_DOMAIN_ID,
+    }),
+];
+static LA2K1000_PLATFORM_DEVICES: [tx_hal::PlatformDevice; 1] = [tx_hal::PlatformDevice {
+    id: DeviceId {
+        provider: LA2K1000_SOC_PROVIDER,
+        local: DeviceLocalId::FirmwarePath("/2k1000-soc/ahci@400e0000"),
+    },
+    status: DeviceStatus::Enabled,
+    matches: &LA2K1000_AHCI_MATCHES,
+    resources: &LA2K1000_AHCI_RESOURCES,
+    origin: LA2K1000_AHCI_ORIGIN,
+}];
+static LA2K1000_DEVICE_RESOURCE_GRAPH: DeviceResourceGraph = DeviceResourceGraph {
+    platform_mmio: &[],
+    devices: &LA2K1000_PLATFORM_DEVICES,
+    dma_domains: &LA2K1000_DMA_DOMAINS,
+};
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -907,7 +997,7 @@ impl PlatformConfig for Platform {
     const PAGE_TABLE_LEVELS: u8 = 4;
     const ASID_BITS: u8 = 10;
     const CACHE_LINE_SIZE: usize = 64;
-    const DMA_COHERENT: bool = false;
+    const DMA_COHERENT: bool = true;
 }
 
 impl BootPlatformIf for Platform {
@@ -937,6 +1027,36 @@ impl BootInfoIf for Platform {
 impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
         boot_facts::platform_info()
+    }
+
+    fn prepare_platform_device(
+        device: &'static tx_hal::PlatformDevice,
+    ) -> Result<(), tx_hal::PlatformDevicePrepareError> {
+        let is_ahci = device.matches.iter().any(|candidate| {
+            matches!(candidate, DeviceMatchId::FirmwareCompatible(value)
+                if *value == "loongson,ls-ahci" || *value == "snps,spear-ahci")
+        });
+        if !is_ahci {
+            return Ok(());
+        }
+
+        let irq = device.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Irq(irq) if irq.role == ResourceRole::Index(0) => Some(*irq),
+            _ => None,
+        });
+        let Some(irq) = irq else {
+            return Err(tx_hal::PlatformDevicePrepareError::MalformedFirmwareProperty);
+        };
+        if irq.line != la2k1000_liointc::AHCI_PUBLIC_IRQ
+            || irq.trigger != IrqTrigger::Level
+            || irq.polarity != IrqPolarity::High
+        {
+            return Err(tx_hal::PlatformDevicePrepareError::MalformedFirmwareProperty);
+        }
+        if !la2k1000_liointc::prepare_level_high_source(irq.line) {
+            return Err(tx_hal::PlatformDevicePrepareError::MalformedFirmwareProperty);
+        }
+        Ok(())
     }
 }
 
@@ -988,3 +1108,61 @@ mod la64_unaligned;
 mod platform_impls;
 #[path = "../../tx-hal-loongarch64-common/src/trap_asm.rs"]
 mod trap_asm;
+
+#[cfg(test)]
+mod device_resource_tests {
+    use super::*;
+
+    #[test]
+    fn ahci_resource_graph_matches_live_board_facts() {
+        let graph = tx_hal::DeviceGraphBuilder::from_seed(&LA2K1000_DEVICE_RESOURCE_GRAPH)
+            .expect("2K1000 resource seed is valid")
+            .freeze()
+            .expect("2K1000 resource graph freezes");
+        assert_eq!(graph.devices.len(), 1);
+        assert_eq!(graph.dma_domains.len(), 1);
+
+        let ahci = &graph.devices[0];
+        assert_eq!(ahci.status, DeviceStatus::Enabled);
+        assert!(ahci.matches.iter().any(|candidate| matches!(
+            candidate,
+            DeviceMatchId::FirmwareCompatible("loongson,ls-ahci")
+        )));
+
+        let mmio = ahci.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Mmio(mmio) => Some(*mmio),
+            _ => None,
+        });
+        let irq = ahci.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Irq(irq) => Some(*irq),
+            _ => None,
+        });
+        let dma = ahci.resources.iter().find_map(|resource| match resource {
+            DeviceResource::DmaDomain(dma) => Some(*dma),
+            _ => None,
+        });
+
+        let mmio = mmio.expect("AHCI MMIO resource");
+        assert_eq!(mmio.phys.start, PhysAddr(LA2K1000_AHCI_BASE));
+        assert_eq!(mmio.phys.size, LA2K1000_AHCI_SIZE);
+        assert_eq!(
+            mmio.virt.start,
+            VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_AHCI_BASE)
+        );
+
+        let irq = irq.expect("AHCI IRQ resource");
+        assert_eq!(irq.line, la2k1000_liointc::AHCI_PUBLIC_IRQ);
+        assert_eq!(irq.trigger, IrqTrigger::Level);
+        assert_eq!(irq.polarity, IrqPolarity::High);
+        assert_eq!(irq.sharing, IrqSharing::Exclusive);
+
+        let dma = dma.expect("AHCI DMA domain reference");
+        assert_eq!(dma.domain, LA2K1000_SOC_DMA_DOMAIN_ID);
+        let domain = &graph.dma_domains[0];
+        assert_eq!(domain.translation, DmaTranslation::Direct { offset: 0 });
+        assert_eq!(domain.constraints.dma_address_bits, 32);
+        assert_eq!(domain.coherency, DmaCoherency::Coherent);
+        assert!(<Platform as PlatformConfig>::DMA_COHERENT);
+        assert!(<Platform as DmaIf>::DMA_COHERENT);
+    }
+}

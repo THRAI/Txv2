@@ -2,6 +2,7 @@
 
 mod block;
 
+pub mod ahci_block;
 pub mod binder;
 pub mod dwmac_net;
 pub mod runtime;

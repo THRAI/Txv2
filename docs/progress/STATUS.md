@@ -1,3 +1,30 @@
+- 2026-08-08 (**Loongson 2K1000 Stage 4 AHCI 裸 ext4 根盘已进入 Alpine `/ #`**).
+  **Changed**：新增通用 AHCI 1.x 单端口/slot0 polling 块驱动，使用独占且 pin 的
+  8 KiB DMA workspace、4 KiB bounce buffer、IDENTIFY 与 LBA48 READ DMA EXT，
+  写入和 barrier 保持 `EROFS`；DMA teardown 仅在 ST/CR、FRE/FR 停止并清除
+  CLB/FB 后释放 workspace，无法确认停止时保留 pins 隔离页面。2K1000 平台独立发布 `ls-ahci@0x400e0000`、
+  32-bit coherent identity DMA domain，以及 hwirq19/public IRQ20 的 level-high
+  route；bootstrap binder 将整盘注册为 `sda`/`DevT(8,0)`。内核支持
+  `tx.root=sda` 与标准 `ro`/`rw` 根挂载模式，裸 ext4 直接挂载 `/`，不假定
+  `/dev/sda1`。ext4 lookup cache 的 512 项内联数组改为堆存储：LA debug ELF 中
+  `Ext4FsInstance::open_with_backend_planner_and_mapping` 栈帧由 66,448 bytes 降为
+  928 bytes，避免超过 2K1000 64 KiB boot stack 后清零相邻 BSS。
+  **Real hardware**：U-Boot 和 txKernel 均识别 Kingchuxing 32GB、62533296 个
+  512-byte sector；txKernel 输出 `ahci:probe:ok`、`block:ext4-superblock:ok`、
+  `mount:rootfs:ext4:sda:ok`，保留双核 IPI/shootdown/RCU sentinels，按
+  `init=/bin/sh` 执行 Alpine 动态用户态并进入 `/ #`。母盘和真实磁盘均未被写入，
+  未执行 `dd`、`saveenv` 或 AHCI write command。
+  **Verification**：tx-drivers 21/21、tx-ext4 38/38、2K HAL 15/15、kernel mount
+  8/8、`cargo xtask full-build --target la64-2k1000 --skip-doctor`、LA QEMU 四核
+  BusyBox sentinel、RV QEMU 四核 BusyBox + owner-wake sentinel 通过；实板 TFTP
+  uImage SHA-256 与本地产物一致。**Accepted/rejected**：接受 DTS 的 32-bit
+  coherent identity DMA 与 polling bring-up；拒绝 vendor U-Boot 因 identity
+  `virt_to_phys()` 遗留的 `0x9000...` 高位作为硬件必需地址，也拒绝用增大板栈
+  掩盖通用 ext4 大栈帧。**Next**：Stage 5 按 live FDT 独立接入 GMAC 3.70a、
+  MDIO/PHY/clock/reset 与 DMA；AHCI IRQ route 已建模但仍保持 masked，Stage 4 不以
+  未验证的中断模式替代已通过的 polling 路径。**Blocker**：Stage 4 无硬件
+  blocker；2K1000 RTC、GMAC、网络/IP/DNS/TLS 和 Git 链路尚未实现或验收。
+
 - 2026-08-07 (**Loongson 2K1000 Stage 3 实板中断与双核 SMP 通过**).
   **Changed**：新增 2K1000 vendor mailbox CPU1 release、独立 AP trampoline/stack，
   并将运行期 IOCSR IPI transport 抽到 `tx-hal-loongarch64-common`，QEMU 仍独占

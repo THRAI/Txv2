@@ -7,6 +7,8 @@ pub(crate) const MAIN_PHYS_BASE: usize = 0x1fe0_1400;
 pub(crate) const MAIN_MMIO_SIZE: usize = 0x80;
 pub(crate) const PUBLIC_IRQ_LIMIT: u32 = 65;
 pub(crate) const UART_SHARED_PUBLIC_IRQ: u32 = 1;
+/// The device tree's AHCI hwirq 19 in the public domain that reserves zero.
+pub(crate) const AHCI_PUBLIC_IRQ: u32 = 20;
 
 const BANKS: usize = 2;
 const SOURCES_PER_BANK: usize = 32;
@@ -44,11 +46,8 @@ pub(crate) fn prepare_uart0_irq() {
         write_uart_u8(uart, UART_IER, 0);
     }
 
-    clear_config_bit(0, POLARITY);
-    clear_config_bit(0, EDGE);
-    clear_config_bit(0, BOUNCE);
-    clear_config_bit(0, AUTO);
-    write_route_u8(0, ROUTE_CPU0_HWI1);
+    let prepared = prepare_level_high_source(UART_SHARED_PUBLIC_IRQ);
+    debug_assert!(prepared);
 
     let _ = read_uart_u8(0, UART_IIR);
     for _ in 0..64 {
@@ -61,6 +60,26 @@ pub(crate) fn prepare_uart0_irq() {
     let _ = read_uart_u8(0, UART_MSR);
     write_uart_u8(0, UART_IER, UART_IER_ERBFI);
     device_barrier();
+}
+
+/// Route one level-high source to CPU0 HWI1 without enabling it.
+///
+/// The static binder can prepare a device before its handler is published;
+/// unmasking remains the binder's final post-publication operation.
+pub(crate) fn prepare_level_high_source(public_irq: u32) -> bool {
+    let Some((bank, bit)) = decode_public_irq(public_irq) else {
+        return false;
+    };
+    let source = public_irq as usize - 1;
+
+    write_bank_u32(bank, ENABLE_CLEAR, bit);
+    clear_config_bit(source, POLARITY);
+    clear_config_bit(source, EDGE);
+    clear_config_bit(source, BOUNCE);
+    clear_config_bit(source, AUTO);
+    write_route_u8(source, ROUTE_CPU0_HWI1);
+    device_barrier();
+    true
 }
 
 pub(crate) fn claim() -> u32 {
@@ -301,5 +320,25 @@ mod tests {
         unmask(PUBLIC_IRQ_LIMIT);
         assert_eq!(HOST_ENABLE[0].load(Ordering::Acquire), 0);
         assert_eq!(HOST_ENABLE[1].load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn ahci_platform_prepare_routes_level_high_and_leaves_source_masked() {
+        let _guard = TEST_LOCK.lock().expect("LIOINTC test lock poisoned");
+        reset();
+        HOST_ENABLE[0].store(u32::MAX, Ordering::Release);
+
+        <Platform as PlatformInfoIf>::prepare_platform_device(&LA2K1000_PLATFORM_DEVICES[0])
+            .expect("AHCI platform preparation");
+
+        let source = (AHCI_PUBLIC_IRQ - 1) as usize;
+        let bit = 1u32 << source;
+        assert_eq!(HOST_ENABLE[0].load(Ordering::Acquire) & bit, 0);
+        assert_ne!(HOST_ENABLE[0].load(Ordering::Acquire) & (1 << 18), 0);
+        assert_eq!(HOST_ROUTE[source].load(Ordering::Acquire), ROUTE_CPU0_HWI1);
+        assert_eq!(HOST_POLARITY[0].load(Ordering::Acquire) & bit, 0);
+        assert_eq!(HOST_EDGE[0].load(Ordering::Acquire) & bit, 0);
+        assert_eq!(HOST_BOUNCE[0].load(Ordering::Acquire) & bit, 0);
+        assert_eq!(HOST_AUTO[0].load(Ordering::Acquire) & bit, 0);
     }
 }

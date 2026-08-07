@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod adapter;
+pub mod ahci;
 pub mod dwmac;
 pub mod mmc;
 mod sync;

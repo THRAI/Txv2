@@ -706,14 +706,14 @@ const LOOKUP_CACHE_NAME_BYTES: usize = 96;
 
 struct LookupCache {
     clock: u64,
-    entries: [LookupCacheEntry; LOOKUP_CACHE_ENTRIES],
+    entries: Vec<LookupCacheEntry>,
 }
 
 impl LookupCache {
-    const fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             clock: 0,
-            entries: [LookupCacheEntry::empty(); LOOKUP_CACHE_ENTRIES],
+            entries: alloc::vec![LookupCacheEntry::empty(); LOOKUP_CACHE_ENTRIES],
         }
     }
 
@@ -923,5 +923,17 @@ fn timespec(sec: u32) -> Timespec {
     Timespec {
         sec: sec as i64,
         nsec: 0,
+    }
+}
+
+#[cfg(test)]
+mod lookup_cache_layout_tests {
+    use super::{LookupCache, LookupCacheEntry, LOOKUP_CACHE_ENTRIES};
+
+    #[test]
+    fn lookup_cache_keeps_its_large_entry_store_off_stack() {
+        let cache = LookupCache::empty();
+        assert_eq!(cache.entries.len(), LOOKUP_CACHE_ENTRIES);
+        assert!(core::mem::size_of::<LookupCache>() < core::mem::size_of::<LookupCacheEntry>() * 2);
     }
 }

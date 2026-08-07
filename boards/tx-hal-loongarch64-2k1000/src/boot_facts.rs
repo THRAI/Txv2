@@ -69,7 +69,7 @@ static mut PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: Platform::BOARD,
     spi_sd: None,
     mmio_regions: &MMIO_REGIONS,
-    device_resources: &EMPTY_DEVICE_RESOURCE_GRAPH,
+    device_resources: &LA2K1000_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: LA64_DEFAULT_POSSIBLE_CPUS,
 };

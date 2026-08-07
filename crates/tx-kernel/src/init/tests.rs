@@ -544,6 +544,10 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         Some("mmcblk0")
     );
     assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sda", true),
+        Some("sda")
+    );
+    assert_eq!(
         CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sdcard", false),
         Some("vda")
     );
@@ -589,6 +593,18 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         ),
         Some("vda")
     );
+}
+
+#[test]
+fn root_mount_mode_honors_the_last_standard_ro_or_rw_token() {
+    assert!(!CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(""));
+    assert!(CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(
+        "tx.root=sda ro"
+    ));
+    assert!(!CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot("tx.root=sda ro rw"));
+    assert!(CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(
+        "tx.root=sda rw ro"
+    ));
 }
 
 #[test]
