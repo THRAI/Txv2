@@ -7,14 +7,16 @@
   "status": "open",
   "plan": null,
   "current_state": [
-    "Work continues on branch feature/portable-net-vf2-dwmac from commit c6b5f5f1 (feat: complete portable networking and VF2 Git validation).",
-    "RV64 and LA64 QEMU boot with the competition Alpine root filesystems; VF2 has completed real-board boot, networking, DNS, TLS, and public GitHub clone validation.",
-    "The Loongson 2K1000 Nebula board is powered and its onboard USB_DEBUG serial console has reached the U-Boot => prompt through /dev/ttyUSB0 at 115200 baud.",
-    "The available LA root filesystem is local-images/alpine-linux-loongarch64-ext4fs.img: a raw bare ext4 full Alpine root filesystem with LoongArch64 userspace and Git, not a partitioned disk image.",
-    "The repository currently exposes la64-qemu only; there is no la64-2k1000 target. Existing LA QEMU success is not evidence of 2K1000 board support.",
-    "The current LA linker uses physical load base 0x00200000, while xtask packages txv2-la.uimage for 0x90000000. The existing LA uImage must not be treated as a verified 2K1000 boot artifact.",
-    "The 2K1000 platform still needs board-specific UART/boot facts, ICU interrupt routing, AHCI storage, and ls,ls-gmac / snps,dwmac-3.70a network support before the Alpine root filesystem and Git can be validated on hardware.",
-    "The required end state is a real 2K1000 boot into the Alpine root filesystem followed by git help, local init/add/commit/log, HTTPS clone, commit, push, manual remote README edit, and pull.",
+    "Work continues on branch feature/portable-net-vf2-dwmac from the LA QEMU SMP4 shootdown checkpoint 0f8b3315; commits 521c2114 and 0811e354 remain the shared Pmap/TLB baseline and were not reverted or duplicated.",
+    "Stage 1 is complete on real Loongson 2K1000 Nebula hardware: the repository now has independent tx-hal-loongarch64-2k1000 and tx-kernel-loongarch64-2k1000 crates plus the la64-2k1000 xtask target.",
+    "U-Boot 2022.04-v2.1.0-00579-g3bcf8c7d reports 1 GiB DDR in two banks: 0x9000000000000000+256 MiB and 0x9000000090000000+768 MiB. Its TFTP staging loadaddr is 0x9000000098000000.",
+    "The verified legacy uImage is Txv2-la2k1000 with 8281 bytes of payload and 32-bit physical load/entry 0x90000000. The old la-uimage command is rejected because it mixed the LA QEMU ELF with board addresses.",
+    "A real bootm run verified the image CRC, reported 1024 MiB, and printed txkernel:loongson-2k1000:h1:uart-inherited:ok followed by txkernel:loongson-2k1000:h1:uart-reinit:ok.",
+    "The stage-1 entry installs VSEG9 cached and VSEG8 uncached DMWs, sets CRMD IE=0/DA=0/PG=1, invalidates TLB only after reaching the high DMW, parks nonzero CPUs before using the BSP stack, and drives the NS16550A at physical 0x1fe20000 from the 125 MHz APB clock.",
+    "The live control FDT, not the empty SPI dtb partition, is the current hardware source of truth. Confirmed nodes include the 2K1000 ICU, ls-ahci at 0x400e0000 IRQ19, and two DWMAC 3.70a controllers; GMAC1 at 0x40050000 is the U-Boot path that links at 1000/full.",
+    "The SATA device is a Kingchuxing 32GB disk containing a raw ext4 filesystem at LBA0 with no partition table; U-Boot ext4ls scsi 0:0 / succeeds. No disk image or mother rootfs was modified.",
+    "LA QEMU remains independent and passed a fresh four-vCPU BusyBox boot sentinel after the target split. The repaired generation-based shootdown protocol remains the baseline for later board SMP work.",
+    "Stage 2 is next: consume the bootm command line/FDT path, establish CPU0 exceptions and timer, validate a non-overlapping initrd load address, and enter a minimal / #. The generated initrd must not be loaded until that address is proven on the board.",
     "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
   ],
   "changed_files": [
@@ -45,6 +47,22 @@
     {
       "path": "docs/progress/handoffs/2026-08-06-la2k1000-real-board-git.json",
       "reason": "Defines the authoritative continuation boundary for LA 2K1000 hardware work."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-2k1000",
+      "reason": "Adds the board-specific Stage 1 linker, U-Boot entry, DMW transition, CPU park, and NS16550A early console."
+    },
+    {
+      "path": "boards/tx-kernel-loongarch64-2k1000",
+      "reason": "Adds the independent board kernel binary and Stage 1 Rust entry point."
+    },
+    {
+      "path": "xtask/src/target.rs",
+      "reason": "Adds la64-2k1000 as a physical-board target with an independent kernel package and artifact path."
+    },
+    {
+      "path": "xtask/src/image.rs",
+      "reason": "Packages the independent board ELF with verified legacy uImage physical load and entry address 0x90000000."
     }
   ],
   "verification": [
@@ -82,29 +100,48 @@
       "command": "picocom -b 115200 /dev/ttyUSB0",
       "status": "passed",
       "notes": "The connected 2K1000 board reached a clean U-Boot => prompt through onboard USB_DEBUG."
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/home/msp/learning/Txv2/target/la2k-stage1-isolated cargo xtask full-build --skip-doctor --target la64-2k1000",
+      "status": "passed",
+      "notes": "Built the independent board ELF, BusyBox CPIO, kernel uImage, and ramdisk uImage in the required order. The Stage 1 boot recipe remains kernel-only until an initrd RAM address is board-validated."
+    },
+    {
+      "command": "U-Boot: tftpboot ${loadaddr} txv2/txv2-la2k1000.uimage; iminfo ${loadaddr}; bootm ${loadaddr}",
+      "status": "passed",
+      "notes": "GMAC1 linked at 1000/full, TFTP transferred 8345 bytes, iminfo verified CRC and physical load/entry 0x90000000, then real hardware printed both Stage 1 UART sentinels."
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/home/msp/learning/Txv2/target/la2k-stage1-isolated cargo xtask qemu --target la64-qemu --profile busybox --expect-sentinel --timeout-ms 30000 --smp 4 --no-block",
+      "status": "passed",
+      "notes": "A fresh LA QEMU four-vCPU regression observed txkernel:qemu-loongarch64-virt:boot:ok after introducing the separate physical target."
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/home/msp/learning/Txv2/target/la2k-stage1-isolated cargo test -p xtask --lib",
+      "status": "failed",
+      "notes": "266 of 274 tests pass. The eight failures are the pre-existing time-layering/time-wake failures already recorded in STATUS; all new target/image/rejection tests pass."
     }
   ],
   "next_actions": [
     {
       "id": "next-1",
-      "title": "Capture the minimum immutable U-Boot and firmware facts",
+      "title": "Reach a CPU0 minimal initramfs shell",
       "paths": [
-        "boards/dtbs/ls2k1000-dp-v10.dts",
-        "xtask/src/target.rs",
-        "xtask/src/image.rs"
+        "boards/tx-hal-loongarch64-2k1000",
+        "boards/tx-kernel-loongarch64-2k1000",
+        "boards/dtbs/ls2k1000-dp-v10.dts"
       ],
-      "notes": "Run only short read-only U-Boot commands first: version, bdinfo, printenv loadaddr bootargs, and FDT chosen/memory inspection. State whether each command runs on the host or at the U-Boot => prompt, and retain only key output."
+      "notes": "Stage 2 must parse the U-Boot command line/FDT carrier, install CPU0 exception and timer state, prove a safe initrd load address, and enter a minimal / #. Do not claim SMP, SATA, or networking yet."
     },
     {
       "id": "next-2",
-      "title": "Create a distinct 2K1000 platform and obtain the first serial boot",
+      "title": "Bring up the 2K1000 ICU, IPI, and SMP",
       "paths": [
-        "boards/tx-hal-loongarch64-qemu-virt",
-        "boards/tx-kernel-loongarch64-qemu-virt",
-        "xtask/src/target.rs",
-        "xtask/src/image.rs"
+        "boards/tx-hal-loongarch64-2k1000",
+        "boards/tx-hal-loongarch64-qemu-virt/src/la64_pmap.rs",
+        "crates/tx-hal/src/lib.rs"
       ],
-      "notes": "Keep QEMU and hardware constants separate. First acceptance point is a correctly loaded 2K1000 kernel that emits early serial output; do not claim rootfs or SMP completion at this stage."
+      "notes": "Stage 3 must verify board-specific interrupt routing, CPU startup, bidirectional IPI, masked-interrupt progress, ASID switching, and generation-based TLB shootdown without copying QEMU mailbox hardware or serializing all cores."
     },
     {
       "id": "next-3",

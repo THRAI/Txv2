@@ -1,0 +1,16 @@
+[package]
+name = "tx-hal-loongarch64-2k1000"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tx-hal = { path = "../../crates/tx-hal" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true

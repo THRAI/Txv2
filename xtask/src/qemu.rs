@@ -80,6 +80,11 @@ enum SentinelState {
 
 pub(crate) fn qemu(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
+    if target == TxTarget::La64Ls2k1000 {
+        return Err(
+            "la64-2k1000 is a physical-board target; use build/image and U-Boot, not qemu".into(),
+        );
+    }
     let profile = Profile::parse(&option_value(&args, "--profile")?)?;
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
     let options = qemu_options(root, target, &args)?;
@@ -316,6 +321,7 @@ fn scenario_target(target: TxTarget) -> ScenarioTarget {
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => ScenarioTarget::QemuRv64,
         TxTarget::La64Qemu => ScenarioTarget::QemuLa64,
+        TxTarget::La64Ls2k1000 => unreachable!("physical board rejected before QEMU setup"),
     }
 }
 
@@ -423,6 +429,7 @@ fn qemu_command(
             args.push(opensbi_bios(root));
         }
         TxTarget::La64Qemu => {}
+        TxTarget::La64Ls2k1000 => unreachable!("physical board rejected before QEMU setup"),
     }
 
     if options.expect_sentinel {
@@ -538,6 +545,9 @@ fn qemu_command(
                 // Pinning avoids device-order changes when networking is on.
                 args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
             }
+            TxTarget::La64Ls2k1000 => {
+                unreachable!("physical board rejected before QEMU setup")
+            }
         }
         args.push("-drive".into());
         if target == TxTarget::Rv64M1DockMock {
@@ -605,6 +615,9 @@ fn qemu_smp(target: TxTarget, profile: Profile, options: &QemuOptions) -> usize 
         (TxTarget::Rv64Qemu, Profile::Alpine) => 1,
         (TxTarget::Rv64Qemu | TxTarget::La64Qemu, _) => 4,
         (TxTarget::Rv64M1DockMock, _) => 1,
+        (TxTarget::La64Ls2k1000, _) => {
+            unreachable!("physical board rejected before QEMU setup")
+        }
     }
 }
 
@@ -630,6 +643,7 @@ fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => None,
         TxTarget::La64Qemu => Some("la464"),
+        TxTarget::La64Ls2k1000 => unreachable!("physical board rejected before QEMU setup"),
     }
 }
 
@@ -638,6 +652,9 @@ fn qemu_memory(target: TxTarget, profile: Profile) -> &'static str {
         (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
         (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
         (TxTarget::La64Qemu, _) => "1152M",
+        (TxTarget::La64Ls2k1000, _) => {
+            unreachable!("physical board rejected before QEMU setup")
+        }
     }
 }
 
@@ -968,6 +985,18 @@ mod tests {
     }
 
     #[test]
+    fn qemu_rejects_physical_target_before_setup() {
+        let args = vec![
+            "--target".into(),
+            "la64-2k1000".into(),
+            "--profile".into(),
+            "smoke".into(),
+        ];
+        let err = qemu(Path::new("/path/that/does/not/exist"), args).unwrap_err();
+        assert!(err.contains("physical-board target"));
+    }
+
+    #[test]
     fn derives_rv64_qemu_sentinel_from_board_name() {
         assert_eq!(
             expected_sentinel(TxTarget::Rv64Qemu),
@@ -1124,25 +1153,21 @@ mod tests {
 
     #[test]
     fn qemu_smoke_command_captures_serial_without_block_image() {
+        let root = Path::new("/tmp/tx");
         let options = QemuOptions {
             expect_sentinel: true,
             ..test_options()
         };
-        let command = qemu_command(
-            Path::new("/tmp/tx"),
-            TxTarget::Rv64Qemu,
-            Profile::Smoke,
-            &options,
-        )
-        .unwrap();
+        let command = qemu_command(root, TxTarget::Rv64Qemu, Profile::Smoke, &options).unwrap();
         let rendered = command.join(" ");
         assert!(rendered.contains("qemu-system-riscv64"));
         assert!(rendered.contains("-machine virt"));
         assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-rv64-qemu-smoke.serial.log"));
-        assert!(rendered.contains(
-            "-kernel /tmp/tx/target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt"
-        ));
+        assert!(rendered.contains(&format!(
+            "-kernel {}",
+            TxTarget::Rv64Qemu.kernel_path(root).display()
+        )));
         assert!(
             rendered.contains("-initrd /tmp/tx/target/images/test-init-initramfs-rv64-qemu.cpio")
         );

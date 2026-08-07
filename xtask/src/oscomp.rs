@@ -261,6 +261,17 @@ fn oscomp_run(root: &Path, args: &[String]) -> Result<()> {
 
 fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
     let target = TxTarget::parse(&option_value(args, "--target")?)?;
+    match target {
+        TxTarget::Rv64M1DockMock => {
+            return Err(
+                "OSComp qemu supports rv64-qemu and la64-qemu, not rv64-m1dock-mock".into(),
+            );
+        }
+        TxTarget::La64Ls2k1000 => {
+            return Err("OSComp qemu does not run the physical la64-2k1000 target".into());
+        }
+        TxTarget::Rv64Qemu | TxTarget::La64Qemu => {}
+    }
     let data = oscomp_data_dir(root, args);
     let boot_suite = optional_option_value(args, "--boot-suite");
     let submit = optional_option_value(args, "--submit")
@@ -336,11 +347,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
                 "base=utc".into(),
             ],
         ),
-        TxTarget::Rv64M1DockMock => {
-            return Err(
-                "OSComp qemu supports rv64-qemu and la64-qemu, not rv64-m1dock-mock".into(),
-            );
-        }
+        TxTarget::Rv64M1DockMock | TxTarget::La64Ls2k1000 => unreachable!(),
     };
     if let Some(cmdline) = oscomp_qemu_boot_cmdline(boot_suite.as_deref()) {
         qemu_args.push("-initrd".into());
@@ -579,7 +586,7 @@ fn oscomp_test(root: &Path, args: &[String]) -> Result<()> {
     let target_str = option_value(args, "--target")?;
     let target = TxTarget::parse(&target_str)?;
 
-    if matches!(target, TxTarget::Rv64M1DockMock) {
+    if matches!(target, TxTarget::Rv64M1DockMock | TxTarget::La64Ls2k1000) {
         return Err("oscomp test supports rv64-qemu and la64-qemu only".into());
     }
 
@@ -590,7 +597,7 @@ fn oscomp_test(root: &Path, args: &[String]) -> Result<()> {
     let kernel_dest_name = match target {
         TxTarget::Rv64Qemu => "kernel-rv",
         TxTarget::La64Qemu => "kernel-la",
-        TxTarget::Rv64M1DockMock => unreachable!(),
+        TxTarget::Rv64M1DockMock | TxTarget::La64Ls2k1000 => unreachable!(),
     };
 
     // Step 1: full-build
@@ -733,5 +740,12 @@ mod tests {
             oscomp_qemu_boot_cmdline(None),
             Some("tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 console=ttyS0".to_string())
         );
+    }
+
+    #[test]
+    fn oscomp_qemu_rejects_physical_target_before_preparing_images() {
+        let args = vec!["--target".into(), "la64-2k1000".into()];
+        let err = oscomp_qemu(Path::new("/path/that/does/not/exist"), &args).unwrap_err();
+        assert!(err.contains("physical la64-2k1000"));
     }
 }

@@ -20,6 +20,8 @@ pub(crate) fn check(root: &Path) -> Result<()> {
             "tx-kernel-riscv64-m1dock-mock",
             "--exclude",
             "tx-kernel-loongarch64-qemu-virt",
+            "--exclude",
+            "tx-kernel-loongarch64-2k1000",
             "--",
             "-D",
             "warnings",
@@ -36,6 +38,7 @@ pub(crate) fn check(root: &Path) -> Result<()> {
         TxTarget::Rv64Qemu,
         TxTarget::Rv64M1DockMock,
         TxTarget::La64Qemu,
+        TxTarget::La64Ls2k1000,
     ] {
         let triple = target_triple(target)?;
         if installed.contains(&triple) {

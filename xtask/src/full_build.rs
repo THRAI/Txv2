@@ -25,21 +25,22 @@ pub(crate) fn full_build(root: &Path, args: Vec<String>) -> Result<()> {
 
     if !no_image {
         for target in TxTarget::all_for(&target_value)? {
-            let kind = image_kind_for(target);
-            println!(
-                "full-build: image {kind} --profile busybox --target {}",
-                target.name()
-            );
-            image::image(
-                root,
-                vec![
-                    kind.to_string(),
-                    "--profile".to_string(),
-                    "busybox".to_string(),
-                    "--target".to_string(),
-                    target.name().to_string(),
-                ],
-            )?;
+            for kind in image_kinds_for(target) {
+                println!(
+                    "full-build: image {kind} --profile busybox --target {}",
+                    target.name()
+                );
+                image::image(
+                    root,
+                    vec![
+                        kind.to_string(),
+                        "--profile".to_string(),
+                        "busybox".to_string(),
+                        "--target".to_string(),
+                        target.name().to_string(),
+                    ],
+                )?;
+            }
         }
     }
 
@@ -47,10 +48,11 @@ pub(crate) fn full_build(root: &Path, args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn image_kind_for(target: TxTarget) -> &'static str {
+fn image_kinds_for(target: TxTarget) -> &'static [&'static str] {
     match target {
-        TxTarget::Rv64Qemu | TxTarget::La64Qemu => "cpio",
-        TxTarget::Rv64M1DockMock => "m1dock-sd",
+        TxTarget::Rv64Qemu | TxTarget::La64Qemu => &["cpio"],
+        TxTarget::Rv64M1DockMock => &["m1dock-sd"],
+        TxTarget::La64Ls2k1000 => &["cpio", "la2k1000-uimage"],
     }
 }
 
@@ -60,17 +62,25 @@ mod tests {
 
     #[test]
     fn image_kind_rv64_qemu() {
-        assert_eq!(image_kind_for(TxTarget::Rv64Qemu), "cpio");
+        assert_eq!(image_kinds_for(TxTarget::Rv64Qemu), &["cpio"]);
     }
 
     #[test]
     fn image_kind_la64_qemu() {
-        assert_eq!(image_kind_for(TxTarget::La64Qemu), "cpio");
+        assert_eq!(image_kinds_for(TxTarget::La64Qemu), &["cpio"]);
     }
 
     #[test]
     fn image_kind_m1dock_mock() {
-        assert_eq!(image_kind_for(TxTarget::Rv64M1DockMock), "m1dock-sd");
+        assert_eq!(image_kinds_for(TxTarget::Rv64M1DockMock), &["m1dock-sd"]);
+    }
+
+    #[test]
+    fn image_kind_la64_ls2k1000() {
+        assert_eq!(
+            image_kinds_for(TxTarget::La64Ls2k1000),
+            &["cpio", "la2k1000-uimage"]
+        );
     }
 
     #[test]

@@ -1,3 +1,31 @@
+- 2026-08-07 (**Loongson 2K1000 独立 target 与最早串口通过实板 Stage 1**).
+  **Changed**：新增独立的 `tx-hal-loongarch64-2k1000` / `tx-kernel-loongarch64-2k1000`
+  crate 和 `la64-2k1000` xtask target，没有向 `la64-qemu` 注入实板常量。legacy
+  uImage 现在包装独立 ELF，32 位 header load/entry 均为物理 `0x90000000`；旧
+  `la-uimage` 因混用 QEMU ELF 与板级地址而被显式拒绝。入口建立 cached/uncached
+  DMW，规范化 CRMD 为 IE=0/DA=0/PG=1，在进入高 DMW 后失效 TLB，非零 CPU 在使用
+  BSP 栈前停驻；NS16550A 使用实板 `0x1fe20000`、125 MHz APB 和 divisor 68。
+  **Real hardware**：U-Boot `2022.04-v2.1.0-00579-g3bcf8c7d` 报告两段 DDR
+  `0x9000000000000000+256 MiB`、`0x9000000090000000+768 MiB`，TFTP staging
+  address `0x9000000098000000`。control FDT 的串口/ICU/AHCI/GMAC1 分别确认于
+  `0x1fe20000`、`0x1fe01400/0x1fe01040`、`0x400e0000`、`0x40050000`；SPI `dtb`
+  分区为空，启动前仅在 RAM 将有效 `${fdtcontroladdr}` 复制到 `${fdt_addr}`。
+  GMAC0 PHY 协商超时，U-Boot 经 GMAC1 1000/full 从 `192.168.1.2` 成功 TFTP；
+  `iminfo` 对 8345-byte `Txv2-la2k1000` 校验通过。`bootm ${loadaddr}` 打印
+  `1024 MiB`、`uart-inherited:ok`、`uart-reinit:ok`。
+  **Verification**：隔离缓存下 `full-build --skip-doctor --target la64-2k1000`
+  通过并按 CPIO -> uImage 顺序生成产物；最终 raw payload SHA-256 为
+  `7908f527...7bfc17a`。LA QEMU `-smp 4` BusyBox 回归观察到
+  `txkernel:qemu-loongarch64-virt:boot:ok`。xtask focused tests 全通过；完整 lib
+  tests 为 266/274，剩余 8 项均是 handoff 已记录的既有 time-layering/time-wake
+  失败。`git diff --check` 通过。
+  **Accepted/rejected**：接受 U-Boot legacy `bootm` 物理 header + cached DMW 跳转
+  和 control-FDT/EFI 参数路径；拒绝旧 LA QEMU uImage、QEMU UART/IRQ/IPI 设备常量、
+  空 SPI DTB 以及把裸 ext4 SATA 根盘当作分区盘。**Next**：Stage 2 解析 bootm
+  参数/FDT，接入 CPU0 异常与定时器，并为已生成的最小 initramfs 验证独立安全装载
+  地址后进入 `/ #`。**Blocker**：Stage 1 无 blocker；initrd load address、异常入口
+  和 timer 尚未在实板验证，因此当前命令刻意保持 kernel-only。
+
 - 2026-08-07 (**修复 LA64 SMP4 TLB shootdown 永久等待**).
   **Changed**：提交四阶段中的前三段：
   `57aeefcd` 增加确定性 ownership/MapPin 见证和 offline index-pack runner，

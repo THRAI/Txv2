@@ -971,6 +971,10 @@ fn unused_check_steps(installed: &BTreeSet<String>) -> Vec<UnusedCheckStep> {
                 target_triple(TxTarget::Rv64M1DockMock),
             ),
             (TxTarget::La64Qemu, target_triple(TxTarget::La64Qemu)),
+            (
+                TxTarget::La64Ls2k1000,
+                target_triple(TxTarget::La64Ls2k1000),
+            ),
         ],
     )
 }

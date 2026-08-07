@@ -590,6 +590,13 @@ name = "tx-hal"
 version = "0.1.0"
 
 [[package]]
+name = "tx-hal-loongarch64-2k1000"
+version = "0.1.0"
+dependencies = [
+ "tx-hal",
+]
+
+[[package]]
 name = "tx-hal-loongarch64-qemu-virt"
 version = "0.1.0"
 dependencies = [
@@ -631,6 +638,13 @@ dependencies = [
  "tx-substrate",
  "tx-subsystems",
  "tx-test-support",
+]
+
+[[package]]
+name = "tx-kernel-loongarch64-2k1000"
+version = "0.1.0"
+dependencies = [
+ "tx-hal-loongarch64-2k1000",
 ]
 
 [[package]]

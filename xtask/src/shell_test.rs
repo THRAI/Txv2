@@ -96,6 +96,11 @@ const ESC_KEY_DELAY: Duration = Duration::from_millis(500);
 
 pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
+    if target == TxTarget::La64Ls2k1000 {
+        return Err(
+            "shell-test is QEMU-only; use the serial real-board workflow for la64-2k1000".into(),
+        );
+    }
     let profile = Profile::parse(
         &optional_option_value(&args, "--profile").unwrap_or_else(|| "busybox".to_string()),
     )?;
@@ -1024,6 +1029,9 @@ fn build_qemu_command(
             (TxTarget::La64Qemu, _) => "1152M",
             (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
             (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
+            (TxTarget::La64Ls2k1000, _) => {
+                unreachable!("physical board rejected before shell-test setup")
+            }
         }
         .into(),
         "-smp".into(),
