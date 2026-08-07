@@ -34,7 +34,7 @@ pub mod wake;
 pub mod zone;
 
 pub use slot::AtomicSlot;
-pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard};
+pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard, SpinWait};
 
 #[doc(hidden)]
 pub mod testing {
@@ -466,6 +466,7 @@ pub fn init<P: TxPlatform>() {
     );
 
     let _ = P::platform_info();
+    sync::install_platform_spin_progress::<P>();
     boot_memory::init_from_hal::<P>();
     epoch::init_on_bsp::<P>().expect("tx_substrate::init epoch initialization failed");
     zone::init_on_bsp::<P>().expect("tx_substrate::init zone initialization failed");

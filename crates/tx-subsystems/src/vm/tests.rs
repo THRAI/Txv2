@@ -1554,11 +1554,11 @@ fn vm_pmap_teardown_stage1_witness_holds_state_and_map_pin_during_remote_wait() 
         "lookup must report a failed state-lock CAS at the remote wait boundary"
     );
     assert!(TEARDOWN_WAIT_PROBE_ACQUIRED_STATE.load(Ordering::Acquire));
-    // Stage 1 intentionally records the faulty ownership boundary: the
-    // synchronous shootdown callback is entered while `VmPmap.state` is still
-    // held, so a real concurrent lookup cannot acquire it. Stage 2 must reverse
-    // this assertion into the regression contract after moving the remote wait
-    // outside the state guard.
+    // This records the sender side of the proven cycle: the synchronous
+    // shootdown callback is entered while `VmPmap.state` is still held, so a
+    // real concurrent lookup cannot acquire it. The repair deliberately keeps
+    // this pmap transaction atomic; progress is guaranteed on the target side
+    // by every interrupt-masked contended wait servicing its pending mailbox.
     assert!(
         TEARDOWN_WAIT_STATE_WAS_UNAVAILABLE.load(Ordering::Acquire),
         "stage-1 witness expects VmPmap.state to remain held at remote wait entry"

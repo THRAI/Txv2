@@ -4,7 +4,7 @@ use super::platform_impls::{la64_copy_from_user_raw, la64_copy_to_user_raw};
 #[cfg(not(target_arch = "loongarch64"))]
 use super::platform_impls::{la64_host_uart_ier_for_test, la64_reset_host_uart_ier_for_test};
 use super::*;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Mutex;
 use tx_hal::{
     AllocError, AuxvIf, DmaAddr, DmaDirection, FpSimdIf, MemoryRegionKind, PmapError, PmapIf,
@@ -22,6 +22,10 @@ static TEST_PMAP_RELEASES: AtomicUsize = AtomicUsize::new(0);
 static TEST_TIMER_TRAPS: AtomicUsize = AtomicUsize::new(0);
 static TEST_SYSCALL_TRAPS: AtomicUsize = AtomicUsize::new(0);
 static TEST_IRQ_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(target_arch = "loongarch64"))]
+static TEST_LA64_INVTLB_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(target_arch = "loongarch64"))]
+static TEST_LA64_INJECTED_GENERATION: AtomicU64 = AtomicU64::new(0);
 const TEST_PMAP_PAGE_COUNT: usize = 12;
 static mut TEST_ROOT_PAGE: [u64; 512] = [0; 512];
 static mut TEST_IRQ_TABLE: IrqDispatchTable = IrqDispatchTable::new();
@@ -1061,6 +1065,58 @@ fn la64_pmap_transition_sequence_covers_publication_gap() {
     reset_pmap_test_state();
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
+fn publish_la64_tlb_generation_for_test(target: CpuId) -> u64 {
+    assert_ne!(la64_current_cpu_id(), target, "test sender must be remote");
+    assert!(try_pin_la64_tlb_target(target.0));
+    let generation = LA64_TLB_SHOOTDOWN_REQUESTED[target.0]
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    <Platform as SmpIf>::send_ipi(target, IpiKind::TlbShootdown);
+    generation
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn record_la64_test_invtlb_all(_cpu: CpuId) {
+    TEST_LA64_INVTLB_ALL_CALLS.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn publish_la64_generation_after_ipi_clear(target: CpuId, kind: IpiKind) {
+    if kind != IpiKind::TlbShootdown {
+        return;
+    }
+    boot_smp::install_la64_test_after_ipi_clear_hook(None);
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    let sender = if target == CpuId(0) {
+        CpuId(1)
+    } else {
+        CpuId(0)
+    };
+    <Platform as PercpuIf>::write_kernel_tls(sender.0 as u64);
+    let generation = publish_la64_tlb_generation_for_test(target);
+    TEST_LA64_INJECTED_GENERATION.store(generation, Ordering::Release);
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn publish_la64_generation_during_first_invtlb(target: CpuId) {
+    let invocation = TEST_LA64_INVTLB_ALL_CALLS.fetch_add(1, Ordering::AcqRel);
+    if invocation != 0 {
+        return;
+    }
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    let sender = if target == CpuId(0) {
+        CpuId(1)
+    } else {
+        CpuId(0)
+    };
+    <Platform as PercpuIf>::write_kernel_tls(sender.0 as u64);
+    let generation = publish_la64_tlb_generation_for_test(target);
+    TEST_LA64_INJECTED_GENERATION.store(generation, Ordering::Release);
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
 #[test]
 fn la64_tlb_mailbox_coalesces_generations_at_polling_safe_point() {
     let _guard = lock_test_pmap_state();
@@ -1100,6 +1156,276 @@ fn la64_tlb_target_lifecycle_rejects_new_senders_before_offline() {
     assert_eq!(LA64_TLB_TARGET_USERS[target.0].load(Ordering::Acquire), 1);
     unpin_la64_tlb_target(target.0);
     assert_eq!(LA64_TLB_TARGET_USERS[target.0].load(Ordering::Acquire), 0);
+
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_request_published_during_ipi_clear_is_drained() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let target = CpuId(1);
+    let bit = CpuMask::single(target).bits();
+    mark_la64_tlb_cpu_online(target);
+    LA64_ONLINE_CPUS.fetch_or(bit, Ordering::AcqRel);
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    let first = publish_la64_tlb_generation_for_test(target);
+    install_la64_test_invtlb_all_hook(Some(record_la64_test_invtlb_all));
+    boot_smp::install_la64_test_after_ipi_clear_hook(Some(publish_la64_generation_after_ipi_clear));
+
+    <Platform as PercpuIf>::install_early_percpu(target);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+
+    let second = TEST_LA64_INJECTED_GENERATION.load(Ordering::Acquire);
+    assert_eq!(second, first.wrapping_add(1));
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire),
+        second
+    );
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 1);
+    assert!(
+        <Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown),
+        "the re-request notification remains as a harmless level"
+    );
+
+    unpin_la64_tlb_target(target.0);
+    unpin_la64_tlb_target(target.0);
+    boot_smp::install_la64_test_after_ipi_clear_hook(None);
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_service_drains_generation_published_during_invtlb() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let target = CpuId(1);
+    let bit = CpuMask::single(target).bits();
+    mark_la64_tlb_cpu_online(target);
+    LA64_ONLINE_CPUS.fetch_or(bit, Ordering::AcqRel);
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    let first = publish_la64_tlb_generation_for_test(target);
+    install_la64_test_invtlb_all_hook(Some(publish_la64_generation_during_first_invtlb));
+
+    <Platform as PercpuIf>::install_early_percpu(target);
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+
+    let second = TEST_LA64_INJECTED_GENERATION.load(Ordering::Acquire);
+    assert_eq!(second, first.wrapping_add(1));
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 2);
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire),
+        second,
+        "the service owner must re-read requested after publishing first completion"
+    );
+    assert!(la64_tlb_generation_reached(second, first));
+    assert!(la64_tlb_generation_reached(second, second));
+
+    unpin_la64_tlb_target(target.0);
+    unpin_la64_tlb_target(target.0);
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_multiple_senders_coalesce_without_losing_generation() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let target = CpuId(2);
+    let bit = CpuMask::single(target).bits();
+    mark_la64_tlb_cpu_online(target);
+    LA64_ONLINE_CPUS.fetch_or(bit, Ordering::AcqRel);
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    install_la64_test_invtlb_all_hook(Some(record_la64_test_invtlb_all));
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let first_start = std::sync::Arc::clone(&start);
+    let second_start = std::sync::Arc::clone(&start);
+    let first = std::thread::spawn(move || {
+        <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+        first_start.wait();
+        publish_la64_tlb_generation_for_test(target)
+    });
+    let second = std::thread::spawn(move || {
+        <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+        second_start.wait();
+        publish_la64_tlb_generation_for_test(target)
+    });
+    start.wait();
+    let first = first.join().expect("first LA64 TLB sender");
+    let second = second.join().expect("second LA64 TLB sender");
+    assert_ne!(first, second);
+
+    <Platform as PercpuIf>::install_early_percpu(target);
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+    let completed = LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire);
+    assert!(la64_tlb_generation_reached(completed, first));
+    assert!(la64_tlb_generation_reached(completed, second));
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 1);
+    unpin_la64_tlb_target(target.0);
+    unpin_la64_tlb_target(target.0);
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_bidirectional_mailboxes_complete_independently() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let cpu0 = CpuId(0);
+    let cpu1 = CpuId(1);
+    let cpu1_bit = CpuMask::single(cpu1).bits();
+    mark_la64_tlb_cpu_online(cpu1);
+    LA64_ONLINE_CPUS.fetch_or(cpu1_bit, Ordering::AcqRel);
+    install_la64_test_invtlb_all_hook(Some(record_la64_test_invtlb_all));
+
+    <Platform as PercpuIf>::install_early_percpu(cpu0);
+    let to_cpu1 = publish_la64_tlb_generation_for_test(cpu1);
+    <Platform as PercpuIf>::install_early_percpu(cpu1);
+    let to_cpu0 = publish_la64_tlb_generation_for_test(cpu0);
+
+    <Platform as PercpuIf>::install_early_percpu(cpu0);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+    <Platform as PercpuIf>::install_early_percpu(cpu1);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[cpu0.0].load(Ordering::Acquire),
+        to_cpu0
+    );
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[cpu1.0].load(Ordering::Acquire),
+        to_cpu1
+    );
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 2);
+    unpin_la64_tlb_target(cpu0.0);
+    unpin_la64_tlb_target(cpu1.0);
+
+    <Platform as PercpuIf>::install_early_percpu(cpu0);
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_masked_ipi_is_completed_by_progress_hook() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let target = CpuId(1);
+    let bit = CpuMask::single(target).bits();
+    mark_la64_tlb_cpu_online(target);
+    LA64_ONLINE_CPUS.fetch_or(bit, Ordering::AcqRel);
+    install_la64_test_invtlb_all_hook(Some(record_la64_test_invtlb_all));
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    let generation = publish_la64_tlb_generation_for_test(target);
+    <Platform as PercpuIf>::install_early_percpu(target);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+
+    // Host fallback has no CRMD.IE. Leaving the IPI pending and deliberately
+    // not entering ack_ipi models the masked-interrupt interval; the pmap
+    // progress hook must complete the generation independently of the trap.
+    <Platform as PmapIf>::service_pending_tlb_shootdown();
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire),
+        generation
+    );
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 1);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    unpin_la64_tlb_target(target.0);
+
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    assert_eq!(
+        TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire),
+        2,
+        "late redundant notification remains safe"
+    );
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_offline_drains_pinned_generation_before_return() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let target = CpuId(1);
+    let bit = CpuMask::single(target).bits();
+    mark_la64_tlb_cpu_online(target);
+    LA64_ONLINE_CPUS.fetch_or(bit, Ordering::AcqRel);
+    install_la64_test_invtlb_all_hook(Some(record_la64_test_invtlb_all));
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    let generation = publish_la64_tlb_generation_for_test(target);
+    let sender = std::thread::spawn(move || {
+        while !la64_tlb_generation_reached(
+            LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire),
+            generation,
+        ) {
+            std::thread::yield_now();
+        }
+        unpin_la64_tlb_target(target.0);
+    });
+
+    <Platform as PercpuIf>::install_early_percpu(target);
+    prepare_la64_tlb_cpu_offline();
+    sender.join().expect("offline-drained LA64 TLB sender");
+
+    assert_eq!(LA64_TLB_ACCEPTING_CPUS.load(Ordering::Acquire) & bit, 0);
+    assert_eq!(LA64_ONLINE_CPUS.load(Ordering::Acquire) & bit, 0);
+    assert!(!try_pin_la64_tlb_target(target.0));
+    assert_eq!(LA64_TLB_TARGET_USERS[target.0].load(Ordering::Acquire), 0);
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire),
+        generation
+    );
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 1);
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_generation_coalescing_survives_wraparound() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    install_la64_test_invtlb_all_hook(Some(record_la64_test_invtlb_all));
+    let cpu = la64_current_cpu_id().0;
+
+    LA64_TLB_SHOOTDOWN_COMPLETED[cpu].store(u64::MAX - 2, Ordering::Release);
+    LA64_TLB_SHOOTDOWN_REQUESTED[cpu].store(u64::MAX, Ordering::Release);
+    assert!(service_la64_pending_tlb_shootdown());
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire),
+        u64::MAX
+    );
+    assert!(la64_tlb_generation_reached(u64::MAX, u64::MAX - 1));
+
+    let wrapped = LA64_TLB_SHOOTDOWN_REQUESTED[cpu]
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    assert_eq!(wrapped, 0);
+    assert!(service_la64_pending_tlb_shootdown());
+    assert_eq!(LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire), 0);
+    assert!(la64_tlb_generation_reached(0, u64::MAX));
+    assert!(!la64_tlb_generation_reached(u64::MAX, 0));
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 2);
 
     reset_pmap_test_state();
 }
@@ -1896,6 +2222,13 @@ fn reset_la64_asids_for_test() {
 }
 
 fn reset_pmap_test_state() {
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        install_la64_test_invtlb_all_hook(None);
+        boot_smp::reset_la64_ipi_state_for_test();
+        TEST_LA64_INVTLB_ALL_CALLS.store(0, Ordering::Release);
+        TEST_LA64_INJECTED_GENERATION.store(0, Ordering::Release);
+    }
     reset_pt_node_allocator_for_test();
     reset_la64_asids_for_test();
     TEST_PMAP_ALLOCATIONS.store(0, Ordering::Release);

@@ -7,15 +7,46 @@ use super::la64_irq_trap::{
 use super::la64_irq_trap::{console_write_hex, console_write_literal};
 use super::la64_percpu::la64_current_cpu_id;
 use super::*;
+use tx_hal::TlbProgressSpinWait;
 
 static LA64_TLB_STALL_DIAG_EMITTED: AtomicBool = AtomicBool::new(false);
 
+#[inline(always)]
+fn spin_with_la64_tlb_progress(wait: &mut TlbProgressSpinWait) {
+    wait.spin_with(|| {
+        service_la64_pending_tlb_shootdown();
+    });
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+type La64TestInvtlbAllHook = fn(CpuId);
+
+/// Host-test-only INVTLB completion point used to inject mailbox events
+/// before `completed` is published. It is absent from LA64 production builds.
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+static LA64_TEST_INVTLB_ALL_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+pub(crate) fn install_la64_test_invtlb_all_hook(hook: Option<La64TestInvtlbAllHook>) {
+    LA64_TEST_INVTLB_ALL_HOOK.store(hook.map_or(0, |hook| hook as usize), Ordering::Release);
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+fn run_la64_test_invtlb_all_hook() {
+    let hook = LA64_TEST_INVTLB_ALL_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        let hook = unsafe { core::mem::transmute::<usize, La64TestInvtlbAllHook>(hook) };
+        hook(la64_current_cpu_id());
+    }
+}
+
 pub(crate) fn uart_put_byte(byte: u8) {
     let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
+    let mut wait = TlbProgressSpinWait::new();
 
     unsafe {
         while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
-            core::hint::spin_loop();
+            spin_with_la64_tlb_progress(&mut wait);
         }
         core::ptr::write_volatile(base.add(UART_THR), byte);
     }
@@ -383,8 +414,8 @@ pub(crate) fn wait_for_la64_asid_quiescence(asid: Asid, pgdl: PhysAddr) {
     let started = super::la64_percpu::la64_read_stable_counter();
     let diagnostic_after = la64_timebase_frequency_hz().max(1);
     let mut diagnostic_emitted = false;
+    let mut wait = TlbProgressSpinWait::new();
     loop {
-        service_la64_pending_tlb_shootdown();
         let mut transition_or_owner = false;
         for cpu in 0..LA64_MAX_BOOT_CPUS {
             let Some((active_asid, active_pgdl, _)) = stable_la64_active_root(cpu) else {
@@ -442,7 +473,7 @@ pub(crate) fn wait_for_la64_asid_quiescence(asid: Asid, pgdl: PhysAddr) {
                 }
             }
         }
-        core::hint::spin_loop();
+        spin_with_la64_tlb_progress(&mut wait);
     }
 }
 
@@ -506,9 +537,9 @@ pub(crate) fn prepare_la64_tlb_cpu_offline() {
     // A sender which pinned before the accepting-bit clear may publish its
     // generation afterwards. The pin remains held until completion, so
     // servicing while users are non-zero closes that race.
+    let mut wait = TlbProgressSpinWait::new();
     while LA64_TLB_TARGET_USERS[cpu.0].load(Ordering::Acquire) != 0 {
-        service_la64_pending_tlb_shootdown();
-        core::hint::spin_loop();
+        spin_with_la64_tlb_progress(&mut wait);
     }
     service_la64_pending_tlb_shootdown();
 }
@@ -613,8 +644,8 @@ pub(crate) fn la64_remote_tlb_shootdown(targets: CpuMask) {
     let started = super::la64_percpu::la64_read_stable_counter();
     let diagnostic_after = la64_timebase_frequency_hz().max(1);
     let mut pending = pinned;
+    let mut wait = TlbProgressSpinWait::new();
     while pending != 0 {
-        service_la64_pending_tlb_shootdown();
         let mut remaining = pending;
         while remaining != 0 {
             let cpu = remaining.trailing_zeros() as usize;
@@ -664,7 +695,7 @@ pub(crate) fn la64_remote_tlb_shootdown(targets: CpuMask) {
                 stalled &= !bit;
             }
         }
-        core::hint::spin_loop();
+        spin_with_la64_tlb_progress(&mut wait);
     }
 }
 
@@ -712,6 +743,7 @@ pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {
 
 pub(crate) fn ensure_la64_kernel_pgdh_bootstrap_mapped() -> Result<PhysAddr, PmapError> {
     let root = ensure_la64_kernel_pgdh_root()?;
+    let mut wait = TlbProgressSpinWait::new();
     loop {
         match LA64_KERNEL_PGDH_BOOTSTRAP_STATE.load(Ordering::Acquire) {
             LA64_PGDH_BOOTSTRAP_READY => return Ok(root),
@@ -719,8 +751,7 @@ pub(crate) fn ensure_la64_kernel_pgdh_bootstrap_mapped() -> Result<PhysAddr, Pma
                 // The builder can be waiting on a pmap operation whose
                 // shootdown targets us, so a plain spin is not a valid SMP
                 // once primitive on LA64.
-                service_la64_pending_tlb_shootdown();
-                core::hint::spin_loop();
+                spin_with_la64_tlb_progress(&mut wait);
             }
             LA64_PGDH_BOOTSTRAP_UNINIT => {
                 if LA64_KERNEL_PGDH_BOOTSTRAP_STATE
@@ -732,6 +763,7 @@ pub(crate) fn ensure_la64_kernel_pgdh_bootstrap_mapped() -> Result<PhysAddr, Pma
                     )
                     .is_err()
                 {
+                    spin_with_la64_tlb_progress(&mut wait);
                     continue;
                 }
 
@@ -1511,11 +1543,12 @@ pub(crate) fn la64_l0_index(virt: usize) -> usize {
 }
 
 pub(crate) fn lock_la64_committed_pt_node_registry() -> La64CommittedPtNodeRegistryGuard {
+    let mut wait = TlbProgressSpinWait::new();
     while LA64_COMMITTED_PT_NODE_REGISTRY_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        core::hint::spin_loop();
+        spin_with_la64_tlb_progress(&mut wait);
     }
     La64CommittedPtNodeRegistryGuard
 }
@@ -1637,4 +1670,7 @@ pub(crate) fn la64_invtlb_all() {
     unsafe {
         core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
     }
+
+    #[cfg(all(test, not(target_arch = "loongarch64")))]
+    run_la64_test_invtlb_all_hook();
 }

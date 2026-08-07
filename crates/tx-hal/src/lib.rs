@@ -824,6 +824,41 @@ pub struct BootstrapPmapInfo {
     pub reserved_page_tables: &'static [PhysRange],
 }
 
+/// Local cadence state for waits which must make lock-free TLB progress.
+///
+/// The first failed wait runs the supplied progress operation. Later calls run
+/// it at attempts 64, 128, and so on, while retaining a processor spin hint on
+/// every attempt. Keeping this pure mechanism in HAL lets a board use it
+/// without depending upward on substrate.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TlbProgressSpinWait {
+    failed_attempts: usize,
+}
+
+impl TlbProgressSpinWait {
+    const CADENCE: usize = 64;
+
+    pub const fn new() -> Self {
+        Self { failed_attempts: 0 }
+    }
+
+    /// Record one failed wait and periodically run `progress`.
+    ///
+    /// `progress` must not allocate, block, or acquire the resource being
+    /// waited on.
+    #[inline(always)]
+    pub fn spin_with<F>(&mut self, mut progress: F)
+    where
+        F: FnMut(),
+    {
+        self.failed_attempts = self.failed_attempts.wrapping_add(1);
+        if self.failed_attempts == 1 || self.failed_attempts & (Self::CADENCE - 1) == 0 {
+            progress();
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// 虚拟内存/页表子系统的接口:让通用内核建/改/删地址空间映射,不碰架构页表格式。
 /// HAL 最大的 trait;fork/mmap/exec/缺页/切进程全靠它。方法几乎都有默认实现
 /// (返回 Unsupported 或空),mock/测试板不实现也能链接,真板覆盖。约分五组(见下)。

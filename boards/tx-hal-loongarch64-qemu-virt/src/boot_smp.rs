@@ -47,6 +47,39 @@ static LA64_IPI_PENDING: [AtomicU8; LA64_MAX_BOOT_CPUS] =
 static LA64_IPI_ACKED: [AtomicU64; LA64_IPI_KIND_COUNT] =
     [const { AtomicU64::new(0) }; LA64_IPI_KIND_COUNT];
 
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+type La64TestAfterIpiClearHook = fn(CpuId, IpiKind);
+
+/// Host-test-only event seam after an IPI action is cleared and before the
+/// TLB mailbox is serviced. It is absent from LA64 production builds.
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+static LA64_TEST_AFTER_IPI_CLEAR_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+pub(crate) fn install_la64_test_after_ipi_clear_hook(hook: Option<La64TestAfterIpiClearHook>) {
+    LA64_TEST_AFTER_IPI_CLEAR_HOOK.store(hook.map_or(0, |hook| hook as usize), Ordering::Release);
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+fn run_la64_test_after_ipi_clear_hook(cpu: CpuId, kind: IpiKind) {
+    let hook = LA64_TEST_AFTER_IPI_CLEAR_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        let hook = unsafe { core::mem::transmute::<usize, La64TestAfterIpiClearHook>(hook) };
+        hook(cpu, kind);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+pub(crate) fn reset_la64_ipi_state_for_test() {
+    install_la64_test_after_ipi_clear_hook(None);
+    for pending in &LA64_IPI_PENDING {
+        pending.store(0, Ordering::Release);
+    }
+    for acked in &LA64_IPI_ACKED {
+        acked.store(0, Ordering::Release);
+    }
+}
+
 const fn ipi_kind_index(kind: IpiKind) -> usize {
     match kind {
         IpiKind::Reschedule => 0,
@@ -305,6 +338,9 @@ pub(crate) fn ack_ipi(kind: IpiKind) {
 
     #[cfg(not(target_arch = "loongarch64"))]
     LA64_IPI_PENDING[cpu.0].fetch_and(!ipi_kind_bit(kind), Ordering::AcqRel);
+
+    #[cfg(all(test, not(target_arch = "loongarch64")))]
+    run_la64_test_after_ipi_clear_hook(cpu, kind);
 
     if matches!(kind, IpiKind::TlbShootdown)
         && !crate::la64_pmap::service_la64_pending_tlb_shootdown()
