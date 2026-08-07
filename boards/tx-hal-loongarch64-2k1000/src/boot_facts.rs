@@ -71,7 +71,7 @@ static mut PLATFORM_INFO: PlatformInfo = PlatformInfo {
     mmio_regions: &MMIO_REGIONS,
     device_resources: &EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
-    possible_cpu_count: 1,
+    possible_cpu_count: LA64_DEFAULT_POSSIBLE_CPUS,
 };
 
 #[repr(C)]
@@ -133,6 +133,16 @@ pub(crate) fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
 
 pub(crate) fn platform_timebase_frequency_hz() -> u64 {
     unsafe { (*core::ptr::addr_of!(PLATFORM_INFO)).timebase_frequency_hz }
+}
+
+pub(crate) fn max_cpus_from_cmdline() -> Option<usize> {
+    let cmdline = boot_info().cmdline?;
+    for token in cmdline.split_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.maxcpus=") {
+            return value.parse().ok();
+        }
+    }
+    None
 }
 
 pub(crate) fn linked_kernel_image() -> PhysRange {
@@ -226,10 +236,12 @@ fn publish() {
                 reserved_page_tables: &[],
             },
         );
-        (*core::ptr::addr_of_mut!(PLATFORM_INFO)).timebase_frequency_hz = timebase;
+        let platform_info = &mut *core::ptr::addr_of_mut!(PLATFORM_INFO);
+        platform_info.timebase_frequency_hz = timebase;
+        platform_info.possible_cpu_count = LA64_DEFAULT_POSSIBLE_CPUS;
     }
     LA64_TIMEBASE_HZ.store(timebase, Ordering::Release);
-    LA64_POSSIBLE_CPU_COUNT.store(1, Ordering::Release);
+    LA64_POSSIBLE_CPU_COUNT.store(LA64_DEFAULT_POSSIBLE_CPUS, Ordering::Release);
 
     console_write_literal(b"txkernel:loongson-2k1000:h2:bootinfo:cpu=0x");
     console_write_hex(args.cpu_id.0);
@@ -245,6 +257,14 @@ fn publish() {
     console_write_hex(fdt.map_or(0, |blob| blob.phys));
     console_write_literal(b":timebase-hz=");
     console_write_decimal(timebase as usize);
+    console_write_literal(b":cpus=");
+    console_write_decimal(LA64_DEFAULT_POSSIBLE_CPUS);
+    console_write_literal(b":iocsr-ipi=");
+    if crate::la64_ipi::transport_available() {
+        console_write_literal(b"yes");
+    } else {
+        console_write_literal(b"no");
+    }
     console_write_literal(b":initrd-start=0x");
     console_write_hex(initrd.map_or(0, |range| range.start.0));
     console_write_literal(b":initrd-size=0x");

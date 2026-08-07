@@ -1,3 +1,35 @@
+- 2026-08-07 (**Loongson 2K1000 Stage 3 实板中断与双核 SMP 通过**).
+  **Changed**：新增 2K1000 vendor mailbox CPU1 release、独立 AP trampoline/stack，
+  并将运行期 IOCSR IPI transport 抽到 `tx-hal-loongarch64-common`，QEMU 仍独占
+  slave-ROM/mailbox 启动协议。通用 LA generation shootdown 未被复制或降级；kernel
+  新增 LA 专用 AP->BSP Maintenance IPI 与“AP 屏蔽本地中断时轮询 generation”启动
+  smoke。2K1000 新增独立 LIOINTC v2 模块，以 `public_irq=hwirq+1` 保留 IRQ 0
+  哨兵，只将 UART0..3 共享 source 0 配为 CPU0/HWI1 route `0x21`，启动时屏蔽其余
+  source、关闭 UART1..3 IER，并仅开放 UART0 RX。`/proc/cpuinfo` 改为运行时平台
+  provider：RV 文本保持兼容，LA 按 online mask 输出真实逻辑 CPU。
+  **Real hardware**：Nebula 板报告 `possible=2:online-aps=1:online=2`、
+  `iocsr-ipi=yes`；BSP->AP IPI、AP->BSP IPI、普通 shootdown、屏蔽中断下
+  shootdown progress、reactor AP runqueue/owner-wake 和 RCU SMP 全部输出 `ok`，
+  BusyBox 进入 `/ #`。首个串口 RX 字符立即触发一次性
+  `irq:uart-rx:ok`，随后 `echo irq-path` 正常，证明输入来自真实 LIOINTC/HWI1
+  路径而非 polling 假阳性。`/proc/cpuinfo` 仅列 CPU0/CPU1 和
+  `architecture: loongarch64`。U-Boot 同时确认板载 AHCI 识别
+  `Kingchuxing 32GB`、62533296 个 512-byte sector，整盘无分区表。
+  **Verification**：2K HAL 13/13（含 3 个 LIOINTC 模型测试）、2K full-build、
+  LA QEMU `-smp 4`（含 bidirectional IPI/masked-progress sentinel）、RV QEMU
+  `-smp 4`、procfs cpuinfo 4/4、TFTP SHA-256/两份 uImage CRC 和
+  `git diff --check` 通过。`cargo -q xtask unit` 仍只失败于既有 tx-shims dispatch、
+  两项 libctest chmod 断言和 thread-future 2624-byte budget；tx-ext4 37/37、
+  tx-scripts 167/167 通过。
+  **Accepted/rejected**：接受 CPU1 vendor mailbox + 架构 IOCSR IPI、固件旧 DTS 的
+  HWI1 cascade 和 LIOINTC `0x1fe01400` 主窗口；拒绝把 `0x1fe01020..38` 邮箱误作
+  ICU、拒绝 QEMU ExtIOI/PCH 常量和全局 SMP 串行锁。**Next**：Stage 4 为
+  ls-ahci `0x400e0000`/hwirq19 增加独立 route、DMA/cache 与块设备绑定，挂载
+  LBA0 裸 ext4 根盘；根设备不能假定为 `/dev/sda1`。**Blocker**：Stage 3 无硬件
+  blocker；LIOINTC 当前只配置已验证的 UART source，AHCI/GMAC source 必须在各自
+  阶段按真实 trigger/route 扩展。现有 `reactor:timer-idle:WARN-deadline` 仍为既有
+  advisory，不影响已通过的 stable-counter、sleep 与 SMP 验证。
+
 - 2026-08-07 (**Loongson 2K1000 Stage 2 已在实板进入最小 `/ #`**).
   **Changed**：将 LA 页表、ASID、trap、per-CPU 和 TLB shootdown 机制移入中立的
   `tx-hal-loongarch64-common` 源目录，QEMU 与 2K1000 通过各自平台 crate 复用；

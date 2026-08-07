@@ -55,6 +55,11 @@ SECTIONS
         . += 64K;
         . = ALIGN(16);
         __tx_boot_stack_top = .;
+
+        __tx_ap_boot_stack_bottom = .;
+        . += 64K;
+        . = ALIGN(16);
+        __tx_ap_boot_stack_top = .;
     }
 
     . = ALIGN(4K);

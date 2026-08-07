@@ -5,26 +5,19 @@
 
 #[cfg(target_arch = "loongarch64")]
 use super::la64_irq_trap::la64_timebase_frequency_hz;
-use super::la64_irq_trap::{read_la64_csr, write_la64_csr};
+#[cfg(target_arch = "loongarch64")]
 use super::la64_percpu::la64_current_cpu_id;
 #[cfg(target_arch = "loongarch64")]
 use super::la64_percpu::la64_read_stable_counter;
 use super::*;
 
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_STATUS: usize = 0x1000;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_ENABLE: usize = 0x1004;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_CLEAR: usize = 0x100c;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_SEND: usize = 0x1040;
+pub(crate) use crate::la64_ipi::{
+    ack_ipi, broadcast_ipi, clear_ipi_ack_cpus, enable_ipi_wakeups, ipi_ack_cpus, pending_ipi,
+    send_ipi,
+};
+
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_MBUF_SEND: usize = 0x1048;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_SEND_CPU_SHIFT: usize = 16;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_IPI_VEC_BOOT: u32 = 0;
 #[cfg(target_arch = "loongarch64")]
@@ -41,78 +34,11 @@ const LA64_IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
 const LA64_IOCSR_AP_ENTRY_MAILBOX: usize = 0;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_AP_RUST_ENTRY_MAILBOX: usize = 1;
-const LA64_IPI_KIND_COUNT: usize = 5;
-static LA64_IPI_PENDING: [AtomicU8; LA64_MAX_BOOT_CPUS] =
-    [const { AtomicU8::new(0) }; LA64_MAX_BOOT_CPUS];
-static LA64_IPI_ACKED: [AtomicU64; LA64_IPI_KIND_COUNT] =
-    [const { AtomicU64::new(0) }; LA64_IPI_KIND_COUNT];
 
 #[cfg(all(test, not(target_arch = "loongarch64")))]
-type La64TestAfterIpiClearHook = fn(CpuId, IpiKind);
-
-/// Host-test-only event seam after an IPI action is cleared and before the
-/// TLB mailbox is serviced. It is absent from LA64 production builds.
-#[cfg(all(test, not(target_arch = "loongarch64")))]
-static LA64_TEST_AFTER_IPI_CLEAR_HOOK: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(all(test, not(target_arch = "loongarch64")))]
-pub(crate) fn install_la64_test_after_ipi_clear_hook(hook: Option<La64TestAfterIpiClearHook>) {
-    LA64_TEST_AFTER_IPI_CLEAR_HOOK.store(hook.map_or(0, |hook| hook as usize), Ordering::Release);
-}
-
-#[cfg(all(test, not(target_arch = "loongarch64")))]
-fn run_la64_test_after_ipi_clear_hook(cpu: CpuId, kind: IpiKind) {
-    let hook = LA64_TEST_AFTER_IPI_CLEAR_HOOK.load(Ordering::Acquire);
-    if hook != 0 {
-        let hook = unsafe { core::mem::transmute::<usize, La64TestAfterIpiClearHook>(hook) };
-        hook(cpu, kind);
-    }
-}
-
-#[cfg(all(test, not(target_arch = "loongarch64")))]
-pub(crate) fn reset_la64_ipi_state_for_test() {
-    install_la64_test_after_ipi_clear_hook(None);
-    for pending in &LA64_IPI_PENDING {
-        pending.store(0, Ordering::Release);
-    }
-    for acked in &LA64_IPI_ACKED {
-        acked.store(0, Ordering::Release);
-    }
-}
-
-const fn ipi_kind_index(kind: IpiKind) -> usize {
-    match kind {
-        IpiKind::Reschedule => 0,
-        IpiKind::TlbShootdown => 1,
-        IpiKind::Membarrier => 2,
-        IpiKind::Maintenance => 3,
-        IpiKind::Stop => 4,
-    }
-}
-
-const fn ipi_kind_bit(kind: IpiKind) -> u8 {
-    1u8 << ipi_kind_index(kind)
-}
-
-/// IOCSR.IPI_SEND carries a vector index, while IOCSR.IPI_STATUS/CLEAR use
-/// the corresponding bit. Keep vector 0 for QEMU's secondary-CPU boot ROM and
-/// give every runtime IPI kind its own hardware action, matching Linux
-/// LoongArch's ACTION_* / BIT(ACTION_*) split.
-#[cfg(target_arch = "loongarch64")]
-const fn ipi_kind_vector(kind: IpiKind) -> u32 {
-    match kind {
-        IpiKind::Reschedule => 1,
-        IpiKind::TlbShootdown => 2,
-        IpiKind::Membarrier => 3,
-        IpiKind::Maintenance => 4,
-        IpiKind::Stop => 5,
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-const fn ipi_kind_action(kind: IpiKind) -> u32 {
-    1u32 << ipi_kind_vector(kind)
-}
+pub(crate) use crate::la64_ipi::{
+    install_la64_test_after_ipi_clear_hook, reset_la64_ipi_state_for_test,
+};
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
@@ -121,32 +47,10 @@ unsafe extern "C" {
 
 #[cfg(target_arch = "loongarch64")]
 #[inline]
-fn la64_iocsr_write_u32(addr: usize, value: u32) {
-    unsafe {
-        core::arch::asm!("iocsrwr.w {value}, {addr}", value = in(reg) value, addr = in(reg) addr);
-    }
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-#[inline]
-fn la64_iocsr_write_u32(_addr: usize, _value: u32) {}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
 fn la64_iocsr_write_u64(addr: usize, value: u64) {
     unsafe {
         core::arch::asm!("iocsrwr.d {value}, {addr}", value = in(reg) value, addr = in(reg) addr);
     }
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn la64_iocsr_read_u32(addr: usize) -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("iocsrrd.w {value}, {addr}", value = out(reg) value, addr = in(reg) addr);
-    }
-    value
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -180,10 +84,7 @@ pub(crate) fn start_secondary_cpu(cpu: CpuId, entry: SecondaryEntry) {
     send_mail_u64(cpu, LA64_IOCSR_AP_RUST_ENTRY_MAILBOX, rust_entry);
     send_mail_u64(cpu, LA64_IOCSR_AP_ENTRY_MAILBOX, trampoline);
 
-    let value = LA64_IOCSR_IPI_SEND_BLOCKING
-        | ((cpu.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
-        | LA64_IOCSR_IPI_VEC_BOOT;
-    la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
+    crate::la64_ipi::send_raw_ipi_vector(cpu, LA64_IOCSR_IPI_VEC_BOOT);
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -245,9 +146,7 @@ pub(crate) fn boot_secondary_cpus(possible: CpuMask, entry: SecondaryEntry) -> u
             return 0;
         }
 
-        for acked in &LA64_IPI_ACKED {
-            acked.store(0, Ordering::Release);
-        }
+        crate::la64_ipi::clear_all_ipi_acks();
 
         let mut bits = target_mask.bits();
         while bits != 0 {
@@ -264,98 +163,4 @@ pub(crate) fn boot_secondary_cpus(possible: CpuMask, entry: SecondaryEntry) -> u
         let _ = (possible, entry);
         0
     }
-}
-
-pub(crate) fn enable_ipi_wakeups() {
-    #[cfg(target_arch = "loongarch64")]
-    la64_iocsr_write_u32(LA64_IOCSR_IPI_ENABLE, u32::MAX);
-
-    let ecfg = read_la64_csr(LA64_CSR_ECFG) | LA64_ESTAT_IS_IPI;
-    write_la64_csr(LA64_CSR_ECFG, ecfg);
-
-    let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
-    write_la64_csr(LA64_CSR_CRMD, crmd);
-}
-
-pub(crate) fn pending_ipi(kind: IpiKind) -> bool {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        la64_iocsr_read_u32(LA64_IOCSR_IPI_STATUS) & ipi_kind_action(kind) != 0
-    }
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        let cpu = la64_current_cpu_id();
-        cpu.0 < LA64_IPI_PENDING.len()
-            && LA64_IPI_PENDING[cpu.0].load(Ordering::Acquire) & ipi_kind_bit(kind) != 0
-    }
-}
-
-pub(crate) fn send_ipi(target: CpuId, kind: IpiKind) {
-    if target != la64_current_cpu_id() {
-        if target.0 >= LA64_IPI_PENDING.len() {
-            return;
-        }
-        #[cfg(not(target_arch = "loongarch64"))]
-        LA64_IPI_PENDING[target.0].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
-        raise_la64_ipi_interrupt(target, kind);
-    }
-}
-
-pub(crate) fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-    let mut bits = mask.bits();
-    while bits != 0 {
-        let cpu = bits.trailing_zeros() as usize;
-        send_ipi(CpuId(cpu), kind);
-        bits &= bits - 1;
-    }
-}
-
-fn raise_la64_ipi_interrupt(target: CpuId, kind: IpiKind) {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let value = LA64_IOCSR_IPI_SEND_BLOCKING
-            | ((target.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
-            | ipi_kind_vector(kind);
-        la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
-    }
-    #[cfg(not(target_arch = "loongarch64"))]
-    let _ = (target, kind);
-}
-
-pub(crate) fn ack_ipi(kind: IpiKind) {
-    let cpu = la64_current_cpu_id();
-    if cpu.0 >= LA64_IPI_PENDING.len() {
-        return;
-    }
-
-    // Retire exactly the hardware action observed by the handler. A same-kind
-    // TLB request which races this clear is still covered by the requested /
-    // completed generation mailbox below; a later hardware action is therefore
-    // either serviced here or remains pending as a harmless redundant trap.
-    #[cfg(target_arch = "loongarch64")]
-    la64_iocsr_write_u32(LA64_IOCSR_IPI_CLEAR, ipi_kind_action(kind));
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    LA64_IPI_PENDING[cpu.0].fetch_and(!ipi_kind_bit(kind), Ordering::AcqRel);
-
-    #[cfg(all(test, not(target_arch = "loongarch64")))]
-    run_la64_test_after_ipi_clear_hook(cpu, kind);
-
-    if matches!(kind, IpiKind::TlbShootdown)
-        && !crate::la64_pmap::service_la64_pending_tlb_shootdown()
-    {
-        // Preserve the public SmpIf contract for a direct TLB IPI that did not
-        // originate from the generation mailbox (primarily host tests).
-        crate::la64_pmap::la64_invtlb_all();
-    }
-    LA64_IPI_ACKED[ipi_kind_index(kind)].fetch_or(CpuMask::single(cpu).bits(), Ordering::AcqRel);
-}
-
-pub(crate) fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
-    LA64_IPI_ACKED[ipi_kind_index(kind)].fetch_and(!mask.bits(), Ordering::AcqRel);
-}
-
-pub(crate) fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
-    CpuMask::from_bits(LA64_IPI_ACKED[ipi_kind_index(kind)].load(Ordering::Acquire))
 }

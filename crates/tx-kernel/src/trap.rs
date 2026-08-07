@@ -99,8 +99,12 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     }
 
     fn on_ipi(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+        let stop = P::pending_ipi(IpiKind::Stop);
         let maintenance = P::pending_ipi(IpiKind::Maintenance);
         let reschedule = P::pending_ipi(IpiKind::Reschedule);
+        if stop {
+            P::ack_ipi(IpiKind::Stop);
+        }
         if maintenance {
             P::ack_ipi(IpiKind::Maintenance);
         }
@@ -115,7 +119,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
             P::ack_ipi(IpiKind::TlbShootdown);
         }
 
-        if (maintenance || reschedule)
+        if (stop || maintenance || reschedule)
             && view.view().previous_mode == tx_hal::TrapPreviousMode::User
         {
             let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
@@ -125,7 +129,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
             return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
         }
 
-        if maintenance {
+        if stop || maintenance {
             TrapAction::Reschedule
         } else {
             TrapAction::Resume
@@ -159,6 +163,10 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
 
 fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
     let mut action = TrapAction::Resume;
+    if P::pending_ipi(IpiKind::Stop) {
+        P::ack_ipi(IpiKind::Stop);
+        action = TrapAction::Reschedule;
+    }
     if P::pending_ipi(IpiKind::Maintenance) {
         P::ack_ipi(IpiKind::Maintenance);
         action = TrapAction::Reschedule;
@@ -184,6 +192,8 @@ mod ipi_tests {
 
     static MAINTENANCE_PENDING: AtomicBool = AtomicBool::new(false);
     static MAINTENANCE_ACKED: AtomicBool = AtomicBool::new(false);
+    static STOP_PENDING: AtomicBool = AtomicBool::new(false);
+    static STOP_ACKED: AtomicBool = AtomicBool::new(false);
 
     struct TestSmp;
 
@@ -200,6 +210,21 @@ mod ipi_tests {
         }
     }
 
+    struct StopSmp;
+
+    impl SmpIf for StopSmp {
+        fn pending_ipi(kind: IpiKind) -> bool {
+            kind == IpiKind::Stop && STOP_PENDING.load(Ordering::Acquire)
+        }
+
+        fn ack_ipi(kind: IpiKind) {
+            if kind == IpiKind::Stop {
+                STOP_PENDING.store(false, Ordering::Release);
+                STOP_ACKED.store(true, Ordering::Release);
+            }
+        }
+    }
+
     #[test]
     fn maintenance_ipi_only_acknowledges_and_reschedules() {
         MAINTENANCE_ACKED.store(false, Ordering::Release);
@@ -210,6 +235,18 @@ mod ipi_tests {
         assert_eq!(action, TrapAction::Reschedule);
         assert!(MAINTENANCE_ACKED.load(Ordering::Acquire));
         assert!(!MAINTENANCE_PENDING.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stop_ipi_is_cleared_before_rescheduling() {
+        STOP_ACKED.store(false, Ordering::Release);
+        STOP_PENDING.store(true, Ordering::Release);
+
+        let action = dispatch_pending_ipis::<StopSmp>();
+
+        assert_eq!(action, TrapAction::Reschedule);
+        assert!(STOP_ACKED.load(Ordering::Acquire));
+        assert!(!STOP_PENDING.load(Ordering::Acquire));
     }
 }
 

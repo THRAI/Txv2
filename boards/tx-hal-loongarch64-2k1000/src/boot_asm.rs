@@ -1,4 +1,4 @@
-// Loongson 2K1000 U-Boot entry and cached-DMW transition for the BSP.
+// Loongson 2K1000 U-Boot entry and cached-DMW transitions.
 
 #[cfg(target_arch = "loongarch64")]
 core::arch::global_asm!(
@@ -85,5 +85,42 @@ tx_la2k1000_high_start:
 
 .Ltx_la2k1000_secondary_park:
     b       .Ltx_la2k1000_secondary_park
+
+    // The vendor U-Boot CPU1 park loop jumps to FN verbatim after installing
+    // the physical SP mailbox through the cached DMW. Keep this entry in the
+    // high text segment and re-establish every architectural prerequisite.
+    .globl tx_la2k1000_secondary_start
+tx_la2k1000_secondary_start:
+    li.d    $t0, TX_LA64_DMW_CACHED
+    csrwr   $t0, TX_LA64_CSR_DMW0
+    li.d    $t0, TX_LA64_DMW_UNCACHED
+    csrwr   $t0, TX_LA64_CSR_DMW1
+    csrwr   $zero, TX_LA64_CSR_DMW2
+    csrwr   $zero, TX_LA64_CSR_DMW3
+
+    csrrd   $t0, TX_LA64_CSR_CRMD
+    li.w    $t1, -29
+    and     $t0, $t0, $t1
+    ori     $t0, $t0, 0x10
+    csrwr   $t0, TX_LA64_CSR_CRMD
+
+    invtlb  0x0, $zero, $zero
+    ibar    0
+    csrrd   $a0, 0x20
+    li.d    $t2, 2
+    bgeu    $a0, $t2, .Ltx_la2k1000_secondary_bad_id
+
+    la.local $sp, __tx_ap_boot_stack_top
+    csrwr   $zero, TX_LA64_CSR_TCFG
+    li.w    $t0, 1
+    csrwr   $t0, TX_LA64_CSR_TICLR
+    csrwr   $zero, TX_LA64_CSR_ECFG
+
+    la.local $t0, tx_la2k1000_secondary_rust_entry
+    jirl    $zero, $t0, 0
+
+.Ltx_la2k1000_secondary_bad_id:
+    idle    0
+    b       .Ltx_la2k1000_secondary_bad_id
 "#
 );

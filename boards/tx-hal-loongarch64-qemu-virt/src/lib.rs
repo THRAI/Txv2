@@ -1379,6 +1379,8 @@ mod boot_firmware;
 mod boot_smp;
 mod dtb;
 mod la64_extioi;
+#[path = "../../tx-hal-loongarch64-common/src/la64_ipi.rs"]
+mod la64_ipi;
 #[path = "../../tx-hal-loongarch64-common/src/la64_irq_trap.rs"]
 mod la64_irq_trap;
 #[path = "../../tx-hal-loongarch64-common/src/la64_percpu.rs"]

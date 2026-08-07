@@ -1,3 +1,4 @@
+use super::la64_ipi;
 use super::la64_irq_trap::*;
 use super::la64_percpu::{
     la64_current_cpu_id, la64_install_kernel_stack, la64_read_kernel_tls, la64_read_stable_counter,
@@ -315,6 +316,9 @@ impl TrapIf for Platform {
 
     fn install_kernel_trap_vector() {
         install_la64_trap_vectors();
+        // The BSP has no later per-CPU wake-source installation step. APs
+        // repeat this after their full vector is live and before publication.
+        la64_ipi::enable_ipi_wakeups();
     }
 
     fn install_user_trap_vector() {
@@ -529,8 +533,8 @@ impl FpSimdIf for Platform {
 }
 
 impl IrqIf for Platform {
-    const MAX_IRQ: u32 = 0;
-    const UART_IRQ: u32 = 0;
+    const MAX_IRQ: u32 = la2k1000_liointc::PUBLIC_IRQ_LIMIT;
+    const UART_IRQ: u32 = la2k1000_liointc::UART_SHARED_PUBLIC_IRQ;
     const RTC_IRQ: u32 = 0;
 
     fn in_irq_context() -> bool {
@@ -547,6 +551,51 @@ impl IrqIf for Platform {
 
     fn exclude_local_execution() -> LocalExecutionGuard {
         exclude_la64_interrupts()
+    }
+
+    fn claim() -> u32 {
+        let irq = la2k1000_liointc::claim();
+        if irq == Self::UART_IRQ && !LA2K1000_UART_IRQ_OBSERVED.swap(true, Ordering::AcqRel) {
+            early_console_write(b"txkernel:loongson-2k1000:irq:uart-rx:ok\n");
+        }
+        irq
+    }
+
+    fn complete(irq: u32) {
+        la2k1000_liointc::complete(irq);
+    }
+
+    fn mask(irq: u32) {
+        la2k1000_liointc::mask(irq);
+    }
+
+    fn unmask(irq: u32) {
+        la2k1000_liointc::unmask(irq);
+    }
+
+    fn set_priority(_irq: u32, _priority: u8) {}
+
+    fn install_dispatch_table(table: &'static IrqDispatchTable) {
+        LA64_IRQ_DISPATCH_TABLE.store(table as *const IrqDispatchTable as usize, Ordering::Release);
+        la2k1000_liointc::prepare_uart0_irq();
+
+        let ecfg = read_la64_csr(LA64_CSR_ECFG) | LA64_ESTAT_IS_HWI1;
+        write_la64_csr(LA64_CSR_ECFG, ecfg);
+        let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
+        write_la64_csr(LA64_CSR_CRMD, crmd);
+    }
+
+    fn dispatch_irq(irq: u32) -> IrqHandled {
+        let table = LA64_IRQ_DISPATCH_TABLE.load(Ordering::Acquire);
+        let Some(handler) = (table != 0)
+            .then(|| unsafe { &*(table as *const IrqDispatchTable) })
+            .and_then(|table| table.entries.get(irq as usize).copied().flatten())
+        else {
+            Self::mask(irq);
+            return IrqHandled::Done;
+        };
+
+        handler(irq)
     }
 }
 
@@ -617,9 +666,8 @@ impl DeadlineTimerIf for Platform {
     }
 
     fn enable_timer_wakeups() {
-        // Stage 2 admits only the CPU-local timer. Do not preserve firmware
-        // HWI/IPI bits until the 2K1000 ICU and IPI transport are validated.
-        write_la64_csr(LA64_CSR_ECFG, LA64_ESTAT_IS_TIMER);
+        let ecfg = read_la64_csr(LA64_CSR_ECFG) | LA64_ESTAT_IS_TIMER;
+        write_la64_csr(LA64_CSR_ECFG, ecfg);
         let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
         write_la64_csr(LA64_CSR_CRMD, crmd);
     }
@@ -693,11 +741,42 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        CpuMask::single(CpuId(0))
+        let discovered = LA64_POSSIBLE_CPU_COUNT
+            .load(Ordering::Acquire)
+            .clamp(1, LA64_MAX_BOOT_CPUS);
+        #[cfg(target_arch = "loongarch64")]
+        let discovered = if la64_ipi::transport_available() {
+            discovered
+        } else {
+            1
+        };
+        let requested = crate::boot_facts::max_cpus_from_cmdline()
+            .unwrap_or(discovered)
+            .clamp(1, LA64_MAX_BOOT_CPUS);
+        CpuMask::first(discovered.min(requested))
     }
 
     fn online_cpus() -> CpuMask {
-        CpuMask::single(CpuId(0))
+        CpuMask::from_bits(LA64_ONLINE_CPUS.load(Ordering::Acquire) & Self::possible_cpus().bits())
+    }
+
+    fn mark_cpu_online(cpu: CpuId) {
+        if Self::possible_cpus().contains(cpu) {
+            mark_la64_tlb_cpu_online(cpu);
+            LA64_ONLINE_CPUS.fetch_or(CpuMask::single(cpu).bits(), Ordering::AcqRel);
+        }
+    }
+
+    fn prepare_cpu_offline() {
+        prepare_la64_tlb_cpu_offline();
+    }
+
+    fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
+        boot_smp::boot_secondary_cpus(Self::possible_cpus(), entry)
+    }
+
+    fn enable_ipi_wakeups() {
+        la64_ipi::enable_ipi_wakeups();
     }
 
     fn wait_for_interrupt_once() {
@@ -728,8 +807,16 @@ impl SmpIf for Platform {
         }
     }
 
+    fn pending_ipi(kind: IpiKind) -> bool {
+        la64_ipi::pending_ipi(kind)
+    }
+
     fn quiesce_this_cpu() -> ! {
         <Self as DeadlineTimerIf>::cancel_deadline();
+        debug_assert_eq!(
+            LA64_TLB_TARGET_USERS[la64_current_cpu_id().0].load(Ordering::Acquire),
+            0
+        );
         write_la64_csr(LA64_CSR_ECFG, 0);
         write_la64_csr(LA64_CSR_CRMD, read_la64_csr(LA64_CSR_CRMD) & !LA64_CRMD_IE);
         loop {
@@ -740,6 +827,26 @@ impl SmpIf for Platform {
             #[cfg(not(target_arch = "loongarch64"))]
             core::hint::spin_loop();
         }
+    }
+
+    fn send_ipi(target: CpuId, kind: IpiKind) {
+        la64_ipi::send_ipi(target, kind);
+    }
+
+    fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
+        la64_ipi::broadcast_ipi(mask, kind);
+    }
+
+    fn ack_ipi(kind: IpiKind) {
+        la64_ipi::ack_ipi(kind);
+    }
+
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
+        la64_ipi::clear_ipi_ack_cpus(kind, mask);
+    }
+
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
+        la64_ipi::ipi_ack_cpus(kind)
     }
 }
 

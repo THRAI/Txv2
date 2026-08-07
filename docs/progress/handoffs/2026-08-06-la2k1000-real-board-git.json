@@ -8,17 +8,20 @@
   "plan": null,
   "current_state": [
     "Work continues on branch feature/portable-net-vf2-dwmac from the LA QEMU SMP4 shootdown checkpoint 0f8b3315; commits 521c2114 and 0811e354 remain the shared Pmap/TLB baseline and were not reverted or duplicated.",
-    "Stages 1 and 2 are complete on real Loongson 2K1000 Nebula hardware: the independent la64-2k1000 target now boots CPU0 through the common kernel path into a BusyBox initramfs / #.",
+    "Stages 1 through 3 are complete on real Loongson 2K1000 Nebula hardware: the independent la64-2k1000 target boots both cores through the common kernel path into a BusyBox initramfs / # with real IOCSR IPI, generation shootdown, and UART LIOINTC delivery.",
     "U-Boot 2022.04-v2.1.0-00579-g3bcf8c7d reports 1 GiB DDR in two banks: 0x9000000000000000+256 MiB and 0x9000000090000000+768 MiB. Its TFTP staging loadaddr is 0x9000000098000000.",
-    "The Stage 2 legacy uImage contains 7016376 payload bytes with 32-bit physical load/entry 0x98000000. Its 64-byte header is transported at cached alias 0x9000000097ffffc0, so the vendor U-Boot relocation maps source and destination to the same pointer. The linked kernel ends at physical 0x9874d000 before the initrd header at 0x98800000.",
+    "The Stage 3 legacy uImage contains 7032768 payload bytes with 32-bit physical load/entry 0x98000000. Its 64-byte header is transported at cached alias 0x9000000097ffffc0, so the vendor U-Boot relocation maps source and destination to the same pointer. The linked kernel ends at physical 0x98761000 before the initrd header at 0x98800000.",
     "The real-board two-argument bootm run verified both image CRCs, reported 1024 MiB, printed the inherited/reinitialized UART markers, recovered a 100 MHz CPUCFG timebase and raw CPIO range 0x98800040..0x98963640 from the BPI EFI FDT, emitted boot:ok, and entered / #.",
-    "The board entry installs VSEG9 cached and VSEG8 uncached DMWs, sets CRMD IE=0/DA=0/PG=1, invalidates TLB only after reaching the high DMW, parks nonzero CPUs before using the BSP stack, and drives the NS16550A at physical 0x1fe20000 from the 125 MHz APB clock. Stage 2 then installs the common LA exception path and enables only the CPU-local timer interrupt.",
+    "The board entry installs VSEG9 cached and VSEG8 uncached DMWs, sets CRMD IE=0/DA=0/PG=1, invalidates TLB only after reaching the high DMW, and drives the NS16550A at physical 0x1fe20000 from the 125 MHz APB clock. Stage 3 releases CPU1 through the vendor mailbox into a separate high trampoline/stack, then enables CPU-local timer/IPI plus the proven CPU0 HWI1 UART cascade.",
     "BootInfo publishes physical RAM banks 0..0x10000000 and 0x90000000..0xc0000000 while reserving the fixed FDT scratch, framebuffer shared-dma-pool, bootparam area, linked kernel, and initrd. Firmware pointers accept only raw physical or known cached/uncached DMW forms; FDT totalsize, UTF-8 cmdline, and initrd overlaps are checked before unsafe parsing or publication.",
     "The live control FDT, not the empty SPI dtb partition, is the current hardware source of truth. Confirmed nodes include the 2K1000 ICU, ls-ahci at 0x400e0000 IRQ19, and two DWMAC 3.70a controllers; GMAC1 at 0x40050000 is the U-Boot path that links at 1000/full.",
     "The SATA device is a Kingchuxing 32GB disk containing a raw ext4 filesystem at LBA0 with no partition table; U-Boot ext4ls scsi 0:0 / succeeds. No disk image or mother rootfs was modified.",
-    "The LA page-table, ASID, trap, per-CPU, unaligned-access, and generation-based TLB shootdown sources now live in a platform-neutral tx-hal-loongarch64-common source directory. QEMU keeps its ExtIOI/PCH implementation separate and passed a fresh four-vCPU BusyBox run with online=4 plus shootdown/IPI and boot sentinels.",
-    "Paced real-board shell input passed echo TXV2_LA2K_STAGE2_OK and sleep 1; echo TIMER_OK. Burst input can overrun the Stage 2 polling UART RX path, and /proc/cpuinfo still exposes the repository's RV64 placeholder instead of LoongArch facts.",
-    "Stage 3 is next: implement the real 2K1000 ICU and CPU1 startup/IPI path, then run bidirectional generation shootdown, masked-interrupt recovery, ASID switching, permanent-wait, and stale-mapping witnesses without replacing the repaired protocol or serializing all cores.",
+    "The LA page-table, ASID, trap, per-CPU, unaligned-access, architectural IOCSR IPI, and generation-based TLB shootdown sources now live in a platform-neutral tx-hal-loongarch64-common source directory. QEMU keeps its slave-ROM boot mailbox and ExtIOI/PCH implementation separate and passed a fresh four-vCPU BusyBox run with bidirectional IPI, masked-progress shootdown, and boot sentinels.",
+    "Real hardware reports possible=2, online-aps=1, online=2, and iocsr-ipi=yes. BSP-to-AP and AP-to-BSP IPI, ordinary and interrupt-masked generation shootdown, reactor AP execution, owner-wake, and RCU SMP sentinels all pass without a global serialization lock or permanent wait.",
+    "The old firmware DTS describes LIOINTC main 0x1fe01400 with a CPU IRQ3/HWI1 cascade. The board maps public IRQ as hwirq+1, routes only the shared UART0..3 source hwirq0 to CPU0/HWI1 with route byte 0x21, disables the other UART IERs and all unowned LIOINTC sources, and has a real first-RX irq:uart-rx:ok witness. QEMU ExtIOI/PCH addresses are not reused.",
+    "The previous 0x1fe01020..0x1fe01038 ICU interpretation was rejected: those registers are vendor SMP mailboxes. The per-core +0x44 readback remains undocumented and is not used by the driver; the proven UART-only claim path reads global status masked by enable status.",
+    "The live /proc/cpuinfo now enumerates CPU0 and CPU1 as architecture loongarch64 from a dynamic platform provider; the former RV64 placeholder is gone while the RV64 text remains byte-compatible in its own target.",
+    "Stage 4 is next: attach ls-ahci at 0x400e0000/hwirq19, verify its dedicated LIOINTC route and trigger, DMA/cache behavior, and expose the Kingchuxing raw ext4 disk at LBA0 to the kernel. The root device is not a partition such as /dev/sda1.",
     "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
   ],
   "changed_files": [
@@ -65,6 +68,26 @@
     {
       "path": "boards/tx-hal-loongarch64-qemu-virt",
       "reason": "Consumes the shared LA mechanisms while keeping QEMU-only ExtIOI/PCH hardware in the QEMU platform."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-2k1000/src/boot_smp.rs",
+      "reason": "Releases CPU1 through the vendor mailbox while keeping the architectural IOCSR runtime IPI transport shared."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-2k1000/src/la2k1000_liointc.rs",
+      "reason": "Owns the real-board LIOINTC register model, nonzero public IRQ domain, UART shared-source isolation, route, claim, mask, and unmask operations."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-common/src/la64_ipi.rs",
+      "reason": "Provides the shared architectural IOCSR IPI transport and acknowledgement protocol used by QEMU and 2K1000 after platform-specific CPU release."
+    },
+    {
+      "path": "crates/tx-kernel/src/init.rs",
+      "reason": "Adds LA bidirectional IPI and interrupt-masked generation-shootdown witnesses and registers live procfs CPU facts."
+    },
+    {
+      "path": "crates/tx-fs/src/procfs/read.rs",
+      "reason": "Renders architecture-correct dynamic CPU information while preserving the existing RV64 text."
     },
     {
       "path": "xtask/src/target.rs",
@@ -160,27 +183,42 @@
       "command": "cargo xtask lint arch",
       "status": "failed",
       "notes": "The repository reports 97 existing issues; none point into the changed LoongArch board/common/xtask files."
+    },
+    {
+      "command": "cargo test -p tx-hal-loongarch64-2k1000 --lib",
+      "status": "passed",
+      "notes": "All 13 tests pass, including three host LIOINTC tests for the hwirq+1 public domain, mask/claim behavior, UART route 0x21, trigger configuration, and shared-UART IER isolation."
+    },
+    {
+      "command": "cargo test -p tx-fs cpuinfo --lib",
+      "status": "passed",
+      "notes": "Four tests preserve the exact RV64 text and cover dual-core, sparse-mask, and live-provider LoongArch CPU output."
+    },
+    {
+      "command": "cargo xtask qemu --target la64-qemu --profile busybox --expect-sentinel --timeout-ms 120000 --smp 4",
+      "status": "passed",
+      "notes": "LA QEMU reports online=4, smp:ipi:bidirectional:ok, smp:shootdown:masked-progress:ok, and boot:ok on the repaired shared Pmap/IPI base."
+    },
+    {
+      "command": "cargo xtask qemu --target rv64-qemu --profile busybox --expect-sentinel --timeout-ms 120000 --smp 4",
+      "status": "passed",
+      "notes": "RV64 four-vCPU BusyBox reaches boot:ok; LA-only witnesses and board ICU code do not affect the RV path."
+    },
+    {
+      "command": "real 2K1000: bootm 0x9000000097ffffc0 0x9000000098800000; first UART RX; cat /proc/cpuinfo",
+      "status": "passed",
+      "notes": "Both uImage CRCs pass; both CPUs come online; bidirectional IPI, masked shootdown, reactor and RCU SMP sentinels pass; the first RX character emits irq:uart-rx:ok; cpuinfo lists CPU0/CPU1 as loongarch64; BusyBox remains usable at / #."
     }
   ],
   "next_actions": [
     {
-      "id": "next-2",
-      "title": "Bring up the 2K1000 ICU, IPI, and SMP",
-      "paths": [
-        "boards/tx-hal-loongarch64-2k1000",
-        "boards/tx-hal-loongarch64-common/src/la64_pmap.rs",
-        "crates/tx-hal/src/lib.rs"
-      ],
-      "notes": "Stage 3 must verify board-specific interrupt routing, CPU1 startup, bidirectional IPI, masked-interrupt progress, ASID switching, permanent-wait freedom, and stale-map rejection without copying QEMU mailbox hardware or serializing all cores. It must also replace the incorrect RV64 /proc/cpuinfo placeholder before final SMP reporting."
-    },
-    {
       "id": "next-3",
-      "title": "Reach a shell, then attach persistent Alpine storage",
+      "title": "Attach persistent Alpine storage through 2K1000 AHCI",
       "paths": [
         "crates/tx-kernel/src/devices/block.rs",
         "boards/dtbs/ls2k1000-dp-v10.dts"
       ],
-      "notes": "Use a RAM-backed minimal userspace for the first / # if necessary. The persistent target is the existing raw LA ext4 image through the board's actual AHCI/SATA path; do not pass the ext4 image to bootm as a kernel."
+      "notes": "BusyBox / # is already proven. The persistent target is the existing raw LA ext4 image at LBA0 through ls-ahci 0x400e0000/hwirq19; add the source-specific LIOINTC route and verify DMA/cache behavior. Do not use /dev/sda1 or pass the ext4 image to bootm as a kernel."
     },
     {
       "id": "next-4",
@@ -216,8 +254,8 @@
     "QEMU 10.0.2.2/10.0.2.3 networking values are QEMU user-network endpoints and must not be copied to the physical 2K1000 network configuration.",
     "U-Boot and txKernel may program different IP and MAC values while taking turns controlling the same physical Ethernet hardware; U-Boot network state does not automatically carry into txKernel.",
     "Keep commands short: avoid unnecessary shell variables, if branches, printf scaffolding, generated helper scripts, and destructive cleanup commands.",
-    "Until the real ICU/UART RX interrupt route exists, pace serial input in small chunks; burst writes can overrun the polling receive path.",
-    "The current /proc/cpuinfo text is an existing RV64 placeholder on LA64 and is not evidence for the board ISA or MMU mode.",
+    "The verified LIOINTC setup currently owns only the shared UART hwirq0 route. AHCI hwirq19 and GMAC IRQs need source-specific trigger and route programming in their own stages before unmasking.",
+    "The one-time irq:uart-rx:ok line is the real-board proof that the first console byte traversed LIOINTC/HWI1; later input uses the same IRQ path with the existing polling reader only as fallback.",
     "For every hardware step, identify the execution context, show the shortest command, show only the key success output, and state what failure means.",
     "Do not describe intermediate repair history in user-facing knowledge documents. Record the final working chain and durable constraints only."
   ],
@@ -228,6 +266,8 @@
     "docs/progress/plans/2026-08-04-userspace-dhcp-client.json",
     "docs/progress/research/2026-08-01-la64-virtio-net-irq-route.md",
     "boards/dtbs/ls2k1000-dp-v10.dts",
+    "boards/tx-hal-loongarch64-2k1000/src/la2k1000_liointc.rs",
+    "boards/tx-hal-loongarch64-common/src/la64_ipi.rs",
     "msp/knowledge-handbook/08-VF2内核下载与启动链路.md",
     "msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md"
   ]

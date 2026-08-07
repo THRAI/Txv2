@@ -7,15 +7,15 @@ use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
     CpuPinGuard, DeadlineTimerIf, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf,
-    InterruptWaitState, IpiKind, IrqIf, KernelTrapSink, LocalExecutionGuard, MemoryRegion,
-    MemoryRegionKind, MmioFlags, MmioRegion, MonotonicCounterIf, ObserverIf, PercpuIf,
-    PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
-    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink,
+    LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
-    PtNodeAllocator, SavedSignalFrame, SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf,
-    TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView,
-    TrapIf, TrapPreviousMode, UserFpContext, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
-    VirtRange, EMPTY_DEVICE_RESOURCE_GRAPH,
+    PtNodeAllocator, SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite,
+    SignalHandlerRegs, SmpIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
+    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext, UserPtr,
+    UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange, EMPTY_DEVICE_RESOURCE_GRAPH,
 };
 
 use boot_facts::ensure_static_boot_facts;
@@ -84,7 +84,7 @@ const LA2K1000_BOOTPARAM_SIZE: usize = 0x0100_0000;
 const LA2K1000_UART_BASE: usize = 0x1fe2_0000;
 const LA2K1000_UART_SIZE: usize = 0x100;
 const LA64_MAX_BOOT_CPUS: usize = 2;
-const LA64_DEFAULT_POSSIBLE_CPUS: usize = 1;
+const LA64_DEFAULT_POSSIBLE_CPUS: usize = LA64_MAX_BOOT_CPUS;
 const LA64_DMW_CACHED_BASE: usize = 0x9000_0000_0000_0000;
 const LA64_DMW_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
 const LA64_PHYS_ADDR_MASK: usize = (1usize << 48) - 1;
@@ -123,6 +123,7 @@ const LA64_CPUCFG2: usize = 0x2;
 const LA64_CPUCFG4: usize = 0x4;
 const LA64_CPUCFG5: usize = 0x5;
 const LA64_ESTAT_IS_HWI_MASK: usize = 0xff << 2;
+const LA64_ESTAT_IS_HWI1: usize = 1 << 3;
 const LA64_ESTAT_IS_TIMER: usize = 1 << 11;
 const LA64_ESTAT_IS_IPI: usize = 1 << 12;
 const LA64_ESTAT_ECODE_SHIFT: usize = 16;
@@ -210,6 +211,7 @@ static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
 static LA64_CPU_PIN_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
     [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
+static LA2K1000_UART_IRQ_OBSERVED: AtomicBool = AtomicBool::new(false);
 /// LA64 supports a 10-bit ASID space (`ASID_BITS = 10`, `LA64_ASID_MASK =
 /// 0x3ff`), i.e. 1024 ASIDs. The allocator must cover that whole space so that
 /// EBR-deferred address-space reclaim (retired-but-not-yet-freed `PmapRoot`s
@@ -803,20 +805,36 @@ pub fn initialize_early_board() {
     early_console_write(b"txkernel:loongson-2k1000:h2:uart-reinit:ok\n");
 }
 
-static MMIO_REGIONS: [MmioRegion; 1] = [MmioRegion {
-    name: "uart0",
-    phys: PhysRange {
-        start: PhysAddr(LA2K1000_UART_BASE),
-        size: LA2K1000_UART_SIZE,
+static MMIO_REGIONS: [MmioRegion; 2] = [
+    MmioRegion {
+        name: "uart0",
+        phys: PhysRange {
+            start: PhysAddr(LA2K1000_UART_BASE),
+            size: LA2K1000_UART_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_UART_BASE),
+            size: LA2K1000_UART_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
     },
-    virt: VirtRange {
-        start: VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_UART_BASE),
-        size: LA2K1000_UART_SIZE,
+    MmioRegion {
+        name: "liointc",
+        phys: PhysRange {
+            start: PhysAddr(la2k1000_liointc::MAIN_PHYS_BASE),
+            size: la2k1000_liointc::MAIN_MMIO_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(LA64_DMW_UNCACHED_BASE | la2k1000_liointc::MAIN_PHYS_BASE),
+            size: la2k1000_liointc::MAIN_MMIO_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
     },
-    flags: MmioFlags::DEVICE_NGNRNE
-        .union(MmioFlags::READ)
-        .union(MmioFlags::WRITE),
-}];
+];
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -955,6 +973,10 @@ pub use boot_args::capture_loongarch64_2k1000_boot_args;
 mod boot_args;
 mod boot_asm;
 mod boot_facts;
+mod boot_smp;
+mod la2k1000_liointc;
+#[path = "../../tx-hal-loongarch64-common/src/la64_ipi.rs"]
+mod la64_ipi;
 #[path = "../../tx-hal-loongarch64-common/src/la64_irq_trap.rs"]
 mod la64_irq_trap;
 #[path = "../../tx-hal-loongarch64-common/src/la64_percpu.rs"]

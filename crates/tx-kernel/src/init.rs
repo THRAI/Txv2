@@ -112,6 +112,7 @@ static OWNER_WAKE_SMP_DELEGATE_TOKEN: SpinMutex<Option<boot_runtime::DelegateTok
 static OWNER_WAKE_SMP_DELEGATE_REGISTRY: SpinMutex<Option<Arc<boot_runtime::DelegateRegistry>>> =
     spin_mutex(None, b"debug.lock.kernel.owner_wake_registry");
 static RCU_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
+static LA64_MASKED_SHOOTDOWN_STAGE: AtomicU64 = AtomicU64::new(0);
 static FILE_IO_SERVICE_REACTOR_TASKS: SpinMutex<Vec<boot_runtime::TaskId>> =
     spin_mutex(Vec::new(), b"debug.lock.kernel.file_io_service_tasks");
 
@@ -161,6 +162,58 @@ const OWNER_WAKE_STAGE_DELEGATE: u64 = 4;
 const RCU_SMP_STAGE_READER_ACTIVE: u64 = 1;
 const RCU_SMP_STAGE_RELEASE_READER: u64 = 2;
 const RCU_SMP_STAGE_READER_DONE: u64 = 3;
+const LA64_MASKED_SHOOTDOWN_ARMED: u64 = 1;
+const LA64_MASKED_SHOOTDOWN_ACTIVE: u64 = 2;
+const LA64_MASKED_SHOOTDOWN_RELEASE: u64 = 3;
+const LA64_MASKED_SHOOTDOWN_DONE: u64 = 4;
+const LA64_MASKED_SHOOTDOWN_CANCELLED: u64 = 5;
+
+struct La64MaskedShootdownTarget<P: TxPlatform> {
+    target_cpu: CpuId,
+    _platform: PhantomData<fn() -> P>,
+}
+
+impl<P: TxPlatform> Future for La64MaskedShootdownTarget<P> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        assert_eq!(
+            <P as tx_hal::SmpIf>::current_cpu_id(),
+            self.target_cpu,
+            "masked shootdown target CPU"
+        );
+
+        if LA64_MASKED_SHOOTDOWN_STAGE.load(Ordering::Acquire) == LA64_MASKED_SHOOTDOWN_CANCELLED {
+            return Poll::Ready(());
+        }
+
+        let irq_guard = P::exclude_local_execution();
+        assert!(
+            !P::interrupts_enabled(),
+            "masked shootdown target interrupts"
+        );
+        if LA64_MASKED_SHOOTDOWN_STAGE
+            .compare_exchange(
+                LA64_MASKED_SHOOTDOWN_ARMED,
+                LA64_MASKED_SHOOTDOWN_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            drop(irq_guard);
+            return Poll::Ready(());
+        }
+
+        while LA64_MASKED_SHOOTDOWN_STAGE.load(Ordering::Acquire) != LA64_MASKED_SHOOTDOWN_RELEASE {
+            P::service_pending_tlb_shootdown();
+            core::hint::spin_loop();
+        }
+        drop(irq_guard);
+        LA64_MASKED_SHOOTDOWN_STAGE.store(LA64_MASKED_SHOOTDOWN_DONE, Ordering::Release);
+        Poll::Ready(())
+    }
+}
 
 struct RcuSmpGuardedReader<P: TxPlatform> {
     target_cpu: CpuId,
@@ -742,6 +795,13 @@ impl<P: TxPlatform> CoreInit<P> {
         timekeeper_clock::<P>().monotonic_now_ns()
     }
 
+    fn procfs_cpuinfo_snapshot() -> tx_fs::procfs::CpuInfoSnapshot {
+        tx_fs::procfs::CpuInfoSnapshot::new(
+            <P as tx_hal::PlatformConfig>::ARCH,
+            <P as tx_hal::SmpIf>::online_cpus(),
+        )
+    }
+
     fn deadline_timer() -> HalDeadlineTimer<P> {
         HalDeadlineTimer::<P>::new()
     }
@@ -814,6 +874,8 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::boot_secondary_cpus();
             Self::run_smp_shootdown_smoke();
             Self::run_smp_ipi_smoke();
+            Self::run_la64_reverse_ipi_smoke();
+            Self::run_la64_masked_shootdown_smoke();
             Self::run_reactor_dispatcher_smoke();
             Self::run_reactor_owner_wake_smp_smoke();
             Self::run_rcu_smp_smoke();
@@ -1605,6 +1667,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // the platform. Inject the boot-time Time facade read once.
         tx_fs::procfs::procfs_register_uptime_clock(Self::monotonic_now_ns);
         tx_fs::procfs::procfs_register_boot_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline);
+        tx_fs::procfs::procfs_register_cpuinfo_provider(Self::procfs_cpuinfo_snapshot);
 
         let root_mount = ROOT_MOUNT
             .lock()
@@ -2478,6 +2541,137 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":smp:ipi:ok\n");
+    }
+
+    fn run_la64_reverse_ipi_smoke() {
+        if P::ARCH != tx_hal::Arch::LoongArch64 {
+            return;
+        }
+        let Some(target_cpu) = Self::first_remote_online_cpu() else {
+            return;
+        };
+
+        let bsp_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let bsp_mask = CpuMask::single(bsp_cpu);
+        let current_hart = boot_runtime::HartId(bsp_cpu.0);
+        P::clear_ipi_ack_cpus(IpiKind::Maintenance, bsp_mask);
+
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let submit_report = BOOT_REACTOR
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    async move {
+                        P::send_ipi(bsp_cpu, IpiKind::Maintenance);
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
+            .expect("boot reactor must be initialized before reverse IPI smoke");
+        assert_eq!(submit_report.remote_ipis, 1, "reverse IPI smoke submit");
+        assert!(
+            Self::wait_for_ipi_ack_with_deadline(bsp_mask, IpiKind::Maintenance),
+            "reverse IPI smoke BSP acknowledgement"
+        );
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":smp:ipi:bidirectional:ok\n");
+    }
+
+    fn run_la64_masked_shootdown_smoke() {
+        if P::ARCH != tx_hal::Arch::LoongArch64 {
+            return;
+        }
+        let Some(target_cpu) = Self::first_remote_online_cpu() else {
+            return;
+        };
+
+        LA64_MASKED_SHOOTDOWN_STAGE.store(LA64_MASKED_SHOOTDOWN_ARMED, Ordering::Release);
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let submit_report = BOOT_REACTOR
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    La64MaskedShootdownTarget::<P> {
+                        target_cpu,
+                        _platform: PhantomData,
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
+            .expect("boot reactor must be initialized before masked shootdown smoke");
+        assert_eq!(
+            submit_report.remote_ipis, 1,
+            "masked shootdown smoke submit"
+        );
+
+        if !Self::wait_for_la64_masked_shootdown_stage(LA64_MASKED_SHOOTDOWN_ACTIVE) {
+            match LA64_MASKED_SHOOTDOWN_STAGE.compare_exchange(
+                LA64_MASKED_SHOOTDOWN_ARMED,
+                LA64_MASKED_SHOOTDOWN_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => panic!("masked shootdown target did not start before deadline"),
+                Err(LA64_MASKED_SHOOTDOWN_ACTIVE) => {}
+                Err(stage) => panic!("masked shootdown target entered invalid stage {stage}"),
+            }
+        }
+
+        P::shootdown_kernel_mapping(tx_hal::PmapInvalidation::new(tx_hal::VirtAddr(0), 4096));
+        LA64_MASKED_SHOOTDOWN_STAGE.store(LA64_MASKED_SHOOTDOWN_RELEASE, Ordering::Release);
+        assert!(
+            Self::wait_for_la64_masked_shootdown_stage(LA64_MASKED_SHOOTDOWN_DONE),
+            "masked shootdown target did not finish before deadline"
+        );
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":smp:shootdown:masked-progress:ok\n");
+    }
+
+    fn wait_for_ipi_ack_with_deadline(mask: CpuMask, kind: IpiKind) -> bool {
+        Self::wait_for_boot_smoke_condition(|| {
+            P::ipi_ack_cpus(kind).bits() & mask.bits() == mask.bits()
+        })
+    }
+
+    fn wait_for_la64_masked_shootdown_stage(expected: u64) -> bool {
+        Self::wait_for_boot_smoke_condition(|| {
+            LA64_MASKED_SHOOTDOWN_STAGE.load(Ordering::Acquire) == expected
+        })
+    }
+
+    fn wait_for_boot_smoke_condition(mut ready: impl FnMut() -> bool) -> bool {
+        const TIMEOUT_NS: u64 = 10_000_000_000;
+
+        if P::frequency_hz() == 0 {
+            for _ in 0..AP_REACTOR_WAIT_SPINS {
+                if ready() {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+            return false;
+        }
+
+        let deadline = P::read_ns().saturating_add(TIMEOUT_NS);
+        loop {
+            if ready() {
+                return true;
+            }
+            if P::read_ns() >= deadline {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
     }
 
     fn run_reactor_dispatcher_smoke() {
