@@ -4,10 +4,14 @@
 # Required inputs:
 #   TX_LA64_IMAGE=/path/to/clean-la64-ext4.img
 #   TX_LA64_PACK=/path/to/input.pack
+#   TX_LA64_ORACLE_BIN=/path/to/precompiled-la64-oracle
+#     OR
+#   TX_LA64_CC='bash tools/images/loongarch64-linux-musl-gcc.zig-wrapper'
 #
 # Optional inputs:
 #   TX_LA64_KERNEL=/path/to/kernel-la64-elf
 #   TX_LA64_ROUNDS=8
+#   TX_LA64_ORACLE_EPOCHS=32
 #   TX_LA64_TIMEOUT_SECONDS=900
 #   TX_LA64_ARTIFACT_PARENT=/tmp
 #
@@ -18,6 +22,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_KERNEL="$ROOT/target/loongarch64-unknown-none-softfloat/debug/tx-kernel-loongarch64-qemu-virt"
+ORACLE_SOURCE="$ROOT/tools/shell-tests/la64-tlb-stale-map.c"
 
 say() {
   printf '%s\n' "$*"
@@ -28,7 +33,12 @@ usage() {
 usage:
   TX_LA64_IMAGE=/path/to/clean-la64-ext4.img \
   TX_LA64_PACK=/path/to/input.pack \
+  TX_LA64_ORACLE_BIN=/path/to/precompiled-la64-oracle \
     bash tools/la64-index-pack-shootdown-witness.sh
+
+Instead of TX_LA64_ORACLE_BIN, set TX_LA64_CC to an explicit LA64 musl
+compiler command. For example:
+  TX_LA64_CC='bash tools/images/loongarch64-linux-musl-gcc.zig-wrapper'
 
 The runner always uses LA64 QEMU with:
   -smp 4
@@ -44,17 +54,33 @@ if [[ -z "${TX_LA64_IMAGE:-}" || -z "${TX_LA64_PACK:-}" ]]; then
   usage >&2
   exit 2
 fi
+if [[ -n "${TX_LA64_ORACLE_BIN:-}" && -n "${TX_LA64_CC:-}" ]]; then
+  say "FATAL: set exactly one of TX_LA64_ORACLE_BIN or TX_LA64_CC" >&2
+  exit 2
+fi
+if [[ -z "${TX_LA64_ORACLE_BIN:-}" && -z "${TX_LA64_CC:-}" ]]; then
+  say "FATAL: set TX_LA64_ORACLE_BIN or TX_LA64_CC for the stale-map oracle" >&2
+  usage >&2
+  exit 2
+fi
 
 IMAGE="$TX_LA64_IMAGE"
 PACK="$TX_LA64_PACK"
 KERNEL="${TX_LA64_KERNEL:-$DEFAULT_KERNEL}"
 ROUNDS="${TX_LA64_ROUNDS:-8}"
+ORACLE_EPOCHS="${TX_LA64_ORACLE_EPOCHS:-32}"
 TIMEOUT_SECONDS="${TX_LA64_TIMEOUT_SECONDS:-900}"
 ARTIFACT_PARENT="${TX_LA64_ARTIFACT_PARENT:-/tmp}"
 
 case "$ROUNDS" in
   ''|*[!0-9]*|0)
     say "FATAL: TX_LA64_ROUNDS must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+case "$ORACLE_EPOCHS" in
+  ''|*[!0-9]*|0)
+    say "FATAL: TX_LA64_ORACLE_EPOCHS must be a positive integer" >&2
     exit 2
     ;;
 esac
@@ -65,7 +91,7 @@ case "$TIMEOUT_SECONDS" in
     ;;
 esac
 
-for command_name in cp debugfs grep mktemp qemu-system-loongarch64 sed stat timeout tr; do
+for command_name in cp debugfs file grep mktemp qemu-system-loongarch64 sed stat timeout tr; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     say "FATAL: required host command not found: $command_name" >&2
     exit 2
@@ -74,6 +100,13 @@ done
 
 [[ -f "$IMAGE" ]] || { say "FATAL: TX_LA64_IMAGE is not a regular file: $IMAGE" >&2; exit 2; }
 [[ -f "$PACK" ]] || { say "FATAL: TX_LA64_PACK is not a regular file: $PACK" >&2; exit 2; }
+[[ -f "$ORACLE_SOURCE" ]] || { say "FATAL: stale-map oracle source not found: $ORACLE_SOURCE" >&2; exit 2; }
+if [[ -n "${TX_LA64_ORACLE_BIN:-}" ]]; then
+  [[ -f "$TX_LA64_ORACLE_BIN" ]] || {
+    say "FATAL: TX_LA64_ORACLE_BIN is not a regular file: $TX_LA64_ORACLE_BIN" >&2
+    exit 2
+  }
+fi
 [[ -f "$KERNEL" ]] || {
   say "FATAL: LA64 kernel ELF not found: $KERNEL" >&2
   say "Build it with: cargo xtask build --target la64-qemu" >&2
@@ -88,6 +121,9 @@ ARTIFACT_DIR="$(mktemp -d "$ARTIFACT_PARENT/la64-index-pack-witness-XXXXXX")" ||
 DISK="$ARTIFACT_DIR/disk.img"
 GUEST_SCRIPT="$ARTIFACT_DIR/guest-witness.sh"
 STAGED_PACK="$ARTIFACT_DIR/tlb-stress.pack"
+ORACLE_BIN="$ARTIFACT_DIR/la64-tlb-stale-map"
+ORACLE_SOURCE_COPY="$ARTIFACT_DIR/la64-tlb-stale-map.c"
+ORACLE_BUILD_LOG="$ARTIFACT_DIR/oracle-build.log"
 SERIAL_RAW="$ARTIFACT_DIR/serial.raw.log"
 SERIAL="$ARTIFACT_DIR/serial.log"
 QEMU_LOG="$ARTIFACT_DIR/qemu.log"
@@ -117,6 +153,30 @@ copy_with_reflink_fallback() {
 
 copy_with_reflink_fallback "$IMAGE" "$DISK" "image"
 copy_with_reflink_fallback "$PACK" "$STAGED_PACK" "pack"
+copy_with_reflink_fallback "$ORACLE_SOURCE" "$ORACLE_SOURCE_COPY" "oracle source"
+
+if [[ -n "${TX_LA64_ORACLE_BIN:-}" ]]; then
+  copy_with_reflink_fallback "$TX_LA64_ORACLE_BIN" "$ORACLE_BIN" "oracle binary"
+  ORACLE_INPUT="precompiled:$TX_LA64_ORACLE_BIN"
+else
+  read -r -a CC_COMMAND <<< "$TX_LA64_CC"
+  if [[ "${#CC_COMMAND[@]}" -eq 0 ]] || ! command -v "${CC_COMMAND[0]}" >/dev/null 2>&1; then
+    say "FATAL: TX_LA64_CC command not found: ${CC_COMMAND[0]:-$TX_LA64_CC}" >&2
+    exit 2
+  fi
+  if ! "${CC_COMMAND[@]}" -static -O2 -std=c11 -pthread -Wall -Wextra -Werror \
+    "$ORACLE_SOURCE_COPY" -o "$ORACLE_BIN" >"$ORACLE_BUILD_LOG" 2>&1; then
+    say "FATAL: LA64 stale-map oracle compilation failed; see $ORACLE_BUILD_LOG" >&2
+    exit 2
+  fi
+  ORACLE_INPUT="compiler:$TX_LA64_CC"
+fi
+
+ORACLE_FILE_DESCRIPTION="$(file -b "$ORACLE_BIN")"
+if [[ "$ORACLE_FILE_DESCRIPTION" != *LoongArch* ]]; then
+  say "FATAL: stale-map oracle is not a LoongArch binary: $ORACLE_FILE_DESCRIPTION" >&2
+  exit 2
+fi
 
 cat > "$GUEST_SCRIPT" <<'GUESTEOF'
 BB=/musl/bin/busybox
@@ -135,6 +195,15 @@ guest_fail() {
 
 echo "TLBWITNESS:BEGIN"
 echo "TLBWITNESS:ROUNDS:__ROUNDS__"
+echo "TLBWITNESS:ORACLE:EPOCHS:__ORACLE_EPOCHS__"
+
+$BB chmod 755 /musl/root/la64-tlb-stale-map || guest_fail oracle-chmod
+echo "TLBWITNESS:ORACLE:START"
+/musl/root/la64-tlb-stale-map __ORACLE_EPOCHS__
+oracle_rc=$?
+echo "TLBWITNESS:ORACLE:RC:$oracle_rc"
+[ "$oracle_rc" -eq 0 ] || guest_fail "oracle-rc-$oracle_rc"
+echo "TLBWITNESS:ORACLE:PASS"
 
 $BB rm -rf /musl/root/tlb-index-pack || guest_fail cleanup
 $BB mkdir -p /musl/root/tlb-index-pack || guest_fail mkdir
@@ -167,25 +236,34 @@ $BB poweroff -f
 exit 0
 GUESTEOF
 sed -i "s/__ROUNDS__/$ROUNDS/g" "$GUEST_SCRIPT"
+sed -i "s/__ORACLE_EPOCHS__/$ORACLE_EPOCHS/g" "$GUEST_SCRIPT"
 
 # The ext4 image root is mounted at /musl in the guest: image `/foo` is guest
 # `/musl/foo`. Remove stale destinations only inside the throwaway image.
 # debugfs may return success for a missing path, so stat checks are authoritative.
 debugfs -w -R "rm /tx-la64-index-pack-witness.sh" "$DISK" >>"$DEBUGFS_LOG" 2>&1 || true
 debugfs -w -R "rm /root/tlb-stress.pack" "$DISK" >>"$DEBUGFS_LOG" 2>&1 || true
+debugfs -w -R "rm /root/la64-tlb-stale-map" "$DISK" >>"$DEBUGFS_LOG" 2>&1 || true
 debugfs -w -R "write $GUEST_SCRIPT /tx-la64-index-pack-witness.sh" "$DISK" >>"$DEBUGFS_LOG" 2>&1
 debugfs -w -R "write $STAGED_PACK /root/tlb-stress.pack" "$DISK" >>"$DEBUGFS_LOG" 2>&1
+debugfs -w -R "write $ORACLE_BIN /root/la64-tlb-stale-map" "$DISK" >>"$DEBUGFS_LOG" 2>&1
 
 script_size="$(stat -c '%s' "$GUEST_SCRIPT")"
 pack_size="$(stat -c '%s' "$STAGED_PACK")"
+oracle_size="$(stat -c '%s' "$ORACLE_BIN")"
 debugfs -R "stat /tx-la64-index-pack-witness.sh" "$DISK" >"$ARTIFACT_DIR/guest-script.stat" 2>>"$DEBUGFS_LOG"
 debugfs -R "stat /root/tlb-stress.pack" "$DISK" >"$ARTIFACT_DIR/guest-pack.stat" 2>>"$DEBUGFS_LOG"
+debugfs -R "stat /root/la64-tlb-stale-map" "$DISK" >"$ARTIFACT_DIR/guest-oracle.stat" 2>>"$DEBUGFS_LOG"
 if ! grep -Eq "Size:[[:space:]]+$script_size([[:space:]]|$)" "$ARTIFACT_DIR/guest-script.stat"; then
   say "FATAL: guest script injection could not be verified" >&2
   exit 2
 fi
 if ! grep -Eq "Size:[[:space:]]+$pack_size([[:space:]]|$)" "$ARTIFACT_DIR/guest-pack.stat"; then
   say "FATAL: pack injection could not be verified" >&2
+  exit 2
+fi
+if ! grep -Eq "Size:[[:space:]]+$oracle_size([[:space:]]|$)" "$ARTIFACT_DIR/guest-oracle.stat"; then
+  say "FATAL: stale-map oracle injection could not be verified" >&2
   exit 2
 fi
 
@@ -217,6 +295,11 @@ QEMU_COMMAND=(
   printf 'pack_source=%s\n' "$PACK"
   printf 'kernel=%s\n' "$KERNEL"
   printf 'rounds=%s\n' "$ROUNDS"
+  printf 'oracle_epochs=%s\n' "$ORACLE_EPOCHS"
+  printf 'oracle_source=%s\n' "$ORACLE_SOURCE"
+  printf 'oracle_input=%s\n' "$ORACLE_INPUT"
+  printf 'oracle_file=%s\n' "$ORACLE_FILE_DESCRIPTION"
+  printf 'oracle_bytes=%s\n' "$oracle_size"
   printf 'timeout_seconds=%s\n' "$TIMEOUT_SECONDS"
   printf 'image_copy=%s\n' "$DISK"
   printf 'pack_bytes=%s\n' "$pack_size"
@@ -231,6 +314,7 @@ QEMU_COMMAND=(
 
 say "== LA64 SMP4 offline index-pack shootdown witness =="
 say "rounds: $ROUNDS"
+say "stale-map oracle epochs: $ORACLE_EPOCHS"
 say "host failure bound: ${TIMEOUT_SECONDS}s"
 say "topology: -smp 4, tcg,thread=multi, tx.maxcpus=4"
 say "network: disabled"
@@ -243,7 +327,7 @@ tr -d '\000\r' < "$SERIAL_RAW" > "$SERIAL"
 
 : > "$FAILURE_MATCHES"
 if grep -aEn \
-  'TLBWITNESS:FAIL:|txkernel:la64-tlb-shootdown-stall|^txkernel:panic:|panicked at|^txkernel:[^[:space:]]*:trap$|^reason=trap-action-terminate$|invalid index-pack output' \
+  'TLBWITNESS:FAIL:|TLBORACLE:FAIL:|txkernel:la64-tlb-shootdown-stall|^txkernel:panic:|panicked at|^txkernel:[^[:space:]]*:trap$|^reason=trap-action-terminate$|invalid index-pack output' \
   "$SERIAL" > "$FAILURE_MATCHES"; then
   say "FAIL: guest failure or forbidden stall/panic/trap/index-pack signature found" >&2
   sed -n '1,80p' "$FAILURE_MATCHES" >&2
@@ -273,6 +357,23 @@ if ! grep -aFxq 'TLBWITNESS:PASS' "$SERIAL"; then
   exit 1
 fi
 
+if [[ "$(grep -aFxc 'TLBWITNESS:ORACLE:PASS' "$SERIAL")" -ne 1 ]]; then
+  say "FAIL: expected exactly one stale-map oracle wrapper success marker" >&2
+  tail -n 80 "$SERIAL" >&2
+  exit 1
+fi
+if [[ "$(grep -aFxc 'TLBORACLE:PASS' "$SERIAL")" -ne 1 ]]; then
+  say "FAIL: expected exactly one stale-map oracle success marker" >&2
+  tail -n 80 "$SERIAL" >&2
+  exit 1
+fi
+oracle_result="TLBORACLE:RESULT:epochs=$ORACLE_EPOCHS:validated_writes=$ORACLE_EPOCHS:stale_writes=0:stale_reads=0:errors=0"
+if [[ "$(grep -aFxc "$oracle_result" "$SERIAL")" -ne 1 ]]; then
+  say "FAIL: stale-map oracle did not report all expected faults with zero stale access" >&2
+  tail -n 80 "$SERIAL" >&2
+  exit 1
+fi
+
 i=1
 while [[ "$i" -le "$ROUNDS" ]]; do
   for phase in INDEX FSCK; do
@@ -292,4 +393,4 @@ while [[ "$i" -le "$ROUNDS" ]]; do
   i=$((i + 1))
 done
 
-say "PASS: LA64 possible=4:online=4 completed $ROUNDS index-pack + fsck rounds"
+say "PASS: LA64 possible=4:online=4 completed $ORACLE_EPOCHS stale-map epochs and $ROUNDS index-pack + fsck rounds"

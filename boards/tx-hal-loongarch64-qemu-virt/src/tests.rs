@@ -1117,6 +1117,59 @@ fn publish_la64_generation_during_first_invtlb(target: CpuId) {
     <Platform as PercpuIf>::write_kernel_tls(saved_tls);
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
+fn publish_la64_generation_after_service_release(target: CpuId) {
+    assert_eq!(la64_current_cpu_id(), target);
+    assert!(!LA64_TLB_SHOOTDOWN_SERVICING[target.0].load(Ordering::Acquire));
+    install_la64_test_service_released_hook(None);
+
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    let sender = if target == CpuId(0) {
+        CpuId(1)
+    } else {
+        CpuId(0)
+    };
+    <Platform as PercpuIf>::write_kernel_tls(sender.0 as u64);
+    let generation = publish_la64_tlb_generation_for_test(target);
+    TEST_LA64_INJECTED_GENERATION.store(generation, Ordering::Release);
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn nested_ack_and_arm_release_publication_during_first_invtlb(target: CpuId) {
+    let invocation = TEST_LA64_INVTLB_ALL_CALLS.fetch_add(1, Ordering::AcqRel);
+    if invocation != 0 {
+        return;
+    }
+    assert_eq!(la64_current_cpu_id(), target);
+    assert!(LA64_TLB_SHOOTDOWN_SERVICING[target.0].load(Ordering::Acquire));
+    let completed_before = LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire);
+
+    // Model a same-kind hardware action arriving while the first owner is in
+    // INVTLB. The nested ack clears that action, but its mailbox service must
+    // lose the owner CAS and leave completion publication to the first owner.
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    let sender = if target == CpuId(0) {
+        CpuId(1)
+    } else {
+        CpuId(0)
+    };
+    <Platform as PercpuIf>::write_kernel_tls(sender.0 as u64);
+    <Platform as SmpIf>::send_ipi(target, IpiKind::TlbShootdown);
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+    assert!(LA64_TLB_SHOOTDOWN_SERVICING[target.0].load(Ordering::Acquire));
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire),
+        completed_before,
+        "nested service must not publish completion after losing the owner CAS"
+    );
+
+    install_la64_test_service_released_hook(Some(publish_la64_generation_after_service_release));
+}
+
 #[test]
 fn la64_tlb_mailbox_coalesces_generations_at_polling_safe_point() {
     let _guard = lock_test_pmap_state();
@@ -1231,6 +1284,48 @@ fn la64_tlb_service_drains_generation_published_during_invtlb() {
 
     unpin_la64_tlb_target(target.0);
     unpin_la64_tlb_target(target.0);
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    reset_pmap_test_state();
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_tlb_owner_final_recheck_drains_generation_after_nested_ack() {
+    let _guard = lock_test_pmap_state();
+    reset_pmap_test_state();
+    let target = CpuId(1);
+    let bit = CpuMask::single(target).bits();
+    mark_la64_tlb_cpu_online(target);
+    LA64_ONLINE_CPUS.fetch_or(bit, Ordering::AcqRel);
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    let first = publish_la64_tlb_generation_for_test(target);
+    install_la64_test_invtlb_all_hook(Some(
+        nested_ack_and_arm_release_publication_during_first_invtlb,
+    ));
+
+    <Platform as PercpuIf>::install_early_percpu(target);
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
+
+    let second = TEST_LA64_INJECTED_GENERATION.load(Ordering::Acquire);
+    assert_eq!(second, first.wrapping_add(1));
+    assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 2);
+    assert_eq!(
+        LA64_TLB_SHOOTDOWN_COMPLETED[target.0].load(Ordering::Acquire),
+        second,
+        "the original owner must reacquire in its final recheck and drain the new generation"
+    );
+    assert!(!LA64_TLB_SHOOTDOWN_SERVICING[target.0].load(Ordering::Acquire));
+    assert!(
+        <Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown),
+        "the release-boundary publication retains a redundant level notification"
+    );
+
+    unpin_la64_tlb_target(target.0);
+    unpin_la64_tlb_target(target.0);
+    install_la64_test_service_released_hook(None);
+    install_la64_test_invtlb_all_hook(None);
+    <Platform as SmpIf>::ack_ipi(IpiKind::TlbShootdown);
     <Platform as PercpuIf>::install_early_percpu(CpuId(0));
     reset_pmap_test_state();
 }
@@ -1428,6 +1523,22 @@ fn la64_tlb_generation_coalescing_survives_wraparound() {
     assert_eq!(TEST_LA64_INVTLB_ALL_CALLS.load(Ordering::Acquire), 2);
 
     reset_pmap_test_state();
+}
+
+#[test]
+fn la64_tlb_generation_reached_respects_signed_half_range_boundary() {
+    let requested = 0xd123_4567_89ab_cdefu64;
+    let last_unambiguous_completion = requested.wrapping_add((1u64 << 63) - 1);
+    let half_range_completion = requested.wrapping_add(1u64 << 63);
+
+    assert!(la64_tlb_generation_reached(
+        last_unambiguous_completion,
+        requested
+    ));
+    assert!(
+        !la64_tlb_generation_reached(half_range_completion, requested),
+        "a distance of exactly 2^63 is outside the serial-number comparison contract"
+    );
 }
 
 #[test]
@@ -2225,6 +2336,7 @@ fn reset_pmap_test_state() {
     #[cfg(not(target_arch = "loongarch64"))]
     {
         install_la64_test_invtlb_all_hook(None);
+        install_la64_test_service_released_hook(None);
         boot_smp::reset_la64_ipi_state_for_test();
         TEST_LA64_INVTLB_ALL_CALLS.store(0, Ordering::Release);
         TEST_LA64_INJECTED_GENERATION.store(0, Ordering::Release);

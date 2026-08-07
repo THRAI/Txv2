@@ -21,10 +21,18 @@ fn spin_with_la64_tlb_progress(wait: &mut TlbProgressSpinWait) {
 #[cfg(all(test, not(target_arch = "loongarch64")))]
 type La64TestInvtlbAllHook = fn(CpuId);
 
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+type La64TestServiceReleasedHook = fn(CpuId);
+
 /// Host-test-only INVTLB completion point used to inject mailbox events
 /// before `completed` is published. It is absent from LA64 production builds.
 #[cfg(all(test, not(target_arch = "loongarch64")))]
 static LA64_TEST_INVTLB_ALL_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Host-test-only seam at the service-owner release/final-recheck boundary.
+/// It is absent from LA64 production builds.
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+static LA64_TEST_SERVICE_RELEASED_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(all(test, not(target_arch = "loongarch64")))]
 pub(crate) fn install_la64_test_invtlb_all_hook(hook: Option<La64TestInvtlbAllHook>) {
@@ -32,10 +40,24 @@ pub(crate) fn install_la64_test_invtlb_all_hook(hook: Option<La64TestInvtlbAllHo
 }
 
 #[cfg(all(test, not(target_arch = "loongarch64")))]
+pub(crate) fn install_la64_test_service_released_hook(hook: Option<La64TestServiceReleasedHook>) {
+    LA64_TEST_SERVICE_RELEASED_HOOK.store(hook.map_or(0, |hook| hook as usize), Ordering::Release);
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
 fn run_la64_test_invtlb_all_hook() {
     let hook = LA64_TEST_INVTLB_ALL_HOOK.load(Ordering::Acquire);
     if hook != 0 {
         let hook = unsafe { core::mem::transmute::<usize, La64TestInvtlbAllHook>(hook) };
+        hook(la64_current_cpu_id());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+fn run_la64_test_service_released_hook() {
+    let hook = LA64_TEST_SERVICE_RELEASED_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        let hook = unsafe { core::mem::transmute::<usize, La64TestServiceReleasedHook>(hook) };
         hook(la64_current_cpu_id());
     }
 }
@@ -488,6 +510,10 @@ pub(crate) fn invalidate_la64_asid_before_reuse() {
 }
 
 #[inline]
+/// Serial-number comparison is unambiguous only while the distance between an
+/// observed completion and a pinned request is less than `2^63`. The mailbox
+/// protocol must therefore never retain `2^63` outstanding generations for one
+/// target; each pin is released after its generation is observed complete.
 pub(crate) fn la64_tlb_generation_reached(completed: u64, requested: u64) -> bool {
     (completed.wrapping_sub(requested) as i64) >= 0
 }
@@ -594,6 +620,8 @@ pub(crate) fn service_la64_pending_tlb_shootdown() -> bool {
         // observes another context doing so, or leaves a later request paired
         // with its still-pending hardware IPI.
         LA64_TLB_SHOOTDOWN_SERVICING[cpu].store(false, Ordering::Release);
+        #[cfg(all(test, not(target_arch = "loongarch64")))]
+        run_la64_test_service_released_hook();
         let requested = LA64_TLB_SHOOTDOWN_REQUESTED[cpu].load(Ordering::Acquire);
         let completed = LA64_TLB_SHOOTDOWN_COMPLETED[cpu].load(Ordering::Acquire);
         if requested == completed {
