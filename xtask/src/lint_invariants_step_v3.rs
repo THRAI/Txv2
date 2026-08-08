@@ -18,8 +18,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::Result;
 use crate::util::{collect_files, relative};
+use crate::Result;
 
 // ---------------------------------------------------------------------------
 // Ratchet ceilings — set to measured baseline; lowered as migration progresses.

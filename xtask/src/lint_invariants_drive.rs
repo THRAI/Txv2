@@ -21,8 +21,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use crate::Result;
 use crate::util::{collect_files, relative};
+use crate::Result;
 
 /// Ratchet ceiling: number of non-test, non-drive files with ad-hoc
 /// StepOutcome dispatch. Measured baseline 2026-05-14.

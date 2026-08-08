@@ -26,8 +26,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use crate::Result;
 use crate::util::{optional_option_value, resolve_path};
+use crate::Result;
 
 pub(crate) fn trap_trace(root: &Path, args: Vec<String>) -> Result<()> {
     let serial = optional_option_value(&args, "--serial")

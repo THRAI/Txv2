@@ -13,8 +13,8 @@ use proc_macro2::{Span, TokenStream, TokenTree};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::Result;
 use crate::util::{collect_files, relative};
+use crate::Result;
 
 const ADAPTER_BUCKET: &str = "adapter mechanism language";
 const WAIT_BUCKET: &str = "wait readiness raw language";
@@ -1647,7 +1647,7 @@ fn is_ident_byte(byte: Option<u8>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RCU_SCAN_ROOTS, enforce_rcu_ratchets, lint_api_language_text};
+    use super::{enforce_rcu_ratchets, lint_api_language_text, RCU_SCAN_ROOTS};
 
     #[test]
     fn api_language_flags_adapter_mechanism_terms() {
@@ -1737,11 +1737,9 @@ fn arm(source_id: WaitSourceId, mask: InterestMask) -> WaitToken {
             "struct ReactorLocals { harts: [AtomicPtr<HartLocal>; 8] }",
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| finding.term != "AtomicPtr-publication-root")
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.term != "AtomicPtr-publication-root"));
         assert!(enforce_rcu_ratchets(&findings).is_ok());
     }
 
@@ -1868,11 +1866,9 @@ fn recipes(owner: &RecipeIndex) -> &Snapshot<RecipeTree> {
 "#,
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| finding.bucket != "publication backend leakage")
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.bucket != "publication backend leakage"));
         assert!(enforce_rcu_ratchets(&findings).is_ok());
     }
 
@@ -1976,11 +1972,9 @@ macro_rules! expose {
 "#,
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.bucket == "publication backend leakage")
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.bucket == "publication backend leakage"));
         assert!(findings.iter().any(|finding| {
             finding.bucket == "raw rcu backend language" && finding.term == "retire_raw-import"
         }));
@@ -1994,11 +1988,9 @@ macro_rules! expose {
             "expose!(tx_substrate);\nexpose!(tx_substrate::epoch);",
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.bucket == "publication backend leakage")
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.bucket == "publication backend leakage"));
         assert!(findings.iter().any(|finding| {
             finding.bucket == "raw rcu backend language" && finding.term == "retire_raw-import"
         }));
@@ -2092,11 +2084,9 @@ impl SnapshotOwner for Owner { type Snapshot = Published<RecipeTree>; }
 "#,
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| finding.bucket != "publication backend leakage")
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.bucket != "publication backend leakage"));
     }
 
     #[test]
@@ -2149,11 +2139,9 @@ impl SnapshotOwner for Owner { type Snapshot = Published<RecipeTree>; }
             "assert_eq!(status, SubmitChildThreadStatus::Published);",
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| finding.bucket != "publication backend leakage")
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.bucket != "publication backend leakage"));
     }
 
     #[test]
@@ -2241,11 +2229,9 @@ pub use tx_substrate::publication::{
             "pub use tx_substrate::publication::{self as backend};",
         ] {
             let findings = lint_api_language_text("crates/tx-subsystems/src/vm/mod.rs", source);
-            assert!(
-                findings
-                    .iter()
-                    .any(|finding| finding.bucket == "publication backend leakage")
-            );
+            assert!(findings
+                .iter()
+                .any(|finding| finding.bucket == "publication backend leakage"));
             assert!(enforce_rcu_ratchets(&findings).is_err());
         }
     }
@@ -2258,11 +2244,9 @@ pub use tx_substrate::publication::{
             "pub use tx_substrate::*;",
         ] {
             let findings = lint_api_language_text("crates/tx-subsystems/src/vm/mod.rs", source);
-            assert!(
-                findings
-                    .iter()
-                    .any(|finding| finding.bucket == "publication backend leakage")
-            );
+            assert!(findings
+                .iter()
+                .any(|finding| finding.bucket == "publication backend leakage"));
             assert!(findings.iter().any(|finding| {
                 finding.bucket == "raw rcu backend language" && finding.term == "retire_raw-import"
             }));
@@ -2496,11 +2480,9 @@ pub enum SubmitChildThreadStatus {
 "#,
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| finding.bucket != "publication backend leakage")
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.bucket != "publication backend leakage"));
     }
 
     #[test]

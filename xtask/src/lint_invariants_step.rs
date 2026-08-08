@@ -8,8 +8,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::Result;
 use crate::util::{collect_files, relative};
+use crate::Result;
 
 /// Ratchet ceiling: number of step functions missing one or more stage comments.
 /// Will be set to measured baseline after first run.

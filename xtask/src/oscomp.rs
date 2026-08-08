@@ -5,13 +5,13 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::Result;
 use crate::image::ensure_test_initramfs;
 use crate::target::TxTarget;
 use crate::util::{
     command_exists, copy_dir_contents, option_value, optional_option_value, resolve_path,
     run_cmd_owned_in, shell_join,
 };
+use crate::Result;
 
 pub(crate) const OSCOMP_AUTOTEST: &str = "external/oscomp-autotest";
 const OSCOMP_DOCKER_IMAGE: &str = "zhouzhouyi/os-contest:20260104";
@@ -802,15 +802,13 @@ mod tests {
         assert_eq!(wait.timeout, std::time::Duration::from_secs(60));
 
         assert!(oscomp_evidence_wait(&["--timeout-ms".to_string(), "1".to_string()]).is_err());
-        assert!(
-            oscomp_evidence_wait(&[
-                "--expect-marker".to_string(),
-                "case-end".to_string(),
-                "--timeout-ms".to_string(),
-                "0".to_string()
-            ])
-            .is_err()
-        );
+        assert!(oscomp_evidence_wait(&[
+            "--expect-marker".to_string(),
+            "case-end".to_string(),
+            "--timeout-ms".to_string(),
+            "0".to_string()
+        ])
+        .is_err());
     }
 }
 

@@ -255,7 +255,7 @@ impl ArtifactManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        CrashCuts, E2fsckImageResult, E2fsckSummary, XfstestsSummary, gates_from_evidence,
+        gates_from_evidence, CrashCuts, E2fsckImageResult, E2fsckSummary, XfstestsSummary,
     };
 
     #[test]

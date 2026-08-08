@@ -8,9 +8,9 @@ use addr2line::Loader;
 use gimli::RunTimeEndian;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
 
-use crate::Result;
 use crate::target::TxTarget;
 use crate::util::{optional_option_value, resolve_path};
+use crate::Result;
 
 static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -26,10 +26,18 @@ fn color_enabled() -> bool {
     COLOR_ENABLED.load(Ordering::Relaxed)
 }
 fn col(code: &'static str) -> &'static str {
-    if color_enabled() { code } else { "" }
+    if color_enabled() {
+        code
+    } else {
+        ""
+    }
 }
 fn col_reset() -> &'static str {
-    if color_enabled() { ANSI_RESET } else { "" }
+    if color_enabled() {
+        ANSI_RESET
+    } else {
+        ""
+    }
 }
 
 const RV64_KERNEL_WINDOW_SIZE: u64 = 512 * 1024 * 1024;
@@ -273,7 +281,11 @@ struct SstatusInfo {
 
 impl SstatusInfo {
     fn spp_label(&self) -> &'static str {
-        if self.spp { "S" } else { "U" }
+        if self.spp {
+            "S"
+        } else {
+            "U"
+        }
     }
 
     fn fs_label(&self) -> &'static str {
@@ -2343,7 +2355,7 @@ fn build_json_trap(
     image: &ElfImage,
     spec: &TargetSpec,
 ) -> serde_json::Value {
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     let scause = decode_scause(trap.scause);
     let sepc_analysis = image.analyze_address(trap.sepc, spec);
@@ -2791,16 +2803,12 @@ trapframe:
             },
             &spec,
         );
-        assert!(
-            suspicious
-                .iter()
-                .any(|candidate| candidate.label == "low 32 bits")
-        );
-        assert!(
-            suspicious
-                .iter()
-                .any(|candidate| candidate.label == "Sv39 canonical-like form")
-        );
+        assert!(suspicious
+            .iter()
+            .any(|candidate| candidate.label == "low 32 bits"));
+        assert!(suspicious
+            .iter()
+            .any(|candidate| candidate.label == "Sv39 canonical-like form"));
     }
 
     #[test]
@@ -2982,13 +2990,11 @@ panicked at 'index out of bounds: len=3 idx=5', kernel/src/foo.rs:42:8\n\
 scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
         let traps = parse_traps(serial_close);
         assert_eq!(traps.len(), 1);
-        assert!(
-            traps[0]
-                .panic_msg
-                .as_deref()
-                .unwrap()
-                .contains("index out of bounds")
-        );
+        assert!(traps[0]
+            .panic_msg
+            .as_deref()
+            .unwrap()
+            .contains("index out of bounds"));
 
         let mut serial_far = String::from("panicked at 'something', kernel/src/bar.rs:10:1\n");
         for i in 0..31 {

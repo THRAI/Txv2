@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::Result;
-use crate::target::{TxTarget, installed_targets, target_triple};
+use crate::target::{installed_targets, target_triple, TxTarget};
 use crate::util::{collect_files, relative, shell_join};
+use crate::Result;
 
 const MAX_AUTHORED_RUST_FILE_LINES: usize = 1_800;
 const AUTHORED_RUST_FILE_LINE_BASELINES: &[(&str, usize)] = &[
@@ -1179,11 +1179,9 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "#[cfg(target_arch = \"riscv64\")] fn bad() {}",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("must not cfg on target_arch"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("must not cfg on target_arch")));
     }
 
     #[test]
@@ -1193,11 +1191,9 @@ mod tests {
             "crates/tx-subsystems/src/foo.rs",
             "#[allow(dead_code)]\nstruct Stale;",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("dead-code allowances hide stale"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("dead-code allowances hide stale")));
     }
 
     #[test]
@@ -1217,11 +1213,9 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "struct HalManager;",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("runtime HAL vocabulary"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("runtime HAL vocabulary")));
     }
 
     #[test]
@@ -1231,11 +1225,9 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "pub fn kernel_main(cpu_id: CpuId, firmware_arg: BootArg) -> ! { loop {} }",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("must consume BootHandoff"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("must consume BootHandoff")));
     }
 
     #[test]
@@ -1245,11 +1237,9 @@ mod tests {
             "crates/tx-subsystems/src/sync.rs",
             "pub(crate) struct SpinMutex<T> { locked: AtomicBool, value: UnsafeCell<T> }",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("private SpinMutex implementation"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("private SpinMutex implementation")));
     }
 
     #[test]
@@ -1259,11 +1249,9 @@ mod tests {
             "crates/tx-subsystems/src/process/adapter.rs",
             "pub use tx_substrate::{AtomicSlot, SpinMutex};",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("raw tx_substrate::SpinMutex"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("raw tx_substrate::SpinMutex")));
     }
 
     #[test]
@@ -1283,11 +1271,9 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "type Bad = Zone<Foo, EbrPolicy>;",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("raw Zone<T, Policy>"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("raw Zone<T, Policy>")));
     }
 
     #[test]
@@ -1307,11 +1293,9 @@ mod tests {
             "crates/tx-kernel/src/lib.rs",
             "use tx_hal_riscv64_qemu_virt::Platform;",
         );
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("concrete RV64 platform"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("concrete RV64 platform")));
     }
 
     #[test]
@@ -1354,11 +1338,9 @@ fn sym() -> usize {
 "#,
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("boot-static capture"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("boot-static capture")));
     }
 
     #[test]
@@ -1369,11 +1351,9 @@ fn sym() -> usize {
             "#[allow(dead_code)]\nfn stale_boot_helper() {}",
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("unused/dead-code allowances"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("unused/dead-code allowances")));
     }
 
     #[test]
@@ -1384,11 +1364,9 @@ fn sym() -> usize {
             "pub struct SessionPgrp { pub session_leader: Cap<ProcessIdentity> }",
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("TTY-CTL-1 violation"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("TTY-CTL-1 violation")));
     }
 
     #[test]
@@ -1399,11 +1377,9 @@ fn sym() -> usize {
             "pub session: Option<Weak<Session>>,\npub foreground_pgrp: Option<Weak<ProcessGroup>>,",
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| !finding.contains("TTY-CTL-1"))
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.contains("TTY-CTL-1")));
     }
 
     #[test]
@@ -1414,11 +1390,9 @@ fn sym() -> usize {
             "pub struct Session { pub foreground_pgrp: AtomicSlot<Option<Weak<ProcessGroup>>> }",
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("TTY-CTL-1a violation"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("TTY-CTL-1a violation")));
     }
 
     #[test]
@@ -1432,11 +1406,9 @@ fn sym() -> usize {
             "pub fn foreground_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> { None }",
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| !finding.contains("TTY-CTL-1a"))
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.contains("TTY-CTL-1a")));
     }
 
     #[test]
@@ -1447,11 +1419,9 @@ fn sym() -> usize {
             "/// The `foreground_pgrp:` field on TtyIdentity.SessionPgrp is the home.",
         );
 
-        assert!(
-            findings
-                .iter()
-                .all(|finding| !finding.contains("TTY-CTL-1a"))
-        );
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.contains("TTY-CTL-1a")));
     }
 
     #[test]
@@ -1467,11 +1437,9 @@ fn bad<P: tx_hal::TxPlatform>() -> bool {
 "#,
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("boot cmdline parsing"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("boot cmdline parsing")));
     }
 
     #[test]
@@ -1502,11 +1470,9 @@ fn bad() {
 "#,
         );
 
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.contains("user-space boot setup"))
-        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("user-space boot setup")));
     }
 
     #[test]

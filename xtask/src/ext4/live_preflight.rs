@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{
-    CrashCutCampaignPlan, CrashCutFamily, Tier1Authorities, XFSTESTS_DOCKER_IMAGE_ENV,
-    XfstestsSourceLock, resolve_repo_path, run_workspace, verify_xfstests_source_lock,
-    xfstests_docker_preflight_command, xfstests_execution_backend_for_host,
+    resolve_repo_path, run_workspace, verify_xfstests_source_lock,
+    xfstests_docker_preflight_command, xfstests_execution_backend_for_host, CrashCutCampaignPlan,
+    CrashCutFamily, Tier1Authorities, XfstestsSourceLock, XFSTESTS_DOCKER_IMAGE_ENV,
 };
-use crate::Result;
 use crate::image;
 use crate::target::TxTarget;
 use crate::util::{command_exists, command_or_candidates, run_cmd_owned_in};
+use crate::Result;
 
 const XFSTESTS_SOURCE_URL: &str = "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git";
 const DEFAULT_TIER1_EXT4_IMAGE_BYTES: u64 = 64 * 1024 * 1024;

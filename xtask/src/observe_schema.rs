@@ -4,8 +4,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::Result;
 use crate::util::{optional_option_value, resolve_path};
+use crate::Result;
 
 pub(crate) fn observe_schema(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(subcmd) = args.first() else {

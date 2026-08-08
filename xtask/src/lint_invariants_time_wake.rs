@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::Result;
 use crate::util::{collect_files, relative};
+use crate::Result;
 
 const MAX_TIME_WAKE_RETIRED_SITES: usize = 0;
 const STRICT_ACTIVE_RUST_RESIDUE_ROOTS: &[&str] = &["crates", "boards"];
@@ -926,14 +926,10 @@ mod tests {
     fn path_ident_matches_exact_segment_only() {
         assert!(path_ident("SignalFd::", "notify").matches("SignalFd::notify(fd);"));
         assert!(!path_ident("SignalFd::", "notify").matches("SignalFd::notify_with_post(fd);"));
-        assert!(
-            path_ident("notification::", "notify_changed")
-                .matches("notification::notify_changed(&sem);")
-        );
-        assert!(
-            !path_ident("notification::", "notify_changed")
-                .matches("notification::notify_changed_with_post(&sem, post);")
-        );
+        assert!(path_ident("notification::", "notify_changed")
+            .matches("notification::notify_changed(&sem);"));
+        assert!(!path_ident("notification::", "notify_changed")
+            .matches("notification::notify_changed_with_post(&sem, post);"));
     }
 
     #[test]
@@ -951,32 +947,20 @@ mod tests {
         assert!(!ident("post_signal").matches("post_signal_with_post(thread, sig, post);"));
         assert!(!ident("notify_v3_source").matches("notify_v3_source_with_post(source, post);"));
         assert!(ident("notify_child_zombified").matches("notify_child_zombified(&parent);"));
-        assert!(
-            !ident("notify_child_zombified")
-                .matches("notify_child_zombified_with_post(&parent, post);")
-        );
+        assert!(!ident("notify_child_zombified")
+            .matches("notify_child_zombified_with_post(&parent, post);"));
         assert!(ident("step_exit_group").matches("step_exit_group(&proc, status);"));
-        assert!(
-            !ident("step_exit_group")
-                .matches("step_exit_group_with_posts(&proc, status, post, source_post);")
-        );
-        assert!(
-            ident("step_exit_group_with_signal")
-                .matches("step_exit_group_with_signal(&proc, sig);")
-        );
-        assert!(
-            !ident("step_exit_group_with_signal")
-                .matches("step_exit_group_with_signal_with_posts(&proc, sig, post, source_post);")
-        );
+        assert!(!ident("step_exit_group")
+            .matches("step_exit_group_with_posts(&proc, status, post, source_post);"));
+        assert!(ident("step_exit_group_with_signal")
+            .matches("step_exit_group_with_signal(&proc, sig);"));
+        assert!(!ident("step_exit_group_with_signal")
+            .matches("step_exit_group_with_signal_with_posts(&proc, sig, post, source_post);"));
         assert!(ident("step_kill_process").matches("step_kill_process(&proc, sig, None);"));
-        assert!(
-            !ident("step_kill_process")
-                .matches("step_kill_process_with_post(&proc, sig, None, post);")
-        );
-        assert!(
-            !ident("step_kill_process")
-                .matches("step_kill_process_with_posts(&proc, sig, None, post, source_post);")
-        );
+        assert!(!ident("step_kill_process")
+            .matches("step_kill_process_with_post(&proc, sig, None, post);"));
+        assert!(!ident("step_kill_process")
+            .matches("step_kill_process_with_posts(&proc, sig, None, post, source_post);"));
         assert!(ident("step_kill_pgrp").matches("step_kill_pgrp(&pgrp, sig);"));
         assert!(!ident("step_kill_pgrp").matches("step_kill_pgrp_with_post(&pgrp, sig, post);"));
         assert!(ident("KillPgrpOp").matches("let mut op = KillPgrpOp { pgrp, sig };"));
@@ -984,45 +968,27 @@ mod tests {
             !ident("KillPgrpOp").matches("let mut op = KillPgrpWithPostOp { pgrp, sig, post };")
         );
         assert!(ident("deliver_posix_signal").matches("deliver_posix_signal(target, sig);"));
-        assert!(
-            !ident("deliver_posix_signal")
-                .matches("deliver_posix_signal_with_post(target, sig, post);")
-        );
+        assert!(!ident("deliver_posix_signal")
+            .matches("deliver_posix_signal_with_post(target, sig, post);"));
         assert!(ident("DeliverSignalOp").matches("let mut op = DeliverSignalOp { target, sig };"));
-        assert!(
-            !ident("DeliverSignalOp")
-                .matches("let mut op = DeliverSignalWithPostOp { target, sig, post };")
-        );
+        assert!(!ident("DeliverSignalOp")
+            .matches("let mut op = DeliverSignalWithPostOp { target, sig, post };"));
         assert!(ident("route_gewalt").matches("route_gewalt(&proc, sig);"));
         assert!(!ident("route_gewalt").matches("route_gewalt_with_post(&proc, sig, post);"));
-        assert!(
-            ident("fire_due_delegate_timeouts")
-                .matches("wheel.fire_due_delegate_timeouts(now, registry);")
-        );
-        assert!(
-            ident("net_delegate_direct_mailbox_post")
-                .matches("net_delegate_kick_poll_with_post(net_delegate_direct_mailbox_post);")
-        );
-        assert!(
-            ident("direct_mailbox_post")
-                .matches("socket.fire_recv_with_post(set, direct_mailbox_post);")
-        );
-        assert!(
-            !ident("direct_mailbox_post")
-                .matches("socket.fire_recv_with_post(set, |mailbox, event| mailbox.post(event));")
-        );
-        assert!(
-            ident("step_process_device_tx_pending")
-                .matches("step_process_device_tx_pending(sink, budget, guard);")
-        );
-        assert!(
-            !ident("step_process_device_tx_pending")
-                .matches("step_process_device_tx_pending_with_post(sink, budget, guard, post);")
-        );
-        assert!(
-            ident("step_process_device_tx_pending_at")
-                .matches("step_process_device_tx_pending_at(sink, now, budget, guard);")
-        );
+        assert!(ident("fire_due_delegate_timeouts")
+            .matches("wheel.fire_due_delegate_timeouts(now, registry);"));
+        assert!(ident("net_delegate_direct_mailbox_post")
+            .matches("net_delegate_kick_poll_with_post(net_delegate_direct_mailbox_post);"));
+        assert!(ident("direct_mailbox_post")
+            .matches("socket.fire_recv_with_post(set, direct_mailbox_post);"));
+        assert!(!ident("direct_mailbox_post")
+            .matches("socket.fire_recv_with_post(set, |mailbox, event| mailbox.post(event));"));
+        assert!(ident("step_process_device_tx_pending")
+            .matches("step_process_device_tx_pending(sink, budget, guard);"));
+        assert!(!ident("step_process_device_tx_pending")
+            .matches("step_process_device_tx_pending_with_post(sink, budget, guard, post);"));
+        assert!(ident("step_process_device_tx_pending_at")
+            .matches("step_process_device_tx_pending_at(sink, now, budget, guard);"));
         assert!(!ident("step_process_device_tx_pending_at").matches(
             "step_process_device_tx_pending_at_with_post(sink, now, budget, guard, post);"
         ));
@@ -1035,44 +1001,28 @@ mod tests {
             "step_process_device_tx_pending_in_namespace_at_with_post(sink, ns, now, budget, guard, post);"
         ));
         assert!(ident("netlink_route_send").matches("netlink_route_send(socket, bytes, cred);"));
-        assert!(
-            !ident("netlink_route_send")
-                .matches("netlink_route_send_with_post(socket, bytes, cred, post);")
-        );
-        assert!(
-            ident("netlink_route_send_with_netns_resolvers")
-                .matches("netlink_route_send_with_netns_resolvers(socket, bytes, cred, fd, pid);")
-        );
+        assert!(!ident("netlink_route_send")
+            .matches("netlink_route_send_with_post(socket, bytes, cred, post);"));
+        assert!(ident("netlink_route_send_with_netns_resolvers")
+            .matches("netlink_route_send_with_netns_resolvers(socket, bytes, cred, fd, pid);"));
         assert!(!ident("netlink_route_send_with_netns_resolvers").matches(
             "netlink_route_send_with_netns_resolvers_and_post(socket, bytes, cred, fd, pid, post);"
         ));
-        assert!(
-            !ident("netlink_netfilter_send")
-                .matches("netlink_netfilter_send_with_post(socket, bytes, cred, post);")
-        );
-        assert!(
-            !ident("netlink_xfrm_send")
-                .matches("netlink_xfrm_send_with_post(socket, bytes, cred, post);")
-        );
-        assert!(
-            ident("step_process_loopback_udp")
-                .matches("step_process_loopback_udp(&socket, 8, guard);")
-        );
-        assert!(
-            !ident("step_process_loopback_udp")
-                .matches("step_process_loopback_udp_with_post(&socket, 8, guard, post);")
-        );
-        assert!(
-            ident("step_process_loopback_udp_on_iface")
-                .matches("step_process_loopback_udp_on_iface(&socket, 8, iface, guard);")
-        );
+        assert!(!ident("netlink_netfilter_send")
+            .matches("netlink_netfilter_send_with_post(socket, bytes, cred, post);"));
+        assert!(!ident("netlink_xfrm_send")
+            .matches("netlink_xfrm_send_with_post(socket, bytes, cred, post);"));
+        assert!(ident("step_process_loopback_udp")
+            .matches("step_process_loopback_udp(&socket, 8, guard);"));
+        assert!(!ident("step_process_loopback_udp")
+            .matches("step_process_loopback_udp_with_post(&socket, 8, guard, post);"));
+        assert!(ident("step_process_loopback_udp_on_iface")
+            .matches("step_process_loopback_udp_on_iface(&socket, 8, iface, guard);"));
         assert!(!ident("step_process_loopback_udp_on_iface").matches(
             "step_process_loopback_udp_on_iface_with_post(&socket, 8, iface, guard, post);"
         ));
-        assert!(
-            ident("step_send_udp_loopback_kernel_bytes")
-                .matches("step_send_udp_loopback_kernel_bytes(&socket, dst, bytes, flags, guard);")
-        );
+        assert!(ident("step_send_udp_loopback_kernel_bytes")
+            .matches("step_send_udp_loopback_kernel_bytes(&socket, dst, bytes, flags, guard);"));
         assert!(!ident("step_send_udp_loopback_kernel_bytes").matches(
             "step_send_udp_loopback_kernel_bytes_with_post(&socket, dst, bytes, flags, guard, post);"
         ));
@@ -1082,25 +1032,17 @@ mod tests {
         assert!(!ident("step_send_udp_loopback_kernel_bytes_on_iface").matches(
             "step_send_udp_loopback_kernel_bytes_on_iface_with_post(&socket, dst, bytes, flags, iface, guard, post);"
         ));
-        assert!(
-            ident("step_process_loopback_icmp")
-                .matches("step_process_loopback_icmp(&socket, 8, guard);")
-        );
-        assert!(
-            !ident("step_process_loopback_icmp")
-                .matches("step_process_loopback_icmp_with_post(&socket, 8, guard, post);")
-        );
-        assert!(
-            ident("step_process_loopback_icmp_on_iface")
-                .matches("step_process_loopback_icmp_on_iface(&socket, 8, iface, guard);")
-        );
+        assert!(ident("step_process_loopback_icmp")
+            .matches("step_process_loopback_icmp(&socket, 8, guard);"));
+        assert!(!ident("step_process_loopback_icmp")
+            .matches("step_process_loopback_icmp_with_post(&socket, 8, guard, post);"));
+        assert!(ident("step_process_loopback_icmp_on_iface")
+            .matches("step_process_loopback_icmp_on_iface(&socket, 8, iface, guard);"));
         assert!(!ident("step_process_loopback_icmp_on_iface").matches(
             "step_process_loopback_icmp_on_iface_with_post(&socket, 8, iface, guard, post);"
         ));
-        assert!(
-            function_def("mark_replied")
-                .matches("pub fn mark_replied(&self, id, reply) -> TransitionOutcome {")
-        );
+        assert!(function_def("mark_replied")
+            .matches("pub fn mark_replied(&self, id, reply) -> TransitionOutcome {"));
         assert!(!function_def("mark_replied").matches(
             "pub fn mark_replied_with_post<F>(&self, id, reply, post) -> TransitionOutcome {"
         ));
@@ -1109,44 +1051,29 @@ mod tests {
             !method_call("mark_timed_out").matches("registry.mark_timed_out_with_post(id, post);")
         );
         assert!(method_call("mark_endpoint_died").matches("registry.mark_endpoint_died(marker);"));
-        assert!(
-            !method_call("mark_endpoint_died")
-                .matches("registry.mark_endpoint_died_with_post(marker, post);")
-        );
+        assert!(!method_call("mark_endpoint_died")
+            .matches("registry.mark_endpoint_died_with_post(marker, post);"));
         assert!(ident("mark_replied").matches("// mark_replied old direct transition"));
-        assert!(
-            !ident("mark_replied").matches("registry.mark_replied_with_post(id, reply, post);")
-        );
+        assert!(!ident("mark_replied").matches("registry.mark_replied_with_post(id, reply, post);"));
         assert!(ident("mark_canceled").matches("// mark_canceled old direct transition"));
         assert!(!ident("mark_canceled").matches("registry.mark_canceled_with_post(id, post);"));
         assert!(ident("mark_agent_died").matches("// mark_agent_died old direct transition"));
         assert!(!ident("mark_agent_died").matches("registry.mark_agent_died_with_post(id, post);"));
         assert!(ident("timerfd_clock_was_set").matches("timerfd_clock_was_set(2);"));
-        assert!(
-            !ident("timerfd_clock_was_set").matches(
-                "timerfd_clock_was_set_with_post(2, |mailbox, event| mailbox.post(event));"
-            )
-        );
+        assert!(!ident("timerfd_clock_was_set")
+            .matches("timerfd_clock_was_set_with_post(2, |mailbox, event| mailbox.post(event));"));
         assert!(ident("timerfd_settime_with_flags").matches("timerfd_settime_with_flags(tfd);"));
-        assert!(
-            !ident("timerfd_settime_with_flags")
-                .matches("timerfd_settime_with_flags_and_post(tfd, post);")
-        );
+        assert!(!ident("timerfd_settime_with_flags")
+            .matches("timerfd_settime_with_flags_and_post(tfd, post);"));
         assert!(contains("pub fn realtime_now_ns").matches("pub fn realtime_now_ns<P>() -> u64"));
         assert!(!contains("pub fn realtime_now_ns").matches("fn realtime_now_ns<P>() -> u64"));
-        assert!(
-            !contains("pub fn realtime_now_ns").matches("fn realtime_now_ns<P>(&self) -> u64;")
-        );
+        assert!(!contains("pub fn realtime_now_ns").matches("fn realtime_now_ns<P>(&self) -> u64;"));
         assert!(ident("step_eventfd_read").matches("step_eventfd_read(efd, buf, false);"));
-        assert!(
-            !ident("step_eventfd_read")
-                .matches("step_eventfd_read_with_post(efd, buf, false, post);")
-        );
+        assert!(!ident("step_eventfd_read")
+            .matches("step_eventfd_read_with_post(efd, buf, false, post);"));
         assert!(ident("step_eventfd_write").matches("step_eventfd_write(efd, 1, false);"));
-        assert!(
-            !ident("step_eventfd_write")
-                .matches("step_eventfd_write_with_post(efd, 1, false, post);")
-        );
+        assert!(!ident("step_eventfd_write")
+            .matches("step_eventfd_write_with_post(efd, 1, false, post);"));
         assert!(function_def("step_read").matches("pub fn step_read(payload: &PipePayload) {}"));
         assert!(
             !function_def("step_read").matches("pub fn step_read_with_post<F>(payload, post) {}")
@@ -1159,45 +1086,28 @@ mod tests {
         assert!(!ident("ReadOp").matches("let mut op = ReadWithPostOp { payload, post };"));
         assert!(ident("WriteOp").matches("let mut op = WriteOp { payload };"));
         assert!(!ident("WriteOp").matches("let mut op = WriteWithPostOp { payload, post };"));
-        assert!(
-            contains("crate::pipe::step_read(")
-                .matches("crate::pipe::step_read(payload, out, guard, false);")
-        );
-        assert!(
-            !contains("crate::pipe::step_read(")
-                .matches("crate::pipe::step_read_with_post(payload, out, guard, false, post);")
-        );
-        assert!(
-            contains("crate::pipe::step_write(")
-                .matches("crate::pipe::step_write(payload, bytes, guard, false, false);")
-        );
+        assert!(contains("crate::pipe::step_read(")
+            .matches("crate::pipe::step_read(payload, out, guard, false);"));
+        assert!(!contains("crate::pipe::step_read(")
+            .matches("crate::pipe::step_read_with_post(payload, out, guard, false, post);"));
+        assert!(contains("crate::pipe::step_write(")
+            .matches("crate::pipe::step_write(payload, bytes, guard, false, false);"));
         assert!(!contains("crate::pipe::step_write(").matches(
             "crate::pipe::step_write_with_post(payload, bytes, guard, false, false, post);"
         ));
         assert!(function_def("push_fault_msg").matches("pub fn push_fault_msg(&self, msg) {}"));
-        assert!(
-            !function_def("push_fault_msg")
-                .matches("pub fn push_fault_msg_with_post<F>(&self, msg, post) {}")
-        );
+        assert!(!function_def("push_fault_msg")
+            .matches("pub fn push_fault_msg_with_post<F>(&self, msg, post) {}"));
         assert!(method_call("push_fault_msg").matches("ufd.push_fault_msg(msg);"));
         assert!(!method_call("push_fault_msg").matches("ufd.push_fault_msg_with_post(msg, post);"));
-        assert!(
-            function_def("fault_script_for_process")
-                .matches("pub async fn fault_script_for_process(&self, fault) {}")
-        );
-        assert!(
-            !function_def("fault_script_for_process")
-                .matches("pub async fn fault_script_for_process_with_post(&self, fault, post) {}")
-        );
-        assert!(
-            method_call("fault_script_for_process")
-                .matches("aspace.fault_script_for_process(fault, process, mailbox);")
-        );
-        assert!(
-            !method_call("fault_script_for_process").matches(
-                "aspace.fault_script_for_process_with_post(fault, process, mailbox, post);"
-            )
-        );
+        assert!(function_def("fault_script_for_process")
+            .matches("pub async fn fault_script_for_process(&self, fault) {}"));
+        assert!(!function_def("fault_script_for_process")
+            .matches("pub async fn fault_script_for_process_with_post(&self, fault, post) {}"));
+        assert!(method_call("fault_script_for_process")
+            .matches("aspace.fault_script_for_process(fault, process, mailbox);"));
+        assert!(!method_call("fault_script_for_process")
+            .matches("aspace.fault_script_for_process_with_post(fault, process, mailbox, post);"));
         assert!(ident("fire_read_wait").matches("rnode.fire_read_wait(VFS_READABLE);"));
         assert!(!ident("fire_read_wait").matches("rnode.fire_read_wait_with_post(mask, post);"));
         assert!(ident("fire_write_wait").matches("rnode.fire_write_wait(VFS_WRITABLE);"));
@@ -1211,83 +1121,55 @@ mod tests {
             !ident("step_mq_receive").matches("step_mq_receive_with_post(mq, len, cred, post);")
         );
         assert!(ident("step_msgsnd").matches("step_msgsnd(msqid, ty, msg, flags, cred);"));
-        assert!(
-            !ident("step_msgsnd")
-                .matches("step_msgsnd_with_post(msqid, ty, msg, flags, cred, post);")
-        );
+        assert!(!ident("step_msgsnd")
+            .matches("step_msgsnd_with_post(msqid, ty, msg, flags, cred, post);"));
         assert!(ident("step_msgrcv").matches("step_msgrcv(msqid, len, typ, flags, cred);"));
-        assert!(
-            !ident("step_msgrcv")
-                .matches("step_msgrcv_with_post(msqid, len, typ, flags, cred, post);")
-        );
+        assert!(!ident("step_msgrcv")
+            .matches("step_msgrcv_with_post(msqid, len, typ, flags, cred, post);"));
         assert!(ident("step_msgsnd_v3").matches("step_msgsnd_v3(msqid, ty, msg, flags, cred);"));
-        assert!(
-            !ident("step_msgsnd_v3")
-                .matches("step_msgsnd_v3_with_post(msqid, ty, msg, flags, cred, post);")
-        );
+        assert!(!ident("step_msgsnd_v3")
+            .matches("step_msgsnd_v3_with_post(msqid, ty, msg, flags, cred, post);"));
         assert!(ident("step_msgrcv_v3").matches("step_msgrcv_v3(msqid, len, typ, flags, cred);"));
-        assert!(
-            !ident("step_msgrcv_v3")
-                .matches("step_msgrcv_v3_with_post(msqid, len, typ, flags, cred, post);")
-        );
+        assert!(!ident("step_msgrcv_v3")
+            .matches("step_msgrcv_v3_with_post(msqid, len, typ, flags, cred, post);"));
         assert!(ident("step_msgctl").matches("step_msgctl(msqid, IPC_RMID, None, cred);"));
-        assert!(
-            !ident("step_msgctl")
-                .matches("step_msgctl_with_post(msqid, IPC_RMID, None, cred, post);")
-        );
-        assert!(
-            ident("step_msgctl_in_ns")
-                .matches("step_msgctl_in_ns(msqid, IPC_RMID, None, cred, ns);")
-        );
-        assert!(
-            !ident("step_msgctl_in_ns")
-                .matches("step_msgctl_in_ns_with_post(msqid, IPC_RMID, None, cred, ns, post);")
-        );
+        assert!(!ident("step_msgctl")
+            .matches("step_msgctl_with_post(msqid, IPC_RMID, None, cred, post);"));
+        assert!(ident("step_msgctl_in_ns")
+            .matches("step_msgctl_in_ns(msqid, IPC_RMID, None, cred, ns);"));
+        assert!(!ident("step_msgctl_in_ns")
+            .matches("step_msgctl_in_ns_with_post(msqid, IPC_RMID, None, cred, ns, post);"));
         assert!(ident("step_semop").matches("step_semop(semid, sops, cred, process);"));
         assert!(
             !ident("step_semop").matches("step_semop_with_post(semid, sops, cred, process, post);")
         );
         assert!(ident("step_semop_v3").matches("step_semop_v3(semid, sops, cred, process);"));
-        assert!(
-            !ident("step_semop_v3")
-                .matches("step_semop_v3_with_post(semid, sops, cred, process, post);")
-        );
+        assert!(!ident("step_semop_v3")
+            .matches("step_semop_v3_with_post(semid, sops, cred, process, post);"));
         assert!(ident("step_semctl").matches("step_semctl(semid, semnum, cmd, arg, cred, None);"));
-        assert!(
-            !ident("step_semctl")
-                .matches("step_semctl_with_post(semid, semnum, cmd, arg, cred, None, post);")
-        );
-        assert!(
-            ident("step_semctl_in_ns")
-                .matches("step_semctl_in_ns(semid, semnum, cmd, arg, cred, ns, process);")
-        );
+        assert!(!ident("step_semctl")
+            .matches("step_semctl_with_post(semid, semnum, cmd, arg, cred, None, post);"));
+        assert!(ident("step_semctl_in_ns")
+            .matches("step_semctl_in_ns(semid, semnum, cmd, arg, cred, ns, process);"));
         assert!(!ident("step_semctl_in_ns").matches(
             "step_semctl_in_ns_with_post(semid, semnum, cmd, arg, cred, ns, process, post);"
         ));
         assert!(ident("step_sem_undo").matches("step_sem_undo(process);"));
         assert!(!ident("step_sem_undo").matches("step_sem_undo_with_post(process, post);"));
-        assert!(
-            function_def("step_ingest")
-                .matches("pub fn step_ingest(tty: &Cap<TtyIdentity>, bytes: &[u8]) {")
-        );
+        assert!(function_def("step_ingest")
+            .matches("pub fn step_ingest(tty: &Cap<TtyIdentity>, bytes: &[u8]) {"));
         assert!(contains("step_ingest(").matches("step_ingest(&tty, bytes, guard);"));
         assert!(
             !contains("step_ingest(").matches("step_ingest_with_post(&tty, bytes, guard, post);")
         );
         assert!(method_call("complete").matches("completion.complete();"));
-        assert!(
-            !method_call("complete")
-                .matches("completion.complete_with_post(|mailbox, event| mailbox.post(event));")
-        );
+        assert!(!method_call("complete")
+            .matches("completion.complete_with_post(|mailbox, event| mailbox.post(event));"));
         assert!(method_call("arrive").matches("countdown.arrive();"));
-        assert!(
-            !method_call("arrive")
-                .matches("countdown.arrive_with_post(|mailbox, event| mailbox.post(event));")
-        );
+        assert!(!method_call("arrive")
+            .matches("countdown.arrive_with_post(|mailbox, event| mailbox.post(event));"));
         assert!(method_call("ack").matches("rendezvous.ack(target);"));
-        assert!(
-            !method_call("ack")
-                .matches("rendezvous.ack_with_post(target, |mailbox, event| mailbox.post(event));")
-        );
+        assert!(!method_call("ack")
+            .matches("rendezvous.ack_with_post(target, |mailbox, event| mailbox.post(event));"));
     }
 }

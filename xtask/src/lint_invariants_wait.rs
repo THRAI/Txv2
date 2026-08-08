@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::Result;
 use crate::util::{collect_files, relative};
+use crate::Result;
 
 /// Ratchet ceiling: production references to the legacy wait-channel bridge.
 ///
@@ -272,7 +272,7 @@ fn should_skip_file(rel: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RetirementFinding, lint_channel_retirement_text};
+    use super::{lint_channel_retirement_text, RetirementFinding};
 
     #[test]
     fn channel_retirement_flags_channel_and_registry_terms() {

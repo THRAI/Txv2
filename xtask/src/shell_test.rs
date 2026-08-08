@@ -77,13 +77,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::Result;
 use crate::image::{alpine_initramfs_name, busybox_initramfs_name};
 use crate::target::{Profile, TxTarget};
 use crate::util::{
     append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
     resolve_path, validate_boot_mode_value,
 };
+use crate::Result;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONTROL_KEY_DELAY: Duration = Duration::from_millis(25);
@@ -233,39 +233,37 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let extra_rv64_ext4 = extra_rv64_ext4.clone();
                 let boot_mode = boot_mode.clone();
                 let append_cmdline = append_cmdline.clone();
-                thread::spawn(move || {
-                    loop {
-                        let idx = next.fetch_add(1, Ordering::Relaxed);
-                        if idx >= groups.len() {
-                            break;
-                        }
-                        let group = &groups[idx];
-                        let run = IsolatedGroupRun {
-                            root: &root,
-                            target,
-                            profile,
-                            smp,
-                            extra_rv64_ext4: &extra_rv64_ext4,
-                            boot_mode: boot_mode.as_deref(),
-                            append_cmdline: append_cmdline.as_deref(),
-                            setup: &setup,
-                            group,
-                        };
-                        let (captured, group_err) = run_group_isolated(&run);
-                        let result = match group_err {
-                            None => Ok(()),
-                            Some(err) => {
-                                println!(
-                                    "\n--- [{}] captured output ({} bytes) ---",
-                                    group.name,
-                                    captured.len()
-                                );
-                                println!("{captured}");
-                                Err(err)
-                            }
-                        };
-                        results.lock().unwrap().push((group.name.clone(), result));
+                thread::spawn(move || loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= groups.len() {
+                        break;
                     }
+                    let group = &groups[idx];
+                    let run = IsolatedGroupRun {
+                        root: &root,
+                        target,
+                        profile,
+                        smp,
+                        extra_rv64_ext4: &extra_rv64_ext4,
+                        boot_mode: boot_mode.as_deref(),
+                        append_cmdline: append_cmdline.as_deref(),
+                        setup: &setup,
+                        group,
+                    };
+                    let (captured, group_err) = run_group_isolated(&run);
+                    let result = match group_err {
+                        None => Ok(()),
+                        Some(err) => {
+                            println!(
+                                "\n--- [{}] captured output ({} bytes) ---",
+                                group.name,
+                                captured.len()
+                            );
+                            println!("{captured}");
+                            Err(err)
+                        }
+                    };
+                    results.lock().unwrap().push((group.name.clone(), result));
                 })
             })
             .collect();

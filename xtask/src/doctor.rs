@@ -1,12 +1,12 @@
 use std::env;
 use std::path::Path;
 
-use crate::Result;
 use crate::oscomp::OSCOMP_AUTOTEST;
 use crate::target::{
-    RV64_TARGET, TxTarget, installed_components, installed_targets, require_target, target_triple,
+    installed_components, installed_targets, require_target, target_triple, TxTarget, RV64_TARGET,
 };
 use crate::util::{check_version, command_exists};
+use crate::Result;
 
 pub(crate) fn doctor(root: &Path) -> Result<()> {
     println!("txKernel doctor");

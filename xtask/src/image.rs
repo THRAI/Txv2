@@ -5,12 +5,12 @@ use std::os::unix::fs::{self as unix_fs, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::Result;
 use crate::target::{Profile, TxTarget};
 use crate::util::{
     command_exists, command_or_candidates, option_value, optional_option_value, run_cmd_owned,
     run_shell, shell_escape,
 };
+use crate::Result;
 
 pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {

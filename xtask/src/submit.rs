@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::Result;
 use crate::util::{copy_dir_contents, optional_option_value, resolve_path};
+use crate::Result;
 
 pub(crate) fn submit(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {

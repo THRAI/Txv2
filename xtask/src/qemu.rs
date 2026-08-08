@@ -4,7 +4,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::Result;
 use crate::image::{
     alpine_initramfs_name, busybox_initramfs_name, busybox_root_ext4_name, test_initramfs_name,
 };
@@ -13,6 +12,7 @@ use crate::util::{
     append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
     resolve_path, shell_join, tail_lines, validate_boot_mode_value,
 };
+use crate::Result;
 
 const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -981,13 +981,11 @@ mod tests {
                 "/tmp/tx/target/qemu-rv64-qemu-smoke.serial.log",
             ]
         );
-        assert!(
-            fault_decode_args_for_serial(
-                TxTarget::La64Qemu,
-                Path::new("/tmp/tx/target/qemu-la64-qemu-smoke.serial.log"),
-            )
-            .is_none()
-        );
+        assert!(fault_decode_args_for_serial(
+            TxTarget::La64Qemu,
+            Path::new("/tmp/tx/target/qemu-la64-qemu-smoke.serial.log"),
+        )
+        .is_none());
     }
 
     #[test]

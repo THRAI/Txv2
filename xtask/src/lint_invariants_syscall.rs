@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::Result;
 use crate::util::{collect_files, relative};
+use crate::Result;
 
 // ---------------------------------------------------------------------------
 // Ratchet ceilings
