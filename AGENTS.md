@@ -116,3 +116,7 @@ tool assumptions.
 - User allows subagent/delegation in this repo, do not ask for confirmation before parallel agent worl.
 - Explorer should return conclusion and evidence table ONLY (claim | file:line | confidence), DO NOT return original output, long diff or irrevelent logs.
 - Main thread should use long timeout `wait_agent` for results. Do not read repo and files in main thread while waiting for agents. Syncthesize the results after explorers returned. Spot checwith key suspects.
+
+## Worktree Identity Checks
+
+- Do not calculate or fingerprint SHA values when comparing or recording worktrees. Use paths, branch names, file status, timestamps, and measured disk usage instead.
