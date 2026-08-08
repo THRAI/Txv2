@@ -284,10 +284,11 @@ kernel/net/sctp/sctp.ko\n";
         tx_hal::console_write_str::<P>(":kernel-config:ok\n");
     }
 
-    /// Seed minimal `/etc/{passwd,group}` (with a `nobody` entry) so libc
-    /// `getpwnam`/`getgrnam` resolve. Re-homed with the net subsystem; PR#50
-    /// dropped the identity-file seeding, so LTP cases that drop privileges to
-    /// `nobody` (e.g. bind02) TBROK with `getpwnam(nobody): ENOENT`.
+    /// Seed minimal `/etc/{passwd,group,nsswitch.conf}` (with a `nobody`
+    /// entry) so libc `getpwnam`/`getgrnam` resolve. Re-homed with the net
+    /// subsystem; PR#50 dropped the identity-file seeding, so LTP cases that
+    /// drop privileges to `nobody` (e.g. bind02) TBROK with
+    /// `getpwnam(nobody): ENOENT`.
     pub(crate) fn populate_rootfs_identity_files() {
         let root_mount = ROOT_MOUNT
             .lock()
@@ -321,8 +322,15 @@ kernel/net/sctp/sctp.ko\n";
         let passwd = b"root:x:0:0:root:/root:/bin/sh\n\
 nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
         let group = b"root:x:0:\ndaemon:x:2:\nusers:x:100:\nnogroup:x:65534:\nnobody:x:65534:\n";
+        let nsswitch = b"passwd: files\n\
+group: files\n\
+shadow: files\n\
+hosts: files dns\n\
+services: files\n\
+protocols: files\n";
         if !create_file_with_data(&create_ctx, etc_id, b"passwd", 0o644, passwd)
             || !create_file_with_data(&create_ctx, etc_id, b"group", 0o644, group)
+            || !create_file_with_data(&create_ctx, etc_id, b"nsswitch.conf", 0o644, nsswitch)
         {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":identity-files:err:create-etc-files\n");

@@ -64,6 +64,13 @@ setup_base_tree() {
         "users:x:100:" \
         "nogroup:x:65534:" \
         "nobody:x:65534:"
+    write_file /etc/nsswitch.conf 0644 \
+        "passwd: files" \
+        "group: files" \
+        "shadow: files" \
+        "hosts: files dns" \
+        "services: files" \
+        "protocols: files"
     write_file /etc/hosts 0666 \
         "127.0.0.1 localhost" \
         "::1 localhost ip6-localhost ip6-loopback"

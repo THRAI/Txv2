@@ -506,6 +506,8 @@ where
     // up in `tx_kernel::thread_future::run_thread` so the dispatch
     // signature stays free of `ConsoleIf + PowerIf` bounds that would
     // ripple into every test-stub platform.
+    let debug_nr = req.nr;
+    let debug_args = req.args;
     let l0_span = emit_syscall_enter(&req);
     let prev = tx_observe::set_current_parent_span(l0_span);
     // Deliver an expired ITIMER_REAL on the generic syscall boundary (Linux
@@ -514,9 +516,41 @@ where
     // (netperf UDP_STREAM/TCP_STREAM `send` bursts) never see SIGALRM and hang.
     time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
     let result = dispatch_inner::<P>(req, ctx).await;
+    maybe_log_efault_syscall::<P>(debug_nr, debug_args, &result);
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
     result
+}
+
+fn maybe_log_efault_syscall<P: tx_hal::ConsoleIf>(
+    nr: u64,
+    args: [u64; 6],
+    result: &SyscallResult,
+) {
+    if !cfg!(debug_assertions) || *result != SyscallResult::Error(EFAULT_VALUE) {
+        return;
+    }
+    tx_hal::console_write_str::<P>("txdbg:sys-efault nr=0x");
+    console_hex_u64::<P>(nr);
+    tx_hal::console_write_str::<P>(" a0=0x");
+    console_hex_u64::<P>(args[0]);
+    tx_hal::console_write_str::<P>(" a1=0x");
+    console_hex_u64::<P>(args[1]);
+    tx_hal::console_write_str::<P>(" a2=0x");
+    console_hex_u64::<P>(args[2]);
+    tx_hal::console_write_str::<P>("\n");
+}
+
+fn console_hex_u64<P: tx_hal::ConsoleIf>(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    for i in 0..16 {
+        let shift = (15 - i) * 4;
+        buf[i] = HEX[((value >> shift) & 0xf) as usize];
+    }
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        tx_hal::console_write_str::<P>(s);
+    }
 }
 
 /// Narrow unboxed lane for the pthread create/join hot path.
