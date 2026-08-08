@@ -9,10 +9,10 @@ type ActivePlatform = tx_hal_loongarch64_2k1000::Platform;
 
 struct ActiveDeviceBundle;
 
-static ACTIVE_DRIVERS: [tx_kernel::devices::binder::StaticDriverDescriptor<ActivePlatform>; 1] =
-    [tx_kernel::devices::ahci_block::driver_descriptor::<
-        ActivePlatform,
-    >()];
+static ACTIVE_DRIVERS: [tx_kernel::devices::binder::StaticDriverDescriptor<ActivePlatform>; 2] = [
+    tx_kernel::devices::ahci_block::driver_descriptor::<ActivePlatform>(),
+    tx_kernel::devices::dwmac3_net::driver_descriptor::<ActivePlatform>(),
+];
 
 impl tx_kernel::devices::binder::StaticDeviceBundle<ActivePlatform> for ActiveDeviceBundle {
     fn resource_providers() -> &'static [tx_hal::ResourceProviderDescriptor<ActivePlatform>] {

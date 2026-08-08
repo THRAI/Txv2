@@ -829,13 +829,18 @@ impl<P: TxPlatform> CoreInit<P> {
             P::service_pending_tlb_shootdown();
             // Complete any outstanding controller transaction even if init
             // became a zombie in the preceding reactor poll.
-            let drained_device_before_poll = Self::drain_device_irq_bottom_halves();
+            Self::drain_device_irq_bottom_halves();
             if init.is_zombie() {
                 break;
             }
 
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
-            if drained_device_before_poll || had_sbi {
+            // A network bottom half wakes the delegate that must consume the
+            // received descriptor. Poll it in this iteration; restarting the
+            // loop here lets a level IRQ reassert forever without running the
+            // delegate. Console input already fed the TTY and may restart the
+            // loop so the blocked reader is reconsidered at the usual boundary.
+            if had_sbi {
                 continue;
             }
 

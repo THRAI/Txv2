@@ -4,6 +4,7 @@ mod block;
 
 pub mod ahci_block;
 pub mod binder;
+pub mod dwmac3_net;
 pub mod dwmac_net;
 pub mod runtime;
 pub mod virtio_mmio_net;

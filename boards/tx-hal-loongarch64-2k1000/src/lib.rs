@@ -7,13 +7,13 @@ use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
     CpuPinGuard, DeadlineTimerIf, DeviceId, DeviceLocalId, DeviceMatchId, DeviceResource,
-    DeviceResourceGraph, DeviceStatus, DmaCoherency, DmaConstraints, DmaDomain, DmaDomainId,
-    DmaDomainRef, DmaIf, DmaTranslation, EntropyIf, FaultInfo, FpSimdIf, InitIf,
+    DeviceResourceGraph, DeviceStatus, DmaCoherency, DmaConstraints, DmaDirection, DmaDomain,
+    DmaDomainId, DmaDomainRef, DmaIf, DmaTranslation, EntropyIf, FaultInfo, FpSimdIf, InitIf,
     InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, IrqPolarity, IrqResource,
-    IrqSharing, IrqTrigger, KernelTrapSink, LocalExecutionGuard, MemoryRegion, MemoryRegionKind,
-    MmioFlags, MmioRegion, MmioResource, MonotonicCounterIf, ObserverIf, PercpuIf,
-    PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
-    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    IrqSharing, IrqTrigger, KernelTrapSink, LocalExecutionGuard, MacAddressSource, MemoryRegion,
+    MemoryRegionKind, MmioFlags, MmioRegion, MmioResource, MonotonicCounterIf, ObserverIf,
+    PercpuIf, PersistentClockIf, PhyRef, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
     PtNodeAllocator, ResourceOrigin, ResourceOriginKind, ResourceProviderId, ResourceRole,
     SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf,
@@ -28,7 +28,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use la64_irq_trap::classify_la64_trap;
 pub use la64_irq_trap::{dispatch_trap_frame, return_to_userspace};
-use la64_pmap::{la64_cached_virt, la64_kernel_addr_to_phys, la64_uncached_virt};
+use la64_pmap::la64_uncached_virt;
+#[cfg(target_arch = "loongarch64")]
+use la64_pmap::{la64_cached_virt, la64_kernel_addr_to_phys};
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
@@ -89,6 +91,17 @@ const LA2K1000_UART_BASE: usize = 0x1fe2_0000;
 const LA2K1000_UART_SIZE: usize = 0x100;
 const LA2K1000_AHCI_BASE: usize = 0x400e_0000;
 const LA2K1000_AHCI_SIZE: usize = 0x0001_0000;
+const LA2K1000_GMAC1_BASE: usize = 0x4005_0000;
+const LA2K1000_GMAC1_SIZE: usize = 0x0000_8000;
+#[cfg(target_arch = "loongarch64")]
+const LA2K1000_GMAC_PINMUX_PHYS: usize = 0x1fe0_0420;
+const LA2K1000_GMAC1_PINMUX_BIT: u32 = 1 << 3;
+/// GMAC1's live PHY is the C22 address-zero node under its integrated MDIO bus.
+pub const LA2K1000_GMAC1_PHY_ADDRESS: u8 = 0;
+/// The Nebula wiring uses RGMII with internal TX/RX delay.
+pub const LA2K1000_GMAC1_PHY_MODE: &str = "rgmii-id";
+/// Stable locally administered address used when firmware does not publish one.
+pub const LA2K1000_GMAC1_MAC_ADDRESS: [u8; 6] = [0x0e, 0x40, 0xdf, 0xbc, 0x58, 0x4e];
 const LA64_MAX_BOOT_CPUS: usize = 2;
 const LA64_DEFAULT_POSSIBLE_CPUS: usize = LA64_MAX_BOOT_CPUS;
 const LA64_DMW_CACHED_BASE: usize = 0x9000_0000_0000_0000;
@@ -811,7 +824,7 @@ pub fn initialize_early_board() {
     early_console_write(b"txkernel:loongson-2k1000:h2:uart-reinit:ok\n");
 }
 
-static MMIO_REGIONS: [MmioRegion; 3] = [
+static MMIO_REGIONS: [MmioRegion; 4] = [
     MmioRegion {
         name: "uart0",
         phys: PhysRange {
@@ -854,6 +867,20 @@ static MMIO_REGIONS: [MmioRegion; 3] = [
             .union(MmioFlags::READ)
             .union(MmioFlags::WRITE),
     },
+    MmioRegion {
+        name: "gmac1",
+        phys: PhysRange {
+            start: PhysAddr(LA2K1000_GMAC1_BASE),
+            size: LA2K1000_GMAC1_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_GMAC1_BASE),
+            size: LA2K1000_GMAC1_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+    },
 ];
 
 const LA2K1000_SOC_PROVIDER: ResourceProviderId = ResourceProviderId("loongson-2k1000-soc");
@@ -862,23 +889,52 @@ const LA2K1000_AHCI_ORIGIN: ResourceOrigin = ResourceOrigin {
     record: "/2k1000-soc/ahci@400e0000",
     kind: ResourceOriginKind::PlatformStatic,
 };
-const LA2K1000_SOC_DMA_DOMAIN_ID: DmaDomainId = DmaDomainId {
+const LA2K1000_GMAC1_ORIGIN: ResourceOrigin = ResourceOrigin {
+    provider: LA2K1000_SOC_PROVIDER,
+    record: "/2k1000-soc/ethernet@40050000",
+    kind: ResourceOriginKind::PlatformStatic,
+};
+const LA2K1000_GMAC1_PHY_ORIGIN: ResourceOrigin = ResourceOrigin {
+    provider: LA2K1000_SOC_PROVIDER,
+    record: "/2k1000-soc/ethernet@40050000/mdio/ethernet-phy@0",
+    kind: ResourceOriginKind::PlatformStatic,
+};
+const LA2K1000_AHCI_DMA_DOMAIN_ID: DmaDomainId = DmaDomainId {
     provider: LA2K1000_SOC_PROVIDER,
     local: 0,
 };
-static LA2K1000_DMA_DOMAINS: [DmaDomain; 1] = [DmaDomain {
-    id: LA2K1000_SOC_DMA_DOMAIN_ID,
-    translation: DmaTranslation::Direct { offset: 0 },
-    constraints: DmaConstraints {
-        dma_address_bits: 32,
-        min_alignment: 1,
-        segment_boundary: None,
-        max_segment_len: usize::MAX,
-        max_segments: u16::MAX,
+const LA2K1000_GMAC1_DMA_DOMAIN_ID: DmaDomainId = DmaDomainId {
+    provider: LA2K1000_SOC_PROVIDER,
+    local: 1,
+};
+static LA2K1000_DMA_DOMAINS: [DmaDomain; 2] = [
+    DmaDomain {
+        id: LA2K1000_AHCI_DMA_DOMAIN_ID,
+        translation: DmaTranslation::Direct { offset: 0 },
+        constraints: DmaConstraints {
+            dma_address_bits: 32,
+            min_alignment: 1,
+            segment_boundary: None,
+            max_segment_len: usize::MAX,
+            max_segments: u16::MAX,
+        },
+        coherency: DmaCoherency::Coherent,
+        origin: LA2K1000_AHCI_ORIGIN,
     },
-    coherency: DmaCoherency::Coherent,
-    origin: LA2K1000_AHCI_ORIGIN,
-}];
+    DmaDomain {
+        id: LA2K1000_GMAC1_DMA_DOMAIN_ID,
+        translation: DmaTranslation::Direct { offset: 0 },
+        constraints: DmaConstraints {
+            dma_address_bits: 32,
+            min_alignment: 1,
+            segment_boundary: None,
+            max_segment_len: usize::MAX,
+            max_segments: u16::MAX,
+        },
+        coherency: DmaCoherency::NonCoherent,
+        origin: LA2K1000_GMAC1_ORIGIN,
+    },
+];
 static LA2K1000_AHCI_MATCHES: [DeviceMatchId; 1] =
     [DeviceMatchId::FirmwareCompatible("loongson,ls-ahci")];
 static LA2K1000_AHCI_RESOURCES: [DeviceResource; 3] = [
@@ -907,24 +963,151 @@ static LA2K1000_AHCI_RESOURCES: [DeviceResource; 3] = [
     }),
     DeviceResource::DmaDomain(DmaDomainRef {
         role: ResourceRole::Index(0),
-        domain: LA2K1000_SOC_DMA_DOMAIN_ID,
+        domain: LA2K1000_AHCI_DMA_DOMAIN_ID,
     }),
 ];
-static LA2K1000_PLATFORM_DEVICES: [tx_hal::PlatformDevice; 1] = [tx_hal::PlatformDevice {
-    id: DeviceId {
-        provider: LA2K1000_SOC_PROVIDER,
-        local: DeviceLocalId::FirmwarePath("/2k1000-soc/ahci@400e0000"),
+static LA2K1000_GMAC1_MATCHES: [DeviceMatchId; 2] = [
+    DeviceMatchId::FirmwareCompatible("snps,dwmac-3.70a"),
+    DeviceMatchId::FirmwareCompatible("snps,arc-dwmac-3.70a"),
+];
+const LA2K1000_GMAC1_PHY_ID: DeviceId = DeviceId {
+    provider: LA2K1000_SOC_PROVIDER,
+    local: DeviceLocalId::FirmwarePath("/2k1000-soc/ethernet@40050000/mdio/ethernet-phy@0"),
+};
+static LA2K1000_GMAC1_RESOURCES: [DeviceResource; 5] = [
+    DeviceResource::Mmio(MmioResource {
+        role: ResourceRole::Index(0),
+        phys: PhysRange {
+            start: PhysAddr(LA2K1000_GMAC1_BASE),
+            size: LA2K1000_GMAC1_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_GMAC1_BASE),
+            size: LA2K1000_GMAC1_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+        origin: LA2K1000_GMAC1_ORIGIN,
+    }),
+    DeviceResource::Irq(IrqResource {
+        role: ResourceRole::Index(0),
+        line: la2k1000_liointc::GMAC1_PUBLIC_IRQ,
+        trigger: IrqTrigger::Level,
+        polarity: IrqPolarity::High,
+        sharing: IrqSharing::Exclusive,
+        origin: LA2K1000_GMAC1_ORIGIN,
+    }),
+    DeviceResource::DmaDomain(DmaDomainRef {
+        role: ResourceRole::Index(0),
+        domain: LA2K1000_GMAC1_DMA_DOMAIN_ID,
+    }),
+    DeviceResource::Phy(PhyRef {
+        role: ResourceRole::Index(0),
+        provider: LA2K1000_GMAC1_PHY_ID,
+    }),
+    DeviceResource::MacAddress {
+        role: ResourceRole::Index(0),
+        source: MacAddressSource::Firmware(LA2K1000_GMAC1_MAC_ADDRESS),
     },
-    status: DeviceStatus::Enabled,
-    matches: &LA2K1000_AHCI_MATCHES,
-    resources: &LA2K1000_AHCI_RESOURCES,
-    origin: LA2K1000_AHCI_ORIGIN,
-}];
+];
+static LA2K1000_GMAC1_PHY_MATCHES: [DeviceMatchId; 1] = [DeviceMatchId::FirmwareCompatible(
+    "ethernet-phy-ieee802.3-c22",
+)];
+static LA2K1000_PLATFORM_DEVICES: [tx_hal::PlatformDevice; 3] = [
+    tx_hal::PlatformDevice {
+        id: DeviceId {
+            provider: LA2K1000_SOC_PROVIDER,
+            local: DeviceLocalId::FirmwarePath("/2k1000-soc/ahci@400e0000"),
+        },
+        status: DeviceStatus::Enabled,
+        matches: &LA2K1000_AHCI_MATCHES,
+        resources: &LA2K1000_AHCI_RESOURCES,
+        origin: LA2K1000_AHCI_ORIGIN,
+    },
+    tx_hal::PlatformDevice {
+        id: DeviceId {
+            provider: LA2K1000_SOC_PROVIDER,
+            local: DeviceLocalId::FirmwarePath("/2k1000-soc/ethernet@40050000"),
+        },
+        status: DeviceStatus::Enabled,
+        matches: &LA2K1000_GMAC1_MATCHES,
+        resources: &LA2K1000_GMAC1_RESOURCES,
+        origin: LA2K1000_GMAC1_ORIGIN,
+    },
+    tx_hal::PlatformDevice {
+        id: LA2K1000_GMAC1_PHY_ID,
+        status: DeviceStatus::Enabled,
+        matches: &LA2K1000_GMAC1_PHY_MATCHES,
+        resources: &[],
+        origin: LA2K1000_GMAC1_PHY_ORIGIN,
+    },
+];
 static LA2K1000_DEVICE_RESOURCE_GRAPH: DeviceResourceGraph = DeviceResourceGraph {
     platform_mmio: &[],
     devices: &LA2K1000_PLATFORM_DEVICES,
     dma_domains: &LA2K1000_DMA_DOMAINS,
 };
+
+trait Gmac1PinmuxIo {
+    fn read(&self) -> u32;
+    fn write(&self, value: u32);
+    fn barrier(&self);
+}
+
+struct Gmac1PinmuxRegister;
+
+#[cfg(not(target_arch = "loongarch64"))]
+static HOST_GMAC1_PINMUX_REGISTER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+impl Gmac1PinmuxIo for Gmac1PinmuxRegister {
+    fn read(&self) -> u32 {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            unsafe {
+                core::ptr::read_volatile(la64_uncached_virt(LA2K1000_GMAC_PINMUX_PHYS) as *const u32)
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            HOST_GMAC1_PINMUX_REGISTER.load(Ordering::Acquire)
+        }
+    }
+
+    fn write(&self, value: u32) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            core::ptr::write_volatile(
+                la64_uncached_virt(LA2K1000_GMAC_PINMUX_PHYS) as *mut u32,
+                value,
+            );
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        HOST_GMAC1_PINMUX_REGISTER.store(value, Ordering::Release);
+    }
+
+    fn barrier(&self) {
+        #[cfg(target_arch = "loongarch64")]
+        la64_irq_trap::la64_dbar();
+        #[cfg(not(target_arch = "loongarch64"))]
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
+}
+
+fn prepare_gmac1_pinmux_with(io: &impl Gmac1PinmuxIo) -> bool {
+    let before = io.read();
+    let prepared = before | LA2K1000_GMAC1_PINMUX_BIT;
+    if prepared != before {
+        io.write(prepared);
+        io.barrier();
+    }
+    io.read() & LA2K1000_GMAC1_PINMUX_BIT != 0
+}
+
+fn prepare_gmac1_pinmux() -> bool {
+    prepare_gmac1_pinmux_with(&Gmac1PinmuxRegister)
+}
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -997,7 +1180,7 @@ impl PlatformConfig for Platform {
     const PAGE_TABLE_LEVELS: u8 = 4;
     const ASID_BITS: u8 = 10;
     const CACHE_LINE_SIZE: usize = 64;
-    const DMA_COHERENT: bool = true;
+    const DMA_COHERENT: bool = false;
 }
 
 impl BootPlatformIf for Platform {
@@ -1036,7 +1219,11 @@ impl PlatformInfoIf for Platform {
             matches!(candidate, DeviceMatchId::FirmwareCompatible(value)
                 if *value == "loongson,ls-ahci" || *value == "snps,spear-ahci")
         });
-        if !is_ahci {
+        let is_gmac1 = device.matches.iter().any(|candidate| {
+            matches!(candidate, DeviceMatchId::FirmwareCompatible(value)
+                if *value == "snps,dwmac-3.70a" || *value == "snps,arc-dwmac-3.70a")
+        });
+        if !is_ahci && !is_gmac1 {
             return Ok(());
         }
 
@@ -1047,12 +1234,24 @@ impl PlatformInfoIf for Platform {
         let Some(irq) = irq else {
             return Err(tx_hal::PlatformDevicePrepareError::MalformedFirmwareProperty);
         };
-        if irq.line != la2k1000_liointc::AHCI_PUBLIC_IRQ
+        let expected_irq = if is_gmac1 {
+            la2k1000_liointc::GMAC1_PUBLIC_IRQ
+        } else {
+            la2k1000_liointc::AHCI_PUBLIC_IRQ
+        };
+        if irq.line != expected_irq
             || irq.trigger != IrqTrigger::Level
             || irq.polarity != IrqPolarity::High
+            || irq.sharing != IrqSharing::Exclusive
         {
             return Err(tx_hal::PlatformDevicePrepareError::MalformedFirmwareProperty);
         }
+        if is_gmac1 && !prepare_gmac1_pinmux() {
+            return Err(tx_hal::PlatformDevicePrepareError::MalformedFirmwareProperty);
+        }
+        // U-Boot has already established the live PHY/RGMII state. Platform
+        // preparation only confirms muxing and IRQ routing; it invents no
+        // undocumented clock/reset writes or PHY reinitialization sequence.
         if !la2k1000_liointc::prepare_level_high_source(irq.line) {
             return Err(tx_hal::PlatformDevicePrepareError::MalformedFirmwareProperty);
         }
@@ -1095,6 +1294,7 @@ mod boot_asm;
 mod boot_facts;
 mod boot_smp;
 mod la2k1000_liointc;
+mod la64_dma_cache;
 #[path = "../../tx-hal-loongarch64-common/src/la64_ipi.rs"]
 mod la64_ipi;
 #[path = "../../tx-hal-loongarch64-common/src/la64_irq_trap.rs"]
@@ -1113,16 +1313,31 @@ mod trap_asm;
 mod device_resource_tests {
     use super::*;
 
-    #[test]
-    fn ahci_resource_graph_matches_live_board_facts() {
-        let graph = tx_hal::DeviceGraphBuilder::from_seed(&LA2K1000_DEVICE_RESOURCE_GRAPH)
+    fn frozen_graph() -> &'static DeviceResourceGraph {
+        tx_hal::DeviceGraphBuilder::from_seed(&LA2K1000_DEVICE_RESOURCE_GRAPH)
             .expect("2K1000 resource seed is valid")
             .freeze()
-            .expect("2K1000 resource graph freezes");
-        assert_eq!(graph.devices.len(), 1);
-        assert_eq!(graph.dma_domains.len(), 1);
+            .expect("2K1000 resource graph freezes")
+    }
 
-        let ahci = &graph.devices[0];
+    #[test]
+    fn ahci_resource_graph_matches_live_board_facts() {
+        let graph = frozen_graph();
+        assert_eq!(graph.devices.len(), 3);
+        assert_eq!(graph.dma_domains.len(), 2);
+
+        let ahci = graph
+            .devices
+            .iter()
+            .find(|device| {
+                device.matches.iter().any(|candidate| {
+                    matches!(
+                        candidate,
+                        DeviceMatchId::FirmwareCompatible("loongson,ls-ahci")
+                    )
+                })
+            })
+            .expect("AHCI platform device");
         assert_eq!(ahci.status, DeviceStatus::Enabled);
         assert!(ahci.matches.iter().any(|candidate| matches!(
             candidate,
@@ -1157,12 +1372,150 @@ mod device_resource_tests {
         assert_eq!(irq.sharing, IrqSharing::Exclusive);
 
         let dma = dma.expect("AHCI DMA domain reference");
-        assert_eq!(dma.domain, LA2K1000_SOC_DMA_DOMAIN_ID);
-        let domain = &graph.dma_domains[0];
+        assert_eq!(dma.domain, LA2K1000_AHCI_DMA_DOMAIN_ID);
+        let domain = graph
+            .dma_domains
+            .iter()
+            .find(|domain| domain.id == dma.domain)
+            .expect("AHCI DMA domain");
         assert_eq!(domain.translation, DmaTranslation::Direct { offset: 0 });
         assert_eq!(domain.constraints.dma_address_bits, 32);
         assert_eq!(domain.coherency, DmaCoherency::Coherent);
-        assert!(<Platform as PlatformConfig>::DMA_COHERENT);
-        assert!(<Platform as DmaIf>::DMA_COHERENT);
+        assert!(!<Platform as PlatformConfig>::DMA_COHERENT);
+        assert!(!<Platform as DmaIf>::DMA_COHERENT);
+    }
+
+    #[test]
+    fn gmac1_resource_graph_matches_live_board_facts() {
+        let graph = frozen_graph();
+        let gmac = graph
+            .devices
+            .iter()
+            .find(|device| {
+                device.matches.iter().any(|candidate| {
+                    matches!(
+                        candidate,
+                        DeviceMatchId::FirmwareCompatible("snps,dwmac-3.70a")
+                    )
+                })
+            })
+            .expect("GMAC1 platform device");
+        assert_eq!(gmac.status, DeviceStatus::Enabled);
+        assert!(gmac.matches.iter().any(|candidate| matches!(
+            candidate,
+            DeviceMatchId::FirmwareCompatible("snps,arc-dwmac-3.70a")
+        )));
+
+        let mmio = gmac.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Mmio(mmio) => Some(*mmio),
+            _ => None,
+        });
+        let irq_resources = gmac
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                DeviceResource::Irq(irq) => Some(*irq),
+                _ => None,
+            })
+            .collect::<std::vec::Vec<_>>();
+        let dma = gmac.resources.iter().find_map(|resource| match resource {
+            DeviceResource::DmaDomain(dma) => Some(*dma),
+            _ => None,
+        });
+        let phy = gmac.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Phy(phy) => Some(*phy),
+            _ => None,
+        });
+        let mac = gmac.resources.iter().find_map(|resource| match resource {
+            DeviceResource::MacAddress { source, .. } => Some(*source),
+            _ => None,
+        });
+
+        let mmio = mmio.expect("GMAC1 MMIO resource");
+        assert_eq!(mmio.phys.start, PhysAddr(LA2K1000_GMAC1_BASE));
+        assert_eq!(mmio.phys.size, LA2K1000_GMAC1_SIZE);
+        assert_eq!(
+            mmio.virt.start,
+            VirtAddr(LA64_DMW_UNCACHED_BASE | LA2K1000_GMAC1_BASE)
+        );
+
+        assert_eq!(irq_resources.len(), 1, "wake IRQ remains unbound");
+        let irq = irq_resources[0];
+        assert_eq!(irq.line, la2k1000_liointc::GMAC1_PUBLIC_IRQ);
+        assert_eq!(irq.trigger, IrqTrigger::Level);
+        assert_eq!(irq.polarity, IrqPolarity::High);
+        assert_eq!(irq.sharing, IrqSharing::Exclusive);
+
+        let dma = dma.expect("GMAC1 DMA domain reference");
+        assert_eq!(dma.domain, LA2K1000_GMAC1_DMA_DOMAIN_ID);
+        let domain = graph
+            .dma_domains
+            .iter()
+            .find(|domain| domain.id == dma.domain)
+            .expect("GMAC1 DMA domain");
+        assert_eq!(domain.translation, DmaTranslation::Direct { offset: 0 });
+        assert_eq!(domain.constraints.dma_address_bits, 32);
+        assert_eq!(domain.coherency, DmaCoherency::NonCoherent);
+
+        let phy = phy.expect("GMAC1 PHY reference");
+        assert_eq!(phy.provider, LA2K1000_GMAC1_PHY_ID);
+        assert_eq!(
+            phy.provider.local,
+            DeviceLocalId::FirmwarePath("/2k1000-soc/ethernet@40050000/mdio/ethernet-phy@0")
+        );
+        assert_eq!(LA2K1000_GMAC1_PHY_ADDRESS, 0);
+        assert_eq!(LA2K1000_GMAC1_PHY_MODE, "rgmii-id");
+        assert_eq!(
+            mac,
+            Some(MacAddressSource::Firmware([
+                0x0e, 0x40, 0xdf, 0xbc, 0x58, 0x4e
+            ]))
+        );
+        assert!(!gmac.resources.iter().any(|resource| matches!(
+            resource,
+            DeviceResource::Clock(_) | DeviceResource::Reset(_)
+        )));
+    }
+
+    struct TestPinmuxIo {
+        value: core::cell::Cell<u32>,
+        writes: core::cell::Cell<usize>,
+        barriers: core::cell::Cell<usize>,
+    }
+
+    impl Gmac1PinmuxIo for TestPinmuxIo {
+        fn read(&self) -> u32 {
+            self.value.get()
+        }
+
+        fn write(&self, value: u32) {
+            self.value.set(value);
+            self.writes.set(self.writes.get() + 1);
+        }
+
+        fn barrier(&self) {
+            self.barriers.set(self.barriers.get() + 1);
+        }
+    }
+
+    #[test]
+    fn gmac1_pinmux_prepare_changes_only_bit3_and_is_idempotent() {
+        let before = 0xa5a5_00f0 & !LA2K1000_GMAC1_PINMUX_BIT;
+        let io = TestPinmuxIo {
+            value: core::cell::Cell::new(before),
+            writes: core::cell::Cell::new(0),
+            barriers: core::cell::Cell::new(0),
+        };
+
+        assert!(prepare_gmac1_pinmux_with(&io));
+        assert_eq!(io.value.get(), before | LA2K1000_GMAC1_PINMUX_BIT);
+        assert_eq!(io.value.get() ^ before, LA2K1000_GMAC1_PINMUX_BIT);
+        assert_eq!(io.writes.get(), 1);
+        assert_eq!(io.barriers.get(), 1);
+
+        assert!(prepare_gmac1_pinmux_with(&io));
+        assert_eq!(io.value.get(), before | LA2K1000_GMAC1_PINMUX_BIT);
+        assert_eq!(io.writes.get(), 1);
+        assert_eq!(io.barriers.get(), 1);
     }
 }

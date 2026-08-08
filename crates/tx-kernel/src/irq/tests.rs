@@ -29,6 +29,7 @@ use crate::init::{console_tty, CoreInit};
 use crate::irq::{
     drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats, publish_deferred_net_claim,
     register_irq_handler, rtc_alarm_irq_handler, try_read_console_bytes, uart_rx_irq_handler,
+    UART_RX_PENDING,
 };
 use crate::test_serialise::KERNEL_TEST_LOCK as IRQ_TEST_LOCK;
 use tx_subsystems::device_binding::BoundDeviceKey;
@@ -69,9 +70,13 @@ static IRQ_TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_COMPLETED_IRQ: AtomicU32 = AtomicU32::new(0);
 static IRQ_TEST_COMPLETE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_NET_ACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_NET_MASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_NET_UNMASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_ACK_ORDER: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_COMPLETE_ORDER: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_UNMASK_ORDER: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_LOCAL_EXCLUSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 static REENTRANT_CONSOLE_READS: AtomicUsize = AtomicUsize::new(0);
 
@@ -229,6 +234,7 @@ impl IrqIf for IrqTestPlatform {
     }
 
     fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        IRQ_TEST_LOCAL_EXCLUSION_COUNT.fetch_add(1, Ordering::AcqRel);
         unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
     }
 
@@ -248,12 +254,23 @@ impl IrqIf for IrqTestPlatform {
         IRQ_TEST_COMPLETE_ORDER.store(order, Ordering::Release);
     }
 
+    fn mask(irq: u32) {
+        if irq == IRQ_TEST_DEVICE_IRQ {
+            IRQ_TEST_NET_MASK_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     fn unmask(irq: u32) {
         if irq == Self::uart_irq() {
             IRQ_TEST_UART_UNMASKED.store(true, Ordering::Release);
         }
         if irq == Self::rtc_irq() {
             IRQ_TEST_RTC_UNMASKED.store(true, Ordering::Release);
+        }
+        if irq == IRQ_TEST_DEVICE_IRQ {
+            IRQ_TEST_NET_UNMASK_COUNT.fetch_add(1, Ordering::AcqRel);
+            let order = IRQ_TEST_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
+            IRQ_TEST_UNMASK_ORDER.store(order, Ordering::Release);
         }
     }
 }
@@ -368,9 +385,13 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     IRQ_TEST_COMPLETED_IRQ.store(0, Ordering::Release);
     IRQ_TEST_COMPLETE_COUNT.store(0, Ordering::Release);
     IRQ_TEST_NET_ACK_COUNT.store(0, Ordering::Release);
+    IRQ_TEST_NET_MASK_COUNT.store(0, Ordering::Release);
+    IRQ_TEST_NET_UNMASK_COUNT.store(0, Ordering::Release);
     IRQ_TEST_SEQUENCE.store(0, Ordering::Release);
     IRQ_TEST_ACK_ORDER.store(0, Ordering::Release);
     IRQ_TEST_COMPLETE_ORDER.store(0, Ordering::Release);
+    IRQ_TEST_UNMASK_ORDER.store(0, Ordering::Release);
+    IRQ_TEST_LOCAL_EXCLUSION_COUNT.store(0, Ordering::Release);
     REENTRANT_CONSOLE_READS.store(0, Ordering::Release);
     BLOCKING_CONSOLE_ENTERED.store(false, Ordering::Release);
     BLOCKING_CONSOLE_RELEASE.store(false, Ordering::Release);
@@ -560,6 +581,8 @@ fn net_irq_bottom_half_acks_device_before_same_hart_completion() {
         0,
         "top half must leave controller completion outstanding",
     );
+    assert_eq!(IRQ_TEST_NET_MASK_COUNT.load(Ordering::Acquire), 1);
+    assert_eq!(IRQ_TEST_NET_UNMASK_COUNT.load(Ordering::Acquire), 0);
 
     assert!(drain_net_rx_irq::<IrqTestPlatform>());
     assert_eq!(IRQ_TEST_NET_ACK_COUNT.load(Ordering::Acquire), 1);
@@ -573,6 +596,12 @@ fn net_irq_bottom_half_acks_device_before_same_hart_completion() {
         IRQ_TEST_COMPLETE_ORDER.load(Ordering::Acquire),
         2,
         "device ACK/poll must precede controller completion",
+    );
+    assert_eq!(IRQ_TEST_NET_UNMASK_COUNT.load(Ordering::Acquire), 1);
+    assert_eq!(
+        IRQ_TEST_UNMASK_ORDER.load(Ordering::Acquire),
+        3,
+        "controller completion must precede unmask",
     );
     assert!(!drain_net_rx_irq::<IrqTestPlatform>());
     assert_eq!(
@@ -702,8 +731,14 @@ fn dispatch_irq_routes_uart_rx_to_tty_deferred_ingest() {
 
     // Drain the deferred buffer the way the reactor loop does on every
     // WFI return.
+    let exclusions_before = IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire);
     let drained = CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty();
     assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
+    assert_eq!(
+        IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire),
+        exclusions_before + 1,
+        "task-context UART pending lock must exclude its local IRQ top half",
+    );
 
     // Normal-context drain should now contain the committed line.
     let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
@@ -714,6 +749,40 @@ fn dispatch_irq_routes_uart_rx_to_tty_deferred_ingest() {
     assert_eq!(
         snapshot, b"X\n",
         "step_ingest should have queued the committed line into the input queue",
+    );
+}
+
+#[test]
+fn uart_rx_irq_leaves_fifo_untouched_when_pending_buffer_is_contended() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"Y\n");
+    }
+
+    let pending = UART_RX_PENDING.lock();
+    let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq());
+    assert_eq!(handled, IrqHandled::Done);
+    assert_eq!(
+        IRQ_TEST_RX_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_slice(),
+        b"Y\n",
+        "a contended top half must not consume bytes from the hardware FIFO",
+    );
+    drop(pending);
+
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        2,
     );
 }
 

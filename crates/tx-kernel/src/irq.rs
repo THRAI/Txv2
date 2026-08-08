@@ -448,6 +448,11 @@ fn publish_deferred_net_claim<P: TxPlatform>(
     let slot = NET_RX_DEFERRED_CLAIMS
         .get(owner.0)
         .expect("network IRQ claimant hart exceeds MAX_HARTS");
+    // PLIC keeps a claimed source unavailable until completion, but simple
+    // level controllers such as the 2K1000 LIOINTC only expose STATUS & ENABLE.
+    // Mask before deferring so the asserted device source cannot be claimed a
+    // second time while this hart's one deferred slot still owns the first.
+    <P as IrqIf>::mask(irq);
     slot.publish(DeferredIrqClaim {
         irq,
         owner,
@@ -480,6 +485,7 @@ pub(crate) fn drain_net_rx_irq<P: TxPlatform>() -> bool {
     let _ = claim.registration.ops.ack_interrupt_and_fire();
     slot.release_before_completion(claim);
     <P as IrqIf>::complete(claim.irq);
+    <P as IrqIf>::unmask(claim.irq);
     NET_IRQ_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
     true
 }
@@ -515,30 +521,32 @@ pub fn rtc_alarm_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
 /// Returns `IrqHandled::Wake` when bytes were buffered (reactor should
 /// reschedule the blocked `read` future).  Returns `IrqHandled::Done`
 /// for spurious or already-drained IRQs.  Returns
-/// `IrqHandled::NotMine` if the console TTY hasn't been registered yet
-/// (defensive check against a stray pre-boot IRQ).
+/// The handler is installed only after the console TTY is published, so the
+/// top half does not acquire the task-context console-cap lock.
 pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
+    // IRQ context must never wait for a task-context holder on another hart.
+    // Leave the FIFO untouched on contention so its level condition retriggers
+    // after the short deferred-drain critical section releases the lock.
+    let Some(mut pending) = UART_RX_PENDING.try_lock() else {
+        return IrqHandled::Done;
+    };
+    let space = UART_RX_PENDING_CAP - pending.len;
+    if space == 0 {
+        return IrqHandled::Done;
+    }
     let mut buf = [0u8; UART_RX_DRAIN_MAX];
-    let n = try_read_console_bytes::<P>(&mut buf);
+    let n = try_read_console_bytes::<P>(&mut buf[..space.min(UART_RX_DRAIN_MAX)]);
     if n == 0 {
         // Spurious IRQ or FIFO already drained.
         return IrqHandled::Done;
-    }
-    if crate::init::console_tty().is_none() {
-        // Pre-boot race: TTY not yet registered. Discard the bytes and
-        // return NotMine so the caller knows the IRQ was unexpected.
-        return IrqHandled::NotMine;
     }
     // Buffer bytes for non-IRQ ingestion. Bytes that overflow the
     // pending buffer (UART_RX_PENDING_CAP) are silently dropped — this
     // is acceptable for a boot console where the reactor loop drains
     // frequently.
-    let mut pending = UART_RX_PENDING.lock();
     let start = pending.len;
-    let space = UART_RX_PENDING_CAP - start;
-    let copy = n.min(space);
-    let end = start + copy;
-    pending.bytes[start..end].copy_from_slice(&buf[..copy]);
+    let end = start + n;
+    pending.bytes[start..end].copy_from_slice(&buf[..n]);
     pending.len = end;
     IrqHandled::Wake
 }
@@ -561,6 +569,10 @@ pub(crate) fn drain_uart_rx_pending<P: tx_hal::TxPlatform>() -> usize {
     // Snapshot and clear the pending buffer under the lock, then
     // release before calling step_ingest (which takes its own locks).
     let (bytes, n) = {
+        // The UART top half takes this same lock in IRQ context. Exclude local
+        // interrupt execution while task context owns it, otherwise a UART
+        // interrupt on this hart can spin forever on the interrupted holder.
+        let _local_execution = <P as IrqIf>::exclude_local_execution();
         let mut pending = UART_RX_PENDING.lock();
         if pending.len == 0 {
             return 0;

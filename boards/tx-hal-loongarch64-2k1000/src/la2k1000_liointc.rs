@@ -7,6 +7,8 @@ pub(crate) const MAIN_PHYS_BASE: usize = 0x1fe0_1400;
 pub(crate) const MAIN_MMIO_SIZE: usize = 0x80;
 pub(crate) const PUBLIC_IRQ_LIMIT: u32 = 65;
 pub(crate) const UART_SHARED_PUBLIC_IRQ: u32 = 1;
+/// The device tree's GMAC1 MAC hwirq 14 in the public domain that reserves zero.
+pub(crate) const GMAC1_PUBLIC_IRQ: u32 = 15;
 /// The device tree's AHCI hwirq 19 in the public domain that reserves zero.
 pub(crate) const AHCI_PUBLIC_IRQ: u32 = 20;
 
@@ -336,6 +338,30 @@ mod tests {
         assert_eq!(HOST_ENABLE[0].load(Ordering::Acquire) & bit, 0);
         assert_ne!(HOST_ENABLE[0].load(Ordering::Acquire) & (1 << 18), 0);
         assert_eq!(HOST_ROUTE[source].load(Ordering::Acquire), ROUTE_CPU0_HWI1);
+        assert_eq!(HOST_POLARITY[0].load(Ordering::Acquire) & bit, 0);
+        assert_eq!(HOST_EDGE[0].load(Ordering::Acquire) & bit, 0);
+        assert_eq!(HOST_BOUNCE[0].load(Ordering::Acquire) & bit, 0);
+        assert_eq!(HOST_AUTO[0].load(Ordering::Acquire) & bit, 0);
+    }
+
+    #[test]
+    fn gmac1_platform_prepare_routes_mac_irq_and_leaves_wake_irq_unbound() {
+        let _guard = TEST_LOCK.lock().expect("LIOINTC test lock poisoned");
+        reset();
+        HOST_ENABLE[0].store(u32::MAX, Ordering::Release);
+
+        <Platform as PlatformInfoIf>::prepare_platform_device(&LA2K1000_PLATFORM_DEVICES[1])
+            .expect("GMAC1 platform preparation");
+        <Platform as PlatformInfoIf>::prepare_platform_device(&LA2K1000_PLATFORM_DEVICES[1])
+            .expect("idempotent GMAC1 platform preparation");
+
+        let source = (GMAC1_PUBLIC_IRQ - 1) as usize;
+        let bit = 1u32 << source;
+        let wake_bit = 1u32 << source.saturating_add(1);
+        assert_eq!(HOST_ENABLE[0].load(Ordering::Acquire) & bit, 0);
+        assert_ne!(HOST_ENABLE[0].load(Ordering::Acquire) & wake_bit, 0);
+        assert_eq!(HOST_ROUTE[source].load(Ordering::Acquire), ROUTE_CPU0_HWI1);
+        assert_eq!(HOST_ROUTE[source + 1].load(Ordering::Acquire), 0);
         assert_eq!(HOST_POLARITY[0].load(Ordering::Acquire) & bit, 0);
         assert_eq!(HOST_EDGE[0].load(Ordering::Acquire) & bit, 0);
         assert_eq!(HOST_BOUNCE[0].load(Ordering::Acquire) & bit, 0);

@@ -1,3 +1,34 @@
+- 2026-08-08 (**Loongson 2K1000 Stage 5 GMAC 实板收发通过**).
+  **Changed**：新增独立 DWMAC 3.70a 驱动和 binder，不复用 VF2 DWMAC5/EQoS
+  寄存器模型；2K1000 平台发布 GMAC1 `0x40050000/0x8000`、hwirq14/public
+  IRQ15、PHY0、`rgmii-id`、32-bit identity DMA 和 LIOINTC level-high route。
+  驱动使用 enhanced chained descriptors、64-byte descriptor stride、MDIO C22
+  YT8511，并在 non-coherent DMA 边界执行 LA cache maintenance。DWMAC3
+  perfect-filter Address0 按 high 后 low 写入，符合实板的地址 latch 行为；IRQ top
+  half 在 defer 前 mask，bottom half 按 device ACK、controller complete、unmask 顺序
+  收尾。网络 delegate 不再用会丢同位 re-kick 的 `peek`/`clear`，改为原子 `take`；
+  reactor 在网络 bottom half 唤醒 delegate 后继续本轮 poll。UART RX top half 在读取
+  FIFO 前 `try_lock` pending buffer，task drain 持锁时排除本 hart IRQ，避免跨核持锁
+  导致 CPU0 IRQ 自旋。
+  **Real hardware**：U-Boot GMAC1 TFTP 以 1000/full 下载 7,081,984-byte legacy
+  uImage；clean kernel 双核、双向 IPI、masked-progress shootdown、AHCI/ext4 mount、
+  DWMAC3 probe 和 Alpine `/ #` 均通过。Guest `eth1=192.168.1.27/24` 后宿主机
+  `ping -c 5 -W 2` 为 5/5、0% loss，后四包 1.50--1.53 ms。80 字符 150 ms
+  paced UART 命令及紧随其后的命令均完整执行。
+  **Verification**：DWMAC3 11/11、binder 3/3、IRQ/UART 10/10、delegate 3/3、
+  2K HAL 21/21、2K full-build 通过；LA QEMU 四核重新构建并命中 online=4、
+  bidirectional IPI、masked shootdown、owner-wake 与 boot sentinel。VF2/DWMAC5
+  host 隔离测试为 driver 17/17、HAL 3/3、binder 6/6，release VF2 uImage 生成；
+  RV QEMU relocated-NIC/changed-subnet 场景动态发现 `eth0` 并成功 ping gateway，
+  `shell-test: ok`。
+  **Accepted/rejected**：接受独立 DWMAC3、GMAC1/PHY0 和显式 DMA cache sync；DTS
+  父总线虽声明 `dma-coherent`，当前实板工作契约仍保留 cache maintenance，后续若要
+  简化必须有独立 A/B 实板证据。拒绝 QEMU/VF2 设备常量、DWMAC5 寄存器模型、轮询
+  代替真实 IRQ，以及将 GMAC 节点误记为 `/soc/...`（正确为 `/2k1000-soc/...`）。
+  **Next**：Stage 6 在现场网络确认地址、默认路由、DNS、RTC/UTC 与 CA/TLS，随后执行
+  完整 GitHub clone。**Blocker**：Stage 5 无硬件 blocker；尚未验收默认路由、DNS、
+  时间、TLS 和 Git 外网链路。
+
 - 2026-08-08 (**Loongson 2K1000 Stage 4 AHCI 裸 ext4 根盘已进入 Alpine `/ #`**).
   **Changed**：新增通用 AHCI 1.x 单端口/slot0 polling 块驱动，使用独占且 pin 的
   8 KiB DMA workspace、4 KiB bounce buffer、IDENTIFY 与 LBA48 READ DMA EXT，

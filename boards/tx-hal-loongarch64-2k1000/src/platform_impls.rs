@@ -728,8 +728,28 @@ impl CacheIf for Platform {
     fn flush_icache_range(_start: VirtAddr, _len: usize) {
         la64_ibar();
     }
+
+    fn dcache_clean_range(start: PhysAddr, len: usize) {
+        la64_dma_cache::writeback_invalidate_range(start, len);
+    }
+
+    fn dcache_invalidate_range(start: PhysAddr, len: usize) {
+        la64_dma_cache::writeback_invalidate_range(start, len);
+    }
+
+    fn dcache_clean_invalidate_range(start: PhysAddr, len: usize) {
+        la64_dma_cache::writeback_invalidate_range(start, len);
+    }
 }
 impl DmaIf for Platform {
+    fn sync_for_device(paddr: PhysAddr, len: usize, _dir: DmaDirection) {
+        la64_dma_cache::writeback_invalidate_range(paddr, len);
+    }
+
+    fn sync_for_cpu(paddr: PhysAddr, len: usize, _dir: DmaDirection) {
+        la64_dma_cache::writeback_invalidate_range(paddr, len);
+    }
+
     fn publish_to_device() {
         la64_dbar();
     }

@@ -18,8 +18,7 @@ use crate::net::protocol::{EtherIface, LoopbackIface};
 use crate::wait_source;
 
 use super::{
-    net_delegate_clear, net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token,
-    DelegateWireSet,
+    net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token, DelegateWireSet,
 };
 
 pub trait NetDelegateDriver {
@@ -202,10 +201,13 @@ pub fn net_delegate_step_once(
             .saturating_mul(1_000),
     );
 
-    let ready = net_delegate_queue().peek();
+    // Consume work requests atomically. A separate peek/clear pair can erase a
+    // same-bit kick that arrives between the two operations and never wakes us
+    // again because the bit was still set when the producer fired it.
+    let ready = net_delegate_queue()
+        .take((DelegateWireSet::POLL | DelegateWireSet::TICK).bits());
     let poll_seen = ready & DelegateWireSet::POLL.bits() != 0;
     let tick_seen = ready & DelegateWireSet::TICK.bits() != 0;
-    net_delegate_clear(DelegateWireSet::POLL | DelegateWireSet::TICK);
 
     let mut outcome = NetDelegateRuntimeOutcome {
         poll_seen,

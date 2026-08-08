@@ -8,7 +8,7 @@
   "plan": null,
   "current_state": [
     "Work continues on branch feature/portable-net-vf2-dwmac from the LA QEMU SMP4 shootdown checkpoint 0f8b3315; commits 521c2114 and 0811e354 remain the shared Pmap/TLB baseline and were not reverted or duplicated.",
-    "Stages 1 through 4 are complete on real Loongson 2K1000 Nebula hardware: the independent la64-2k1000 target boots both cores through the common kernel path, preserves real IOCSR IPI/generation shootdown/UART LIOINTC behavior, reads the onboard SATA disk through ls-ahci, mounts its raw ext4 filesystem as /, and enters the Alpine / #.",
+    "Stages 1 through 5 are complete on real Loongson 2K1000 Nebula hardware: the independent la64-2k1000 target boots both cores through the common kernel path, preserves real IOCSR IPI/generation shootdown/UART LIOINTC behavior, reads the onboard SATA disk through ls-ahci, mounts its raw ext4 filesystem as /, enters the Alpine / #, and exchanges Ethernet frames through GMAC1.",
     "U-Boot 2022.04-v2.1.0-00579-g3bcf8c7d reports 1 GiB DDR in two banks: 0x9000000000000000+256 MiB and 0x9000000090000000+768 MiB. Its TFTP staging loadaddr is 0x9000000098000000.",
     "The Stage 3 legacy uImage contains 7032768 payload bytes with 32-bit physical load/entry 0x98000000. Its 64-byte header is transported at cached alias 0x9000000097ffffc0, so the vendor U-Boot relocation maps source and destination to the same pointer. The linked kernel ends at physical 0x98761000 before the initrd header at 0x98800000.",
     "The real-board two-argument bootm run verified both image CRCs, reported 1024 MiB, printed the inherited/reinitialized UART markers, recovered a 100 MHz CPUCFG timebase and raw CPIO range 0x98800040..0x98963640 from the BPI EFI FDT, emitted boot:ok, and entered / #.",
@@ -23,7 +23,12 @@
     "The old firmware DTS describes LIOINTC main 0x1fe01400 with a CPU IRQ3/HWI1 cascade. The board maps public IRQ as hwirq+1, routes only the shared UART0..3 source hwirq0 to CPU0/HWI1 with route byte 0x21, disables the other UART IERs and all unowned LIOINTC sources, and has a real first-RX irq:uart-rx:ok witness. QEMU ExtIOI/PCH addresses are not reused.",
     "The previous 0x1fe01020..0x1fe01038 ICU interpretation was rejected: those registers are vendor SMP mailboxes. The per-core +0x44 readback remains undocumented and is not used by the driver; the proven UART-only claim path reads global status masked by enable status.",
     "The live /proc/cpuinfo now enumerates CPU0 and CPU1 as architecture loongarch64 from a dynamic platform provider; the former RV64 placeholder is gone while the RV64 text remains byte-compatible in its own target.",
-    "Stage 5 is next: bring up the live-FDT DWMAC 3.70a GMAC path, including controller selection, PHY/MDIO, clock/reset, coherent DMA descriptors and the source-specific LIOINTC route. Do not reuse the VF2 DWMAC5/EQoS register model or QEMU network constants without capability checks.",
+    "Stage 5 adds an independent DWMAC 3.70a driver and binder for GMAC1 at 0x40050000, hwirq14/public IRQ15, PHY0 YT8511 over clause-22 MDIO, rgmii-id, enhanced chained descriptors with 64-byte stride, and a 32-bit identity DMA domain. It does not reuse the VF2 DWMAC5/EQoS register model or QEMU network constants.",
+    "The working real-board DMA contract performs explicit LoongArch cache maintenance around GMAC descriptors and buffers. This is intentionally retained even though the old DTS marks the parent 2k1000-soc dma-coherent; removing it requires a separate real-board A/B witness. The firmware node path is /2k1000-soc/ethernet@40050000, not /soc/ethernet@40050000.",
+    "DWMAC3 Address0 must be written high word before low word so the 3.70a perfect filter latches the unicast MAC. Before that change broadcast RX and TX/ARP worked but unicast ingress did not; after it, a clean kernel at 192.168.1.27 answered 5 of 5 host pings with zero loss and approximately 1.5 ms steady-state RTT.",
+    "The network IRQ path masks the level source before publishing a deferred claim, then performs device ACK, controller completion, and unmask on the claimant hart. The reactor continues into the network delegate after draining the bottom half, and the delegate atomically takes POLL/TICK bits so a concurrent same-bit re-kick cannot be erased by a split peek/clear.",
+    "UART RX now acquires its pending buffer with try_lock before touching the FIFO and task-context drain excludes local IRQ execution while holding that buffer. The clean board completed an 80-character command paced at 150 ms per character and immediately executed a second command without truncation or lockup.",
+    "Stage 6 is next: determine the real LAN address, default route, DNS, RTC/UTC and CA state, validate TLS without disabling certificate checks, then perform the complete GitHub clone and Git scoring chain.",
     "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
   ],
   "changed_files": [
@@ -114,6 +119,26 @@
     {
       "path": "crates/tx-ext4/src/read_backend.rs",
       "reason": "Moves the 512-entry lookup cache storage to the heap so ext4 mount does not overflow the 64 KiB board boot stack."
+    },
+    {
+      "path": "crates/tx-drivers/src/dwmac3",
+      "reason": "Provides the independent DWMAC 3.70a MAC, MDIO/PHY, enhanced descriptor rings, DMA sync, RX/TX, and interrupt implementation used by 2K1000 GMAC1."
+    },
+    {
+      "path": "crates/tx-kernel/src/devices/dwmac3_net.rs",
+      "reason": "Binds only the DWMAC 3.70a compatible and transactionally publishes its typed MMIO, IRQ, DMA, PHY, MAC, and network device resources."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-2k1000/src/la64_dma_cache.rs",
+      "reason": "Discovers the LA cache hierarchy and performs bounded writeback/invalidate maintenance for the working GMAC DMA contract."
+    },
+    {
+      "path": "crates/tx-kernel/src/irq.rs",
+      "reason": "Masks deferred level network claims until device ACK/controller completion and makes UART RX pending-buffer ownership nonblocking in IRQ context."
+    },
+    {
+      "path": "crates/tx-subsystems/src/net/delegate/runtime.rs",
+      "reason": "Atomically consumes delegate POLL/TICK requests so a concurrent same-bit network kick cannot be lost."
     }
   ],
   "verification": [
@@ -251,18 +276,53 @@
       "command": "real 2K1000: tx.root=sda ro init=/bin/sh; bootm 0x9000000097ffffc0",
       "status": "passed",
       "notes": "Real hardware reports AHCI 62533296 x 512, ext4-superblock:ok, mount:rootfs:ext4:sda:ok, bootstrap-exec:path:/bin/sh, bootstrap-exec:ok, boot:ok, and the Alpine / #. No media write or saveenv occurred."
+    },
+    {
+      "command": "cargo test -p tx-drivers dwmac3; cargo test -p tx-kernel --lib dwmac3_net::tests --no-default-features; cargo test -p tx-kernel --lib irq::tests --no-default-features; cargo test -p tx-subsystems net_delegate_step_once; cargo test -p tx-hal-loongarch64-2k1000",
+      "status": "passed",
+      "notes": "Stage 5 focused results are 11/11, 3/3, 10/10, 3/3, and 21/21 respectively."
+    },
+    {
+      "command": "cargo xtask full-build --target la64-2k1000 --skip-doctor; U-Boot GMAC1 TFTP; bootm ${loadaddr}; guest ifconfig eth1 192.168.1.27 up; host ping -c 5 -W 2 192.168.1.27",
+      "status": "passed",
+      "notes": "The clean 7081920-byte payload reached both CPUs, Alpine / #, and DWMAC3 probe; host ping received 5/5 replies with zero loss and approximately 1.5 ms steady-state RTT."
+    },
+    {
+      "command": "real 2K1000: 80-character command paced at 150 ms per character; immediate echo UART_AFTER_PACED",
+      "status": "passed",
+      "notes": "Both commands and prompts were complete, validating the nonblocking UART IRQ handoff under sustained input."
+    },
+    {
+      "command": "cargo xtask full-build --target la64-qemu --skip-doctor; cargo xtask qemu --target la64-qemu --profile busybox --expect-sentinel --expect-marker <online4> --expect-marker <bidirectional-ipi> --expect-marker <masked-shootdown> --expect-marker <owner-wake> --timeout-ms 120000 --smp 4",
+      "status": "passed",
+      "notes": "A fresh LA QEMU four-vCPU run observed boot:ok plus all four explicit SMP/Pmap/reactor markers after the independent real-board GMAC changes."
+    },
+    {
+      "command": "cargo test -p tx-drivers -p tx-kernel -p tx-hal-riscv64-qemu-virt --lib dwmac -- --test-threads=1; cargo xtask build --target rv64-qemu --release; cargo xtask image vf2-uimage --release",
+      "status": "passed",
+      "notes": "The isolated DWMAC/DWMAC3 results are driver 17/17, RV HAL 3/3, and kernel binder 6/6; the release VF2 kernel and initrd uImages were generated successfully."
+    },
+    {
+      "command": "cargo xtask full-build --target rv64-qemu --skip-doctor; cargo xtask shell-test --target rv64-qemu --profile busybox --smp 4 --net-scenario tools/network-scenarios/mutations/rv64-relocated-changed-subnet.toml --script tools/shell-tests/busybox-scenario-gateway.txt",
+      "status": "passed",
+      "notes": "The relocated virtio NIC plus two-decoy changed-subnet scenario dynamically found eth0, configured 172.31.44.77/24, pinged gateway 172.31.44.9 with zero loss, and ended shell-test: ok."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "Validation remains blocked by untouched docs/progress/plans/2026-07-24-network-time-integration.json using legacy step status completed instead of complete; the Stage 5 handoff parses successfully with jq."
     }
   ],
   "next_actions": [
     {
       "id": "next-4",
-      "title": "Bring up 2K1000 GMAC and external connectivity",
+      "title": "Validate 2K1000 LAN configuration, time, DNS, TLS, and external connectivity",
       "paths": [
-        "crates/tx-drivers/src/dwmac",
-        "crates/tx-kernel/src/devices/dwmac_net.rs",
-        "boards/dtbs/ls2k1000-dp-v10.dts"
+        "boards/tx-hal-loongarch64-2k1000",
+        "crates/tx-services/src/time",
+        "local-images/alpine-linux-loongarch64-ext4fs.img"
       ],
-      "notes": "Acceptance requires link, IPv4 address, default route, DNS, correct time, TLS, and HTTPS access on the real board. Host and board commands must be clearly separated."
+      "notes": "GMAC1 link and bidirectional ICMP are complete. Acceptance still requires the real LAN address, default route, DNS, correct UTC time, CA bundle, TLS, and HTTPS access on the board. Host and board commands must be clearly separated."
     },
     {
       "id": "next-5",
@@ -288,7 +348,7 @@
     "QEMU 10.0.2.2/10.0.2.3 networking values are QEMU user-network endpoints and must not be copied to the physical 2K1000 network configuration.",
     "U-Boot and txKernel may program different IP and MAC values while taking turns controlling the same physical Ethernet hardware; U-Boot network state does not automatically carry into txKernel.",
     "Keep commands short: avoid unnecessary shell variables, if branches, printf scaffolding, generated helper scripts, and destructive cleanup commands.",
-    "The verified LIOINTC setup owns the shared UART hwirq0 route. Stage 4 models AHCI hwirq19/public IRQ20 as level-high but deliberately leaves it masked because the accepted bootstrap transport is polling; GMAC IRQs still need source-specific routing and live verification before unmasking.",
+    "The verified LIOINTC setup owns the shared UART hwirq0 route. Stage 4 models AHCI hwirq19/public IRQ20 as level-high but deliberately leaves it masked because the accepted bootstrap transport is polling. Stage 5 routes GMAC1 hwirq14/public IRQ15 level-high and masks each deferred claim until device ACK and controller completion.",
     "The one-time irq:uart-rx:ok line is the real-board proof that the first console byte traversed LIOINTC/HWI1; later input uses the same IRQ path with the existing polling reader only as fallback.",
     "For every hardware step, identify the execution context, show the shortest command, show only the key success output, and state what failure means.",
     "Do not describe intermediate repair history in user-facing knowledge documents. Record the final working chain and durable constraints only."
@@ -305,6 +365,9 @@
     "crates/tx-drivers/src/ahci/mod.rs",
     "crates/tx-kernel/src/devices/ahci_block.rs",
     "crates/tx-ext4/src/read_backend.rs",
+    "crates/tx-drivers/src/dwmac3/mod.rs",
+    "crates/tx-kernel/src/devices/dwmac3_net.rs",
+    "boards/tx-hal-loongarch64-2k1000/src/la64_dma_cache.rs",
     "msp/knowledge-handbook/08-VF2内核下载与启动链路.md",
     "msp/knowledge-handbook/09-比赛镜像识别与四平台接入.md"
   ]
