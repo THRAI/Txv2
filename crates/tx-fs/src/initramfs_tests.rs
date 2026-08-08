@@ -10,6 +10,7 @@ use crate::tmpfs::adapter::step_engine::{
 };
 use tx_subsystems::initramfs::{unpack_into_root_mount, UnpackError};
 use tx_subsystems::mount::{MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel};
+use tx_subsystems::page_backed::read_exact_at;
 use tx_subsystems::vfs::{
     DEntry, FsObjectId, FsOps, InlineName, InodeKind, RNode, RNodeBacking, S_IFMT,
 };
@@ -148,6 +149,36 @@ fn fs_ops_of(mount: &Cap<MountIdentity>) -> Arc<dyn FsOps> {
         .into_cap()
         .fs_ops
         .clone()
+}
+
+fn payload_of(mount: &Cap<MountIdentity>) -> Cap<MountPayload> {
+    mount
+        .payload_cap()
+        .expect("mount payload alive in test")
+        .into_cap()
+}
+
+fn read_regular_exact(mount: &Cap<MountIdentity>, id: FsObjectId, len: usize) -> Vec<u8> {
+    let payload = payload_of(mount);
+    let fs_ops = payload.fs_ops.clone();
+    let guard = guard();
+    let meta = match fs_ops.load_inode_meta(id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta before read: {other:?}"),
+    };
+    let rnode = match fs_ops.materialise_rnode(id, meta, &payload, &guard) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("materialise_rnode before read: {other:?}"),
+    };
+    let pc = match rnode.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        other => panic!("expected PageBacked regular file, got {other:?}"),
+    };
+    let mut out = vec![0; len];
+    match read_exact_at(&pc, 0, &mut out, &guard) {
+        StepOutcome::Done(()) => out,
+        other => panic!("read_exact_at unpacked regular file: {other:?}"),
+    }
 }
 
 #[test]
@@ -410,6 +441,9 @@ fn unpack_handles_multi_page_files() {
         other => panic!("load_inode_meta: {other:?}"),
     };
     assert_eq!(meta.size, target_len as u64);
+
+    let roundtrip = read_regular_exact(&mount, id, target_len);
+    assert_eq!(roundtrip, data);
 }
 
 #[test]
