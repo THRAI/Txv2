@@ -164,6 +164,7 @@ impl<T: 'static> Zone<T> {
         &'static self,
     ) -> Result<core::ptr::NonNull<slot::Slot<T>>, ZoneError> {
         measure_zone!(b"debug.ds.substrate.zone.pop_free_slot", T, {
+            let _local_execution = runtime::exclude_local_execution();
             let cpu_pin = runtime::pin_current_cpu()?;
             let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
             if let Some(slot) = bucket.pop() {
@@ -191,6 +192,7 @@ impl<T: 'static> Zone<T> {
     }
 
     pub(crate) fn flush_current_cpu_bucket(&'static self) -> Result<(), ZoneError> {
+        let _local_execution = runtime::exclude_local_execution();
         let cpu_pin = runtime::pin_current_cpu()?;
         let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
         self.drain_bucket_to_keg(bucket);
@@ -335,6 +337,10 @@ pub mod testing {
 
     pub fn init_for_test(page_size: usize, direct_map_base: usize) -> Result<(), super::ZoneError> {
         super::runtime::init_for_test(page_size, direct_map_base)
+    }
+
+    pub fn set_direct_map_base_for_test(direct_map_base: usize) -> Result<(), super::ZoneError> {
+        super::runtime::set_direct_map_base_for_test(direct_map_base)
     }
 
     /// Return a `Cap` pointing at the reserved (not yet live) slot.

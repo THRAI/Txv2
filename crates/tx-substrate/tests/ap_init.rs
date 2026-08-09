@@ -3,10 +3,11 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tx_hal::{
     Arch, AuxvIf, BootInfo, BootInfoIf, BootPlatformIf, BootProtocol, CacheIf, ConsoleIf, CpuId,
-    CpuMask, DeadlineTimerIf, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, MonotonicCounterIf,
-    ObserverIf, PercpuIf, PersistentClockIf, PhysRange, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TrapIf, VirtAddr,
+    CpuMask, CpuPinGuard, DeadlineTimerIf, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion,
+    MonotonicCounterIf, ObserverIf, PercpuIf, PersistentClockIf, PhysRange, PlatformConfig,
+    PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TrapIf, VirtAddr,
 };
+use tx_substrate::zone::{Zone, ZoneAllocated};
 use tx_substrate::{epoch, zone};
 
 static AP_INIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -14,6 +15,22 @@ static CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static POSSIBLE_CPUS: AtomicU64 = AtomicU64::new(0b11);
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0b1);
 static RECLAIM_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_EXECUTION_DEPTHS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+static CPU_PIN_DEPTHS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+static LOCAL_EXCLUSION_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PINS_WHILE_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+static UNPINS_WHILE_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Eq, PartialEq)]
+struct ApZoneObject(u64);
+
+static AP_ZONE: Zone<ApZoneObject> = Zone::const_new();
+
+unsafe impl ZoneAllocated for ApZoneObject {
+    fn zone() -> &'static Zone<Self> {
+        &AP_ZONE
+    }
+}
 
 static BOOT_MEMORY: [MemoryRegion; 0] = [];
 static BOOT_INFO: BootInfo = BootInfo {
@@ -73,10 +90,28 @@ impl ConsoleIf for TestPlatform {
 impl PmapIf for TestPlatform {}
 impl TrapIf for TestPlatform {}
 impl SignalFrameIf for TestPlatform {}
-unsafe fn restore_test_local_execution(_: usize) {}
+unsafe fn restore_test_local_execution(saved_state: usize) {
+    let cpu = saved_state >> 16;
+    let previous_depth = saved_state & 0xffff;
+    assert_eq!(CURRENT_CPU.load(Ordering::Acquire), cpu);
+    let observed = LOCAL_EXECUTION_DEPTHS[cpu].fetch_sub(1, Ordering::AcqRel);
+    assert_eq!(observed, previous_depth + 1);
+    if previous_depth == 0 {
+        assert_eq!(CPU_PIN_DEPTHS[cpu].load(Ordering::Acquire), 0);
+    }
+}
 impl IrqIf for TestPlatform {
     fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
-        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+        let cpu = CURRENT_CPU.load(Ordering::Acquire);
+        let previous_depth = LOCAL_EXECUTION_DEPTHS[cpu].fetch_add(1, Ordering::AcqRel);
+        assert!(previous_depth < 0xffff);
+        LOCAL_EXCLUSION_CALLS.fetch_add(1, Ordering::AcqRel);
+        unsafe {
+            tx_hal::LocalExecutionGuard::new(
+                (cpu << 16) | previous_depth,
+                restore_test_local_execution,
+            )
+        }
     }
 }
 impl EntropyIf for TestPlatform {}
@@ -103,6 +138,23 @@ impl PercpuIf for TestPlatform {
     fn current_cpu_id() -> CpuId {
         CpuId(CURRENT_CPU.load(Ordering::Acquire))
     }
+
+    fn pin_current_cpu() -> CpuPinGuard {
+        let cpu = CURRENT_CPU.load(Ordering::Acquire);
+        if LOCAL_EXECUTION_DEPTHS[cpu].load(Ordering::Acquire) > 0 {
+            PINS_WHILE_EXCLUDED.fetch_add(1, Ordering::AcqRel);
+        }
+        CPU_PIN_DEPTHS[cpu].fetch_add(1, Ordering::AcqRel);
+        CpuPinGuard::with_unpin(CpuId(cpu), unpin_test_cpu)
+    }
+}
+
+fn unpin_test_cpu(cpu: CpuId) {
+    if LOCAL_EXECUTION_DEPTHS[cpu.0].load(Ordering::Acquire) > 0 {
+        UNPINS_WHILE_EXCLUDED.fetch_add(1, Ordering::AcqRel);
+    }
+    let previous = CPU_PIN_DEPTHS[cpu.0].fetch_sub(1, Ordering::AcqRel);
+    assert!(previous > 0);
 }
 
 impl ObserverIf for TestPlatform {}
@@ -137,8 +189,21 @@ fn reset_runtime(possible_cpus: CpuMask, current_cpu: CpuId, online_cpus: CpuMas
     CURRENT_CPU.store(current_cpu.0, Ordering::Release);
     ONLINE_CPUS.store(online_cpus.bits(), Ordering::Release);
     RECLAIM_COUNT.store(0, Ordering::Release);
+    LOCAL_EXCLUSION_CALLS.store(0, Ordering::Release);
+    PINS_WHILE_EXCLUDED.store(0, Ordering::Release);
+    UNPINS_WHILE_EXCLUDED.store(0, Ordering::Release);
+    for depth in &LOCAL_EXECUTION_DEPTHS {
+        depth.store(0, Ordering::Release);
+    }
+    for depth in &CPU_PIN_DEPTHS {
+        depth.store(0, Ordering::Release);
+    }
     epoch::init_on_bsp::<TestPlatform>().expect("epoch bsp init");
     zone::init_on_bsp::<TestPlatform>().expect("zone bsp init");
+    zone::testing::set_direct_map_base_for_test(
+        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
+    )
+    .expect("host zone direct map");
 }
 
 unsafe fn count_reclaim(_ptr: *mut u8) {
@@ -165,6 +230,39 @@ fn substrate_ap_init_makes_epoch_guard_valid_on_secondary_cpu() {
     let guard = epoch::guard();
 
     assert_eq!(guard.cpu_id(), CpuId(1));
+}
+
+#[test]
+fn zone_bucket_and_keg_exclude_local_execution_on_each_cpu() {
+    let _guard = AP_INIT_TEST_LOCK.lock().expect("ap init test lock");
+    reset_runtime(
+        CpuMask::from_bits(0b11),
+        CpuId(0),
+        CpuMask::single(CpuId(0)),
+    );
+    zone::register_zone_for::<ApZoneObject>().expect("register AP zone");
+
+    let bsp_cap = zone::sign(ApZoneObject(10)).expect("BSP zone sign");
+    let bsp_clone = bsp_cap.clone();
+    assert_eq!(bsp_clone.0, 10);
+    drop(bsp_clone);
+
+    CURRENT_CPU.store(1, Ordering::Release);
+    ONLINE_CPUS.store(0b11, Ordering::Release);
+    tx_substrate::init_on_ap(CpuId(1)).expect("AP substrate init");
+
+    let ap_cap = zone::sign(ApZoneObject(20)).expect("AP zone sign");
+    let ap_clone = ap_cap.clone();
+    assert_eq!(ap_clone.0, 20);
+    drop(ap_clone);
+
+    assert!(LOCAL_EXCLUSION_CALLS.load(Ordering::Acquire) > 0);
+    assert!(PINS_WHILE_EXCLUDED.load(Ordering::Acquire) > 0);
+    assert!(UNPINS_WHILE_EXCLUDED.load(Ordering::Acquire) > 0);
+    assert_eq!(LOCAL_EXECUTION_DEPTHS[0].load(Ordering::Acquire), 0);
+    assert_eq!(LOCAL_EXECUTION_DEPTHS[1].load(Ordering::Acquire), 0);
+    assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 0);
+    assert_eq!(CPU_PIN_DEPTHS[1].load(Ordering::Acquire), 0);
 }
 
 #[test]

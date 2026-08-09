@@ -7,7 +7,9 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use tx_hal::{CpuId, CpuPinGuard, PercpuIf, PhysAddr, SmpIf, TxPlatform};
+use tx_hal::{
+    CpuId, CpuPinGuard, IrqIf, LocalExecutionGuard, PercpuIf, PhysAddr, SmpIf, TxPlatform,
+};
 
 use super::ZoneError;
 
@@ -165,6 +167,10 @@ pub fn pin_current_cpu() -> Result<CpuPinGuard, ZoneError> {
     }
 }
 
+pub(crate) fn exclude_local_execution() -> LocalExecutionGuard {
+    unsafe { ((*HOOKS.get()).exclude_local_execution)() }
+}
+
 pub fn page_size() -> usize {
     PAGE_SIZE.load(Ordering::Acquire)
 }
@@ -181,6 +187,16 @@ pub fn direct_map_ptr(phys: PhysAddr) -> Result<*mut u8, ZoneError> {
 }
 
 #[doc(hidden)]
+pub fn set_direct_map_base_for_test(direct_map_base: usize) -> Result<(), ZoneError> {
+    ensure_running()?;
+    if direct_map_base == 0 {
+        return Err(ZoneError::InvalidState);
+    }
+    DIRECT_MAP_BASE.store(direct_map_base, Ordering::Release);
+    Ok(())
+}
+
+#[doc(hidden)]
 pub unsafe fn reset_for_test() {
     ZONE_RUNTIME_INITIALIZED.store(false, Ordering::Release);
     ZONE_RUNTIME_STATE.store(ZoneRuntimeState::NotReady as usize, Ordering::Release);
@@ -194,21 +210,24 @@ pub unsafe fn reset_for_test() {
 
 struct RuntimeHooks {
     pin_current_cpu: fn() -> CpuPinGuard,
+    exclude_local_execution: fn() -> LocalExecutionGuard,
 }
 
 impl RuntimeHooks {
     const fn default() -> Self {
         Self {
             pin_current_cpu: default_pin_current_cpu,
+            exclude_local_execution: default_exclude_local_execution,
         }
     }
 
     fn for_platform<P>() -> Self
     where
-        P: PercpuIf + SmpIf,
+        P: IrqIf + PercpuIf + SmpIf,
     {
         Self {
             pin_current_cpu: P::pin_current_cpu,
+            exclude_local_execution: P::exclude_local_execution,
         }
     }
 }
@@ -216,6 +235,12 @@ impl RuntimeHooks {
 fn default_pin_current_cpu() -> CpuPinGuard {
     CpuPinGuard::new(CpuId(0))
 }
+
+fn default_exclude_local_execution() -> LocalExecutionGuard {
+    unsafe { LocalExecutionGuard::new(0, default_restore_local_execution) }
+}
+
+unsafe fn default_restore_local_execution(_saved_state: usize) {}
 
 fn is_possible_cpu(cpu: CpuId) -> bool {
     cpu.0 < MAX_ZONE_CPUS

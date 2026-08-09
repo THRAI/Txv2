@@ -5,6 +5,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use tx_hal::LocalExecutionGuard;
+
 pub(crate) struct SpinLock {
     /// False means unlocked, true means held.
     held: AtomicBool,
@@ -18,19 +20,25 @@ impl SpinLock {
     }
 
     pub(crate) fn lock(&self) -> SpinGuard<'_> {
+        let local_execution = super::runtime::exclude_local_execution();
+        let mut wait = crate::SpinWait::new();
         while self
             .held
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            wait.tick();
         }
-        SpinGuard { lock: self }
+        SpinGuard {
+            lock: self,
+            _local_execution: local_execution,
+        }
     }
 }
 
 pub(crate) struct SpinGuard<'a> {
     lock: &'a SpinLock,
+    _local_execution: LocalExecutionGuard,
 }
 
 impl Drop for SpinGuard<'_> {
