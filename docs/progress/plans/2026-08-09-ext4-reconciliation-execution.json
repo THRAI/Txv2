@@ -236,7 +236,7 @@
         "resolver shim is versioned, idempotently installed only into WORKLOAD, and leaves generic Alpine unchanged",
         "QEMU proves rustc -vV and a clean offline frozen build over TEST, SCRATCH, and read-only WORKLOAD images"
       ],
-      "notes": "The high-DTB direct-map prerequisite is complete: the pre-entry trampoline maps the firmware leaf before BootInfo parsing, and direct-map extension accounts for that preinstalled leaf (95 focused board tests passed). Current qemu and shell-test entry points now also accept named TEST/SCRATCH/WORKLOAD paths, reject mixed legacy/named or duplicate roles, assign stable vda/vdb/vdc cmdline identities, and attach only WORKLOAD read-only. The fixture-non-evidence rustc workload contract has been imported without its obsolete xtask perf command path. It defines the desired offline/frozen command, role-image names, and 4096 MiB geometry, but has placeholder pins and no runtime authority. The resolver must still be versioned and WORKLOAD-only, and RV64 QEMU must still prove rustc -vV plus the clean frozen build. Decode any boot fault with cargo xtask fault-decode; do not change global QEMU or tmpfs defaults."
+      "notes": "The high-DTB direct-map prerequisite is complete: the pre-entry trampoline maps the firmware leaf before BootInfo parsing, and direct-map extension accounts for that preinstalled leaf (95 focused board tests passed). Current qemu and shell-test entry points accept named TEST/SCRATCH/WORKLOAD paths, reject mixed legacy/named or duplicate roles, assign stable vda/vdb/vdc cmdline identities, and attach only WORKLOAD read-only. The materializer copies source/vendor and the pre-materialized rustc wrapper only to TEST, and the toolchain plus resolver shim only to WORKLOAD. The production runner now uses set -eu, an absolute TEST manifest path, exported wrapper environment, and bounded TX_GUEST_RUST_STAGE markers with Cargo -vv diagnostics. Real RV64 QEMU proves rustc -vV, cargo -V, and offline cargo metadata in the named topology. A default-kernel frozen build remained CPU-bound for 1,800,000 ms after rustc startup and emitted no TX_GUEST_RUST_BUILD status=0 marker; a shorter stage probe again reached rustc -vV without a post-probe marker. M1/M2 remains pending on a complete build receipt. Do not claim acceptance from loader or metadata-only evidence; do not change global QEMU or tmpfs defaults."
     },
     {
       "id": "m3-performance-handoff",
@@ -359,6 +359,21 @@
       "command": "cargo test -p xtask -- --test-threads=1 && cargo xtask ext4 tier1 --dry-run",
       "status": "passed",
       "notes": "450 xtask tests passed on 2026-08-09. Named TEST/SCRATCH/WORKLOAD role drives preserve the legacy tier1 shell invocation, assign vda/vdb/vdc, and attach WORKLOAD read-only; Tier 1 dry-run remains green."
+    },
+    {
+      "command": "python3 -m unittest tools/tests/test_ext4_rustc_workload.py && cargo test -p xtask shell_test -- --test-threads=1",
+      "status": "passed",
+      "notes": "Four Python workload-contract tests and 13 shell-test role/memory/harness tests passed after the runner portability and QEMU early-exit/reap fixes."
+    },
+    {
+      "command": "cargo xtask shell-test --target rv64-qemu --profile alpine --memory-mib 4096 --script tools/shell-tests/ext4-rustc-cargo-metadata-witness.scn",
+      "status": "passed",
+      "notes": "Real RV64 QEMU completed Cargo metadata with the TEST/SCRATCH/WORKLOAD topology; the serial receipt contains ext4-cargo-metadata-status:0. This is diagnostic/workspace evidence, not a kernel-build receipt."
+    },
+    {
+      "command": "python3 tools/ext4/run_rustc_kernel_workload.py ... --timeout-ms 1800000",
+      "status": "failed",
+      "notes": "The default-kernel real RV64 runner printed rustc 1.89.0 and remained CPU-bound in Cargo for 30 minutes, then timed out without TX_GUEST_RUST_BUILD status=0. No M1/M2 completion or Tier 1 acceptance claim is allowed."
     },
     {
       "command": "cargo xtask progress validate",

@@ -1,3 +1,35 @@
+- 2026-08-09 (ext4 M1 rustc materialization path).
+  Added a current-interface TEST/SCRATCH/WORKLOAD materializer, a
+  WORKLOAD-copy-only resolver installer, and a guest runner that uses named
+  role flags with explicit 4096 MiB geometry. Focused xtask/Python checks and
+  role dry-run rendering passed. A temporary clean fixture source produced all
+  three images through Homebrew e2fsprogs and each passed `e2fsck -fn`;
+  `debugfs` confirmed the resolver exists only in WORKLOAD. The fixture used
+  fake compiler binaries, so a measured RV64 toolchain and QEMU rustc build
+  receipt are still missing and M1/M2 remains open.
+  See `docs/progress/research/2026-08-09-ext4-rustc-materialization-path.md`.
+
+- 2026-08-09 (ext4 M1 real guest boundary and remaining build blocker).
+  Real RV64 QEMU now proves `rustc -vV`, `cargo -V`, and offline Cargo
+  metadata over TEST=`vda`, SCRATCH=`vdb`, and read-only WORKLOAD=`vdc`.
+  The runner uses an absolute TEST manifest path, exports the TEST-side
+  rustc-wrapper environment, and is portable to Alpine BusyBox `sh`. The
+  sequential shell-test harness now detects early QEMU exit, joins readers,
+  and writes serial logs before returning. A default-kernel frozen build was
+  bounded at 1,800,000 ms; it remained CPU-bound after the rustc probe and
+  emitted no `TX_GUEST_RUST_BUILD status=0`. Therefore M1/M2 is still open,
+  and no M3 or Tier 1 acceptance claim is made. Next: profile the guest build
+  progress and bind only a complete status-0 receipt; blocker: measured RV64
+  full-build completion is still missing.
+
+- 2026-08-09 (ext4 rustc bounded stage probe).
+  The guest runner now emits preflight, rustc-version, and Cargo-build stage
+  markers and enables Cargo `-vv` for bounded diagnostics. A follow-up probe
+  again reached the real `rustc -vV` output but produced no post-probe marker
+  before being stopped, narrowing the next investigation to Cargo startup or
+  its first compiler invocation. This is diagnostic evidence only; the full
+  status-0 build receipt remains required and M1/M2 stays open.
+
 - 2026-08-09 (ext4 M1 named role-image QEMU wiring).
   `qemu` and `shell-test` now accept distinct TEST/SCRATCH/WORKLOAD images,
   publish their stable RV64 device roles, and present only WORKLOAD as a

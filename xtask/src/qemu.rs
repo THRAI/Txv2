@@ -22,6 +22,7 @@ struct QemuOptions {
     expect_markers: Vec<String>,
     timeout: Duration,
     smp: Option<usize>,
+    memory_mib: Option<usize>,
     /// Skip the busybox-profile virtio-blk drive wiring. Used by smoke
     /// runs that only need the initramfs to come up; it sidesteps the
     /// `mkfs.ext4` host-tool dependency.
@@ -159,6 +160,20 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
                 })
         })
         .transpose()?;
+    let memory_mib = optional_option_value(args, "--memory-mib")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|err| format!("invalid --memory-mib value '{value}': {err}"))
+                .and_then(|value| {
+                    if value == 0 {
+                        Err("--memory-mib must be greater than zero".into())
+                    } else {
+                        Ok(value)
+                    }
+                })
+        })
+        .transpose()?;
 
     let expect_sentinel = args.iter().any(|arg| arg == "--expect-sentinel");
     let expect_markers = option_values(args, "--expect-marker")?;
@@ -175,6 +190,7 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
         expect_markers,
         timeout,
         smp,
+        memory_mib,
         no_block: args.iter().any(|arg| arg == "--no-block"),
         interactive: args.iter().any(|arg| arg == "--interactive"),
         boot_mode,
@@ -384,7 +400,10 @@ fn qemu_command(
 
     args.extend([
         "-m".to_string(),
-        qemu_memory(target, profile).to_string(),
+        options
+            .memory_mib
+            .map(|value| format!("{value}M"))
+            .unwrap_or_else(|| qemu_memory(target, profile).to_string()),
         "-smp".to_string(),
         qemu_smp(target, profile, options).to_string(),
         // Force multi-threaded TCG: vCPUs run on parallel host threads
@@ -1009,6 +1028,7 @@ mod tests {
             expect_markers: Vec::new(),
             timeout: Duration::from_secs(10),
             smp: None,
+            memory_mib: None,
             no_block: false,
             interactive: false,
             boot_mode: None,
@@ -1202,6 +1222,45 @@ mod tests {
             "tx.profile=smoke tx.boot.mode=smoke init=/tx-test-init tx.test_init=1 console=ttyS0"
         ));
         assert!(!rendered.contains("-drive file=target/images/smoke.ext4"));
+    }
+
+    #[test]
+    fn qemu_memory_override_is_explicit_and_rejects_zero() {
+        let options = qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "alpine".into(),
+                "--memory-mib".into(),
+                "4096".into(),
+            ],
+        )
+        .expect("parse memory override");
+        assert_eq!(options.memory_mib, Some(4096));
+        assert!(qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            &options
+        )
+        .unwrap()
+        .join(" ")
+        .contains("-m 4096M"));
+        assert!(qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "alpine".into(),
+                "--memory-mib".into(),
+                "0".into()
+            ],
+        )
+        .unwrap_err()
+        .contains("greater than zero"));
     }
 
     #[test]

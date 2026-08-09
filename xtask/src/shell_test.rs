@@ -77,13 +77,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::Result;
 use crate::image::{alpine_initramfs_name, busybox_initramfs_name};
 use crate::target::{Profile, TxTarget};
 use crate::util::{
     append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
     resolve_path, validate_boot_mode_value,
 };
-use crate::Result;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONTROL_KEY_DELAY: Duration = Duration::from_millis(25);
@@ -147,6 +147,19 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         })
         .transpose()?
         .unwrap_or(1);
+    let memory_mib = optional_option_value(&args, "--memory-mib")
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|err| format!("invalid --memory-mib value '{s}': {err}"))
+                .and_then(|value| {
+                    if value == 0 {
+                        Err("--memory-mib must be greater than zero".into())
+                    } else {
+                        Ok(value)
+                    }
+                })
+        })
+        .transpose()?;
     let jobs: usize = optional_option_value(&args, "--jobs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4)
@@ -248,38 +261,42 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let ext4_block_images = ext4_block_images.clone();
                 let boot_mode = boot_mode.clone();
                 let append_cmdline = append_cmdline.clone();
-                thread::spawn(move || loop {
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    if idx >= groups.len() {
-                        break;
-                    }
-                    let group = &groups[idx];
-                    let run = IsolatedGroupRun {
-                        root: &root,
-                        target,
-                        profile,
-                        smp,
-                        extra_rv64_ext4: &extra_rv64_ext4,
-                        ext4_block_images: &ext4_block_images,
-                        boot_mode: boot_mode.as_deref(),
-                        append_cmdline: append_cmdline.as_deref(),
-                        setup: &setup,
-                        group,
-                    };
-                    let (captured, group_err) = run_group_isolated(&run);
-                    let result = match group_err {
-                        None => Ok(()),
-                        Some(err) => {
-                            println!(
-                                "\n--- [{}] captured output ({} bytes) ---",
-                                group.name,
-                                captured.len()
-                            );
-                            println!("{captured}");
-                            Err(err)
+                let memory_mib = memory_mib;
+                thread::spawn(move || {
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= groups.len() {
+                            break;
                         }
-                    };
-                    results.lock().unwrap().push((group.name.clone(), result));
+                        let group = &groups[idx];
+                        let run = IsolatedGroupRun {
+                            root: &root,
+                            target,
+                            profile,
+                            smp,
+                            memory_mib,
+                            extra_rv64_ext4: &extra_rv64_ext4,
+                            ext4_block_images: &ext4_block_images,
+                            boot_mode: boot_mode.as_deref(),
+                            append_cmdline: append_cmdline.as_deref(),
+                            setup: &setup,
+                            group,
+                        };
+                        let (captured, group_err) = run_group_isolated(&run);
+                        let result = match group_err {
+                            None => Ok(()),
+                            Some(err) => {
+                                println!(
+                                    "\n--- [{}] captured output ({} bytes) ---",
+                                    group.name,
+                                    captured.len()
+                                );
+                                println!("{captured}");
+                                Err(err)
+                            }
+                        };
+                        results.lock().unwrap().push((group.name.clone(), result));
+                    }
                 })
             })
             .collect();
@@ -327,6 +344,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         &extra_rv64_ext4,
         append_cmdline.as_deref(),
         boot_mode.as_deref(),
+        memory_mib,
     )?;
     append_ext4_role_images(&mut qemu_cmd, target, &ext4_block_images)?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
@@ -344,8 +362,8 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         .map_err(|err| format!("failed to spawn {program}: {err}"))?;
 
     let buffer = Arc::new(Mutex::new(String::new()));
-    let _ = spawn_reader(&mut child, "stdout", Arc::clone(&buffer), true);
-    let _ = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), true);
+    let h_out = spawn_reader(&mut child, "stdout", Arc::clone(&buffer), true);
+    let h_err = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), true);
 
     let mut anchor = 0usize;
     let mut group_results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
@@ -415,6 +433,10 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     // QEMU doesn't linger past the test.
     let _ = child.kill();
     let _ = child.wait();
+    // Drain both pipes before writing the optional serial log. This keeps
+    // late QEMU diagnostics from racing the snapshot after process exit.
+    let _ = h_out.join();
+    let _ = h_err.join();
 
     if let Some(path) = &serial_log {
         write_serial_log(path, &buffer)?;
@@ -517,7 +539,7 @@ fn run_block(
                 unreachable!("Directive::Group should not survive parse_script");
             }
             Directive::Wait { needle, timeout } => {
-                if let Err(err) = wait_for(buffer, 0, needle, *timeout) {
+                if let Err(err) = wait_for(child, buffer, 0, needle, *timeout) {
                     return Ok(Some(err));
                 }
             }
@@ -537,7 +559,7 @@ fn run_block(
                 send_interactive_bytes(stdin, text.as_bytes())?;
             }
             Directive::Expect { needle, timeout } => {
-                if let Err(err) = wait_for(buffer, *script_anchor, needle, *timeout) {
+                if let Err(err) = wait_for(child, buffer, *script_anchor, needle, *timeout) {
                     return Ok(Some(err));
                 }
             }
@@ -574,6 +596,7 @@ fn run_block(
 }
 
 fn wait_for(
+    child: &mut Child,
     buffer: &Arc<Mutex<String>>,
     start_offset: usize,
     needle: &str,
@@ -588,6 +611,17 @@ fn wait_for(
                     return Ok(());
                 }
             }
+        }
+        if let Some(status) = child.try_wait().map_err(|err| {
+            format!(
+                "failed to poll QEMU status while waiting for {:?}: {err}",
+                needle
+            )
+        })? {
+            return Err(format!(
+                "QEMU exited with {status} while waiting for {:?}",
+                needle
+            ));
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -893,6 +927,7 @@ struct IsolatedGroupRun<'a> {
     target: TxTarget,
     profile: Profile,
     smp: usize,
+    memory_mib: Option<usize>,
     extra_rv64_ext4: &'a [PathBuf],
     ext4_block_images: &'a Ext4BlockImages,
     boot_mode: Option<&'a str>,
@@ -930,6 +965,7 @@ fn run_group_isolated_inner(
         run.extra_rv64_ext4,
         run.append_cmdline,
         run.boot_mode,
+        run.memory_mib,
     ) {
         Ok(c) => c,
         Err(e) => return Some(format!("qemu command: {e}")),
@@ -1005,6 +1041,7 @@ fn build_qemu_command(
     extra_rv64_ext4: &[PathBuf],
     append_cmdline: Option<&str>,
     boot_mode: Option<&str>,
+    memory_mib: Option<usize>,
 ) -> Result<Vec<String>> {
     // Reuse the existing qemu_command builder by constructing an
     // args list and invoking the same dispatcher path. We can't call
@@ -1025,12 +1062,16 @@ fn build_qemu_command(
         "-machine".into(),
         target.qemu_machine().to_string(),
         "-m".into(),
-        match (target, profile) {
-            (TxTarget::La64Qemu, _) => "1152M",
-            (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
-            (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
-        }
-        .into(),
+        memory_mib
+            .map(|value| format!("{value}M"))
+            .unwrap_or_else(|| {
+                match (target, profile) {
+                    (TxTarget::La64Qemu, _) => "1152M",
+                    (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
+                    (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
+                }
+                .to_string()
+            }),
         "-smp".into(),
         smp.to_string(),
         "-accel".into(),
@@ -1220,6 +1261,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1246,9 +1288,26 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .expect("build qemu command");
         assert!(command.join(" ").contains("-smp 4"));
+    }
+
+    #[test]
+    fn shell_test_qemu_command_honors_explicit_memory_override() {
+        let command = build_qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            &[],
+            None,
+            None,
+            Some(4096),
+        )
+        .expect("build qemu command");
+        assert!(command.join(" ").contains("-m 4096M"));
     }
 
     #[test]
@@ -1261,6 +1320,7 @@ mod tests {
             Profile::Alpine,
             1,
             &[image],
+            None,
             None,
             None,
         )
@@ -1287,6 +1347,7 @@ mod tests {
             &images,
             None,
             None,
+            None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1310,6 +1371,7 @@ mod tests {
             Profile::Alpine,
             1,
             &[],
+            None,
             None,
             None,
         )
@@ -1399,6 +1461,7 @@ wait "never" within 1
             &[],
             Some("tx.mount.sdcard=0"),
             None,
+            None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1419,6 +1482,7 @@ wait "never" within 1
             &[],
             None,
             Some("contest"),
+            None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
