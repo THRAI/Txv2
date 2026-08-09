@@ -1,3 +1,13 @@
+- 2026-08-09 (ext4 rustc workload contract disposition).
+  Imported only the standalone `fixture-non-evidence` native-RV64 rustc
+  workload manifest into the reconciliation worktree. Its pinned command,
+  role-image topology, and 4096 MiB geometry are an executable-contract
+  template, not measured evidence. The historical `xtask/src/ext4.rs` perf
+  path was intentionally not merged because current `xtask/src/ext4/mod.rs`
+  has the later Tier 1-only interface; guest, resolver, materializer, and
+  receipt paths remain M1/M3 work pending current-interface bindings. See
+  `docs/progress/research/2026-08-09-ext4-rustc-contract-disposition.md`.
+
 - 2026-08-09 (ext4 A6 Linux depth-three runtime interoperability).
   The ignored 3 GiB Docker/debugfs witness now retains the Tier 1
   `metadata_csum` profile while Linux creates a depth-three fragmented tree and

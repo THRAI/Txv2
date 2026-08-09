@@ -234,7 +234,7 @@
         "resolver shim is versioned, idempotently installed only into WORKLOAD, and leaves generic Alpine unchanged",
         "QEMU proves rustc -vV and a clean offline frozen build over TEST, SCRATCH, and read-only WORKLOAD images"
       ],
-      "notes": "Decode any boot fault with cargo xtask fault-decode; do not change global QEMU or tmpfs defaults."
+      "notes": "The fixture-non-evidence rustc workload contract has been imported without its obsolete xtask perf command path. It defines the desired offline/frozen command, role-image names, and 4096 MiB geometry, but has placeholder pins and no runtime authority. Decode any boot fault with cargo xtask fault-decode; do not change global QEMU or tmpfs defaults."
     },
     {
       "id": "m3-performance-handoff",
