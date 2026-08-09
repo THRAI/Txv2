@@ -1902,6 +1902,199 @@ fn pager_converts_depth_three_unwritten_leaf_without_new_claims() {
 }
 
 #[test]
+fn pager_splits_full_depth_three_unwritten_leaf_without_data_claim() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 53);
+    let extents = full_unwritten_extent_leaf();
+    ExtentNode::encode_leaf(&extents, image.block_mut(52)).unwrap();
+    ExtentNode::encode_index(
+        1,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 52,
+        }],
+        image.block_mut(51),
+    )
+    .unwrap();
+    ExtentNode::encode_index(
+        2,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 51,
+        }],
+        image.block_mut(50),
+    )
+    .unwrap();
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o644;
+    inode.size = 342 * BLOCK_SIZE as u64;
+    inode.blocks_512 = 24;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_index_root(
+            &[ExtentIdx {
+                logical_block: 0,
+                child: 50,
+            }],
+            3,
+        )
+        .unwrap();
+    write_inode(&mut image, 12, &inode);
+    let inode_before = *image.block(4);
+    let grandparent_before = *image.block(50);
+    let parent_before = *image.block(51);
+    let leaf_before = *image.block(52);
+    let bitmap_before = *image.block(2);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 1, &filled_page(0xD9), FsyncStamp::new(62))
+        .unwrap();
+
+    assert_eq!(plan.data[0].physical_block, 1001);
+    assert_eq!(
+        plan.allocations
+            .iter()
+            .map(|claim| claim.physical_block)
+            .collect::<Vec<_>>(),
+        vec![53]
+    );
+    let extent_homes = plan
+        .metadata
+        .iter()
+        .filter(|metadata| metadata.role == tx_ext4_format::mutation::MetaRole::ExtentNode)
+        .map(|metadata| metadata.home)
+        .collect::<Vec<_>>();
+    assert_eq!(extent_homes, vec![52, 53, 51]);
+    let parent_after = plan
+        .metadata
+        .iter()
+        .find(|metadata| metadata.home == 51)
+        .unwrap();
+    let parent_indexes = match ExtentNode::parse(&parent_after.after).unwrap() {
+        ExtentNode::Index(indexes) => indexes,
+        ExtentNode::Leaf(_) => panic!("depth-one parent must remain indexed"),
+    };
+    assert_eq!(parent_indexes.len(), 2);
+    assert_eq!(parent_indexes[0].child, 52);
+    assert_eq!(parent_indexes[1].child, 53);
+    let inode_after = Inode::parse(
+        &plan
+            .metadata
+            .iter()
+            .find(|metadata| metadata.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+            .unwrap()
+            .after[11 * 256..12 * 256],
+    )
+    .unwrap();
+    assert_eq!(inode_after.blocks_512, 32);
+    assert_eq!(pager.image().block(4), &inode_before);
+    assert_eq!(pager.image().block(50), &grandparent_before);
+    assert_eq!(pager.image().block(51), &parent_before);
+    assert_eq!(pager.image().block(52), &leaf_before);
+    assert_eq!(pager.image().block(2), &bitmap_before);
+    assert_eq!(extents.len(), 340);
+}
+
+#[test]
+fn pager_carries_depth_three_unwritten_leaf_split_to_the_root() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 53);
+    ExtentNode::encode_leaf(&full_unwritten_extent_leaf(), image.block_mut(52)).unwrap();
+    ExtentNode::encode_index(
+        1,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 52,
+        }],
+        image.block_mut(51),
+    )
+    .unwrap();
+    image.block_mut(51)[4..6].copy_from_slice(&1u16.to_le_bytes());
+    ExtentNode::encode_index(
+        2,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 51,
+        }],
+        image.block_mut(50),
+    )
+    .unwrap();
+    image.block_mut(50)[4..6].copy_from_slice(&1u16.to_le_bytes());
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o644;
+    inode.size = 342 * BLOCK_SIZE as u64;
+    inode.blocks_512 = 24;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_index_root(
+            &[ExtentIdx {
+                logical_block: 0,
+                child: 50,
+            }],
+            3,
+        )
+        .unwrap();
+    write_inode(&mut image, 12, &inode);
+    let inode_before = *image.block(4);
+    let grandparent_before = *image.block(50);
+    let parent_before = *image.block(51);
+    let leaf_before = *image.block(52);
+    let bitmap_before = *image.block(2);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 1, &filled_page(0xDA), FsyncStamp::new(63))
+        .unwrap();
+
+    assert_eq!(plan.data[0].physical_block, 1001);
+    assert_eq!(
+        plan.allocations
+            .iter()
+            .map(|claim| claim.physical_block)
+            .collect::<Vec<_>>(),
+        vec![53, 54, 55]
+    );
+    let extent_homes = plan
+        .metadata
+        .iter()
+        .filter(|metadata| metadata.role == tx_ext4_format::mutation::MetaRole::ExtentNode)
+        .map(|metadata| metadata.home)
+        .collect::<Vec<_>>();
+    assert_eq!(extent_homes, vec![52, 53, 51, 54, 50, 55]);
+    let inode_after = Inode::parse(
+        &plan
+            .metadata
+            .iter()
+            .find(|metadata| metadata.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+            .unwrap()
+            .after[11 * 256..12 * 256],
+    )
+    .unwrap();
+    assert_eq!(inode_after.blocks_512, 48);
+    assert_eq!(
+        ExtentHeader::parse(inode_after.extent_root_bytes())
+            .unwrap()
+            .depth,
+        3
+    );
+    let root_indexes = match ExtentNode::parse(inode_after.extent_root_bytes()).unwrap() {
+        ExtentNode::Index(indexes) => indexes,
+        ExtentNode::Leaf(_) => panic!("carried root must remain indexed"),
+    };
+    assert_eq!(root_indexes.len(), 2);
+    assert_eq!(root_indexes[0].child, 50);
+    assert_eq!(root_indexes[1].child, 55);
+    assert_eq!(pager.image().block(4), &inode_before);
+    assert_eq!(pager.image().block(50), &grandparent_before);
+    assert_eq!(pager.image().block(51), &parent_before);
+    assert_eq!(pager.image().block(52), &leaf_before);
+    assert_eq!(pager.image().block(2), &bitmap_before);
+}
+
+#[test]
 fn destroy_plan_frees_zero_link_regular_inode_without_home_write() {
     let mut image = mock_image();
     mark_block_bitmap_used(&mut image, 31);
@@ -3772,6 +3965,20 @@ fn mark_inode_bitmap_used(image: &mut MemImage, count: usize) {
     for bit in 0..count {
         bm.set(bit).unwrap();
     }
+}
+
+fn full_unwritten_extent_leaf() -> Vec<Extent> {
+    let mut extents = vec![Extent {
+        logical_block: 0,
+        len: Extent::UNINITIALIZED_MASK | 3,
+        physical_start: 1000,
+    }];
+    extents.extend((0..339u32).map(|index| Extent {
+        logical_block: index + 3,
+        len: Extent::UNINITIALIZED_MASK | 1,
+        physical_start: 1003 + u64::from(index),
+    }));
+    extents
 }
 
 fn mock_image() -> MemImage {

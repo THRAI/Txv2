@@ -1115,10 +1115,10 @@ impl<I: BlockImage> Ext4Pager<I> {
         }))
     }
 
-    /// Convert an unwritten block through a depth-three-or-deeper indexed path
-    /// when the selected leaf remains within its existing extent capacity.
-    /// Splits still fail closed until their complete ancestor carry path is
-    /// represented in one immutable plan.
+    /// Convert an unwritten block through a depth-three-or-deeper indexed path.
+    /// A split carries the new right sibling through the captured ancestors in
+    /// one immutable plan, growing the inline root only when every ancestor is
+    /// full.
     fn plan_deep_uninitialized_conversion(
         &mut self,
         inode: &Inode,
@@ -1132,24 +1132,23 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Corrupt);
         }
         validate_extent_node_layout(inode.extent_root_bytes(), root_header)?;
-        let mut expected_depth = root_header.depth;
-        let mut node = ExtentNode::parse(inode.extent_root_bytes())?;
+        let mut root_indexes = match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+            _ => return Err(Ext4FormatError::Corrupt),
+        };
+        let root_pos = root_indexes
+            .iter()
+            .rposition(|index| index.logical_block <= logical_block)
+            .unwrap_or(0);
+        let mut expected_depth = root_header
+            .depth
+            .checked_sub(1)
+            .ok_or(Ext4FormatError::Corrupt)?;
+        let mut home = root_indexes[root_pos].child;
         let mut visited_homes = Vec::new();
+        let mut path = Vec::new();
 
-        loop {
-            let indexes = match node {
-                ExtentNode::Index(indexes) if expected_depth != 0 => indexes,
-                ExtentNode::Leaf(_) if expected_depth == 0 => return Err(Ext4FormatError::Corrupt),
-                _ => return Err(Ext4FormatError::Corrupt),
-            };
-            if indexes.is_empty() {
-                return Err(Ext4FormatError::Corrupt);
-            }
-            let selected = indexes
-                .iter()
-                .rposition(|index| index.logical_block <= logical_block)
-                .unwrap_or(0);
-            let home = indexes[selected].child;
+        let (leaf_home, leaf_before, leaf_header, mut extents, physical_block) = loop {
             if visited_homes.contains(&home) {
                 return Err(Ext4FormatError::Corrupt);
             }
@@ -1158,9 +1157,6 @@ impl<I: BlockImage> Ext4Pager<I> {
             let mut before = [0u8; BLOCK_SIZE];
             self.read_block(home, &mut before)?;
             let header = ExtentHeader::parse(&before)?;
-            expected_depth = expected_depth
-                .checked_sub(1)
-                .ok_or(Ext4FormatError::Corrupt)?;
             if header.depth != expected_depth {
                 return Err(Ext4FormatError::Corrupt);
             }
@@ -1175,26 +1171,235 @@ impl<I: BlockImage> Ext4Pager<I> {
                 else {
                     return Ok(None);
                 };
-                if extents.len() > usize::from(header.max) {
-                    return Err(Ext4FormatError::Unsupported);
+                if extents.len() <= usize::from(header.max) {
+                    let mut after = before;
+                    ExtentNode::encode_leaf(&extents, &mut after)?;
+                    return Ok(Some(IndexedUninitializedConversion {
+                        physical_block,
+                        extent_metadata: vec![MetadataBlock {
+                            home,
+                            role: MetaRole::ExtentNode,
+                            before_version: crc32c(0, &before) as u64,
+                            after,
+                            depends_on: Vec::new(),
+                        }],
+                        allocation: None,
+                        inode_after: None,
+                    }));
                 }
-                let mut after = before;
-                ExtentNode::encode_leaf(&extents, &mut after)?;
-                return Ok(Some(IndexedUninitializedConversion {
-                    physical_block,
-                    extent_metadata: vec![MetadataBlock {
-                        home,
-                        role: MetaRole::ExtentNode,
-                        before_version: crc32c(0, &before) as u64,
-                        after,
-                        depends_on: Vec::new(),
-                    }],
-                    allocation: None,
-                    inode_after: None,
-                }));
+                break (home, before, header, extents, physical_block);
             }
-            node = ExtentNode::parse(&before)?;
+            let indexes = match ExtentNode::parse(&before)? {
+                ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+                _ => return Err(Ext4FormatError::Corrupt),
+            };
+            let selected = indexes
+                .iter()
+                .rposition(|index| index.logical_block <= logical_block)
+                .unwrap_or(0);
+            let child_home = indexes[selected].child;
+            path.push((home, before, header, indexes, selected));
+            home = child_home;
+            expected_depth = expected_depth
+                .checked_sub(1)
+                .ok_or(Ext4FormatError::Corrupt)?;
+        };
+
+        if extents.len() <= usize::from(leaf_header.max) {
+            return Err(Ext4FormatError::Corrupt);
         }
+        if extents.len() < 2 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        let mut allocation_count = 1usize;
+        let mut carry_reaches_root = true;
+        for (_, _, header, indexes, _) in path.iter().rev() {
+            if indexes.len() < usize::from(header.max) {
+                carry_reaches_root = false;
+                break;
+            }
+            allocation_count = allocation_count
+                .checked_add(1)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+        }
+        if carry_reaches_root && root_indexes.len() >= usize::from(root_header.max) {
+            if root_header.depth >= EXT4_MAX_EXTENT_DEPTH {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            allocation_count = allocation_count
+                .checked_add(2)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+        }
+        let allocation = self.plan_block_allocations(allocation_count)?;
+        if allocation
+            .claims
+            .iter()
+            .any(|claim| visited_homes.contains(claim))
+        {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        let right_leaf_home = allocation.claims[0];
+        let right_extents = extents.split_off(extents.len() / 2);
+        let mut leaf_after = leaf_before;
+        ExtentNode::encode_leaf(&extents, &mut leaf_after)?;
+        let mut right_leaf_before = [0u8; BLOCK_SIZE];
+        self.read_block(right_leaf_home, &mut right_leaf_before)?;
+        let mut right_leaf_after = right_leaf_before;
+        ExtentNode::encode_leaf(&right_extents, &mut right_leaf_after)?;
+        let mut extent_metadata = vec![
+            MetadataBlock {
+                home: leaf_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &leaf_before) as u64,
+                after: leaf_after,
+                depends_on: Vec::new(),
+            },
+            MetadataBlock {
+                home: right_leaf_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_leaf_before) as u64,
+                after: right_leaf_after,
+                depends_on: Vec::new(),
+            },
+        ];
+        let mut claim_index = 1usize;
+        let mut left_key = extents[0].logical_block;
+        let mut right_index = ExtentIdx {
+            logical_block: right_extents[0].logical_block,
+            child: right_leaf_home,
+        };
+        let mut carry = true;
+
+        while let Some((parent_home, before, header, mut indexes, selected)) = path.pop() {
+            indexes[selected].logical_block = left_key;
+            indexes.insert(selected + 1, right_index);
+            if indexes.len() <= usize::from(header.max) {
+                let mut after = before;
+                ExtentNode::encode_index(header.depth, &indexes, &mut after)?;
+                extent_metadata.push(MetadataBlock {
+                    home: parent_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &before) as u64,
+                    after,
+                    depends_on: Vec::new(),
+                });
+                carry = false;
+                break;
+            }
+
+            let right_home = *allocation
+                .claims
+                .get(claim_index)
+                .ok_or(Ext4FormatError::Corrupt)?;
+            claim_index += 1;
+            let right_indexes = indexes.split_off(indexes.len() / 2);
+            let mut after = before;
+            ExtentNode::encode_index(header.depth, &indexes, &mut after)?;
+            let mut right_before = [0u8; BLOCK_SIZE];
+            self.read_block(right_home, &mut right_before)?;
+            let mut right_after = right_before;
+            ExtentNode::encode_index(header.depth, &right_indexes, &mut right_after)?;
+            extent_metadata.push(MetadataBlock {
+                home: parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &before) as u64,
+                after,
+                depends_on: Vec::new(),
+            });
+            extent_metadata.push(MetadataBlock {
+                home: right_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_before) as u64,
+                after: right_after,
+                depends_on: Vec::new(),
+            });
+            left_key = indexes[0].logical_block;
+            right_index = ExtentIdx {
+                logical_block: right_indexes[0].logical_block,
+                child: right_home,
+            };
+        }
+
+        let mut inode_after = *inode;
+        if carry {
+            root_indexes[root_pos].logical_block = left_key;
+            root_indexes.insert(root_pos + 1, right_index);
+            if root_indexes.len() <= usize::from(root_header.max) {
+                inode_after.set_extent_index_root(&root_indexes, root_header.depth)?;
+            } else {
+                let left_root_home = *allocation
+                    .claims
+                    .get(claim_index)
+                    .ok_or(Ext4FormatError::Corrupt)?;
+                claim_index += 1;
+                let right_root_home = *allocation
+                    .claims
+                    .get(claim_index)
+                    .ok_or(Ext4FormatError::Corrupt)?;
+                claim_index += 1;
+                let right_root_indexes = root_indexes.split_off(root_indexes.len() / 2);
+                let mut left_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(left_root_home, &mut left_root_before)?;
+                let mut left_root_after = left_root_before;
+                ExtentNode::encode_index(root_header.depth, &root_indexes, &mut left_root_after)?;
+                let mut right_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(right_root_home, &mut right_root_before)?;
+                let mut right_root_after = right_root_before;
+                ExtentNode::encode_index(
+                    root_header.depth,
+                    &right_root_indexes,
+                    &mut right_root_after,
+                )?;
+                inode_after.set_extent_index_root(
+                    &[
+                        ExtentIdx {
+                            logical_block: root_indexes[0].logical_block,
+                            child: left_root_home,
+                        },
+                        ExtentIdx {
+                            logical_block: right_root_indexes[0].logical_block,
+                            child: right_root_home,
+                        },
+                    ],
+                    root_header
+                        .depth
+                        .checked_add(1)
+                        .ok_or(Ext4FormatError::OutOfBounds)?,
+                )?;
+                extent_metadata.push(MetadataBlock {
+                    home: left_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &left_root_before) as u64,
+                    after: left_root_after,
+                    depends_on: Vec::new(),
+                });
+                extent_metadata.push(MetadataBlock {
+                    home: right_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_root_before) as u64,
+                    after: right_root_after,
+                    depends_on: Vec::new(),
+                });
+            }
+        }
+        if claim_index != allocation.claims.len() {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        inode_after.blocks_512 = inode_after
+            .blocks_512
+            .checked_add(
+                u64::try_from(allocation.claims.len()).map_err(|_| Ext4FormatError::OutOfBounds)?
+                    * (BLOCK_SIZE / 512) as u64,
+            )
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        Ok(Some(IndexedUninitializedConversion {
+            physical_block,
+            extent_metadata,
+            allocation: Some(allocation),
+            inode_after: Some(inode_after),
+        }))
     }
 
     /// Build an immutable writeback plan for a contiguous run of already

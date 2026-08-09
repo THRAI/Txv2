@@ -1,12 +1,14 @@
+use std::cell::RefCell;
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tx_ext4_format::capability::{Tier1Capabilities, Tier1Reject, Tier1Request, sha256};
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
-use tx_ext4_format::ondisk::{Ext4FormatError, ExtentHeader, Superblock};
+use tx_ext4_format::ondisk::{Ext4FormatError, ExtentHeader, ExtentNode, Superblock};
 use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, DirEntryLite, Ext4Pager, InodeNo};
 
 #[test]
@@ -83,6 +85,60 @@ impl BlockImage for VecImage {
 
     fn barrier(&mut self) -> tx_ext4_format::Result<()> {
         Ok(())
+    }
+}
+
+struct FileImage {
+    file: RefCell<File>,
+    total_blocks: u64,
+}
+
+impl FileImage {
+    fn open(path: &Path) -> Self {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open generated ext4 image");
+        let total_blocks =
+            file.metadata().expect("stat generated ext4 image").len() / BLOCK_SIZE as u64;
+        Self {
+            file: RefCell::new(file),
+            total_blocks,
+        }
+    }
+}
+
+impl BlockImage for FileImage {
+    fn total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+
+    fn read_block(&self, block: u64, out: &mut [u8; BLOCK_SIZE]) -> tx_ext4_format::Result<()> {
+        let offset = block
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let mut file = self.file.borrow_mut();
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(out))
+            .map_err(|_| Ext4FormatError::Corrupt)
+    }
+
+    fn write_block(&mut self, block: u64, data: &[u8; BLOCK_SIZE]) -> tx_ext4_format::Result<()> {
+        let offset = block
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let mut file = self.file.borrow_mut();
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(data))
+            .map_err(|_| Ext4FormatError::Corrupt)
+    }
+
+    fn barrier(&mut self) -> tx_ext4_format::Result<()> {
+        self.file
+            .borrow_mut()
+            .sync_data()
+            .map_err(|_| Ext4FormatError::Corrupt)
     }
 }
 
@@ -452,6 +508,81 @@ fn docker_e2fsck_accepts_depth_two_fragmented_unlink_destroy_after_images() {
     docker_e2fsck(&image_name, &fixture, &image);
 }
 
+#[test]
+#[ignore = "builds a 3 GiB Linux depth-three extent fixture"]
+fn docker_e2fsck_accepts_depth_three_fragmented_unwritten_conversion_after_images() {
+    let image_name = std::env::var("TX_EXT4_E2FSPROGS_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "tx-ext4-xfstests-tier1:local".to_owned());
+    if !docker_image_available(&image_name) {
+        eprintln!("skipping Docker ext4 verification; image unavailable: {image_name}");
+        return;
+    }
+
+    let fixture = Fixture::docker_mountable();
+    let image = fixture.path("depth-three-fragmented-split.ext4");
+    docker_build_depth_three_fragmented_fixture(&image_name, &fixture, &image);
+    let retained_mapping_before = docker_debugfs_bmap(&image_name, &fixture, &image, "/file", 0);
+
+    let mut pager = Ext4Pager::open(FileImage::open(&image)).expect("open Docker ext4 image");
+    let inode = pager
+        .lookup(InodeNo::new(2), b"file")
+        .expect("lookup Docker fixture")
+        .expect("/file exists");
+    let (_, root) = pager
+        .inode_meta_and_extent_root(inode)
+        .expect("read fragmented extent root");
+    assert_eq!(
+        ExtentHeader::parse(&root)
+            .expect("parse fragmented extent root")
+            .depth,
+        3,
+        "debugfs fixture must force a depth-three extent tree"
+    );
+
+    let target_logical_block = find_unwritten_extent(&FileImage::open(&image), &root)
+        .expect("Linux depth-three fixture must retain an unwritten extent");
+    let conversion = pager
+        .plan_write_page(
+            inode,
+            target_logical_block,
+            &[0xE8; BLOCK_SIZE],
+            FsyncStamp::new(58),
+        )
+        .expect("convert one Linux depth-three unwritten extent");
+    assert!(conversion.allocations.is_empty());
+    assert_eq!(
+        conversion
+            .metadata
+            .iter()
+            .filter(|metadata| metadata.role == tx_ext4_format::mutation::MetaRole::ExtentNode)
+            .count(),
+        1
+    );
+    for data in &conversion.data {
+        pager
+            .apply_l6_write_page(data.physical_block * 8, 8, &data.bytes)
+            .expect("write converted data block");
+    }
+    pager
+        .apply_l6_barrier()
+        .expect("order converted data before metadata");
+    for metadata in &conversion.metadata {
+        pager
+            .apply_l6_write_page(metadata.home * 8, 8, &metadata.after)
+            .expect("write Linux deep-shape metadata after-image");
+    }
+    pager
+        .apply_l6_barrier()
+        .expect("persist Linux deep-shape metadata after-images");
+
+    docker_e2fsck(&image_name, &fixture, &image);
+    assert_eq!(
+        docker_debugfs_bmap(&image_name, &fixture, &image, "/file", 0),
+        retained_mapping_before,
+        "deep conversion must retain the logical block zero mapping"
+    );
+}
+
 fn docker_image_available(image_name: &str) -> bool {
     Command::new("docker")
         .args(["image", "inspect", image_name])
@@ -490,6 +621,35 @@ fn docker_build_depth_two_fragmented_fixture(image_name: &str, fixture: &Fixture
     );
     let script = format!(
         "set -eu; image=/fixture/{}; commands=/fixture/depth-two.debugfs; dd if=/dev/zero of=\"$image\" bs=1M count=64 status=none; mke2fs -q -t ext4 -F -b 4096 -g 1024 -O extent,^64bit,^metadata_csum \"$image\"; printf 'write /etc/hostname /file\\n' > \"$commands\"; for i in $(seq 2 2 2800); do printf 'fallocate /file %s %s\\n' \"$i\" \"$i\" >> \"$commands\"; done; printf 'sif /file size 11472896\\n' >> \"$commands\"; debugfs -w -f \"$commands\" \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
+        image.file_name().unwrap().to_str().unwrap(),
+    );
+    run(
+        "docker",
+        [
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--mount".to_owned(),
+            mount,
+            image_name.to_owned(),
+            "sh".to_owned(),
+            "-lc".to_owned(),
+            script,
+        ],
+    );
+}
+
+fn docker_build_depth_three_fragmented_fixture(image_name: &str, fixture: &Fixture, image: &Path) {
+    const NODE_MAX: u64 = 340;
+    const ROOT_MAX: u64 = 4;
+    let extent_count = ROOT_MAX * NODE_MAX * NODE_MAX + 1;
+    let last_logical_block = (extent_count - 1) * 2;
+    let size_bytes = (last_logical_block + 1) * BLOCK_SIZE as u64;
+    let mount = format!(
+        "type=bind,source={},target=/fixture",
+        fixture.root.display()
+    );
+    let script = format!(
+        "set -eu; image=/fixture/{}; commands=/fixture/depth-three.debugfs; truncate -s 3G \"$image\"; mke2fs -q -t ext4 -F -b 4096 -O extent,^64bit,^metadata_csum \"$image\"; printf 'write /etc/hostname /file\\n' > \"$commands\"; i=2; while [ \"$i\" -le {last_logical_block} ]; do printf 'fallocate /file %s %s\\n' \"$i\" \"$i\" >> \"$commands\"; i=$((i + 2)); done; printf 'sif /file size {size_bytes}\\n' >> \"$commands\"; debugfs -w -f \"$commands\" \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
         image.file_name().unwrap().to_str().unwrap(),
     );
     run(
@@ -559,6 +719,26 @@ fn docker_debugfs_bmap(
         .expect("debugfs bmap output utf8")
         .trim()
         .to_owned()
+}
+
+fn find_unwritten_extent(image: &FileImage, node_bytes: &[u8]) -> Option<u64> {
+    ExtentHeader::parse(node_bytes).ok()?;
+    match ExtentNode::parse(node_bytes).ok()? {
+        ExtentNode::Leaf(extents) => extents
+            .iter()
+            .find(|extent| !extent.is_initialized())
+            .map(|extent| u64::from(extent.logical_block)),
+        ExtentNode::Index(indexes) => {
+            for index in indexes {
+                let mut child = [0u8; BLOCK_SIZE];
+                image.read_block(index.child, &mut child).ok()?;
+                if let Some(logical_block) = find_unwritten_extent(image, &child) {
+                    return Some(logical_block);
+                }
+            }
+            None
+        }
+    }
 }
 
 fn debugfs_stat(image: &Path, path: &str) -> String {

@@ -1,3 +1,17 @@
+- 2026-08-09 (ext4 reconciliation depth-three split planner and Linux fixture).
+  `Ext4Pager` now captures a depth-three-or-deeper indexed path and carries a
+  full unwritten leaf split through every full ancestor in one immutable plan;
+  a full inline root grows by one level unless the ext4 maximum depth would be
+  exceeded. New pager regressions cover the depth-three leaf split and
+  multi-ancestor carry to the root with metadata-only claims and unchanged
+  source homes. An ignored 3 GiB Docker fixture creates more than 462,400
+  Linux/debugfs fragmented unwritten extents, proves an actual depth-three
+  inode root, converts one selected unwritten extent through Tx, and passes
+  Docker `e2fsck -fn` in 67.86 seconds. The tested e2fsprogs shape does not
+  retain a full leaf/parent pair, so this is Linux depth-three conversion
+  evidence, not Linux depth-three split/carry evidence. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
 - 2026-08-09 (ext4 Tier 1 xfstests Docker preflight harness).
   The clean `codex/ext4-worktree-reconciliation` worktree now generates the
   pinned xfstests `configure` script before invoking it, builds its required

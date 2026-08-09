@@ -176,3 +176,33 @@ the flush only admits the ordered-data transaction; a following metadata-only
 observes the converted leaf home. This preserves the existing ownership split:
 PageBacked supplies the dirty frame, ext4 owns the immutable plan/JBD2 state,
 and the runtime retains the active transaction until settlement.
+
+## Depth-Three Split And Linux Fixture Update
+
+`plan_deep_uninitialized_conversion` now captures every physical index node on
+the selected depth-three-or-deeper path. When converting an unwritten extent
+overflows its leaf, it claims a right leaf, carries the new index through each
+full captured ancestor, and grows the inline inode root only if every ancestor
+is full. The plan rejects repeated child homes, allocation claims that alias a
+captured node, and root growth beyond `EXT4_MAX_EXTENT_DEPTH`; it still emits
+only immutable metadata after-images and allocation claims.
+
+- `pager_splits_full_depth_three_unwritten_leaf_without_data_claim` covers a
+  full depth-three leaf that splits into a non-full parent.
+- `pager_carries_depth_three_unwritten_leaf_split_to_the_root` covers a full
+  leaf and two full ancestors carrying a new index into the inode root. It
+  verifies child-to-parent metadata order, three metadata-only claims,
+  `i_blocks`, and unchanged source homes.
+- `docker_e2fsck_accepts_depth_three_fragmented_unwritten_conversion_after_images`
+  is an explicit `#[ignore]` Docker regression. It creates
+  `4 * 340 * 340 + 1` sparse one-block unwritten extents in a 3 GiB Linux ext4
+  image, proves the inode root is depth three, finds a real unwritten extent
+  by traversing the generated tree, applies its Tx after-image through a
+  file-backed test image, and passes `e2fsck -fn`. The command completed in
+  67.86 seconds on 2026-08-09.
+
+The selected e2fsprogs shape did not retain a full leaf (nor a full
+leaf/parent pair) after its own balancing decisions. Therefore the Docker test
+is Linux depth-three conversion evidence only. Linux-generated depth-three
+leaf split/carry remains pending; the new split/carry regressions are bounded
+host-planner evidence and must not be promoted to Tier 2 compatibility.
