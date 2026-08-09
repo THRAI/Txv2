@@ -1,13 +1,17 @@
 use crate::journal::Jbd2Superblock;
 use crate::ondisk::{
-    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentIdx,
-    ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock, block_bitmap_csum32,
-    crc32c, encode_dir_entry, encode_journal_commit, encode_journal_descriptor, group_desc_csum16,
-    inode_bitmap_csum32, inode_csum32, parse_journal_descriptor, superblock_csum32,
+    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent,
+    ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout,
+    Superblock, block_bitmap_csum32, crc32c, encode_dir_entry, encode_journal_commit,
+    encode_journal_descriptor, group_desc_csum16, inode_bitmap_csum32, inode_csum32,
+    parse_journal_descriptor, superblock_csum32,
 };
-use crate::ondisk::{dirblock_csum32, read_u16_le, read_u32_le, write_u16_le, write_u32_le};
+use crate::ondisk::{
+    dirblock_csum32, extent_block_csum32, read_u16_le, read_u32_le, write_u16_le, write_u32_le,
+};
 use crate::{Ext4FormatError, Result};
-use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -18,6 +22,42 @@ use crate::mutation::{
 
 pub const BLOCK_SIZE: usize = 4096;
 pub type Page4K = [u8; BLOCK_SIZE];
+const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
+
+enum TruncateSubtreeState {
+    Removed,
+    Retained {
+        node: ExtentNode,
+        first_key: u32,
+        changed: bool,
+    },
+}
+
+struct TruncateSubtreePlan {
+    state: TruncateSubtreeState,
+    original_first_key: Option<u32>,
+    original_logical_end: Option<u32>,
+    released: Vec<u64>,
+    retained_data: Vec<PhysicalBlockRange>,
+    retained_homes: Vec<u64>,
+    metadata: Vec<MetadataBlock>,
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalBlockRange {
+    start: u64,
+    end: u64,
+}
+
+impl PhysicalBlockRange {
+    fn contains(self, block: u64) -> bool {
+        self.start <= block && block < self.end
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
 
 pub trait BlockImage {
     fn total_blocks(&self) -> u64;
@@ -145,8 +185,29 @@ pub struct Ext4Pager<I> {
     superblock: Superblock,
     groups: Vec<GroupDesc>,
     inode_table: InodeTableLayout,
+    reserved_blocks: BTreeSet<u64>,
     journal_start: Option<u64>,
     next_sequence: u32,
+}
+
+struct PlannedGroupAllocation {
+    group_index: usize,
+    bitmap_home: u64,
+    bitmap_before: Page4K,
+    bitmap_after: Page4K,
+    count: u32,
+}
+
+struct PlannedBlockAllocations {
+    claims: Vec<u64>,
+    groups: Vec<PlannedGroupAllocation>,
+}
+
+struct IndexedUninitializedConversion {
+    physical_block: u64,
+    extent_metadata: Vec<MetadataBlock>,
+    allocation: Option<PlannedBlockAllocations>,
+    inode_after: Option<Inode>,
 }
 
 impl<I: BlockImage> Ext4Pager<I> {
@@ -161,6 +222,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 inodes_per_group: 0,
                 first_inode_table_block: 0,
             },
+            reserved_blocks: BTreeSet::new(),
             journal_start: None,
             next_sequence: 1,
         };
@@ -178,13 +240,22 @@ impl<I: BlockImage> Ext4Pager<I> {
         pager.superblock = superblock;
         pager.groups = groups;
         pager.inode_table = InodeTableLayout::from_superblock_group(&superblock, &group);
-        pager.journal_start = pager
-            .read_inode(InodeNo::new(superblock.journal_inode))
-            .ok()
-            .and_then(|inode| match pager.resolve_inode_block(&inode, 0).ok()? {
-                BlockMapping::Data(block) => Some(block),
-                _ => None,
-            });
+        pager.reserve_filesystem_metadata()?;
+        if superblock.journal_inode != 0 {
+            if let Ok(journal_inode) = pager.read_inode(InodeNo::new(superblock.journal_inode)) {
+                pager.journal_start = match pager.resolve_inode_block(&journal_inode, 0) {
+                    Ok(BlockMapping::Data(block)) => Some(block),
+                    _ => None,
+                };
+                if let (Ok(data_blocks), Ok(node_homes)) = (
+                    pager.collect_extent_data_blocks(journal_inode.extent_root_bytes()),
+                    pager.collect_extent_node_homes(journal_inode.extent_root_bytes()),
+                ) {
+                    pager.reserved_blocks.extend(data_blocks);
+                    pager.reserved_blocks.extend(node_homes);
+                }
+            }
+        }
         Ok(pager)
     }
 
@@ -420,74 +491,87 @@ impl<I: BlockImage> Ext4Pager<I> {
         let logical = logical_block(file_page_index)?;
         let mut plan =
             Ext4MutationPlan::new(MutationOrigin::FlushPage, inode.get() as u64, fsync_stamp);
-        let block = match self.resolve_inode_block(&disk_inode, logical)? {
-            BlockMapping::Data(block) => block,
-            BlockMapping::Hole => {
-                let (physical_block, group_index, bitmap_home, bitmap_before, bitmap_after) =
-                    self.plan_block_allocation()?;
-                let (group_desc_home, group_desc_before, group_desc_after) =
-                    self.plan_group_free_block_decrement(group_index, &bitmap_after)?;
+        let inline_uninitialized =
+            convert_inline_uninitialized_extent(disk_inode.extent_root_bytes(), logical)?;
+        let indexed_uninitialized = if inline_uninitialized.is_none() {
+            let depth_one = self.plan_depth_one_uninitialized_conversion(&disk_inode, logical)?;
+            if depth_one.is_some() {
+                depth_one
+            } else {
+                let depth_two =
+                    self.plan_depth_two_uninitialized_conversion(&disk_inode, logical)?;
+                if depth_two.is_some() {
+                    depth_two
+                } else {
+                    self.plan_deep_uninitialized_conversion(&disk_inode, logical)?
+                }
+            }
+        } else {
+            None
+        };
+        let block = if let Some((physical_block, extents)) = inline_uninitialized {
+            let mut inode_after = disk_inode;
+            inode_after.set_extent_root(&extents)?;
+            let page_end = file_page_index
+                .checked_add(1)
+                .and_then(|page| page.checked_mul(BLOCK_SIZE as u64))
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            inode_after.size = core::cmp::max(inode_after.size, page_end);
+
+            let loc = self.inode_location(inode)?;
+            let mut inode_table_before = [0u8; BLOCK_SIZE];
+            self.read_block(loc.block, &mut inode_table_before)?;
+            let mut inode_table_after = inode_table_before;
+            let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
+            inode_after.encode(inode_bytes)?;
+            self.refresh_inode_checksum(inode, &inode_after, inode_bytes)?;
+            plan.push_metadata(MetadataBlock {
+                home: loc.block,
+                role: MetaRole::InodeTable,
+                before_version: crc32c(0, &inode_table_before) as u64,
+                after: inode_table_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+            physical_block
+        } else if let Some(indexed_uninitialized) = indexed_uninitialized {
+            let IndexedUninitializedConversion {
+                physical_block,
+                extent_metadata,
+                allocation,
+                mut inode_after,
+            } = indexed_uninitialized;
+            for metadata in extent_metadata {
+                plan.push_metadata(metadata)
+                    .map_err(|_| Ext4FormatError::Corrupt)?;
+            }
+            if let Some(allocation) = allocation {
+                let allocated_count = u32::try_from(allocation.claims.len())
+                    .map_err(|_| Ext4FormatError::OutOfBounds)?;
+                let group_desc_updates =
+                    self.plan_group_free_block_decrements(&allocation.groups)?;
                 let (superblock_home, superblock_before, superblock_after) =
-                    self.plan_superblock_free_block_decrement()?;
-                let mut inode_after = disk_inode;
-                let mut extents = match ExtentNode::parse(inode_after.extent_root_bytes())? {
-                    ExtentNode::Leaf(extents) => extents,
-                    ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
-                };
-                coalesce_insert_extent(&mut extents, logical, physical_block);
-                if extents.len() > 4 {
-                    return Err(Ext4FormatError::Unsupported);
+                    self.plan_superblock_free_block_decrement(allocated_count)?;
+                for group in &allocation.groups {
+                    plan.push_metadata(MetadataBlock {
+                        home: group.bitmap_home,
+                        role: MetaRole::BlockBitmap,
+                        before_version: crc32c(0, &group.bitmap_before) as u64,
+                        after: group.bitmap_after,
+                        depends_on: Vec::new(),
+                    })
+                    .map_err(|_| Ext4FormatError::Corrupt)?;
                 }
-                inode_after.set_extent_root(&extents)?;
-                inode_after.blocks_512 = inode_after
-                    .blocks_512
-                    .saturating_add((BLOCK_SIZE / 512) as u64);
-                let page_end = file_page_index
-                    .checked_add(1)
-                    .and_then(|page| page.checked_mul(BLOCK_SIZE as u64))
-                    .ok_or(Ext4FormatError::OutOfBounds)?;
-                inode_after.size = core::cmp::max(inode_after.size, page_end);
-
-                let loc = self.inode_location(inode)?;
-                let mut inode_table_before = [0u8; BLOCK_SIZE];
-                self.read_block(loc.block, &mut inode_table_before)?;
-                let mut inode_table_after = inode_table_before;
-                let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
-                inode_after.encode(inode_bytes)?;
-                if self.superblock.has_metadata_csum() {
-                    inode_bytes[124..126].fill(0);
-                    if inode_bytes.len() >= 132 {
-                        inode_bytes[130..132].fill(0);
-                    }
-                    let checksum = inode_csum32(
-                        self.superblock.metadata_csum_seed(),
-                        inode.get(),
-                        inode_after.generation,
-                        inode_bytes,
-                    )?;
-                    inode_bytes[124..126].copy_from_slice(&(checksum as u16).to_le_bytes());
-                    if inode_bytes.len() >= 132 {
-                        inode_bytes[130..132]
-                            .copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
-                    }
+                for (home, before, after) in group_desc_updates {
+                    plan.push_metadata(MetadataBlock {
+                        home,
+                        role: MetaRole::GroupDescriptor,
+                        before_version: crc32c(0, &before) as u64,
+                        after,
+                        depends_on: Vec::new(),
+                    })
+                    .map_err(|_| Ext4FormatError::Corrupt)?;
                 }
-
-                plan.push_metadata(MetadataBlock {
-                    home: bitmap_home,
-                    role: MetaRole::BlockBitmap,
-                    before_version: crc32c(0, &bitmap_before) as u64,
-                    after: bitmap_after,
-                    depends_on: Vec::new(),
-                })
-                .map_err(|_| Ext4FormatError::Corrupt)?;
-                plan.push_metadata(MetadataBlock {
-                    home: group_desc_home,
-                    role: MetaRole::GroupDescriptor,
-                    before_version: crc32c(0, &group_desc_before) as u64,
-                    after: group_desc_after,
-                    depends_on: Vec::new(),
-                })
-                .map_err(|_| Ext4FormatError::Corrupt)?;
                 plan.push_metadata(MetadataBlock {
                     home: superblock_home,
                     role: MetaRole::Superblock,
@@ -496,6 +580,27 @@ impl<I: BlockImage> Ext4Pager<I> {
                     depends_on: Vec::new(),
                 })
                 .map_err(|_| Ext4FormatError::Corrupt)?;
+                plan.allocations.extend(
+                    allocation
+                        .claims
+                        .into_iter()
+                        .map(|physical_block| BlockClaim { physical_block }),
+                );
+            }
+            let page_end = file_page_index
+                .checked_add(1)
+                .and_then(|page| page.checked_mul(BLOCK_SIZE as u64))
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            if inode_after.is_some() || page_end > disk_inode.size {
+                let mut inode_after = inode_after.take().unwrap_or(disk_inode);
+                inode_after.size = core::cmp::max(inode_after.size, page_end);
+                let loc = self.inode_location(inode)?;
+                let mut inode_table_before = [0u8; BLOCK_SIZE];
+                self.read_block(loc.block, &mut inode_table_before)?;
+                let mut inode_table_after = inode_table_before;
+                let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
+                inode_after.encode(inode_bytes)?;
+                self.refresh_inode_checksum(inode, &inode_after, inode_bytes)?;
                 plan.push_metadata(MetadataBlock {
                     home: loc.block,
                     role: MetaRole::InodeTable,
@@ -504,10 +609,123 @@ impl<I: BlockImage> Ext4Pager<I> {
                     depends_on: Vec::new(),
                 })
                 .map_err(|_| Ext4FormatError::Corrupt)?;
-                plan.allocations.push(BlockClaim { physical_block });
-                physical_block
             }
-            BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            physical_block
+        } else {
+            match self.resolve_inode_block(&disk_inode, logical)? {
+                BlockMapping::Data(block) => block,
+                BlockMapping::Hole => {
+                    let mut allocation = self.plan_block_allocations(1)?;
+                    let physical_block = allocation.claims[0];
+                    let mut inode_after = disk_inode;
+                    let mut extents = match ExtentNode::parse(inode_after.extent_root_bytes())? {
+                        ExtentNode::Leaf(extents) => extents,
+                        ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
+                    };
+                    coalesce_insert_extent(&mut extents, logical, physical_block);
+                    let mut extent_metadata = Vec::new();
+                    if extents.len() > 4 {
+                        let replanned = self.plan_block_allocations(2)?;
+                        if replanned.claims[0] != physical_block {
+                            return Err(Ext4FormatError::Corrupt);
+                        }
+                        allocation = replanned;
+                        let child = allocation.claims[1];
+                        let mut child_before = [0u8; BLOCK_SIZE];
+                        self.read_block(child, &mut child_before)?;
+                        let mut child_after = child_before;
+                        ExtentNode::encode_leaf(&extents, &mut child_after)?;
+                        inode_after.set_extent_index_root(
+                            &[ExtentIdx {
+                                logical_block: extents[0].logical_block,
+                                child,
+                            }],
+                            1,
+                        )?;
+                        extent_metadata.push(MetadataBlock {
+                            home: child,
+                            role: MetaRole::ExtentNode,
+                            before_version: crc32c(0, &child_before) as u64,
+                            after: child_after,
+                            depends_on: Vec::new(),
+                        });
+                    } else {
+                        inode_after.set_extent_root(&extents)?;
+                    }
+                    let group_desc_updates =
+                        self.plan_group_free_block_decrements(&allocation.groups)?;
+                    let (superblock_home, superblock_before, superblock_after) = self
+                        .plan_superblock_free_block_decrement(
+                            u32::try_from(allocation.claims.len())
+                                .map_err(|_| Ext4FormatError::OutOfBounds)?,
+                        )?;
+                    inode_after.blocks_512 = inode_after
+                        .blocks_512
+                        .saturating_add(allocation.claims.len() as u64 * (BLOCK_SIZE / 512) as u64);
+                    let page_end = file_page_index
+                        .checked_add(1)
+                        .and_then(|page| page.checked_mul(BLOCK_SIZE as u64))
+                        .ok_or(Ext4FormatError::OutOfBounds)?;
+                    inode_after.size = core::cmp::max(inode_after.size, page_end);
+
+                    let loc = self.inode_location(inode)?;
+                    let mut inode_table_before = [0u8; BLOCK_SIZE];
+                    self.read_block(loc.block, &mut inode_table_before)?;
+                    let mut inode_table_after = inode_table_before;
+                    let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
+                    inode_after.encode(inode_bytes)?;
+                    self.refresh_inode_checksum(inode, &inode_after, inode_bytes)?;
+
+                    for group in &allocation.groups {
+                        plan.push_metadata(MetadataBlock {
+                            home: group.bitmap_home,
+                            role: MetaRole::BlockBitmap,
+                            before_version: crc32c(0, &group.bitmap_before) as u64,
+                            after: group.bitmap_after,
+                            depends_on: Vec::new(),
+                        })
+                        .map_err(|_| Ext4FormatError::Corrupt)?;
+                    }
+                    for (home, before, after) in group_desc_updates {
+                        plan.push_metadata(MetadataBlock {
+                            home,
+                            role: MetaRole::GroupDescriptor,
+                            before_version: crc32c(0, &before) as u64,
+                            after,
+                            depends_on: Vec::new(),
+                        })
+                        .map_err(|_| Ext4FormatError::Corrupt)?;
+                    }
+                    plan.push_metadata(MetadataBlock {
+                        home: superblock_home,
+                        role: MetaRole::Superblock,
+                        before_version: crc32c(0, &superblock_before) as u64,
+                        after: superblock_after,
+                        depends_on: Vec::new(),
+                    })
+                    .map_err(|_| Ext4FormatError::Corrupt)?;
+                    plan.push_metadata(MetadataBlock {
+                        home: loc.block,
+                        role: MetaRole::InodeTable,
+                        before_version: crc32c(0, &inode_table_before) as u64,
+                        after: inode_table_after,
+                        depends_on: Vec::new(),
+                    })
+                    .map_err(|_| Ext4FormatError::Corrupt)?;
+                    for metadata in extent_metadata {
+                        plan.push_metadata(metadata)
+                            .map_err(|_| Ext4FormatError::Corrupt)?;
+                    }
+                    plan.allocations.extend(
+                        allocation
+                            .claims
+                            .into_iter()
+                            .map(|physical_block| BlockClaim { physical_block }),
+                    );
+                    physical_block
+                }
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            }
         };
         if plan.metadata.is_empty() {
             // A mapped data write still needs a committed metadata anchor so
@@ -525,12 +743,666 @@ impl<I: BlockImage> Ext4Pager<I> {
             })
             .map_err(|_| Ext4FormatError::Corrupt)?;
         }
+        self.refresh_extent_node_checksums(inode, &disk_inode, &mut plan.metadata);
         plan.data.push(SealedDataWrite {
             logical_page: file_page_index,
             physical_block: block,
             bytes: *page,
         });
         Ok(plan)
+    }
+
+    /// Convert one unwritten block from a depth-one extent tree without
+    /// allocating data blocks. A full leaf splits in place; when the inline
+    /// root is full, its index entries are promoted into two new depth-one
+    /// nodes and the inode root grows to depth two.
+    fn plan_depth_one_uninitialized_conversion(
+        &mut self,
+        inode: &Inode,
+        logical_block: u32,
+    ) -> Result<Option<IndexedUninitializedConversion>> {
+        let root_header = ExtentHeader::parse(inode.extent_root_bytes())?;
+        if root_header.depth == 0 {
+            return Ok(None);
+        }
+        if root_header.depth != 1 {
+            return Ok(None);
+        }
+        let indexes = match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+            _ => return Err(Ext4FormatError::Corrupt),
+        };
+        let selected = indexes
+            .iter()
+            .rposition(|index| index.logical_block <= logical_block)
+            .unwrap_or(0);
+        let home = indexes[selected].child;
+        let mut before = [0u8; BLOCK_SIZE];
+        self.read_block(home, &mut before)?;
+        let header = ExtentHeader::parse(&before)?;
+        if header.depth != 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut extents = match ExtentNode::parse(&before)? {
+            ExtentNode::Leaf(extents) => extents,
+            ExtentNode::Index(_) => return Err(Ext4FormatError::Corrupt),
+        };
+        let Some(physical_block) = convert_uninitialized_extent_list(&mut extents, logical_block)?
+        else {
+            return Ok(None);
+        };
+        if extents.len() > usize::from(header.max) {
+            let root_growth = indexes.len() >= usize::from(root_header.max);
+            let allocation = self.plan_block_allocations(if root_growth { 3 } else { 1 })?;
+            let right_home = allocation.claims[0];
+            let right_extents = extents.split_off(extents.len() / 2);
+            let mut leaf_after = before;
+            ExtentNode::encode_leaf(&extents, &mut leaf_after)?;
+            let mut right_before = [0u8; BLOCK_SIZE];
+            self.read_block(right_home, &mut right_before)?;
+            let mut right_after = right_before;
+            ExtentNode::encode_leaf(&right_extents, &mut right_after)?;
+            let mut root_indexes = indexes;
+            root_indexes[selected].logical_block = extents[0].logical_block;
+            root_indexes.insert(
+                selected + 1,
+                ExtentIdx {
+                    logical_block: right_extents[0].logical_block,
+                    child: right_home,
+                },
+            );
+            let mut inode_after = *inode;
+            let mut extent_metadata = vec![
+                MetadataBlock {
+                    home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &before) as u64,
+                    after: leaf_after,
+                    depends_on: Vec::new(),
+                },
+                MetadataBlock {
+                    home: right_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_before) as u64,
+                    after: right_after,
+                    depends_on: Vec::new(),
+                },
+            ];
+            if root_growth {
+                let left_root_home = allocation.claims[1];
+                let right_root_home = allocation.claims[2];
+                let split = root_indexes.len() / 2;
+                let right_root_indexes = root_indexes.split_off(split);
+                let mut left_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(left_root_home, &mut left_root_before)?;
+                let mut right_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(right_root_home, &mut right_root_before)?;
+                let mut left_root_after = left_root_before;
+                let mut right_root_after = right_root_before;
+                ExtentNode::encode_index(1, &root_indexes, &mut left_root_after)?;
+                ExtentNode::encode_index(1, &right_root_indexes, &mut right_root_after)?;
+                inode_after.set_extent_index_root(
+                    &[
+                        ExtentIdx {
+                            logical_block: root_indexes[0].logical_block,
+                            child: left_root_home,
+                        },
+                        ExtentIdx {
+                            logical_block: right_root_indexes[0].logical_block,
+                            child: right_root_home,
+                        },
+                    ],
+                    root_header
+                        .depth
+                        .checked_add(1)
+                        .ok_or(Ext4FormatError::OutOfBounds)?,
+                )?;
+                extent_metadata.push(MetadataBlock {
+                    home: left_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &left_root_before) as u64,
+                    after: left_root_after,
+                    depends_on: Vec::new(),
+                });
+                extent_metadata.push(MetadataBlock {
+                    home: right_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_root_before) as u64,
+                    after: right_root_after,
+                    depends_on: Vec::new(),
+                });
+            } else {
+                inode_after.set_extent_index_root(&root_indexes, root_header.depth)?;
+            }
+            inode_after.blocks_512 = inode_after
+                .blocks_512
+                .checked_add(
+                    u64::try_from(allocation.claims.len())
+                        .map_err(|_| Ext4FormatError::OutOfBounds)?
+                        * (BLOCK_SIZE / 512) as u64,
+                )
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            return Ok(Some(IndexedUninitializedConversion {
+                physical_block,
+                extent_metadata,
+                allocation: Some(allocation),
+                inode_after: Some(inode_after),
+            }));
+        }
+        let mut after = before;
+        ExtentNode::encode_leaf(&extents, &mut after)?;
+        Ok(Some(IndexedUninitializedConversion {
+            physical_block,
+            extent_metadata: vec![MetadataBlock {
+                home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &before) as u64,
+                after,
+                depends_on: Vec::new(),
+            }],
+            allocation: None,
+            inode_after: None,
+        }))
+    }
+
+    /// Convert an unwritten block through one depth-two root -> parent -> leaf
+    /// path. A full parent carries one new sibling into a non-full inode root.
+    fn plan_depth_two_uninitialized_conversion(
+        &mut self,
+        inode: &Inode,
+        logical_block: u32,
+    ) -> Result<Option<IndexedUninitializedConversion>> {
+        let root_header = ExtentHeader::parse(inode.extent_root_bytes())?;
+        if root_header.depth != 2 {
+            return Ok(None);
+        }
+        let mut root_indexes = match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+            _ => return Err(Ext4FormatError::Corrupt),
+        };
+        let root_pos = root_indexes
+            .iter()
+            .rposition(|index| index.logical_block <= logical_block)
+            .unwrap_or(0);
+        let parent_home = root_indexes[root_pos].child;
+        let mut parent_before = [0u8; BLOCK_SIZE];
+        self.read_block(parent_home, &mut parent_before)?;
+        let parent_header = ExtentHeader::parse(&parent_before)?;
+        if parent_header.depth != 1 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut parent_indexes = match ExtentNode::parse(&parent_before)? {
+            ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+            _ => return Err(Ext4FormatError::Corrupt),
+        };
+        let parent_pos = parent_indexes
+            .iter()
+            .rposition(|index| index.logical_block <= logical_block)
+            .unwrap_or(0);
+        let home = parent_indexes[parent_pos].child;
+        let mut before = [0u8; BLOCK_SIZE];
+        self.read_block(home, &mut before)?;
+        let header = ExtentHeader::parse(&before)?;
+        if header.depth != 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut extents = match ExtentNode::parse(&before)? {
+            ExtentNode::Leaf(extents) => extents,
+            ExtentNode::Index(_) => return Err(Ext4FormatError::Corrupt),
+        };
+        let Some(physical_block) = convert_uninitialized_extent_list(&mut extents, logical_block)?
+        else {
+            return Ok(None);
+        };
+        if extents.len() <= usize::from(header.max) {
+            let mut after = before;
+            ExtentNode::encode_leaf(&extents, &mut after)?;
+            return Ok(Some(IndexedUninitializedConversion {
+                physical_block,
+                extent_metadata: vec![MetadataBlock {
+                    home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &before) as u64,
+                    after,
+                    depends_on: Vec::new(),
+                }],
+                allocation: None,
+                inode_after: None,
+            }));
+        }
+        let parent_split = parent_indexes.len() >= usize::from(parent_header.max);
+        let root_growth = parent_split && root_indexes.len() >= usize::from(root_header.max);
+        let allocation = self.plan_block_allocations(match (parent_split, root_growth) {
+            (false, false) => 1,
+            (true, false) => 2,
+            (true, true) => 4,
+            (false, true) => return Err(Ext4FormatError::Corrupt),
+        })?;
+        let right_home = allocation.claims[0];
+        let right_extents = extents.split_off(extents.len() / 2);
+        let mut leaf_after = before;
+        ExtentNode::encode_leaf(&extents, &mut leaf_after)?;
+        let mut right_before = [0u8; BLOCK_SIZE];
+        self.read_block(right_home, &mut right_before)?;
+        let mut right_after = right_before;
+        ExtentNode::encode_leaf(&right_extents, &mut right_after)?;
+        parent_indexes[parent_pos].logical_block = extents[0].logical_block;
+        parent_indexes.insert(
+            parent_pos + 1,
+            ExtentIdx {
+                logical_block: right_extents[0].logical_block,
+                child: right_home,
+            },
+        );
+        let mut parent_after = parent_before;
+        let mut inode_after = *inode;
+        let mut extent_metadata = vec![
+            MetadataBlock {
+                home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &before) as u64,
+                after: leaf_after,
+                depends_on: Vec::new(),
+            },
+            MetadataBlock {
+                home: right_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_before) as u64,
+                after: right_after,
+                depends_on: Vec::new(),
+            },
+        ];
+        if parent_split {
+            let right_parent_home = allocation.claims[1];
+            let split = parent_indexes.len() / 2;
+            let right_parent_indexes = parent_indexes.split_off(split);
+            let mut right_parent_before = [0u8; BLOCK_SIZE];
+            self.read_block(right_parent_home, &mut right_parent_before)?;
+            let mut right_parent_after = right_parent_before;
+            ExtentNode::encode_index(1, &parent_indexes, &mut parent_after)?;
+            ExtentNode::encode_index(1, &right_parent_indexes, &mut right_parent_after)?;
+            root_indexes[root_pos].logical_block = parent_indexes[0].logical_block;
+            root_indexes.insert(
+                root_pos + 1,
+                ExtentIdx {
+                    logical_block: right_parent_indexes[0].logical_block,
+                    child: right_parent_home,
+                },
+            );
+            extent_metadata.push(MetadataBlock {
+                home: parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &parent_before) as u64,
+                after: parent_after,
+                depends_on: Vec::new(),
+            });
+            extent_metadata.push(MetadataBlock {
+                home: right_parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_parent_before) as u64,
+                after: right_parent_after,
+                depends_on: Vec::new(),
+            });
+            if root_growth {
+                let left_root_home = allocation.claims[2];
+                let right_root_home = allocation.claims[3];
+                let split = root_indexes.len() / 2;
+                let right_root_indexes = root_indexes.split_off(split);
+                let mut left_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(left_root_home, &mut left_root_before)?;
+                let mut right_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(right_root_home, &mut right_root_before)?;
+                let mut left_root_after = left_root_before;
+                let mut right_root_after = right_root_before;
+                ExtentNode::encode_index(root_header.depth, &root_indexes, &mut left_root_after)?;
+                ExtentNode::encode_index(
+                    root_header.depth,
+                    &right_root_indexes,
+                    &mut right_root_after,
+                )?;
+                inode_after.set_extent_index_root(
+                    &[
+                        ExtentIdx {
+                            logical_block: root_indexes[0].logical_block,
+                            child: left_root_home,
+                        },
+                        ExtentIdx {
+                            logical_block: right_root_indexes[0].logical_block,
+                            child: right_root_home,
+                        },
+                    ],
+                    root_header
+                        .depth
+                        .checked_add(1)
+                        .ok_or(Ext4FormatError::OutOfBounds)?,
+                )?;
+                extent_metadata.push(MetadataBlock {
+                    home: left_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &left_root_before) as u64,
+                    after: left_root_after,
+                    depends_on: Vec::new(),
+                });
+                extent_metadata.push(MetadataBlock {
+                    home: right_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_root_before) as u64,
+                    after: right_root_after,
+                    depends_on: Vec::new(),
+                });
+            } else {
+                inode_after.set_extent_index_root(&root_indexes, root_header.depth)?;
+            }
+        } else {
+            ExtentNode::encode_index(1, &parent_indexes, &mut parent_after)?;
+            extent_metadata.push(MetadataBlock {
+                home: parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &parent_before) as u64,
+                after: parent_after,
+                depends_on: Vec::new(),
+            });
+        }
+        inode_after.blocks_512 = inode_after
+            .blocks_512
+            .checked_add(
+                u64::try_from(allocation.claims.len()).map_err(|_| Ext4FormatError::OutOfBounds)?
+                    * (BLOCK_SIZE / 512) as u64,
+            )
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        Ok(Some(IndexedUninitializedConversion {
+            physical_block,
+            extent_metadata,
+            allocation: Some(allocation),
+            inode_after: Some(inode_after),
+        }))
+    }
+
+    /// Convert an unwritten block through a depth-three-or-deeper indexed path.
+    /// A split carries the new right sibling through the captured ancestors in
+    /// one immutable plan, growing the inline root only when every ancestor is
+    /// full.
+    fn plan_deep_uninitialized_conversion(
+        &mut self,
+        inode: &Inode,
+        logical_block: u32,
+    ) -> Result<Option<IndexedUninitializedConversion>> {
+        let root_header = ExtentHeader::parse(inode.extent_root_bytes())?;
+        if root_header.depth < 3 {
+            return Ok(None);
+        }
+        if root_header.depth > EXT4_MAX_EXTENT_DEPTH {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        validate_extent_node_layout(inode.extent_root_bytes(), root_header)?;
+        let mut root_indexes = match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+            _ => return Err(Ext4FormatError::Corrupt),
+        };
+        let root_pos = root_indexes
+            .iter()
+            .rposition(|index| index.logical_block <= logical_block)
+            .unwrap_or(0);
+        let mut expected_depth = root_header
+            .depth
+            .checked_sub(1)
+            .ok_or(Ext4FormatError::Corrupt)?;
+        let mut home = root_indexes[root_pos].child;
+        let mut visited_homes = Vec::new();
+        let mut path = Vec::new();
+
+        let (leaf_home, leaf_before, leaf_header, mut extents, physical_block) = loop {
+            if visited_homes.contains(&home) {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            visited_homes.push(home);
+
+            let mut before = [0u8; BLOCK_SIZE];
+            self.read_block(home, &mut before)?;
+            let header = ExtentHeader::parse(&before)?;
+            if header.depth != expected_depth {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            validate_extent_node_layout(&before, header)?;
+            if expected_depth == 0 {
+                let mut extents = match ExtentNode::parse(&before)? {
+                    ExtentNode::Leaf(extents) => extents,
+                    ExtentNode::Index(_) => return Err(Ext4FormatError::Corrupt),
+                };
+                let Some(physical_block) =
+                    convert_uninitialized_extent_list(&mut extents, logical_block)?
+                else {
+                    return Ok(None);
+                };
+                if extents.len() <= usize::from(header.max) {
+                    let mut after = before;
+                    ExtentNode::encode_leaf(&extents, &mut after)?;
+                    return Ok(Some(IndexedUninitializedConversion {
+                        physical_block,
+                        extent_metadata: vec![MetadataBlock {
+                            home,
+                            role: MetaRole::ExtentNode,
+                            before_version: crc32c(0, &before) as u64,
+                            after,
+                            depends_on: Vec::new(),
+                        }],
+                        allocation: None,
+                        inode_after: None,
+                    }));
+                }
+                break (home, before, header, extents, physical_block);
+            }
+            let indexes = match ExtentNode::parse(&before)? {
+                ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+                _ => return Err(Ext4FormatError::Corrupt),
+            };
+            let selected = indexes
+                .iter()
+                .rposition(|index| index.logical_block <= logical_block)
+                .unwrap_or(0);
+            let child_home = indexes[selected].child;
+            path.push((home, before, header, indexes, selected));
+            home = child_home;
+            expected_depth = expected_depth
+                .checked_sub(1)
+                .ok_or(Ext4FormatError::Corrupt)?;
+        };
+
+        if extents.len() <= usize::from(leaf_header.max) {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        if extents.len() < 2 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        let mut allocation_count = 1usize;
+        let mut carry_reaches_root = true;
+        for (_, _, header, indexes, _) in path.iter().rev() {
+            if indexes.len() < usize::from(header.max) {
+                carry_reaches_root = false;
+                break;
+            }
+            allocation_count = allocation_count
+                .checked_add(1)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+        }
+        if carry_reaches_root && root_indexes.len() >= usize::from(root_header.max) {
+            if root_header.depth >= EXT4_MAX_EXTENT_DEPTH {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            allocation_count = allocation_count
+                .checked_add(2)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+        }
+        let allocation = self.plan_block_allocations(allocation_count)?;
+        if allocation
+            .claims
+            .iter()
+            .any(|claim| visited_homes.contains(claim))
+        {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        let right_leaf_home = allocation.claims[0];
+        let right_extents = extents.split_off(extents.len() / 2);
+        let mut leaf_after = leaf_before;
+        ExtentNode::encode_leaf(&extents, &mut leaf_after)?;
+        let mut right_leaf_before = [0u8; BLOCK_SIZE];
+        self.read_block(right_leaf_home, &mut right_leaf_before)?;
+        let mut right_leaf_after = right_leaf_before;
+        ExtentNode::encode_leaf(&right_extents, &mut right_leaf_after)?;
+        let mut extent_metadata = vec![
+            MetadataBlock {
+                home: leaf_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &leaf_before) as u64,
+                after: leaf_after,
+                depends_on: Vec::new(),
+            },
+            MetadataBlock {
+                home: right_leaf_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_leaf_before) as u64,
+                after: right_leaf_after,
+                depends_on: Vec::new(),
+            },
+        ];
+        let mut claim_index = 1usize;
+        let mut left_key = extents[0].logical_block;
+        let mut right_index = ExtentIdx {
+            logical_block: right_extents[0].logical_block,
+            child: right_leaf_home,
+        };
+        let mut carry = true;
+
+        while let Some((parent_home, before, header, mut indexes, selected)) = path.pop() {
+            indexes[selected].logical_block = left_key;
+            indexes.insert(selected + 1, right_index);
+            if indexes.len() <= usize::from(header.max) {
+                let mut after = before;
+                ExtentNode::encode_index(header.depth, &indexes, &mut after)?;
+                extent_metadata.push(MetadataBlock {
+                    home: parent_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &before) as u64,
+                    after,
+                    depends_on: Vec::new(),
+                });
+                carry = false;
+                break;
+            }
+
+            let right_home = *allocation
+                .claims
+                .get(claim_index)
+                .ok_or(Ext4FormatError::Corrupt)?;
+            claim_index += 1;
+            let right_indexes = indexes.split_off(indexes.len() / 2);
+            let mut after = before;
+            ExtentNode::encode_index(header.depth, &indexes, &mut after)?;
+            let mut right_before = [0u8; BLOCK_SIZE];
+            self.read_block(right_home, &mut right_before)?;
+            let mut right_after = right_before;
+            ExtentNode::encode_index(header.depth, &right_indexes, &mut right_after)?;
+            extent_metadata.push(MetadataBlock {
+                home: parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &before) as u64,
+                after,
+                depends_on: Vec::new(),
+            });
+            extent_metadata.push(MetadataBlock {
+                home: right_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_before) as u64,
+                after: right_after,
+                depends_on: Vec::new(),
+            });
+            left_key = indexes[0].logical_block;
+            right_index = ExtentIdx {
+                logical_block: right_indexes[0].logical_block,
+                child: right_home,
+            };
+        }
+
+        let mut inode_after = *inode;
+        if carry {
+            root_indexes[root_pos].logical_block = left_key;
+            root_indexes.insert(root_pos + 1, right_index);
+            if root_indexes.len() <= usize::from(root_header.max) {
+                inode_after.set_extent_index_root(&root_indexes, root_header.depth)?;
+            } else {
+                let left_root_home = *allocation
+                    .claims
+                    .get(claim_index)
+                    .ok_or(Ext4FormatError::Corrupt)?;
+                claim_index += 1;
+                let right_root_home = *allocation
+                    .claims
+                    .get(claim_index)
+                    .ok_or(Ext4FormatError::Corrupt)?;
+                claim_index += 1;
+                let right_root_indexes = root_indexes.split_off(root_indexes.len() / 2);
+                let mut left_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(left_root_home, &mut left_root_before)?;
+                let mut left_root_after = left_root_before;
+                ExtentNode::encode_index(root_header.depth, &root_indexes, &mut left_root_after)?;
+                let mut right_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(right_root_home, &mut right_root_before)?;
+                let mut right_root_after = right_root_before;
+                ExtentNode::encode_index(
+                    root_header.depth,
+                    &right_root_indexes,
+                    &mut right_root_after,
+                )?;
+                inode_after.set_extent_index_root(
+                    &[
+                        ExtentIdx {
+                            logical_block: root_indexes[0].logical_block,
+                            child: left_root_home,
+                        },
+                        ExtentIdx {
+                            logical_block: right_root_indexes[0].logical_block,
+                            child: right_root_home,
+                        },
+                    ],
+                    root_header
+                        .depth
+                        .checked_add(1)
+                        .ok_or(Ext4FormatError::OutOfBounds)?,
+                )?;
+                extent_metadata.push(MetadataBlock {
+                    home: left_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &left_root_before) as u64,
+                    after: left_root_after,
+                    depends_on: Vec::new(),
+                });
+                extent_metadata.push(MetadataBlock {
+                    home: right_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_root_before) as u64,
+                    after: right_root_after,
+                    depends_on: Vec::new(),
+                });
+            }
+        }
+        if claim_index != allocation.claims.len() {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        inode_after.blocks_512 = inode_after
+            .blocks_512
+            .checked_add(
+                u64::try_from(allocation.claims.len()).map_err(|_| Ext4FormatError::OutOfBounds)?
+                    * (BLOCK_SIZE / 512) as u64,
+            )
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        Ok(Some(IndexedUninitializedConversion {
+            physical_block,
+            extent_metadata,
+            allocation: Some(allocation),
+            inode_after: Some(inode_after),
+        }))
     }
 
     /// Build an immutable writeback plan for a contiguous run of already
@@ -649,11 +1521,286 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.plan_setattr(inode, SetAttr::Mode(mode), fsync_stamp)
     }
 
-    /// Build a truncate plan without mutating the home image.
-    ///
-    /// The first Tier 1 reclamation slice supports inline extent-leaf files
-    /// whose shrink releases complete tail blocks. Indexed extent trees and
-    /// more complex free shapes remain fail-closed.
+    /// Build one immutable recursive truncate subtree plan without mutating
+    /// any home block. Child metadata is emitted before parent metadata.
+    fn plan_truncate_subtree(
+        &self,
+        home: Option<u64>,
+        before: &[u8],
+        expected_depth: u16,
+        new_end: u32,
+        visited_homes: &mut Vec<u64>,
+    ) -> Result<TruncateSubtreePlan> {
+        let header = ExtentHeader::parse(before)?;
+        if header.depth != expected_depth {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        validate_extent_node_layout(before, header)?;
+        if let Some(home) = home {
+            if visited_homes.contains(&home) {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            visited_homes.push(home);
+        }
+
+        let mut plan = match ExtentNode::parse(before)? {
+            ExtentNode::Leaf(extents) => {
+                if expected_depth != 0 {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                let original = extents.clone();
+                let original_first_key = original.first().map(|extent| extent.logical_block);
+                let original_logical_end = original
+                    .last()
+                    .map(|extent| {
+                        extent
+                            .logical_block
+                            .checked_add(extent.initialized_len())
+                            .ok_or(Ext4FormatError::Corrupt)
+                    })
+                    .transpose()?;
+                let (retained, released) = truncate_extents_at(extents, new_end)?;
+                let retained_data = retained
+                    .iter()
+                    .map(|extent| {
+                        Ok(PhysicalBlockRange {
+                            start: extent.physical_start,
+                            end: extent
+                                .physical_start
+                                .checked_add(u64::from(extent.initialized_len()))
+                                .ok_or(Ext4FormatError::OutOfBounds)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let state = retained
+                    .first()
+                    .map_or(TruncateSubtreeState::Removed, |first| {
+                        TruncateSubtreeState::Retained {
+                            first_key: first.logical_block,
+                            changed: retained != original,
+                            node: ExtentNode::Leaf(retained.clone()),
+                        }
+                    });
+                TruncateSubtreePlan {
+                    state,
+                    original_first_key,
+                    original_logical_end,
+                    released,
+                    retained_data,
+                    retained_homes: Vec::new(),
+                    metadata: Vec::new(),
+                }
+            }
+            ExtentNode::Index(indexes) => {
+                if expected_depth == 0 {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                let mut retained_indexes = Vec::new();
+                let mut original_first_key = None;
+                let mut original_logical_end = None;
+                let mut released = Vec::new();
+                let mut retained_data = Vec::new();
+                let mut retained_homes = Vec::new();
+                let mut metadata = Vec::new();
+                for index in &indexes {
+                    let mut child_before = Box::new([0u8; BLOCK_SIZE]);
+                    self.read_block(index.child, child_before.as_mut())?;
+                    let child = self.plan_truncate_subtree(
+                        Some(index.child),
+                        child_before.as_ref(),
+                        expected_depth - 1,
+                        new_end,
+                        visited_homes,
+                    )?;
+                    let child_first = child.original_first_key.ok_or(Ext4FormatError::Corrupt)?;
+                    let child_end = child.original_logical_end.ok_or(Ext4FormatError::Corrupt)?;
+                    if child_first != index.logical_block
+                        || original_logical_end.is_some_and(|end| child_first < end)
+                    {
+                        return Err(Ext4FormatError::Corrupt);
+                    }
+                    original_first_key.get_or_insert(child_first);
+                    original_logical_end = Some(child_end);
+                    released.extend(child.released);
+                    retained_data.extend(child.retained_data);
+                    retained_homes.extend(child.retained_homes);
+                    metadata.extend(child.metadata);
+                    if let TruncateSubtreeState::Retained { first_key, .. } = child.state {
+                        retained_indexes.push(ExtentIdx {
+                            logical_block: first_key,
+                            child: index.child,
+                        });
+                    }
+                }
+                let state =
+                    retained_indexes
+                        .first()
+                        .map_or(TruncateSubtreeState::Removed, |first| {
+                            TruncateSubtreeState::Retained {
+                                first_key: first.logical_block,
+                                changed: retained_indexes != indexes,
+                                node: ExtentNode::Index(retained_indexes.clone()),
+                            }
+                        });
+                TruncateSubtreePlan {
+                    state,
+                    original_first_key,
+                    original_logical_end,
+                    released,
+                    retained_data,
+                    retained_homes,
+                    metadata,
+                }
+            }
+        };
+
+        match (&plan.state, home) {
+            (TruncateSubtreeState::Removed, Some(home)) => {
+                if plan.released.contains(&home) {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                plan.released.push(home);
+            }
+            (TruncateSubtreeState::Retained { node, changed, .. }, Some(home)) => {
+                plan.retained_homes.push(home);
+                if !changed {
+                    return Ok(plan);
+                }
+                let before: &Page4K = before.try_into().map_err(|_| Ext4FormatError::Corrupt)?;
+                let mut after = *before;
+                match node {
+                    ExtentNode::Leaf(extents) => ExtentNode::encode_leaf(extents, &mut after)?,
+                    ExtentNode::Index(indexes) => {
+                        ExtentNode::encode_index(expected_depth, indexes, &mut after)?
+                    }
+                }
+                if after != *before {
+                    plan.metadata.push(MetadataBlock {
+                        home,
+                        role: MetaRole::ExtentNode,
+                        before_version: crc32c(0, before) as u64,
+                        after,
+                        depends_on: Vec::new(),
+                    });
+                }
+            }
+            (_, None) => {}
+        }
+        Ok(plan)
+    }
+
+    fn plan_extent_release_tree(
+        &self,
+        root: &[u8],
+        new_end: u32,
+    ) -> Result<(u16, TruncateSubtreePlan)> {
+        let root_depth = ExtentHeader::parse(root)?.depth;
+        if root_depth > EXT4_MAX_EXTENT_DEPTH {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut visited_homes = Vec::new();
+        let mut subtree =
+            self.plan_truncate_subtree(None, root, root_depth, new_end, &mut visited_homes)?;
+        let collapse_home = match &subtree.state {
+            TruncateSubtreeState::Retained {
+                node: ExtentNode::Index(indexes),
+                ..
+            } if root_depth == 1 && indexes.len() == 1 => Some(indexes[0].child),
+            _ => None,
+        };
+        if let Some(home) = collapse_home {
+            let mut leaf_bytes = [0u8; BLOCK_SIZE];
+            if let Some(after) = subtree
+                .metadata
+                .iter()
+                .find(|block| block.home == home && block.role == MetaRole::ExtentNode)
+                .map(|block| block.after)
+            {
+                leaf_bytes = after;
+            } else {
+                self.read_block(home, &mut leaf_bytes)?;
+            }
+            if let ExtentNode::Leaf(extents) = ExtentNode::parse(&leaf_bytes)? {
+                if extents.len() <= 4 {
+                    let first_key = extents
+                        .first()
+                        .ok_or(Ext4FormatError::Corrupt)?
+                        .logical_block;
+                    subtree
+                        .metadata
+                        .retain(|block| block.home != home || block.role != MetaRole::ExtentNode);
+                    let retained = subtree
+                        .retained_homes
+                        .iter()
+                        .position(|retained| *retained == home)
+                        .ok_or(Ext4FormatError::Corrupt)?;
+                    subtree.retained_homes.remove(retained);
+                    subtree.released.push(home);
+                    subtree.state = TruncateSubtreeState::Retained {
+                        node: ExtentNode::Leaf(extents),
+                        first_key,
+                        changed: true,
+                    };
+                }
+            }
+        }
+        let released_set = subtree.released.iter().copied().collect::<BTreeSet<_>>();
+        let mut retained_data = subtree.retained_data.clone();
+        retained_data.sort_unstable_by_key(|range| range.start);
+        if released_set.len() != subtree.released.len()
+            || released_set
+                .iter()
+                .any(|block| self.reserved_blocks.contains(block))
+            || subtree
+                .retained_homes
+                .iter()
+                .any(|home| released_set.contains(home))
+            || retained_data
+                .iter()
+                .any(|range| released_set.range(range.start..range.end).next().is_some())
+            || retained_data.iter().any(|range| {
+                self.reserved_blocks
+                    .range(range.start..range.end)
+                    .next()
+                    .is_some()
+            })
+            || retained_data
+                .windows(2)
+                .any(|ranges| ranges[0].overlaps(ranges[1]))
+            || subtree.retained_homes.iter().any(|home| {
+                self.reserved_blocks.contains(home)
+                    || physical_ranges_contain(&retained_data, *home)
+            })
+        {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        Ok((root_depth, subtree))
+    }
+
+    fn reserve_filesystem_metadata(&mut self) -> Result<()> {
+        self.reserved_blocks.insert(0);
+        let inode_table_bytes = u64::from(self.superblock.inodes_per_group)
+            .checked_mul(u64::from(self.superblock.inode_size))
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let inode_table_blocks = div_ceil_u64(inode_table_bytes, BLOCK_SIZE as u64);
+        for group_index in 0..self.groups.len() {
+            let group = self.groups[group_index];
+            self.reserved_blocks
+                .insert(self.group_desc_home(group_index)?);
+            self.reserved_blocks.insert(group.block_bitmap_block());
+            self.reserved_blocks.insert(group.inode_bitmap_block());
+            for offset in 0..inode_table_blocks {
+                self.reserved_blocks.insert(
+                    group
+                        .inode_table_block()
+                        .checked_add(offset)
+                        .ok_or(Ext4FormatError::OutOfBounds)?,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn plan_truncate_size(
         &mut self,
         inode: InodeNo,
@@ -670,15 +1817,75 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Unsupported);
         }
 
-        let old_blocks = rounded_data_blocks(disk_inode.size)?;
-        let new_blocks = rounded_data_blocks(new_size)?;
+        let mut released = Vec::new();
+        let mut extent_metadata = Vec::new();
+        if new_size < disk_inode.size {
+            let new_end = u32::try_from(div_ceil_u64(new_size, BLOCK_SIZE as u64))
+                .map_err(|_| Ext4FormatError::OutOfBounds)?;
+            let (root_depth, subtree) =
+                self.plan_extent_release_tree(disk_inode.extent_root_bytes(), new_end)?;
+            match subtree.state {
+                TruncateSubtreeState::Removed => disk_inode.set_extent_root(&[])?,
+                TruncateSubtreeState::Retained { node, changed, .. } if changed => match node {
+                    ExtentNode::Leaf(extents) => disk_inode.set_extent_root(&extents)?,
+                    ExtentNode::Index(indexes) => {
+                        disk_inode.set_extent_index_root(&indexes, root_depth)?
+                    }
+                },
+                TruncateSubtreeState::Retained { .. } => {}
+            }
+            released = subtree.released;
+            extent_metadata = subtree.metadata;
+        }
+        let released_count =
+            u64::try_from(released.len()).map_err(|_| Ext4FormatError::OutOfBounds)?;
         let mut plan =
             Ext4MutationPlan::new(MutationOrigin::Truncate, inode.get() as u64, fsync_stamp);
-
-        if new_size < disk_inode.size && new_blocks < old_blocks {
-            self.plan_truncate_tail_free(&mut plan, &mut disk_inode, new_blocks, inode_bytes)?;
+        if !released.is_empty() {
+            let releases = self.plan_block_releases(&released)?;
+            let group_desc_updates = self.plan_group_free_block_increments(&releases)?;
+            let (superblock_home, superblock_before, superblock_after) =
+                self.plan_superblock_free_block_increment(released_count)?;
+            for release in releases {
+                plan.push_metadata(MetadataBlock {
+                    home: release.bitmap_home,
+                    role: MetaRole::BlockBitmap,
+                    before_version: crc32c(0, &release.bitmap_before) as u64,
+                    after: release.bitmap_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+            }
+            for (home, before, after) in group_desc_updates {
+                plan.push_metadata(MetadataBlock {
+                    home,
+                    role: MetaRole::GroupDescriptor,
+                    before_version: crc32c(0, &before) as u64,
+                    after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+            }
+            plan.push_metadata(MetadataBlock {
+                home: superblock_home,
+                role: MetaRole::Superblock,
+                before_version: crc32c(0, &superblock_before) as u64,
+                after: superblock_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+            for physical_block in released.iter().copied() {
+                plan.defer_free(physical_block);
+            }
         }
-
+        for metadata in extent_metadata {
+            plan.push_metadata(metadata)
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
+        disk_inode.blocks_512 = disk_inode
+            .blocks_512
+            .checked_sub(released_count * (BLOCK_SIZE as u64 / 512))
+            .ok_or(Ext4FormatError::Corrupt)?;
         disk_inode.size = new_size;
         disk_inode.encode_preserving_unknown(inode_bytes)?;
         self.refresh_inode_checksum(inode, &disk_inode, inode_bytes)?;
@@ -696,11 +1903,10 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     /// Build a bounded destroy plan for a VFS-proven dead inode.
     ///
-    /// Tier 1 supports zero-link regular files and empty directories whose
-    /// data blocks live in an inline initialized extent leaf and one block
-    /// group, plus inline fast symlinks. Indexed extents, unwritten extents,
-    /// non-empty directories, block-backed symlinks, and nonzero-link inodes
-    /// remain fail-closed.
+    /// Supports zero-link regular files and empty directories with initialized
+    /// extent trees, plus inline fast symlinks. Unwritten extents, non-empty
+    /// directories, block-backed symlinks, and nonzero-link inodes remain
+    /// fail-closed.
     pub fn plan_destroy_inode(
         &mut self,
         inode: InodeNo,
@@ -734,23 +1940,23 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let releases_directory = disk_inode.is_dir();
         let mut freed = if disk_inode.is_file() || releases_directory {
-            let mut blocks = Vec::new();
-            let extents = match ExtentNode::parse(disk_inode.extent_root_bytes())? {
-                ExtentNode::Leaf(extents) => extents,
-                ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
-            };
-            for extent in extents {
-                if !extent.is_initialized() {
-                    return Err(Ext4FormatError::Unsupported);
-                }
-                for logical in 0..extent.initialized_len() {
-                    blocks.push(extent.physical_start + logical as u64);
-                }
+            if disk_inode.flags & Inode::EXTENTS_FL == 0 {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            let (_, subtree) = self.plan_extent_release_tree(disk_inode.extent_root_bytes(), 0)?;
+            if !matches!(&subtree.state, TruncateSubtreeState::Removed)
+                || !subtree.metadata.is_empty()
+                || !subtree.retained_data.is_empty()
+                || !subtree.retained_homes.is_empty()
+            {
+                return Err(Ext4FormatError::Corrupt);
             }
             if releases_directory {
-                self.ensure_destroy_directory_is_empty(inode, &blocks)?;
+                let data_blocks =
+                    self.collect_extent_data_blocks(disk_inode.extent_root_bytes())?;
+                self.ensure_destroy_directory_is_empty(inode, &data_blocks)?;
             }
-            blocks
+            subtree.released
         } else if disk_inode.is_symlink() {
             if disk_inode.inline_symlink_target()?.is_none() {
                 return Err(Ext4FormatError::Unsupported);
@@ -764,28 +1970,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Corrupt);
         }
 
-        let mut block_bitmap_update = None;
-        if let Some(first) = freed.first().copied() {
-            let (block_group, bitmap_home, _) = self.block_group_for_physical(first)?;
-            if block_group != inode_group {
-                return Err(Ext4FormatError::Unsupported);
-            }
-            let mut bitmap_before = [0u8; BLOCK_SIZE];
-            self.read_block(bitmap_home, &mut bitmap_before)?;
-            let mut bitmap_after = bitmap_before;
-            for physical_block in freed.iter().copied() {
-                let (candidate_group, candidate_home, bit) =
-                    self.block_group_for_physical(physical_block)?;
-                if candidate_group != block_group || candidate_home != bitmap_home {
-                    return Err(Ext4FormatError::Unsupported);
-                }
-                if !BitmapView::new(&bitmap_after).is_set(bit) {
-                    return Err(Ext4FormatError::Corrupt);
-                }
-                BitmapMut::new(&mut bitmap_after).clear(bit)?;
-            }
-            block_bitmap_update = Some((bitmap_home, bitmap_before, bitmap_after));
-        }
+        let releases = self.plan_block_releases(&freed)?;
 
         let inode_bitmap_home = group.inode_bitmap_block();
         let mut inode_bitmap_before = [0u8; BLOCK_SIZE];
@@ -797,12 +1982,15 @@ impl<I: BlockImage> Ext4Pager<I> {
         BitmapMut::new(&mut inode_bitmap_after).clear(inode_bit)?;
 
         let mut deleted_inode = Inode::default();
-        deleted_inode.mode = disk_inode.mode;
+        // The inode bitmap is cleared by this same plan. Retaining a file
+        // type here makes e2fsprogs treat the freed slot as an orphaned live
+        // inode even after `s_last_orphan` has been cleared.
+        deleted_inode.mode = 0;
         deleted_inode.ctime = disk_inode.ctime;
-        deleted_inode.dtime = u32::try_from(fsync_stamp.raw()).unwrap_or(u32::MAX);
-        if deleted_inode.dtime == 0 {
-            deleted_inode.dtime = 1;
-        }
+        // `i_dtime` carries the next orphan only while unlink keeps the inode
+        // live. Once destroy clears the inode bitmap, it must not retain that
+        // chain state or a deletion timestamp as a stale orphan pointer.
+        deleted_inode.dtime = 0;
         deleted_inode.generation = disk_inode.generation;
         deleted_inode.extra_isize = disk_inode.extra_isize;
         deleted_inode.encode(inode_bytes)?;
@@ -816,28 +2004,26 @@ impl<I: BlockImage> Ext4Pager<I> {
         let released_blocks =
             u32::try_from(freed.len()).map_err(|_| Ext4FormatError::Unsupported)?;
         let released_dirs = if releases_directory { 1 } else { 0 };
-        let (group_desc_home, group_desc_before, group_desc_after) = self
-            .plan_group_destroy_counts(
-                inode_group,
-                block_bitmap_update.as_ref().map(|(_, _, after)| after),
-                &inode_bitmap_after,
-                released_blocks,
-                released_dirs,
-            )?;
+        let group_desc_updates = self.plan_group_destroy_count_updates(
+            &releases,
+            inode_group,
+            &inode_bitmap_after,
+            released_dirs,
+        )?;
         let (superblock_home, superblock_before, superblock_after) =
             self.plan_superblock_destroy_counts(released_blocks as u64, orphan_next)?;
 
         let mut plan =
             Ext4MutationPlan::new(MutationOrigin::Destroy, inode.get() as u64, fsync_stamp);
-        if let Some((home, before, after)) = block_bitmap_update {
-            for physical_block in freed.iter().copied() {
-                plan.defer_free(physical_block);
-            }
+        for physical_block in freed.iter().copied() {
+            plan.defer_free(physical_block);
+        }
+        for release in releases {
             plan.push_metadata(MetadataBlock {
-                home,
+                home: release.bitmap_home,
                 role: MetaRole::BlockBitmap,
-                before_version: crc32c(0, &before) as u64,
-                after,
+                before_version: crc32c(0, &release.bitmap_before) as u64,
+                after: release.bitmap_after,
                 depends_on: Vec::new(),
             })
             .map_err(|_| Ext4FormatError::Corrupt)?;
@@ -850,14 +2036,16 @@ impl<I: BlockImage> Ext4Pager<I> {
             depends_on: Vec::new(),
         })
         .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: group_desc_home,
-            role: MetaRole::GroupDescriptor,
-            before_version: crc32c(0, &group_desc_before) as u64,
-            after: group_desc_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+        for (home, before, after) in group_desc_updates {
+            plan.push_metadata(MetadataBlock {
+                home,
+                role: MetaRole::GroupDescriptor,
+                before_version: crc32c(0, &before) as u64,
+                after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
         plan.push_metadata(MetadataBlock {
             home: superblock_home,
             role: MetaRole::Superblock,
@@ -893,106 +2081,112 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(())
     }
 
-    fn plan_truncate_tail_free(
+    fn collect_extent_data_blocks(&self, root: &[u8]) -> Result<Vec<u64>> {
+        let depth = ExtentHeader::parse(root)?.depth;
+        if depth > EXT4_MAX_EXTENT_DEPTH {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut visited = Vec::new();
+        let mut blocks = Vec::new();
+        self.collect_extent_data_subtree(root, depth, &mut visited, &mut blocks)?;
+        blocks.sort_unstable();
+        if blocks.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        Ok(blocks)
+    }
+
+    fn collect_extent_node_homes(&self, root: &[u8]) -> Result<Vec<u64>> {
+        let depth = ExtentHeader::parse(root)?.depth;
+        if depth > EXT4_MAX_EXTENT_DEPTH {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut visited = Vec::new();
+        let mut homes = Vec::new();
+        self.collect_extent_node_homes_subtree(root, depth, &mut visited, &mut homes)?;
+        homes.sort_unstable();
+        Ok(homes)
+    }
+
+    fn collect_extent_node_homes_subtree(
         &self,
-        plan: &mut Ext4MutationPlan,
-        disk_inode: &mut Inode,
-        keep_blocks: u64,
-        inode_bytes: &mut [u8],
+        before: &[u8],
+        expected_depth: u16,
+        visited: &mut Vec<u64>,
+        homes: &mut Vec<u64>,
     ) -> Result<()> {
-        let keep_blocks = u32::try_from(keep_blocks).map_err(|_| Ext4FormatError::Unsupported)?;
-        let extents = match ExtentNode::parse(disk_inode.extent_root_bytes())? {
-            ExtentNode::Leaf(extents) => extents,
-            ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
-        };
-        let mut retained = Vec::new();
-        let mut freed = Vec::new();
-
-        for extent in extents {
-            if !extent.is_initialized() {
-                return Err(Ext4FormatError::Unsupported);
-            }
-            let start = extent.logical_block;
-            let len = extent.initialized_len();
-            let end = start.checked_add(len).ok_or(Ext4FormatError::OutOfBounds)?;
-            if end <= keep_blocks {
-                retained.push(extent);
-                continue;
-            }
-            if start < keep_blocks {
-                let keep_len = keep_blocks - start;
-                let mut trimmed = extent;
-                trimmed.len = u16::try_from(keep_len).map_err(|_| Ext4FormatError::Unsupported)?;
-                retained.push(trimmed);
-                for logical in keep_blocks..end {
-                    freed.push(extent.physical_start + (logical - start) as u64);
-                }
-            } else {
-                for logical in start..end {
-                    freed.push(extent.physical_start + (logical - start) as u64);
-                }
-            }
+        let header = ExtentHeader::parse(before)?;
+        if header.depth != expected_depth {
+            return Err(Ext4FormatError::Corrupt);
         }
-
-        if freed.is_empty() {
-            disk_inode.set_extent_root(&retained)?;
-            return Ok(());
-        }
-
-        let (group_index, bitmap_home, _) = self.block_group_for_physical(freed[0])?;
-        let mut bitmap_before = [0u8; BLOCK_SIZE];
-        self.read_block(bitmap_home, &mut bitmap_before)?;
-        let mut bitmap_after = bitmap_before;
-        for physical_block in freed.iter().copied() {
-            let (candidate_group, candidate_home, bit) =
-                self.block_group_for_physical(physical_block)?;
-            if candidate_group != group_index || candidate_home != bitmap_home {
-                return Err(Ext4FormatError::Unsupported);
-            }
-            if !BitmapView::new(&bitmap_after).is_set(bit) {
+        if expected_depth == 0 {
+            if !matches!(ExtentNode::parse(before)?, ExtentNode::Leaf(_)) {
                 return Err(Ext4FormatError::Corrupt);
             }
-            BitmapMut::new(&mut bitmap_after).clear(bit)?;
-            plan.defer_free(physical_block);
+            return Ok(());
         }
+        let indexes = match ExtentNode::parse(before)? {
+            ExtentNode::Index(indexes) => indexes,
+            ExtentNode::Leaf(_) => return Err(Ext4FormatError::Corrupt),
+        };
+        for index in indexes {
+            if visited.contains(&index.child) {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            visited.push(index.child);
+            homes.push(index.child);
+            let mut child = [0u8; BLOCK_SIZE];
+            self.read_block(index.child, &mut child)?;
+            self.collect_extent_node_homes_subtree(&child, expected_depth - 1, visited, homes)?;
+        }
+        Ok(())
+    }
 
-        let release_count = u32::try_from(freed.len()).map_err(|_| Ext4FormatError::Unsupported)?;
-        let (group_desc_home, group_desc_before, group_desc_after) =
-            self.plan_group_free_block_increment(group_index, &bitmap_after, release_count)?;
-        let (superblock_home, superblock_before, superblock_after) =
-            self.plan_superblock_free_block_increment(release_count as u64)?;
-
-        disk_inode.set_extent_root(&retained)?;
-        disk_inode.blocks_512 = disk_inode
-            .blocks_512
-            .checked_sub((freed.len() as u64) * (BLOCK_SIZE as u64 / 512))
-            .ok_or(Ext4FormatError::Corrupt)?;
-        disk_inode.encode_preserving_unknown(inode_bytes)?;
-
-        plan.push_metadata(MetadataBlock {
-            home: bitmap_home,
-            role: MetaRole::BlockBitmap,
-            before_version: crc32c(0, &bitmap_before) as u64,
-            after: bitmap_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: group_desc_home,
-            role: MetaRole::GroupDescriptor,
-            before_version: crc32c(0, &group_desc_before) as u64,
-            after: group_desc_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: superblock_home,
-            role: MetaRole::Superblock,
-            before_version: crc32c(0, &superblock_before) as u64,
-            after: superblock_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+    fn collect_extent_data_subtree(
+        &self,
+        before: &[u8],
+        expected_depth: u16,
+        visited: &mut Vec<u64>,
+        blocks: &mut Vec<u64>,
+    ) -> Result<()> {
+        let header = ExtentHeader::parse(before)?;
+        if header.depth != expected_depth {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        match ExtentNode::parse(before)? {
+            ExtentNode::Leaf(extents) => {
+                if expected_depth != 0 {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                for extent in extents {
+                    if !extent.is_initialized() {
+                        return Err(Ext4FormatError::Unsupported);
+                    }
+                    for offset in 0..extent.initialized_len() {
+                        blocks.push(
+                            extent
+                                .physical_start
+                                .checked_add(offset as u64)
+                                .ok_or(Ext4FormatError::OutOfBounds)?,
+                        );
+                    }
+                }
+            }
+            ExtentNode::Index(indexes) => {
+                if expected_depth == 0 {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                for index in indexes {
+                    if visited.contains(&index.child) {
+                        return Err(Ext4FormatError::Corrupt);
+                    }
+                    visited.push(index.child);
+                    let mut child = [0u8; BLOCK_SIZE];
+                    self.read_block(index.child, &mut child)?;
+                    self.collect_extent_data_subtree(&child, expected_depth - 1, visited, blocks)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1022,7 +2216,51 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(())
     }
 
+    fn refresh_extent_node_checksums(
+        &self,
+        inode: InodeNo,
+        disk_inode: &Inode,
+        metadata: &mut [MetadataBlock],
+    ) {
+        if !self.superblock.has_metadata_csum() {
+            return;
+        }
+        let seed = self.superblock.metadata_csum_seed();
+        for block in metadata.iter_mut() {
+            if block.role != MetaRole::ExtentNode {
+                continue;
+            }
+            let checksum = extent_block_csum32(
+                seed,
+                inode.get(),
+                disk_inode.generation,
+                &block.after,
+            );
+            block.after[BLOCK_SIZE - 4..].copy_from_slice(&checksum.to_le_bytes());
+        }
+    }
+
     fn plan_block_allocation(&self) -> Result<(u64, usize, u64, Page4K, Page4K)> {
+        let allocations = self.plan_block_allocations(1)?;
+        let physical_block = allocations.claims[0];
+        let group = allocations
+            .groups
+            .into_iter()
+            .next()
+            .ok_or(Ext4FormatError::Corrupt)?;
+        Ok((
+            physical_block,
+            group.group_index,
+            group.bitmap_home,
+            group.bitmap_before,
+            group.bitmap_after,
+        ))
+    }
+
+    fn plan_block_allocations(&self, amount: usize) -> Result<PlannedBlockAllocations> {
+        if amount == 0 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
         if self.superblock.blocks_per_group == 0 {
             return Err(Ext4FormatError::Corrupt);
         }
@@ -1030,6 +2268,8 @@ impl<I: BlockImage> Ext4Pager<I> {
         let first_data_block = self.superblock.first_data_block as u64;
         let total_blocks = core::cmp::min(self.superblock.blocks_count, self.image.total_blocks());
 
+        let mut claims = Vec::new();
+        let mut groups = Vec::new();
         for (group_index, group) in self.groups.iter().copied().enumerate() {
             let group_start = first_data_block + group_index as u64 * blocks_per_group;
             if group_start >= total_blocks {
@@ -1037,24 +2277,98 @@ impl<I: BlockImage> Ext4Pager<I> {
             }
             let group_block_count = core::cmp::min(blocks_per_group, total_blocks - group_start);
             let bitmap_home = group.block_bitmap_block();
+            if bitmap_home == 0
+                || bitmap_home >= total_blocks
+                || group.inode_bitmap_block() == 0
+                || group.inode_bitmap_block() >= total_blocks
+                || group.inode_table_block() == 0
+                || group.inode_table_block() >= total_blocks
+            {
+                return Err(Ext4FormatError::Corrupt);
+            }
             let mut bitmap_before = [0u8; BLOCK_SIZE];
             self.read_block(bitmap_home, &mut bitmap_before)?;
             let mut bitmap_after = bitmap_before;
-            let view = BitmapView::new(&bitmap_after);
-            let Some(bit) = (0..group_block_count as usize).find(|bit| !view.is_set(*bit)) else {
+            let remaining = amount - claims.len();
+            let mut free = Vec::new();
+            for bit in 0..group_block_count as usize {
+                if BitmapView::new(&bitmap_after).is_set(bit)
+                    || self.is_reserved_metadata_block(group_start + bit as u64)?
+                {
+                    continue;
+                }
+                free.push(bit);
+                if free.len() == remaining {
+                    break;
+                }
+            }
+            if free.is_empty() {
                 continue;
-            };
-            BitmapMut::new(&mut bitmap_after).set(bit)?;
-            return Ok((
-                group_start + bit as u64,
+            }
+            for bit in &free {
+                BitmapMut::new(&mut bitmap_after).set(*bit)?;
+            }
+            let count = u32::try_from(free.len()).map_err(|_| Ext4FormatError::OutOfBounds)?;
+            claims.extend(free.into_iter().map(|bit| group_start + bit as u64));
+            groups.push(PlannedGroupAllocation {
                 group_index,
                 bitmap_home,
                 bitmap_before,
                 bitmap_after,
-            ));
+                count,
+            });
+            if claims.len() == amount {
+                return Ok(PlannedBlockAllocations { claims, groups });
+            }
         }
 
         Err(Ext4FormatError::OutOfBounds)
+    }
+
+    fn is_reserved_metadata_block(&self, block: u64) -> Result<bool> {
+        if block == 0 {
+            return Ok(true);
+        }
+        let gdt_start = if self.superblock.block_size() == 1024 {
+            2
+        } else {
+            1
+        };
+        let gdt_bytes = self
+            .groups
+            .len()
+            .checked_mul(self.superblock.group_desc_size())
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let gdt_blocks = gdt_bytes.div_ceil(BLOCK_SIZE) as u64;
+        if block >= gdt_start && block < gdt_start + gdt_blocks {
+            return Ok(true);
+        }
+        let inode_table_bytes = u64::from(self.superblock.inodes_per_group)
+            .checked_mul(u64::from(self.superblock.inode_size))
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let inode_table_blocks = inode_table_bytes.div_ceil(BLOCK_SIZE as u64);
+        for group in &self.groups {
+            if block == group.block_bitmap_block() || block == group.inode_bitmap_block() {
+                return Ok(true);
+            }
+            let inode_table_start = group.inode_table_block();
+            if block >= inode_table_start && block < inode_table_start + inode_table_blocks {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn group_desc_home(&self, group_index: usize) -> Result<u64> {
+        let byte_offset = group_index
+            .checked_mul(self.superblock.group_desc_size())
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let gdt_start = if self.superblock.block_size() == 1024 {
+            2
+        } else {
+            1
+        };
+        Ok(gdt_start + (byte_offset / BLOCK_SIZE) as u64)
     }
 
     fn plan_inode_allocation(&self) -> Result<(InodeNo, usize, u64, Page4K, Page4K)> {
@@ -1123,6 +2437,43 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((group_index, group.block_bitmap_block(), bit))
     }
 
+    fn plan_block_releases(&self, released: &[u64]) -> Result<Vec<PlannedGroupAllocation>> {
+        let mut groups = Vec::new();
+        for physical_block in released.iter().copied() {
+            let (group_index, bitmap_home, bit) = self.block_group_for_physical(physical_block)?;
+            let group_pos = groups
+                .iter()
+                .position(|group: &PlannedGroupAllocation| group.group_index == group_index);
+            let group_pos = if let Some(pos) = group_pos {
+                pos
+            } else {
+                let mut bitmap_before = [0u8; BLOCK_SIZE];
+                self.read_block(bitmap_home, &mut bitmap_before)?;
+                groups.push(PlannedGroupAllocation {
+                    group_index,
+                    bitmap_home,
+                    bitmap_before,
+                    bitmap_after: bitmap_before,
+                    count: 0,
+                });
+                groups.len() - 1
+            };
+            let group = &mut groups[group_pos];
+            if group.bitmap_home != bitmap_home {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            if !BitmapView::new(&group.bitmap_after).is_set(bit) {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            BitmapMut::new(&mut group.bitmap_after).clear(bit)?;
+            group.count = group
+                .count
+                .checked_add(1)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+        }
+        Ok(groups)
+    }
+
     fn group_inode_count(&self, group_index: usize) -> Result<usize> {
         if self.superblock.inodes_per_group == 0 {
             return Err(Ext4FormatError::Corrupt);
@@ -1147,6 +2498,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         offset: usize,
         after: &mut Page4K,
     ) -> Result<()> {
+        // `bg_itable_unused` is validated together with group metadata
+        // checksums. Preserve it on non-metadata-csum filesystems rather than
+        // manufacturing an uninitialized-group claim we cannot authenticate.
+        if !self.superblock.has_metadata_csum() {
+            return Ok(());
+        }
         let group_inode_count = self.group_inode_count(group_index)?;
         let bitmap = BitmapView::new(inode_bitmap_after);
         let mut unused = 0usize;
@@ -1297,14 +2654,178 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((home, before, after))
     }
 
-    fn plan_group_free_block_increment(
+    fn plan_group_free_block_decrements(
         &self,
-        group_index: usize,
-        bitmap_after: &Page4K,
-        released: u32,
-    ) -> Result<(u64, Page4K, Page4K)> {
+        allocations: &[PlannedGroupAllocation],
+    ) -> Result<Vec<(u64, Page4K, Page4K)>> {
+        if let [allocation] = allocations {
+            if allocation.count == 1 {
+                return Ok(vec![self.plan_group_free_block_decrement(
+                    allocation.group_index,
+                    &allocation.bitmap_after,
+                )?]);
+            }
+        }
         let desc_size = self.superblock.group_desc_size();
-        let byte_offset = group_index
+        let gdt_start = if self.superblock.block_size() == 1024 {
+            2
+        } else {
+            1
+        };
+        let mut updates = Vec::new();
+        for allocation in allocations {
+            let byte_offset = allocation
+                .group_index
+                .checked_mul(desc_size)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            let home = gdt_start + (byte_offset / BLOCK_SIZE) as u64;
+            let offset = byte_offset % BLOCK_SIZE;
+            if offset + desc_size > BLOCK_SIZE {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            let update_pos = updates
+                .iter()
+                .position(|(existing, _, _)| *existing == home);
+            let update_pos = if let Some(pos) = update_pos {
+                pos
+            } else {
+                let mut before = [0u8; BLOCK_SIZE];
+                self.read_block(home, &mut before)?;
+                updates.push((home, before, before));
+                updates.len() - 1
+            };
+            let after = &mut updates[update_pos].2;
+            let descriptor = GroupDesc::parse_sized(&after[offset..offset + desc_size], desc_size)?;
+            let free = u32::from(descriptor.free_blocks_count)
+                | (u32::from(descriptor.free_blocks_count_hi) << 16);
+            let next = free
+                .checked_sub(allocation.count)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            if desc_size < 64 && next > u16::MAX as u32 {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            after[offset + 12..offset + 14].copy_from_slice(&(next as u16).to_le_bytes());
+            if desc_size >= 64 {
+                after[offset + 44..offset + 46]
+                    .copy_from_slice(&((next >> 16) as u16).to_le_bytes());
+            }
+            if self.superblock.has_metadata_csum() {
+                let bitmap_checksum = block_bitmap_csum32(
+                    self.superblock.metadata_csum_seed(),
+                    &allocation.bitmap_after,
+                    self.superblock.blocks_per_group,
+                )?;
+                after[offset + 24..offset + 26]
+                    .copy_from_slice(&(bitmap_checksum as u16).to_le_bytes());
+                if desc_size >= 64 {
+                    after[offset + 56..offset + 58]
+                        .copy_from_slice(&((bitmap_checksum >> 16) as u16).to_le_bytes());
+                }
+                after[offset + 30..offset + 32].fill(0);
+                let group_id = u32::try_from(allocation.group_index)
+                    .map_err(|_| Ext4FormatError::OutOfBounds)?;
+                let checksum = group_desc_csum16(
+                    self.superblock.metadata_csum_seed(),
+                    group_id,
+                    &after[offset..offset + desc_size],
+                );
+                after[offset + 30..offset + 32].copy_from_slice(&checksum.to_le_bytes());
+            }
+        }
+        Ok(updates)
+    }
+
+    fn plan_group_free_block_increments(
+        &self,
+        releases: &[PlannedGroupAllocation],
+    ) -> Result<Vec<(u64, Page4K, Page4K)>> {
+        let desc_size = self.superblock.group_desc_size();
+        let gdt_start = if self.superblock.block_size() == 1024 {
+            2
+        } else {
+            1
+        };
+        let mut updates = Vec::new();
+        for release in releases {
+            let byte_offset = release
+                .group_index
+                .checked_mul(desc_size)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            let home = gdt_start + (byte_offset / BLOCK_SIZE) as u64;
+            let offset = byte_offset % BLOCK_SIZE;
+            if offset + desc_size > BLOCK_SIZE {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            let update_pos = updates
+                .iter()
+                .position(|(existing, _, _)| *existing == home);
+            let update_pos = if let Some(pos) = update_pos {
+                pos
+            } else {
+                let mut before = [0u8; BLOCK_SIZE];
+                self.read_block(home, &mut before)?;
+                updates.push((home, before, before));
+                updates.len() - 1
+            };
+            let after = &mut updates[update_pos].2;
+            let descriptor = GroupDesc::parse_sized(&after[offset..offset + desc_size], desc_size)?;
+            let free = u32::from(descriptor.free_blocks_count)
+                | (u32::from(descriptor.free_blocks_count_hi) << 16);
+            let next = free
+                .checked_add(release.count)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            if desc_size < 64 && next > u16::MAX as u32 {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            after[offset + 12..offset + 14].copy_from_slice(&(next as u16).to_le_bytes());
+            if desc_size >= 64 {
+                after[offset + 44..offset + 46]
+                    .copy_from_slice(&((next >> 16) as u16).to_le_bytes());
+            }
+            if self.superblock.has_metadata_csum() {
+                let bitmap_checksum = block_bitmap_csum32(
+                    self.superblock.metadata_csum_seed(),
+                    &release.bitmap_after,
+                    self.superblock.blocks_per_group,
+                )?;
+                after[offset + 24..offset + 26]
+                    .copy_from_slice(&(bitmap_checksum as u16).to_le_bytes());
+                if desc_size >= 64 {
+                    after[offset + 56..offset + 58]
+                        .copy_from_slice(&((bitmap_checksum >> 16) as u16).to_le_bytes());
+                }
+                after[offset + 30..offset + 32].fill(0);
+                let group_id =
+                    u32::try_from(release.group_index).map_err(|_| Ext4FormatError::OutOfBounds)?;
+                let checksum = group_desc_csum16(
+                    self.superblock.metadata_csum_seed(),
+                    group_id,
+                    &after[offset..offset + desc_size],
+                );
+                after[offset + 30..offset + 32].copy_from_slice(&checksum.to_le_bytes());
+            }
+        }
+        Ok(updates)
+    }
+
+    fn plan_group_destroy_count_updates(
+        &self,
+        releases: &[PlannedGroupAllocation],
+        inode_group: usize,
+        inode_bitmap_after: &Page4K,
+        released_dirs: u32,
+    ) -> Result<Vec<(u64, Page4K, Page4K)>> {
+        if releases.is_empty() {
+            return Ok(vec![self.plan_group_destroy_counts(
+                inode_group,
+                None,
+                inode_bitmap_after,
+                0,
+                released_dirs,
+            )?]);
+        }
+        let desc_size = self.superblock.group_desc_size();
+        let byte_offset = inode_group
             .checked_mul(desc_size)
             .ok_or(Ext4FormatError::OutOfBounds)?;
         let gdt_start = if self.superblock.block_size() == 1024 {
@@ -1317,36 +2838,59 @@ impl<I: BlockImage> Ext4Pager<I> {
         if offset + desc_size > BLOCK_SIZE {
             return Err(Ext4FormatError::Unsupported);
         }
-        let mut before = [0u8; BLOCK_SIZE];
-        self.read_block(home, &mut before)?;
-        let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
-        let free = u32::from(descriptor.free_blocks_count)
-            | (u32::from(descriptor.free_blocks_count_hi) << 16);
-        let next = free
-            .checked_add(released)
+
+        let mut updates = self.plan_group_free_block_increments(releases)?;
+        let update_pos = updates
+            .iter()
+            .position(|(existing, _, _)| *existing == home);
+        let update_pos = if let Some(pos) = update_pos {
+            pos
+        } else {
+            let mut before = [0u8; BLOCK_SIZE];
+            self.read_block(home, &mut before)?;
+            updates.push((home, before, before));
+            updates.len() - 1
+        };
+        let after = &mut updates[update_pos].2;
+        let descriptor = GroupDesc::parse_sized(&after[offset..offset + desc_size], desc_size)?;
+        let free_inodes = u32::from(descriptor.free_inodes_count)
+            | (u32::from(descriptor.free_inodes_count_hi) << 16);
+        let used_dirs = u32::from(descriptor.used_dirs_count)
+            | (u32::from(descriptor.used_dirs_count_hi) << 16);
+        let next_free_inodes = free_inodes
+            .checked_add(1)
             .ok_or(Ext4FormatError::OutOfBounds)?;
-        if desc_size < 64 && next > u16::MAX as u32 {
+        let next_used_dirs = used_dirs
+            .checked_sub(released_dirs)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        if desc_size < 64
+            && (next_free_inodes > u16::MAX as u32 || next_used_dirs > u16::MAX as u32)
+        {
             return Err(Ext4FormatError::Corrupt);
         }
-        let mut after = before;
-        after[offset + 12..offset + 14].copy_from_slice(&(next as u16).to_le_bytes());
+        after[offset + 14..offset + 16].copy_from_slice(&(next_free_inodes as u16).to_le_bytes());
+        after[offset + 16..offset + 18].copy_from_slice(&(next_used_dirs as u16).to_le_bytes());
         if desc_size >= 64 {
-            after[offset + 44..offset + 46].copy_from_slice(&((next >> 16) as u16).to_le_bytes());
+            after[offset + 46..offset + 48]
+                .copy_from_slice(&((next_free_inodes >> 16) as u16).to_le_bytes());
+            after[offset + 48..offset + 50]
+                .copy_from_slice(&((next_used_dirs >> 16) as u16).to_le_bytes());
         }
+        self.sync_group_itable_unused(inode_group, inode_bitmap_after, desc_size, offset, after)?;
         if self.superblock.has_metadata_csum() {
-            let bitmap_checksum = block_bitmap_csum32(
+            let inode_bitmap_checksum = inode_bitmap_csum32(
                 self.superblock.metadata_csum_seed(),
-                bitmap_after,
-                self.superblock.blocks_per_group,
+                inode_bitmap_after,
+                self.superblock.inodes_per_group,
             )?;
-            after[offset + 24..offset + 26]
-                .copy_from_slice(&(bitmap_checksum as u16).to_le_bytes());
+            after[offset + 26..offset + 28]
+                .copy_from_slice(&(inode_bitmap_checksum as u16).to_le_bytes());
             if desc_size >= 64 {
-                after[offset + 56..offset + 58]
-                    .copy_from_slice(&((bitmap_checksum >> 16) as u16).to_le_bytes());
+                after[offset + 58..offset + 60]
+                    .copy_from_slice(&((inode_bitmap_checksum >> 16) as u16).to_le_bytes());
             }
             after[offset + 30..offset + 32].fill(0);
-            let group_id = u32::try_from(group_index).map_err(|_| Ext4FormatError::OutOfBounds)?;
+            let group_id = u32::try_from(inode_group).map_err(|_| Ext4FormatError::OutOfBounds)?;
             let checksum = group_desc_csum16(
                 self.superblock.metadata_csum_seed(),
                 group_id,
@@ -1354,7 +2898,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             );
             after[offset + 30..offset + 32].copy_from_slice(&checksum.to_le_bytes());
         }
-        Ok((home, before, after))
+        Ok(updates)
     }
 
     fn plan_group_free_inode_decrement(
@@ -1610,13 +3154,13 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok((home, before, after))
     }
 
-    fn plan_superblock_free_block_decrement(&self) -> Result<(u64, Page4K, Page4K)> {
+    fn plan_superblock_free_block_decrement(&self, amount: u32) -> Result<(u64, Page4K, Page4K)> {
         let mut before = [0u8; BLOCK_SIZE];
         self.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
         let next = observed
             .free_blocks_count
-            .checked_sub(1)
+            .checked_sub(u64::from(amount))
             .ok_or(Ext4FormatError::OutOfBounds)?;
         let mut after = before;
         after[1024 + 12..1024 + 16].copy_from_slice(&(next as u32).to_le_bytes());
@@ -3438,6 +4982,159 @@ impl<I: BlockImage> Ext4Pager<I> {
     }
 }
 
+fn validate_extent_node_layout(bytes: &[u8], header: ExtentHeader) -> Result<()> {
+    if header.depth == 0 {
+        let mut previous_end = None;
+        for entry in 0..usize::from(header.entries) {
+            let start = 12 + entry * 12;
+            let extent = Extent::parse(
+                bytes
+                    .get(start..start + 12)
+                    .ok_or(Ext4FormatError::Truncated)?,
+            )?;
+            let len = extent.initialized_len();
+            if len == 0 {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            if previous_end.is_some_and(|end| extent.logical_block < end) {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            previous_end = Some(
+                extent
+                    .logical_block
+                    .checked_add(len)
+                    .ok_or(Ext4FormatError::Corrupt)?,
+            );
+        }
+    } else {
+        let mut previous_key = None;
+        for entry in 0..usize::from(header.entries) {
+            let start = 12 + entry * 12;
+            let index = ExtentIdx::parse(
+                bytes
+                    .get(start..start + 12)
+                    .ok_or(Ext4FormatError::Truncated)?,
+            )?;
+            if previous_key.is_some_and(|key| index.logical_block <= key) {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            previous_key = Some(index.logical_block);
+        }
+    }
+    Ok(())
+}
+
+fn physical_ranges_contain(ranges: &[PhysicalBlockRange], block: u64) -> bool {
+    let index = ranges.partition_point(|range| range.start <= block);
+    index != 0 && ranges[index - 1].contains(block)
+}
+
+fn truncate_extents_at(extents: Vec<Extent>, new_end: u32) -> Result<(Vec<Extent>, Vec<u64>)> {
+    let mut retained = Vec::new();
+    let mut released = Vec::new();
+    for mut extent in extents {
+        if !extent.is_initialized() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let extent_end = extent
+            .logical_block
+            .checked_add(extent.initialized_len())
+            .ok_or(Ext4FormatError::Corrupt)?;
+        if extent_end <= new_end {
+            retained.push(extent);
+            continue;
+        }
+        let keep = new_end.saturating_sub(extent.logical_block);
+        for offset in keep..extent.initialized_len() {
+            released.push(
+                extent
+                    .physical_start
+                    .checked_add(offset as u64)
+                    .ok_or(Ext4FormatError::OutOfBounds)?,
+            );
+        }
+        if keep != 0 {
+            extent.len = u16::try_from(keep).map_err(|_| Ext4FormatError::Corrupt)?;
+            retained.push(extent);
+        }
+    }
+    Ok((retained, released))
+}
+
+fn convert_inline_uninitialized_extent(
+    root: &[u8],
+    logical: u32,
+) -> Result<Option<(u64, Vec<Extent>)>> {
+    let mut extents = match ExtentNode::parse(root)? {
+        ExtentNode::Leaf(extents) => extents,
+        ExtentNode::Index(_) => return Ok(None),
+    };
+    let Some(physical) = convert_uninitialized_extent_list(&mut extents, logical)? else {
+        return Ok(None);
+    };
+    if extents.len() > 4 {
+        return Err(Ext4FormatError::Unsupported);
+    }
+    Ok(Some((physical, extents)))
+}
+
+fn convert_uninitialized_extent_list(
+    extents: &mut Vec<Extent>,
+    logical: u32,
+) -> Result<Option<u64>> {
+    let Some(position) = extents
+        .iter()
+        .position(|extent| !extent.is_initialized() && extent.contains(logical))
+    else {
+        return Ok(None);
+    };
+    let original = extents[position];
+    let prefix_len = logical
+        .checked_sub(original.logical_block)
+        .ok_or(Ext4FormatError::Corrupt)?;
+    let total_len = original.initialized_len();
+    let suffix_len = total_len
+        .checked_sub(prefix_len)
+        .and_then(|remaining| remaining.checked_sub(1))
+        .ok_or(Ext4FormatError::Corrupt)?;
+    let physical = original
+        .physical_start
+        .checked_add(u64::from(prefix_len))
+        .ok_or(Ext4FormatError::OutOfBounds)?;
+
+    let mut replacement = Vec::new();
+    if prefix_len != 0 {
+        replacement.push(Extent {
+            logical_block: original.logical_block,
+            len: uninitialized_extent_len(prefix_len)?,
+            physical_start: original.physical_start,
+        });
+    }
+    replacement.push(Extent {
+        logical_block: logical,
+        len: 1,
+        physical_start: physical,
+    });
+    if suffix_len != 0 {
+        replacement.push(Extent {
+            logical_block: logical.checked_add(1).ok_or(Ext4FormatError::Corrupt)?,
+            len: uninitialized_extent_len(suffix_len)?,
+            physical_start: physical
+                .checked_add(1)
+                .ok_or(Ext4FormatError::OutOfBounds)?,
+        });
+    }
+    extents.splice(position..=position, replacement);
+    Ok(Some(physical))
+}
+
+fn uninitialized_extent_len(len: u32) -> Result<u16> {
+    if len == 0 || len >= u32::from(Extent::UNINITIALIZED_MASK) {
+        return Err(Ext4FormatError::Corrupt);
+    }
+    Ok(Extent::UNINITIALIZED_MASK | len as u16)
+}
+
 /// Insert `(logical → physical)` into a logical-sorted extent list, growing the
 /// preceding extent in place when the new block continues it contiguously
 /// (the common sequential case → one growing extent), otherwise inserting a
@@ -3522,10 +5219,6 @@ fn logical_block(file_page_index: u64) -> Result<u32> {
     file_page_index
         .try_into()
         .map_err(|_| Ext4FormatError::OutOfBounds)
-}
-
-fn rounded_data_blocks(size: u64) -> Result<u64> {
-    Ok(div_ceil_u64(size, BLOCK_SIZE as u64))
 }
 
 fn seconds_from_ns(timestamp_ns: u64) -> Result<u32> {

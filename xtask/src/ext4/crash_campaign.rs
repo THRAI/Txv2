@@ -8,8 +8,8 @@ use crate::target::TxTarget;
 use crate::Result;
 
 use super::{
-    is_real_sha256, read_json, receipt, run_workspace, sha256_file, CrashCutCampaignPlan,
-    CrashCutCatalog, CrashCutFamily,
+    e2fsprogs::ToolCommand, is_real_sha256, read_json, receipt, run_workspace, sha256_file,
+    CrashCutCampaignPlan, CrashCutCatalog, CrashCutFamily,
 };
 
 const REPLAY_PROBE_MAX_ATTEMPTS: usize = 3;
@@ -187,7 +187,8 @@ pub(crate) fn execute_crash_cut_campaign(
     boot_image: &Path,
     source_image: &Path,
     workload_image: &Path,
-    e2fsck: &str,
+    e2fsck: &ToolCommand,
+    debugfs: &ToolCommand,
     start_cut: Option<usize>,
 ) -> Result<CrashCutCampaignEvidence> {
     let Some(campaign) = &crash_cuts.campaign else {
@@ -233,8 +234,13 @@ pub(crate) fn execute_crash_cut_campaign(
             source_image,
             workload_image,
         )?;
-        let executor_result =
-            run_fault_qemu_executor(root, &job.request_path, &job.fault_executor_log, e2fsck);
+        let executor_result = run_fault_qemu_executor(
+            root,
+            &job.request_path,
+            &job.fault_executor_log,
+            e2fsck,
+            debugfs,
+        );
         record_existing_fault_job_artifacts(run, &cut_id, &job)?;
         executor_result?;
         let campaign_plan_sha256 = sha256_file(&manifest)?;
@@ -866,7 +872,8 @@ fn run_fault_qemu_executor(
     root: &Path,
     request_path: &Path,
     log_path: &Path,
-    e2fsck: &str,
+    e2fsck: &ToolCommand,
+    debugfs: &ToolCommand,
 ) -> Result<()> {
     let script = root.join("tools/ext4/fault_qemu_executor.py");
     if !script.is_file() {
@@ -877,7 +884,8 @@ fn run_fault_qemu_executor(
     let output = Command::new("python3")
         .arg(&script)
         .arg(request_path)
-        .env("TX_EXT4_FAULT_E2FSCK_COMMAND", e2fsck)
+        .env("TX_EXT4_FAULT_E2FSCK_COMMAND", e2fsck.env_command())
+        .env("TX_EXT4_FAULT_DEBUGFS_COMMAND", debugfs.env_command())
         .current_dir(root)
         .output()
         .map_err(|err| format!("failed to run {}: {err}", script.display()))?;

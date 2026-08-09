@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LINUX_RUNNER = ROOT / "tools" / "ext4" / "fault_linux_rw_replay.py"
 XFSTESTS_DOCKER_RUNNER = ROOT / "tools" / "ext4" / "tier1_xfstests_docker.py"
 XFSTESTS_DOCKERFILE = ROOT / "tools" / "ext4" / "Dockerfile.xfstests-tier1"
+E2FSPROGS_DOCKER_RUNNER = ROOT / "tools" / "ext4" / "e2fsprogs_docker.py"
 TX_RUNNER = ROOT / "tools" / "ext4" / "fault_tx_remount.py"
 TX_SCRIPT = ROOT / "tools" / "shell-tests" / "ext4-fault-tx-remount.txt"
 
@@ -28,9 +29,11 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         self.assertTrue(LINUX_RUNNER.is_file())
         self.assertTrue(XFSTESTS_DOCKER_RUNNER.is_file())
         self.assertTrue(XFSTESTS_DOCKERFILE.is_file())
+        self.assertTrue(E2FSPROGS_DOCKER_RUNNER.is_file())
         self.assertTrue(TX_RUNNER.is_file())
         self.assertTrue(os.access(LINUX_RUNNER, os.X_OK))
         self.assertTrue(os.access(XFSTESTS_DOCKER_RUNNER, os.X_OK))
+        self.assertTrue(os.access(E2FSPROGS_DOCKER_RUNNER, os.X_OK))
         self.assertTrue(os.access(TX_RUNNER, os.X_OK))
         self.assertTrue(TX_SCRIPT.is_file())
 
@@ -63,6 +66,29 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(module.LinuxReplayError, "Docker fallback blocked"):
                 module.preflight_replay_environment()
+
+    def test_e2fsprogs_docker_runner_binds_the_image_parent_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "candidate.ext4"
+            image.write_bytes(b"ext4-image")
+            module = load_module(E2FSPROGS_DOCKER_RUNNER, "e2fsprogs_docker")
+            completed = subprocess.CompletedProcess(["docker"], 0, "", "")
+            with mock.patch.object(module.shutil, "which", return_value="/usr/bin/docker"), mock.patch.object(
+                module.subprocess, "run", return_value=completed
+            ) as run:
+                self.assertEqual(module.run("e2fsck", ["-fn", str(image)]), 0)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["/usr/bin/docker", "run", "--rm"])
+        self.assertIn("readonly", command[command.index("--mount") + 1])
+        self.assertEqual(command[-3:], ["e2fsck", "-fn", "/fixture/candidate.ext4"])
+
+    def test_e2fsprogs_docker_runner_preserves_tool_short_options(self):
+        module = load_module(E2FSPROGS_DOCKER_RUNNER, "e2fsprogs_docker")
+        with mock.patch.object(module, "run", return_value=0) as run:
+            self.assertEqual(module.main(["--tool", "debugfs", "-R", "stat <2>", "image.ext4"]), 0)
+
+        run.assert_called_once_with("debugfs", ["-R", "stat <2>", "image.ext4"])
 
     def test_xfstests_docker_preflight_reports_unbuilt_selected_helpers(self):
         module = load_module(XFSTESTS_DOCKER_RUNNER, "tier1_xfstests_docker")
@@ -104,14 +130,15 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         module = load_module(XFSTESTS_DOCKER_RUNNER, "tier1_xfstests_docker")
         script = module.docker_prepare_script(["generic/013", "generic/091"])
 
+        self.assertIn("make configure;", script)
+        self.assertLess(script.index("make configure;"), script.index("./configure"))
         self.assertIn('CFLAGS="-D_GNU_SOURCE ${CFLAGS:-}" ./configure', script)
         self.assertIn("--libexecdir=/usr/lib", script)
         self.assertIn("--exec_prefix=/var/lib", script)
-        self.assertIn("make -j2", script)
-        self.assertIn("'ltp/fsstress'", script)
-        self.assertIn("'ltp/fsx'", script)
-        self.assertIn("'src/feature'", script)
-        self.assertIn("'src/min_dio_alignment'", script)
+        self.assertIn("make -C lib;", script)
+        self.assertIn("make -j2 -C 'ltp' 'fsstress' 'fsx'", script)
+        self.assertIn("make -j2 -C 'src' 'feature' 'min_dio_alignment'", script)
+        self.assertNotIn("make -j2 'ltp/fsstress'", script)
 
     def test_tx_runner_builds_shell_test_with_matrix_image_as_scratch(self):
         with tempfile.TemporaryDirectory() as tmp:

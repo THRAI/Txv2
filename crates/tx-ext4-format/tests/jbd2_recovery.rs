@@ -1,11 +1,11 @@
 use tx_ext4_format::journal::{
-    Jbd2MetadataUpdate, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
-    JBD2_BLOCK_SUPERBLOCK_V2, JBD2_MAGIC,
+    JBD2_BLOCK_SIZE, JBD2_BLOCK_SUPERBLOCK_V2, JBD2_MAGIC, Jbd2MetadataUpdate, Jbd2Revoke,
+    Jbd2Superblock, Jbd2TransactionImage,
 };
-use tx_ext4_format::ondisk::{crc32c_append, Superblock};
+use tx_ext4_format::ondisk::{Superblock, crc32c_append};
 use tx_ext4_format::pager::{BlockImage, JournalGeometry, Page4K};
 use tx_ext4_format::{
-    clean_replayed_journal, recover_if_required, replay_journal, Ext4FormatError, RecoveryReport,
+    Ext4FormatError, RecoveryReport, clean_replayed_journal, recover_if_required, replay_journal,
 };
 
 #[derive(Clone)]
@@ -129,8 +129,38 @@ fn replay_does_not_apply_a_committed_after_image_revoked_by_the_same_transaction
     *image.block_mut(9) = before;
     *image.block_mut(44) = record.descriptor;
     *image.block_mut(48) = record.metadata_blocks[0];
-    *image.block_mut(52) = record.revoke.expect("revoke page");
+    *image.block_mut(52) = record.revokes[0];
     *image.block_mut(56) = record.commit;
+
+    let report = replay_journal(&mut image, &geometry).unwrap();
+
+    assert_eq!(report.transactions, 1);
+    assert_eq!(report.blocks_replayed, 0);
+    assert_eq!(image.block(9), &before);
+}
+
+#[test]
+fn replay_honors_every_revoke_page_in_one_committed_transaction() {
+    let geometry = geometry();
+    let mut image = MemImage::new(80);
+    let before = [0x11; JBD2_BLOCK_SIZE];
+    let mut revoked_blocks: Vec<u32> = (100..).take(Jbd2Revoke::MAX_BLOCKS_PER_PAGE).collect();
+    revoked_blocks.push(9);
+    let record = Jbd2TransactionImage::encode_legacy_with_revokes(
+        42,
+        geometry.superblock.uuid,
+        vec![Jbd2MetadataUpdate::new(9, [0x5A; JBD2_BLOCK_SIZE])],
+        revoked_blocks,
+    )
+    .unwrap();
+
+    assert_eq!(record.revokes.len(), 2);
+    *image.block_mut(9) = before;
+    *image.block_mut(44) = record.descriptor;
+    *image.block_mut(48) = record.metadata_blocks[0];
+    *image.block_mut(52) = record.revokes[0];
+    *image.block_mut(56) = record.revokes[1];
+    *image.block_mut(60) = record.commit;
 
     let report = replay_journal(&mut image, &geometry).unwrap();
 

@@ -31,9 +31,10 @@ use super::address_space::{
     reserve_mapping_from_root, unmap_mapping_from_root,
 };
 use super::kernel_space::{
-    commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag, protect_kernel_mapping_from_bag,
-    reserve_direct_map_1g_from_bag, reserve_kernel_mapping_from_bag,
-    rollback_kernel_mapping_from_bag, unmap_kernel_mapping_from_bag,
+    commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag, extend_direct_map_from_bag,
+    protect_kernel_mapping_from_bag, reserve_direct_map_1g_from_bag,
+    reserve_kernel_mapping_from_bag, rollback_kernel_mapping_from_bag,
+    unmap_kernel_mapping_from_bag,
 };
 use super::pt_node::{
     alloc_pt_node_from_bag, free_pt_node_from_bag, install_pt_node_allocator_for_test,
@@ -464,6 +465,26 @@ fn direct_map_extension_is_idempotent_for_existing_leaf() {
         reserve_direct_map_1g_from_bag(&bag, PhysAddr(QEMU_RAM_BASE))
             .expect("existing direct map leaf"),
         None
+    );
+}
+
+#[test]
+fn direct_map_extension_accounts_for_the_preinstalled_fdt_leaf() {
+    let _guard = pmap_test_guard();
+    let mut bag = test_bag();
+    let fdt_leaf = PhysAddr(QEMU_RAM_BASE + QEMU_BOOTSTRAP_MAP_SIZE * 3);
+    map_bootstrap_pmap(&mut bag).map_direct_map_leaf(fdt_leaf);
+    bag.publish_bootstrap_pmap_info();
+
+    extend_direct_map_from_bag(&bag, PhysAddr(QEMU_RAM_BASE + QEMU_BOOTSTRAP_MAP_SIZE * 4))
+        .expect("extend through FDT leaf");
+
+    let info = bag.bootstrap_pmap_info_ref().expect("pmap info");
+    assert_eq!(info.direct_map.size, QEMU_BOOTSTRAP_MAP_SIZE * 4);
+    assert_eq!(info.mapped.size, QEMU_BOOTSTRAP_MAP_SIZE * 4);
+    assert_eq!(
+        bag.bootstrap_root_ref().0[rv64_1g_leaf_index(EXPECTED_DIRECT_MAP_BASE + fdt_leaf.0)],
+        encode_leaf_pte(fdt_leaf, PTE_R | PTE_W | PTE_G)
     );
 }
 

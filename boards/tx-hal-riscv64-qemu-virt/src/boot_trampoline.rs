@@ -77,6 +77,28 @@ _start:
     add t3, s2, t2
     sd t1, 0(t3)
 
+    // QEMU may place the FDT at the top of RAM. Preserve the one direct-map
+    // leaf containing the firmware pointer so Rust can parse BootInfo before
+    // substrate extends the contiguous RAM mapping.
+    li t0, TX_RV64_QEMU_RAM_BASE
+    bltu s1, t0, .Ltx_fdt_direct_done
+    sub t1, s1, t0
+    srli t1, t1, 30
+    li t2, 128
+    bgeu t1, t2, .Ltx_fdt_direct_done
+    li t2, TX_RV64_DIRECT_MAP_ROOT_SLOT
+    add t2, t2, t1
+    slli t2, t2, 3
+    add t3, s2, t2
+    slli t1, t1, 30
+    li t2, TX_RV64_QEMU_RAM_BASE
+    add t1, t1, t2
+    srli t1, t1, 12
+    slli t1, t1, 10
+    ori t1, t1, TX_RV64_PTE_DIRECT
+    sd t1, 0(t3)
+.Ltx_fdt_direct_done:
+
     la s3, __kernel_alias_l1_load
     srli t1, s3, 12
     slli t1, t1, 10

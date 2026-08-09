@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{
+    e2fsprogs::{resolve_debugfs, resolve_e2fsck},
     resolve_repo_path, run_workspace, verify_xfstests_source_lock,
     xfstests_docker_preflight_command, xfstests_execution_backend_for_host, CrashCutCampaignPlan,
     CrashCutFamily, Tier1Authorities, XfstestsSourceLock, XFSTESTS_DOCKER_IMAGE_ENV,
 };
 use crate::image;
 use crate::target::TxTarget;
-use crate::util::{command_exists, command_or_candidates, run_cmd_owned_in};
+use crate::util::{command_exists, run_cmd_owned_in};
 use crate::Result;
 
 const XFSTESTS_SOURCE_URL: &str = "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git";
@@ -266,33 +267,15 @@ fn collect_tool_preflight(root: &Path, authorities: &Tier1Authorities, blockers:
             blockers.push(format!("{tool} is required for live Tier 1 execution"));
         }
     }
-    if command_or_candidates(
-        "e2fsck",
-        &[
-            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
-            "/opt/homebrew/sbin/e2fsck",
-            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/e2fsck",
-            "/usr/local/opt/e2fsprogs/sbin/e2fsck",
-            "/usr/local/sbin/e2fsck",
-        ],
-    )
-    .is_none()
-    {
-        blockers.push("e2fsck is required for live Tier 1 execution".into());
+    if let Err(error) = resolve_e2fsck(root) {
+        blockers.push(format!(
+            "e2fsck is required for live Tier 1 execution: {error}"
+        ));
     }
-    if command_or_candidates(
-        "debugfs",
-        &[
-            "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
-            "/opt/homebrew/sbin/debugfs",
-            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/debugfs",
-            "/usr/local/opt/e2fsprogs/sbin/debugfs",
-            "/usr/local/sbin/debugfs",
-        ],
-    )
-    .is_none()
-    {
-        blockers.push("debugfs is required for semantic oracle verification".into());
+    if let Err(error) = resolve_debugfs(root) {
+        blockers.push(format!(
+            "debugfs is required for semantic oracle verification: {error}"
+        ));
     }
     for relative in [
         "tools/ext4/fault_qemu_executor.py",

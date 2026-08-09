@@ -1,0 +1,19 @@
+# Named ext4 role device projection witness.
+
+wait ":mount:bdevfs:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox ls -l /dev/block; echo ext4-role-vda:$?; /bin/busybox test -e /dev/block/vda; echo ext4-role-vda-exists:$?; /bin/busybox test -e /dev/block/vdb; echo ext4-role-vdb-exists:$?; /bin/busybox test -e /dev/block/vdc; echo ext4-role-vdc-exists:$?\n"
+expect "ext4-role-vda-exists:0" within 10000
+expect "ext4-role-vdb-exists:0" within 10000
+expect "ext4-role-vdc-exists:0" within 10000
+expect "/ # " within 10000
+
+send "/bin/busybox mkdir -p /tmp/role-test /tmp/role-scratch /tmp/role-workload; /bin/busybox mount -o ro -t ext4 /dev/block/vda /tmp/role-test; echo ext4-role-vda-ro:$?; /bin/busybox mount -o rw -t ext4 /dev/block/vdb /tmp/role-scratch; echo ext4-role-vdb-rw:$?; /bin/busybox mount -o ro -t ext4 /dev/block/vdc /tmp/role-workload; echo ext4-role-vdc-ro:$?\n"
+expect "ext4-role-vda-ro:" within 30000
+expect "ext4-role-vdb-rw:" within 30000
+expect "ext4-role-vdc-ro:" within 30000
+expect "/ # " within 10000
+
+quit

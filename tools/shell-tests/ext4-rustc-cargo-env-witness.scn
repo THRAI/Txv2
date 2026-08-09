@@ -1,0 +1,11 @@
+# Diagnose Cargo startup with the production build environment, without
+# entering compilation or mutating the TEST source tree.
+
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox mkdir -p /mnt/ext4-test /mnt/ext4-workload; /bin/busybox mount -t ext4 -o rw /dev/block/vda /mnt/ext4-test; /bin/busybox mount -t ext4 -o ro /dev/block/vdc /mnt/ext4-workload; PATH=/mnt/ext4-workload/toolchain/bin:/bin LD_PRELOAD=/lib/libgcompat.so.0:/mnt/ext4-workload/toolchain/lib/libtx-rustc-resolv-preload.so CARGO_HOME=/mnt/ext4-test/cargo-home CARGO_TARGET_DIR=/mnt/ext4-test/target CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 RUSTC=/mnt/ext4-test/rustc-via-musl-loader /lib/ld-musl-riscv64.so.1 /mnt/ext4-workload/toolchain/bin/cargo -V; echo ext4-cargo-env-status:$?\n"
+expect "ext4-cargo-env-status:0" within 30000
+expect "/ # " within 10000
+
+quit

@@ -5,12 +5,11 @@ use std::process::{Command, Stdio};
 use crate::image;
 use crate::shell_test;
 use crate::target::TxTarget;
-use crate::util::{
-    command_exists, command_or_candidates, optional_option_value, run_cmd_owned_in, shell_join,
-};
+use crate::util::{command_exists, optional_option_value, run_cmd_owned_in, shell_join};
 use crate::Result;
 
 mod crash_campaign;
+mod e2fsprogs;
 mod live_preflight;
 mod receipt;
 mod receipt_verify;
@@ -22,6 +21,7 @@ pub(crate) use crash_campaign::{
     crash_cut_shell_test_args, parse_fault_job_result, run_crash_cut_campaign,
     write_fault_job_request, CrashCutCampaignEvidence, CrashCutOutcome,
 };
+use e2fsprogs::{resolve_debugfs, resolve_e2fsck, ToolCommand};
 use live_preflight::run_live_preflight;
 pub(crate) use receipt_verify::verify_tier1_receipt;
 
@@ -113,17 +113,8 @@ fn run_live_tier1(
 ) -> Result<()> {
     let action_log = invocation.planned_actions();
     let base_target = TxTarget::Rv64Qemu;
-    let e2fsck = command_or_candidates(
-        "e2fsck",
-        &[
-            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
-            "/opt/homebrew/sbin/e2fsck",
-            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/e2fsck",
-            "/usr/local/opt/e2fsprogs/sbin/e2fsck",
-            "/usr/local/sbin/e2fsck",
-        ],
-    )
-    .ok_or_else(|| "e2fsck is required for the live Tier 1 runner".to_string())?;
+    let e2fsck = resolve_e2fsck(root)?;
+    let debugfs = resolve_debugfs(root)?;
 
     for tool in ["git"] {
         if !command_exists(tool) {
@@ -219,6 +210,7 @@ fn run_live_tier1(
         &scratch_image,
         &workload_image,
         &e2fsck,
+        &debugfs,
         invocation.crash_cut_start,
     ) {
         Ok(campaign) => campaign,
@@ -234,7 +226,7 @@ fn run_live_tier1(
         ("workload", &workload_image),
     ] {
         let (exit_code, output) =
-            run_capture(root, &e2fsck, &["-fn".into(), path.display().to_string()])?;
+            run_tool_capture(root, &e2fsck, &["-fn".into(), path.display().to_string()])?;
         let log_path = run.working_dir().join(format!("e2fsck-{role}.log"));
         fs::write(&log_path, &output)
             .map_err(|err| format!("failed to write {}: {err}", log_path.display()))?;
@@ -1450,6 +1442,11 @@ fn run_capture(cwd: &Path, program: &str, args: &[String]) -> Result<(i32, Strin
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok((output.status.code().unwrap_or(-1), combined))
+}
+
+fn run_tool_capture(cwd: &Path, tool: &ToolCommand, args: &[String]) -> Result<(i32, String)> {
+    let command_args = tool.args_with(args);
+    run_capture(cwd, tool.program(), &command_args)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

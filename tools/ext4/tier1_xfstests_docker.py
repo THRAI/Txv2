@@ -151,14 +151,31 @@ def prepare_source(image: str, root: Path, cases: list[str]) -> None:
 
 def docker_prepare_script(cases: list[str]) -> str:
     targets = sorted({helper for case in cases for helper in CASE_HELPERS.get(case, ())})
-    make_targets = " ".join(shell_quote(target) for target in targets)
-    if not make_targets:
-        make_targets = "ltp/fsstress src/t_rename_overwrite src/feature src/min_dio_alignment ltp/fsx src/godown"
+    if not targets:
+        targets = [
+            "ltp/fsstress",
+            "ltp/fsx",
+            "src/feature",
+            "src/godown",
+            "src/min_dio_alignment",
+            "src/t_rename_overwrite",
+        ]
+    targets_by_directory: dict[str, list[str]] = {}
+    for target in targets:
+        directory, name = target.rsplit("/", 1)
+        targets_by_directory.setdefault(directory, []).append(name)
+    build_helpers = "; ".join(
+        f"make -j2 -C {shell_quote(directory)} "
+        + " ".join(shell_quote(name) for name in names)
+        for directory, names in sorted(targets_by_directory.items())
+    )
     return (
         "set -eu; "
         "cd /xfstests; "
+        "make configure; "
         'CFLAGS="-D_GNU_SOURCE ${CFLAGS:-}" ./configure --libexecdir=/usr/lib --exec_prefix=/var/lib; '
-        f"make -j2 {make_targets}"
+        "make -C lib; "
+        f"{build_helpers}"
     )
 
 

@@ -1,6 +1,6 @@
 use tx_ext4_format::journal::{
-    Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage,
-    JBD2_BLOCK_SIZE, JBD2_MAGIC,
+    JBD2_BLOCK_SIZE, JBD2_MAGIC, Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2Revoke,
+    Jbd2TransactionImage,
 };
 
 #[test]
@@ -48,9 +48,31 @@ fn freeing_transaction_image_encodes_sorted_revokes_before_commit() {
     .unwrap();
 
     assert_eq!(
-        Jbd2Revoke::parse(image.revoke.as_ref().expect("revoke page"))
+        Jbd2Revoke::parse(image.revokes.first().expect("revoke page"))
             .unwrap()
             .blocks,
         vec![8, 33]
+    );
+}
+
+#[test]
+fn freeing_transaction_image_splits_revokes_across_pages() {
+    let revokes: Vec<u32> = (100..).take(Jbd2Revoke::MAX_BLOCKS_PER_PAGE + 1).collect();
+    let image = Jbd2TransactionImage::encode_legacy_with_revokes(
+        77,
+        [0x44; 16],
+        vec![Jbd2MetadataUpdate::new(9, [0x5A; JBD2_BLOCK_SIZE])],
+        revokes.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(image.revokes.len(), 2);
+    assert_eq!(
+        Jbd2Revoke::parse(&image.revokes[0]).unwrap().blocks.len(),
+        Jbd2Revoke::MAX_BLOCKS_PER_PAGE
+    );
+    assert_eq!(
+        Jbd2Revoke::parse(&image.revokes[1]).unwrap().blocks,
+        revokes[Jbd2Revoke::MAX_BLOCKS_PER_PAGE..]
     );
 }

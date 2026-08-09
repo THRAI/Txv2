@@ -6,12 +6,12 @@ use tx_hal::{
     PhysRange, PlatformConfig, PlatformInfo, VirtAddr, VirtRange,
 };
 
-use crate::Platform;
 use crate::pmap::topology::{
     DIRECT_MAP_BASE, KERNEL_ALIAS_L0_TABLES, KERNEL_BOOTSTRAP_ALIAS_SIZE, KERNEL_VIRT_BASE,
     PAGE_SIZE, PT_NODE_POOL_ENTRIES, QEMU_KERNEL_PHYS_BASE,
 };
 use crate::time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
+use crate::Platform;
 
 pub(crate) const MAX_MEMORY_REGIONS: usize = 8;
 pub(crate) const CMDLINE_CAPACITY: usize = 16384;
@@ -34,6 +34,21 @@ impl FirmwareDtb {
 
     pub(crate) const fn addr(self) -> usize {
         self.phys.0
+    }
+
+    /// The early trampoline preserves the firmware DTB through this direct-map
+    /// alias until boot has copied the facts it needs. Host tests keep using
+    /// their ordinary process pointer because they do not install Sv39.
+    pub(crate) const fn mapped_addr(self) -> usize {
+        #[cfg(target_arch = "riscv64")]
+        {
+            DIRECT_MAP_BASE + self.phys.0
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            self.phys.0
+        }
     }
 }
 

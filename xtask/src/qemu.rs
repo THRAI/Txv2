@@ -22,6 +22,7 @@ struct QemuOptions {
     expect_markers: Vec<String>,
     timeout: Duration,
     smp: Option<usize>,
+    memory_mib: Option<usize>,
     /// Skip the busybox-profile virtio-blk drive wiring. Used by smoke
     /// runs that only need the initramfs to come up; it sidesteps the
     /// `mkfs.ext4` host-tool dependency.
@@ -34,9 +35,26 @@ struct QemuOptions {
     interactive: bool,
     boot_mode: Option<String>,
     append_cmdline: Option<String>,
-    extra_rv64_ext4: Vec<PathBuf>,
+    ext4_block_images: Ext4BlockImages,
     net: QemuNet,
     host_ping: Option<HostPingOptions>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Ext4BlockImages {
+    test: Option<PathBuf>,
+    scratch: Option<PathBuf>,
+    workload: Option<PathBuf>,
+    legacy: Vec<PathBuf>,
+}
+
+impl Ext4BlockImages {
+    fn any(&self) -> bool {
+        self.test.is_some()
+            || self.scratch.is_some()
+            || self.workload.is_some()
+            || !self.legacy.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,6 +160,20 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
                 })
         })
         .transpose()?;
+    let memory_mib = optional_option_value(args, "--memory-mib")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|err| format!("invalid --memory-mib value '{value}': {err}"))
+                .and_then(|value| {
+                    if value == 0 {
+                        Err("--memory-mib must be greater than zero".into())
+                    } else {
+                        Ok(value)
+                    }
+                })
+        })
+        .transpose()?;
 
     let expect_sentinel = args.iter().any(|arg| arg == "--expect-sentinel");
     let expect_markers = option_values(args, "--expect-marker")?;
@@ -149,10 +181,7 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
         .map(|value| validate_boot_mode_value(&value).map(|()| value))
         .transpose()?;
     let append_cmdline = optional_option_value(args, "--append-cmdline");
-    let extra_rv64_ext4 = option_values(args, "--extra-rv64-ext4")?
-        .into_iter()
-        .map(|path| resolve_path(root, PathBuf::from(path)))
-        .collect();
+    let ext4_block_images = ext4_block_images(root, args)?;
     let net = qemu_net(args)?;
     let host_ping = host_ping_options(args, expect_sentinel, &net)?;
 
@@ -161,14 +190,73 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
         expect_markers,
         timeout,
         smp,
+        memory_mib,
         no_block: args.iter().any(|arg| arg == "--no-block"),
         interactive: args.iter().any(|arg| arg == "--interactive"),
         boot_mode,
         append_cmdline,
-        extra_rv64_ext4,
+        ext4_block_images,
         net,
         host_ping,
     })
+}
+
+fn ext4_block_images(root: &Path, args: &[String]) -> Result<Ext4BlockImages> {
+    let legacy: Vec<PathBuf> = option_values(args, "--extra-rv64-ext4")?
+        .into_iter()
+        .map(|path| resolve_path(root, PathBuf::from(path)))
+        .collect();
+    let test = single_role_image(root, args, "--ext4-test-image")?;
+    let scratch = single_role_image(root, args, "--ext4-scratch-image")?;
+    let workload = single_role_image(root, args, "--ext4-workload-image")?;
+    if !legacy.is_empty() && (test.is_some() || scratch.is_some() || workload.is_some()) {
+        return Err("--extra-rv64-ext4 cannot be combined with ext4 role image flags".into());
+    }
+
+    let images = Ext4BlockImages {
+        test,
+        scratch,
+        workload,
+        legacy,
+    };
+    reject_duplicate_ext4_role_paths(&images)?;
+    Ok(images)
+}
+
+fn single_role_image(root: &Path, args: &[String], name: &str) -> Result<Option<PathBuf>> {
+    let values = option_values(args, name)?;
+    if values.len() > 1 {
+        return Err(format!("{name} may be specified only once"));
+    }
+    Ok(values
+        .into_iter()
+        .next()
+        .map(|path| resolve_path(root, PathBuf::from(path))))
+}
+
+fn reject_duplicate_ext4_role_paths(images: &Ext4BlockImages) -> Result<()> {
+    let roles = [
+        ("TEST", images.test.as_ref()),
+        ("SCRATCH", images.scratch.as_ref()),
+        ("WORKLOAD", images.workload.as_ref()),
+    ];
+    for left in 0..roles.len() {
+        let Some(left_path) = roles[left].1 else {
+            continue;
+        };
+        for right in (left + 1)..roles.len() {
+            let Some(right_path) = roles[right].1 else {
+                continue;
+            };
+            if left_path == right_path {
+                return Err(format!(
+                    "ext4 block roles {} and {} must use different image paths",
+                    roles[left].0, roles[right].0
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
@@ -287,13 +375,13 @@ fn qemu_command(
     profile: Profile,
     options: &QemuOptions,
 ) -> Result<Vec<String>> {
-    if !options.extra_rv64_ext4.is_empty() && target != TxTarget::Rv64Qemu {
-        return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
+    if options.ext4_block_images.any() && target != TxTarget::Rv64Qemu {
+        return Err("ext4 role images are only supported for rv64-qemu".into());
     }
-    if !options.extra_rv64_ext4.is_empty() && profile == Profile::Busybox && !options.no_block {
-        return Err("--extra-rv64-ext4 conflicts with the busybox default block image; pass --no-block or use --profile alpine".into());
+    if options.ext4_block_images.any() && profile == Profile::Busybox && !options.no_block {
+        return Err("ext4 role images conflict with the busybox default block image; pass --no-block or use --profile alpine".into());
     }
-    if options.extra_rv64_ext4.len() > 3 {
+    if options.ext4_block_images.legacy.len() > 3 {
         return Err("--extra-rv64-ext4 supports at most three RV64 virtio-mmio drives".into());
     }
 
@@ -312,7 +400,10 @@ fn qemu_command(
 
     args.extend([
         "-m".to_string(),
-        qemu_memory(target, profile).to_string(),
+        options
+            .memory_mib
+            .map(|value| format!("{value}M"))
+            .unwrap_or_else(|| qemu_memory(target, profile).to_string()),
         "-smp".to_string(),
         qemu_smp(target, profile, options).to_string(),
         // Force multi-threaded TCG: vCPUs run on parallel host threads
@@ -385,6 +476,8 @@ fn qemu_command(
             }
             (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
+        let ext4_cmdline = ext4_role_cmdline(&options.ext4_block_images);
+        let cmdline_base = append_extra_cmdline(&cmdline_base, ext4_cmdline.as_deref());
         let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
         let cmdline = append_tty_winsize_cmdline(&cmdline_base);
         args.push("-initrd".into());
@@ -411,6 +504,8 @@ fn qemu_command(
                 "tx.profile=smoke tx.boot.mode={boot_mode} init=/tx-test-init tx.test_init=1 console=ttyS0"
             )
         };
+        let ext4_cmdline = ext4_role_cmdline(&options.ext4_block_images);
+        let cmdline_base = append_extra_cmdline(&cmdline_base, ext4_cmdline.as_deref());
         let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
         let cmdline = append_tty_winsize_cmdline(&cmdline_base);
         let initramfs = root
@@ -457,7 +552,7 @@ fn qemu_command(
             ));
         }
     }
-    for (idx, path) in options.extra_rv64_ext4.iter().enumerate() {
+    for (idx, path) in options.ext4_block_images.legacy.iter().enumerate() {
         args.push("-drive".into());
         args.push(format!(
             "file={},format=raw,if=none,id=txblk{idx}",
@@ -468,7 +563,13 @@ fn qemu_command(
             "virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
         ));
     }
-    append_net_args(&mut args, target, &options.net);
+    append_ext4_role_drives(&mut args, &options.ext4_block_images);
+    append_net_args_with_bus_offset(
+        &mut args,
+        target,
+        &options.net,
+        ext4_bus_count(&options.ext4_block_images),
+    );
     args.push("-d".into());
     args.push("guest_errors".into());
     args.push("-D".into());
@@ -478,6 +579,49 @@ fn qemu_command(
         profile.name()
     ));
     Ok(args)
+}
+
+fn append_ext4_role_drives(args: &mut Vec<String>, images: &Ext4BlockImages) {
+    for (id, bus, path, read_only) in [
+        ("tx-test", 0, images.test.as_ref(), false),
+        ("tx-scratch", 1, images.scratch.as_ref(), false),
+        ("tx-workload", 2, images.workload.as_ref(), true),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let read_only_suffix = if read_only { ",read-only=on" } else { "" };
+        args.push("-drive".into());
+        args.push(format!(
+            "file={},format=raw,if=none,id={id}{read_only_suffix}",
+            path.display(),
+        ));
+        args.push("-device".into());
+        args.push(format!(
+            "virtio-blk-device,drive={id},bus=virtio-mmio-bus.{bus}"
+        ));
+    }
+}
+
+fn ext4_role_cmdline(images: &Ext4BlockImages) -> Option<String> {
+    let mut tokens = Vec::new();
+    if images.test.is_some() {
+        tokens.push("tx.ext4.test=vda");
+    }
+    if images.scratch.is_some() {
+        tokens.push("tx.ext4.scratch=vdb");
+    }
+    if images.workload.is_some() {
+        tokens.push("tx.ext4.workload=vdc");
+    }
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+fn ext4_bus_count(images: &Ext4BlockImages) -> usize {
+    images.legacy.len()
+        + usize::from(images.test.is_some())
+        + usize::from(images.scratch.is_some())
+        + usize::from(images.workload.is_some())
 }
 
 fn append_extra_cmdline(base: &str, extra: Option<&str>) -> String {
@@ -499,34 +643,41 @@ fn qemu_smp(target: TxTarget, profile: Profile, options: &QemuOptions) -> usize 
     }
 }
 
-pub(crate) fn append_net_args(args: &mut Vec<String>, target: TxTarget, net: &QemuNet) {
+fn append_net_args_with_bus_offset(
+    args: &mut Vec<String>,
+    target: TxTarget,
+    net: &QemuNet,
+    bus_offset: usize,
+) {
     match net {
         QemuNet::None => {}
         QemuNet::User => {
             args.push("-netdev".into());
             args.push("user,id=net0".into());
-            push_net_device(args, target);
+            push_net_device(args, target, bus_offset);
         }
         QemuNet::Tap(ifname) => {
             args.push("-netdev".into());
             args.push(format!(
                 "tap,id=net0,ifname={ifname},script=no,downscript=no"
             ));
-            push_net_device(args, target);
+            push_net_device(args, target, bus_offset);
         }
         QemuNet::Bridge(bridge) => {
             args.push("-netdev".into());
             args.push(format!("bridge,id=net0,br={bridge}"));
-            push_net_device(args, target);
+            push_net_device(args, target, bus_offset);
         }
     }
 }
 
-fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
+fn push_net_device(args: &mut Vec<String>, target: TxTarget, bus_offset: usize) {
     args.push("-device".into());
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
-            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0".into());
+            args.push(format!(
+                "virtio-net-device,netdev=net0,bus=virtio-mmio-bus.{bus_offset}"
+            ));
         }
         TxTarget::La64Qemu => {
             args.push("virtio-net-pci,netdev=net0".into());
@@ -877,11 +1028,12 @@ mod tests {
             expect_markers: Vec::new(),
             timeout: Duration::from_secs(10),
             smp: None,
+            memory_mib: None,
             no_block: false,
             interactive: false,
             boot_mode: None,
             append_cmdline: None,
-            extra_rv64_ext4: Vec::new(),
+            ext4_block_images: Ext4BlockImages::default(),
             net: QemuNet::None,
             host_ping: None,
         }
@@ -1070,6 +1222,45 @@ mod tests {
             "tx.profile=smoke tx.boot.mode=smoke init=/tx-test-init tx.test_init=1 console=ttyS0"
         ));
         assert!(!rendered.contains("-drive file=target/images/smoke.ext4"));
+    }
+
+    #[test]
+    fn qemu_memory_override_is_explicit_and_rejects_zero() {
+        let options = qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "alpine".into(),
+                "--memory-mib".into(),
+                "4096".into(),
+            ],
+        )
+        .expect("parse memory override");
+        assert_eq!(options.memory_mib, Some(4096));
+        assert!(qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            &options
+        )
+        .unwrap()
+        .join(" ")
+        .contains("-m 4096M"));
+        assert!(qemu_options(
+            Path::new("/tmp/tx"),
+            &[
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "alpine".into(),
+                "--memory-mib".into(),
+                "0".into()
+            ],
+        )
+        .unwrap_err()
+        .contains("greater than zero"));
     }
 
     #[test]
@@ -1356,10 +1547,14 @@ mod tests {
     }
 
     #[test]
-    fn qemu_can_attach_rv64_ext4_drive_on_bus0() {
-        let image = PathBuf::from("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
+    fn qemu_can_attach_named_ext4_roles() {
         let options = QemuOptions {
-            extra_rv64_ext4: vec![image],
+            ext4_block_images: Ext4BlockImages {
+                test: Some(PathBuf::from("/tmp/tx/test.img")),
+                scratch: Some(PathBuf::from("/tmp/tx/scratch.img")),
+                workload: Some(PathBuf::from("/tmp/tx/workload.img")),
+                legacy: Vec::new(),
+            },
             ..test_options()
         };
 
@@ -1372,23 +1567,30 @@ mod tests {
         .unwrap()
         .join(" ");
 
+        assert!(command.contains("-drive file=/tmp/tx/test.img,format=raw,if=none,id=tx-test"));
+        assert!(
+            command.contains("-drive file=/tmp/tx/scratch.img,format=raw,if=none,id=tx-scratch")
+        );
         assert!(command.contains(
-            "-drive file=/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4,format=raw,if=none,id=txblk0"
+            "-drive file=/tmp/tx/workload.img,format=raw,if=none,id=tx-workload,read-only=on"
         ));
-        assert!(command.contains("-device virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0"));
+        assert!(command.contains("tx.ext4.test=vda"));
+        assert!(command.contains("tx.ext4.scratch=vdb"));
+        assert!(command.contains("tx.ext4.workload=vdc"));
     }
 
     #[test]
-    fn qemu_can_attach_three_rv64_ext4_drives_on_stable_buses() {
+    fn qemu_places_rv64_net_after_named_ext4_roles() {
         let options = QemuOptions {
-            extra_rv64_ext4: vec![
-                PathBuf::from("/tmp/tx/test.img"),
-                PathBuf::from("/tmp/tx/scratch.img"),
-                PathBuf::from("/tmp/tx/workload.img"),
-            ],
+            ext4_block_images: Ext4BlockImages {
+                test: Some(PathBuf::from("/tmp/tx/test.img")),
+                scratch: Some(PathBuf::from("/tmp/tx/scratch.img")),
+                workload: Some(PathBuf::from("/tmp/tx/workload.img")),
+                legacy: Vec::new(),
+            },
+            net: QemuNet::User,
             ..test_options()
         };
-
         let command = qemu_command(
             Path::new("/tmp/tx"),
             TxTarget::Rv64Qemu,
@@ -1398,14 +1600,23 @@ mod tests {
         .unwrap()
         .join(" ");
 
-        for (idx, name) in ["test", "scratch", "workload"].iter().enumerate() {
-            assert!(command.contains(&format!(
-                "-drive file=/tmp/tx/{name}.img,format=raw,if=none,id=txblk{idx}"
-            )));
-            assert!(command.contains(&format!(
-                "-device virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
-            )));
-        }
+        assert!(command.contains("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.3"));
+    }
+
+    #[test]
+    fn qemu_rejects_duplicate_named_ext4_role_paths() {
+        let err = ext4_block_images(
+            Path::new("/tmp/tx"),
+            &[
+                "--ext4-test-image".into(),
+                "same.img".into(),
+                "--ext4-workload-image".into(),
+                "same.img".into(),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.contains("TEST and WORKLOAD"));
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! state, so callers can replay the image before exposing the filesystem.
 
 use crate::journal::{
-    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR,
-    JBD2_BLOCK_REVOKE, JBD2_MAGIC,
+    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC, Jbd2Commit,
+    Jbd2Descriptor, Jbd2Header, Jbd2Revoke,
 };
 use crate::ondisk::Superblock;
 use crate::pager::{BlockImage, JournalGeometry, Page4K};
@@ -50,7 +50,7 @@ pub fn recover_if_required<I: BlockImage>(
 /// A descriptor is never applied until every tagged metadata page and its
 /// matching commit record have been read. An incomplete tail is normal after a
 /// power loss and terminates the scan without modifying home blocks for that
-/// transaction. The bounded profile supports one optional revoke page between
+/// transaction. A transaction may contain zero or more revoke pages between
 /// the metadata copies and commit record. Its revokes suppress matching stale
 /// after-images from that transaction; allocator reuse remains a higher-layer
 /// lifecycle responsibility.
@@ -74,7 +74,7 @@ pub fn replay_journal<I: BlockImage>(
     let mut transactions = 0u32;
     let mut blocks_replayed = 0u32;
 
-    while scanned < limit {
+    'scan: while scanned < limit {
         let descriptor_page = read_log_page(image, geometry, cursor)?;
         let header = match Jbd2Header::parse(&descriptor_page) {
             Ok(header) if header.block_type == JBD2_BLOCK_DESCRIPTOR => header,
@@ -102,43 +102,42 @@ pub fn replay_journal<I: BlockImage>(
             payload_cursor = advance(geometry, payload_cursor);
         }
         let mut commit_cursor = payload_cursor;
-        let record_page = read_log_page(image, geometry, payload_cursor)?;
-        let header = match Jbd2Header::parse(&record_page) {
-            Ok(header) => header,
-            Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break,
-            Err(error) => return Err(error),
-        };
-        let revokes = match header.block_type {
-            JBD2_BLOCK_COMMIT => None,
-            JBD2_BLOCK_REVOKE => {
-                record_blocks = record_blocks
-                    .checked_add(1)
-                    .ok_or(Ext4FormatError::OutOfBounds)?;
-                if record_blocks > limit - scanned {
-                    break;
-                }
-                let revoke = match Jbd2Revoke::parse(&record_page) {
-                    Ok(revoke) => revoke,
-                    Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break,
+        let mut revoked_blocks = alloc::vec::Vec::new();
+        let commit = loop {
+            let record_page = read_log_page(image, geometry, commit_cursor)?;
+            let header = match Jbd2Header::parse(&record_page) {
+                Ok(header) => header,
+                Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break 'scan,
+                Err(error) => return Err(error),
+            };
+            match header.block_type {
+                JBD2_BLOCK_COMMIT => match Jbd2Commit::parse(&record_page) {
+                    Ok(commit) => break commit,
+                    Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break 'scan,
                     Err(error) => return Err(error),
-                };
-                if revoke.header.sequence != descriptor.header.sequence {
-                    break;
+                },
+                JBD2_BLOCK_REVOKE => {
+                    record_blocks = record_blocks
+                        .checked_add(1)
+                        .ok_or(Ext4FormatError::OutOfBounds)?;
+                    if record_blocks > limit - scanned {
+                        break 'scan;
+                    }
+                    let revoke = match Jbd2Revoke::parse(&record_page) {
+                        Ok(revoke) => revoke,
+                        Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => {
+                            break 'scan;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if revoke.header.sequence != descriptor.header.sequence {
+                        break 'scan;
+                    }
+                    revoked_blocks.extend(revoke.blocks);
+                    commit_cursor = advance(geometry, commit_cursor);
                 }
-                commit_cursor = advance(geometry, payload_cursor);
-                Some(revoke)
+                _ => break 'scan,
             }
-            _ => break,
-        };
-        let commit_page = if revokes.is_some() {
-            read_log_page(image, geometry, commit_cursor)?
-        } else {
-            record_page
-        };
-        let commit = match Jbd2Commit::parse(&commit_page) {
-            Ok(commit) => commit,
-            Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break,
-            Err(error) => return Err(error),
         };
         if commit.header.sequence != descriptor.header.sequence {
             break;
@@ -146,10 +145,7 @@ pub fn replay_journal<I: BlockImage>(
         validate_commit_checksum(&commit)?;
 
         for (tag, mut payload) in descriptor.tags.iter().zip(payloads) {
-            if revokes
-                .as_ref()
-                .is_some_and(|revoke| revoke.blocks.contains(&tag.target_block))
-            {
+            if revoked_blocks.contains(&tag.target_block) {
                 continue;
             }
             if tag.escaped {

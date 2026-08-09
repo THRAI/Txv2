@@ -1,0 +1,12 @@
+# Diagnose the immutable WORKLOAD toolchain with the production runner's
+# compatibility environment. This isolates any remaining dynamic-loader
+# failures from mount, PATH, and role-device wiring.
+
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox mkdir -p /tmp/loader-test /tmp/loader-workload; /bin/busybox mount -t ext4 -o rw /dev/block/vda /tmp/loader-test; /bin/busybox mount -t ext4 -o ro /dev/block/vdc /tmp/loader-workload; /bin/busybox ls -l /lib/ld-musl-riscv64.so.1 /lib/libgcompat.so.0 /tmp/loader-workload/toolchain/lib/libtx-rustc-resolv-preload.so /tmp/loader-workload/toolchain/bin/rustc /tmp/loader-workload/toolchain/bin/cargo; LD_PRELOAD=/lib/libgcompat.so.0:/tmp/loader-workload/toolchain/lib/libtx-rustc-resolv-preload.so /lib/ld-musl-riscv64.so.1 /tmp/loader-workload/toolchain/bin/rustc -vV; echo ext4-rustc-loader-status:$?; LD_PRELOAD=/lib/libgcompat.so.0:/tmp/loader-workload/toolchain/lib/libtx-rustc-resolv-preload.so /lib/ld-musl-riscv64.so.1 /tmp/loader-workload/toolchain/bin/cargo -V; echo ext4-cargo-loader-status:$?\n"
+expect "ext4-cargo-loader-status:0" within 30000
+expect "/ # " within 10000
+
+quit

@@ -1,0 +1,400 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-09-ext4-reconciliation-execution",
+  "title": "Execute four-worktree ext4 reconciliation as current Tier 2 slices",
+  "status": "active",
+  "created": "2026-08-09",
+  "updated": "2026-08-09",
+  "owner": "codex/root",
+  "summary": "Extract only verified algorithms and witnesses from four historical ext4 worktrees into the current ownership model, while retaining Tier 1 as the compatibility and crash-safety floor.",
+  "scope": {
+    "in": [
+      "crates/tx-ext4-format",
+      "crates/tx-ext4",
+      "boards/tx-hal-riscv64-qemu-virt",
+      "xtask/src/qemu.rs",
+      "xtask/src/shell_test.rs",
+      "tools/images",
+      "tools/ext4",
+      "tools/shell-tests",
+      "tools/io-submission-perf.py",
+      "tools/tests",
+      "docs/progress"
+    ],
+    "out": [
+      "whole historical worktree merges",
+      "broad cherry-pick ranges",
+      "VFS, Mount, PageBacked, VM, or device trait changes without a design update",
+      "historical direct pager home writes, JournalFsyncSource lifecycle, or caller-managed journal discard",
+      "multiple outstanding transactions or cross-transaction revoke replay",
+      "global QEMU memory or tmpfs defaults",
+      "Tier 2 claims without Linux-visible compatibility and crash evidence"
+    ],
+    "write_sets": [
+      {
+        "owner": "ext4-format-runtime",
+        "paths": [
+          "crates/tx-ext4-format",
+          "crates/tx-ext4"
+        ],
+        "notes": "Own pure planners and current MutationHandle lowering. Preserve immutable Ext4MutationPlan and Mount-owned settlement."
+      },
+      {
+        "owner": "rustc-witness",
+        "paths": [
+          "boards/tx-hal-riscv64-qemu-virt",
+          "xtask/src/qemu.rs",
+          "xtask/src/shell_test.rs",
+          "tools/images",
+          "tools/ext4",
+          "tools/shell-tests",
+          "tools/tests"
+        ],
+        "notes": "Own the bounded HAL, guest geometry, resolver, WORKLOAD-image, and evidence closure without editing ext4 or shared PageBacked owners."
+      },
+      {
+        "owner": "reconciliation-coordinator",
+        "paths": [
+          "docs/progress"
+        ],
+        "notes": "Own plan state, research, STATUS catch-up, acceptance boundary, and final disposition."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md",
+      "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/05_filesystem/MOUNT_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-08-09-ext4-reconciliation-a1-multi-page-revoke.md",
+      "docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-release.md",
+      "docs/progress/research/2026-08-09-ext4-tier1-xfstests-preflight.md",
+      "docs/progress/research/2026-08-09-ext4-high-dtb-boot-prerequisite.md",
+      "docs/progress/research/2026-08-09-ext4-rustc-role-image-wiring.md",
+      "docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "g0-disposition-and-baseline",
+      "title": "Freeze source disposition and preserve the Tier 1 floor",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json",
+        "tools/ext4/tier1"
+      ],
+      "verification": [
+        "four source worktrees classified by path, branch, status, and change surface without whole-branch merge",
+        "cargo test -p tx-ext4-format -- --test-threads=1",
+        "cargo -q xtask unit",
+        "cargo xtask ext4 tier1 --dry-run"
+      ],
+      "notes": "The isolation worktree is active. Its absent historical acceptance receipt prevents a renewed Tier 1 claim, but does not invalidate host regression gates."
+    },
+    {
+      "id": "a1-multi-page-revoke",
+      "title": "Reimplement one admitted transaction with all revoke pages",
+      "status": "complete",
+      "depends_on": [
+        "g0-disposition-and-baseline"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/journal.rs",
+        "crates/tx-ext4-format/src/journal_replay.rs",
+        "crates/tx-ext4/src/journal.rs"
+      ],
+      "verification": [
+        "JBD2 image and recovery regressions cover every same-sequence revoke page",
+        "prepared transaction regression retains every revoke lease through checkpoint completion",
+        "cargo xtask lint invariants ext4-no-direct-home-write"
+      ],
+      "notes": "Keep descriptor -> metadata -> revokes -> commit and current serialized MutationHandle ownership. Multiple outstanding transactions remain out of scope."
+    },
+    {
+      "id": "a2-cross-group-release",
+      "title": "Release inline initialized extents across block groups",
+      "status": "complete",
+      "depends_on": [
+        "g0-disposition-and-baseline"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4-format/tests/pager_mock.rs"
+      ],
+      "verification": [
+        "pager_mock covers cross-group inline truncate and zero-link destroy without source-image mutation",
+        "cargo test -p tx-ext4-format -- --test-threads=1",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Each bitmap is planned once, GDT edits sharing one home page are merged, and deferred frees are added only after all after-images plan successfully."
+    },
+    {
+      "id": "a2-cross-group-allocation",
+      "title": "Port deterministic cross-group allocation into immutable plans",
+      "status": "complete",
+      "depends_on": [
+        "a2-cross-group-release"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4-format/tests/host_tools.rs",
+        "crates/tx-ext4-format/tests/pager_mock.rs"
+      ],
+      "verification": [
+        "two-group inline-root spill allocates claims deterministically and emits one bitmap after-image per group",
+        "GDT after-images merge descriptors sharing one home page and superblock count changes once",
+        "ENOSPC, reserved metadata alias, or incomplete group produces no visible claim or after-image",
+        "Docker-backed e2fsck -fn validates every generated allocation fixture"
+      ],
+      "notes": "The two-group inline-root spill is deterministic; no-space, metadata-alias, and incomplete-group rejection leave the source image unchanged. A Docker-generated inline-root spill fixture applies the full plan and passes e2fsck -fn. Do not pull indexed extent-root growth into this step; it belongs to A3."
+    },
+    {
+      "id": "a3-inline-unwritten-conversion",
+      "title": "Convert one inline unwritten extent block without allocation",
+      "status": "complete",
+      "depends_on": [
+        "a2-cross-group-allocation"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4-format/tests/pager_mock.rs"
+      ],
+      "verification": [
+        "pager_mock proves prefix and suffix remain unwritten, the target becomes initialized, and no allocation claim or home write occurs",
+        "cargo test -p tx-ext4-format -- --test-threads=1",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Depth-0 through bounded depth-3 unwritten conversion is host-verified: full depth-1 leaves split, full inode roots grow one level, depth-2 leaves split/carry/promote, and a depth-3 path converts a non-overflowing leaf through checked ancestor descent. Depth-3+ leaf splits remain fail closed."
+    },
+    {
+      "id": "a3-a5-tier2-extent-planners",
+      "title": "Migrate captured-path extents, unwritten conversion, and recursive freeing",
+      "status": "complete",
+      "depends_on": [
+        "a3-inline-unwritten-conversion",
+        "a1-multi-page-revoke"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4-format/tests/pager_mock.rs"
+      ],
+      "verification": [
+        "captured-path ladder covers indexed insertion, leaf split, root growth, and validated child/key ordering",
+        "unwritten conversion preserves data allocation and changes only required extent metadata claims",
+        "recursive truncate/destroy emits descendant-first after-images and revoke order with root collapse",
+        "Linux debugfs bmap comparison and Docker-backed e2fsck -fn cover fragmented depth-2 and depth-3 conversion fixtures"
+      ],
+      "notes": "Depth-0 through bounded depth-3 unwritten conversion and bounded recursive truncate/destroy release are now host-verified. Recursive release validates depth/key ordering/cycles and reserved or overlapping physical ranges, emits descendant-first extent-node after-images, updates merged allocation metadata, and retains sorted revoke/deferred-free claims. A Docker debugfs fixture now creates a real depth-two unwritten tree, converts it through Tx after-images, recursively truncates it, compares its retained debugfs bmap, and passes e2fsck -fn. The same fixture now proves unlink -> destroy e2fsck cleanliness; a bounded depth-three mock proves recursive truncate revokes all descendant nodes. The full depth-two root carry is now host-verified: splitting a full leaf and parent produces four metadata-node claims and promotes the inode root to depth three. The deep planner now splits a full depth-three leaf and carries through full ancestors, including inline-root growth when bounded by the ext4 maximum depth. An ignored 3 GiB Docker/debugfs fixture now uses two Linux in-leaf insertions to make a depth-three parent full, then converts another near-full three-block unwritten leaf through Tx. The immutable plan claims two metadata-only nodes and emits five extent-node after-images through the parent carry before e2fsck -fn accepts it. Linux depth-three split/carry format evidence is complete; crash cuts remain pending. Do not add depth-specific runtime shortcuts."
+    },
+    {
+      "id": "a6-runtime-lowering-and-tier2-evidence",
+      "title": "Lower selected planners through current mutation ownership",
+      "status": "pending",
+      "depends_on": [
+        "a3-a5-tier2-extent-planners"
+      ],
+      "paths": [
+        "crates/tx-ext4/src/journal.rs",
+        "crates/tx-ext4/src/pager.rs",
+        "crates/tx-ext4/tests",
+        "crates/tx-ext4/src/tests_v3.rs",
+        "crates/tx-ext4-format/src/ondisk.rs",
+        "crates/tx-ext4-format/src/pager.rs"
+      ],
+      "verification": [
+        "mutation lifecycle and prepared-journal tests prove complete metadata, revoke, and checkpoint lease ownership",
+        "cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1",
+        "cargo xtask lint invariants ext4-no-direct-home-write",
+        "Linux-to-Tx and Tx-to-Linux extent fixtures pass Docker-backed e2fsck -fn"
+      ],
+      "notes": "Depth-two host runtime witnesses cover public truncate checkpointing of the retained leaf/allocation/inode after-images and MutationHandle retention of recursive destroy deferred-free claims. A depth-three host witness now drives public flush admission, ordered-data settlement, and checkpoint through the next metadata mutation before validating the converted leaf home. Ignored Docker runtime witnesses now build Linux-generated Tier 1 depth-two and depth-three-parent-carry fragmented unwritten images, mount the same file-backed images through the public mutation-journal path, flush an unwritten page, settle with chmod, and pass Linux e2fsck -fn. The depth-three fixture retains metadata_csum so it exercises the writable Tier 1 profile and carries a leaf split through a full parent. External extent-node metadata_csum tails are refreshed in plan_write_page. PageBacked retains file-page lifecycle, ext4 retains mutation planning and JBD2 staging, and Mount retains settlement. A6 remains open for crash-bound acceptance."
+    },
+    {
+      "id": "m1-m2-rustc-witness",
+      "title": "Rebuild bounded HAL/QEMU, resolver, and WORKLOAD-image witness",
+      "status": "pending",
+      "depends_on": [
+        "g0-disposition-and-baseline"
+      ],
+      "paths": [
+        "boards/tx-hal-riscv64-qemu-virt",
+        "xtask/src/qemu.rs",
+        "xtask/src/shell_test.rs",
+        "tools/images",
+        "tools/ext4",
+        "tools/shell-tests",
+        "tools/tests"
+      ],
+      "verification": [
+        "high-DTB direct map is covered before BootInfo publication",
+        "only the rustc witness requests explicit 4096 MiB geometry",
+        "resolver shim is versioned, idempotently installed only into WORKLOAD, and leaves generic Alpine unchanged",
+        "QEMU proves rustc -vV and a clean offline frozen build over TEST, SCRATCH, and read-only WORKLOAD images"
+      ],
+      "notes": "The high-DTB direct-map prerequisite is complete: the pre-entry trampoline maps the firmware leaf before BootInfo parsing, and direct-map extension accounts for that preinstalled leaf (95 focused board tests passed). Current qemu and shell-test entry points accept named TEST/SCRATCH/WORKLOAD paths, reject mixed legacy/named or duplicate roles, assign stable vda/vdb/vdc cmdline identities, and attach only WORKLOAD read-only. The materializer copies source/vendor and the pre-materialized rustc wrapper only to TEST, and the toolchain plus resolver shim only to WORKLOAD. The production runner now uses set -eu, an absolute TEST manifest path, exported wrapper environment, and bounded TX_GUEST_RUST_STAGE markers with Cargo -vv diagnostics. Real RV64 QEMU proves rustc -vV, cargo -V, and offline cargo metadata in the named topology. A default-kernel frozen build remained CPU-bound for 1,800,000 ms after rustc startup and emitted no TX_GUEST_RUST_BUILD status=0 marker; a shorter stage probe again reached rustc -vV without a post-probe marker. M1/M2 remains pending on a complete build receipt. Do not claim acceptance from loader or metadata-only evidence; do not change global QEMU or tmpfs defaults."
+    },
+    {
+      "id": "m3-performance-handoff",
+      "title": "Bind rustc workload to the canonical SubmissionManager receipt",
+      "status": "pending",
+      "depends_on": [
+        "m1-m2-rustc-witness"
+      ],
+      "paths": [
+        "docs/progress/plans/2026-08-05-io-submission-manager-performance.json",
+        "tools/io-submission-perf.py",
+        "tools/tests/test_io_submission_perf.py"
+      ],
+      "verification": [
+        "canonical-contracts, c0-ext4-frontier, and p0-observation-baseline complete before performance execution",
+        "receipt binds geometry, raw artifacts, counters, trace loss, timing distribution, and baseline/candidate configuration",
+        "receipt verification succeeds with tools/io-submission-perf.py"
+      ],
+      "notes": "This is a handoff to the existing SubmissionManager plan, not permission to implement P1-P9 here."
+    },
+    {
+      "id": "final-candidate-acceptance",
+      "title": "Run candidate-bound compatibility, crash, and documentation acceptance",
+      "status": "pending",
+      "depends_on": [
+        "a6-runtime-lowering-and-tier2-evidence",
+        "m3-performance-handoff"
+      ],
+      "paths": [
+        "tools/ext4",
+        "tools/shell-tests",
+        "docs/progress"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4-format",
+        "cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1",
+        "cargo -q xtask unit",
+        "cargo xtask lint invariants ext4-no-direct-home-write",
+        "selected extent/revoke crash cuts, manifest-pinned xfstests, and exchanged Linux/Tx images pass e2fsck -fn",
+        "one fresh timestamp-named candidate-bound cargo xtask ext4 tier1 campaign completes",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate",
+        "git diff --check"
+      ],
+      "notes": "The Docker xfstests live preflight now passes after the runner generates configure and builds helpers in their owning directories. Native e2fsprogs remains preferred, while a repository-owned read-only Docker fallback now carries candidate e2fsck/debugfs checks through the live runner, crash executor, and semantic oracle on hosts without them. Tier 1 remains green and keeps rejecting non-migrated shapes. Completion may claim only the actually evidenced slices."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-ext4-format -- --test-threads=1",
+      "status": "passed",
+      "notes": "93 format tests and doc-tests passed in the integration worktree on 2026-08-09 after recursive depth-2/3 truncate/destroy regressions, A2 allocation, incomplete-group, Docker e2fsck, bounded unwritten conversion coverage, and extent-node metadata checksum refresh."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "tx-shims 655, tx-kernel 114, tx-ext4 72, and tx-scripts 167 passed in the integration worktree on 2026-08-09."
+    },
+    {
+      "command": "cargo xtask lint invariants ext4-no-direct-home-write && git diff --check",
+      "status": "passed",
+      "notes": "The allocation extraction reports zero production direct-home-write violations and no whitespace errors on 2026-08-09."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib depth_two -- --test-threads=1",
+      "status": "passed",
+      "notes": "Three depth-two runtime witnesses passed on 2026-08-09: public truncate checkpoint after-images, destroy deferred-free retention, and public destroy checkpoint settlement."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format --test host_tools docker_e2fsck_accepts_depth_two_fragmented_truncate_after_images -- --test-threads=1",
+      "status": "passed",
+      "notes": "Docker debugfs generated a real depth-two fragmented tree; Tx converted its unwritten mappings, recursively truncated it, and Docker e2fsck -fn accepted the final image on 2026-08-09."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format --test host_tools docker_e2fsck_accepts_depth_two_fragmented_unlink_destroy_after_images -- --test-threads=1",
+      "status": "passed",
+      "notes": "Docker debugfs generated a real depth-two tree; Tx converted it, unlinked it, destroyed the zero-link inode, and Docker e2fsck -fn accepted the final image on 2026-08-09."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format --test pager_mock pager_grows_full_depth_two_root_for_unwritten_leaf_without_data_claim -- --exact --test-threads=1",
+      "status": "passed",
+      "notes": "A full depth-two root now promotes into two depth-two extent nodes and a depth-three inode root with four metadata-only claims; the source homes remain unchanged."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format --test pager_mock pager_converts_depth_three_unwritten_leaf_without_new_claims -- --exact --test-threads=1",
+      "status": "passed",
+      "notes": "A depth-three root -> index -> index -> leaf path is descended with depth and layout validation; a non-overflowing unwritten leaf converts in place with one extent-node after-image and no allocation claim."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format --test host_tools docker_e2fsck_accepts_depth_three_fragmented_unwritten_parent_carry_after_images -- --exact --ignored --test-threads=1",
+      "status": "passed",
+      "notes": "Docker debugfs split one full leaf through two in-leaf inserts, yielding a full depth-three parent. Tx then split a separate three-block unwritten leaf beneath it, claimed two metadata-only nodes, emitted five extent-node after-images, and e2fsck -fn accepted the result."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features docker_linux_depth_two_unwritten_flush_survives_tx_runtime_settlement -- --ignored --test-threads=1",
+      "status": "passed",
+      "notes": "Linux/debugfs generated a Tier 1 depth-two fragmented unwritten image; the same file-backed image crossed the public FsPageBacking/FsOps mutation-journal path and Docker e2fsck -fn accepted the settled image."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features docker_linux_depth_three_parent_carry_flush_survives_tx_runtime_settlement -- --ignored --test-threads=1",
+      "status": "passed",
+      "notes": "A Linux/debugfs 3 GiB metadata_csum image with a depth-three root and full parent crossed the public FsPageBacking/FsOps mutation-journal path; Tx split the selected unwritten leaf through that parent and Docker e2fsck -fn accepted the settled image in 136.03s."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1",
+      "status": "passed",
+      "notes": "72 tx-ext4 library tests passed; the two Docker interoperability witnesses are ignored in the ordinary suite and were run explicitly above."
+    },
+    {
+      "command": "cargo xtask ext4 tier1 --preflight-live --preflight-report target/ext4/reconciliation-preflight-docker-e2fsprogs.json",
+      "status": "passed",
+      "notes": "Native e2fsprogs absence is now covered by the repository-owned read-only Docker fallback; live preflight reports Linux replay, xfstests Docker execution, and CoW storage readiness."
+    },
+    {
+      "command": "cargo test -p tx-hal-riscv64-qemu-virt -- --test-threads=1",
+      "status": "passed",
+      "notes": "95 focused board tests passed on 2026-08-09, including direct_map_extension_accounts_for_the_preinstalled_fdt_leaf. This closes only M1/M2 high-DTB pre-entry mapping evidence."
+    },
+    {
+      "command": "cargo test -p xtask -- --test-threads=1 && cargo xtask ext4 tier1 --dry-run",
+      "status": "passed",
+      "notes": "450 xtask tests passed on 2026-08-09. Named TEST/SCRATCH/WORKLOAD role drives preserve the legacy tier1 shell invocation, assign vda/vdb/vdc, and attach WORKLOAD read-only; Tier 1 dry-run remains green."
+    },
+    {
+      "command": "python3 -m unittest tools/tests/test_ext4_rustc_workload.py && cargo test -p xtask shell_test -- --test-threads=1",
+      "status": "passed",
+      "notes": "Four Python workload-contract tests and 13 shell-test role/memory/harness tests passed after the runner portability and QEMU early-exit/reap fixes."
+    },
+    {
+      "command": "cargo xtask shell-test --target rv64-qemu --profile alpine --memory-mib 4096 --script tools/shell-tests/ext4-rustc-cargo-metadata-witness.scn",
+      "status": "passed",
+      "notes": "Real RV64 QEMU completed Cargo metadata with the TEST/SCRATCH/WORKLOAD topology; the serial receipt contains ext4-cargo-metadata-status:0. This is diagnostic/workspace evidence, not a kernel-build receipt."
+    },
+    {
+      "command": "python3 tools/ext4/run_rustc_kernel_workload.py ... --timeout-ms 1800000",
+      "status": "failed",
+      "notes": "The default-kernel real RV64 runner printed rustc 1.89.0 and remained CPU-bound in Cargo for 30 minutes, then timed out without TX_GUEST_RUST_BUILD status=0. No M1/M2 completion or Tier 1 acceptance claim is allowed."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "Blocked by the unrelated missing docs/progress/research/2026-08-04-smp-scheduler-readiness-audit.md reference in the SMP plan."
+    }
+  ],
+  "risks": [
+    "Historical worktrees are dirty and mix ext4 work with unrelated VM, VFS, syscall, and tooling changes.",
+    "Current host lacks direct ext4 tools, so Linux-visible fixture validation must use the repository Docker/e2fsprogs path.",
+    "Tier 2 cannot inherit Tier 1 crash or compatibility evidence after planner changes."
+  ],
+  "blockers": [
+    "No local historical Tier 1 acceptance receipt is present for integrity-only verification in this integration worktree.",
+    "Cross-transaction revoke replay needs a separate multiple-outstanding-transaction and checkpoint-overlay design.",
+    "Mapped partial-tail truncate remains fail closed pending a full writable-file mapping invalidation and shootdown contract.",
+    "Rustc performance promotion waits on the existing SubmissionManager prerequisites.",
+    "cargo xtask progress validate is blocked by an unrelated missing SMP research reference."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

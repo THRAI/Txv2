@@ -200,9 +200,16 @@ impl BootStaticBag<IdentityLive> {
 
     #[cfg(test)]
     fn map_direct_map_window(&mut self) -> &mut Self {
+        self.map_direct_map_leaf(PhysAddr(QEMU_RAM_BASE))
+    }
+
+    #[cfg(test)]
+    fn map_direct_map_leaf(&mut self, phys: PhysAddr) -> &mut Self {
+        assert!(phys.0 >= QEMU_RAM_BASE);
+        assert!(phys.0.is_multiple_of(SUPERPAGE_1G_SIZE));
         unsafe {
-            self.bootstrap_root_mut().0[rv64_1g_leaf_index(direct_map_virt(QEMU_RAM_BASE))] =
-                encode_leaf_pte(PhysAddr(QEMU_RAM_BASE), PTE_R | PTE_W | PTE_G);
+            self.bootstrap_root_mut().0[rv64_1g_leaf_index(direct_map_virt(phys.0))] =
+                encode_leaf_pte(phys, PTE_R | PTE_W | PTE_G);
         }
         self
     }

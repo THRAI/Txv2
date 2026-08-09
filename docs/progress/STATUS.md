@@ -1,3 +1,232 @@
+- 2026-08-09 (ext4 M1 rustc materialization path).
+  Added a current-interface TEST/SCRATCH/WORKLOAD materializer, a
+  WORKLOAD-copy-only resolver installer, and a guest runner that uses named
+  role flags with explicit 4096 MiB geometry. Focused xtask/Python checks and
+  role dry-run rendering passed. A temporary clean fixture source produced all
+  three images through Homebrew e2fsprogs and each passed `e2fsck -fn`;
+  `debugfs` confirmed the resolver exists only in WORKLOAD. The fixture used
+  fake compiler binaries, so a measured RV64 toolchain and QEMU rustc build
+  receipt are still missing and M1/M2 remains open.
+  See `docs/progress/research/2026-08-09-ext4-rustc-materialization-path.md`.
+
+- 2026-08-09 (ext4 M1 real guest boundary and remaining build blocker).
+  Real RV64 QEMU now proves `rustc -vV`, `cargo -V`, and offline Cargo
+  metadata over TEST=`vda`, SCRATCH=`vdb`, and read-only WORKLOAD=`vdc`.
+  The runner uses an absolute TEST manifest path, exports the TEST-side
+  rustc-wrapper environment, and is portable to Alpine BusyBox `sh`. The
+  sequential shell-test harness now detects early QEMU exit, joins readers,
+  and writes serial logs before returning. A default-kernel frozen build was
+  bounded at 1,800,000 ms; it remained CPU-bound after the rustc probe and
+  emitted no `TX_GUEST_RUST_BUILD status=0`. Therefore M1/M2 is still open,
+  and no M3 or Tier 1 acceptance claim is made. Next: profile the guest build
+  progress and bind only a complete status-0 receipt; blocker: measured RV64
+  full-build completion is still missing.
+
+- 2026-08-09 (ext4 rustc bounded stage probe).
+  The guest runner now emits preflight, rustc-version, and Cargo-build stage
+  markers and enables Cargo `-vv` for bounded diagnostics. A follow-up probe
+  again reached the real `rustc -vV` output but produced no post-probe marker
+  before being stopped, narrowing the next investigation to Cargo startup or
+  its first compiler invocation. This is diagnostic evidence only; the full
+  status-0 build receipt remains required and M1/M2 stays open.
+
+- 2026-08-09 (ext4 M1 named role-image QEMU wiring).
+  `qemu` and `shell-test` now accept distinct TEST/SCRATCH/WORKLOAD images,
+  publish their stable RV64 device roles, and present only WORKLOAD as a
+  read-only QEMU drive. Legacy `--extra-rv64-ext4` callers remain supported;
+  mixed or duplicate role images fail before QEMU starts. All 450 xtask tests
+  and the Tier 1 dry-run pass. This is transport wiring only: no measured
+  WORKLOAD image, WORKLOAD-only resolver install, or RV64 rustc build witness
+  exists. See `docs/progress/research/2026-08-09-ext4-rustc-role-image-wiring.md`.
+
+- 2026-08-09 (ext4 M1 high-DTB boot prerequisite).
+  The RV64 QEMU trampoline now maps the 1 GiB direct-map leaf containing a
+  firmware DTB before Rust parses BootInfo, and direct-map extension accounts
+  for that preinstalled leaf. The focused board suite passed 95 tests. This
+  closes only the high-DTB sub-evidence of M1/M2: the resolver must still be
+  WORKLOAD-only and an RV64 QEMU rustc/offline-build witness is still absent.
+  See `docs/progress/research/2026-08-09-ext4-high-dtb-boot-prerequisite.md`.
+
+- 2026-08-09 (ext4 Docker e2fsprogs candidate path).
+  Tier 1 candidate preflight now resolves native `e2fsck`/`debugfs` first and
+  otherwise invokes the repository's read-only Docker e2fsprogs wrapper. The
+  same resolved commands reach the role-image checks, crash executor, and
+  semantic oracle. A real Docker-created ext4 image passed wrapper e2fsck and
+  debugfs; live preflight is green with Linux replay, xfstests Docker, and CoW
+  capacity checks. This unblocks the local candidate entry path only; no crash
+  campaign or acceptance receipt has run. See
+  `docs/progress/research/2026-08-09-ext4-docker-e2fsprogs-candidate-path.md`.
+
+- 2026-08-09 (ext4 rustc workload contract disposition).
+  Imported only the standalone `fixture-non-evidence` native-RV64 rustc
+  workload manifest into the reconciliation worktree. Its pinned command,
+  role-image topology, and 4096 MiB geometry are an executable-contract
+  template, not measured evidence. The historical `xtask/src/ext4.rs` perf
+  path was intentionally not merged because current `xtask/src/ext4/mod.rs`
+  has the later Tier 1-only interface; guest, resolver, materializer, and
+  receipt paths remain M1/M3 work pending current-interface bindings. See
+  `docs/progress/research/2026-08-09-ext4-rustc-contract-disposition.md`.
+
+- 2026-08-09 (ext4 A6 Linux depth-three runtime interoperability).
+  The ignored 3 GiB Docker/debugfs witness now retains the Tier 1
+  `metadata_csum` profile while Linux creates a depth-three fragmented tree and
+  fills one parent. Tx discovers the target three-block unwritten extent below
+  that full parent, mounts the same file-backed image through the public
+  mutation-journal path, flushes its middle block through `FsPageBacking`,
+  settles with `FsOps::chmod_inode`, and Docker `e2fsck -fn` accepts the
+  persisted image. The focused witness passed in 136.03s. This closes the
+  complementary deep-shape public runtime exchange; crash cuts, a
+  candidate-bound campaign, and the Rust workload/SubmissionManager handoff
+  remain open.
+
+- 2026-08-09 (ext4 Linux depth-three parent carry witness).
+  The ignored 3 GiB Docker/debugfs fixture now uses two Linux-generated
+  in-leaf insertions to split one full leaf and leave its depth-three parent
+  at 340 entries. Tx then converts a three-block unwritten extent in another
+  near-full child leaf, claims two metadata-only extent nodes, emits five
+  extent-node after-images through the parent carry, and passes Docker
+  `e2fsck -fn`. This closes the Linux depth-three split/carry format witness;
+  deep runtime exchange, crash/candidate acceptance, and the Rust workload/
+  SubmissionManager handoff remain open.
+
+- 2026-08-09 (ext4 Linux depth-three leaf split witness).
+  The ignored 3 GiB Docker/debugfs fixture now emits one three-block unwritten
+  extent per 1000 fragmented extents, so Tx can convert a real middle block in
+  a Linux-generated near-full depth-three leaf. The immutable plan claims one
+  metadata-only extent node and emits the modified leaf, new sibling, and
+  parent after-images; Docker `e2fsck -fn` accepted the result in 80.18s.
+  This is Linux depth-three leaf-split evidence, not Linux depth-three parent
+  carry evidence. Crash/candidate acceptance and the Rust workload/
+  SubmissionManager handoff remain open.
+
+- 2026-08-09 (ext4 A6 Linux-to-Tx runtime interoperability).
+  Added an ignored Docker-backed `tx-ext4` test that builds a Linux-generated
+  Tier 1 depth-two fragmented unwritten image, opens it through
+  `Ext4Pager`, mounts the same file through
+  `mount_ext4_read_write_with_mutation_journal_io_manager_planner`, and drives
+  `FsPageBacking::flush_page` followed by `FsOps::chmod_inode` to settle the
+  ordered-data and metadata transaction. The file-backed image then passes
+  Docker `e2fsck -fn`. The format planner now refreshes external extent-node
+  metadata checksums when metadata_csum is enabled. The focused ignored test,
+  full `tx-ext4-format`, and 72-test `tx-ext4` lib suite pass. This closes one
+  public runtime interoperability witness, not A6 or the overall plan:
+  deep-shape public runtime exchange, crash cuts/candidate acceptance, and
+  the Rust workload/SubmissionManager handoff remain open. Global progress
+  validation is still blocked by the unrelated missing SMP research reference.
+
+- 2026-08-09 (ext4 reconciliation depth-three split planner and Linux fixture).
+  `Ext4Pager` now captures a depth-three-or-deeper indexed path and carries a
+  full unwritten leaf split through every full ancestor in one immutable plan;
+  a full inline root grows by one level unless the ext4 maximum depth would be
+  exceeded. New pager regressions cover the depth-three leaf split and
+  multi-ancestor carry to the root with metadata-only claims and unchanged
+  source homes. An ignored 3 GiB Docker fixture creates more than 462,400
+  Linux/debugfs fragmented unwritten extents, proves an actual depth-three
+  inode root, converts one selected unwritten extent through Tx, and passes
+  Docker `e2fsck -fn` in 67.86 seconds. The follow-up fixture now forces a
+  real Linux depth-three leaf split and parent carry before e2fsck acceptance.
+  See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
+- 2026-08-09 (ext4 Tier 1 xfstests Docker preflight harness).
+  The clean `codex/ext4-worktree-reconciliation` worktree now generates the
+  pinned xfstests `configure` script before invoking it, builds its required
+  `lib/libtest.la`, and invokes selected helpers from their owning `ltp/` or
+  `src/` make directory rather than triggering top-level implicit rules. The
+  runner regression passed 12/12 and
+  `cargo xtask ext4 tier1 --preflight-live --preflight-report
+  target/ext4/reconciliation-preflight-after-helper-build.json` passed with
+  zero blockers. This proves only live-campaign prerequisites; it does not
+  start a 1000-cut campaign or create an acceptance receipt. Next: finish the
+  pending Linux-generated depth-three and exchanged-image evidence, then select
+  a timestamped candidate run id. See
+  `docs/progress/research/2026-08-09-ext4-tier1-xfstests-preflight.md`.
+
+- 2026-08-09 (ext4 reconciliation A3 bounded indexed unwritten conversion).
+  The clean `codex/ext4-worktree-reconciliation` worktree now turns one
+  depth-0 through bounded depth-2 unwritten extent block into an initialized block during
+  `plan_write_page`, retaining the surrounding unwritten prefix/suffix and
+  physical mapping with no data allocation claim. Full depth-one leaves can
+  split, grow a full inode root to depth two, and split a depth-two leaf into a
+  non-full parent; each new metadata node carries its bitmap, GDT, superblock,
+  and inode after-images in the same plan. The full format suite passed 82
+  tests plus doc-tests and the direct-home-write invariant passed. A full
+  depth-two parent now carries into a non-full inode root. Root-full carry,
+  recursive release, and Docker/debugfs deep-shape witnesses remain pending.
+  See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
+- 2026-08-09 (ext4 reconciliation A2 cross-group allocation).
+  The clean `codex/ext4-worktree-reconciliation` worktree now plans and
+  validates a full inline extent-root spill through immutable cross-group
+  allocation: data and extent-node claims are deterministic, bitmap
+  after-images remain per group, shared GDT descriptor edits fold into one
+  home page, and the superblock count changes once. The planner rejects known
+  metadata aliases, exhausted bitmaps, and incomplete group descriptors
+  without source-image mutation. A Docker `debugfs` fixture applies the
+  generated after-images and passes `e2fsck -fn`. Verification passed 76
+  `tx-ext4-format` tests plus doc-tests, `cargo -q xtask unit`, the
+  direct-home-write invariant, and `git diff --check`. A2 is complete; its
+  Docker fixture is an on-disk consistency witness, not a broad Tier 2 claim.
+  Indexed/deep extent paths remain A3-A5. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-allocation.md`.
+
+- 2026-08-09 (ext4 four-worktree execution plan).
+  Published the executable integration plan at
+  `docs/progress/plans/2026-08-09-ext4-reconciliation-execution.json` without
+  modifying the user-owned reconciliation draft in the primary checkout. It
+  records G0, A1, and the A2 release subset as complete; separates pending
+  cross-group allocation from deep extent work; and keeps the independent
+  rustc-witness/SubmissionManager lane gated until final candidate acceptance.
+  Whole-worktree merges, historical lifecycle restoration, shared-interface
+  changes, and unsupported Tier 2 claims remain out of scope. The worktree
+  record now links the plan. Next: A2 cross-group allocation. Blockers remain
+  the absent local historical Tier 1 receipt and the unrelated missing SMP
+  progress reference that prevents global progress validation.
+
+- 2026-08-09 (ext4 reconciliation A2 cross-block-group release).
+  In the clean `codex/ext4-worktree-reconciliation` worktree, extracted
+  format-only cross-block-group release planning for current inline initialized
+  extent truncate and zero-link inode destroy paths. Each involved block bitmap
+  is planned once, group-descriptor after-images sharing a GDT home are merged,
+  and deferred-free/revoke claims are appended only after bitmap, GDT, and
+  superblock planning succeeds. Two regressions cover truncate and destroy
+  across group 0 and group 1 without mutating the source image. The JBD2
+  state-update codec fixture now supplies a valid initial checksum required by
+  the integration baseline's parser. Verification passed the full format crate
+  test suite (72 tests plus doc-tests), `cargo -q xtask unit` (`655 + 114 +
+  68`), direct-home-write lint (0 violations), Tier 1 dry-run, docs lint
+  (7 existing warnings), and scoped rustfmt/diff checks. Cross-group
+  allocation, indexed/deep extent trees, and unwritten extents remain
+  fail-closed; no VFS/Mount/PageBacked/VM types changed. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-release.md`
+  and
+  `docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json`.
+  Next: independently scope cross-group allocation. Blockers: this worktree
+  has no local historical Tier 1 receipt, so no renewed crash/e2fsck/xfstests
+  claim is made; `cargo xtask progress validate` also remains blocked by the
+  unrelated missing SMP scheduler-readiness research reference.
+
+- 2026-08-09 (ext4 reconciliation A1 multi-page revoke).
+  In the clean
+  `codex/ext4-worktree-reconciliation` worktree, completed the bounded
+  single-transaction multi-page JBD2 revoke extraction. The format codec and
+  same-transaction replay now process every revoke page; the current
+  `JournalRing` reserves `descriptor -> metadata -> revokes -> commit`; and
+  `PreparedJournalTransaction` retains all revoke leases until checkpoint
+  completion. No VFS/Mount/PageBacked/VM interface or cross-transaction replay
+  path changed. Verification passed JBD2 image 3/3, recovery 11/11, journal
+  plan 4/4, prepared transaction 10/10, mutation lifecycle 7/7, the direct
+  home-write invariant, scoped rustfmt/diff checks, and `cargo -q xtask unit`
+  (`655 + 114 + 68 + 167`). See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a1-multi-page-revoke.md`
+  and
+  `docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json`.
+  Next: A2 cross-block-group allocation/release planning. Blocker: this clean
+  worktree has no historical Tier 1 acceptance receipt for integrity-only
+  verification, so this is host regression evidence rather than renewed
+  crash/e2fsck/xfstests acceptance.
+
 - 2026-08-05 (I/O SubmissionManager performance implementation plan).
   Added the approved 19-task implementation plan at
   `docs/superpowers/plans/2026-08-05-io-submission-manager-performance.md`
@@ -32041,3 +32270,77 @@
   dual-architecture evidence bundle and close the highest-scoring guest
   blockers. Blocker: current ext4 receipt still lacks built xfstests helpers,
   storage, and a fresh 1000-cut/e2fsck/xfstests run.
+- 2026-08-09 (ext4 reconciliation recursive truncate/destroy release).
+  The clean `codex/ext4-worktree-reconciliation` worktree now routes public
+  `plan_truncate_size` shrink plans and zero-link `plan_destroy_inode` plans
+  through a bounded recursive extent-release planner. Depth-2 truncate emits
+  descendant-first extent-node after-images, collapses removed children from
+  the inode root where supported, updates per-group block bitmaps/GDT and the
+  superblock, and appends sorted revoke/deferred-free claims only after all
+  metadata plans succeed. Indexed destroy releases data plus extent-node
+  homes while preserving inode bitmap, orphan, directory, and group-count
+  lifecycle checks. Journal inode data and extent-node homes are reserved when
+  present; extension-only truncate keeps its existing size-update behavior.
+  Two new depth-2 pager regressions prove source-image immutability.
+  Verification passed `cargo test -p tx-ext4-format -- --test-threads=1` (88
+  tests plus doc-tests), `cargo -q xtask unit` (`655 + 114 + 71 + 167`),
+  `cargo xtask lint invariants ext4-no-direct-home-write` (0 violations),
+  `cargo xtask lint docs` (7 existing warning-only stale-vocabulary mentions),
+  scoped rustfmt, and `git diff --check`. Linux/debugfs bmap comparison,
+  fresh Docker/e2fsck deep-shape fixtures, crash cuts, and full runtime
+  lowering remain pending; no Tier 2 or production acceptance claim is made.
+  `cargo xtask progress validate` remains blocked by the unrelated missing
+  `docs/progress/research/2026-08-04-smp-scheduler-readiness-audit.md` in this
+  isolated worktree. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
+- 2026-08-09 (ext4 reconciliation depth-two runtime lowering).
+  Public `FsPageBacking::truncate` now has a depth-two runtime witness: its
+  immutable five-metadata/one-revoke plan is admitted by
+  `JournalMutationRuntime` and checkpointed to retained extent, allocation,
+  and inode home blocks. The zero-link depth-two destroy plan is likewise
+  admitted through `MutationHandle`; each recursive deferred-free claim stays
+  non-reusable while that handle is live, and the public `FsOps::destroy_inode`
+  path reaches checkpoint settlement. Verification passed
+  `cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1`
+  (71 tests) and `cargo -q xtask unit` (`655 + 114 + 71 + 167`).
+  Docker now creates a Linux depth-two fragmented fixture, which Tx converts
+  from unwritten, recursively truncates with a stable `debugfs bmap`, or
+  unlinks and destroys before `e2fsck -fn` passes. Final destroy clears the
+  free inode's mode/dtime and only metadata-csum profiles update
+  `bg_itable_unused`, fixing two Linux-visible failures. Next: depth-3 conversion
+  and crash/compatibility evidence. No Tier 2 or production acceptance is claimed.
+  `cargo xtask progress validate` remains blocked by the unrelated missing SMP
+  research reference.
+
+- 2026-08-09 (ext4 reconciliation full depth-two root carry).
+  The immutable unwritten-conversion planner now handles a full depth-two
+  inode root when its selected full parent and full leaf split: it claims the
+  right leaf, right parent, and two new depth-two roots, then publishes a
+  two-entry depth-three inode root through its inode after-image. The focused
+  pager regression proves the five preserved root entries, four metadata-only
+  claims, unchanged source images, and no data allocation. Verification:
+  focused `pager_mock` and full `cargo test -p tx-ext4-format --
+  --test-threads=1` (88 tests plus doc-tests) passed. Next: support subsequent
+  depth-three conversion before attempting a Linux deep-shape witness. Crash
+  and cross-runtime compatibility evidence remain required; no Tier 2 or
+  production acceptance is claimed. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
+- 2026-08-09 (ext4 reconciliation depth-three unwritten descent).
+  `plan_write_page` now descends a checked depth-three extent path and converts
+  a non-overflowing unwritten leaf in place. The path validates each ancestor's
+  expected depth and key layout, rejects child-home cycles, preserves the
+  physical mapping, and emits only the leaf after-image. Verification passed
+  the new focused pager regression and the full `tx-ext4-format` suite (59
+  pager-mock tests plus journal/host-tool tests). Linux-generated depth-three
+  shape and leaf-split evidence remain open; the current Docker fixture is
+  intentionally depth-two because the required fanout is much larger.
+
+- 2026-08-09 (ext4 reconciliation depth-three runtime settlement).
+  The public `FsPageBacking::flush_page` path now has a depth-three witness:
+  it admits the converted page as ordered data, and the next metadata mutation
+  settles the data graph, journal commit, and checkpoint before the test reads
+  the converted leaf home. This preserves the ext4/JBD2 ownership sequence;
+  Linux-to-Tx and Tx-to-Linux deep-shape fixtures remain required before A6 can
+  close.
