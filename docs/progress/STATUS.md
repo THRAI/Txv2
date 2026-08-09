@@ -1,3 +1,15 @@
+- 2026-08-09 (ext4 A6 Linux depth-three runtime interoperability).
+  The ignored 3 GiB Docker/debugfs witness now retains the Tier 1
+  `metadata_csum` profile while Linux creates a depth-three fragmented tree and
+  fills one parent. Tx discovers the target three-block unwritten extent below
+  that full parent, mounts the same file-backed image through the public
+  mutation-journal path, flushes its middle block through `FsPageBacking`,
+  settles with `FsOps::chmod_inode`, and Docker `e2fsck -fn` accepts the
+  persisted image. The focused witness passed in 136.03s. This closes the
+  complementary deep-shape public runtime exchange; crash cuts, a
+  candidate-bound campaign, and the Rust workload/SubmissionManager handoff
+  remain open.
+
 - 2026-08-09 (ext4 Linux depth-three parent carry witness).
   The ignored 3 GiB Docker/debugfs fixture now uses two Linux-generated
   in-leaf insertions to split one full leaf and leave its depth-three parent

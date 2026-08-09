@@ -48,6 +48,7 @@
     "cargo test -p tx-ext4-format --test host_tools docker_e2fsck_accepts_depth_two_fragmented_unlink_destroy_after_images -- --test-threads=1",
     "cargo test -p tx-ext4-format --test host_tools docker_e2fsck_accepts_depth_three_fragmented_unwritten_parent_carry_after_images -- --exact --ignored --test-threads=1",
     "cargo test -p tx-ext4 --lib --no-default-features docker_linux_depth_two_unwritten_flush_survives_tx_runtime_settlement -- --ignored --test-threads=1",
+    "cargo test -p tx-ext4 --lib --no-default-features docker_linux_depth_three_parent_carry_flush_survives_tx_runtime_settlement -- --ignored --test-threads=1",
     "cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1",
     "cargo xtask lint invariants ext4-no-direct-home-write",
     "cargo -q xtask unit",

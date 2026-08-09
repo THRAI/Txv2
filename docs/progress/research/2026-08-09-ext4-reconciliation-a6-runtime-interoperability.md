@@ -21,6 +21,18 @@ the resulting image. This proves Linux -> Tx format/runtime admission and Tx ->
 Linux persisted extent metadata through the current public mount, PageBacked,
 and VFS entry points. The test ran explicitly on 2026-08-09 and passed in 0.84s.
 
+The complementary ignored test
+`docker_linux_depth_three_parent_carry_flush_survives_tx_runtime_settlement`
+uses a 3 GiB Docker/debugfs fixture with the writable Tier 1
+`metadata_csum` profile. Linux builds a depth-three fragmented unwritten tree,
+then two in-leaf insertions fill one depth-three parent. The test finds a
+three-block unwritten extent in a near-full sibling leaf below that parent,
+opens the same file-backed image through `Ext4Pager`, mounts it through
+`mount_ext4_read_write_with_mutation_journal_io_manager_planner`, and flushes
+the middle logical block. `FsOps::chmod_inode` settles the ordered data and
+metadata transaction. Docker `e2fsck -fn` accepts the resulting file. The
+explicit test passed on 2026-08-09 in 136.03s.
+
 ## Format Fix
 
 The first direct e2fsck run exposed that `ExtentNode::encode_*` leaves the
@@ -36,11 +48,13 @@ existing no-direct-home-write ownership boundary.
 - `cargo test -p tx-ext4-format -- --test-threads=1`: 61 pager tests and all
   host/journal tests passed; one existing 3 GiB Docker test remains ignored.
 - `cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1`: 72
-  tests passed, one Docker test ignored in the ordinary suite.
+  tests passed, with the two explicit Docker runtime witnesses ignored in the
+  ordinary suite.
 - The explicit ignored Docker runtime test passed and final `e2fsck -fn` was
   clean.
-- The witness is depth two and uses a single public flush plus metadata
-  settlement. The separate Linux-generated depth-three split/carry format
-  witness does not establish deep public runtime exchange, crash-cut acceptance,
-  and the Rust workload/SubmissionManager handoff remain open. It is not a
+- Both the depth-two and depth-three parent-carry witnesses use one public
+  flush plus metadata settlement, while preserving PageBacked page lifecycle,
+  ext4 immutable planning/JBD2 staging, and Mount settlement ownership.
+- Crash-cut acceptance, a timestamped Tier 1 candidate campaign, and the Rust
+  workload/SubmissionManager handoff remain open. These witnesses are not a
   Tier 2 or production acceptance claim.

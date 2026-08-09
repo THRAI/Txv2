@@ -345,6 +345,77 @@ fn docker_build_tier1_depth_two_unwritten_fixture(
     docker_run(image_name, fixture, false, script);
 }
 
+fn docker_build_depth_three_fragmented_fixture(
+    image_name: &str,
+    fixture: &DockerFixture,
+    image: &Path,
+) {
+    const NODE_MAX: u64 = 340;
+    const ROOT_MAX: u64 = 4;
+    let unwritten_extent_count = ROOT_MAX * NODE_MAX * NODE_MAX + 1;
+    let script = format!(
+        "set -eux; image=/fixture/{}; commands=/fixture/depth-three.debugfs; truncate -s 3G \"$image\"; mke2fs -q -t ext4 -F -b 4096 -O extent,^64bit \"$image\"; printf 'write /etc/hostname /file\\n' > \"$commands\"; count={unwritten_extent_count}; i=2; n=0; while [ \"$n\" -lt \"$count\" ]; do start=$i; if [ $((n % 1000)) -eq 999 ]; then end=$((i + 2)); i=$((i + 4)); else end=$i; i=$((i + 2)); fi; printf 'fallocate /file %s %s\\n' \"$start\" \"$end\" >> \"$commands\"; n=$((n + 1)); done; printf 'sif /file size %s\\n' \"$((i * 4096))\" >> \"$commands\"; debugfs -w -f \"$commands\" \"$image\" >/dev/null; debugfs -w -R 'fallocate /file 1 1' \"$image\" >/dev/null; debugfs -w -R 'fallocate /file 3 3' \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
+        image.file_name()
+            .expect("fixture image file name")
+            .to_str()
+            .expect("fixture image file name utf8"),
+    );
+    docker_run(image_name, fixture, false, script);
+}
+
+fn find_near_full_unwritten_extent_with_full_parent(
+    image: &SharedFileImage,
+    node_bytes: &[u8],
+) -> Option<u64> {
+    let header = ExtentHeader::parse(node_bytes).ok()?;
+    match ExtentNode::parse(node_bytes).ok()? {
+        ExtentNode::Leaf(extents) if header.entries + 2 > header.max => extents
+            .iter()
+            .find(|extent| !extent.is_initialized() && extent.initialized_len() >= 3)
+            .map(|extent| u64::from(extent.logical_block) + 1),
+        ExtentNode::Leaf(_) => None,
+        ExtentNode::Index(indexes) => {
+            let parent_is_full = header.entries == header.max;
+            for index in indexes {
+                let mut child = [0u8; BLOCK_SIZE];
+                image.read_block(index.child, &mut child).ok()?;
+                if parent_is_full {
+                    if let Some(logical_block) = find_near_full_unwritten_extent(image, &child) {
+                        return Some(logical_block);
+                    }
+                }
+                if let Some(logical_block) =
+                    find_near_full_unwritten_extent_with_full_parent(image, &child)
+                {
+                    return Some(logical_block);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn find_near_full_unwritten_extent(image: &SharedFileImage, node_bytes: &[u8]) -> Option<u64> {
+    let header = ExtentHeader::parse(node_bytes).ok()?;
+    match ExtentNode::parse(node_bytes).ok()? {
+        ExtentNode::Leaf(extents) if header.entries + 2 > header.max => extents
+            .iter()
+            .find(|extent| !extent.is_initialized() && extent.initialized_len() >= 3)
+            .map(|extent| u64::from(extent.logical_block) + 1),
+        ExtentNode::Leaf(_) => None,
+        ExtentNode::Index(indexes) => {
+            for index in indexes {
+                let mut child = [0u8; BLOCK_SIZE];
+                image.read_block(index.child, &mut child).ok()?;
+                if let Some(logical_block) = find_near_full_unwritten_extent(image, &child) {
+                    return Some(logical_block);
+                }
+            }
+            None
+        }
+    }
+}
+
 fn docker_e2fsck(image_name: &str, fixture: &DockerFixture, image: &Path) {
     let image_path = format!(
         "/fixture/{}",
@@ -1788,6 +1859,100 @@ fn docker_linux_depth_two_unwritten_flush_survives_tx_runtime_settlement() {
     drop(mounted);
 
     docker_e2fsck(&image_name, &fixture, &image_path);
+}
+
+/// Linux creates a depth-three fragmented extent tree whose target leaf split
+/// carries through a full parent. Tx performs that conversion through the
+/// public writeback and settlement interfaces before Linux verifies the image.
+#[test]
+#[ignore = "builds a 3 GiB Linux depth-three extent fixture"]
+fn docker_linux_depth_three_parent_carry_flush_survives_tx_runtime_settlement() {
+    let image_name = std::env::var("TX_EXT4_E2FSPROGS_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "tx-ext4-xfstests-tier1:local".to_owned());
+    if !docker_image_available(&image_name) {
+        eprintln!("skipping Docker ext4 runtime verification; image unavailable: {image_name}");
+        return;
+    }
+
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fixture = DockerFixture::new();
+    let image_path = fixture.path("linux-depth-three-parent-carry.ext4");
+    eprintln!("depth-three runtime witness: build fixture");
+    docker_build_depth_three_fragmented_fixture(&image_name, &fixture, &image_path);
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let image = SharedFileImage::open(&image_path, Arc::clone(&writes));
+    let mut pager = Ext4Pager::open(image.clone()).expect("open Linux ext4 fixture");
+    let inode = pager
+        .lookup(InodeNo::new(2), b"file")
+        .expect("lookup Linux /file")
+        .expect("Linux /file exists");
+    let (_, root) = pager
+        .inode_meta_and_extent_root(inode)
+        .expect("read Linux /file extent root");
+    assert_eq!(
+        ExtentHeader::parse(&root)
+            .expect("parse Linux /file extent root")
+            .depth,
+        3,
+        "fixture must exercise a Linux-generated depth-three extent root"
+    );
+    let target_logical_block = find_near_full_unwritten_extent_with_full_parent(&image, &root)
+        .expect("fixture must retain a near-full unwritten leaf beneath a full parent");
+    let journal_geometry = pager
+        .journal_geometry()
+        .expect("read Linux JBD2 geometry for the mounted runtime");
+    drop(pager);
+
+    eprintln!("depth-three runtime witness: mount target={target_logical_block}");
+    let runtime = Arc::new(
+        JournalMutationRuntime::from_geometry_with_sequence(
+            Arc::new(JournalFsyncSource::new()),
+            JournalPagePool::new(32).expect("journal pool"),
+            DeviceKey::new(7),
+            8,
+            journal_geometry,
+            62,
+        )
+        .expect("build runtime from Linux JBD2 geometry"),
+    );
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        image,
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Linux depth-three fixture through the mutation runtime");
+    let guard = epoch::guard();
+    let frame = Frame::new(page_allocator::zero_frame_ppn().expect("zero frame"));
+
+    eprintln!("depth-three runtime witness: flush");
+    assert_eq!(
+        mounted.fs_page_backing().flush_page(
+            FsObjectId::new(inode.get() as u64),
+            target_logical_block * BLOCK_SIZE as u64,
+            &frame,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    eprintln!("depth-three runtime witness: settle");
+    assert_eq!(
+        mounted.fs_ops().chmod_inode(
+            FsObjectId::new(inode.get() as u64),
+            0o640,
+            &tx_subsystems::vfs::Credential::root(),
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+    drop(guard);
+    drop(mounted);
+
+    eprintln!("depth-three runtime witness: e2fsck");
+    docker_e2fsck(&image_name, &fixture, &image_path);
+    eprintln!("depth-three runtime witness: complete");
 }
 
 #[test]

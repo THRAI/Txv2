@@ -172,7 +172,7 @@
     {
       "id": "a3-a5-tier2-extent-planners",
       "title": "Migrate captured-path extents, unwritten conversion, and recursive freeing",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "a3-inline-unwritten-conversion",
         "a1-multi-page-revoke"
@@ -210,7 +210,7 @@
         "cargo xtask lint invariants ext4-no-direct-home-write",
         "Linux-to-Tx and Tx-to-Linux extent fixtures pass Docker-backed e2fsck -fn"
       ],
-      "notes": "Depth-two host runtime witnesses cover public truncate checkpointing of the retained leaf/allocation/inode after-images and MutationHandle retention of recursive destroy deferred-free claims. A depth-three host witness now drives public flush admission, ordered-data settlement, and checkpoint through the next metadata mutation before validating the converted leaf home. The ignored Docker runtime witness now builds a Linux-generated Tier 1 depth-two fragmented unwritten image, mounts the same file-backed image through the public mutation-journal path, flushes an unwritten page, settles with chmod, and passes Linux e2fsck -fn. External extent-node metadata_csum tails are refreshed in plan_write_page. PageBacked retains file-page lifecycle, ext4 retains mutation planning and JBD2 staging, and Mount retains settlement. A6 remains open for the complementary exchanged-image/deep-shape evidence and crash-bound acceptance."
+      "notes": "Depth-two host runtime witnesses cover public truncate checkpointing of the retained leaf/allocation/inode after-images and MutationHandle retention of recursive destroy deferred-free claims. A depth-three host witness now drives public flush admission, ordered-data settlement, and checkpoint through the next metadata mutation before validating the converted leaf home. Ignored Docker runtime witnesses now build Linux-generated Tier 1 depth-two and depth-three-parent-carry fragmented unwritten images, mount the same file-backed images through the public mutation-journal path, flush an unwritten page, settle with chmod, and pass Linux e2fsck -fn. The depth-three fixture retains metadata_csum so it exercises the writable Tier 1 profile and carries a leaf split through a full parent. External extent-node metadata_csum tails are refreshed in plan_write_page. PageBacked retains file-page lifecycle, ext4 retains mutation planning and JBD2 staging, and Mount retains settlement. A6 remains open for crash-bound acceptance."
     },
     {
       "id": "m1-m2-rustc-witness",
@@ -334,9 +334,14 @@
       "notes": "Linux/debugfs generated a Tier 1 depth-two fragmented unwritten image; the same file-backed image crossed the public FsPageBacking/FsOps mutation-journal path and Docker e2fsck -fn accepted the settled image."
     },
     {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features docker_linux_depth_three_parent_carry_flush_survives_tx_runtime_settlement -- --ignored --test-threads=1",
+      "status": "passed",
+      "notes": "A Linux/debugfs 3 GiB metadata_csum image with a depth-three root and full parent crossed the public FsPageBacking/FsOps mutation-journal path; Tx split the selected unwritten leaf through that parent and Docker e2fsck -fn accepted the settled image in 136.03s."
+    },
+    {
       "command": "cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1",
       "status": "passed",
-      "notes": "72 tx-ext4 library tests passed; the Docker interoperability witness is ignored in the ordinary suite and was run explicitly above."
+      "notes": "72 tx-ext4 library tests passed; the two Docker interoperability witnesses are ignored in the ordinary suite and were run explicitly above."
     },
     {
       "command": "cargo xtask progress validate",
