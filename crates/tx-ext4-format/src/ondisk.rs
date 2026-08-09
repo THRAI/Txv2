@@ -1206,6 +1206,15 @@ pub fn dirblock_csum32(seed: u32, inode: u32, generation: u32, block_bytes: &[u8
     metadata_csum32(seed, &[&inode, &generation, block_bytes])
 }
 
+/// Checksum for an external ext4 extent node. The final four bytes are the
+/// extent-tail checksum field and are excluded from the CRC input.
+pub fn extent_block_csum32(seed: u32, inode: u32, generation: u32, block_bytes: &[u8]) -> u32 {
+    let inode = inode.to_le_bytes();
+    let generation = generation.to_le_bytes();
+    let body_len = block_bytes.len().saturating_sub(4);
+    metadata_csum32(seed, &[&inode, &generation, &block_bytes[..body_len]])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalHeader {
     pub magic: u32,

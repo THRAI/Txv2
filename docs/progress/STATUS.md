@@ -1,3 +1,18 @@
+- 2026-08-09 (ext4 A6 Linux-to-Tx runtime interoperability).
+  Added an ignored Docker-backed `tx-ext4` test that builds a Linux-generated
+  Tier 1 depth-two fragmented unwritten image, opens it through
+  `Ext4Pager`, mounts the same file through
+  `mount_ext4_read_write_with_mutation_journal_io_manager_planner`, and drives
+  `FsPageBacking::flush_page` followed by `FsOps::chmod_inode` to settle the
+  ordered-data and metadata transaction. The file-backed image then passes
+  Docker `e2fsck -fn`. The format planner now refreshes external extent-node
+  metadata checksums when metadata_csum is enabled. The focused ignored test,
+  full `tx-ext4-format`, and 72-test `tx-ext4` lib suite pass. This closes one
+  public runtime interoperability witness, not A6 or the overall plan:
+  Linux-generated depth-three split/carry, crash cuts/candidate acceptance, and
+  the Rust workload/SubmissionManager handoff remain open. Global progress
+  validation is still blocked by the unrelated missing SMP research reference.
+
 - 2026-08-09 (ext4 reconciliation depth-three split planner and Linux fixture).
   `Ext4Pager` now captures a depth-three-or-deeper indexed path and carries a
   full unwritten leaf split through every full ancestor in one immutable plan;

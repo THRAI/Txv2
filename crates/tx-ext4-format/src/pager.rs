@@ -6,7 +6,9 @@ use crate::ondisk::{
     encode_journal_descriptor, group_desc_csum16, inode_bitmap_csum32, inode_csum32,
     parse_journal_descriptor, superblock_csum32,
 };
-use crate::ondisk::{dirblock_csum32, read_u16_le, read_u32_le, write_u16_le, write_u32_le};
+use crate::ondisk::{
+    dirblock_csum32, extent_block_csum32, read_u16_le, read_u32_le, write_u16_le, write_u32_le,
+};
 use crate::{Ext4FormatError, Result};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -741,6 +743,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             })
             .map_err(|_| Ext4FormatError::Corrupt)?;
         }
+        self.refresh_extent_node_checksums(inode, &disk_inode, &mut plan.metadata);
         plan.data.push(SealedDataWrite {
             logical_page: file_page_index,
             physical_block: block,
@@ -2211,6 +2214,30 @@ impl<I: BlockImage> Ext4Pager<I> {
             inode_bytes[130..132].copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
         }
         Ok(())
+    }
+
+    fn refresh_extent_node_checksums(
+        &self,
+        inode: InodeNo,
+        disk_inode: &Inode,
+        metadata: &mut [MetadataBlock],
+    ) {
+        if !self.superblock.has_metadata_csum() {
+            return;
+        }
+        let seed = self.superblock.metadata_csum_seed();
+        for block in metadata.iter_mut() {
+            if block.role != MetaRole::ExtentNode {
+                continue;
+            }
+            let checksum = extent_block_csum32(
+                seed,
+                inode.get(),
+                disk_inode.generation,
+                &block.after,
+            );
+            block.after[BLOCK_SIZE - 4..].copy_from_slice(&checksum.to_le_bytes());
+        }
     }
 
     fn plan_block_allocation(&self) -> Result<(u64, usize, u64, Page4K, Page4K)> {

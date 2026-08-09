@@ -17,17 +17,27 @@
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
+use alloc::format;
 use alloc::sync::Arc;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::eprintln;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::adapter::step_engine::{
     self as epoch, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3, page_allocator,
 };
 use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
 use tx_ext4_format::ondisk::{
-    BitmapMut, BitmapView, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, Superblock,
+    BitmapMut, BitmapView, Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode,
+    Superblock,
 };
 use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Ext4Pager, InodeNo, Page4K};
 use tx_substrate::step::PageProgress;
@@ -191,6 +201,165 @@ impl BlockImage for SharedCountingImage {
     fn barrier(&mut self) -> tx_ext4_format::Result<()> {
         self.image.lock().expect("shared image lock").barrier()
     }
+}
+
+#[derive(Clone)]
+struct SharedFileImage {
+    file: Arc<std::sync::Mutex<File>>,
+    total_blocks: u64,
+    writes: Arc<AtomicUsize>,
+}
+
+impl SharedFileImage {
+    fn open(path: &Path, writes: Arc<AtomicUsize>) -> Self {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open Linux-generated ext4 image");
+        let total_blocks = file
+            .metadata()
+            .expect("stat Linux-generated ext4 image")
+            .len()
+            / BLOCK_SIZE as u64;
+        Self {
+            file: Arc::new(std::sync::Mutex::new(file)),
+            total_blocks,
+            writes,
+        }
+    }
+}
+
+impl BlockImage for SharedFileImage {
+    fn total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+
+    fn read_block(&self, block: u64, out: &mut Page4K) -> tx_ext4_format::Result<()> {
+        let offset = block
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or(tx_ext4_format::Ext4FormatError::OutOfBounds)?;
+        let mut file = self.file.lock().expect("shared Linux image lock");
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(out))
+            .map_err(|_| tx_ext4_format::Ext4FormatError::Corrupt)
+    }
+
+    fn write_block(&mut self, block: u64, data: &Page4K) -> tx_ext4_format::Result<()> {
+        let offset = block
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or(tx_ext4_format::Ext4FormatError::OutOfBounds)?;
+        let mut file = self.file.lock().expect("shared Linux image lock");
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(data))
+            .map_err(|_| tx_ext4_format::Ext4FormatError::Corrupt)?;
+        self.writes.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn barrier(&mut self) -> tx_ext4_format::Result<()> {
+        self.file
+            .lock()
+            .expect("shared Linux image lock")
+            .sync_data()
+            .map_err(|_| tx_ext4_format::Ext4FormatError::Corrupt)
+    }
+}
+
+struct DockerFixture {
+    root: PathBuf,
+}
+
+impl DockerFixture {
+    fn new() -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let root = std::env::current_dir()
+            .expect("current directory")
+            .join("target")
+            .join(format!("tx-ext4-runtime-docker-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).expect("create Docker fixture directory");
+        Self { root }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+}
+
+impl Drop for DockerFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn docker_image_available(image_name: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", image_name])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn docker_run(image_name: &str, fixture: &DockerFixture, readonly: bool, script: String) {
+    let suffix = if readonly { ",readonly" } else { "" };
+    let mount = format!(
+        "type=bind,source={},target=/fixture{suffix}",
+        fixture.root.display()
+    );
+    let output = Command::new("docker")
+        .args([
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--mount".to_owned(),
+            mount,
+            image_name.to_owned(),
+            "sh".to_owned(),
+            "-lc".to_owned(),
+            script,
+        ])
+        .output()
+        .expect("run ext4 Docker fixture");
+    assert!(
+        output.status.success(),
+        "Docker ext4 command failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn docker_build_tier1_depth_two_unwritten_fixture(
+    image_name: &str,
+    fixture: &DockerFixture,
+    image: &Path,
+) {
+    let script = format!(
+        "set -eu; image=/fixture/{}; commands=/fixture/depth-two.debugfs; dd if=/dev/zero of=\"$image\" bs=1M count=64 status=none; mke2fs -q -t ext4 -F -b 4096 -g 1024 -O extent,^64bit \"$image\"; printf 'write /etc/hostname /file\\n' > \"$commands\"; for i in $(seq 2 2 2800); do printf 'fallocate /file %s %s\\n' \"$i\" \"$i\" >> \"$commands\"; done; printf 'sif /file size 11472896\\n' >> \"$commands\"; debugfs -w -f \"$commands\" \"$image\" >/dev/null; e2fsck -fy \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
+        image.file_name()
+            .expect("fixture image file name")
+            .to_str()
+            .expect("fixture image file name utf8"),
+    );
+    docker_run(image_name, fixture, false, script);
+}
+
+fn docker_e2fsck(image_name: &str, fixture: &DockerFixture, image: &Path) {
+    let image_path = format!(
+        "/fixture/{}",
+        image
+            .file_name()
+            .expect("fixture image file name")
+            .to_str()
+            .expect("fixture image file name utf8")
+    );
+    docker_run(
+        image_name,
+        fixture,
+        true,
+        format!("set -eu; e2fsck -fn {image_path}"),
+    );
 }
 
 fn init_substrate() {
@@ -1533,6 +1702,92 @@ fn ext4_depth_three_flush_public_path_checkpoints_leaf_after_image() {
         ),
         ExtentNode::Index(_) => panic!("depth-three flush must retain a leaf node"),
     }
+}
+
+/// Linux creates the fragmented unwritten extent tree. Tx then performs the
+/// conversion through the mounted `FsPageBacking` and `FsOps` interfaces, and
+/// Linux e2fsprogs validates the persisted result.
+#[test]
+#[ignore = "requires the tx-ext4-xfstests-tier1 Docker image"]
+fn docker_linux_depth_two_unwritten_flush_survives_tx_runtime_settlement() {
+    let image_name = std::env::var("TX_EXT4_E2FSPROGS_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "tx-ext4-xfstests-tier1:local".to_owned());
+    if !docker_image_available(&image_name) {
+        eprintln!("skipping Docker ext4 runtime verification; image unavailable: {image_name}");
+        return;
+    }
+
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fixture = DockerFixture::new();
+    let image_path = fixture.path("linux-depth-two-unwritten.ext4");
+    docker_build_tier1_depth_two_unwritten_fixture(&image_name, &fixture, &image_path);
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let image = SharedFileImage::open(&image_path, Arc::clone(&writes));
+    let mut pager = Ext4Pager::open(image.clone()).expect("open Linux ext4 fixture");
+    let inode = pager
+        .lookup(InodeNo::new(2), b"file")
+        .expect("lookup Linux /file")
+        .expect("Linux /file exists");
+    let (_, root) = pager
+        .inode_meta_and_extent_root(inode)
+        .expect("read Linux /file extent root");
+    assert_eq!(
+        ExtentHeader::parse(&root)
+            .expect("parse Linux /file extent root")
+            .depth,
+        2,
+        "fixture must exercise a Linux-generated depth-two extent root"
+    );
+    let journal_geometry = pager
+        .journal_geometry()
+        .expect("read Linux JBD2 geometry for the mounted runtime");
+    drop(pager);
+
+    let runtime = Arc::new(
+        JournalMutationRuntime::from_geometry_with_sequence(
+            Arc::new(JournalFsyncSource::new()),
+            JournalPagePool::new(32).expect("journal pool"),
+            DeviceKey::new(7),
+            8,
+            journal_geometry,
+            61,
+        )
+        .expect("build runtime from Linux JBD2 geometry"),
+    );
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        image,
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Linux Tier 1 ext4 fixture through the mutation runtime");
+    let guard = epoch::guard();
+    let frame = Frame::new(page_allocator::zero_frame_ppn().expect("zero frame"));
+
+    assert_eq!(
+        mounted.fs_page_backing().flush_page(
+            FsObjectId::new(inode.get() as u64),
+            2 * BLOCK_SIZE as u64,
+            &frame,
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        mounted.fs_ops().chmod_inode(
+            FsObjectId::new(inode.get() as u64),
+            0o640,
+            &tx_subsystems::vfs::Credential::root(),
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+    drop(guard);
+    drop(mounted);
+
+    docker_e2fsck(&image_name, &fixture, &image_path);
 }
 
 #[test]

@@ -199,7 +199,10 @@
       "paths": [
         "crates/tx-ext4/src/journal.rs",
         "crates/tx-ext4/src/pager.rs",
-        "crates/tx-ext4/tests"
+        "crates/tx-ext4/tests",
+        "crates/tx-ext4/src/tests_v3.rs",
+        "crates/tx-ext4-format/src/ondisk.rs",
+        "crates/tx-ext4-format/src/pager.rs"
       ],
       "verification": [
         "mutation lifecycle and prepared-journal tests prove complete metadata, revoke, and checkpoint lease ownership",
@@ -207,7 +210,7 @@
         "cargo xtask lint invariants ext4-no-direct-home-write",
         "Linux-to-Tx and Tx-to-Linux extent fixtures pass Docker-backed e2fsck -fn"
       ],
-      "notes": "Depth-two host runtime witnesses cover public truncate checkpointing of the retained leaf/allocation/inode after-images and MutationHandle retention of recursive destroy deferred-free claims. A depth-three host witness now drives public flush admission, ordered-data settlement, and checkpoint through the next metadata mutation before validating the converted leaf home. PageBacked retains file-page lifecycle, ext4 retains mutation planning and JBD2 staging, and Mount retains settlement. Linux-to-Tx and Tx-to-Linux deep-shape fixtures remain required before this step can close."
+      "notes": "Depth-two host runtime witnesses cover public truncate checkpointing of the retained leaf/allocation/inode after-images and MutationHandle retention of recursive destroy deferred-free claims. A depth-three host witness now drives public flush admission, ordered-data settlement, and checkpoint through the next metadata mutation before validating the converted leaf home. The ignored Docker runtime witness now builds a Linux-generated Tier 1 depth-two fragmented unwritten image, mounts the same file-backed image through the public mutation-journal path, flushes an unwritten page, settles with chmod, and passes Linux e2fsck -fn. External extent-node metadata_csum tails are refreshed in plan_write_page. PageBacked retains file-page lifecycle, ext4 retains mutation planning and JBD2 staging, and Mount retains settlement. A6 remains open for the complementary exchanged-image/deep-shape evidence and crash-bound acceptance."
     },
     {
       "id": "m1-m2-rustc-witness",
@@ -283,12 +286,12 @@
     {
       "command": "cargo test -p tx-ext4-format -- --test-threads=1",
       "status": "passed",
-      "notes": "88 tests and doc-tests passed in the integration worktree on 2026-08-09 after recursive depth-2/3 truncate/destroy regressions, A2 allocation, incomplete-group, Docker e2fsck, and bounded unwritten conversion coverage."
+      "notes": "93 format tests and doc-tests passed in the integration worktree on 2026-08-09 after recursive depth-2/3 truncate/destroy regressions, A2 allocation, incomplete-group, Docker e2fsck, bounded unwritten conversion coverage, and extent-node metadata checksum refresh."
     },
     {
       "command": "cargo -q xtask unit",
       "status": "passed",
-      "notes": "tx-shims 655, tx-kernel 114, tx-ext4 71, and tx-scripts 167 passed in the integration worktree on 2026-08-09."
+      "notes": "tx-shims 655, tx-kernel 114, tx-ext4 72, and tx-scripts 167 passed in the integration worktree on 2026-08-09."
     },
     {
       "command": "cargo xtask lint invariants ext4-no-direct-home-write && git diff --check",
@@ -319,6 +322,16 @@
       "command": "cargo test -p tx-ext4-format --test pager_mock pager_converts_depth_three_unwritten_leaf_without_new_claims -- --exact --test-threads=1",
       "status": "passed",
       "notes": "A depth-three root -> index -> index -> leaf path is descended with depth and layout validation; a non-overflowing unwritten leaf converts in place with one extent-node after-image and no allocation claim."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features docker_linux_depth_two_unwritten_flush_survives_tx_runtime_settlement -- --ignored --test-threads=1",
+      "status": "passed",
+      "notes": "Linux/debugfs generated a Tier 1 depth-two fragmented unwritten image; the same file-backed image crossed the public FsPageBacking/FsOps mutation-journal path and Docker e2fsck -fn accepted the settled image."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1",
+      "status": "passed",
+      "notes": "72 tx-ext4 library tests passed; the Docker interoperability witness is ignored in the ordinary suite and was run explicitly above."
     },
     {
       "command": "cargo xtask progress validate",
