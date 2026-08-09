@@ -1,3 +1,12 @@
+- 2026-08-09 (ext4 M1 named role-image QEMU wiring).
+  `qemu` and `shell-test` now accept distinct TEST/SCRATCH/WORKLOAD images,
+  publish their stable RV64 device roles, and present only WORKLOAD as a
+  read-only QEMU drive. Legacy `--extra-rv64-ext4` callers remain supported;
+  mixed or duplicate role images fail before QEMU starts. All 450 xtask tests
+  and the Tier 1 dry-run pass. This is transport wiring only: no measured
+  WORKLOAD image, WORKLOAD-only resolver install, or RV64 rustc build witness
+  exists. See `docs/progress/research/2026-08-09-ext4-rustc-role-image-wiring.md`.
+
 - 2026-08-09 (ext4 M1 high-DTB boot prerequisite).
   The RV64 QEMU trampoline now maps the 1 GiB direct-map leaf containing a
   firmware DTB before Rust parses BootInfo, and direct-map extension accounts

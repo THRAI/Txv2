@@ -90,6 +90,19 @@ const CONTROL_KEY_DELAY: Duration = Duration::from_millis(25);
 const ESC_KEY_DELAY: Duration = Duration::from_millis(500);
 const SEND_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Ext4BlockImages {
+    test: Option<PathBuf>,
+    scratch: Option<PathBuf>,
+    workload: Option<PathBuf>,
+}
+
+impl Ext4BlockImages {
+    fn any(&self) -> bool {
+        self.test.is_some() || self.scratch.is_some() || self.workload.is_some()
+    }
+}
+
 pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
     let profile = Profile::parse(
@@ -115,6 +128,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         .into_iter()
         .map(|path| resolve_path(root, PathBuf::from(path)))
         .collect();
+    let ext4_block_images = ext4_block_images(root, &args, &extra_rv64_ext4)?;
     let boot_mode = optional_option_value(&args, "--boot-mode")
         .map(|value| validate_boot_mode_value(&value).map(|()| value))
         .transpose()?;
@@ -231,6 +245,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let next = Arc::clone(&next_idx);
                 let root = root.to_path_buf();
                 let extra_rv64_ext4 = extra_rv64_ext4.clone();
+                let ext4_block_images = ext4_block_images.clone();
                 let boot_mode = boot_mode.clone();
                 let append_cmdline = append_cmdline.clone();
                 thread::spawn(move || loop {
@@ -245,6 +260,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                         profile,
                         smp,
                         extra_rv64_ext4: &extra_rv64_ext4,
+                        ext4_block_images: &ext4_block_images,
                         boot_mode: boot_mode.as_deref(),
                         append_cmdline: append_cmdline.as_deref(),
                         setup: &setup,
@@ -303,7 +319,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     }
 
     // ── Sequential mode (default) ───────────────────────────────────────────
-    let qemu_cmd = build_qemu_command(
+    let mut qemu_cmd = build_qemu_command(
         root,
         target,
         profile,
@@ -312,6 +328,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         append_cmdline.as_deref(),
         boot_mode.as_deref(),
     )?;
+    append_ext4_role_images(&mut qemu_cmd, target, &ext4_block_images)?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
 
     let Some((program, rest)) = qemu_cmd.split_first() else {
@@ -877,6 +894,7 @@ struct IsolatedGroupRun<'a> {
     profile: Profile,
     smp: usize,
     extra_rv64_ext4: &'a [PathBuf],
+    ext4_block_images: &'a Ext4BlockImages,
     boot_mode: Option<&'a str>,
     append_cmdline: Option<&'a str>,
     setup: &'a [Directive],
@@ -904,7 +922,7 @@ fn run_group_isolated_inner(
     run: &IsolatedGroupRun<'_>,
     buffer: Arc<Mutex<String>>,
 ) -> Option<String> {
-    let qemu_cmd = match build_qemu_command(
+    let mut qemu_cmd = match build_qemu_command(
         run.root,
         run.target,
         run.profile,
@@ -916,6 +934,9 @@ fn run_group_isolated_inner(
         Ok(c) => c,
         Err(e) => return Some(format!("qemu command: {e}")),
     };
+    if let Err(e) = append_ext4_role_images(&mut qemu_cmd, run.target, run.ext4_block_images) {
+        return Some(format!("qemu command: {e}"));
+    }
     let Some((program, rest)) = qemu_cmd.split_first() else {
         return Some("empty qemu command".into());
     };
@@ -1081,6 +1102,108 @@ fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
     Ok(values)
 }
 
+fn ext4_block_images(root: &Path, args: &[String], legacy: &[PathBuf]) -> Result<Ext4BlockImages> {
+    let test = single_role_image(root, args, "--ext4-test-image")?;
+    let scratch = single_role_image(root, args, "--ext4-scratch-image")?;
+    let workload = single_role_image(root, args, "--ext4-workload-image")?;
+    if !legacy.is_empty() && (test.is_some() || scratch.is_some() || workload.is_some()) {
+        return Err("--extra-rv64-ext4 cannot be combined with ext4 role image flags".into());
+    }
+
+    let images = Ext4BlockImages {
+        test,
+        scratch,
+        workload,
+    };
+    reject_duplicate_ext4_role_paths(&images)?;
+    Ok(images)
+}
+
+fn single_role_image(root: &Path, args: &[String], name: &str) -> Result<Option<PathBuf>> {
+    let values = option_values(args, name)?;
+    if values.len() > 1 {
+        return Err(format!("{name} may be specified only once"));
+    }
+    Ok(values
+        .into_iter()
+        .next()
+        .map(|path| resolve_path(root, PathBuf::from(path))))
+}
+
+fn reject_duplicate_ext4_role_paths(images: &Ext4BlockImages) -> Result<()> {
+    let roles = [
+        ("TEST", images.test.as_ref()),
+        ("SCRATCH", images.scratch.as_ref()),
+        ("WORKLOAD", images.workload.as_ref()),
+    ];
+    for left in 0..roles.len() {
+        let Some(left_path) = roles[left].1 else {
+            continue;
+        };
+        for right in (left + 1)..roles.len() {
+            let Some(right_path) = roles[right].1 else {
+                continue;
+            };
+            if left_path == right_path {
+                return Err(format!(
+                    "ext4 block roles {} and {} must use different image paths",
+                    roles[left].0, roles[right].0
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_ext4_role_images(
+    args: &mut Vec<String>,
+    target: TxTarget,
+    images: &Ext4BlockImages,
+) -> Result<()> {
+    if !images.any() {
+        return Ok(());
+    }
+    if target != TxTarget::Rv64Qemu {
+        return Err("ext4 role images are only supported for rv64-qemu".into());
+    }
+
+    let Some(cmdline_index) = args.windows(2).position(|pair| pair[0] == "-append") else {
+        return Err("shell-test QEMU command has no kernel cmdline".into());
+    };
+    let cmdline = &mut args[cmdline_index + 1];
+    for (token, present) in [
+        ("tx.ext4.test=vda", images.test.is_some()),
+        ("tx.ext4.scratch=vdb", images.scratch.is_some()),
+        ("tx.ext4.workload=vdc", images.workload.is_some()),
+    ] {
+        if present {
+            cmdline.push(' ');
+            cmdline.push_str(token);
+        }
+    }
+
+    for (id, bus, path, read_only) in [
+        ("tx-test", 0, images.test.as_ref(), false),
+        ("tx-scratch", 1, images.scratch.as_ref(), false),
+        ("tx-workload", 2, images.workload.as_ref(), true),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let read_only_suffix = if read_only { ",read-only=on" } else { "" };
+        args.push("-drive".into());
+        args.push(format!(
+            "file={},format=raw,if=none,id={id}{read_only_suffix}",
+            path.display(),
+        ));
+        args.push("-device".into());
+        args.push(format!(
+            "virtio-blk-device,drive={id},bus=virtio-mmio-bus.{bus}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,6 +1299,58 @@ mod tests {
                 "-device virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
             )));
         }
+    }
+
+    #[test]
+    fn shell_test_can_attach_named_ext4_roles() {
+        let root = Path::new("/tmp/tx");
+        let mut command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            &[],
+            None,
+            None,
+        )
+        .expect("build qemu command");
+        let images = Ext4BlockImages {
+            test: Some(PathBuf::from("/tmp/tx/test.img")),
+            scratch: Some(PathBuf::from("/tmp/tx/scratch.img")),
+            workload: Some(PathBuf::from("/tmp/tx/workload.img")),
+        };
+
+        append_ext4_role_images(&mut command, TxTarget::Rv64Qemu, &images)
+            .expect("append ext4 role images");
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("-drive file=/tmp/tx/test.img,format=raw,if=none,id=tx-test"));
+        assert!(
+            rendered.contains("-drive file=/tmp/tx/scratch.img,format=raw,if=none,id=tx-scratch")
+        );
+        assert!(rendered.contains(
+            "-drive file=/tmp/tx/workload.img,format=raw,if=none,id=tx-workload,read-only=on"
+        ));
+        assert!(rendered.contains("tx.ext4.test=vda"));
+        assert!(rendered.contains("tx.ext4.scratch=vdb"));
+        assert!(rendered.contains("tx.ext4.workload=vdc"));
+    }
+
+    #[test]
+    fn shell_test_rejects_duplicate_named_ext4_role_paths() {
+        let err = ext4_block_images(
+            Path::new("/tmp/tx"),
+            &[
+                "--ext4-test-image".into(),
+                "same.img".into(),
+                "--ext4-workload-image".into(),
+                "same.img".into(),
+            ],
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(err.contains("TEST and WORKLOAD"));
     }
 
     #[test]

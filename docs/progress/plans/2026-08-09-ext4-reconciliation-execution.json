@@ -73,6 +73,7 @@
       "docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-release.md",
       "docs/progress/research/2026-08-09-ext4-tier1-xfstests-preflight.md",
       "docs/progress/research/2026-08-09-ext4-high-dtb-boot-prerequisite.md",
+      "docs/progress/research/2026-08-09-ext4-rustc-role-image-wiring.md",
       "docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json"
     ],
     "external_refs": []
@@ -235,7 +236,7 @@
         "resolver shim is versioned, idempotently installed only into WORKLOAD, and leaves generic Alpine unchanged",
         "QEMU proves rustc -vV and a clean offline frozen build over TEST, SCRATCH, and read-only WORKLOAD images"
       ],
-      "notes": "The high-DTB direct-map prerequisite is complete: the pre-entry trampoline maps the firmware leaf before BootInfo parsing, and direct-map extension accounts for that preinstalled leaf (95 focused board tests passed). The fixture-non-evidence rustc workload contract has been imported without its obsolete xtask perf command path. It defines the desired offline/frozen command, role-image names, and 4096 MiB geometry, but has placeholder pins and no runtime authority. The resolver must still be versioned and WORKLOAD-only, and RV64 QEMU must still prove rustc -vV plus the clean frozen build. Decode any boot fault with cargo xtask fault-decode; do not change global QEMU or tmpfs defaults."
+      "notes": "The high-DTB direct-map prerequisite is complete: the pre-entry trampoline maps the firmware leaf before BootInfo parsing, and direct-map extension accounts for that preinstalled leaf (95 focused board tests passed). Current qemu and shell-test entry points now also accept named TEST/SCRATCH/WORKLOAD paths, reject mixed legacy/named or duplicate roles, assign stable vda/vdb/vdc cmdline identities, and attach only WORKLOAD read-only. The fixture-non-evidence rustc workload contract has been imported without its obsolete xtask perf command path. It defines the desired offline/frozen command, role-image names, and 4096 MiB geometry, but has placeholder pins and no runtime authority. The resolver must still be versioned and WORKLOAD-only, and RV64 QEMU must still prove rustc -vV plus the clean frozen build. Decode any boot fault with cargo xtask fault-decode; do not change global QEMU or tmpfs defaults."
     },
     {
       "id": "m3-performance-handoff",
@@ -353,6 +354,11 @@
       "command": "cargo test -p tx-hal-riscv64-qemu-virt -- --test-threads=1",
       "status": "passed",
       "notes": "95 focused board tests passed on 2026-08-09, including direct_map_extension_accounts_for_the_preinstalled_fdt_leaf. This closes only M1/M2 high-DTB pre-entry mapping evidence."
+    },
+    {
+      "command": "cargo test -p xtask -- --test-threads=1 && cargo xtask ext4 tier1 --dry-run",
+      "status": "passed",
+      "notes": "450 xtask tests passed on 2026-08-09. Named TEST/SCRATCH/WORKLOAD role drives preserve the legacy tier1 shell invocation, assign vda/vdb/vdc, and attach WORKLOAD read-only; Tier 1 dry-run remains green."
     },
     {
       "command": "cargo xtask progress validate",
