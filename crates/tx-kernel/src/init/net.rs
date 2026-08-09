@@ -27,6 +27,12 @@ const DEADLINE_UPDATED: tx_reactor::wait::Mask = tx_reactor::wait::Mask::from_bi
 
 static BOOT_NET_RUNTIME: SpinMutex<Option<&'static BootNetRuntime>> = SpinMutex::new(None);
 
+fn net_delegate_sched_meta(current_cpu: tx_hal::CpuId) -> tx_reactor::InitialSchedMeta {
+    tx_reactor::InitialSchedMeta::fair()
+        .pinned()
+        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
+}
+
 struct BootNetDeadlineState {
     supervisor: NetDelegateSupervisor,
 }
@@ -230,14 +236,11 @@ impl<P: TxPlatform> CoreInit<P> {
                     )
                     .await;
                 },
-                // The network state machine has one protocol owner. Pin both
-                // its future and its timer publisher to the same hart so the
-                // delegate's wait registration, wake routing, and protocol
-                // ownership cannot move independently between polls. User
-                // processes remain movable across every online CPU.
-                tx_reactor::InitialSchedMeta::kernel()
-                    .pinned()
-                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                // The network state machine has one protocol owner, so keep
+                // it on one hart. It is a long-lived, self-waking service and
+                // must share the fair queue with the userspace consumers that
+                // drain its socket work.
+                net_delegate_sched_meta(current_cpu),
             )
         })
     }
@@ -333,5 +336,24 @@ async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
             | tx_reactor::wait::WaitOutcome::Interrupted
             | tx_reactor::wait::WaitOutcome::Killed => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tx_hal::CpuId;
+    use tx_reactor::{MigrationPolicy, SchedClass};
+
+    use super::net_delegate_sched_meta;
+
+    #[test]
+    fn net_delegate_is_a_pinned_fair_service() {
+        let meta = net_delegate_sched_meta(CpuId(1));
+
+        assert_eq!(meta.class, SchedClass::Fair);
+        assert!(!meta.kernel_only);
+        assert!(!meta.userspace_thread);
+        assert_eq!(meta.migration, MigrationPolicy::Pinned);
+        assert_eq!(meta.affinity, 0b10);
     }
 }

@@ -300,6 +300,42 @@ fn net_delegate_task_loop_waits_for_poll_and_processes_bounded_steps() {
 }
 
 #[test]
+fn net_delegate_run_forever_yields_when_work_self_requeues() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let source = ScriptedPacketSource::new(std::vec::Vec::new());
+    let driver = LoopbackDelegateDriver {
+        now: smoltcp::time::Instant::ZERO,
+        source: &source,
+        iface: None,
+    };
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+
+    let mut ready_steps = 0usize;
+    let mut task = std::boxed::Box::pin(net_delegate_task_loop_with_deadline_hook(
+        &driver,
+        NetDelegateTaskConfig::run_forever(),
+        |_| {
+            ready_steps += 1;
+            crate::net::delegate::net_delegate_kick_poll();
+        },
+    ));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
+    crate::net::delegate::net_delegate_kick_poll();
+    assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
+    drop(task);
+
+    assert_eq!(ready_steps, 1);
+}
+
+#[test]
 fn net_delegate_task_loop_reports_deadline_refresh_from_tick() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

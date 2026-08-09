@@ -17,9 +17,7 @@ use crate::net::packet::{PacketSource, PacketTxSink};
 use crate::net::protocol::{EtherIface, LoopbackIface};
 use crate::wait_source;
 
-use super::{
-    net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token, DelegateWireSet,
-};
+use super::{net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token, DelegateWireSet};
 
 pub trait NetDelegateDriver {
     fn now(&self) -> Instant;
@@ -99,6 +97,15 @@ pub struct NetDelegateTaskReport {
     pub last_deadline: Option<Instant>,
 }
 
+const READY_STEPS_BEFORE_COOPERATIVE_YIELD: usize = 1;
+
+fn should_yield_after_ready_step(config: NetDelegateTaskConfig, ready_steps: usize) -> bool {
+    ready_steps % READY_STEPS_BEFORE_COOPERATIVE_YIELD == 0
+        && config
+            .max_ready_steps
+            .is_none_or(|max_ready_steps| ready_steps < max_ready_steps)
+}
+
 pub async fn net_delegate_task_loop(
     driver: &dyn NetDelegateDriver,
     config: NetDelegateTaskConfig,
@@ -131,9 +138,10 @@ where
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
         let wait_token = net_delegate_wait_token();
-        let Some(wait) =
-            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
-        else {
+        let Some(wait) = wait_source::wait_on_registered_source_id(
+            wait_token.source_id(),
+            wait_token.interest(),
+        ) else {
             report.waits_failed += 1;
             break;
         };
@@ -144,11 +152,16 @@ where
 
         report.waits_ready += 1;
         report.ready_steps += 1;
-        let guard = tx_substrate::epoch::guard();
-        let outcome = net_delegate_step_once(&driver, &guard);
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            net_delegate_step_once(&driver, &guard)
+        };
         report.runtime.merge(outcome);
         report.last_deadline = outcome.next_deadline;
         on_deadline(outcome.next_deadline);
+        if should_yield_after_ready_step(config, report.ready_steps) {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
@@ -165,9 +178,10 @@ pub async fn net_delegate_task_loop_with_deadline_hook(
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
         let wait_token = net_delegate_wait_token();
-        let Some(wait) =
-            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
-        else {
+        let Some(wait) = wait_source::wait_on_registered_source_id(
+            wait_token.source_id(),
+            wait_token.interest(),
+        ) else {
             report.waits_failed += 1;
             break;
         };
@@ -178,11 +192,16 @@ pub async fn net_delegate_task_loop_with_deadline_hook(
 
         report.waits_ready += 1;
         report.ready_steps += 1;
-        let guard = tx_substrate::epoch::guard();
-        let outcome = net_delegate_step_once(driver, &guard);
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            net_delegate_step_once(driver, &guard)
+        };
         report.runtime.merge(outcome);
         report.last_deadline = outcome.next_deadline;
         on_deadline(outcome.next_deadline);
+        if should_yield_after_ready_step(config, report.ready_steps) {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
@@ -204,8 +223,7 @@ pub fn net_delegate_step_once(
     // Consume work requests atomically. A separate peek/clear pair can erase a
     // same-bit kick that arrives between the two operations and never wakes us
     // again because the bit was still set when the producer fired it.
-    let ready = net_delegate_queue()
-        .take((DelegateWireSet::POLL | DelegateWireSet::TICK).bits());
+    let ready = net_delegate_queue().take((DelegateWireSet::POLL | DelegateWireSet::TICK).bits());
     let poll_seen = ready & DelegateWireSet::POLL.bits() != 0;
     let tick_seen = ready & DelegateWireSet::TICK.bits() != 0;
 
