@@ -510,7 +510,7 @@ fn docker_e2fsck_accepts_depth_two_fragmented_unlink_destroy_after_images() {
 
 #[test]
 #[ignore = "builds a 3 GiB Linux depth-three extent fixture"]
-fn docker_e2fsck_accepts_depth_three_fragmented_unwritten_leaf_split_after_images() {
+fn docker_e2fsck_accepts_depth_three_fragmented_unwritten_parent_carry_after_images() {
     let image_name = std::env::var("TX_EXT4_E2FSPROGS_DOCKER_IMAGE")
         .unwrap_or_else(|_| "tx-ext4-xfstests-tier1:local".to_owned());
     if !docker_image_available(&image_name) {
@@ -519,7 +519,7 @@ fn docker_e2fsck_accepts_depth_three_fragmented_unwritten_leaf_split_after_image
     }
 
     let fixture = Fixture::docker_mountable();
-    let image = fixture.path("depth-three-fragmented-split.ext4");
+    let image = fixture.path("depth-three-fragmented-parent-carry.ext4");
     docker_build_depth_three_fragmented_fixture(&image_name, &fixture, &image);
     let retained_mapping_before = docker_debugfs_bmap(&image_name, &fixture, &image, "/file", 0);
 
@@ -539,8 +539,9 @@ fn docker_e2fsck_accepts_depth_three_fragmented_unwritten_leaf_split_after_image
         "debugfs fixture must force a depth-three extent tree"
     );
 
-    let target_logical_block = find_near_full_unwritten_extent(&FileImage::open(&image), &root)
-        .expect("Linux depth-three fixture must retain a leaf that overflows on conversion");
+    let target_logical_block =
+        find_near_full_unwritten_extent_with_full_parent(&FileImage::open(&image), &root)
+            .expect("Linux depth-three fixture must retain a near-full leaf beneath a full parent");
     let conversion = pager
         .plan_write_page(
             inode,
@@ -549,14 +550,14 @@ fn docker_e2fsck_accepts_depth_three_fragmented_unwritten_leaf_split_after_image
             FsyncStamp::new(58),
         )
         .expect("convert one Linux depth-three unwritten extent");
-    assert_eq!(conversion.allocations.len(), 1);
+    assert_eq!(conversion.allocations.len(), 2);
     assert_eq!(
         conversion
             .metadata
             .iter()
             .filter(|metadata| metadata.role == tx_ext4_format::mutation::MetaRole::ExtentNode)
             .count(),
-        3
+        5
     );
     for data in &conversion.data {
         pager
@@ -647,7 +648,7 @@ fn docker_build_depth_three_fragmented_fixture(image_name: &str, fixture: &Fixtu
         fixture.root.display()
     );
     let script = format!(
-        "set -eu; image=/fixture/{}; commands=/fixture/depth-three.debugfs; truncate -s 3G \"$image\"; mke2fs -q -t ext4 -F -b 4096 -O extent,^64bit,^metadata_csum \"$image\"; printf 'write /etc/hostname /file\\n' > \"$commands\"; count={unwritten_extent_count}; i=2; n=0; while [ \"$n\" -lt \"$count\" ]; do start=$i; if [ $((n % 1000)) -eq 999 ]; then end=$((i + 2)); i=$((i + 4)); else end=$i; i=$((i + 2)); fi; printf 'fallocate /file %s %s\\n' \"$start\" \"$end\" >> \"$commands\"; n=$((n + 1)); done; printf 'sif /file size %s\\n' \"$((i * 4096))\" >> \"$commands\"; debugfs -w -f \"$commands\" \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
+        "set -eu; image=/fixture/{}; commands=/fixture/depth-three.debugfs; truncate -s 3G \"$image\"; mke2fs -q -t ext4 -F -b 4096 -O extent,^64bit,^metadata_csum \"$image\"; printf 'write /etc/hostname /file\\n' > \"$commands\"; count={unwritten_extent_count}; i=2; n=0; while [ \"$n\" -lt \"$count\" ]; do start=$i; if [ $((n % 1000)) -eq 999 ]; then end=$((i + 2)); i=$((i + 4)); else end=$i; i=$((i + 2)); fi; printf 'fallocate /file %s %s\\n' \"$start\" \"$end\" >> \"$commands\"; n=$((n + 1)); done; printf 'sif /file size %s\\n' \"$((i * 4096))\" >> \"$commands\"; debugfs -w -f \"$commands\" \"$image\" >/dev/null; debugfs -w -R 'fallocate /file 1 1' \"$image\" >/dev/null; debugfs -w -R 'fallocate /file 3 3' \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
         image.file_name().unwrap().to_str().unwrap(),
     );
     run(
@@ -719,7 +720,10 @@ fn docker_debugfs_bmap(
         .to_owned()
 }
 
-fn find_near_full_unwritten_extent(image: &FileImage, node_bytes: &[u8]) -> Option<u64> {
+fn find_near_full_unwritten_extent_with_full_parent(
+    image: &FileImage,
+    node_bytes: &[u8],
+) -> Option<u64> {
     let header = ExtentHeader::parse(node_bytes).ok()?;
     match ExtentNode::parse(node_bytes).ok()? {
         ExtentNode::Leaf(extents) if header.entries + 2 > header.max => extents
@@ -727,6 +731,35 @@ fn find_near_full_unwritten_extent(image: &FileImage, node_bytes: &[u8]) -> Opti
             .enumerate()
             .find(|(_, extent)| !extent.is_initialized() && extent.initialized_len() >= 3)
             .map(|(_, extent)| u64::from(extent.logical_block) + 1),
+        ExtentNode::Leaf(_) => None,
+        ExtentNode::Index(indexes) => {
+            let parent_is_full = header.entries == header.max;
+            for index in indexes {
+                let mut child = [0u8; BLOCK_SIZE];
+                image.read_block(index.child, &mut child).ok()?;
+                if parent_is_full {
+                    if let Some(logical_block) = find_near_full_unwritten_extent(image, &child) {
+                        return Some(logical_block);
+                    }
+                }
+                if let Some(logical_block) =
+                    find_near_full_unwritten_extent_with_full_parent(image, &child)
+                {
+                    return Some(logical_block);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn find_near_full_unwritten_extent(image: &FileImage, node_bytes: &[u8]) -> Option<u64> {
+    let header = ExtentHeader::parse(node_bytes).ok()?;
+    match ExtentNode::parse(node_bytes).ok()? {
+        ExtentNode::Leaf(extents) if header.entries + 2 > header.max => extents
+            .iter()
+            .find(|extent| !extent.is_initialized() && extent.initialized_len() >= 3)
+            .map(|extent| u64::from(extent.logical_block) + 1),
         ExtentNode::Leaf(_) => None,
         ExtentNode::Index(indexes) => {
             for index in indexes {

@@ -1,3 +1,13 @@
+- 2026-08-09 (ext4 Linux depth-three parent carry witness).
+  The ignored 3 GiB Docker/debugfs fixture now uses two Linux-generated
+  in-leaf insertions to split one full leaf and leave its depth-three parent
+  at 340 entries. Tx then converts a three-block unwritten extent in another
+  near-full child leaf, claims two metadata-only extent nodes, emits five
+  extent-node after-images through the parent carry, and passes Docker
+  `e2fsck -fn`. This closes the Linux depth-three split/carry format witness;
+  deep runtime exchange, crash/candidate acceptance, and the Rust workload/
+  SubmissionManager handoff remain open.
+
 - 2026-08-09 (ext4 Linux depth-three leaf split witness).
   The ignored 3 GiB Docker/debugfs fixture now emits one three-block unwritten
   extent per 1000 fragmented extents, so Tx can convert a real middle block in
@@ -19,7 +29,7 @@
   metadata checksums when metadata_csum is enabled. The focused ignored test,
   full `tx-ext4-format`, and 72-test `tx-ext4` lib suite pass. This closes one
   public runtime interoperability witness, not A6 or the overall plan:
-  Linux-generated depth-three split/carry, crash cuts/candidate acceptance, and
+  deep-shape public runtime exchange, crash cuts/candidate acceptance, and
   the Rust workload/SubmissionManager handoff remain open. Global progress
   validation is still blocked by the unrelated missing SMP research reference.
 
@@ -33,8 +43,8 @@
   Linux/debugfs fragmented unwritten extents, proves an actual depth-three
   inode root, converts one selected unwritten extent through Tx, and passes
   Docker `e2fsck -fn` in 67.86 seconds. The follow-up fixture now forces a
-  real Linux depth-three leaf split and e2fsck acceptance, but does not retain
-  a full parent; Linux depth-three parent carry remains pending. See
+  real Linux depth-three leaf split and parent carry before e2fsck acceptance.
+  See
   `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
 
 - 2026-08-09 (ext4 Tier 1 xfstests Docker preflight harness).

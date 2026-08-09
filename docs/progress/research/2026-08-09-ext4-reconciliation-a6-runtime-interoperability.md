@@ -40,6 +40,7 @@ existing no-direct-home-write ownership boundary.
 - The explicit ignored Docker runtime test passed and final `e2fsck -fn` was
   clean.
 - The witness is depth two and uses a single public flush plus metadata
-  settlement. Linux-generated depth-three parent carry, crash-cut acceptance,
+  settlement. The separate Linux-generated depth-three split/carry format
+  witness does not establish deep public runtime exchange, crash-cut acceptance,
   and the Rust workload/SubmissionManager handoff remain open. It is not a
   Tier 2 or production acceptance claim.

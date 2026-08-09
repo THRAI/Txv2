@@ -193,16 +193,18 @@ only immutable metadata after-images and allocation claims.
   leaf and two full ancestors carrying a new index into the inode root. It
   verifies child-to-parent metadata order, three metadata-only claims,
   `i_blocks`, and unchanged source homes.
-- `docker_e2fsck_accepts_depth_three_fragmented_unwritten_leaf_split_after_images`
+- `docker_e2fsck_accepts_depth_three_fragmented_unwritten_parent_carry_after_images`
   is an explicit `#[ignore]` Docker regression. It creates
   `4 * 340 * 340 + 1` fragmented Linux extents in a 3 GiB ext4 image and makes
-  every thousandth unwritten extent three blocks long. The test finds a
-  three-block extent in a near-full depth-three leaf, converts its middle block
-  through the Tx planner, and verifies one metadata-only extent-node claim plus
-  leaf, sibling, and parent after-images before `e2fsck -fn` accepts the image.
-  The command completed in 80.18 seconds on 2026-08-09.
+  every thousandth unwritten extent three blocks long. Two Linux `debugfs`
+  in-leaf insertions first fill and then split the first full leaf, leaving its
+  depth-three parent at 340 entries. The test finds a separate three-block
+  unwritten extent in another near-full child leaf, converts its middle block
+  through the Tx planner, and verifies two metadata-only extent-node claims
+  plus leaf, sibling, parent, parent-sibling, and grandparent after-images
+  before `e2fsck -fn` accepts the image.
 
-The selected e2fsprogs shape keeps parent nodes below capacity. Therefore the
-Docker test is Linux depth-three leaf-split evidence only. Linux-generated
-depth-three parent carry remains pending; the full carry regressions are
-bounded host-planner evidence and must not be promoted to Tier 2 compatibility.
+This is Linux depth-three leaf-split and one-parent-carry format evidence. It
+does not replace the required crash/candidate acceptance or establish the
+deeper public runtime exchange; the full carry regressions remain host-planner
+coverage beyond this one Linux-generated carry shape.
