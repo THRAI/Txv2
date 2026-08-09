@@ -1,3 +1,13 @@
+- 2026-08-09 (ext4 Docker e2fsprogs candidate path).
+  Tier 1 candidate preflight now resolves native `e2fsck`/`debugfs` first and
+  otherwise invokes the repository's read-only Docker e2fsprogs wrapper. The
+  same resolved commands reach the role-image checks, crash executor, and
+  semantic oracle. A real Docker-created ext4 image passed wrapper e2fsck and
+  debugfs; live preflight is green with Linux replay, xfstests Docker, and CoW
+  capacity checks. This unblocks the local candidate entry path only; no crash
+  campaign or acceptance receipt has run. See
+  `docs/progress/research/2026-08-09-ext4-docker-e2fsprogs-candidate-path.md`.
+
 - 2026-08-09 (ext4 rustc workload contract disposition).
   Imported only the standalone `fixture-non-evidence` native-RV64 rustc
   workload manifest into the reconciliation worktree. Its pinned command,

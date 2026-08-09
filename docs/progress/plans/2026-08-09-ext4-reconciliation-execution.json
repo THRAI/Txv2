@@ -279,7 +279,7 @@
         "cargo xtask progress validate",
         "git diff --check"
       ],
-      "notes": "The Docker xfstests live preflight now passes after the runner generates configure and builds helpers in their owning directories. Tier 1 remains green and keeps rejecting non-migrated shapes. Completion may claim only the actually evidenced slices."
+      "notes": "The Docker xfstests live preflight now passes after the runner generates configure and builds helpers in their owning directories. Native e2fsprogs remains preferred, while a repository-owned read-only Docker fallback now carries candidate e2fsck/debugfs checks through the live runner, crash executor, and semantic oracle on hosts without them. Tier 1 remains green and keeps rejecting non-migrated shapes. Completion may claim only the actually evidenced slices."
     }
   ],
   "verification": [
@@ -342,6 +342,11 @@
       "command": "cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1",
       "status": "passed",
       "notes": "72 tx-ext4 library tests passed; the two Docker interoperability witnesses are ignored in the ordinary suite and were run explicitly above."
+    },
+    {
+      "command": "cargo xtask ext4 tier1 --preflight-live --preflight-report target/ext4/reconciliation-preflight-docker-e2fsprogs.json",
+      "status": "passed",
+      "notes": "Native e2fsprogs absence is now covered by the repository-owned read-only Docker fallback; live preflight reports Linux replay, xfstests Docker execution, and CoW storage readiness."
     },
     {
       "command": "cargo xtask progress validate",
