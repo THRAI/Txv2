@@ -72,6 +72,7 @@
       "docs/progress/research/2026-08-09-ext4-reconciliation-a1-multi-page-revoke.md",
       "docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-release.md",
       "docs/progress/research/2026-08-09-ext4-tier1-xfstests-preflight.md",
+      "docs/progress/research/2026-08-09-ext4-high-dtb-boot-prerequisite.md",
       "docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json"
     ],
     "external_refs": []
@@ -234,7 +235,7 @@
         "resolver shim is versioned, idempotently installed only into WORKLOAD, and leaves generic Alpine unchanged",
         "QEMU proves rustc -vV and a clean offline frozen build over TEST, SCRATCH, and read-only WORKLOAD images"
       ],
-      "notes": "The fixture-non-evidence rustc workload contract has been imported without its obsolete xtask perf command path. It defines the desired offline/frozen command, role-image names, and 4096 MiB geometry, but has placeholder pins and no runtime authority. Decode any boot fault with cargo xtask fault-decode; do not change global QEMU or tmpfs defaults."
+      "notes": "The high-DTB direct-map prerequisite is complete: the pre-entry trampoline maps the firmware leaf before BootInfo parsing, and direct-map extension accounts for that preinstalled leaf (95 focused board tests passed). The fixture-non-evidence rustc workload contract has been imported without its obsolete xtask perf command path. It defines the desired offline/frozen command, role-image names, and 4096 MiB geometry, but has placeholder pins and no runtime authority. The resolver must still be versioned and WORKLOAD-only, and RV64 QEMU must still prove rustc -vV plus the clean frozen build. Decode any boot fault with cargo xtask fault-decode; do not change global QEMU or tmpfs defaults."
     },
     {
       "id": "m3-performance-handoff",
@@ -347,6 +348,11 @@
       "command": "cargo xtask ext4 tier1 --preflight-live --preflight-report target/ext4/reconciliation-preflight-docker-e2fsprogs.json",
       "status": "passed",
       "notes": "Native e2fsprogs absence is now covered by the repository-owned read-only Docker fallback; live preflight reports Linux replay, xfstests Docker execution, and CoW storage readiness."
+    },
+    {
+      "command": "cargo test -p tx-hal-riscv64-qemu-virt -- --test-threads=1",
+      "status": "passed",
+      "notes": "95 focused board tests passed on 2026-08-09, including direct_map_extension_accounts_for_the_preinstalled_fdt_leaf. This closes only M1/M2 high-DTB pre-entry mapping evidence."
     },
     {
       "command": "cargo xtask progress validate",

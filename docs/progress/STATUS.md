@@ -1,3 +1,11 @@
+- 2026-08-09 (ext4 M1 high-DTB boot prerequisite).
+  The RV64 QEMU trampoline now maps the 1 GiB direct-map leaf containing a
+  firmware DTB before Rust parses BootInfo, and direct-map extension accounts
+  for that preinstalled leaf. The focused board suite passed 95 tests. This
+  closes only the high-DTB sub-evidence of M1/M2: the resolver must still be
+  WORKLOAD-only and an RV64 QEMU rustc/offline-build witness is still absent.
+  See `docs/progress/research/2026-08-09-ext4-high-dtb-boot-prerequisite.md`.
+
 - 2026-08-09 (ext4 Docker e2fsprogs candidate path).
   Tier 1 candidate preflight now resolves native `e2fsck`/`debugfs` first and
   otherwise invokes the repository's read-only Docker e2fsprogs wrapper. The
