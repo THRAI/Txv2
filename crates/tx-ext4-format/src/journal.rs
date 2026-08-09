@@ -40,7 +40,7 @@ impl Jbd2MetadataUpdate {
 pub struct Jbd2TransactionImage {
     pub descriptor: [u8; JBD2_BLOCK_SIZE],
     pub metadata_blocks: Vec<[u8; JBD2_BLOCK_SIZE]>,
-    pub revoke: Option<[u8; JBD2_BLOCK_SIZE]>,
+    pub revokes: Vec<[u8; JBD2_BLOCK_SIZE]>,
     pub commit: [u8; JBD2_BLOCK_SIZE],
 }
 
@@ -58,8 +58,8 @@ impl Jbd2TransactionImage {
         Self::encode_legacy_with_revokes(sequence, journal_uuid, updates, Vec::new())
     }
 
-    /// Encode the bounded legacy transaction layout with an optional revoke
-    /// page between the metadata copies and commit record.
+    /// Encode a legacy transaction with zero or more revoke pages between its
+    /// metadata copies and commit record.
     pub fn encode_legacy_with_revokes(
         sequence: u32,
         journal_uuid: [u8; 16],
@@ -99,17 +99,16 @@ impl Jbd2TransactionImage {
 
         revoked_blocks.sort_unstable();
         revoked_blocks.dedup();
-        let revoke = if revoked_blocks.is_empty() {
-            None
-        } else {
+        let mut revokes = Vec::new();
+        for blocks in revoked_blocks.chunks(Jbd2Revoke::MAX_BLOCKS_PER_PAGE) {
             let mut page = [0; JBD2_BLOCK_SIZE];
             Jbd2Revoke {
                 header: Jbd2Header::revoke(sequence),
-                blocks: revoked_blocks,
+                blocks: blocks.to_vec(),
             }
             .encode(&mut page)?;
-            Some(page)
-        };
+            revokes.push(page);
+        }
 
         let mut commit = [0; JBD2_BLOCK_SIZE];
         Jbd2Commit {
@@ -125,7 +124,7 @@ impl Jbd2TransactionImage {
         Ok(Self {
             descriptor,
             metadata_blocks,
-            revoke,
+            revokes,
             commit,
         })
     }
@@ -500,6 +499,11 @@ pub struct Jbd2Revoke {
 
 impl Jbd2Revoke {
     const HEADER_LEN: usize = Jbd2Header::ENCODED_LEN + 4;
+    pub const MAX_BLOCKS_PER_PAGE: usize = (JBD2_BLOCK_SIZE - Self::HEADER_LEN) / 4;
+
+    pub const fn page_count(block_count: usize) -> usize {
+        block_count.div_ceil(Self::MAX_BLOCKS_PER_PAGE)
+    }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         require_len(bytes, Self::HEADER_LEN)?;
@@ -524,6 +528,9 @@ impl Jbd2Revoke {
     pub fn encode(&self, bytes: &mut [u8]) -> Result<()> {
         if self.header.block_type != JBD2_BLOCK_REVOKE {
             return Err(Ext4FormatError::Corrupt);
+        }
+        if self.blocks.len() > Self::MAX_BLOCKS_PER_PAGE {
+            return Err(Ext4FormatError::OutOfBounds);
         }
         let count = Self::HEADER_LEN
             .checked_add(

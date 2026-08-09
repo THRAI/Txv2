@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tx_ext4_format::capability::{sha256, Tier1Capabilities, Tier1Reject, Tier1Request};
+use tx_ext4_format::capability::{Tier1Capabilities, Tier1Reject, Tier1Request, sha256};
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
-use tx_ext4_format::ondisk::Ext4FormatError;
-use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeNo, BLOCK_SIZE};
+use tx_ext4_format::ondisk::{Ext4FormatError, ExtentHeader, Superblock};
+use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, DirEntryLite, Ext4Pager, InodeNo};
 
 #[test]
 fn tier1_rejects_unsupported_shape_before_mutation() {
@@ -155,9 +155,11 @@ fn generated_ext4_image_matches_host_tool_directory_and_file_observations() {
 
     let mut entries = [DirEntryLite::empty(); 8];
     let count = pager.read_dir_entries(folder_ino, &mut entries).unwrap();
-    assert!(entries[..count]
-        .iter()
-        .any(|entry| entry.name() == b"hello.txt"));
+    assert!(
+        entries[..count]
+            .iter()
+            .any(|entry| entry.name() == b"hello.txt")
+    );
 
     let mut page = [0u8; BLOCK_SIZE];
     pager.read_page(file_ino, 0, &mut page).unwrap();
@@ -221,6 +223,342 @@ fn tier1_busybox_image_can_plan_mkdir_under_musl() {
     assert!(data_block > 0);
     assert_eq!(plan.origin, MutationOrigin::Create);
     assert!(plan.metadata.len() >= 7);
+}
+
+#[test]
+fn docker_e2fsck_accepts_inline_root_spill_after_images() {
+    let image_name = std::env::var("TX_EXT4_E2FSPROGS_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "tx-ext4-xfstests-tier1:local".to_owned());
+    if !docker_image_available(&image_name) {
+        eprintln!("skipping Docker ext4 verification; image unavailable: {image_name}");
+        return;
+    }
+
+    let fixture = Fixture::docker_mountable();
+    let image = fixture.path("inline-root-spill.ext4");
+    docker_build_inline_root_fixture(&image_name, &fixture, &image);
+
+    let mut pager = Ext4Pager::open(VecImage::open(&image)).expect("open Docker ext4 image");
+    let inode = pager
+        .lookup(InodeNo::new(2), b"file")
+        .expect("lookup Docker fixture")
+        .expect("/file exists");
+    let page = [0xE9; BLOCK_SIZE];
+    let plan = pager
+        .plan_write_page(inode, 8, &page, FsyncStamp::new(52))
+        .expect("plan inline-root spill");
+    assert_eq!(plan.allocations.len(), 2);
+    assert_eq!(
+        plan.metadata
+            .iter()
+            .filter(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+            .count(),
+        1
+    );
+
+    for data in &plan.data {
+        pager
+            .apply_l6_write_page(data.physical_block * 8, 8, &data.bytes)
+            .expect("write planned data page");
+    }
+    pager
+        .apply_l6_barrier()
+        .expect("order data before metadata");
+    for metadata in &plan.metadata {
+        pager
+            .apply_l6_write_page(metadata.home * 8, 8, &metadata.after)
+            .expect("write planned metadata after-image");
+    }
+    pager
+        .apply_l6_barrier()
+        .expect("persist metadata after-images");
+    fs::write(&image, &pager.image().bytes).expect("persist planned image");
+
+    docker_e2fsck(&image_name, &fixture, &image);
+}
+
+#[test]
+fn docker_e2fsck_accepts_depth_two_fragmented_truncate_after_images() {
+    let image_name = std::env::var("TX_EXT4_E2FSPROGS_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "tx-ext4-xfstests-tier1:local".to_owned());
+    if !docker_image_available(&image_name) {
+        eprintln!("skipping Docker ext4 verification; image unavailable: {image_name}");
+        return;
+    }
+
+    let fixture = Fixture::docker_mountable();
+    let image = fixture.path("depth-two-fragmented-truncate.ext4");
+    docker_build_depth_two_fragmented_fixture(&image_name, &fixture, &image);
+    let retained_mapping_before = docker_debugfs_bmap(&image_name, &fixture, &image, "/file", 0);
+
+    let mut pager = Ext4Pager::open(VecImage::open(&image)).expect("open Docker ext4 image");
+    let inode = pager
+        .lookup(InodeNo::new(2), b"file")
+        .expect("lookup Docker fixture")
+        .expect("/file exists");
+    let (_, root) = pager
+        .inode_meta_and_extent_root(inode)
+        .expect("read fragmented extent root");
+    assert_eq!(
+        ExtentHeader::parse(&root)
+            .expect("parse fragmented extent root")
+            .depth,
+        2,
+        "debugfs fixture must force a depth-two extent tree"
+    );
+
+    let page = [0xE7; BLOCK_SIZE];
+    for logical_block in (2..=2_800u64).step_by(2) {
+        let conversion = pager
+            .plan_write_page(inode, logical_block, &page, FsyncStamp::new(53))
+            .expect("convert one depth-two unwritten extent block");
+        assert!(conversion.allocations.is_empty());
+        for data in &conversion.data {
+            pager
+                .apply_l6_write_page(data.physical_block * 8, 8, &data.bytes)
+                .expect("write converted data block");
+        }
+        pager
+            .apply_l6_barrier()
+            .expect("order converted data before metadata");
+        for metadata in &conversion.metadata {
+            pager
+                .apply_l6_write_page(metadata.home * 8, 8, &metadata.after)
+                .expect("write converted extent metadata");
+        }
+        pager
+            .apply_l6_barrier()
+            .expect("persist converted extent metadata");
+    }
+
+    let plan = pager
+        .plan_truncate_size(inode, BLOCK_SIZE as u64, FsyncStamp::new(54))
+        .expect("plan depth-two truncate");
+    assert!(plan.data.is_empty());
+    assert!(plan.revokes.len() >= 1_400);
+    assert_eq!(plan.revokes.len(), plan.deferred_frees.len());
+
+    for metadata in &plan.metadata {
+        pager
+            .apply_l6_write_page(metadata.home * 8, 8, &metadata.after)
+            .expect("write planned metadata after-image");
+    }
+    pager
+        .apply_l6_barrier()
+        .expect("persist metadata after-images");
+    fs::write(&image, &pager.image().bytes).expect("persist planned image");
+
+    docker_e2fsck(&image_name, &fixture, &image);
+    assert_eq!(
+        docker_debugfs_bmap(&image_name, &fixture, &image, "/file", 0),
+        retained_mapping_before,
+        "truncate must retain the logical block zero mapping"
+    );
+}
+
+#[test]
+fn docker_e2fsck_accepts_depth_two_fragmented_unlink_destroy_after_images() {
+    let image_name = std::env::var("TX_EXT4_E2FSPROGS_DOCKER_IMAGE")
+        .unwrap_or_else(|_| "tx-ext4-xfstests-tier1:local".to_owned());
+    if !docker_image_available(&image_name) {
+        eprintln!("skipping Docker ext4 verification; image unavailable: {image_name}");
+        return;
+    }
+
+    let fixture = Fixture::docker_mountable();
+    let image = fixture.path("depth-two-fragmented-destroy.ext4");
+    docker_build_depth_two_fragmented_fixture(&image_name, &fixture, &image);
+
+    let mut pager = Ext4Pager::open(VecImage::open(&image)).expect("open Docker ext4 image");
+    let inode = pager
+        .lookup(InodeNo::new(2), b"file")
+        .expect("lookup Docker fixture")
+        .expect("/file exists");
+    let (_, root) = pager
+        .inode_meta_and_extent_root(inode)
+        .expect("read fragmented extent root");
+    assert_eq!(
+        ExtentHeader::parse(&root)
+            .expect("parse fragmented extent root")
+            .depth,
+        2,
+        "debugfs fixture must force a depth-two extent tree"
+    );
+
+    let page = [0xD5; BLOCK_SIZE];
+    for logical_block in (2..=2_800u64).step_by(2) {
+        let conversion = pager
+            .plan_write_page(inode, logical_block, &page, FsyncStamp::new(55))
+            .expect("convert one depth-two unwritten extent block");
+        assert!(conversion.allocations.is_empty());
+        for data in &conversion.data {
+            pager
+                .apply_l6_write_page(data.physical_block * 8, 8, &data.bytes)
+                .expect("write converted data block");
+        }
+        pager
+            .apply_l6_barrier()
+            .expect("order converted data before metadata");
+        for metadata in &conversion.metadata {
+            pager
+                .apply_l6_write_page(metadata.home * 8, 8, &metadata.after)
+                .expect("write converted extent metadata");
+        }
+        pager
+            .apply_l6_barrier()
+            .expect("persist converted extent metadata");
+    }
+
+    let unlink = pager
+        .plan_unlink_dir_entry(InodeNo::new(2), b"file", inode, FsyncStamp::new(56))
+        .expect("plan unlink before destroy");
+    for metadata in &unlink.metadata {
+        pager
+            .apply_l6_write_page(metadata.home * 8, 8, &metadata.after)
+            .expect("write unlink metadata after-image");
+    }
+    pager
+        .apply_l6_barrier()
+        .expect("persist unlink metadata after-images");
+
+    let destroy = pager
+        .plan_destroy_inode(inode, FsyncStamp::new(57))
+        .expect("plan depth-two destroy");
+    assert!(destroy.data.is_empty());
+    assert!(destroy.revokes.len() >= 1_400);
+    assert_eq!(destroy.revokes.len(), destroy.deferred_frees.len());
+    let destroy_superblock = destroy
+        .metadata
+        .iter()
+        .find(|metadata| metadata.home == 0)
+        .expect("destroy plan superblock after-image");
+    assert_eq!(
+        Superblock::parse(&destroy_superblock.after[1024..2048])
+            .expect("parse destroy superblock after-image")
+            .last_orphan,
+        0,
+        "destroy must unlink the zero-link inode from the orphan chain"
+    );
+    for metadata in &destroy.metadata {
+        pager
+            .apply_l6_write_page(metadata.home * 8, 8, &metadata.after)
+            .expect("write destroy metadata after-image");
+    }
+    pager
+        .apply_l6_barrier()
+        .expect("persist destroy metadata after-images");
+    fs::write(&image, &pager.image().bytes).expect("persist planned image");
+
+    docker_e2fsck(&image_name, &fixture, &image);
+}
+
+fn docker_image_available(image_name: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", image_name])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn docker_build_inline_root_fixture(image_name: &str, fixture: &Fixture, image: &Path) {
+    let mount = format!(
+        "type=bind,source={},target=/fixture",
+        fixture.root.display()
+    );
+    let script = format!(
+        "set -eu; image=/fixture/{}; dd if=/dev/zero of=\"$image\" bs=1M count=32 status=none; mke2fs -q -t ext4 -F -b 4096 -g 1024 -O extent,^64bit,^metadata_csum \"$image\"; debugfs -w -R 'write /etc/hostname /file' \"$image\" >/dev/null; debugfs -w -R 'fallocate /file 2 2' \"$image\" >/dev/null; debugfs -w -R 'fallocate /file 4 4' \"$image\" >/dev/null; debugfs -w -R 'fallocate /file 6 6' \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
+        image.file_name().unwrap().to_str().unwrap(),
+    );
+    run(
+        "docker",
+        [
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--mount".to_owned(),
+            mount,
+            image_name.to_owned(),
+            "sh".to_owned(),
+            "-lc".to_owned(),
+            script,
+        ],
+    );
+}
+
+fn docker_build_depth_two_fragmented_fixture(image_name: &str, fixture: &Fixture, image: &Path) {
+    let mount = format!(
+        "type=bind,source={},target=/fixture",
+        fixture.root.display()
+    );
+    let script = format!(
+        "set -eu; image=/fixture/{}; commands=/fixture/depth-two.debugfs; dd if=/dev/zero of=\"$image\" bs=1M count=64 status=none; mke2fs -q -t ext4 -F -b 4096 -g 1024 -O extent,^64bit,^metadata_csum \"$image\"; printf 'write /etc/hostname /file\\n' > \"$commands\"; for i in $(seq 2 2 2800); do printf 'fallocate /file %s %s\\n' \"$i\" \"$i\" >> \"$commands\"; done; printf 'sif /file size 11472896\\n' >> \"$commands\"; debugfs -w -f \"$commands\" \"$image\" >/dev/null; e2fsck -fn \"$image\" >/dev/null",
+        image.file_name().unwrap().to_str().unwrap(),
+    );
+    run(
+        "docker",
+        [
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--mount".to_owned(),
+            mount,
+            image_name.to_owned(),
+            "sh".to_owned(),
+            "-lc".to_owned(),
+            script,
+        ],
+    );
+}
+
+fn docker_e2fsck(image_name: &str, fixture: &Fixture, image: &Path) {
+    let mount = format!(
+        "type=bind,source={},target=/fixture,readonly",
+        fixture.root.display()
+    );
+    let image_path = format!("/fixture/{}", image.file_name().unwrap().to_str().unwrap());
+    run(
+        "docker",
+        [
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--mount".to_owned(),
+            mount,
+            image_name.to_owned(),
+            "e2fsck".to_owned(),
+            "-fn".to_owned(),
+            image_path,
+        ],
+    );
+}
+
+fn docker_debugfs_bmap(
+    image_name: &str,
+    fixture: &Fixture,
+    image: &Path,
+    path: &str,
+    logical_block: u64,
+) -> String {
+    let mount = format!(
+        "type=bind,source={},target=/fixture,readonly",
+        fixture.root.display()
+    );
+    let image_path = format!("/fixture/{}", image.file_name().unwrap().to_str().unwrap());
+    let command = format!("bmap {path} {logical_block}");
+    let output = run(
+        "docker",
+        [
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--mount".to_owned(),
+            mount,
+            image_name.to_owned(),
+            "debugfs".to_owned(),
+            "-R".to_owned(),
+            command,
+            image_path,
+        ],
+    );
+    String::from_utf8(output.stdout)
+        .expect("debugfs bmap output utf8")
+        .trim()
+        .to_owned()
 }
 
 fn debugfs_stat(image: &Path, path: &str) -> String {
@@ -334,6 +672,22 @@ impl Fixture {
 
     fn path(&self, name: &str) -> PathBuf {
         self.root.join(name)
+    }
+
+    fn docker_mountable() -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let root = std::env::current_dir()
+            .expect("current directory")
+            .join("target")
+            .join(format!(
+                "tx-ext4-format-docker-{}-{unique}",
+                std::process::id()
+            ));
+        fs::create_dir_all(&root).expect("create Docker-mountable fixture temp dir");
+        Self { root }
     }
 }
 

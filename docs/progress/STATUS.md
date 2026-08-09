@@ -1,3 +1,88 @@
+- 2026-08-09 (ext4 reconciliation A3 bounded indexed unwritten conversion).
+  The clean `codex/ext4-worktree-reconciliation` worktree now turns one
+  depth-0 through bounded depth-2 unwritten extent block into an initialized block during
+  `plan_write_page`, retaining the surrounding unwritten prefix/suffix and
+  physical mapping with no data allocation claim. Full depth-one leaves can
+  split, grow a full inode root to depth two, and split a depth-two leaf into a
+  non-full parent; each new metadata node carries its bitmap, GDT, superblock,
+  and inode after-images in the same plan. The full format suite passed 82
+  tests plus doc-tests and the direct-home-write invariant passed. A full
+  depth-two parent now carries into a non-full inode root. Root-full carry,
+  recursive release, and Docker/debugfs deep-shape witnesses remain pending.
+  See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
+- 2026-08-09 (ext4 reconciliation A2 cross-group allocation).
+  The clean `codex/ext4-worktree-reconciliation` worktree now plans and
+  validates a full inline extent-root spill through immutable cross-group
+  allocation: data and extent-node claims are deterministic, bitmap
+  after-images remain per group, shared GDT descriptor edits fold into one
+  home page, and the superblock count changes once. The planner rejects known
+  metadata aliases, exhausted bitmaps, and incomplete group descriptors
+  without source-image mutation. A Docker `debugfs` fixture applies the
+  generated after-images and passes `e2fsck -fn`. Verification passed 76
+  `tx-ext4-format` tests plus doc-tests, `cargo -q xtask unit`, the
+  direct-home-write invariant, and `git diff --check`. A2 is complete; its
+  Docker fixture is an on-disk consistency witness, not a broad Tier 2 claim.
+  Indexed/deep extent paths remain A3-A5. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-allocation.md`.
+
+- 2026-08-09 (ext4 four-worktree execution plan).
+  Published the executable integration plan at
+  `docs/progress/plans/2026-08-09-ext4-reconciliation-execution.json` without
+  modifying the user-owned reconciliation draft in the primary checkout. It
+  records G0, A1, and the A2 release subset as complete; separates pending
+  cross-group allocation from deep extent work; and keeps the independent
+  rustc-witness/SubmissionManager lane gated until final candidate acceptance.
+  Whole-worktree merges, historical lifecycle restoration, shared-interface
+  changes, and unsupported Tier 2 claims remain out of scope. The worktree
+  record now links the plan. Next: A2 cross-group allocation. Blockers remain
+  the absent local historical Tier 1 receipt and the unrelated missing SMP
+  progress reference that prevents global progress validation.
+
+- 2026-08-09 (ext4 reconciliation A2 cross-block-group release).
+  In the clean `codex/ext4-worktree-reconciliation` worktree, extracted
+  format-only cross-block-group release planning for current inline initialized
+  extent truncate and zero-link inode destroy paths. Each involved block bitmap
+  is planned once, group-descriptor after-images sharing a GDT home are merged,
+  and deferred-free/revoke claims are appended only after bitmap, GDT, and
+  superblock planning succeeds. Two regressions cover truncate and destroy
+  across group 0 and group 1 without mutating the source image. The JBD2
+  state-update codec fixture now supplies a valid initial checksum required by
+  the integration baseline's parser. Verification passed the full format crate
+  test suite (72 tests plus doc-tests), `cargo -q xtask unit` (`655 + 114 +
+  68`), direct-home-write lint (0 violations), Tier 1 dry-run, docs lint
+  (7 existing warnings), and scoped rustfmt/diff checks. Cross-group
+  allocation, indexed/deep extent trees, and unwritten extents remain
+  fail-closed; no VFS/Mount/PageBacked/VM types changed. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-release.md`
+  and
+  `docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json`.
+  Next: independently scope cross-group allocation. Blockers: this worktree
+  has no local historical Tier 1 receipt, so no renewed crash/e2fsck/xfstests
+  claim is made; `cargo xtask progress validate` also remains blocked by the
+  unrelated missing SMP scheduler-readiness research reference.
+
+- 2026-08-09 (ext4 reconciliation A1 multi-page revoke).
+  In the clean
+  `codex/ext4-worktree-reconciliation` worktree, completed the bounded
+  single-transaction multi-page JBD2 revoke extraction. The format codec and
+  same-transaction replay now process every revoke page; the current
+  `JournalRing` reserves `descriptor -> metadata -> revokes -> commit`; and
+  `PreparedJournalTransaction` retains all revoke leases until checkpoint
+  completion. No VFS/Mount/PageBacked/VM interface or cross-transaction replay
+  path changed. Verification passed JBD2 image 3/3, recovery 11/11, journal
+  plan 4/4, prepared transaction 10/10, mutation lifecycle 7/7, the direct
+  home-write invariant, scoped rustfmt/diff checks, and `cargo -q xtask unit`
+  (`655 + 114 + 68 + 167`). See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a1-multi-page-revoke.md`
+  and
+  `docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json`.
+  Next: A2 cross-block-group allocation/release planning. Blocker: this clean
+  worktree has no historical Tier 1 acceptance receipt for integrity-only
+  verification, so this is host regression evidence rather than renewed
+  crash/e2fsck/xfstests acceptance.
+
 - 2026-08-05 (I/O SubmissionManager performance implementation plan).
   Added the approved 19-task implementation plan at
   `docs/superpowers/plans/2026-08-05-io-submission-manager-performance.md`
@@ -32041,3 +32126,59 @@
   dual-architecture evidence bundle and close the highest-scoring guest
   blockers. Blocker: current ext4 receipt still lacks built xfstests helpers,
   storage, and a fresh 1000-cut/e2fsck/xfstests run.
+- 2026-08-09 (ext4 reconciliation recursive truncate/destroy release).
+  The clean `codex/ext4-worktree-reconciliation` worktree now routes public
+  `plan_truncate_size` shrink plans and zero-link `plan_destroy_inode` plans
+  through a bounded recursive extent-release planner. Depth-2 truncate emits
+  descendant-first extent-node after-images, collapses removed children from
+  the inode root where supported, updates per-group block bitmaps/GDT and the
+  superblock, and appends sorted revoke/deferred-free claims only after all
+  metadata plans succeed. Indexed destroy releases data plus extent-node
+  homes while preserving inode bitmap, orphan, directory, and group-count
+  lifecycle checks. Journal inode data and extent-node homes are reserved when
+  present; extension-only truncate keeps its existing size-update behavior.
+  Two new depth-2 pager regressions prove source-image immutability.
+  Verification passed `cargo test -p tx-ext4-format -- --test-threads=1` (88
+  tests plus doc-tests), `cargo -q xtask unit` (`655 + 114 + 71 + 167`),
+  `cargo xtask lint invariants ext4-no-direct-home-write` (0 violations),
+  `cargo xtask lint docs` (7 existing warning-only stale-vocabulary mentions),
+  scoped rustfmt, and `git diff --check`. Linux/debugfs bmap comparison,
+  fresh Docker/e2fsck deep-shape fixtures, crash cuts, and full runtime
+  lowering remain pending; no Tier 2 or production acceptance claim is made.
+  `cargo xtask progress validate` remains blocked by the unrelated missing
+  `docs/progress/research/2026-08-04-smp-scheduler-readiness-audit.md` in this
+  isolated worktree. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
+- 2026-08-09 (ext4 reconciliation depth-two runtime lowering).
+  Public `FsPageBacking::truncate` now has a depth-two runtime witness: its
+  immutable five-metadata/one-revoke plan is admitted by
+  `JournalMutationRuntime` and checkpointed to retained extent, allocation,
+  and inode home blocks. The zero-link depth-two destroy plan is likewise
+  admitted through `MutationHandle`; each recursive deferred-free claim stays
+  non-reusable while that handle is live, and the public `FsOps::destroy_inode`
+  path reaches checkpoint settlement. Verification passed
+  `cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1`
+  (71 tests) and `cargo -q xtask unit` (`655 + 114 + 71 + 167`).
+  Docker now creates a Linux depth-two fragmented fixture, which Tx converts
+  from unwritten, recursively truncates with a stable `debugfs bmap`, or
+  unlinks and destroys before `e2fsck -fn` passes. Final destroy clears the
+  free inode's mode/dtime and only metadata-csum profiles update
+  `bg_itable_unused`, fixing two Linux-visible failures. Next: depth-3 conversion
+  and crash/compatibility evidence. No Tier 2 or production acceptance is claimed.
+  `cargo xtask progress validate` remains blocked by the unrelated missing SMP
+  research reference.
+
+- 2026-08-09 (ext4 reconciliation full depth-two root carry).
+  The immutable unwritten-conversion planner now handles a full depth-two
+  inode root when its selected full parent and full leaf split: it claims the
+  right leaf, right parent, and two new depth-two roots, then publishes a
+  two-entry depth-three inode root through its inode after-image. The focused
+  pager regression proves the five preserved root entries, four metadata-only
+  claims, unchanged source images, and no data allocation. Verification:
+  focused `pager_mock` and full `cargo test -p tx-ext4-format --
+  --test-threads=1` (88 tests plus doc-tests) passed. Next: support subsequent
+  depth-three conversion before attempting a Linux deep-shape witness. Crash
+  and cross-runtime compatibility evidence remain required; no Tier 2 or
+  production acceptance is claimed. See
+  `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.

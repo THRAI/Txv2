@@ -1,15 +1,16 @@
 use std::sync::Arc;
 use tx_ext4::journal::{
-    Ext4MutationPlanSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool,
-    JournalRecordLayout, JournalRing, JournalRingError, MutationJournalImage,
+    Ext4MutationPlanSource, JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource,
+    JournalPagePool, JournalRecordLayout, JournalRing, JournalRingError, MutationJournalImage,
     MutationJournalLayout, PreparedJournalTransaction,
 };
 use tx_ext4::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
 use tx_ext4_format::journal::{
-    Jbd2MetadataUpdate, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
+    JBD2_BLOCK_SIZE, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock, Jbd2TransactionImage,
 };
 use tx_ext4_format::mutation::{
-    Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
+    Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, RevokeRecord,
+    SealedDataWrite,
 };
 use tx_ext4_format::pager::JournalGeometry;
 use tx_subsystems::fs_iface::{IoDataLeaseId, IoDataSource, PageFrameRef};
@@ -72,6 +73,91 @@ fn prepared_transaction_keeps_all_commit_record_leases() {
 
     assert_eq!(prepared.record_count(), 3);
     assert_eq!(prepared.plan().commit_graph().unwrap().nodes().len(), 6);
+}
+
+#[test]
+fn prepared_transaction_keeps_every_revoke_page_until_checkpoint_completion() {
+    setup();
+    let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
+    mutation
+        .push_metadata(MetadataBlock {
+            home: 33,
+            role: MetaRole::InodeTable,
+            before_version: 1,
+            after: [2; JBD2_BLOCK_SIZE],
+            depends_on: Vec::new(),
+        })
+        .unwrap();
+    mutation.revokes = (100..)
+        .take(Jbd2Revoke::MAX_BLOCKS_PER_PAGE + 1)
+        .map(|physical_block| RevokeRecord { physical_block })
+        .collect();
+    let image = MutationJournalImage::from_plan(
+        &mutation,
+        MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [1; 16],
+            7,
+            JournalRecordLayout::new(
+                LbaRange::new(80, 8),
+                vec![LbaRange::new(88, 8)],
+                LbaRange::new(120, 8),
+            )
+            .with_revokes(vec![LbaRange::new(96, 8), LbaRange::new(104, 8)]),
+        ),
+    )
+    .unwrap();
+    assert_eq!(image.image.revokes.len(), 2);
+
+    let pool = JournalPagePool::new(6).unwrap();
+    let guard = tx_substrate::epoch::guard();
+    let prepared = PreparedJournalTransaction::stage_mutation(&pool, image, &guard).unwrap();
+    assert_eq!(prepared.record_count(), 6);
+
+    let source = JournalFsyncSource::new();
+    source.begin(prepared).unwrap();
+    let data = tx_subsystems::fs_iface::BackendPageRequest::new(
+        tx_subsystems::fs_iface::FsObjectKey::new(12),
+        tx_subsystems::io_manager::page::PageIoRequestId::new(69),
+        tx_subsystems::io_manager::page::PageIoRange::new(0, 1),
+        tx_subsystems::io_manager::page::PageIoOp::Writeback,
+        tx_subsystems::io_manager::page::PageIoFlags::WRITEBACK,
+        None,
+    );
+    assert!(matches!(
+        source.plan_data(&data),
+        tx_subsystems::fs_iface::BackendPlan::SubmitGraph(_)
+    ));
+    source.complete_data(tx_subsystems::fs_iface::BackendPageCompletion::new(
+        data.object,
+        data.id,
+        data.op,
+        tx_subsystems::io_manager::page::PageIoResult::Done,
+    ));
+    let fsync = tx_subsystems::fs_iface::BackendPageRequest::new(
+        tx_subsystems::fs_iface::FsObjectKey::new(12),
+        tx_subsystems::io_manager::page::PageIoRequestId::new(70),
+        tx_subsystems::io_manager::page::PageIoRange::new(0, 1),
+        tx_subsystems::io_manager::page::PageIoOp::Fsync,
+        tx_subsystems::io_manager::page::PageIoFlags::BARRIER,
+        None,
+    );
+    assert!(matches!(
+        source.plan_fsync(&fsync),
+        tx_subsystems::fs_iface::BackendPlan::SubmitGraph(_)
+    ));
+    source.complete_fsync(tx_subsystems::fs_iface::BackendPageCompletion::new(
+        fsync.object,
+        fsync.id,
+        fsync.op,
+        tx_subsystems::io_manager::page::PageIoResult::Done,
+    ));
+    assert!(source.take_checkpoint_graph().unwrap().is_some());
+    assert!(pool.stage(&[0; JBD2_BLOCK_SIZE], &guard).is_err());
+
+    source.complete_checkpoint_result(Ok(())).unwrap();
+    assert!(pool.stage(&[0; JBD2_BLOCK_SIZE], &guard).is_ok());
 }
 
 #[test]
@@ -376,19 +462,23 @@ fn journal_source_commits_only_after_data_graph_completion() {
         fsync.op,
         tx_subsystems::io_manager::page::PageIoResult::Done,
     ));
-    assert!(source
-        .take_checkpoint_graph()
-        .expect("durable commit exposes checkpoint")
-        .is_some());
+    assert!(
+        source
+            .take_checkpoint_graph()
+            .expect("durable commit exposes checkpoint")
+            .is_some()
+    );
     assert!(source.take_checkpoint_graph().is_err());
     source
         .complete_checkpoint_result(Err(tx_subsystems::execution::Errno::EIO))
         .expect("failed checkpoint remains retryable");
     assert_eq!(ring.reserve(1), Err(JournalRingError::Busy));
-    assert!(source
-        .take_checkpoint_graph()
-        .expect("failed checkpoint retries")
-        .is_some());
+    assert!(
+        source
+            .take_checkpoint_graph()
+            .expect("failed checkpoint retries")
+            .is_some()
+    );
     source
         .complete_checkpoint_result(Ok(()))
         .expect("successful retry releases ring reservation");

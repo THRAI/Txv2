@@ -26,8 +26,10 @@ use crate::adapter::step_engine::{
     self as epoch, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3, page_allocator,
 };
 use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
-use tx_ext4_format::ondisk::{BitmapMut, Extent, GroupDesc, Inode, Superblock};
-use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Page4K};
+use tx_ext4_format::ondisk::{
+    BitmapMut, BitmapView, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, Superblock,
+};
+use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Ext4Pager, InodeNo, Page4K};
 use tx_substrate::step::PageProgress;
 use tx_subsystems::fs_iface::{
     BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
@@ -369,6 +371,80 @@ fn build_tier1_destroy_image() -> MemImage {
     image
 }
 
+fn build_tier1_depth_two_extent_image(links_count: u16) -> MemImage {
+    let mut image = build_tier1_mount_image();
+    for block in [20, 21, 30, 32, 33, 34, 35] {
+        BitmapMut::new(image.block_mut(2)).set(block).unwrap();
+    }
+
+    ExtentNode::encode_leaf(
+        &[Extent {
+            logical_block: 0,
+            len: 2,
+            physical_start: 20,
+        }],
+        image.block_mut(34),
+    )
+    .unwrap();
+    ExtentNode::encode_leaf(
+        &[Extent {
+            logical_block: 2,
+            len: 1,
+            physical_start: 30,
+        }],
+        image.block_mut(35),
+    )
+    .unwrap();
+    ExtentNode::encode_index(
+        1,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 34,
+        }],
+        image.block_mut(32),
+    )
+    .unwrap();
+    ExtentNode::encode_index(
+        1,
+        &[ExtentIdx {
+            logical_block: 2,
+            child: 35,
+        }],
+        image.block_mut(33),
+    )
+    .unwrap();
+
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o600;
+    inode.size = 3 * BLOCK_SIZE as u64;
+    inode.blocks_512 = 56;
+    inode.links_count = links_count;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_index_root(
+            &[
+                ExtentIdx {
+                    logical_block: 0,
+                    child: 32,
+                },
+                ExtentIdx {
+                    logical_block: 2,
+                    child: 33,
+                },
+            ],
+            2,
+        )
+        .unwrap();
+    write_inode_at(&mut image, 12, &inode);
+    image
+}
+
+fn build_tier1_depth_two_destroy_image() -> MemImage {
+    let mut image = build_tier1_depth_two_extent_image(0);
+    mark_inode_bitmap_used(&mut image, 12);
+    image
+}
+
 fn build_tier1_empty_dir_image() -> MemImage {
     let mut image = build_tier1_mount_image();
 
@@ -585,7 +661,7 @@ fn mutation_runtime_for_test_with_metadata(
     }
     Arc::new(JournalMutationRuntime::new(
         fsync,
-        JournalPagePool::new(16).expect("journal pool"),
+        JournalPagePool::new(32).expect("journal pool"),
         MutationJournalLayout::new(DeviceKey::new(7), 8, [1; 16], sequence, records),
     ))
 }
@@ -747,6 +823,48 @@ fn mounted_counting_destroy_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 destroy mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_shared_counting_depth_two_truncate_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<SharedCountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<MemImage>>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 5, true);
+    let (image, image_handle) =
+        SharedCountingImage::new(build_tier1_depth_two_extent_image(1), Arc::clone(&writes));
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        image,
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 depth-two truncate image");
+    (mounted, runtime, writes, image_handle)
+}
+
+fn mounted_counting_depth_two_destroy_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 5, true);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_depth_two_destroy_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 depth-two destroy image");
     (mounted, runtime, writes)
 }
 
@@ -1221,6 +1339,73 @@ fn ext4_truncate_cross_block_shrink_admits_free_revoke_mutation() {
 }
 
 #[test]
+fn ext4_depth_two_truncate_public_path_checkpoints_descendant_after_images() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let mut planner = Ext4Pager::open(build_tier1_depth_two_extent_image(1))
+        .expect("open Tier 1 depth-two truncate image");
+    let plan = planner
+        .plan_truncate_size(
+            InodeNo::new(12),
+            BLOCK_SIZE as u64,
+            tx_ext4_format::mutation::FsyncStamp::new(46),
+        )
+        .expect("plan depth-two truncate");
+    assert_eq!(plan.metadata.len(), 5);
+    assert_eq!(plan.revokes.len(), 4);
+    let direct_runtime = mutation_runtime_for_test_with_metadata(46, 5, true);
+    assert!(
+        direct_runtime.begin_mutation(&plan, &guard).is_ok(),
+        "depth-two truncate runtime admission must stage every metadata and revoke record"
+    );
+    let (mounted, runtime, writes, image) = mounted_shared_counting_depth_two_truncate_fs(46);
+
+    assert_eq!(
+        mounted
+            .fs_page_backing()
+            .truncate(FsObjectId::new(12), BLOCK_SIZE as u64, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+
+    let image = image.lock().expect("shared image lock");
+    let bitmap = BitmapView::new(&image.blocks[2]);
+    assert!(bitmap.is_set(20));
+    assert!(!bitmap.is_set(21));
+    assert!(!bitmap.is_set(30));
+    assert!(bitmap.is_set(32));
+    assert!(!bitmap.is_set(33));
+    assert!(bitmap.is_set(34));
+    assert!(!bitmap.is_set(35));
+
+    match ExtentNode::parse(&image.blocks[34]).unwrap() {
+        ExtentNode::Leaf(extents) => assert_eq!(
+            extents,
+            vec![Extent {
+                logical_block: 0,
+                len: 1,
+                physical_start: 20,
+            }]
+        ),
+        ExtentNode::Index(_) => panic!("depth-two leaf must stay a leaf"),
+    }
+    match ExtentNode::parse(&image.blocks[32]).unwrap() {
+        ExtentNode::Index(indexes) => assert_eq!(
+            indexes,
+            vec![ExtentIdx {
+                logical_block: 0,
+                child: 34,
+            }]
+        ),
+        ExtentNode::Leaf(_) => panic!("depth-two parent must stay indexed"),
+    }
+    let inode = Inode::parse(&image.blocks[4][11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.size, BLOCK_SIZE as u64);
+    assert_eq!(inode.blocks_512, 24);
+}
+
+#[test]
 fn ext4_flush_public_path_admits_mapped_writeback_without_home_write() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
@@ -1517,6 +1702,58 @@ fn ext4_destroy_public_path_admits_zero_link_regular_inode_without_home_write() 
     init_substrate();
     let guard = epoch::guard();
     let (mounted, runtime, writes) = mounted_counting_destroy_fs(26);
+
+    assert_eq!(
+        mounted.fs_ops().destroy_inode(FsObjectId::new(12), &guard),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn runtime_retains_depth_two_destroy_deferred_frees_until_checkpoint() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let mut pager = Ext4Pager::open(build_tier1_depth_two_destroy_image())
+        .expect("open Tier 1 depth-two destroy image");
+    let mutation = pager
+        .plan_destroy_inode(
+            InodeNo::new(12),
+            tx_ext4_format::mutation::FsyncStamp::new(47),
+        )
+        .expect("plan depth-two destroy");
+    assert_eq!(
+        mutation
+            .revokes
+            .iter()
+            .map(|claim| claim.physical_block)
+            .collect::<Vec<_>>(),
+        vec![20, 21, 30, 32, 33, 34, 35]
+    );
+    let runtime = mutation_runtime_for_test_with_metadata(47, 5, true);
+
+    runtime
+        .begin_mutation(&mutation, &guard)
+        .expect("admit depth-two destroy mutation");
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(47)
+    );
+    for claim in &mutation.deferred_frees {
+        assert_eq!(
+            runtime.source().try_reuse_for_test(claim.physical_block),
+            Err(V3Errno::EBUSY)
+        );
+    }
+}
+
+#[test]
+fn ext4_depth_two_destroy_public_path_checkpoints_inode_and_allocation_metadata() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_depth_two_destroy_fs(48);
 
     assert_eq!(
         mounted.fs_ops().destroy_inode(FsObjectId::new(12), &guard),

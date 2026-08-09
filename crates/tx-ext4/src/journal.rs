@@ -9,10 +9,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_ext4_format::journal::{Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLOCK_SIZE};
+use tx_ext4_format::Ext4FormatError;
+use tx_ext4_format::journal::{
+    JBD2_BLOCK_SIZE, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage,
+};
 use tx_ext4_format::mutation::Ext4MutationPlan;
 use tx_ext4_format::pager::{JournalGeometry, Page4K};
-use tx_ext4_format::Ext4FormatError;
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::fs_iface::{
@@ -74,7 +76,7 @@ pub struct JournalTransactionPlan {
     data_writes: Vec<JournalBio>,
     descriptor: JournalBio,
     metadata_writes: Vec<JournalBio>,
-    revoke: Option<JournalBio>,
+    revokes: Vec<JournalBio>,
     commit: JournalBio,
     checkpoint_writes: Vec<JournalBio>,
     activation: Option<JournalBio>,
@@ -90,12 +92,12 @@ impl JournalTransactionPlan {
         commit: JournalBio,
         checkpoint_writes: Vec<JournalBio>,
     ) -> Result<Self, JournalTransactionPlanError> {
-        Self::with_revoke(
+        Self::with_revokes(
             sequence,
             data_writes,
             descriptor,
             metadata_writes,
-            None,
+            Vec::new(),
             commit,
             checkpoint_writes,
         )
@@ -110,6 +112,26 @@ impl JournalTransactionPlan {
         commit: JournalBio,
         checkpoint_writes: Vec<JournalBio>,
     ) -> Result<Self, JournalTransactionPlanError> {
+        Self::with_revokes(
+            sequence,
+            data_writes,
+            descriptor,
+            metadata_writes,
+            revoke.into_iter().collect(),
+            commit,
+            checkpoint_writes,
+        )
+    }
+
+    pub fn with_revokes(
+        sequence: u32,
+        data_writes: Vec<JournalBio>,
+        descriptor: JournalBio,
+        metadata_writes: Vec<JournalBio>,
+        revokes: Vec<JournalBio>,
+        commit: JournalBio,
+        checkpoint_writes: Vec<JournalBio>,
+    ) -> Result<Self, JournalTransactionPlanError> {
         if metadata_writes.is_empty() {
             return Err(JournalTransactionPlanError::EmptyMetadata);
         }
@@ -120,7 +142,7 @@ impl JournalTransactionPlan {
             data_writes,
             descriptor,
             metadata_writes,
-            revoke,
+            revokes,
             commit,
             checkpoint_writes,
             activation: None,
@@ -187,7 +209,7 @@ impl JournalTransactionPlan {
         for write in &self.metadata_writes {
             journal_ids.push(builder.push(write.clone())?);
         }
-        if let Some(revoke) = &self.revoke {
+        for revoke in &self.revokes {
             journal_ids.push(builder.push(revoke.clone())?);
         }
         let journal_fence = builder.push(fence(self.device))?;
@@ -234,7 +256,7 @@ impl JournalTransactionPlan {
             builder.depends_on(data_fence, node);
             journal_ids.push(node);
         }
-        if let Some(revoke) = &self.revoke {
+        for revoke in &self.revokes {
             let node = builder.push(revoke.clone())?;
             builder.depends_on(data_fence, node);
             journal_ids.push(node);
@@ -287,7 +309,7 @@ impl JournalTransactionPlan {
             .iter()
             .chain(core::iter::once(&self.descriptor))
             .chain(self.metadata_writes.iter())
-            .chain(self.revoke.iter())
+            .chain(self.revokes.iter())
             .chain(core::iter::once(&self.commit))
             .chain(self.checkpoint_writes.iter())
         {
@@ -422,11 +444,13 @@ pub struct JournalPagePool {
 
 impl JournalPagePool {
     /// Pages needed to stage one owned mutation through checkpoint completion.
-    /// Metadata has one journal copy and one home-checkpoint copy; data is
-    /// staged only when it is not retained by an L4-owned source.
+    /// Metadata has one journal copy and one home-checkpoint copy. Revoke
+    /// records have only their journal copy; data is staged only when it is
+    /// not retained by an L4-owned source.
     pub fn required_pages(
         owned_data_pages: usize,
         metadata_pages: usize,
+        revoke_pages: usize,
         has_superblock_state: bool,
     ) -> Result<u64, JournalPagePoolError> {
         let superblock_state_pages = usize::from(has_superblock_state) * 2;
@@ -436,6 +460,7 @@ impl JournalPagePool {
                     .checked_mul(2)
                     .ok_or(JournalPagePoolError::Capacity)?,
             )
+            .and_then(|pages| pages.checked_add(revoke_pages))
             .and_then(|pages| pages.checked_add(2))
             .and_then(|pages| pages.checked_add(superblock_state_pages))
             .ok_or(JournalPagePoolError::Capacity)?;
@@ -523,7 +548,7 @@ impl JournalPagePool {
 pub struct JournalRecordLayout {
     pub descriptor: LbaRange,
     pub metadata: Vec<LbaRange>,
-    pub revoke: Option<LbaRange>,
+    pub revokes: Vec<LbaRange>,
     pub commit: LbaRange,
 }
 
@@ -532,13 +557,18 @@ impl JournalRecordLayout {
         Self {
             descriptor,
             metadata,
-            revoke: None,
+            revokes: Vec::new(),
             commit,
         }
     }
 
     pub fn with_revoke(mut self, revoke: LbaRange) -> Self {
-        self.revoke = Some(revoke);
+        self.revokes.push(revoke);
+        self
+    }
+
+    pub fn with_revokes(mut self, revokes: Vec<LbaRange>) -> Self {
+        self.revokes = revokes;
         self
     }
 }
@@ -695,7 +725,7 @@ impl JournalRing {
         &self,
         metadata_blocks: usize,
     ) -> Result<JournalRingReservation, JournalRingError> {
-        self.reserve_for(metadata_blocks, false)
+        self.reserve_with_revoke_pages(metadata_blocks, 0)
     }
 
     pub fn reserve_for(
@@ -703,11 +733,20 @@ impl JournalRing {
         metadata_blocks: usize,
         has_revoke: bool,
     ) -> Result<JournalRingReservation, JournalRingError> {
+        self.reserve_with_revoke_pages(metadata_blocks, usize::from(has_revoke))
+    }
+
+    pub fn reserve_with_revoke_pages(
+        &self,
+        metadata_blocks: usize,
+        revoke_pages: usize,
+    ) -> Result<JournalRingReservation, JournalRingError> {
         if metadata_blocks == 0 {
             return Err(JournalRingError::EmptyMetadata);
         }
         let record_blocks = metadata_blocks
-            .checked_add(2 + usize::from(has_revoke))
+            .checked_add(revoke_pages)
+            .and_then(|count| count.checked_add(2))
             .ok_or(JournalRingError::TooLarge)?;
         if record_blocks > self.blocks.len() - self.first {
             return Err(JournalRingError::TooLarge);
@@ -724,22 +763,20 @@ impl JournalRing {
         let end = cursor + record_blocks;
         let descriptor = self.lba_for(cursor)?;
         let mut metadata = Vec::new();
-        let metadata_end = end - 1 - usize::from(has_revoke);
-        for index in cursor + 1..metadata_end {
+        for index in cursor + 1..cursor + 1 + metadata_blocks {
             metadata.push(self.lba_for(index)?);
         }
-        let revoke = has_revoke.then(|| self.lba_for(metadata_end)).transpose()?;
+        let mut revokes = Vec::new();
+        for index in cursor + 1 + metadata_blocks..end - 1 {
+            revokes.push(self.lba_for(index)?);
+        }
         let mut layout = MutationJournalLayout::new(
             self.device,
             self.sectors_per_block,
             self.journal_uuid,
             state.sequence,
-            JournalRecordLayout {
-                descriptor,
-                metadata,
-                revoke,
-                commit: self.lba_for(end - 1)?,
-            },
+            JournalRecordLayout::new(descriptor, metadata, self.lba_for(end - 1)?)
+                .with_revokes(revokes),
         );
         if let (Some(page), Some(lba)) = (self.superblock_page, self.superblock_lba) {
             let mut activate = page;
@@ -835,6 +872,7 @@ pub enum MutationJournalImageError {
     EmptyMetadata,
     RecordLayout,
     MetadataHomeOutOfRange,
+    RevokeHomeOutOfRange,
     ZeroSectorsPerBlock,
     LbaOverflow,
     Format(Ext4FormatError),
@@ -854,7 +892,9 @@ impl MutationJournalImage {
         if mutation.metadata.is_empty() {
             return Err(MutationJournalImageError::EmptyMetadata);
         }
-        if layout.records.metadata.len() != mutation.metadata.len() {
+        if layout.records.metadata.len() != mutation.metadata.len()
+            || layout.records.revokes.len() != Jbd2Revoke::page_count(mutation.revokes.len())
+        {
             return Err(MutationJournalImageError::RecordLayout);
         }
 
@@ -883,7 +923,7 @@ impl MutationJournalImage {
             .iter()
             .map(|revoke| {
                 u32::try_from(revoke.physical_block)
-                    .map_err(|_| MutationJournalImageError::MetadataHomeOutOfRange)
+                    .map_err(|_| MutationJournalImageError::RevokeHomeOutOfRange)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -1034,13 +1074,14 @@ impl PreparedJournalTransaction {
     ) -> Result<Self, PreparedJournalTransactionError> {
         if mutation.data_writes.len() != data_sources.len()
             || mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len()
-            || mutation.layout.records.revoke.is_some() != mutation.image.revoke.is_some()
+            || mutation.layout.records.revokes.len() != mutation.image.revokes.len()
         {
             return Err(PreparedJournalTransactionError::Layout);
         }
         let required_pages = JournalPagePool::required_pages(
             0,
             mutation.image.metadata_blocks.len(),
+            mutation.image.revokes.len(),
             mutation.layout.superblock_state.is_some(),
         )
         .map_err(PreparedJournalTransactionError::Pool)?;
@@ -1071,14 +1112,19 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
-        let revoke = stage_revoke_record(
-            pool,
-            device,
-            mutation.image.revoke.as_ref(),
-            mutation.layout.records.revoke,
-            guard,
-            &mut records,
-        )?;
+        let mut revokes = Vec::new();
+        for (bytes, lba) in mutation
+            .image
+            .revokes
+            .iter()
+            .zip(mutation.layout.records.revokes.iter().copied())
+        {
+            let record = pool
+                .stage(bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            revokes.push(record.as_journal_bio(device, lba));
+            records.push(record);
+        }
         let commit = pool
             .stage(&mutation.image.commit, guard)
             .map_err(PreparedJournalTransactionError::Pool)?;
@@ -1103,12 +1149,12 @@ impl PreparedJournalTransaction {
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let mut plan = JournalTransactionPlan::with_revoke(
+        let mut plan = JournalTransactionPlan::with_revokes(
             sequence,
             data_writes,
             descriptor_bio,
             metadata_writes,
-            revoke,
+            revokes,
             commit_bio,
             checkpoint_writes,
         )
@@ -1130,13 +1176,14 @@ impl PreparedJournalTransaction {
         guard: &Guard<'_>,
     ) -> Result<Self, PreparedJournalTransactionError> {
         if mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len()
-            || mutation.layout.records.revoke.is_some() != mutation.image.revoke.is_some()
+            || mutation.layout.records.revokes.len() != mutation.image.revokes.len()
         {
             return Err(PreparedJournalTransactionError::Layout);
         }
         let required_pages = JournalPagePool::required_pages(
             mutation.data_writes.len(),
             mutation.image.metadata_blocks.len(),
+            mutation.image.revokes.len(),
             mutation.layout.superblock_state.is_some(),
         )
         .map_err(PreparedJournalTransactionError::Pool)?;
@@ -1173,14 +1220,19 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
-        let revoke = stage_revoke_record(
-            pool,
-            device,
-            mutation.image.revoke.as_ref(),
-            mutation.layout.records.revoke,
-            guard,
-            &mut records,
-        )?;
+        let mut revokes = Vec::new();
+        for (bytes, lba) in mutation
+            .image
+            .revokes
+            .iter()
+            .zip(mutation.layout.records.revokes.iter().copied())
+        {
+            let record = pool
+                .stage(bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            revokes.push(record.as_journal_bio(device, lba));
+            records.push(record);
+        }
 
         let commit = pool
             .stage(&mutation.image.commit, guard)
@@ -1208,12 +1260,12 @@ impl PreparedJournalTransaction {
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let mut plan = JournalTransactionPlan::with_revoke(
+        let mut plan = JournalTransactionPlan::with_revokes(
             sequence,
             data_writes,
             descriptor_bio,
             metadata_writes,
-            revoke,
+            revokes,
             commit_bio,
             checkpoint_writes,
         )
@@ -1234,7 +1286,7 @@ impl PreparedJournalTransaction {
         guard: &Guard<'_>,
     ) -> Result<Self, PreparedJournalTransactionError> {
         if layout.metadata.len() != image.metadata_blocks.len()
-            || layout.revoke.is_some() != image.revoke.is_some()
+            || layout.revokes.len() != image.revokes.len()
         {
             return Err(PreparedJournalTransactionError::Layout);
         }
@@ -1254,21 +1306,21 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
-        let revoke = stage_revoke_record(
-            pool,
-            device,
-            image.revoke.as_ref(),
-            layout.revoke,
-            guard,
-            &mut records,
-        )?;
+        let mut revokes = Vec::new();
+        for (bytes, lba) in image.revokes.iter().zip(layout.revokes.iter().copied()) {
+            let record = pool
+                .stage(bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            revokes.push(record.as_journal_bio(device, lba));
+            records.push(record);
+        }
         let commit = pool
             .stage(&image.commit, guard)
             .map_err(PreparedJournalTransactionError::Pool)?;
         let descriptor_bio = records[0].as_journal_bio(device, layout.descriptor);
         let commit_bio = commit.as_journal_bio(device, layout.commit);
         records.push(commit);
-        let plan = JournalTransactionPlan::with_revoke(
+        let plan = JournalTransactionPlan::with_revokes(
             tx_ext4_format::journal::Jbd2Commit::parse(&image.commit)
                 .map_err(|_| PreparedJournalTransactionError::Layout)?
                 .header
@@ -1276,7 +1328,7 @@ impl PreparedJournalTransaction {
             data_writes,
             descriptor_bio,
             metadata_writes,
-            revoke,
+            revokes,
             commit_bio,
             checkpoint_writes,
         )
@@ -1314,28 +1366,6 @@ fn stage_superblock_state(
     let clean_bio = clean.as_journal_bio(device, state.lba);
     records.push(clean);
     Ok(Some((activate_bio, clean_bio)))
-}
-
-fn stage_revoke_record(
-    pool: &JournalPagePool,
-    device: DeviceKey,
-    bytes: Option<&Page4K>,
-    lba: Option<LbaRange>,
-    guard: &Guard<'_>,
-    records: &mut Vec<JournalRecordLease>,
-) -> Result<Option<JournalBio>, PreparedJournalTransactionError> {
-    match (bytes, lba) {
-        (Some(bytes), Some(lba)) => {
-            let record = pool
-                .stage(bytes, guard)
-                .map_err(PreparedJournalTransactionError::Pool)?;
-            let bio = record.as_journal_bio(device, lba);
-            records.push(record);
-            Ok(Some(bio))
-        }
-        (None, None) => Ok(None),
-        _ => Err(PreparedJournalTransactionError::Layout),
-    }
 }
 
 fn journal_bio_from_l4_source(
@@ -1631,7 +1661,10 @@ impl JournalMutationRuntime {
         }
         let ring = self.ring.as_ref().expect("runtime has layout or ring");
         let reservation = ring
-            .reserve_for(mutation.metadata.len(), !mutation.revokes.is_empty())
+            .reserve_with_revoke_pages(
+                mutation.metadata.len(),
+                Jbd2Revoke::page_count(mutation.revokes.len()),
+            )
             .map_err(|_| JournalMutationRuntimeError::Busy(JournalTransactionStateError::Busy))?;
         Ok((
             reservation.layout.clone(),
@@ -1689,8 +1722,9 @@ mod tests {
 
     #[test]
     fn journal_pool_sizing_counts_owned_data_metadata_checkpoint_and_state_pages() {
-        assert_eq!(JournalPagePool::required_pages(1, 2, true).unwrap(), 9);
-        assert_eq!(JournalPagePool::required_pages(0, 1, false).unwrap(), 4);
+        assert_eq!(JournalPagePool::required_pages(1, 2, 0, true).unwrap(), 9);
+        assert_eq!(JournalPagePool::required_pages(0, 1, 0, false).unwrap(), 4);
+        assert_eq!(JournalPagePool::required_pages(0, 1, 2, false).unwrap(), 6);
     }
 
     #[test]
@@ -1748,6 +1782,42 @@ mod tests {
         );
         ring.complete(&retry, true)
             .expect("current retry completes after stale completion rejection");
+    }
+
+    #[test]
+    fn journal_ring_places_every_revoke_page_before_commit() {
+        let geometry = JournalGeometry {
+            superblock: Jbd2Superblock {
+                block_type: 4,
+                block_size: JBD2_BLOCK_SIZE as u32,
+                max_len: 8,
+                first: 1,
+                sequence: 11,
+                start: 0,
+                uuid: [0x3c; 16],
+            },
+            blocks: vec![40, 41, 42, 50, 51, 52, 53, 54],
+            superblock_page: None,
+        };
+        let ring = JournalRing::new(DeviceKey::new(9), 8, geometry).expect("valid journal ring");
+
+        let reservation = ring
+            .reserve_with_revoke_pages(1, 2)
+            .expect("reserve metadata and two revoke records");
+
+        assert_eq!(
+            reservation.layout.records.descriptor,
+            LbaRange::new(41 * 8, 8)
+        );
+        assert_eq!(
+            reservation.layout.records.metadata,
+            vec![LbaRange::new(42 * 8, 8)]
+        );
+        assert_eq!(
+            reservation.layout.records.revokes,
+            vec![LbaRange::new(50 * 8, 8), LbaRange::new(51 * 8, 8)]
+        );
+        assert_eq!(reservation.layout.records.commit, LbaRange::new(52 * 8, 8));
     }
 
     #[test]

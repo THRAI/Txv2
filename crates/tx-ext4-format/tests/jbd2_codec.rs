@@ -1,9 +1,9 @@
+use tx_ext4_format::Ext4FormatError;
 use tx_ext4_format::journal::{
-    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Superblock, Jbd2Tag, JBD2_BLOCK_COMMIT,
-    JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC,
+    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC, Jbd2Commit,
+    Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Superblock, Jbd2Tag,
 };
 use tx_ext4_format::ondisk::crc32c_append;
-use tx_ext4_format::Ext4FormatError;
 
 const BLOCK_SIZE: usize = 4096;
 
@@ -133,6 +133,8 @@ fn superblock_state_update_preserves_unknown_bytes_and_recomputes_crc32c() {
     bytes[48..64].copy_from_slice(&[0x5a; 16]);
     bytes[80] = 4;
     bytes[84..252].fill(0xC3);
+    let initial_checksum = crc32c_append(0xFFFF_FFFF, &bytes);
+    bytes[252..256].copy_from_slice(&initial_checksum.to_be_bytes());
 
     let superblock = Jbd2Superblock::parse(&bytes).unwrap();
     superblock.write_state(&mut bytes, 19, 0).unwrap();

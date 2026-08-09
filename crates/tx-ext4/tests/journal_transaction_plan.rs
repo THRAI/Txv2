@@ -109,26 +109,27 @@ fn split_graphs_fence_data_before_journal_commit() {
 }
 
 #[test]
-fn commit_graph_places_revoke_in_the_durable_journal_body() {
+fn commit_graph_places_every_revoke_before_the_durable_journal_fence() {
     let device = DeviceKey::new(9);
-    let plan = JournalTransactionPlan::with_revoke(
+    let plan = JournalTransactionPlan::with_revokes(
         41,
         vec![],
         write(device, 200, 2),
         vec![write(device, 208, 3)],
-        Some(write(device, 216, 4)),
-        write(device, 224, 5),
+        vec![write(device, 216, 4), write(device, 224, 5)],
+        write(device, 232, 6),
         vec![],
     )
     .unwrap();
 
     let graph = plan.commit_graph_after_data().unwrap();
 
-    assert_eq!(graph.nodes().len(), 6);
+    assert_eq!(graph.nodes().len(), 7);
     assert_eq!(graph.nodes()[0].bio.lba, LbaRange::new(200, 8));
     assert_eq!(graph.nodes()[1].bio.lba, LbaRange::new(208, 8));
     assert_eq!(graph.nodes()[2].bio.lba, LbaRange::new(216, 8));
-    assert_eq!(graph.nodes()[3].bio.op, BlockOp::Barrier);
-    assert_eq!(graph.nodes()[4].bio.lba, LbaRange::new(224, 8));
-    assert_eq!(graph.nodes()[5].bio.op, BlockOp::Barrier);
+    assert_eq!(graph.nodes()[3].bio.lba, LbaRange::new(224, 8));
+    assert_eq!(graph.nodes()[4].bio.op, BlockOp::Barrier);
+    assert_eq!(graph.nodes()[5].bio.lba, LbaRange::new(232, 8));
+    assert_eq!(graph.nodes()[6].bio.op, BlockOp::Barrier);
 }
