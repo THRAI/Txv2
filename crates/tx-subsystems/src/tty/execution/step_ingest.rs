@@ -125,6 +125,14 @@ where
         });
     });
 
+    // The line discipline can enqueue echo, erase, and kill-sequence bytes.
+    // No queue lock may be held while the transport drains because the kick
+    // takes the output lock again. Hardware console transports complete this
+    // synchronously; a blocking transport restores its bytes for a later kick.
+    if output_touched {
+        let _ = super::step_write::kick_transport(tty, guard);
+    }
+
     V3::Done(outcome)
 }
 
@@ -161,6 +169,7 @@ mod step_op_wraps {
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::tty::structure::{TtyKind, TtyPayload};
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     struct NoopOps;
 
@@ -181,6 +190,28 @@ mod step_op_wraps {
         ops: &NOOP_OPS,
     };
 
+    struct RecordingOps;
+
+    static RECORDED_TX_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    impl CharDeviceOps for RecordingOps {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+            StepOutcome::Done(0)
+        }
+
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+            RECORDED_TX_BYTES.fetch_add(bytes.len(), Ordering::AcqRel);
+            StepOutcome::Done(bytes.len())
+        }
+    }
+
+    static RECORDING_OPS: RecordingOps = RecordingOps;
+    static RECORDING_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(4, 241),
+        name: "tty-ingest-recording-test",
+        ops: &RECORDING_OPS,
+    };
+
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         tx_test_support::init_host();
@@ -189,19 +220,25 @@ mod step_op_wraps {
         guard
     }
 
-    fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
+    fn alloc_hardware_tty_with(
+        index: u32,
+        name: &str,
+        binding: &'static CharDeviceBinding,
+    ) -> Cap<TtyIdentity> {
         let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
         let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
-        let payload_cap = PayloadCap::from_cap(sign_for(
-            payload_res,
-            TtyPayload::new_hardware(&NOOP_BINDING),
-        ));
+        let payload_cap =
+            PayloadCap::from_cap(sign_for(payload_res, TtyPayload::new_hardware(binding)));
         let identity = sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, index, name),
         );
         identity.install_payload(payload_cap);
         identity
+    }
+
+    fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
+        alloc_hardware_tty_with(index, name, &NOOP_BINDING)
     }
 
     #[test]
@@ -216,6 +253,21 @@ mod step_op_wraps {
             V3::Done(o) => assert_eq!(o.consumed, bytes.len()),
             other => panic!("expected Done(_), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ingest_echo_kicks_hardware_without_a_followup_userspace_write() {
+        let _setup = setup();
+        RECORDED_TX_BYTES.store(0, Ordering::Release);
+        let tty = alloc_hardware_tty_with(602, "ttyV3-ingest-echo", &RECORDING_BINDING);
+
+        let guard = step_engine::guard();
+        let outcome = step_ingest_with_post(&tty, b"abc", &guard, |_, _, _| true);
+        drop(guard);
+        assert!(matches!(outcome, V3::Done(result) if result.consumed == 3));
+        assert_eq!(RECORDED_TX_BYTES.load(Ordering::Acquire), 3);
+        let live = tty.live_payload().expect("live tty payload");
+        assert!(live.with_output_queue(|queue| queue.is_empty()));
     }
 
     #[test]

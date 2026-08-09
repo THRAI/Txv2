@@ -683,7 +683,7 @@ fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
         step_poll_hardware_input(&tty, 16, &guard),
         StepOutcome::Done(crate::tty::execution::HardwarePollOutcome::default())
     );
-    assert!(ops.recorded_writes().is_empty());
+    assert_eq!(ops.recorded_writes(), alloc::vec![b"hello\n".to_vec()]);
 }
 
 #[test]
