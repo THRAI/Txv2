@@ -193,16 +193,16 @@ only immutable metadata after-images and allocation claims.
   leaf and two full ancestors carrying a new index into the inode root. It
   verifies child-to-parent metadata order, three metadata-only claims,
   `i_blocks`, and unchanged source homes.
-- `docker_e2fsck_accepts_depth_three_fragmented_unwritten_conversion_after_images`
+- `docker_e2fsck_accepts_depth_three_fragmented_unwritten_leaf_split_after_images`
   is an explicit `#[ignore]` Docker regression. It creates
-  `4 * 340 * 340 + 1` sparse one-block unwritten extents in a 3 GiB Linux ext4
-  image, proves the inode root is depth three, finds a real unwritten extent
-  by traversing the generated tree, applies its Tx after-image through a
-  file-backed test image, and passes `e2fsck -fn`. The command completed in
-  67.86 seconds on 2026-08-09.
+  `4 * 340 * 340 + 1` fragmented Linux extents in a 3 GiB ext4 image and makes
+  every thousandth unwritten extent three blocks long. The test finds a
+  three-block extent in a near-full depth-three leaf, converts its middle block
+  through the Tx planner, and verifies one metadata-only extent-node claim plus
+  leaf, sibling, and parent after-images before `e2fsck -fn` accepts the image.
+  The command completed in 80.18 seconds on 2026-08-09.
 
-The selected e2fsprogs shape did not retain a full leaf (nor a full
-leaf/parent pair) after its own balancing decisions. Therefore the Docker test
-is Linux depth-three conversion evidence only. Linux-generated depth-three
-leaf split/carry remains pending; the new split/carry regressions are bounded
-host-planner evidence and must not be promoted to Tier 2 compatibility.
+The selected e2fsprogs shape keeps parent nodes below capacity. Therefore the
+Docker test is Linux depth-three leaf-split evidence only. Linux-generated
+depth-three parent carry remains pending; the full carry regressions are
+bounded host-planner evidence and must not be promoted to Tier 2 compatibility.

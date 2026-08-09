@@ -1,3 +1,13 @@
+- 2026-08-09 (ext4 Linux depth-three leaf split witness).
+  The ignored 3 GiB Docker/debugfs fixture now emits one three-block unwritten
+  extent per 1000 fragmented extents, so Tx can convert a real middle block in
+  a Linux-generated near-full depth-three leaf. The immutable plan claims one
+  metadata-only extent node and emits the modified leaf, new sibling, and
+  parent after-images; Docker `e2fsck -fn` accepted the result in 80.18s.
+  This is Linux depth-three leaf-split evidence, not Linux depth-three parent
+  carry evidence. Crash/candidate acceptance and the Rust workload/
+  SubmissionManager handoff remain open.
+
 - 2026-08-09 (ext4 A6 Linux-to-Tx runtime interoperability).
   Added an ignored Docker-backed `tx-ext4` test that builds a Linux-generated
   Tier 1 depth-two fragmented unwritten image, opens it through
@@ -22,9 +32,9 @@
   source homes. An ignored 3 GiB Docker fixture creates more than 462,400
   Linux/debugfs fragmented unwritten extents, proves an actual depth-three
   inode root, converts one selected unwritten extent through Tx, and passes
-  Docker `e2fsck -fn` in 67.86 seconds. The tested e2fsprogs shape does not
-  retain a full leaf/parent pair, so this is Linux depth-three conversion
-  evidence, not Linux depth-three split/carry evidence. See
+  Docker `e2fsck -fn` in 67.86 seconds. The follow-up fixture now forces a
+  real Linux depth-three leaf split and e2fsck acceptance, but does not retain
+  a full parent; Linux depth-three parent carry remains pending. See
   `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
 
 - 2026-08-09 (ext4 Tier 1 xfstests Docker preflight harness).
