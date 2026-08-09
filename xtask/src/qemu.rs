@@ -545,7 +545,12 @@ fn qemu_command(
         ));
     }
     append_ext4_role_drives(&mut args, &options.ext4_block_images);
-    append_net_args(&mut args, target, &options.net);
+    append_net_args_with_bus_offset(
+        &mut args,
+        target,
+        &options.net,
+        ext4_bus_count(&options.ext4_block_images),
+    );
     args.push("-d".into());
     args.push("guest_errors".into());
     args.push("-D".into());
@@ -593,6 +598,13 @@ fn ext4_role_cmdline(images: &Ext4BlockImages) -> Option<String> {
     (!tokens.is_empty()).then(|| tokens.join(" "))
 }
 
+fn ext4_bus_count(images: &Ext4BlockImages) -> usize {
+    images.legacy.len()
+        + usize::from(images.test.is_some())
+        + usize::from(images.scratch.is_some())
+        + usize::from(images.workload.is_some())
+}
+
 fn append_extra_cmdline(base: &str, extra: Option<&str>) -> String {
     match extra {
         Some(extra) if !extra.trim().is_empty() => format!("{base} {}", extra.trim()),
@@ -612,34 +624,41 @@ fn qemu_smp(target: TxTarget, profile: Profile, options: &QemuOptions) -> usize 
     }
 }
 
-pub(crate) fn append_net_args(args: &mut Vec<String>, target: TxTarget, net: &QemuNet) {
+fn append_net_args_with_bus_offset(
+    args: &mut Vec<String>,
+    target: TxTarget,
+    net: &QemuNet,
+    bus_offset: usize,
+) {
     match net {
         QemuNet::None => {}
         QemuNet::User => {
             args.push("-netdev".into());
             args.push("user,id=net0".into());
-            push_net_device(args, target);
+            push_net_device(args, target, bus_offset);
         }
         QemuNet::Tap(ifname) => {
             args.push("-netdev".into());
             args.push(format!(
                 "tap,id=net0,ifname={ifname},script=no,downscript=no"
             ));
-            push_net_device(args, target);
+            push_net_device(args, target, bus_offset);
         }
         QemuNet::Bridge(bridge) => {
             args.push("-netdev".into());
             args.push(format!("bridge,id=net0,br={bridge}"));
-            push_net_device(args, target);
+            push_net_device(args, target, bus_offset);
         }
     }
 }
 
-fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
+fn push_net_device(args: &mut Vec<String>, target: TxTarget, bus_offset: usize) {
     args.push("-device".into());
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
-            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0".into());
+            args.push(format!(
+                "virtio-net-device,netdev=net0,bus=virtio-mmio-bus.{bus_offset}"
+            ));
         }
         TxTarget::La64Qemu => {
             args.push("virtio-net-pci,netdev=net0".into());
@@ -1499,6 +1518,30 @@ mod tests {
         assert!(command.contains("tx.ext4.test=vda"));
         assert!(command.contains("tx.ext4.scratch=vdb"));
         assert!(command.contains("tx.ext4.workload=vdc"));
+    }
+
+    #[test]
+    fn qemu_places_rv64_net_after_named_ext4_roles() {
+        let options = QemuOptions {
+            ext4_block_images: Ext4BlockImages {
+                test: Some(PathBuf::from("/tmp/tx/test.img")),
+                scratch: Some(PathBuf::from("/tmp/tx/scratch.img")),
+                workload: Some(PathBuf::from("/tmp/tx/workload.img")),
+                legacy: Vec::new(),
+            },
+            net: QemuNet::User,
+            ..test_options()
+        };
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            &options,
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.3"));
     }
 
     #[test]

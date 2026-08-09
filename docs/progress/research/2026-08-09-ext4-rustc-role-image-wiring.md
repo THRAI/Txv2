@@ -15,11 +15,15 @@ role-image arguments:
 
 The existing repeatable `--extra-rv64-ext4` path remains for Tier 1 callers.
 It cannot be mixed with named roles, and two named roles cannot name the same
-image. These checks run before QEMU starts. No global memory default changed.
+image. These checks run before QEMU starts. When RV64 networking is enabled,
+the net device is placed after the role buses (bus 3 for all three roles), so
+it cannot alias TEST/SCRATCH/WORKLOAD. No global memory default changed.
 
 ## Verification
 
 - `cargo test -p xtask -- --test-threads=1`: 450 passed.
+- Focused role rerun: qemu 24 and shell-test 12 passed, including the RV64
+  net-after-role bus regression.
 - `cargo xtask ext4 tier1 --dry-run`: passed; the legacy role-image invocation
   still produces the full Tier 1 action plan.
 - `rustfmt --check xtask/src/qemu.rs xtask/src/shell_test.rs`
