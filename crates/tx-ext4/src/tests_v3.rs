@@ -445,6 +445,57 @@ fn build_tier1_depth_two_destroy_image() -> MemImage {
     image
 }
 
+fn build_tier1_depth_three_unwritten_image() -> MemImage {
+    let mut image = build_tier1_mount_image();
+    for block in [20, 21, 22, 30] {
+        BitmapMut::new(image.block_mut(2)).set(block).unwrap();
+    }
+    ExtentNode::encode_leaf(
+        &[Extent {
+            logical_block: 0,
+            len: Extent::UNINITIALIZED_MASK | 3,
+            physical_start: 30,
+        }],
+        image.block_mut(20),
+    )
+    .unwrap();
+    ExtentNode::encode_index(
+        1,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 20,
+        }],
+        image.block_mut(21),
+    )
+    .unwrap();
+    ExtentNode::encode_index(
+        2,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 21,
+        }],
+        image.block_mut(22),
+    )
+    .unwrap();
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o600;
+    inode.size = 4 * BLOCK_SIZE as u64;
+    inode.blocks_512 = 32;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_index_root(
+            &[ExtentIdx {
+                logical_block: 0,
+                child: 22,
+            }],
+            3,
+        )
+        .unwrap();
+    write_inode_at(&mut image, 12, &inode);
+    image
+}
+
 fn build_tier1_empty_dir_image() -> MemImage {
     let mut image = build_tier1_mount_image();
 
@@ -866,6 +917,29 @@ fn mounted_counting_depth_two_destroy_fs(
     )
     .expect("mount Tier 1 depth-two destroy image");
     (mounted, runtime, writes)
+}
+
+fn mounted_shared_counting_depth_three_unwritten_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<SharedCountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<MemImage>>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test(sequence);
+    let (image, image_handle) = SharedCountingImage::new(
+        build_tier1_depth_three_unwritten_image(),
+        Arc::clone(&writes),
+    );
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        image,
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount Tier 1 depth-three unwritten image");
+    (mounted, runtime, writes, image_handle)
 }
 
 fn mounted_counting_create_fs(
@@ -1403,6 +1477,62 @@ fn ext4_depth_two_truncate_public_path_checkpoints_descendant_after_images() {
     let inode = Inode::parse(&image.blocks[4][11 * 256..12 * 256]).unwrap();
     assert_eq!(inode.size, BLOCK_SIZE as u64);
     assert_eq!(inode.blocks_512, 24);
+}
+
+#[test]
+fn ext4_depth_three_flush_public_path_checkpoints_leaf_after_image() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes, image) = mounted_shared_counting_depth_three_unwritten_fs(49);
+    let frame = tx_subsystems::page_backed::Frame::new(
+        page_allocator::zero_frame_ppn().expect("zero frame"),
+    );
+
+    assert_eq!(
+        mounted.fs_page_backing().flush_page(
+            FsObjectId::new(12),
+            BLOCK_SIZE as u64,
+            &frame,
+            &guard
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_eq!(
+        mounted.fs_ops().chmod_inode(
+            FsObjectId::new(12),
+            0o640,
+            &tx_subsystems::vfs::Credential::root(),
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+
+    let image = image.lock().expect("shared image lock");
+    match ExtentNode::parse(&image.blocks[20]).unwrap() {
+        ExtentNode::Leaf(extents) => assert_eq!(
+            extents,
+            vec![
+                Extent {
+                    logical_block: 0,
+                    len: Extent::UNINITIALIZED_MASK | 1,
+                    physical_start: 30,
+                },
+                Extent {
+                    logical_block: 1,
+                    len: 1,
+                    physical_start: 31,
+                },
+                Extent {
+                    logical_block: 2,
+                    len: Extent::UNINITIALIZED_MASK | 1,
+                    physical_start: 32,
+                },
+            ]
+        ),
+        ExtentNode::Index(_) => panic!("depth-three flush must retain a leaf node"),
+    }
 }
 
 #[test]

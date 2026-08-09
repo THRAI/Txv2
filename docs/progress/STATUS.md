@@ -32192,3 +32192,11 @@
   pager-mock tests plus journal/host-tool tests). Linux-generated depth-three
   shape and leaf-split evidence remain open; the current Docker fixture is
   intentionally depth-two because the required fanout is much larger.
+
+- 2026-08-09 (ext4 reconciliation depth-three runtime settlement).
+  The public `FsPageBacking::flush_page` path now has a depth-three witness:
+  it admits the converted page as ordered data, and the next metadata mutation
+  settles the data graph, journal commit, and checkpoint before the test reads
+  the converted leaf home. This preserves the ext4/JBD2 ownership sequence;
+  Linux-to-Tx and Tx-to-Linux deep-shape fixtures remain required before A6 can
+  close.

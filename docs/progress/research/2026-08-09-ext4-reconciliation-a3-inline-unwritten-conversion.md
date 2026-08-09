@@ -166,3 +166,13 @@ depth-three tree requires each depth-one parent to carry 340 leaf children and
 the depth-two root to carry four such parents, which is a materially larger
 shape than the current 64 MiB fixture. This is a compatibility-evidence gap,
 not permission to infer Linux depth-three support from the mock.
+
+## Depth-Three Runtime Settlement Update
+
+`ext4_depth_three_flush_public_path_checkpoints_leaf_after_image` runs the
+format plan through the public `FsPageBacking::flush_page` entry. As intended,
+the flush only admits the ordered-data transaction; a following metadata-only
+`chmod_inode` settles its data graph, commit, and checkpoint before the test
+observes the converted leaf home. This preserves the existing ownership split:
+PageBacked supplies the dirty frame, ext4 owns the immutable plan/JBD2 state,
+and the runtime retains the active transaction until settlement.

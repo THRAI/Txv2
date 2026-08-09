@@ -206,7 +206,7 @@
         "cargo xtask lint invariants ext4-no-direct-home-write",
         "Linux-to-Tx and Tx-to-Linux extent fixtures pass Docker-backed e2fsck -fn"
       ],
-      "notes": "Depth-two host runtime witnesses now cover public truncate checkpointing of the retained leaf/allocation/inode after-images and MutationHandle retention of recursive destroy deferred-free claims. PageBacked retains file-page lifecycle, ext4 retains mutation planning and JBD2 staging, and Mount retains settlement. Linux-to-Tx and Tx-to-Linux deep-shape fixtures remain required before this step can close."
+      "notes": "Depth-two host runtime witnesses cover public truncate checkpointing of the retained leaf/allocation/inode after-images and MutationHandle retention of recursive destroy deferred-free claims. A depth-three host witness now drives public flush admission, ordered-data settlement, and checkpoint through the next metadata mutation before validating the converted leaf home. PageBacked retains file-page lifecycle, ext4 retains mutation planning and JBD2 staging, and Mount retains settlement. Linux-to-Tx and Tx-to-Linux deep-shape fixtures remain required before this step can close."
     },
     {
       "id": "m1-m2-rustc-witness",
