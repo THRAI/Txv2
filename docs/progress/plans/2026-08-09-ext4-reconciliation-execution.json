@@ -71,6 +71,7 @@
     "progress_refs": [
       "docs/progress/research/2026-08-09-ext4-reconciliation-a1-multi-page-revoke.md",
       "docs/progress/research/2026-08-09-ext4-reconciliation-a2-cross-group-release.md",
+      "docs/progress/research/2026-08-09-ext4-tier1-xfstests-preflight.md",
       "docs/progress/worktrees/2026-08-08-ext4-worktree-reconciliation.json"
     ],
     "external_refs": []
@@ -275,7 +276,7 @@
         "cargo xtask progress validate",
         "git diff --check"
       ],
-      "notes": "Tier 1 remains green and keeps rejecting non-migrated shapes. Completion may claim only the actually evidenced slices."
+      "notes": "The Docker xfstests live preflight now passes after the runner generates configure and builds helpers in their owning directories. Tier 1 remains green and keeps rejecting non-migrated shapes. Completion may claim only the actually evidenced slices."
     }
   ],
   "verification": [

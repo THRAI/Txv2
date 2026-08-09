@@ -104,14 +104,15 @@ class Ext4FaultMatrixRunnerTests(unittest.TestCase):
         module = load_module(XFSTESTS_DOCKER_RUNNER, "tier1_xfstests_docker")
         script = module.docker_prepare_script(["generic/013", "generic/091"])
 
+        self.assertIn("make configure;", script)
+        self.assertLess(script.index("make configure;"), script.index("./configure"))
         self.assertIn('CFLAGS="-D_GNU_SOURCE ${CFLAGS:-}" ./configure', script)
         self.assertIn("--libexecdir=/usr/lib", script)
         self.assertIn("--exec_prefix=/var/lib", script)
-        self.assertIn("make -j2", script)
-        self.assertIn("'ltp/fsstress'", script)
-        self.assertIn("'ltp/fsx'", script)
-        self.assertIn("'src/feature'", script)
-        self.assertIn("'src/min_dio_alignment'", script)
+        self.assertIn("make -C lib;", script)
+        self.assertIn("make -j2 -C 'ltp' 'fsstress' 'fsx'", script)
+        self.assertIn("make -j2 -C 'src' 'feature' 'min_dio_alignment'", script)
+        self.assertNotIn("make -j2 'ltp/fsstress'", script)
 
     def test_tx_runner_builds_shell_test_with_matrix_image_as_scratch(self):
         with tempfile.TemporaryDirectory() as tmp:

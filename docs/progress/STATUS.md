@@ -1,3 +1,17 @@
+- 2026-08-09 (ext4 Tier 1 xfstests Docker preflight harness).
+  The clean `codex/ext4-worktree-reconciliation` worktree now generates the
+  pinned xfstests `configure` script before invoking it, builds its required
+  `lib/libtest.la`, and invokes selected helpers from their owning `ltp/` or
+  `src/` make directory rather than triggering top-level implicit rules. The
+  runner regression passed 12/12 and
+  `cargo xtask ext4 tier1 --preflight-live --preflight-report
+  target/ext4/reconciliation-preflight-after-helper-build.json` passed with
+  zero blockers. This proves only live-campaign prerequisites; it does not
+  start a 1000-cut campaign or create an acceptance receipt. Next: finish the
+  pending Linux-generated depth-three and exchanged-image evidence, then select
+  a timestamped candidate run id. See
+  `docs/progress/research/2026-08-09-ext4-tier1-xfstests-preflight.md`.
+
 - 2026-08-09 (ext4 reconciliation A3 bounded indexed unwritten conversion).
   The clean `codex/ext4-worktree-reconciliation` worktree now turns one
   depth-0 through bounded depth-2 unwritten extent block into an initialized block during
