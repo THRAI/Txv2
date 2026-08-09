@@ -58,7 +58,7 @@ pub(super) struct BootArgs {
     pub(super) envp: &'static [&'static [u8]],
     pub(super) tty_winsize: Option<Winsize>,
     pub(super) test_init_requested: bool,
-    pub(super) mount_sdcard: bool,
+    pub(super) mount_sdcard_device: Option<&'static str>,
 }
 
 impl BootArgs {
@@ -76,7 +76,12 @@ impl BootArgs {
         let test_init_requested = cmdline
             .map(test_init_requested_from_cmdline_str)
             .unwrap_or(false);
-        let mount_sdcard = cmdline_value_str(cmdline.unwrap_or(""), "tx.mount.sdcard") != Some("0");
+        let mount_sdcard_device = match cmdline_value_str(cmdline.unwrap_or(""), "tx.mount.sdcard")
+        {
+            Some("0") => None,
+            Some(device) => Some(device),
+            None => Some("vda"),
+        };
 
         Self {
             mode,
@@ -84,7 +89,7 @@ impl BootArgs {
             envp,
             tty_winsize,
             test_init_requested,
-            mount_sdcard,
+            mount_sdcard_device,
         }
     }
 }
@@ -183,7 +188,13 @@ fn parse_init_from_cmdline_str(cmdline: &'static str) -> InitSpec {
 
 fn bootstrap_envp_from_cmdline_str(cmdline: &str) -> &'static [&'static [u8]] {
     if cmdline_has_profile_str(cmdline, "alpine") {
-        return &[b"PATH=/bin:/usr/bin:/sbin:/usr/sbin"];
+        return &[
+            b"PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+            b"HOME=/home",
+            b"TMPDIR=/tmp",
+            b"GIT_TEMPLATE_DIR=",
+            b"TERM=linux",
+        ];
     }
     &[b"PATH=/bin"]
 }
@@ -224,7 +235,7 @@ mod tests {
     use super::{
         boot_mode_from_cmdline_str, bootstrap_envp_from_cmdline_str, cmdline_has_profile_str,
         cmdline_value_str, parse_init_from_cmdline_str, test_init_requested_from_cmdline_str,
-        tty_winsize_from_cmdline_str, BootMode,
+        tty_winsize_from_cmdline_str, BootArgs, BootMode,
     };
     use tx_subsystems::tty::structure::Winsize;
 
@@ -263,7 +274,30 @@ mod tests {
     fn alpine_bootstrap_env_includes_usr_paths() {
         assert_eq!(
             bootstrap_envp_from_cmdline_str("tx.profile=alpine init=/bin/tx-bootstrap-busybox"),
-            &[b"PATH=/bin:/usr/bin:/sbin:/usr/sbin"]
+            &[
+                b"PATH=/bin:/usr/bin:/sbin:/usr/sbin".as_slice(),
+                b"HOME=/home".as_slice(),
+                b"TMPDIR=/tmp".as_slice(),
+                b"GIT_TEMPLATE_DIR=".as_slice(),
+                b"TERM=linux".as_slice(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sdcard_sidecar_device_defaults_disables_and_selects_named_device() {
+        assert_eq!(
+            BootArgs::from_cmdline(Some("tx.profile=busybox")).mount_sdcard_device,
+            Some("vda")
+        );
+        assert_eq!(
+            BootArgs::from_cmdline(Some("tx.mount.sdcard=0")).mount_sdcard_device,
+            None
+        );
+        assert_eq!(
+            BootArgs::from_cmdline(Some("tx.mount.sdcard=sda tx.profile=alpine"))
+                .mount_sdcard_device,
+            Some("sda")
         );
     }
 

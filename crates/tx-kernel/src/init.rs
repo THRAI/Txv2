@@ -485,7 +485,7 @@ static SYS_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.sys_mount");
 
 /// Global sdcard ext4 mount at `/musl`. Populated by
-/// `mount_sdcard_at_musl` when a `vda` block device is registered.
+/// `mount_sdcard_at_musl` when the selected block device is registered.
 /// Boards without a block device silently leave this `None`.
 static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.musl_mount");
@@ -933,8 +933,14 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_sysfs_at_sys();
             Self::mount_bdevfs_at_dev_block();
             let boot_plan = BootPlan::read::<P>();
-            if boot_plan.args.mount_sdcard {
-                Self::mount_sdcard_at_musl();
+            let runsh_lane = exec::cmdline_value::<P>("tx.runsh").is_some();
+            let alpine_sidecar = boot_plan.args.mode == boot_args::BootMode::Alpine;
+            if let Some(device_name) = boot_plan.args.mount_sdcard_device {
+                Self::mount_sdcard_at_musl(
+                    device_name,
+                    alpine_sidecar || runsh_lane,
+                    boot_plan.rootfs_setup == RootfsSetup::LegacyKernelShims && !runsh_lane,
+                );
             }
             publish_proc_mounts();
             // Scratch directories are runtime infrastructure, not image
@@ -945,10 +951,9 @@ impl<P: TxPlatform> CoreInit<P> {
             // shebang shims, `/tmp`, identity files, resolver databases. The
             // lane boots without a mode flag, so `BootPlan` classifies it as
             // `LinuxLike` and would skip all of that — and then git's helper
-            // spawn and the `overlay_image_dirs_for_runsh` bind mounts have
+            // spawn and the Alpine image-directory overlays have
             // nothing to attach to. The pre-merge tree had no such gate and
             // always populated; force the legacy behaviour for this lane.
-            let runsh_lane = exec::cmdline_value::<P>("tx.runsh").is_some();
             match boot_plan.rootfs_setup {
                 _ if runsh_lane => {
                     Self::populate_rootfs_shebang_shims();
@@ -2113,29 +2118,34 @@ impl<P: TxPlatform> CoreInit<P> {
 
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
     ///
-    /// If a `vda` block device is registered (RV64 QEMU virtio-blk
-    /// path), opens its ext4 image via `BlockDeviceImage`, mounts it
-    /// read-only, creates `/musl` in the rootfs tmpfs, and binds the
-    /// ext4 mount there. Boards without a block device silently skip.
+    /// The selected block device is opened via `BlockDeviceImage`, mounted,
+    /// and attached at `/musl`. Compatibility modes keep the historical
+    /// read-write OSComp layout; Alpine and `tx.runsh` use a read-only
+    /// sidecar so their source filesystem is never mutated.
     ///
     /// **Order invariant:** must follow `mount_devfs_at_dev` (ROOT_MOUNT
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
-    pub(crate) fn mount_sdcard_at_musl() {
+    pub(crate) fn mount_sdcard_at_musl(
+        requested_device: &'static str,
+        read_only: bool,
+        install_legacy_shims: bool,
+    ) {
         if ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
             return;
         }
 
         tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
+        use tx_fs::tx_ext4::{mount_ext4_read_only, mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
-        let Some(reg) = block_device_by_name(b"vda") else {
+        let Some(reg) = block_device_by_name(requested_device.as_bytes()) else {
             return;
         };
+        let device_name = reg.name;
 
         let image = BlockDeviceImage::new(reg.ops);
-        // Plain read-write mount, NOT the journal-discovering variant.
+        // Plain direct backend mount, NOT the journal-discovering variant.
         //
         // `mount_ext4_read_write_with_discovered_journal` attaches a backend
         // planner, which routes page fetches through the async io_manager
@@ -2151,7 +2161,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // Journalled writeback for this mount is given up in exchange; the
         // sdcard image is a test fixture, and the pre-merge tree ran the
         // same way.
-        let mount_output = match mount_ext4_read_write(image) {
+        let mount_output = match if read_only {
+            mount_ext4_read_only(image)
+        } else {
+            mount_ext4_read_write(image)
+        } {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -2217,9 +2231,15 @@ impl<P: TxPlatform> CoreInit<P> {
             mount_output.fs_page_backing().clone(),
             None,
             mount::allocate_dev_id(),
-            MountOptions::default(),
+            MountOptions {
+                flags: if read_only {
+                    MountFlags::READ_ONLY
+                } else {
+                    MountFlags::empty()
+                },
+            },
             "ext4",
-            SourceLabel::Static("vda"),
+            SourceLabel::Static(device_name),
         )
         .expect("mount_sdcard_at_musl: ext4 payload reservation");
 
@@ -2255,7 +2275,11 @@ impl<P: TxPlatform> CoreInit<P> {
             ext4_root_rnode,
             Some(root_mount),
             ext4_payload,
-            MountFlags::empty(),
+            if read_only {
+                MountFlags::READ_ONLY
+            } else {
+                MountFlags::empty()
+            },
         )
         .expect("mount_sdcard_at_musl: mount identity reservation");
 
@@ -2278,7 +2302,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // calls a handful of utilities by bare name (for example `cp hello
         // /tmp/hello`).  Publish those names as BusyBox symlinks so PATH
         // lookup observes the same applet contract as a normal BusyBox rootfs.
-        {
+        if install_legacy_shims {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
                 tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
@@ -2374,7 +2398,8 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        note_mount_line("/dev/vda /musl ext4 rw 0 0");
+        let mode = if read_only { "ro" } else { "rw" };
+        note_mount_line(&alloc::format!("/dev/{device_name} /musl ext4 {mode} 0 0"));
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:sdcard:ext4:ok\n");
     }
@@ -3482,8 +3507,8 @@ impl<P: TxPlatform> CoreInit<P> {
     /// (`/musl/usr` -> `/usr`, `/musl/lib` -> `/lib`, `/musl/bin` -> `/bin`,
     /// `/musl/sbin` -> `/sbin`) over the empty rootfs skeleton directories.
     ///
-    /// For the `tx.runsh` (on-site-finals git) lane only — call it from the
-    /// bootstrap path when `tx.runsh` is set.
+    /// Used by `tx.profile=alpine` and the legacy `tx.runsh` lane after the
+    /// initramfs has populated the tmpfs mountpoints.
     ///
     /// The image is mounted at `/musl`, but its binaries and its own *absolute*
     /// symlinks assume a real root layout: `/usr/bin/git`, `/bin/sh ->
@@ -3495,11 +3520,10 @@ impl<P: TxPlatform> CoreInit<P> {
     /// empty tmpfs dirs, so a plain top-level symlink can't take their place
     /// (EEXIST). Instead, mount the matching ext4 subtree over each empty
     /// skeleton dir, so the mounted image behaves as the root fs for the
-    /// helper-spawn paths git relies on. Gated to this lane, so the OSComp
-    /// tmpfs layout is untouched. Best-effort: a missing image dir or a backend
-    /// that would block is skipped rather than aborting boot. (Ported from
-    /// net-git e7992ef8 — git Task2.)
-    pub(super) fn overlay_image_dirs_for_runsh() {
+    /// helper-spawn paths Git relies on. The caller gates this away from the
+    /// OSComp tmpfs layout. Best-effort: a missing image dir is skipped rather
+    /// than aborting boot.
+    pub(super) fn overlay_alpine_image_dirs() {
         use step_engine::StepOutcome as V3;
         let Some(musl_mount) = MUSL_MOUNT.lock().clone() else {
             return;
@@ -3511,6 +3535,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
         let ext4_payload = ext4_payload.into_cap();
+        let overlay_flags = musl_mount.flags();
         let ext4_fs_ops = ext4_payload.fs_ops.clone();
         let ext4_root_id = musl_mount.root().fs_object_id();
         let Ok(rootfs_payload) = root_mount.payload_cap() else {
@@ -3585,7 +3610,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 ext4_sub_rnode,
                 Some(root_mount.clone()),
                 ext4_payload.clone(),
-                MountFlags::empty(),
+                overlay_flags,
             ) else {
                 continue;
             };
@@ -3594,7 +3619,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 mnt_ns.register_mount(&mountpoint_dentry, overlay_mount);
             }
             Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":runsh:overlay:");
+            tx_hal::console_write_str::<P>(":alpine:overlay:");
             tx_hal::console_write_bytes::<P>(name);
             tx_hal::console_write_str::<P>(":ok\n");
         }

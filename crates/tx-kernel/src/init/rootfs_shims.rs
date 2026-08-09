@@ -180,9 +180,42 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
+    /// Publish the Alpine CA directory without covering the writable tmpfs
+    /// `/etc`. DNS configuration can then be written to `/etc/resolv.conf`,
+    /// while TLS consumers see the image's `/etc/ssl/cert.pem` through the
+    /// sidecar mounted at `/musl`.
+    pub(crate) fn populate_alpine_sidecar_links() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("populate_alpine_sidecar_links: ROOT_MOUNT must be populated");
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+        let cred = Credential::root();
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let fs_ops = &rootfs_payload.fs_ops;
+
+        let Some(etc_id) = mkdir_or_find(fs_ops, root_fs_object_id, b"etc", 0o755, &cred) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":alpine:links:err:mkdir-etc\n");
+            return;
+        };
+        let ok = symlink_into(fs_ops, etc_id, b"ssl", b"/musl/etc/ssl", &cred);
+        Self::write_board_sentinel_prefix();
+        if ok {
+            tx_hal::console_write_str::<P>(":alpine:links:ok\n");
+        } else {
+            tx_hal::console_write_str::<P>(":alpine:links:err:ssl\n");
+        }
+    }
+
     /// Populate the rootfs tmpfs with the writable scratch
     /// directories that POSIX-shaped userspace expects to exist.
-    /// Today this covers `/tmp/`, `/var/`, and `/var/tmp/`.
+    /// Today this covers `/tmp/`, `/var/`, `/var/tmp/`, `/home/`, and
+    /// `/proj/`.
     ///
     /// **Why this exists.** The OSComp `lmbench-musl` suite (and
     /// many libc/libctest tests) `open(O_RDWR|O_CREAT, "/var/tmp/…")`
@@ -245,6 +278,17 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-var-tmp\n");
             return;
+        }
+
+        // Writable Alpine home and scoring workspace. The ext4 image remains
+        // read-only at /musl; repositories and credentials must stay on the
+        // disposable tmpfs root.
+        for name in [b"home".as_slice(), b"proj".as_slice()] {
+            if mkdir_or_find(fs_ops, root_fs_object_id, name, 0o755, &cred).is_none() {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-workspace\n");
+                return;
+            }
         }
 
         // /var/run/netns — LTP's `init_ltp_netspace` symlinks the network

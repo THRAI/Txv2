@@ -276,6 +276,12 @@ impl<P: TxPlatform> CoreInit<P> {
         // Bootstrap exec runs as init (root) by construction.
         let cred = Credential::root();
         let boot_plan = BootPlan::read::<P>();
+        let alpine_sidecar = boot_plan.args.mode == super::boot_args::BootMode::Alpine
+            && super::MUSL_MOUNT.lock().is_some();
+        if alpine_sidecar {
+            Self::overlay_alpine_image_dirs();
+            Self::populate_alpine_sidecar_links();
+        }
 
         // When the sdcard ext4 mount is present (RV64 QEMU with vda),
         // exec busybox sh to run the oscomp basic-musl test suite.
@@ -371,7 +377,10 @@ impl<P: TxPlatform> CoreInit<P> {
                 // index-pack/upload-pack) assume a real root layout. Bind-mount
                 // the image's /usr,/lib,/bin,/sbin subtrees over the empty rootfs
                 // skeleton so the image behaves as the root fs. Gated to this lane.
-                Self::overlay_image_dirs_for_runsh();
+                if !alpine_sidecar {
+                    Self::overlay_alpine_image_dirs();
+                    Self::populate_alpine_sidecar_links();
+                }
                 let envp: &[&[u8]] = &[
                     b"PATH=/musl/usr/bin:/musl/bin:/musl/usr/sbin:/musl/sbin:/usr/bin:/bin",
                     b"LD_LIBRARY_PATH=/musl/usr/lib:/musl/lib",

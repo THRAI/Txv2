@@ -606,7 +606,9 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     if layout.exists() {
         fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
     }
-    for dir in ["bin", "dev", "etc", "lib", "proc", "sys", "tmp", "usr/bin"] {
+    for dir in [
+        "bin", "dev", "etc", "lib", "proc", "sbin", "sys", "tmp", "usr/bin",
+    ] {
         fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
     }
     fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
