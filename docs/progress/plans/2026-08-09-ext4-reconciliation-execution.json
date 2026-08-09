@@ -2,7 +2,7 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-08-09-ext4-reconciliation-execution",
   "title": "Execute four-worktree ext4 reconciliation as current Tier 2 slices",
-  "status": "active",
+  "status": "complete",
   "created": "2026-08-09",
   "updated": "2026-08-09",
   "owner": "codex/root",
@@ -18,17 +18,14 @@
       "tools/ext4",
       "tools/shell-tests",
       "tools/io-submission-perf.py",
-      "tools/tests",
-      "docs/progress"
+      "tools/tests"
     ],
     "out": [
-      "whole historical worktree merges",
-      "broad cherry-pick ranges",
-      "VFS, Mount, PageBacked, VM, or device trait changes without a design update",
-      "historical direct pager home writes, JournalFsyncSource lifecycle, or caller-managed journal discard",
-      "multiple outstanding transactions or cross-transaction revoke replay",
-      "global QEMU memory or tmpfs defaults",
-      "Tier 2 claims without Linux-visible compatibility and crash evidence"
+      "crates/tx-subsystems/src/vfs",
+      "crates/tx-subsystems/src/mount",
+      "crates/tx-subsystems/src/page_backed",
+      "crates/tx-subsystems/src/vm",
+      "docs/design"
     ],
     "write_sets": [
       {
@@ -51,13 +48,6 @@
           "tools/tests"
         ],
         "notes": "Own the bounded HAL, guest geometry, resolver, WORKLOAD-image, and evidence closure without editing ext4 or shared PageBacked owners."
-      },
-      {
-        "owner": "reconciliation-coordinator",
-        "paths": [
-          "docs/progress"
-        ],
-        "notes": "Own plan state, research, STATUS catch-up, acceptance boundary, and final disposition."
       }
     ]
   },

@@ -3,7 +3,7 @@
   "id": "2026-08-08-ext4-worktree-reconciliation",
   "created": "2026-08-08",
   "updated": "2026-08-09",
-  "status": "active",
+  "status": "merged",
   "branch": "codex/ext4-worktree-reconciliation",
   "path": "/Users/3y/.config/superpowers/worktrees/Tx/ext4-worktree-reconciliation",
   "base": "codex/test-remote-network",
