@@ -166,7 +166,7 @@
         "cargo test -p tx-ext4-format -- --test-threads=1",
         "cargo -q xtask unit"
       ],
-      "notes": "Depth-0 through bounded depth-2 unwritten conversion is host-verified: full depth-1 leaves split, full inode roots grow one level, and depth-2 leaves split, carry a full parent into a non-full root, or promote a full inode root into two depth-two nodes behind a depth-three inode root. Depth-3+ conversion remains fail closed."
+      "notes": "Depth-0 through bounded depth-3 unwritten conversion is host-verified: full depth-1 leaves split, full inode roots grow one level, depth-2 leaves split/carry/promote, and a depth-3 path converts a non-overflowing leaf through checked ancestor descent. Depth-3+ leaf splits remain fail closed."
     },
     {
       "id": "a3-a5-tier2-extent-planners",
@@ -186,7 +186,7 @@
         "recursive truncate/destroy emits descendant-first after-images and revoke order with root collapse",
         "Linux debugfs bmap comparison and Docker-backed e2fsck -fn cover fragmented depth-2 and depth-3 fixtures"
       ],
-      "notes": "Depth-0 through bounded depth-2 unwritten conversion and bounded recursive truncate/destroy release are now host-verified. Recursive release validates depth/key ordering/cycles and reserved or overlapping physical ranges, emits descendant-first extent-node after-images, updates merged allocation metadata, and retains sorted revoke/deferred-free claims. A Docker debugfs fixture now creates a real depth-two unwritten tree, converts it through Tx after-images, recursively truncates it, compares its retained debugfs bmap, and passes e2fsck -fn. The same fixture now proves unlink -> destroy e2fsck cleanliness; a bounded depth-three mock proves recursive truncate revokes all descendant nodes. The full depth-two root carry is now host-verified: splitting a full leaf and parent produces four metadata-node claims and promotes the inode root to depth three. Depth-3+ conversion and crash cuts remain pending; do not add depth-specific runtime shortcuts."
+      "notes": "Depth-0 through bounded depth-3 unwritten conversion and bounded recursive truncate/destroy release are now host-verified. Recursive release validates depth/key ordering/cycles and reserved or overlapping physical ranges, emits descendant-first extent-node after-images, updates merged allocation metadata, and retains sorted revoke/deferred-free claims. A Docker debugfs fixture now creates a real depth-two unwritten tree, converts it through Tx after-images, recursively truncates it, compares its retained debugfs bmap, and passes e2fsck -fn. The same fixture now proves unlink -> destroy e2fsck cleanliness; a bounded depth-three mock proves recursive truncate revokes all descendant nodes. The full depth-two root carry is now host-verified: splitting a full leaf and parent produces four metadata-node claims and promotes the inode root to depth three. A checked depth-three descent now converts a non-overflowing leaf without allocation. Linux-generated depth-three shape, leaf splits at that depth, and crash cuts remain pending; do not add depth-specific runtime shortcuts."
     },
     {
       "id": "a6-runtime-lowering-and-tier2-evidence",
@@ -313,6 +313,11 @@
       "command": "cargo test -p tx-ext4-format --test pager_mock pager_grows_full_depth_two_root_for_unwritten_leaf_without_data_claim -- --exact --test-threads=1",
       "status": "passed",
       "notes": "A full depth-two root now promotes into two depth-two extent nodes and a depth-three inode root with four metadata-only claims; the source homes remain unchanged."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format --test pager_mock pager_converts_depth_three_unwritten_leaf_without_new_claims -- --exact --test-threads=1",
+      "status": "passed",
+      "notes": "A depth-three root -> index -> index -> leaf path is descended with depth and layout validation; a non-overflowing unwritten leaf converts in place with one extent-node after-image and no allocation claim."
     },
     {
       "command": "cargo xtask progress validate",

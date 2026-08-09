@@ -147,3 +147,22 @@ and the full `cargo test -p tx-ext4-format -- --test-threads=1` suite passed.
 Boundary remains explicit: follow-on depth-3+ unwritten conversion, crash-cut
 campaigns, and candidate acceptance remain pending. These host planner and
 runtime regressions do not establish Tier 2 or production compatibility.
+
+## Depth-Three Descent Update
+
+`plan_write_page` now descends depth-three through the existing index path with
+per-node depth/layout validation and a cycle guard. When the selected leaf has
+capacity, conversion reuses the physical block and emits one extent-node
+after-image without allocation or inode-root mutation. A leaf overflow still
+returns `Unsupported` until the complete ancestor carry plan is implemented.
+
+`pager_converts_depth_three_unwritten_leaf_without_new_claims` proves the
+root -> index -> index -> leaf path, exact prefix/initialized/suffix extents,
+unchanged source homes, and zero allocation claims. The full format suite now
+passes 59 pager-mock tests plus all host-tool and journal tests.
+
+The existing Docker fixture remains intentionally depth-two: a Linux-generated
+depth-three tree requires each depth-one parent to carry 340 leaf children and
+the depth-two root to carry four such parents, which is a materially larger
+shape than the current 64 MiB fixture. This is a compatibility-evidence gap,
+not permission to infer Linux depth-three support from the mock.

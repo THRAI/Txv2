@@ -32182,3 +32182,13 @@
   and cross-runtime compatibility evidence remain required; no Tier 2 or
   production acceptance is claimed. See
   `docs/progress/research/2026-08-09-ext4-reconciliation-a3-inline-unwritten-conversion.md`.
+
+- 2026-08-09 (ext4 reconciliation depth-three unwritten descent).
+  `plan_write_page` now descends a checked depth-three extent path and converts
+  a non-overflowing unwritten leaf in place. The path validates each ancestor's
+  expected depth and key layout, rejects child-home cycles, preserves the
+  physical mapping, and emits only the leaf after-image. Verification passed
+  the new focused pager regression and the full `tx-ext4-format` suite (59
+  pager-mock tests plus journal/host-tool tests). Linux-generated depth-three
+  shape and leaf-split evidence remain open; the current Docker fixture is
+  intentionally depth-two because the required fanout is much larger.

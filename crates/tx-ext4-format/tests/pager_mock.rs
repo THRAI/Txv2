@@ -1818,6 +1818,90 @@ fn pager_grows_full_depth_two_root_for_unwritten_leaf_without_data_claim() {
 }
 
 #[test]
+fn pager_converts_depth_three_unwritten_leaf_without_new_claims() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 53);
+    let leaf_before = {
+        let leaf = image.block_mut(52);
+        ExtentNode::encode_leaf(
+            &[Extent {
+                logical_block: 0,
+                len: Extent::UNINITIALIZED_MASK | 3,
+                physical_start: 1000,
+            }],
+            leaf,
+        )
+        .unwrap();
+        *leaf
+    };
+    ExtentNode::encode_index(
+        1,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 52,
+        }],
+        image.block_mut(51),
+    )
+    .unwrap();
+    ExtentNode::encode_index(
+        2,
+        &[ExtentIdx {
+            logical_block: 0,
+            child: 51,
+        }],
+        image.block_mut(50),
+    )
+    .unwrap();
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o644;
+    inode.size = 4 * BLOCK_SIZE as u64;
+    inode.blocks_512 = 24;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_index_root(
+            &[ExtentIdx {
+                logical_block: 0,
+                child: 50,
+            }],
+            3,
+        )
+        .unwrap();
+    write_inode(&mut image, 12, &inode);
+    let inode_before = *image.block(4);
+    let parent_before = *image.block(50);
+    let intermediate_before = *image.block(51);
+    let bitmap_before = *image.block(2);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 1, &filled_page(0xD8), FsyncStamp::new(61))
+        .unwrap();
+
+    assert_eq!(plan.data[0].physical_block, 1001);
+    assert!(plan.allocations.is_empty());
+    assert_eq!(plan.metadata.len(), 1);
+    let after = &plan.metadata[0];
+    assert_eq!(after.home, 52);
+    let converted = match ExtentNode::parse(&after.after).unwrap() {
+        ExtentNode::Leaf(extents) => extents,
+        ExtentNode::Index(_) => panic!("depth-three conversion must retain a leaf"),
+    };
+    assert_eq!(converted[0].logical_block, 0);
+    assert_eq!(converted[0].len, Extent::UNINITIALIZED_MASK | 1);
+    assert_eq!(converted[1].logical_block, 1);
+    assert_eq!(converted[1].len, 1);
+    assert_eq!(converted[1].physical_start, 1001);
+    assert_eq!(converted[2].logical_block, 2);
+    assert_eq!(converted[2].len, Extent::UNINITIALIZED_MASK | 1);
+    assert_eq!(pager.image().block(4), &inode_before);
+    assert_eq!(pager.image().block(50), &parent_before);
+    assert_eq!(pager.image().block(51), &intermediate_before);
+    assert_eq!(pager.image().block(52), &leaf_before);
+    assert_eq!(pager.image().block(2), &bitmap_before);
+}
+
+#[test]
 fn destroy_plan_frees_zero_link_regular_inode_without_home_write() {
     let mut image = mock_image();
     mark_block_bitmap_used(&mut image, 31);
