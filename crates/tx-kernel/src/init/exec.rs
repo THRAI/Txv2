@@ -749,24 +749,12 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     pub(super) fn drain_sbi_console_into_tty() -> usize {
-        // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
-        // command lines in a single SBI poll. The 64-byte cap left the
-        // 17-byte tail of an 81-character `ln -s` line stranded in the
-        // UART FIFO until the PLIC RX IRQ fired; the IRQ-deferred drain
-        // path then re-entered `step_ingest` and the `wait_channel.fire`
-        // it issued did not propagate to the parked `sys_read` task
-        // (root cause still under investigation — see the
-        // `tools/shell-tests/busybox-extended.txt` links/chmod-stat
-        // groups). Bumping the SBI buffer ensures most realistic shell
-        // input fits in one `step_ingest` call so the proven SBI-direct
-        // path handles it. The IRQ path stays in place so a quiescent
-        // WFI still wakes promptly when bytes arrive.
-        let mut buf = [0u8; 512];
-        let n = crate::irq::try_read_console_bytes::<P>(&mut buf);
-        if n == 0 {
-            return 0;
-        }
-        ingest_console_tty_bytes::<P>(&buf[..n])
+        // Polling is a firmware/IRQ fallback, but it must join the same ordered
+        // pending FIFO as the IRQ top half. BSP and AP reactors can both reach
+        // this path; submitting the polled chunk directly would let it overtake
+        // an earlier chunk already buffered by the interrupt handler.
+        let _ = crate::irq::poll_console_rx_into_pending::<P>();
+        crate::irq::drain_uart_rx_pending::<P>()
     }
 
     pub(super) fn run_userspace_reactor_loop() {

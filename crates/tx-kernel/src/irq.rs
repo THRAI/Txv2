@@ -97,6 +97,48 @@ impl UartRxPending {
 static UART_RX_PENDING: SpinMutex<UartRxPending> =
     spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
 
+/// Single task-context owner for the pending-buffer-to-TTY handoff.
+///
+/// Both BSP and AP reactors drain device bottom halves. The pending lock only
+/// serializes the snapshot: without a wider owner, one hart can snapshot an
+/// earlier chunk, lose the race into the line discipline, and submit it after
+/// a later chunk. Contenders must not spin because the owner may be running on
+/// another hart and may itself need cross-hart progress.
+static CONSOLE_RX_INGEST_OWNED: AtomicBool = AtomicBool::new(false);
+
+struct ConsoleRxIngestGuard;
+
+impl Drop for ConsoleRxIngestGuard {
+    fn drop(&mut self) {
+        CONSOLE_RX_INGEST_OWNED.store(false, Ordering::Release);
+    }
+}
+
+fn try_acquire_console_rx_ingest() -> Option<ConsoleRxIngestGuard> {
+    CONSOLE_RX_INGEST_OWNED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| ConsoleRxIngestGuard)
+}
+
+fn pending_uart_rx_nonempty<P: IrqIf>() -> bool {
+    let _local_execution = P::exclude_local_execution();
+    UART_RX_PENDING.lock().len != 0
+}
+
+fn restore_pending_uart_rx_front<P: IrqIf>(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let _local_execution = P::exclude_local_execution();
+    let mut pending = UART_RX_PENDING.lock();
+    let restore_len = bytes.len().min(UART_RX_PENDING_CAP);
+    let retained_new = pending.len.min(UART_RX_PENDING_CAP - restore_len);
+    pending.bytes.copy_within(..retained_new, restore_len);
+    pending.bytes[..restore_len].copy_from_slice(&bytes[..restore_len]);
+    pending.len = restore_len + retained_new;
+}
+
 /// Non-blocking single-reader ownership for the platform console RX source.
 ///
 /// The UART IRQ top half and the reactor's polling fallback both call
@@ -341,6 +383,7 @@ pub fn reset_pending_uart_rx_for_test() {
     let mut pending = UART_RX_PENDING.lock();
     pending.len = 0;
     CONSOLE_RX_READER_OWNED.store(false, Ordering::Release);
+    CONSOLE_RX_INGEST_OWNED.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -523,22 +566,22 @@ pub fn rtc_alarm_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
 /// for spurious or already-drained IRQs.  Returns
 /// The handler is installed only after the console TTY is published, so the
 /// top half does not acquire the task-context console-cap lock.
-pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
+fn buffer_console_rx<P: ConsoleIf, const DRAIN_MAX: usize>() -> usize {
     // IRQ context must never wait for a task-context holder on another hart.
     // Leave the FIFO untouched on contention so its level condition retriggers
     // after the short deferred-drain critical section releases the lock.
     let Some(mut pending) = UART_RX_PENDING.try_lock() else {
-        return IrqHandled::Done;
+        return 0;
     };
     let space = UART_RX_PENDING_CAP - pending.len;
     if space == 0 {
-        return IrqHandled::Done;
+        return 0;
     }
-    let mut buf = [0u8; UART_RX_DRAIN_MAX];
-    let n = try_read_console_bytes::<P>(&mut buf[..space.min(UART_RX_DRAIN_MAX)]);
+    let mut buf = [0u8; DRAIN_MAX];
+    let n = try_read_console_bytes::<P>(&mut buf[..space.min(DRAIN_MAX)]);
     if n == 0 {
         // Spurious IRQ or FIFO already drained.
-        return IrqHandled::Done;
+        return 0;
     }
     // Buffer bytes for non-IRQ ingestion. Bytes that overflow the
     // pending buffer (UART_RX_PENDING_CAP) are silently dropped — this
@@ -548,7 +591,22 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
     let end = start + n;
     pending.bytes[start..end].copy_from_slice(&buf[..n]);
     pending.len = end;
-    IrqHandled::Wake
+    n
+}
+
+pub fn uart_rx_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
+    if buffer_console_rx::<P, UART_RX_DRAIN_MAX>() == 0 {
+        IrqHandled::Done
+    } else {
+        IrqHandled::Wake
+    }
+}
+
+/// Poll the console FIFO into the same ordered buffer used by the IRQ top
+/// half. Direct polling must not bypass pending bytes and submit a newer chunk
+/// to the TTY first.
+pub(crate) fn poll_console_rx_into_pending<P: ConsoleIf>() -> usize {
+    buffer_console_rx::<P, UART_RX_PENDING_CAP>()
 }
 
 /// Drain any bytes buffered by `uart_rx_irq_handler` into the boot
@@ -566,25 +624,68 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
 /// the SBI poll buffer fills first. See the 2026-05-13 sizing note on
 /// `drain_sbi_console_into_tty` for why we keep both paths.
 pub(crate) fn drain_uart_rx_pending<P: tx_hal::TxPlatform>() -> usize {
-    // Snapshot and clear the pending buffer under the lock, then
-    // release before calling step_ingest (which takes its own locks).
-    let (bytes, n) = {
-        // The UART top half takes this same lock in IRQ context. Exclude local
-        // interrupt execution while task context owns it, otherwise a UART
-        // interrupt on this hart can spin forever on the interrupted holder.
-        let _local_execution = <P as IrqIf>::exclude_local_execution();
-        let mut pending = UART_RX_PENDING.lock();
-        if pending.len == 0 {
-            return 0;
-        }
-        let mut snapshot = [0u8; UART_RX_PENDING_CAP];
-        snapshot[..pending.len].copy_from_slice(&pending.bytes[..pending.len]);
-        let n = pending.len;
-        pending.len = 0;
-        (snapshot, n)
+    // The boot console is a singleton routed to the boot hart on the supported
+    // SMP platforms. Keep its deferred line-discipline and echo path on that
+    // same hart: an AP may help run the reactor, but it must not take console
+    // ownership between two CPU0 UART interrupts.
+    if <P as tx_hal::SmpIf>::current_cpu_id().0 != 0 {
+        return 0;
+    }
+
+    let Some(ingest_owner) = try_acquire_console_rx_ingest() else {
+        return 0;
     };
 
-    crate::init::ingest_console_tty_bytes::<P>(&bytes[..n])
+    let mut ingest_owner = Some(ingest_owner);
+    let mut processed = 0usize;
+    loop {
+        // Snapshot and clear the pending buffer under the lock, then release
+        // before calling step_ingest (which takes its own locks). Keep the
+        // wider ingest ownership until every chunk observed here is submitted,
+        // so another reactor cannot overtake this one between snapshots.
+        let Some((bytes, n)) = (|| {
+            // The UART top half takes this same lock in IRQ context. Exclude
+            // local interrupt execution while task context owns it, otherwise
+            // a UART interrupt on this hart can spin forever on the interrupted
+            // holder.
+            let local_execution = <P as IrqIf>::exclude_local_execution();
+            let mut pending = UART_RX_PENDING.lock();
+            if pending.len == 0 {
+                return None;
+            }
+            let mut snapshot = [0u8; UART_RX_PENDING_CAP];
+            snapshot[..pending.len].copy_from_slice(&pending.bytes[..pending.len]);
+            let n = pending.len;
+            pending.len = 0;
+            // End the IRQ-off section before the 512-byte snapshot is moved
+            // into the closure result.
+            drop(pending);
+            drop(local_execution);
+            Some((snapshot, n))
+        })() else {
+            // Release before the final recheck. A producer that appended
+            // before this release may have woken a contender that observed us
+            // as the owner and returned; the recheck either reclaims ownership
+            // and drains that byte or observes a successor already doing so.
+            drop(ingest_owner.take());
+            if !pending_uart_rx_nonempty::<P>() {
+                break;
+            }
+            let Some(next_owner) = try_acquire_console_rx_ingest() else {
+                break;
+            };
+            ingest_owner = Some(next_owner);
+            continue;
+        };
+
+        let consumed = crate::init::ingest_console_tty_bytes::<P>(&bytes[..n]);
+        processed = processed.saturating_add(consumed);
+        if consumed != n {
+            restore_pending_uart_rx_front::<P>(&bytes[consumed.min(n)..n]);
+            break;
+        }
+    }
+    processed
 }
 
 #[cfg(test)]

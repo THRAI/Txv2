@@ -214,8 +214,13 @@ const UART_LSR: usize = 5;
 const UART_LSR_DR: u8 = 1 << 0;
 const UART_LSR_THRE: u8 = 1 << 5;
 const UART_LSR_TEMT: u8 = 1 << 6;
+const UART_FCR_ENABLE_FIFO: u8 = 1 << 0;
+const UART_FCR_CLEAR_TX: u8 = 1 << 2;
 const UART_LCR_DLAB: u8 = 1 << 7;
 const UART_DIVISOR_125MHZ_115200: u16 = 68;
+const UART_PORT_OWNER_WAIT_LIMIT: usize = 100_000;
+const UART_TX_READY_WAIT_LIMIT: usize = 100_000;
+const UART_TX_RECOVERY_WAIT_LIMIT: usize = 10_000;
 
 const fn la64_addi_d(rd: u32, rj: u32, imm12: u32) -> u32 {
     0x02c0_0000 | ((imm12 & 0x0fff) << 10) | ((rj & 0x1f) << 5) | (rd & 0x1f)
@@ -231,6 +236,7 @@ static LA64_CPU_PIN_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
     [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
 static LA2K1000_UART_IRQ_OBSERVED: AtomicBool = AtomicBool::new(false);
+static LA2K1000_UART_PORT_OWNED: AtomicBool = AtomicBool::new(false);
 /// LA64 supports a 10-bit ASID space (`ASID_BITS = 10`, `LA64_ASID_MASK =
 /// 0x3ff`), i.e. 1024 ASIDs. The allocator must cover that whole space so that
 /// EBR-deferred address-space reclaim (retired-but-not-yet-freed `PmapRoot`s
@@ -764,27 +770,98 @@ fn la64_test_restored_fp_context() -> UserFpContext {
         .expect("LA64 restored FP test mutex poisoned")
 }
 
-fn uart_put_byte(byte: u8) {
-    let base = la64_uncached_virt(LA2K1000_UART_BASE) as *mut u8;
-    let mut wait = tx_hal::TlbProgressSpinWait::new();
-    unsafe {
-        while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
-            wait.spin_with(|| {
-                la64_pmap::service_la64_pending_tlb_shootdown();
-            });
-        }
-        core::ptr::write_volatile(base.add(UART_THR), byte);
+struct UartPortOwner;
+
+impl Drop for UartPortOwner {
+    fn drop(&mut self) {
+        LA2K1000_UART_PORT_OWNED.store(false, Ordering::Release);
     }
+}
+
+fn try_acquire_uart_port_owner() -> Option<UartPortOwner> {
+    LA2K1000_UART_PORT_OWNED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| UartPortOwner)
+}
+
+fn acquire_uart_port_owner() -> Option<(LocalExecutionGuard, UartPortOwner)> {
+    let mut wait = tx_hal::TlbProgressSpinWait::new();
+    for _ in 0..UART_PORT_OWNER_WAIT_LIMIT {
+        let local_execution = <Platform as IrqIf>::exclude_local_execution();
+        if let Some(owner) = try_acquire_uart_port_owner() {
+            return Some((local_execution, owner));
+        }
+        drop(local_execution);
+        wait.spin_with(|| {
+            la64_pmap::service_la64_pending_tlb_shootdown();
+        });
+    }
+    None
+}
+
+fn wait_for_uart_tx_ready_with<R, P>(limit: usize, mut read_lsr: R, mut progress: P) -> bool
+where
+    R: FnMut() -> u8,
+    P: FnMut(),
+{
+    let mut wait = tx_hal::TlbProgressSpinWait::new();
+    for _ in 0..limit {
+        if read_lsr() & UART_LSR_THRE != 0 {
+            return true;
+        }
+        wait.spin_with(&mut progress);
+    }
+    false
+}
+
+fn uart_put_byte(byte: u8) {
+    let Some((local_execution, owner)) = acquire_uart_port_owner() else {
+        return;
+    };
+    let base = la64_uncached_virt(LA2K1000_UART_BASE) as *mut u8;
+    unsafe {
+        let mut ready = wait_for_uart_tx_ready_with(
+            UART_TX_READY_WAIT_LIMIT,
+            || core::ptr::read_volatile(base.add(UART_LSR)),
+            || {
+                la64_pmap::service_la64_pending_tlb_shootdown();
+            },
+        );
+        if !ready {
+            core::ptr::write_volatile(base.add(UART_FCR), UART_FCR_ENABLE_FIFO | UART_FCR_CLEAR_TX);
+            la64_irq_trap::la64_dbar();
+            ready = wait_for_uart_tx_ready_with(
+                UART_TX_RECOVERY_WAIT_LIMIT,
+                || core::ptr::read_volatile(base.add(UART_LSR)),
+                || {
+                    la64_pmap::service_la64_pending_tlb_shootdown();
+                },
+            );
+        }
+        if ready {
+            core::ptr::write_volatile(base.add(UART_THR), byte);
+            la64_irq_trap::la64_dbar();
+        }
+    }
+    // A pending UART IRQ may run as soon as local execution is restored. Make
+    // the port available to that handler before opening the interrupt window.
+    drop(owner);
+    drop(local_execution);
 }
 
 fn uart_try_get_byte() -> Option<u8> {
     #[cfg(target_arch = "loongarch64")]
-    unsafe {
+    {
+        let (local_execution, owner) = acquire_uart_port_owner()?;
         let base = la64_uncached_virt(LA2K1000_UART_BASE) as *const u8;
-        if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_DR == 0 {
-            return None;
-        }
-        Some(core::ptr::read_volatile(base.add(UART_RBR)))
+        let byte = unsafe {
+            let lsr = core::ptr::read_volatile(base.add(UART_LSR));
+            (lsr & UART_LSR_DR != 0).then(|| core::ptr::read_volatile(base.add(UART_RBR)))
+        };
+        drop(owner);
+        drop(local_execution);
+        byte
     }
     #[cfg(not(target_arch = "loongarch64"))]
     {
@@ -1273,6 +1350,11 @@ impl ConsoleIf for Platform {
     }
 
     fn read_bytes(buf: &mut [u8]) -> usize {
+        // UART0 and its LIOINTC route are owned by CPU0. AP reactor polling
+        // must not race the routed top half for the same physical FIFO.
+        if <Self as SmpIf>::current_cpu_id().0 != 0 {
+            return 0;
+        }
         let mut count = 0;
         for slot in buf {
             let Some(byte) = uart_try_get_byte() else {
@@ -1308,6 +1390,55 @@ mod la64_unaligned;
 mod platform_impls;
 #[path = "../../tx-hal-loongarch64-common/src/trap_asm.rs"]
 mod trap_asm;
+
+#[cfg(test)]
+mod uart_tx_tests {
+    use super::*;
+
+    #[test]
+    fn uart_port_owner_is_exclusive_and_released_by_guard() {
+        LA2K1000_UART_PORT_OWNED.store(false, Ordering::Release);
+        let owner = try_acquire_uart_port_owner().expect("first UART port owner");
+        assert!(try_acquire_uart_port_owner().is_none());
+        drop(owner);
+        let owner = try_acquire_uart_port_owner().expect("UART port owner after release");
+        drop(owner);
+    }
+
+    #[test]
+    fn uart_tx_ready_wait_stops_at_the_supplied_limit() {
+        let mut reads = 0usize;
+        let mut progress = 0usize;
+        assert!(!wait_for_uart_tx_ready_with(
+            5,
+            || {
+                reads += 1;
+                0
+            },
+            || progress += 1,
+        ));
+        assert_eq!(reads, 5);
+        assert_eq!(progress, 1);
+    }
+
+    #[test]
+    fn uart_tx_ready_wait_returns_on_thre() {
+        let mut reads = 0usize;
+        assert!(wait_for_uart_tx_ready_with(
+            5,
+            || {
+                reads += 1;
+                if reads == 3 {
+                    UART_LSR_THRE
+                } else {
+                    0
+                }
+            },
+            || {},
+        ));
+        assert_eq!(reads, 3);
+    }
+}
 
 #[cfg(test)]
 mod device_resource_tests {

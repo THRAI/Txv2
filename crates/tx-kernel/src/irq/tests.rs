@@ -27,9 +27,10 @@ use tx_hal::{
 
 use crate::init::{console_tty, CoreInit};
 use crate::irq::{
-    drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats, publish_deferred_net_claim,
-    register_irq_handler, rtc_alarm_irq_handler, try_read_console_bytes, uart_rx_irq_handler,
-    UART_RX_PENDING,
+    drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats,
+    poll_console_rx_into_pending, publish_deferred_net_claim, register_irq_handler,
+    rtc_alarm_irq_handler, try_acquire_console_rx_ingest, try_read_console_bytes,
+    uart_rx_irq_handler, UART_RX_PENDING,
 };
 use crate::test_serialise::KERNEL_TEST_LOCK as IRQ_TEST_LOCK;
 use tx_subsystems::device_binding::BoundDeviceKey;
@@ -736,8 +737,8 @@ fn dispatch_irq_routes_uart_rx_to_tty_deferred_ingest() {
     assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
     assert_eq!(
         IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire),
-        exclusions_before + 1,
-        "task-context UART pending lock must exclude its local IRQ top half",
+        exclusions_before + 3,
+        "the snapshot, final empty check, and owner-release handoff recheck must exclude the local IRQ top half",
     );
 
     // Normal-context drain should now contain the committed line.
@@ -784,6 +785,85 @@ fn uart_rx_irq_leaves_fifo_untouched_when_pending_buffer_is_contended() {
         CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
         2,
     );
+}
+
+#[test]
+fn console_rx_polling_cannot_overtake_an_irq_buffered_chunk() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+
+    let ingest_owner = try_acquire_console_rx_ingest().expect("test owns deferred ingest");
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"A");
+    }
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+        "a competing reactor must not enter the TTY ingest path",
+    );
+
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"B\n");
+    }
+    assert_eq!(poll_console_rx_into_pending::<IrqTestPlatform>(), 2);
+    drop(ingest_owner);
+
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        3,
+    );
+    let tty = console_tty().expect("console TTY");
+    let payload = tty.live_payload().expect("console TTY payload");
+    let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
+        let mut tmp = [0u8; 8];
+        let n = queue.drain_to_slice(&mut tmp);
+        tmp[..n].to_vec()
+    });
+    assert_eq!(snapshot, b"AB\n");
+}
+
+#[test]
+fn console_rx_deferred_ingest_stays_on_the_boot_hart() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"C\n");
+    }
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+
+    IRQ_TEST_CURRENT_CPU.store(1, Ordering::Release);
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+        "an AP reactor must leave the boot console's pending bytes untouched",
+    );
+
+    IRQ_TEST_CURRENT_CPU.store(0, Ordering::Release);
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        2,
+    );
+    let tty = console_tty().expect("console TTY");
+    let payload = tty.live_payload().expect("console TTY payload");
+    let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
+        let mut tmp = [0u8; 4];
+        let n = queue.drain_to_slice(&mut tmp);
+        tmp[..n].to_vec()
+    });
+    assert_eq!(snapshot, b"C\n");
 }
 
 #[test]
