@@ -99,7 +99,7 @@ use tx_shims::linux_syscall::numbers::{
 };
 use tx_shims::linux_syscall::SyscallResult;
 use tx_substrate::wake::MailboxSchedulerHint;
-use tx_subsystems::process::ProcessIdentity;
+use tx_subsystems::process::{ExitStatus, ProcessIdentity};
 use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::signal::{ast_dispatch, refresh_deliverable_signal_summary, AstOutcome};
@@ -139,6 +139,7 @@ struct ThreadLoopState {
     last_entry_sysno: Option<u64>,
     syscall_handoff_pending: bool,
     hot_syscall_budget: u8,
+    thread_exit_status: Option<i32>,
 }
 
 impl ThreadLoopState {
@@ -147,6 +148,14 @@ impl ThreadLoopState {
             last_entry_sysno: None,
             syscall_handoff_pending: false,
             hot_syscall_budget: HOT_SYSCALL_HANDOFF_BUDGET,
+            thread_exit_status: None,
+        }
+    }
+
+    fn take_task_result(&mut self) -> ThreadTaskResult {
+        match self.thread_exit_status.take() {
+            Some(status) => ThreadTaskResult::ThreadExit(status),
+            None => ThreadTaskResult::GroupExit,
         }
     }
 }
@@ -155,6 +164,35 @@ enum ThreadLoopControl {
     Continue,
     YieldBeforeContinue,
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Terminal intent returned by the userspace thread loop to its task wrapper.
+pub enum ThreadTaskResult {
+    /// The inner task completed without requiring thread teardown.
+    Complete,
+    /// A direct `exit(2)` carrying the raw Linux exit code.
+    ThreadExit(i32),
+    /// A process-wide or signal-driven exit using the process episode status.
+    GroupExit,
+}
+
+/// Conversion into the terminal intent understood by [`PerHartSlotted`].
+pub trait ThreadTaskOutput {
+    /// Consume the inner task result and select the wrapper action.
+    fn into_thread_task_result(self) -> ThreadTaskResult;
+}
+
+impl ThreadTaskOutput for ThreadTaskResult {
+    fn into_thread_task_result(self) -> ThreadTaskResult {
+        self
+    }
+}
+
+impl ThreadTaskOutput for () {
+    fn into_thread_task_result(self) -> ThreadTaskResult {
+        ThreadTaskResult::Complete
+    }
 }
 
 struct EntryTimerPollContext {
@@ -197,10 +235,10 @@ where
 
 fn fatal_signal_teardown_from_current_hart<P: TxPlatform>(
     process: &Cap<ProcessIdentity>,
-    thread: &Cap<ThreadIdentity>,
+    _thread: &Cap<ThreadIdentity>,
     sig: Signum,
 ) -> ThreadLoopControl {
-    let control = fatal_signal_teardown_with_posts(
+    fatal_signal_teardown_with_posts(
         process,
         sig,
         |mailbox, event| {
@@ -213,11 +251,7 @@ fn fatal_signal_teardown_from_current_hart<P: TxPlatform>(
                 MailboxSchedulerHint::Normal,
             )
         },
-    );
-    if matches!(control, ThreadLoopControl::Exit) {
-        tx_subsystems::process::execution::step_current_thread_group_exit(thread);
-    }
-    control
+    )
 }
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
@@ -302,7 +336,8 @@ const fn pf_info_implies_from_user(_info: ReactorPageFaultInfo) -> bool {
 pub struct PerHartSlotted<P: TxPlatform, F: Future> {
     thread: Cap<ThreadIdentity>,
     payload: PayloadCap<ThreadPayload>,
-    inner: F,
+    inner: Option<Pin<Box<F>>>,
+    exit: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     _platform: core::marker::PhantomData<fn() -> P>,
 }
 
@@ -320,13 +355,44 @@ impl<P: TxPlatform, F: Future> PerHartSlotted<P, F> {
         Self {
             thread,
             payload,
-            inner,
+            inner: Some(Box::pin(inner)),
+            exit: None,
             _platform: core::marker::PhantomData,
         }
     }
 }
 
-impl<P: TxPlatform, F: Future<Output = ()>> Future for PerHartSlotted<P, F> {
+fn group_exit_future(
+    thread: Cap<ThreadIdentity>,
+    status: ExitStatus,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let _ = tx_shims::linux_syscall::drive_thread_exit_with_status(thread, status).await;
+    })
+}
+
+fn explicit_thread_exit_future(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let _ = tx_shims::linux_syscall::drive_thread_exit(thread, status).await;
+    })
+}
+
+fn canonical_group_exit_status(thread: &Cap<ThreadIdentity>) -> ExitStatus {
+    thread
+        .upgrade_owner_proc()
+        .and_then(|process| tx_subsystems::process::execution::group_exit_status(&process))
+        .unwrap_or(ExitStatus::Exited(0))
+}
+
+impl<P, F> Future for PerHartSlotted<P, F>
+where
+    P: TxPlatform,
+    F: Future,
+    F::Output: ThreadTaskOutput,
+{
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -361,18 +427,74 @@ impl<P: TxPlatform, F: Future<Output = ()>> Future for PerHartSlotted<P, F> {
         // *any* nested await (userspace-run, futex, I/O, timer, ...). The old
         // inner-loop-only checkpoint was unreachable until that await happened
         // to resolve, which left exec waiting forever for random siblings.
-        if this.payload.interrupt_summary().termination {
-            tx_subsystems::process::execution::step_current_thread_group_exit(&this.thread);
+        if this.payload.interrupt_summary().termination && this.exit.is_none() {
+            this.inner.take();
+            this.exit = Some(group_exit_future(
+                this.thread.clone(),
+                canonical_group_exit_status(&this.thread),
+            ));
+        }
+        if let Some(exit) = this.exit.as_mut() {
+            let out = exit.as_mut().poll(cx);
             let _ = clear_current_userspace_payload(hart);
             let _ = clear_current_thread_payload(hart);
             let _ = clear_current_thread_identity(hart);
-            return Poll::Ready(());
+            return out;
         }
 
-        // SAFETY: `this.inner` is structurally pinned via the
-        // `get_unchecked_mut` above; we never move out of it.
-        let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
-        let out = inner.poll(cx);
+        let inner_out = this
+            .inner
+            .as_mut()
+            .expect("inner future remains until task completion or termination")
+            .as_mut()
+            .poll(cx);
+        let mut out = Poll::Pending;
+        let inner_result = match inner_out {
+            Poll::Pending => None,
+            Poll::Ready(result) => Some(result.into_thread_task_result()),
+        };
+
+        let termination = this.payload.interrupt_summary().termination;
+        if termination || inner_result.is_some() {
+            this.inner.take();
+        }
+        if termination {
+            this.exit = Some(group_exit_future(
+                this.thread.clone(),
+                canonical_group_exit_status(&this.thread),
+            ));
+            out = this
+                .exit
+                .as_mut()
+                .expect("exit future installed")
+                .as_mut()
+                .poll(cx);
+        } else if let Some(result) = inner_result {
+            match result {
+                ThreadTaskResult::Complete => out = Poll::Ready(()),
+                ThreadTaskResult::ThreadExit(status) => {
+                    this.exit = Some(explicit_thread_exit_future(this.thread.clone(), status));
+                    out = this
+                        .exit
+                        .as_mut()
+                        .expect("exit future installed")
+                        .as_mut()
+                        .poll(cx);
+                }
+                ThreadTaskResult::GroupExit => {
+                    this.exit = Some(group_exit_future(
+                        this.thread.clone(),
+                        canonical_group_exit_status(&this.thread),
+                    ));
+                    out = this
+                        .exit
+                        .as_mut()
+                        .expect("exit future installed")
+                        .as_mut()
+                        .poll(cx);
+                }
+            }
+        }
 
         if out.is_pending() {
             if let Some(mailbox) = task_mailbox.as_ref() {
@@ -381,10 +503,9 @@ impl<P: TxPlatform, F: Future<Output = ()>> Future for PerHartSlotted<P, F> {
                     cx.waker().wake_by_ref();
                 }
             }
-        } else {
-            let _ = clear_current_userspace_payload(hart);
         }
 
+        let _ = clear_current_userspace_payload(hart);
         let _ = clear_current_thread_payload(hart);
         let _ = clear_current_thread_identity(hart);
 
@@ -405,7 +526,7 @@ impl<P: TxPlatform, F: Future<Output = ()>> Future for PerHartSlotted<P, F> {
 pub async fn run_thread<P: TxPlatform>(
     thread: Cap<ThreadIdentity>,
     payload: PayloadCap<ThreadPayload>,
-) {
+) -> ThreadTaskResult {
     let mut state = ThreadLoopState::new();
     loop {
         if let Some(sysno) = state.last_entry_sysno {
@@ -462,7 +583,7 @@ pub async fn run_thread<P: TxPlatform>(
         }
 
         if !poll_entry_timers_and_liveness::<P>(&thread) {
-            return;
+            return state.take_task_result();
         }
 
         // Phase D (AST checkpoint): run ast_dispatch *before* entering
@@ -489,20 +610,18 @@ pub async fn run_thread<P: TxPlatform>(
                     deliver_entry_signal_handler::<P>(&thread, &payload, sig, action),
                     ThreadLoopControl::Exit
                 ) {
-                    return;
+                    return state.take_task_result();
                 }
             }
             AstOutcome::InitiateTermination => {
                 payload.set_active_userspace_request(None);
                 drop(entry_wait);
-                tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
-                return;
+                return state.take_task_result();
             }
             AstOutcome::DefaultTerminate { .. } => {
                 payload.set_active_userspace_request(None);
                 drop(entry_wait);
-                tx_subsystems::process::execution::step_current_thread_group_exit(&thread);
-                return;
+                return state.take_task_result();
             }
             AstOutcome::DefaultTerminateDeferred { .. } => {
                 payload.set_active_userspace_request(None);
@@ -564,7 +683,7 @@ pub async fn run_thread<P: TxPlatform>(
             enter_userspace_once::<P>(&thread, &payload, entry_token, state.last_entry_sysno),
             ThreadLoopControl::Exit
         ) {
-            return;
+            return state.take_task_result();
         }
 
         // ----------------------------------------------------------------
@@ -602,7 +721,7 @@ pub async fn run_thread<P: TxPlatform>(
             ThreadLoopControl::YieldBeforeContinue => {
                 crate::adapter::boot_runtime::yield_now().await;
             }
-            ThreadLoopControl::Exit => return,
+            ThreadLoopControl::Exit => return state.take_task_result(),
         }
         // Fall through to the top of the loop — next iteration
         // re-opens the entry-side wait, re-runs the AST checkpoint,
@@ -876,10 +995,7 @@ async fn dispatch_userspace_trap<P: TxPlatform>(
             );
             dump_syscall_history::<P>();
             match deliver_synchronous_fault(thread, Signum::SIGSEGV) {
-                tx_subsystems::process::ProcessExitOutcome::Completed => {
-                    tx_subsystems::process::execution::step_current_thread_group_exit(thread);
-                    ThreadLoopControl::Exit
-                }
+                tx_subsystems::process::ProcessExitOutcome::Completed => ThreadLoopControl::Exit,
                 tx_subsystems::process::ProcessExitOutcome::Retry => ThreadLoopControl::Continue,
             }
         }
@@ -918,6 +1034,10 @@ async fn dispatch_syscall_trap<P: TxPlatform>(
     }
     dump_observe_threshold_if_ready::<P>();
 
+    if req.nr == NR_EXIT && matches!(result, SyscallResult::NoReturn) {
+        state.thread_exit_status = Some(req.args[0] as i32);
+    }
+
     if matches!(
         store_syscall_result::<P>(thread, payload, &process, &sigreturn_ctx, &result),
         ThreadLoopControl::Exit
@@ -938,22 +1058,10 @@ async fn run_syscall_dispatch<P: TxPlatform>(
     req: SyscallRequest,
 ) -> Option<SyscallResult> {
     if req.nr == NR_EXIT {
-        loop {
-            let result = tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, thread)
-                .expect("NR_EXIT is owned by the thread-exit lane");
-            if !matches!(result, SyscallResult::Error(11)) {
-                emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
-                return Some(result);
-            }
-            // Exec may briefly own the process lifecycle lane.  Yielding here
-            // lets its initiator either commit the collapse or release the
-            // reservation; exit(2) itself must never return EAGAIN.
-            crate::adapter::boot_runtime::yield_now().await;
-        }
-    }
-    if let Some(result) = tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, thread) {
-        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
-        return Some(result);
+        // The outer PerHartSlotted wrapper owns the resumable exit operation.
+        // Returning only the intent here prevents a simultaneous group-exit
+        // publication from creating a second operation for the same tid.
+        return Some(SyscallResult::NoReturn);
     }
     if let Some(result) = tx_shims::linux_syscall::dispatch_cap_only_immediate(&req, process) {
         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.immediate.after");
@@ -1096,7 +1204,6 @@ fn store_syscall_result<P: TxPlatform>(
             payload.store_pending_syscall_return(Some(Err(*e)));
         }
         SyscallResult::NoReturn => {
-            tx_subsystems::process::execution::step_current_thread_group_exit(thread);
             return ThreadLoopControl::Exit;
         }
         SyscallResult::ExecCommitted => {}
@@ -1193,10 +1300,7 @@ async fn handle_page_fault_trap<P: TxPlatform>(
             dump_user_mem_windows::<P>(&aspace, payload);
             dump_all_recipes::<P>(&aspace);
             match deliver_synchronous_fault(thread, Signum::SIGSEGV) {
-                tx_subsystems::process::ProcessExitOutcome::Completed => {
-                    tx_subsystems::process::execution::step_current_thread_group_exit(thread);
-                    ThreadLoopControl::Exit
-                }
+                tx_subsystems::process::ProcessExitOutcome::Completed => ThreadLoopControl::Exit,
                 tx_subsystems::process::ProcessExitOutcome::Retry => {
                     ThreadLoopControl::YieldBeforeContinue
                 }

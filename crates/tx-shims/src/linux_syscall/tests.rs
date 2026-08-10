@@ -668,7 +668,7 @@ fn dispatch_exit_group_marks_process_zombie() {
 
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread.clone());
 
     let req = SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
@@ -740,7 +740,7 @@ fn dispatch_exit_for_single_thread_chains_to_exit_group() {
 
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread.clone());
 
     let req = SyscallRequest::new(NR_EXIT, [7, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
@@ -751,6 +751,7 @@ fn dispatch_exit_for_single_thread_chains_to_exit_group() {
         "single-threaded exit should zombify the process via step_thread_exit's last-thread cascade"
     );
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(7)));
+    assert_eq!(thread.exit_status(), Some(7));
     assert_eq!(proc_cap.live_thread_count(), 0);
 }
 

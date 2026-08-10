@@ -148,16 +148,9 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
 /// step_process_exit"), the dispatcher therefore calls **only**
 /// `step_thread_exit`. Calling `step_exit_group` here would
 /// double-zombify the payload and corrupt the recorded exit status.
-/// PR-3 migration: `ThreadExitOp` is a `OneShotStepOp` — dispatched
-/// via `drive_oneshot` (no reactor, no yield).
-pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = ThreadExitOp {
-        thread: ctx.thread.clone(),
-        status,
-    };
-    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+    match drive_thread_exit(ctx.thread.clone(), status).await {
         Ok(()) => SyscallResult::NoReturn,
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }

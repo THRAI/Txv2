@@ -78,9 +78,7 @@ use tx_subsystems::signal::{
 use tx_subsystems::thread_runtime::execution::{
     step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange, SigprocmaskOp,
 };
-use tx_subsystems::thread_runtime::{
-    step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillOp, ThreadPayload,
-};
+use tx_subsystems::thread_runtime::{ThreadExitOp, ThreadIdentity, ThreadKillOp, ThreadPayload};
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
     step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp_for_process,
@@ -634,7 +632,7 @@ pub fn dispatch_pthread_hot_oneshot(
     ctx: &SyscallCtx<'_>,
 ) -> Option<SyscallResult> {
     match req.nr {
-        NR_FUTEX | NR_RT_SIGPROCMASK | NR_EXIT | NR_SET_TID_ADDRESS => {}
+        NR_FUTEX | NR_RT_SIGPROCMASK | NR_SET_TID_ADDRESS => {}
         _ => return None,
     }
 
@@ -643,7 +641,6 @@ pub fn dispatch_pthread_hot_oneshot(
     let result = match req.nr {
         NR_FUTEX => sys_futex_oneshot(req.args, ctx)?,
         NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
-        NR_EXIT => sys_exit(req.args, ctx),
         NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         _ => unreachable!("pthread hot dispatch prefilter covers all arms"),
     };
@@ -687,32 +684,39 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     Some(result)
 }
 
-/// One-shot lane for `exit(2)` from an already-resolved thread identity.
+/// Drive exit cleanup without allowing a terminating thread to be interrupted
+/// by its own fatal-signal mailbox state.
 ///
-/// `exit` never returns to userspace and does not need a Linux syscall context:
-/// `step_thread_exit` resolves the owning process and `clear_child_tid` state
-/// through the thread identity. Keeping this before `SyscallCtx` construction
-/// trims the pthread child teardown path without changing the no-return
-/// contract.
-pub fn dispatch_thread_exit_oneshot(
-    req: &SyscallRequest,
-    thread: &Cap<ThreadIdentity>,
-) -> Option<SyscallResult> {
-    if req.nr != NR_EXIT {
-        return None;
-    }
-    let l0_span = emit_syscall_enter(req);
-    let result = match step_thread_exit(thread.clone(), req.args[0] as i32) {
-        tx_subsystems::thread_runtime::ThreadExitOutcome::Completed => SyscallResult::NoReturn,
-        // The process lifecycle lane can temporarily belong to exec.  Do not
-        // report NoReturn until this thread has actually detached; the async
-        // kernel boundary consumes this private retry result and yields.
-        tx_subsystems::thread_runtime::ThreadExitOutcome::Retry => {
-            SyscallResult::Error(EAGAIN_VALUE)
+/// `clear_child_tid` can suspend on page materialisation. The normal syscall
+/// driver treats process termination as an interrupt, so this terminal path
+/// instead retains the exit operation and creates a scheduler boundary before
+/// rechecking it. This keeps device and page-service tasks runnable while the
+/// lifecycle permit and old address space remain pinned by `ThreadExitOp`.
+async fn drive_thread_exit_op(mut op: ThreadExitOp) -> Result<(), tx_subsystems::execution::Errno> {
+    loop {
+        match op.step_exit() {
+            crate::adapter::step_engine::StepOutcome::Done(()) => return Ok(()),
+            crate::adapter::step_engine::StepOutcome::Err(errno) => return Err(errno),
+            crate::adapter::step_engine::StepOutcome::Continue { .. }
+            | crate::adapter::step_engine::StepOutcome::Yield { .. } => {
+                tx_reactor::yield_now().await;
+            }
         }
-    };
-    emit_syscall_exit(l0_span, &result);
-    Some(result)
+    }
+}
+
+pub async fn drive_thread_exit(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+) -> Result<(), tx_subsystems::execution::Errno> {
+    drive_thread_exit_op(ThreadExitOp::new(thread, status)).await
+}
+
+pub async fn drive_thread_exit_with_status(
+    thread: Cap<ThreadIdentity>,
+    status: ExitStatus,
+) -> Result<(), tx_subsystems::execution::Errno> {
+    drive_thread_exit_op(ThreadExitOp::with_status(thread, status)).await
 }
 
 /// Fast dispatch for immediate syscalls that can be answered from the
@@ -1125,7 +1129,7 @@ where
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6_TIME64 => sys_pselect6::<P>(req.args, ctx).await,
-        nr if nr == NR_EXIT => sys_exit(req.args, ctx),
+        nr if nr == NR_EXIT => sys_exit(req.args, ctx).await,
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
         nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),

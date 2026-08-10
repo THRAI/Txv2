@@ -48,7 +48,7 @@ use crate::thread_future::{
     pf_access_to_vm_access, restore_sigreturn_frame, run_thread, siginfo_to_user_abi,
     signal_frame_source_context, signal_saved_context_with_pending_return,
     syscall_return_consumes_hot_budget, syscall_return_may_publish_wake_handoff,
-    syscall_return_needs_handoff, PerHartSlotted,
+    syscall_return_needs_handoff, PerHartSlotted, ThreadTaskResult,
 };
 use crate::trap::direct_trap_syscall_needs_wake_handoff;
 
@@ -768,6 +768,28 @@ fn per_hart_slotted_clears_slot_on_pending_exit() {
         current_thread_payload(0).is_none(),
         "slot cleared after Pending poll exit",
     );
+}
+
+#[test]
+fn per_hart_slotted_commits_explicit_thread_exit_status() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let inner = async { ThreadTaskResult::ThreadExit(7) };
+    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(leader.clone(), payload, inner);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Ready(()));
+    assert_eq!(leader.exit_status(), Some(7));
+    assert_eq!(
+        init.exit_status(),
+        Some(tx_subsystems::process::ExitStatus::Exited(7))
+    );
+    assert!(init.is_zombie());
 }
 
 /// `PerHartSlotted` also binds the reactor task mailbox into the
