@@ -149,6 +149,7 @@ fn restore_pending_uart_rx_front<P: IrqIf>(bytes: &[u8]) {
 /// second time.  IRQ context must never wait for task context, so contenders
 /// skip this drain and let the current owner consume the FIFO.
 static CONSOLE_RX_READER_OWNED: AtomicBool = AtomicBool::new(false);
+static UART_RX_IRQ_DEFERRED_MASKED: AtomicBool = AtomicBool::new(false);
 
 struct ConsoleRxReaderGuard;
 
@@ -163,17 +164,32 @@ impl Drop for ConsoleRxReaderGuard {
 /// Returns zero when another IRQ/hart/reactor poll currently owns the source.
 /// Polling therefore remains available as a firmware/IRQ fallback without
 /// allowing two consumers to overlap the platform's hardware read sequence.
-pub(crate) fn try_read_console_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
-    if buf.is_empty()
-        || CONSOLE_RX_READER_OWNED
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+enum ConsoleRxReadResult {
+    Read(usize),
+    Busy,
+}
+
+fn try_read_console_bytes_result<P: ConsoleIf>(buf: &mut [u8]) -> ConsoleRxReadResult {
+    if buf.is_empty() {
+        return ConsoleRxReadResult::Read(0);
+    }
+    if CONSOLE_RX_READER_OWNED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
     {
-        return 0;
+        return ConsoleRxReadResult::Busy;
     }
 
     let _reader = ConsoleRxReaderGuard;
-    <P as ConsoleIf>::read_bytes(buf)
+    ConsoleRxReadResult::Read(<P as ConsoleIf>::read_bytes(buf))
+}
+
+#[cfg(test)]
+pub(crate) fn try_read_console_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
+    match try_read_console_bytes_result::<P>(buf) {
+        ConsoleRxReadResult::Read(n) => n,
+        ConsoleRxReadResult::Busy => 0,
+    }
 }
 
 const DEFERRED_IRQ_IDLE: u8 = 0;
@@ -561,27 +577,36 @@ pub fn rtc_alarm_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
 /// therefore must NOT call `epoch::guard()`.  All TTY line-discipline
 /// work is deferred to `drain_uart_rx_pending`.
 ///
-/// Returns `IrqHandled::Wake` when bytes were buffered (reactor should
-/// reschedule the blocked `read` future).  Returns `IrqHandled::Done`
-/// for spurious or already-drained IRQs.  Returns
+/// Returns `IrqHandled::Wake` when bytes were buffered or the level source was
+/// masked for task-context recovery. Returns `IrqHandled::Done` only for
+/// spurious or already-drained IRQs.
 /// The handler is installed only after the console TTY is published, so the
 /// top half does not acquire the task-context console-cap lock.
-fn buffer_console_rx<P: ConsoleIf, const DRAIN_MAX: usize>() -> usize {
+enum ConsoleRxBufferResult {
+    Buffered(usize),
+    Empty,
+    MustDefer,
+}
+
+fn buffer_console_rx<P: ConsoleIf, const DRAIN_MAX: usize>() -> ConsoleRxBufferResult {
     // IRQ context must never wait for a task-context holder on another hart.
-    // Leave the FIFO untouched on contention so its level condition retriggers
-    // after the short deferred-drain critical section releases the lock.
+    // Leave the FIFO untouched on contention; the top-half caller masks the
+    // level source until task context releases the shared state and rearms it.
     let Some(mut pending) = UART_RX_PENDING.try_lock() else {
-        return 0;
+        return ConsoleRxBufferResult::MustDefer;
     };
     let space = UART_RX_PENDING_CAP - pending.len;
     if space == 0 {
-        return 0;
+        return ConsoleRxBufferResult::MustDefer;
     }
     let mut buf = [0u8; DRAIN_MAX];
-    let n = try_read_console_bytes::<P>(&mut buf[..space.min(DRAIN_MAX)]);
+    let n = match try_read_console_bytes_result::<P>(&mut buf[..space.min(DRAIN_MAX)]) {
+        ConsoleRxReadResult::Read(n) => n,
+        ConsoleRxReadResult::Busy => return ConsoleRxBufferResult::MustDefer,
+    };
     if n == 0 {
         // Spurious IRQ or FIFO already drained.
-        return 0;
+        return ConsoleRxBufferResult::Empty;
     }
     // Buffer bytes for non-IRQ ingestion. Bytes that overflow the
     // pending buffer (UART_RX_PENDING_CAP) are silently dropped — this
@@ -591,14 +616,20 @@ fn buffer_console_rx<P: ConsoleIf, const DRAIN_MAX: usize>() -> usize {
     let end = start + n;
     pending.bytes[start..end].copy_from_slice(&buf[..n]);
     pending.len = end;
-    n
+    ConsoleRxBufferResult::Buffered(n)
 }
 
-pub fn uart_rx_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
-    if buffer_console_rx::<P, UART_RX_DRAIN_MAX>() == 0 {
-        IrqHandled::Done
-    } else {
-        IrqHandled::Wake
+pub fn uart_rx_irq_handler<P: TxPlatform>(irq: u32) -> IrqHandled {
+    match buffer_console_rx::<P, UART_RX_DRAIN_MAX>() {
+        ConsoleRxBufferResult::Buffered(_) => IrqHandled::Wake,
+        ConsoleRxBufferResult::Empty => IrqHandled::Done,
+        ConsoleRxBufferResult::MustDefer => {
+            // The source is level-triggered. Leaving it enabled while the FIFO
+            // is still asserted can trap-loop on the interrupted lock holder.
+            UART_RX_IRQ_DEFERRED_MASKED.store(true, Ordering::Release);
+            <P as IrqIf>::mask(irq);
+            IrqHandled::Wake
+        }
     }
 }
 
@@ -611,7 +642,10 @@ pub(crate) fn poll_console_rx_into_pending<P: TxPlatform>() -> usize {
     // interrupt cannot repeatedly re-enter while this context owns the pending
     // lock and leave the interrupted holder unable to resume.
     let _local_execution = <P as IrqIf>::exclude_local_execution();
-    buffer_console_rx::<P, UART_RX_PENDING_CAP>()
+    match buffer_console_rx::<P, UART_RX_PENDING_CAP>() {
+        ConsoleRxBufferResult::Buffered(n) => n,
+        ConsoleRxBufferResult::Empty | ConsoleRxBufferResult::MustDefer => 0,
+    }
 }
 
 /// Drain any bytes buffered by `uart_rx_irq_handler` into the boot
@@ -688,6 +722,16 @@ pub(crate) fn drain_uart_rx_pending<P: tx_hal::TxPlatform>() -> usize {
         if consumed != n {
             restore_pending_uart_rx_front::<P>(&bytes[consumed.min(n)..n]);
             break;
+        }
+    }
+    // No pending-buffer, reader, ingest, or TTY lock may remain held when the
+    // level source is reopened. If the hardware FIFO is still non-empty, the
+    // fresh IRQ can now make progress instead of re-entering a lock holder.
+    drop(ingest_owner);
+    if UART_RX_IRQ_DEFERRED_MASKED.swap(false, Ordering::AcqRel) {
+        let irq = <P as IrqIf>::uart_irq();
+        if irq != 0 {
+            <P as IrqIf>::unmask(irq);
         }
     }
     processed

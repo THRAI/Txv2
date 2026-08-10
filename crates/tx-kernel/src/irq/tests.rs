@@ -30,7 +30,7 @@ use crate::irq::{
     drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats,
     poll_console_rx_into_pending, publish_deferred_net_claim, register_irq_handler,
     rtc_alarm_irq_handler, try_acquire_console_rx_ingest, try_read_console_bytes,
-    uart_rx_irq_handler, UART_RX_PENDING,
+    uart_rx_irq_handler, UART_RX_PENDING, UART_RX_PENDING_CAP,
 };
 use crate::test_serialise::KERNEL_TEST_LOCK as IRQ_TEST_LOCK;
 use tx_subsystems::device_binding::BoundDeviceKey;
@@ -59,6 +59,8 @@ static IRQ_TEST_LAST_PRIORITY: AtomicU32 = AtomicU32::new(0);
 
 /// Records that `unmask` was called for the UART IRQ.
 static IRQ_TEST_UART_UNMASKED: AtomicBool = AtomicBool::new(false);
+static IRQ_TEST_UART_MASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_UART_UNMASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Records that `unmask` was called for the RTC IRQ.
 static IRQ_TEST_RTC_UNMASKED: AtomicBool = AtomicBool::new(false);
@@ -256,6 +258,9 @@ impl IrqIf for IrqTestPlatform {
     }
 
     fn mask(irq: u32) {
+        if irq == Self::uart_irq() {
+            IRQ_TEST_UART_MASK_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
         if irq == IRQ_TEST_DEVICE_IRQ {
             IRQ_TEST_NET_MASK_COUNT.fetch_add(1, Ordering::AcqRel);
         }
@@ -264,6 +269,7 @@ impl IrqIf for IrqTestPlatform {
     fn unmask(irq: u32) {
         if irq == Self::uart_irq() {
             IRQ_TEST_UART_UNMASKED.store(true, Ordering::Release);
+            IRQ_TEST_UART_UNMASK_COUNT.fetch_add(1, Ordering::AcqRel);
         }
         if irq == Self::rtc_irq() {
             IRQ_TEST_RTC_UNMASKED.store(true, Ordering::Release);
@@ -379,6 +385,9 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     IRQ_TEST_INSTALLED_TABLE_PTR.store(0, Ordering::Release);
     IRQ_TEST_LAST_PRIORITY.store(0, Ordering::Release);
     IRQ_TEST_UART_UNMASKED.store(false, Ordering::Release);
+    IRQ_TEST_UART_MASK_COUNT.store(0, Ordering::Release);
+    IRQ_TEST_UART_UNMASK_COUNT.store(0, Ordering::Release);
+    super::UART_RX_IRQ_DEFERRED_MASKED.store(false, Ordering::Release);
     IRQ_TEST_RTC_UNMASKED.store(false, Ordering::Release);
     IRQ_TEST_RUNTIME_UART_IRQ.store(17, Ordering::Release);
     IRQ_TEST_RUNTIME_RTC_IRQ.store(18, Ordering::Release);
@@ -766,7 +775,8 @@ fn uart_rx_irq_leaves_fifo_untouched_when_pending_buffer_is_contended() {
 
     let pending = UART_RX_PENDING.lock();
     let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq());
-    assert_eq!(handled, IrqHandled::Done);
+    assert_eq!(handled, IrqHandled::Wake);
+    assert_eq!(IRQ_TEST_UART_MASK_COUNT.load(Ordering::Acquire), 1);
     assert_eq!(
         IRQ_TEST_RX_QUEUE
             .lock()
@@ -778,6 +788,12 @@ fn uart_rx_irq_leaves_fifo_untouched_when_pending_buffer_is_contended() {
     drop(pending);
 
     assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+    );
+    assert_eq!(IRQ_TEST_UART_UNMASK_COUNT.load(Ordering::Acquire), 1);
+
+    assert_eq!(
         uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
         IrqHandled::Wake,
     );
@@ -785,6 +801,43 @@ fn uart_rx_irq_leaves_fifo_untouched_when_pending_buffer_is_contended() {
         CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
         2,
     );
+}
+
+#[test]
+fn uart_rx_irq_masks_level_source_while_pending_buffer_is_full() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+
+    {
+        let mut pending = UART_RX_PENDING.lock();
+        pending.len = UART_RX_PENDING_CAP;
+    }
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"Z\n");
+    }
+
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+    assert_eq!(IRQ_TEST_UART_MASK_COUNT.load(Ordering::Acquire), 1);
+    assert_eq!(
+        IRQ_TEST_RX_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_slice(),
+        b"Z\n",
+        "a full software buffer must leave the hardware FIFO for the rearmed IRQ",
+    );
+
+    UART_RX_PENDING.lock().len = 0;
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+    );
+    assert_eq!(IRQ_TEST_UART_UNMASK_COUNT.load(Ordering::Acquire), 1);
 }
 
 #[test]
