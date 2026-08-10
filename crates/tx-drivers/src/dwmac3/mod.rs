@@ -58,6 +58,7 @@ pub struct Dwmac3Net<P: TxPlatform> {
     dma_domain: &'static DmaDomain,
     configured_mac: Option<[u8; 6]>,
     state: SpinMutex<Option<Dwmac3State<P>>>,
+    rx_irq: SpinMutex<RxIrqControl>,
     initialized: AtomicBool,
     mac: AtomicU64,
     _platform: PhantomData<fn() -> P>,
@@ -70,6 +71,10 @@ struct Dwmac3State<P: TxPlatform> {
     tx_buffers: DmaBuffer<P>,
     rx_index: usize,
     tx_index: usize,
+}
+
+struct RxIrqControl {
+    masked: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +136,7 @@ impl<P: TxPlatform> Dwmac3Net<P> {
             dma_domain,
             configured_mac,
             state: SpinMutex::new(None),
+            rx_irq: SpinMutex::new(RxIrqControl { masked: true }),
             initialized: AtomicBool::new(false),
             mac: AtomicU64::new(0),
             _platform: PhantomData,
@@ -194,6 +200,7 @@ impl<P: TxPlatform> Dwmac3Net<P> {
     pub fn stop(&self) -> Result<(), Dwmac3Error> {
         let mut state = self.state.lock();
         if let Some(state) = state.as_ref() {
+            self.rx_irq.lock().masked = true;
             stop_hardware::<P>(state.regs)?;
         }
         *state = None;
@@ -206,28 +213,41 @@ impl<P: TxPlatform> Dwmac3Net<P> {
             return;
         }
         let regs = RegisterBlock::new(self.region.virt.start.0);
-        regs.write(DMA_STATUS, DMA_ACK_MASK);
+        let mut rx_irq = self.rx_irq.lock();
+        regs.write(DMA_STATUS, DMA_STATUS_W1C_MASK);
+        let _ = regs.read(DMA_STATUS);
         regs.write(DMA_INTERRUPT_ENABLE, DMA_INTERRUPT_MASK);
+        let _ = regs.read(DMA_INTERRUPT_ENABLE);
+        rx_irq.masked = false;
     }
 
     fn acknowledge_irq(&self) -> NetDeviceIrqOutcome {
         if !self.initialized.load(Ordering::Acquire) {
             return NetDeviceIrqOutcome::default();
         }
-        // RX/TX polling owns `state` in task context. The interrupt top half
-        // must only touch the fixed register bank or it can spin on the lock
-        // held by the interrupted task.
+        // Descriptor polling owns `state`. Device acknowledgement runs from
+        // the deferred bottom half and serializes only the interrupt register
+        // bank, so it never waits for a data-path operation to release state.
         let regs = RegisterBlock::new(self.region.virt.start.0);
-        let status = regs.read(DMA_STATUS);
-        let acknowledged = status & DMA_ACK_MASK;
-        if acknowledged == 0 {
-            return NetDeviceIrqOutcome::default();
-        }
-        regs.write(DMA_STATUS, acknowledged);
+        let (rx_ready, tx_completed) = {
+            let mut rx_irq = self.rx_irq.lock();
+            let status = regs.read(DMA_STATUS);
+            let acknowledged = status & DMA_STATUS_W1C_MASK;
+            if acknowledged == 0 {
+                return NetDeviceIrqOutcome::default();
+            }
 
-        let rx_ready =
-            status & (DMA_STATUS_RI | DMA_STATUS_RU | DMA_STATUS_RPS | DMA_STATUS_OVF) != 0;
-        let tx_completed = usize::from(status & DMA_STATUS_TI != 0);
+            let rx_ready =
+                status & (DMA_STATUS_RI | DMA_STATUS_RU | DMA_STATUS_RPS | DMA_STATUS_OVF) != 0;
+            if rx_ready {
+                regs.modify(DMA_INTERRUPT_ENABLE, DMA_INTERRUPT_RIE, 0);
+                let _ = regs.read(DMA_INTERRUPT_ENABLE);
+                rx_irq.masked = true;
+            }
+            regs.write(DMA_STATUS, acknowledged);
+            let _ = regs.read(DMA_STATUS);
+            (rx_ready, usize::from(status & DMA_STATUS_TI != 0))
+        };
         let poll_wakes = if rx_ready || tx_completed != 0 {
             tx_subsystems::net::delegate::net_delegate_kick_poll()
         } else {
@@ -244,8 +264,17 @@ impl<P: TxPlatform> Dwmac3Net<P> {
 
 impl<P: TxPlatform> NetDeviceOps for Dwmac3Net<P> {
     fn receive(&self) -> Option<RxFrame> {
-        let mut state = self.state.lock();
-        receive_frame(state.as_mut()?)
+        let (frame, poll_again) = {
+            let mut state = self.state.lock();
+            let state = state.as_mut()?;
+            let frame = receive_frame(state);
+            let poll_again = frame.is_none() && self.finish_rx_poll(state);
+            (frame, poll_again)
+        };
+        if poll_again {
+            let _ = tx_subsystems::net::delegate::net_delegate_kick_poll();
+        }
+        frame
     }
 
     fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
@@ -285,6 +314,27 @@ impl<P: TxPlatform> NetDeviceOps for Dwmac3Net<P> {
 
     fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
         self.acknowledge_irq()
+    }
+}
+
+impl<P: TxPlatform> Dwmac3Net<P> {
+    fn finish_rx_poll(&self, state: &mut Dwmac3State<P>) -> bool {
+        let mut rx_irq = self.rx_irq.lock();
+        if !rx_irq.masked {
+            return false;
+        }
+
+        if !descriptor_owned(&state.descriptors, rx_descriptor_offset(state.rx_index)) {
+            return true;
+        }
+
+        state.regs.write(DMA_RX_POLL_DEMAND, 1);
+        state
+            .regs
+            .modify(DMA_INTERRUPT_ENABLE, 0, DMA_INTERRUPT_RIE);
+        let _ = state.regs.read(DMA_INTERRUPT_ENABLE);
+        rx_irq.masked = false;
+        false
     }
 }
 
@@ -334,7 +384,14 @@ fn configure_mac(regs: RegisterBlock, link: PhyLink) {
         GMAC_CORE_INIT | speed | duplex,
     );
     regs.write(GMAC_FRAME_FILTER, 0);
-    regs.write(GMAC_INTERRUPT_MASK, GMAC_INTERRUPT_DEFAULT_MASK);
+    regs.modify(GMAC_INTERRUPT_MASK, 0, GMAC_INTERRUPT_UNSUPPORTED_MASK);
+    let _ = regs.read(GMAC_INTERRUPT_MASK);
+    regs.write(MMC_RX_INTERRUPT_MASK, MMC_INTERRUPT_MASK_ALL);
+    regs.write(MMC_TX_INTERRUPT_MASK, MMC_INTERRUPT_MASK_ALL);
+    regs.write(MMC_RX_IPC_INTERRUPT_MASK, MMC_INTERRUPT_MASK_ALL);
+    let _ = regs.read(MMC_RX_INTERRUPT_MASK);
+    let _ = regs.read(MMC_TX_INTERRUPT_MASK);
+    let _ = regs.read(MMC_RX_IPC_INTERRUPT_MASK);
     // Loongson's GMAC integration does not implement MAC flow control.
     regs.write(GMAC_FLOW_CONTROL, 0);
 }
@@ -417,7 +474,7 @@ fn configure_rings<P: TxPlatform>(
         DMA_OPERATION_MODE,
         DMA_OPERATION_MODE_TSF | DMA_OPERATION_MODE_RSF | DMA_OPERATION_MODE_OSF,
     );
-    regs.write(DMA_STATUS, DMA_ACK_MASK);
+    regs.write(DMA_STATUS, DMA_STATUS_W1C_MASK);
 }
 
 fn start_hardware(regs: RegisterBlock) {
@@ -902,6 +959,55 @@ mod tests {
         assert_eq!((mode >> DMA_BUS_MODE_RPBL_SHIFT) & 0x3f, 32);
         assert_ne!(mode & DMA_BUS_MODE_USP, 0);
         assert_ne!(mode & DMA_BUS_MODE_PBLX8, 0);
+    }
+
+    #[test]
+    fn interrupt_mask_only_arms_causes_with_recovery_paths() {
+        let normal = DMA_INTERRUPT_NIE | DMA_INTERRUPT_RIE | DMA_INTERRUPT_TIE;
+        let abnormal = DMA_INTERRUPT_AIE
+            | DMA_INTERRUPT_FBE
+            | DMA_INTERRUPT_RSE
+            | DMA_INTERRUPT_RUE
+            | DMA_INTERRUPT_TUE
+            | DMA_INTERRUPT_TSE;
+
+        assert_eq!(DMA_INTERRUPT_MASK, normal);
+        assert_eq!(DMA_INTERRUPT_MASK & abnormal, 0);
+        assert_eq!(DMA_STATUS_W1C_MASK, 0x0001_ffff);
+        assert_eq!(DMA_STATUS_W1C_MASK & DMA_STATUS_NIS, DMA_STATUS_NIS);
+        assert_eq!(DMA_STATUS_W1C_MASK & DMA_STATUS_AIS, DMA_STATUS_AIS);
+        assert_eq!(DMA_STATUS_W1C_MASK & DMA_STATUS_FBI, DMA_STATUS_FBI);
+        assert_eq!(DMA_STATUS_W1C_MASK & DMA_STATUS_TU, DMA_STATUS_TU);
+        assert_eq!(DMA_STATUS_W1C_MASK & DMA_STATUS_TPS, DMA_STATUS_TPS);
+        assert_eq!(DMA_STATUS_W1C_MASK & (1 << 14), 1 << 14);
+        assert_eq!(DMA_STATUS_W1C_MASK & (1 << 10), 1 << 10);
+        assert_eq!(DMA_STATUS_W1C_MASK & (1 << 9), 1 << 9);
+        assert_eq!(DMA_STATUS_W1C_MASK & (1 << 5), 1 << 5);
+        assert_eq!(DMA_STATUS_W1C_MASK & (1 << 3), 1 << 3);
+    }
+
+    #[test]
+    fn mac_setup_masks_all_unsupported_optional_interrupts() {
+        let mut mmio = vec![0u32; MIN_MMIO_SIZE / core::mem::size_of::<u32>()];
+        let regs = RegisterBlock::new(mmio.as_mut_ptr() as usize);
+        let inherited_mac_mask = 1 << 12;
+        regs.write(GMAC_INTERRUPT_MASK, inherited_mac_mask);
+
+        configure_mac(
+            regs,
+            PhyLink {
+                speed: LinkSpeed::Mbps1000,
+                full_duplex: true,
+            },
+        );
+
+        assert_eq!(
+            regs.read(GMAC_INTERRUPT_MASK),
+            inherited_mac_mask | GMAC_INTERRUPT_UNSUPPORTED_MASK
+        );
+        assert_eq!(regs.read(MMC_RX_INTERRUPT_MASK), MMC_INTERRUPT_MASK_ALL);
+        assert_eq!(regs.read(MMC_TX_INTERRUPT_MASK), MMC_INTERRUPT_MASK_ALL);
+        assert_eq!(regs.read(MMC_RX_IPC_INTERRUPT_MASK), MMC_INTERRUPT_MASK_ALL);
     }
 
     #[test]
