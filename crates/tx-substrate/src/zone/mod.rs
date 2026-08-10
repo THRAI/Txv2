@@ -164,14 +164,39 @@ impl<T: 'static> Zone<T> {
         &'static self,
     ) -> Result<core::ptr::NonNull<slot::Slot<T>>, ZoneError> {
         measure_zone!(b"debug.ds.substrate.zone.pop_free_slot", T, {
-            let _local_execution = runtime::exclude_local_execution();
-            let cpu_pin = runtime::pin_current_cpu()?;
-            let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
-            if let Some(slot) = bucket.pop() {
-                return Ok(slot);
+            {
+                let _local_execution = runtime::exclude_local_execution();
+                let cpu_pin = runtime::pin_current_cpu()?;
+                let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
+                if let Some(slot) = bucket.pop() {
+                    return Ok(slot);
+                }
             }
-            self.keg.refill_bucket(self, bucket)?;
-            bucket.pop().ok_or(ZoneError::AllocationFailed)
+
+            // Do central Keg work without holding the bucket's outer exclusion;
+            // contended waits can therefore restore the caller's prior IRQ state.
+            // A private bucket owns every claimed slot until it can be merged
+            // into whichever CPU the caller is pinned to after the refill.
+            let mut staging: ZoneBucket<T> = ZoneBucket::new();
+            let refill_error = self.keg.refill_bucket(self, &mut staging).err();
+            let selected = {
+                let _local_execution = runtime::exclude_local_execution();
+                match runtime::pin_current_cpu() {
+                    Ok(cpu_pin) => {
+                        let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
+                        let selected = bucket.pop().or_else(|| staging.pop());
+                        staging.move_slots_to(bucket);
+                        Ok(selected)
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+
+            // Overflow belongs to the private staging bucket and must return to
+            // the Keg after local execution is enabled again.
+            self.drain_bucket_to_keg(&mut staging);
+            let selected = selected?;
+            selected.ok_or_else(|| refill_error.unwrap_or(ZoneError::AllocationFailed))
         })
     }
 
@@ -192,10 +217,16 @@ impl<T: 'static> Zone<T> {
     }
 
     pub(crate) fn flush_current_cpu_bucket(&'static self) -> Result<(), ZoneError> {
-        let _local_execution = runtime::exclude_local_execution();
-        let cpu_pin = runtime::pin_current_cpu()?;
-        let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
-        self.drain_bucket_to_keg(bucket);
+        let mut staging: ZoneBucket<T> = ZoneBucket::new();
+        {
+            let _local_execution = runtime::exclude_local_execution();
+            let cpu_pin = runtime::pin_current_cpu()?;
+            let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
+            let moved = bucket.move_slots_to(&mut staging);
+            debug_assert_eq!(moved, staging.len());
+            debug_assert!(bucket.is_empty());
+        }
+        self.drain_bucket_to_keg(&mut staging);
         Ok(())
     }
 

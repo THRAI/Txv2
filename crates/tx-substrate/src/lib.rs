@@ -2,6 +2,8 @@
 #![feature(associated_type_defaults)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use tx_hal::{CpuId, TxPlatform};
 
