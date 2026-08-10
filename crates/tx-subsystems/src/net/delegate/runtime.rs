@@ -8,7 +8,7 @@ use crate::net::execution::{
     step_process_loopback_pending_in_namespace, step_process_network_events_in_namespace_at,
     step_process_network_tick_in_namespace, step_process_network_tick_loopback_in_namespace,
     ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome, LoopbackPendingOutcome, LoopbackPollBudget,
-    ARP_FLUSH_BUDGET_DEFAULT,
+    ARP_FLUSH_BUDGET_DEFAULT, NET_EVENT_BUDGET,
 };
 use crate::net::namespace::{
     drive_all_net_namespace_runtimes_at, initial_net_namespace_payload, NetNamespacePayload,
@@ -250,6 +250,9 @@ pub fn net_delegate_step_once(
         outcome.backlog_failed += events.backlog.half_open_failed;
         outcome.next_deadline =
             earliest_deadline(outcome.next_deadline, events.backlog.next_deadline);
+        if events.packets_seen == NET_EVENT_BUDGET {
+            outcome.wakes_fired += net_delegate_kick_poll();
+        }
         if let Some(iface) = driver.loopback_iface() {
             let StepOutcome::Done(loopback) = step_process_loopback_pending_in_namespace(
                 driver.now(),
