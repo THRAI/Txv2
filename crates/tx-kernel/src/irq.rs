@@ -605,7 +605,12 @@ pub fn uart_rx_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
 /// Poll the console FIFO into the same ordered buffer used by the IRQ top
 /// half. Direct polling must not bypass pending bytes and submit a newer chunk
 /// to the TTY first.
-pub(crate) fn poll_console_rx_into_pending<P: ConsoleIf>() -> usize {
+pub(crate) fn poll_console_rx_into_pending<P: TxPlatform>() -> usize {
+    // The polling fallback shares `UART_RX_PENDING` with the level-triggered
+    // IRQ top half. Keep local IRQs excluded across the whole FIFO drain so an
+    // interrupt cannot repeatedly re-enter while this context owns the pending
+    // lock and leave the interrupted holder unable to resume.
+    let _local_execution = <P as IrqIf>::exclude_local_execution();
     buffer_console_rx::<P, UART_RX_PENDING_CAP>()
 }
 

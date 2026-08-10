@@ -812,7 +812,13 @@ fn console_rx_polling_cannot_overtake_an_irq_buffered_chunk() {
         let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         queue.extend_from_slice(b"B\n");
     }
+    let exclusions_before = IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire);
     assert_eq!(poll_console_rx_into_pending::<IrqTestPlatform>(), 2);
+    assert_eq!(
+        IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire),
+        exclusions_before + 1,
+        "polling must exclude its local UART IRQ across the shared pending-buffer drain",
+    );
     drop(ingest_owner);
 
     assert_eq!(
