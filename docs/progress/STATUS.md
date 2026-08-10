@@ -1,3 +1,24 @@
+- 2026-08-10 (**Loongson 2K1000 完整 clone 已成功，但 clone 后 CPU-pin panic 阻断最终 Git 验收**).
+  **Changed**：当前代码位于 `335321ef`，包含 zone contention、2K UART
+  串行化/延迟 level IRQ、可恢复线程退出、DWMAC3 IRQ/RX budget 修复；共享
+  LA QEMU Pmap/IPI/TLB 协议没有回退。
+  **Real hardware**：双核、双向 IPI、普通与屏蔽中断的 TLB shootdown、
+  AHCI 62533296x512、raw ext4 Alpine `/ #`、GMAC LAN/公网、DNS、CA bundle、
+  `git -h/help` 和 `/proj` 本地提交均通过。人工 HTTPS clone 在不关闭 TLS
+  校验的情况下完成 7818/7818 objects、4137/4137 deltas、17.47 MiB。
+  **Blocker**：clone 完成后输入下一条普通命令时，内核在
+  `boards/tx-hal-loongarch64-2k1000/src/platform_impls.rs:713` panic：
+  `LA64 CPU pin nesting underflow`。此前另一轮 clone 在持续负载下停止，
+  `Ctrl-C` 后 shell 和 ping 无网卡 reset 即恢复，还存在 task-context 服务饥饿风险。
+  **Verification**：`cargo test -p tx-kernel --lib irq::tests::` 13/13；2K1000
+  `full-build` 通过；LA QEMU 四核 busybox sentinel 通过；RV QEMU 四核
+  boot/owner-wake sentinel 通过。当前实板镜像与 TFTP 哈希匹配。
+  **Next**：新对话先用 host test 与低扰动计数器修复 CPU-pin underflow，
+  再单独闭合 file-I/O/kernel service 公平性；完整 clone 后必须继续执行
+  shallow/log/echo 和普通 shell 命令且无 panic，才能进入用户 push、网页修改和 pull。
+  每次复位仍需从可信宿主恢复 UTC，禁止关闭 TLS 校验。详细现场交接见
+  `msp/debug-logs/2026-08-10-la2k1000-real-board-git-handoff.md`。
+
 - 2026-08-08 (**Loongson 2K1000 Stage 5 GMAC 实板收发通过**).
   **Changed**：新增独立 DWMAC 3.70a 驱动和 binder，不复用 VF2 DWMAC5/EQoS
   寄存器模型；2K1000 平台发布 GMAC1 `0x40050000/0x8000`、hwirq14/public
