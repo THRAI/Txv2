@@ -26,8 +26,8 @@ pub use step_ioctl::{
     step_ioctl_tiocnotty_for_process, step_ioctl_tiocsctty, step_ioctl_tiocsctty_for_process,
     step_ioctl_tiocspgrp, step_ioctl_tiocspgrp_for_process, step_ioctl_tiocswinsz, IoctlCaller,
     IoctlSideEffect, IoctlTcgetsOp, IoctlTcsetsOp, IoctlTiocgpgrpOp, IoctlTiocgwinszOp,
-    IoctlTiocnottyOp, IoctlTiocscttyForProcessOp, IoctlTiocspgrpForProcessOp,
-    IoctlTiocswinszOp, JobControlSignal, SessionCtlEvent, SignalDispatch, SignalTarget,
+    IoctlTiocnottyOp, IoctlTiocscttyForProcessOp, IoctlTiocspgrpForProcessOp, IoctlTiocswinszOp,
+    JobControlSignal, SessionCtlEvent, SignalDispatch, SignalTarget,
 };
 pub use step_master_close::step_master_close_last;
 pub use step_openpty::{step_openpty, OpenPtyOutcome};

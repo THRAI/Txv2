@@ -6,7 +6,7 @@ use tx_ext4::journal::{
 };
 use tx_ext4::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
 use tx_ext4_format::journal::{
-    JBD2_BLOCK_SIZE, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock, Jbd2TransactionImage,
+    Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
 };
 use tx_ext4_format::mutation::{
     Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, RevokeRecord,
@@ -462,23 +462,19 @@ fn journal_source_commits_only_after_data_graph_completion() {
         fsync.op,
         tx_subsystems::io_manager::page::PageIoResult::Done,
     ));
-    assert!(
-        source
-            .take_checkpoint_graph()
-            .expect("durable commit exposes checkpoint")
-            .is_some()
-    );
+    assert!(source
+        .take_checkpoint_graph()
+        .expect("durable commit exposes checkpoint")
+        .is_some());
     assert!(source.take_checkpoint_graph().is_err());
     source
         .complete_checkpoint_result(Err(tx_subsystems::execution::Errno::EIO))
         .expect("failed checkpoint remains retryable");
     assert_eq!(ring.reserve(1), Err(JournalRingError::Busy));
-    assert!(
-        source
-            .take_checkpoint_graph()
-            .expect("failed checkpoint retries")
-            .is_some()
-    );
+    assert!(source
+        .take_checkpoint_graph()
+        .expect("failed checkpoint retries")
+        .is_some());
     source
         .complete_checkpoint_result(Ok(()))
         .expect("successful retry releases ring reservation");

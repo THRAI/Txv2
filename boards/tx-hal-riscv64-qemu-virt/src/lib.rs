@@ -157,7 +157,7 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
 /// `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`).
 ///
 /// The userspace-entry shim (`tx_rv64_enter_userspace_save_resume`)
-/// stashes (sp, ra, s0..s11) here before `sret`. The trap-shell
+/// stashes (sp, ra, kernel tp, s0..s11) here before `sret`. The trap-shell
 /// longjmp helper (`tx_rv64_resume_kernel_after_reschedule`)
 /// restores them on `TrapAction::Reschedule` and `ret`s back to the
 /// kernel-side caller of `enter_userspace_with_context`.
@@ -169,7 +169,8 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
 pub struct KernelResumeCtx {
     pub sp: usize,      // offset 0
     pub ra: usize,      // offset 8
-    pub s: [usize; 12], // offset 16..112
+    pub tp: usize,      // offset 16
+    pub s: [usize; 12], // offset 24..120
 }
 
 // These offsets are referenced by literal byte offset in the trap-vector
@@ -178,10 +179,12 @@ pub struct KernelResumeCtx {
 // reorder triggers a compile-time mismatch with the static_assert.
 const _KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
 const _KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
-const _KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
-const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
+const _KERNEL_RESUME_CTX_TP_OFFSET: usize = 16;
+const _KERNEL_RESUME_CTX_S0_OFFSET: usize = 24;
+const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 15 * 8);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == _KERNEL_RESUME_CTX_SP_OFFSET);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == _KERNEL_RESUME_CTX_RA_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, tp) == _KERNEL_RESUME_CTX_TP_OFFSET);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == _KERNEL_RESUME_CTX_S0_OFFSET);
 
 /// Per-hart cell with `Sync` because the only writer/reader is the
@@ -206,21 +209,25 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
 ];
@@ -272,7 +279,10 @@ pub extern "C" fn tx_rv64_kernel_tls_from_trap_stack_top(trap_stack_top: usize) 
     let mut cpu = 0;
     while cpu < MAX_BOOT_CPUS {
         let cpu_id = CpuId(cpu);
-        if trap_stack_top_for_cpu(cpu_id) == trap_stack_top {
+        let stack = RV64_TRAP_STACKS[cpu].as_ptr();
+        let base = stack as usize;
+        let top = base + RV64_TRAP_STACK_SIZE;
+        if trap_stack_top > base && trap_stack_top <= top {
             return percpu_tls_for_cpu(cpu_id).unwrap_or(cpu);
         }
         cpu += 1;

@@ -68,6 +68,27 @@ setup_base_tree() {
         [ -e "/bin/$applet" ] || link_force /bin/busybox "/bin/$applet"
     done
     [ -e /usr/bin/env ] || link_force /bin/busybox /usr/bin/env
+    if [ ! -e /lib/ld-musl-riscv64.so.1 ]; then
+        if [ -e /musl/lib/libc.so ]; then
+            link_force /musl/lib/libc.so /lib/ld-musl-riscv64.so.1
+        elif [ -e /musl/musl/lib/libc.so ]; then
+            link_force /musl/musl/lib/libc.so /lib/ld-musl-riscv64.so.1
+        fi
+    fi
+    if [ ! -e /lib/ld-musl-riscv64-sf.so.1 ]; then
+        if [ -e /musl/lib/libc.so ]; then
+            link_force /musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1
+        elif [ -e /musl/musl/lib/libc.so ]; then
+            link_force /musl/musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1
+        fi
+    fi
+    if [ ! -e /lib/ld-linux-riscv64-lp64d.so.1 ]; then
+        if [ -e /musl/lib/libc.so ]; then
+            link_force /musl/lib/libc.so /lib/ld-linux-riscv64-lp64d.so.1
+        elif [ -e /musl/musl/lib/libc.so ]; then
+            link_force /musl/musl/lib/libc.so /lib/ld-linux-riscv64-lp64d.so.1
+        fi
+    fi
 
     write_file /etc/passwd 0644 \
         "root:x:0:0:root:/root:/bin/sh" \

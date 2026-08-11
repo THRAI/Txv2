@@ -3,7 +3,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
@@ -209,6 +209,39 @@ pub enum ForkError {
     PidNamespace,
     /// Zone allocator could not satisfy the reservation.
     Zone(ZoneError),
+}
+
+const FORK_ZONE_STAGE_NONE: usize = 0;
+const FORK_ZONE_STAGE_ASPACE_CAP: usize = 1;
+const FORK_ZONE_STAGE_PROCESS_IDENTITY: usize = 2;
+const FORK_ZONE_STAGE_LEADER_THREAD: usize = 3;
+const FORK_ZONE_STAGE_NSPROXY: usize = 4;
+const FORK_ZONE_STAGE_MOUNT_NAMESPACE: usize = 5;
+const FORK_ZONE_STAGE_NET_NAMESPACE: usize = 6;
+const FORK_ZONE_STAGE_PAYLOAD: usize = 7;
+
+static LAST_FORK_ZONE_STAGE: AtomicUsize = AtomicUsize::new(FORK_ZONE_STAGE_NONE);
+
+fn record_fork_zone_error(stage: usize, error: ZoneError) -> ForkError {
+    LAST_FORK_ZONE_STAGE.store(stage, Ordering::Release);
+    ForkError::Zone(error)
+}
+
+fn fork_zone_stage_label(stage: usize) -> &'static str {
+    match stage {
+        FORK_ZONE_STAGE_ASPACE_CAP => "aspace-cap",
+        FORK_ZONE_STAGE_PROCESS_IDENTITY => "process-identity",
+        FORK_ZONE_STAGE_LEADER_THREAD => "leader-thread",
+        FORK_ZONE_STAGE_NSPROXY => "nsproxy",
+        FORK_ZONE_STAGE_MOUNT_NAMESPACE => "mount-namespace",
+        FORK_ZONE_STAGE_NET_NAMESPACE => "net-namespace",
+        FORK_ZONE_STAGE_PAYLOAD => "payload",
+        _ => "none",
+    }
+}
+
+pub fn last_fork_zone_stage_label() -> &'static str {
+    fork_zone_stage_label(LAST_FORK_ZONE_STAGE.load(Ordering::Acquire))
 }
 
 impl From<VmMapError> for ForkError {
@@ -447,6 +480,7 @@ pub fn step_fork_with_options<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
     options: ForkOptions,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
+    LAST_FORK_ZONE_STAGE.store(FORK_ZONE_STAGE_NONE, Ordering::Release);
     // observe
     // upgrade
     // reserve
@@ -514,7 +548,8 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_aspace.clone()
     } else {
         let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
-        step_engine::sign(child_aspace)?
+        step_engine::sign(child_aspace)
+            .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_ASPACE_CAP, e))?
     };
 
     // Identity first (payload=None) so the leader thread can hold a
@@ -522,10 +557,11 @@ pub fn step_fork_with_options<P: PmapIf>(
     let child_pid = allocate_pid();
     let child_proc =
         sign_process_identity(child_pid, Some(parent.downgrade()), parent_pgrp.clone())
-            .map_err(ForkError::Zone)?;
+            .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_PROCESS_IDENTITY, e))?;
 
     // Leader thread.
-    let leader = sign_thread(child_proc.downgrade(), Tid(child_pid.0)).map_err(ForkError::Zone)?;
+    let leader = sign_thread(child_proc.downgrade(), Tid(child_pid.0))
+        .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_LEADER_THREAD, e))?;
 
     // Wire up payload — child inherits parent credentials, cwd, and
     // a per-slot clone of the parent's fd table. POSIX: fork copies
@@ -540,18 +576,20 @@ pub fn step_fork_with_options<P: PmapIf>(
     // parent's mount table snapshot, matching Linux's copy-on-unshare shape.
     let mut child_nsproxy =
         crate::process::nsproxy::clone_nsproxy_for_fork(&parent_nsproxy, options.clone_newipc)
-            .map_err(ForkError::Zone)?;
+            .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_NSPROXY, e))?;
     if options.clone_newns {
         let parent_mnt_ns = parent_nsproxy
             .mnt_ns
             .as_ref()
             .ok_or(ForkError::Zone(ZoneError::InvalidState))?;
-        let child_mnt_ns = parent_mnt_ns.clone_ns().map_err(ForkError::Zone)?;
+        let child_mnt_ns = parent_mnt_ns
+            .clone_ns()
+            .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_MOUNT_NAMESPACE, e))?;
         child_nsproxy = crate::process::nsproxy::clone_nsproxy_with_mount_namespace(
             &child_nsproxy,
             child_mnt_ns,
         )
-        .map_err(ForkError::Zone)?;
+        .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_MOUNT_NAMESPACE, e))?;
     }
     // CLONE_NEWNET: publish a fresh isolated network namespace for the child
     // (owned by the parent's user namespace) instead of inheriting the parent's.
@@ -561,16 +599,16 @@ pub fn step_fork_with_options<P: PmapIf>(
             "clone",
             Some(parent_nsproxy.user_ns.clone()),
         )
-        .map_err(ForkError::Zone)?;
-        namespace
-            .payload_cap()
-            .ok_or(ForkError::Zone(ZoneError::InvalidState))?
+        .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_NET_NAMESPACE, e))?;
+        namespace.payload_cap().ok_or_else(|| {
+            record_fork_zone_error(FORK_ZONE_STAGE_NET_NAMESPACE, ZoneError::InvalidState)
+        })?
     } else {
         parent_net_namespace
     };
     let payload = sign_process_payload(
         child_aspace_cap,
-        vec![leader],
+        vec![leader.clone()],
         child_nsproxy,
         parent_cred,
         parent_cwd,
@@ -585,10 +623,11 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_personality,
         child_sig_actions,
     )
-    .map_err(ForkError::Zone)?;
+    .map_err(|e| record_fork_zone_error(FORK_ZONE_STAGE_PAYLOAD, e))?;
     *child_proc.payload.lock() = Some(payload);
 
     register_pid(child_pid, child_proc.clone());
+    register_tid(Tid(child_pid.0), leader.clone());
 
     // Register child in parent's pgrp.
     parent_pgrp.members.attach(child_proc.downgrade());
@@ -1063,6 +1102,7 @@ where
         );
     }
     *process.exit_status.lock() = Some(status);
+    maintenance_after_process_reap();
 
     if try_auto_reap_adopted_by_init(process) {
         return ProcessExitOutcome::Completed;
@@ -1163,7 +1203,7 @@ fn step_process_exit_inner<F, G>(
 /// fork/clone/wait4 slice (2026-05-06) added the `exit_source` fire
 /// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
-    step_process_exit_inner(
+    step_process_exit_with_posts(
         process,
         status,
         |weak, event| {
@@ -1173,6 +1213,23 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
             let _ = mailbox.post(event);
         },
         |mailbox, event| mailbox.post(event),
+    );
+}
+
+pub(crate) fn step_process_exit_with_posts<F, G>(
+    process: &Cap<ProcessIdentity>,
+    status: ExitStatus,
+    mut signal_post: F,
+    mut wake_post: G,
+) where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    step_process_exit_inner(
+        process,
+        status,
+        &mut signal_post,
+        &mut wake_post,
     );
 }
 
@@ -1411,6 +1468,13 @@ fn reap_child_from_parent(parent: &Cap<ProcessIdentity>, child: &Cap<ProcessIden
     });
 
     unregister_pid(child.pid);
+    // The leader thread uses the same numeric id as the process, but its
+    // `PidNameKind::Thread` binding is distinct from the process binding.
+    // Group-exit deliberately keeps that TID resolvable while the child is a
+    // zombie; reap is the matching withdrawal point. Without this removal,
+    // every fork/exec child retained one `ThreadIdentity` cap in PID_NS and
+    // repeated lmbench process churn eventually exhausted the thread zone.
+    unregister_tid_number(child.pid.0 as u64);
 }
 
 fn maintenance_after_process_reap() {
@@ -1418,8 +1482,9 @@ fn maintenance_after_process_reap() {
         return;
     }
 
-    let _ = step_engine::drain_with_budget(128);
-    let _ = step_engine::drain_with_budget(128);
+    let _ = step_engine::drain_with_budget(usize::MAX);
+    let _ = step_engine::drain_with_budget(usize::MAX);
+    crate::zones::try_memory_pressure_maintenance_tick();
 }
 
 fn try_auto_reap_adopted_by_init(process: &Cap<ProcessIdentity>) -> bool {

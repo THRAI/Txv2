@@ -14,8 +14,8 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step", "zone", "epoch"],
-    reason = "expose substrate step engine (StepOp/StepOutcome, CredentialView, RestrictionStackHandle), EBR guard, and zone allocation as cred-side primitives"
+    apis = ["step", "zone", "epoch", "sync"],
+    reason = "expose substrate step engine (StepOp/StepOutcome, CredentialView, RestrictionStackHandle), EBR guard, zone allocation, and the subsystem-local SpinMutex used to cache the placeholder restriction cap"
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
@@ -24,6 +24,7 @@ pub mod step_engine {
         drive_oneshot, CredentialView, NoProgress, OneShotStepOp, RestrictionStackHandle,
         ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
+    pub use tx_substrate::sync::SpinMutex;
     pub use tx_substrate::zone::{
         sign, Cap, Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
     };

@@ -2,7 +2,7 @@ use crate::adapter::step_engine::{
     drain_with_budget, guard, page_allocator, summary as epoch_summary, zone, Zone, ZoneAllocated,
     ZoneError,
 };
-use tx_hal::{console_write_str, TxPlatform};
+use tx_hal::{console_write_str, ConsoleIf, TxPlatform};
 use tx_substrate::slab;
 
 use crate::{
@@ -111,8 +111,8 @@ pub(crate) fn best_effort_maintenance_tick() -> zone::ZoneMaintenanceStats {
 
 pub(crate) fn bounded_maintenance_tick() -> zone::ZoneMaintenanceStats {
     zone::maintenance_tick(zone::ZoneMaintenanceBudget {
-        epoch_reclaim_budget: 32,
-        empty_slab_budget: 4,
+        epoch_reclaim_budget: 512,
+        empty_slab_budget: 512,
     })
 }
 
@@ -123,10 +123,19 @@ pub fn try_bounded_maintenance_tick() {
     let _ = bounded_maintenance_tick();
 }
 
-pub(crate) fn try_best_effort_maintenance_tick() {
+pub fn try_best_effort_maintenance_tick() {
     if !zone::is_initialized() {
         return;
     }
+    let _ = best_effort_maintenance_tick();
+}
+
+pub fn try_memory_pressure_maintenance_tick() {
+    if !zone::is_initialized() {
+        return;
+    }
+    let _ = crate::page_backed::reclaim_clean_file_pages(usize::MAX);
+    let _ = best_effort_maintenance_tick();
     let _ = best_effort_maintenance_tick();
 }
 
@@ -151,7 +160,7 @@ pub fn shutdown_with_quiet_zone_cleanup<P: TxPlatform>() -> ! {
     P::system_off()
 }
 
-pub fn dump_summary<P: TxPlatform>() {
+pub fn dump_summary<P: ConsoleIf>() {
     let summary = summary();
     console_write_str::<P>("txkernel:zone:summary:epoch=");
     write_usize::<P>(summary.epoch.global_epoch as usize);
@@ -185,6 +194,8 @@ pub fn dump_summary<P: TxPlatform>() {
         write_usize::<P>(fail.total_count);
         console_write_str::<P>(":max_run=");
         write_usize::<P>(fail.max_contiguous_free_run);
+        console_write_str::<P>(":caller_ra=0x");
+        write_hex_usize::<P>(fail.caller_ra);
         console_write_str::<P>("\n");
     }
 
@@ -226,7 +237,7 @@ pub fn dump_summary<P: TxPlatform>() {
     }
 }
 
-fn dump_process_summary<P: TxPlatform>() {
+fn dump_process_summary<P: ConsoleIf>() {
     let pids = crate::process::all_pids();
     let mut live = 0usize;
     let mut zombies = 0usize;
@@ -299,13 +310,13 @@ fn proc_comm_bytes(bytes: &[u8; 16]) -> &str {
     core::str::from_utf8(&bytes[..len]).unwrap_or("?")
 }
 
-fn write_char<P: TxPlatform>(value: char) {
+fn write_char<P: ConsoleIf>(value: char) {
     let mut buf = [0u8; 4];
     let s = value.encode_utf8(&mut buf);
     console_write_str::<P>(s);
 }
 
-fn write_usize<P: TxPlatform>(value: usize) {
+fn write_usize<P: ConsoleIf>(value: usize) {
     let mut digits = [0u8; 20];
     let mut len = 0usize;
     let mut n = value;
@@ -319,6 +330,27 @@ fn write_usize<P: TxPlatform>(value: usize) {
     }
 
     let mut out = [0u8; 20];
+    for (dst, src) in out[..len].iter_mut().zip(digits[..len].iter().rev()) {
+        *dst = *src;
+    }
+    console_write_str::<P>(core::str::from_utf8(&out[..len]).unwrap_or("?"));
+}
+
+fn write_hex_usize<P: ConsoleIf>(value: usize) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut digits = [0u8; core::mem::size_of::<usize>() * 2];
+    let mut len = 0usize;
+    let mut n = value;
+    loop {
+        digits[len] = HEX[n & 0xf];
+        len += 1;
+        n >>= 4;
+        if n == 0 {
+            break;
+        }
+    }
+
+    let mut out = [0u8; core::mem::size_of::<usize>() * 2];
     for (dst, src) in out[..len].iter_mut().zip(digits[..len].iter().rev()) {
         *dst = *src;
     }

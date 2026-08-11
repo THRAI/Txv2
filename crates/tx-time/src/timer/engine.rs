@@ -8,6 +8,8 @@ use crate::{DeadlineNs, TimerKey};
 use super::min_heap::MinHeap;
 use super::queue::TimerQueue;
 
+const DEFAULT_PREPARED_INSERTS: usize = 4096;
+
 struct TimerState {
     next_key: Option<u64>,
     mutation: u64,
@@ -37,7 +39,7 @@ impl TimerEngine {
             state: Arc::new(SpinMutex::new(EngineState::Ready(TimerState {
                 next_key: Some(next_key),
                 mutation: 0,
-                queue: MinHeap::new(),
+                queue: MinHeap::with_insert_capacity(DEFAULT_PREPARED_INSERTS),
                 #[cfg(test)]
                 panic_during_growth: false,
             }))),
@@ -52,7 +54,10 @@ impl TimerEngine {
     #[cfg(test)]
     pub(super) fn with_growth_panic_for_test() -> Self {
         let engine = Self::new();
-        with_ready_state(&engine.state, |state| state.panic_during_growth = true);
+        with_ready_state(&engine.state, |state| {
+            state.queue = MinHeap::new();
+            state.panic_during_growth = true;
+        });
         engine
     }
 
@@ -288,4 +293,25 @@ fn rearm_key(shared: &Arc<SpinMutex<EngineState>>, key: TimerKey, deadline: Dead
         }
         rearmed
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    #[test]
+    fn default_engine_prepares_insert_capacity_for_runtime_timer_churn() {
+        let engine = TimerEngine::new();
+        let mut guards = Vec::new();
+
+        for index in 0..128 {
+            guards.push(engine.insert(DeadlineNs::new(1_000 + index)));
+        }
+
+        assert_eq!(engine.next_deadline_ns(), Some(1_000));
+        drop(guards);
+        assert_eq!(engine.next_deadline_ns(), None);
+    }
 }

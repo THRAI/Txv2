@@ -653,20 +653,16 @@ fn vm_recipe_ordered_coverage_walk_rejects_first_gap_without_partial_tagging() {
         aspace.tag_ufd_registration(range(0x10_0000, 5), tag),
         Err(VmMapError::MissingMapping)
     );
-    assert!(
-        aspace
-            .lookup(UserVirtAddr(0x10_0000))
-            .expect("left recipe")
-            .ufd_registration
-            .is_none()
-    );
-    assert!(
-        aspace
-            .lookup(UserVirtAddr(0x10_4000))
-            .expect("right recipe")
-            .ufd_registration
-            .is_none()
-    );
+    assert!(aspace
+        .lookup(UserVirtAddr(0x10_0000))
+        .expect("left recipe")
+        .ufd_registration
+        .is_none());
+    assert!(aspace
+        .lookup(UserVirtAddr(0x10_4000))
+        .expect("right recipe")
+        .ufd_registration
+        .is_none());
 }
 
 #[test]

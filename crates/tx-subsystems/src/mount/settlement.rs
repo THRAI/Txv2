@@ -1,7 +1,7 @@
 use crate::execution::{Errno, Guard};
 use crate::page_backed::{ErrorCursor, ErrorSeq, FileFsyncFrontier};
-use crate::vfs::FsObjectId;
 use crate::vfs::adapter::step_engine::{NoProgress, StepOutcome};
+use crate::vfs::FsObjectId;
 
 use super::MountPayloadPin;
 

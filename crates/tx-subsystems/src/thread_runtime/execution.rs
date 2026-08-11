@@ -246,18 +246,45 @@ pub enum ThreadExitOutcome {
 }
 
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) -> ThreadExitOutcome {
-    step_thread_exit_inner(thread, status, || {}, || {})
+    step_thread_exit_with_posts(
+        thread,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    )
 }
 
-fn step_thread_exit_inner<H, Z>(
+pub fn step_thread_exit_with_posts<F, G>(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+    signal_post: F,
+    wake_post: G,
+) -> ThreadExitOutcome
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    step_thread_exit_inner(thread, status, || {}, || {}, signal_post, wake_post)
+}
+
+fn step_thread_exit_inner<H, Z, F, G>(
     thread: Cap<ThreadIdentity>,
     status: i32,
     after_lane_check: H,
     after_zombify: Z,
+    mut signal_post: F,
+    mut wake_post: G,
 ) -> ThreadExitOutcome
 where
     H: FnOnce(),
     Z: FnOnce(),
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
 {
     if thread.is_zombie() {
         return ThreadExitOutcome::Completed;
@@ -307,7 +334,7 @@ where
     // reserve
     // commit
     // publish
-    set_thread_zombie(&thread, status);
+    set_thread_zombie_with_post(&thread, status, &mut signal_post);
     after_zombify();
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.zombie.after", thread.tid.0 as i64);
@@ -378,9 +405,11 @@ where
         // signal-driven termination doesn't reach this path (it goes
         // through the fatal group-exit transition which records
         // `ExitStatus::Signaled` directly before zombifying threads).
-        crate::process::execution::step_process_exit(
+        crate::process::execution::step_process_exit_with_posts(
             &parent,
             crate::process::structure::ExitStatus::Exited(status),
+            &mut signal_post,
+            &mut wake_post,
         );
     }
 
@@ -437,7 +466,7 @@ pub(crate) fn step_thread_exit_after_lane_check_for_test<H>(
 where
     H: FnOnce(),
 {
-    step_thread_exit_inner(thread, status, after_lane_check, || {})
+    step_thread_exit_inner(thread, status, after_lane_check, || {}, |_, _| {}, |_, _| true)
 }
 
 #[cfg(test)]
@@ -449,7 +478,7 @@ pub(crate) fn step_thread_exit_after_zombify_for_test<Z>(
 where
     Z: FnOnce(),
 {
-    step_thread_exit_inner(thread, status, || {}, after_zombify)
+    step_thread_exit_inner(thread, status, || {}, after_zombify, |_, _| {}, |_, _| true)
 }
 
 fn clear_and_wake_child_tid(

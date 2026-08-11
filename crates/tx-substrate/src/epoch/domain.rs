@@ -143,8 +143,11 @@ impl LocalRetireGuard {
     }
 
     pub(crate) fn prepare_head_bags_after_barrier(&mut self, epoch: u64) -> Result<(), EpochError> {
-        let state = unsafe { &mut *self.local.retire_state_ptr() };
         let next = epoch.saturating_add(1);
+        for candidate in [epoch, next] {
+            self.reclaim_conflicting_bag_after_barrier(candidate)?;
+        }
+        let state = unsafe { &mut *self.local.retire_state_ptr() };
         for candidate in [epoch, next] {
             let bag = &state.bags[candidate as usize % super::bag::EPOCH_BAG_COUNT];
             if !bag.is_empty() && bag.epoch != candidate {
@@ -191,15 +194,59 @@ impl LocalRetireGuard {
         epoch: u64,
         link: impl FnOnce(Option<crate::zone::SlotKey>),
     ) {
+        let mut epoch = epoch;
+        loop {
+            if self.reclaim_conflicting_bag_after_barrier(epoch).is_err() {
+                epoch = self.sample_epoch_after_barrier();
+                continue;
+            }
+            let state = unsafe { &mut *self.local.retire_state_ptr() };
+            let Some(bag) = state.bag_for_epoch_mut(epoch) else {
+                epoch = self.sample_epoch_after_barrier();
+                continue;
+            };
+            let previous_head = bag.zone_head;
+            link(previous_head);
+            bag.zone_head = Some(key);
+            bag.zone_count += 1;
+            self.local.publish_retire_summary(state);
+            return;
+        }
+    }
+
+    fn reclaim_conflicting_bag_after_barrier(&mut self, epoch: u64) -> Result<(), EpochError> {
         let state = unsafe { &mut *self.local.retire_state_ptr() };
-        let bag = state
-            .bag_for_epoch_mut(epoch)
-            .expect("post-barrier Zone slot enqueue must be infallible");
-        let previous_head = bag.zone_head;
-        link(previous_head);
-        bag.zone_head = Some(key);
-        bag.zone_count += 1;
+        let bag = &mut state.bags[epoch as usize % super::bag::EPOCH_BAG_COUNT];
+        if bag.is_empty() || bag.epoch == epoch {
+            return Ok(());
+        }
+
+        if bag.epoch > epoch {
+            debug_assert!(
+                false,
+                "post-barrier retire enqueue encountered a future retire epoch"
+            );
+            return Err(EpochError::RetireBagOccupied);
+        }
+
+        let zone_head = bag.zone_head.take();
+        let rcu_head = core::mem::replace(&mut bag.rcu_head, core::ptr::null_mut());
+        bag.zone_count = 0;
+        bag.rcu_count = 0;
+        bag.epoch = 0;
         self.local.publish_retire_summary(state);
+
+        let domain = self.domain;
+        if let Some(head) = zone_head {
+            domain.reclaim_zone_list(self, Some(head));
+        }
+        if !rcu_head.is_null() {
+            domain.reclaim_intrusive_list(self, rcu_head);
+        }
+
+        let state = unsafe { &mut *self.local.retire_state_ptr() };
+        self.local.publish_retire_summary(state);
+        Ok(())
     }
 
     pub(crate) fn with_local_execution_open<R>(
@@ -744,8 +791,8 @@ impl EpochDomain {
         while let Some(current) = head {
             head = crate::zone::retiring_next(current);
             crate::zone::set_retiring_next(current, Some(current));
-            local_guard.with_local_execution_open(|_| unsafe {
-                crate::zone::reclaim_retired_slot(current);
+            local_guard.with_local_execution_open(|local_guard| unsafe {
+                crate::zone::reclaim_retired_slot(current, local_guard);
             });
             reclaimed += 1;
         }

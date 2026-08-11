@@ -12,7 +12,7 @@ use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
     self as step_engine, init, init_on_ap, spin_mutex, ByteProgress, Cap, SpinMutex, StepOutcome,
 };
-use crate::init::boot_plan::{BootPlan, RootfsSetup};
+use crate::init::boot_plan::{BootPlan, FirstUserspace, RootfsSetup};
 use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_services::time::{
@@ -660,12 +660,22 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_subsystems::time_hooks::ensure_hooks_installed();
             Self::install_kernel_trap_vector();
             Self::init_boot_reactor();
+            let boot_plan = BootPlan::read::<P>();
             Self::boot_secondary_cpus();
             Self::run_smp_shootdown_smoke();
             Self::run_smp_ipi_smoke();
             Self::run_reactor_dispatcher_smoke();
-            Self::run_reactor_owner_wake_smp_smoke();
-            Self::run_rcu_smp_smoke();
+            if matches!(
+                boot_plan.first_userspace,
+                FirstUserspace::OscompSdcard { .. }
+            ) {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":reactor:owner-wake:smp:skip:oscomp\n");
+                tx_hal::console_write_str::<P>(":rcu:smp:skip:oscomp\n");
+            } else {
+                Self::run_reactor_owner_wake_smp_smoke();
+                Self::run_rcu_smp_smoke();
+            }
             Self::run_zone_smoke();
             Self::run_bsp_reactor_runtime_smoke();
             Self::run_bsp_reactor_timer_idle_smoke();
@@ -715,7 +725,6 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_procfs_at_proc();
             Self::mount_sysfs_at_sys();
             Self::mount_bdevfs_at_dev_block();
-            let boot_plan = BootPlan::read::<P>();
             if boot_plan.args.mount_sdcard {
                 Self::mount_sdcard_at_musl();
             }
@@ -727,8 +736,9 @@ impl<P: TxPlatform> CoreInit<P> {
                     tx_hal::console_write_str::<P>("\n");
                 }
                 RootfsSetup::TestInit => {
+                    Self::populate_rootfs_tmp_dirs();
                     Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":rootfs-shims:skip:test-init\n");
+                    tx_hal::console_write_str::<P>(":rootfs-shims:test-init:scratch-dirs\n");
                 }
                 RootfsSetup::LegacyKernelShims => {
                     Self::populate_rootfs_shebang_shims();
@@ -1669,45 +1679,22 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{
-            mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
-            Ext4FileIoRuntimeBinder, JournalPagePool,
-        };
+        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage, Ext4FileIoRuntimeBinder};
         use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
-        use tx_subsystems::io_manager::block::DeviceKey;
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
         };
 
-        let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
-        let Some(geometry) = image.block_geometry(device) else {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
-            return;
-        };
-        // The pool holds the active ordered transaction's descriptor, commit,
-        // metadata journal copies, and later home-block checkpoint copies.
-        // Ext4Pager currently supports at most four inline extent mutations,
-        // so 32 pages leaves headroom without allowing unbounded staging.
-        let pool = match JournalPagePool::new(32) {
-            Ok(pool) => pool,
+        let mount_output = match mount_ext4_read_only(image) {
+            Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
                 return;
             }
         };
-        let mount_output =
-            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
-                Ok(out) => out,
-                Err(_) => {
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
-                    return;
-                }
-            };
         mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
             Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
         )));

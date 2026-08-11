@@ -453,6 +453,7 @@ static LAST_ALLOC_FAIL_PAGES: AtomicUsize = AtomicUsize::new(0);
 static LAST_ALLOC_FAIL_FREE: AtomicUsize = AtomicUsize::new(0);
 static LAST_ALLOC_FAIL_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static LAST_ALLOC_FAIL_MAX_RUN: AtomicUsize = AtomicUsize::new(0);
+static LAST_ALLOC_FAIL_CALLER_RA: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GlobalAllocationFailureDiagnostics {
@@ -462,6 +463,7 @@ pub struct GlobalAllocationFailureDiagnostics {
     pub free_count: usize,
     pub total_count: usize,
     pub max_contiguous_free_run: usize,
+    pub caller_ra: usize,
 }
 
 unsafe impl SlabPageProvider for GlobalPageProvider {
@@ -521,10 +523,11 @@ pub struct KernelGlobalAllocator;
 
 unsafe impl GlobalAlloc for KernelGlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let caller_ra = allocation_caller_ra();
         match GLOBAL_HEAP.try_alloc(layout) {
             Ok(ptr) => ptr.as_ptr(),
             Err(_) => {
-                record_global_alloc_failure(layout);
+                record_global_alloc_failure(layout, caller_ra);
                 ptr::null_mut()
             }
         }
@@ -537,7 +540,24 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
     }
 }
 
-fn record_global_alloc_failure(layout: Layout) {
+#[inline(always)]
+fn allocation_caller_ra() -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let caller_ra: usize;
+        unsafe {
+            core::arch::asm!("mv {ra}, ra", ra = out(reg) caller_ra, options(nomem, nostack));
+        }
+        caller_ra
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        0
+    }
+}
+
+fn record_global_alloc_failure(layout: Layout, caller_ra: usize) {
     let page_size = GLOBAL_PAGE_SIZE
         .load(Ordering::Acquire)
         .max(DEFAULT_PAGE_SIZE);
@@ -558,6 +578,7 @@ fn record_global_alloc_failure(layout: Layout) {
     LAST_ALLOC_FAIL_FREE.store(free_count, Ordering::Release);
     LAST_ALLOC_FAIL_TOTAL.store(total_count, Ordering::Release);
     LAST_ALLOC_FAIL_MAX_RUN.store(max_run, Ordering::Release);
+    LAST_ALLOC_FAIL_CALLER_RA.store(caller_ra, Ordering::Release);
     LAST_ALLOC_FAIL_SIZE.store(layout.size(), Ordering::Release);
 }
 
@@ -574,6 +595,7 @@ pub fn last_allocation_failure() -> Option<GlobalAllocationFailureDiagnostics> {
         free_count: LAST_ALLOC_FAIL_FREE.load(Ordering::Acquire),
         total_count: LAST_ALLOC_FAIL_TOTAL.load(Ordering::Acquire),
         max_contiguous_free_run: LAST_ALLOC_FAIL_MAX_RUN.load(Ordering::Acquire),
+        caller_ra: LAST_ALLOC_FAIL_CALLER_RA.load(Ordering::Acquire),
     })
 }
 

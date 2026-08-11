@@ -16,16 +16,16 @@ use alloc::vec::Vec;
 
 use crate::execution::Guard;
 use crate::mount::{MountIdentity, MountNamespace, MountPayload};
-use crate::vfs::FsOps;
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_ISVTX,
 };
 use crate::vfs::walker::{self, SYMLOOP_MAX};
+use crate::vfs::FsOps;
 
 use super::state::{
-    FinalSymlinkPolicy, IORequest, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode,
-    WalkState, WalkingState, try_clone_io_request, try_copy_path, try_join_path,
+    try_clone_io_request, try_copy_path, try_join_path, FinalSymlinkPolicy, IORequest, KernelStep,
+    PathResolution, ResumeToken, WalkCause, WalkMode, WalkState, WalkingState,
 };
 use super::terminal;
 

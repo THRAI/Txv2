@@ -100,7 +100,7 @@ fn cached_child_retains_target(
     };
     parent
         .cached_child(name)
-        .is_some_and(|child| child.rnode().fs_object_id() == target)
+        .is_some_and(|child| child.rnode().fs_object_id() == target && child.retain_count() > 1)
 }
 
 fn open_fd_retains_target(ctx: &SyscallCtx<'_>, target: tx_subsystems::vfs::FsObjectId) -> bool {
@@ -119,7 +119,9 @@ fn maybe_destroy_zero_link_inode_after_namespace_remove(
         StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => return,
     };
     if meta.nlinks == 0 {
-        let _ = fs_ops.destroy_inode(target, &guard);
+        if matches!(fs_ops.destroy_inode(target, &guard), StepOutcome::Done(())) {
+            zero_link_destroy_pressure_maintenance();
+        }
     }
 }
 
@@ -139,6 +141,19 @@ fn maybe_destroy_zero_link_inode_after_namespace_remove(
 pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
     let split = split_parent_name(path);
     (split.parent_path, split.basename)
+}
+
+/// Linux accepts trailing slashes on a directory path being created:
+/// `mkdir("foo/")` creates `foo`, while `mkdir("/")` still targets the
+/// existing root directory.  Keep the compatibility normalization local to
+/// `mkdirat` so path-removal/link operations can retain their stricter
+/// syscall-specific trailing-slash behaviour.
+fn split_mkdir_path(path: &[u8]) -> (&[u8], &[u8]) {
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    split_path(&path[..end])
 }
 
 fn proc_self_fd_number(path: &[u8]) -> Option<u32> {
@@ -256,7 +271,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Err(e) => return SyscallResult::Error(e),
     };
     let cred = ctx.walker_cred();
-    let (parent_path, basename) = split_path(&path);
+    let (parent_path, basename) = split_mkdir_path(&path);
     if basename.is_empty() {
         // Trailing-slash-only basename, e.g. `mkdir("/")` — the FsOps
         // layer rejects an empty `InlineName`. Linux's behaviour for
@@ -420,10 +435,10 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     };
     match result {
         Ok(()) => {
+            parent_dentry.remove_cached_child_by_name(basename);
             let retained_by_live_dentry =
                 cached_child_retains_target(&parent_dentry, basename, target_id);
             let retained_by_open_fd = open_fd_retains_target(ctx, target_id);
-            parent_dentry.remove_cached_child_by_name(basename);
             if !retained_by_live_dentry && !retained_by_open_fd {
                 maybe_destroy_zero_link_inode_after_namespace_remove(&fs_ops, target_id);
             }

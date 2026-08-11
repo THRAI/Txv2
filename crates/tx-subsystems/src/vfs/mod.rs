@@ -35,18 +35,18 @@ pub use execution::{
     ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp, SymlinkOp, TruncateFsObjectOp,
     UnlinkFromParentOp, WalkInMountNamespaceWithOriginOp,
 };
-pub use fd_ready::{FdReadyMask, FdReadyQuery, FdReadyReport, FdWait, query_fd_ready};
+pub use fd_ready::{query_fd_ready, FdReadyMask, FdReadyQuery, FdReadyReport, FdWait};
 pub use notification::{VFS_READABLE, VFS_WRITABLE};
 pub use structure::{
-    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
-    OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
-    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
-    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, StructPayload, Timespec,
-    VFS_NAME_MAX, VfsName, render_dentry_path,
+    render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
+    InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
+    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload, Timespec, VfsName,
+    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID,
+    S_ISVTX, VFS_NAME_MAX,
 };
 pub use walker::{
-    OpenFileWithMount, ResolvedDEntryWithMount, SYMLOOP_MAX, step_open,
-    step_open_in_mount_namespace, step_open_in_mount_namespace_with_mount,
+    step_open, step_open_in_mount_namespace, step_open_in_mount_namespace_with_mount,
     step_open_in_mount_namespace_with_origin_mount, step_open_nofollow, step_walk,
     step_walk_in_mount_namespace, step_walk_in_mount_namespace_with_origin_mount,
+    OpenFileWithMount, ResolvedDEntryWithMount, SYMLOOP_MAX,
 };

@@ -96,8 +96,9 @@ core::arch::global_asm!(
     # `boards::tx_hal_riscv64_qemu_virt::KernelResumeCtx` in lib.rs.
     .equ TX_RV64_RCTX_SP, 0
     .equ TX_RV64_RCTX_RA, 8
-    .equ TX_RV64_RCTX_S0, 16
-    # s1..s11 follow at +8 each up to offset 104.
+    .equ TX_RV64_RCTX_TP, 16
+    .equ TX_RV64_RCTX_S0, 24
+    # s1..s11 follow at +8 each up to offset 112.
 
     .globl tx_rv64_qemu_minimal_trap_vector
 tx_rv64_qemu_minimal_trap_vector:
@@ -362,7 +363,7 @@ tx_rv64_qemu_minimal_trap_vector:
     #   a1 = *const Rv64TrapFrame       (user trap frame to load)
     #   a2 = trap_stack_top             (boot-primed sscratch value)
     #
-    # Stash (sp, ra, s0..s11) into *a0 so the trap-shell longjmp
+    # Stash (sp, ra, kernel tp, s0..s11) into *a0 so the trap-shell longjmp
     # helper can unwind back here. Then re-prime sscratch with a2
     # so the upcoming user trap lands on the trap stack. Then load
     # the user frame from a1 and sret.
@@ -376,6 +377,7 @@ tx_rv64_qemu_minimal_trap_vector:
 tx_rv64_enter_userspace_save_resume:
     sd sp,   TX_RV64_RCTX_SP(a0)
     sd ra,   TX_RV64_RCTX_RA(a0)
+    sd tp,   TX_RV64_RCTX_TP(a0)
     sd s0,  (TX_RV64_RCTX_S0 +   0)(a0)
     sd s1,  (TX_RV64_RCTX_S0 +   8)(a0)
     sd s2,  (TX_RV64_RCTX_S0 +  16)(a0)
@@ -476,7 +478,7 @@ tx_rv64_enter_userspace_save_resume:
     # tx_rv64_resume_kernel_after_reschedule:
     #   a0 = *const KernelResumeCtx
     #
-    # Restore (sp, ra, s0..s11) from *a0 and `ret`. The caller in
+    # Restore (sp, ra, kernel tp, s0..s11) from *a0 and `ret`. The caller in
     # apply_trap_action has already re-primed sscratch with
     # trap_stack_top.
     # ------------------------------------------------------------------
@@ -489,6 +491,7 @@ tx_rv64_resume_kernel_after_reschedule:
     .option pop
     ld sp,   TX_RV64_RCTX_SP(a0)
     ld ra,   TX_RV64_RCTX_RA(a0)
+    ld tp,   TX_RV64_RCTX_TP(a0)
     ld s0,  (TX_RV64_RCTX_S0 +   0)(a0)
     ld s1,  (TX_RV64_RCTX_S0 +   8)(a0)
     ld s2,  (TX_RV64_RCTX_S0 +  16)(a0)

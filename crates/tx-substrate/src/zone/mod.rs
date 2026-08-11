@@ -72,8 +72,11 @@ pub(crate) fn set_retiring_next(key: SlotKey, next: Option<SlotKey>) {
     }
 }
 
-pub(crate) unsafe fn reclaim_retired_slot(key: SlotKey) {
-    unsafe { registry::reclaim_slot(key) }
+pub(crate) unsafe fn reclaim_retired_slot(
+    key: SlotKey,
+    local_guard: &mut crate::epoch::LocalRetireGuard,
+) {
+    unsafe { registry::reclaim_slot(key, local_guard) }
 }
 
 const ZONE_ID_INITIALIZING: usize = usize::MAX;
@@ -207,9 +210,15 @@ impl<T: 'static> Zone<T> {
         });
     }
 
-    pub(crate) fn return_slot_from_reclaim(&self, slot: core::ptr::NonNull<slot::Slot<T>>) {
+    pub(crate) fn return_slot_from_reclaim(
+        &self,
+        slot: core::ptr::NonNull<slot::Slot<T>>,
+        local_guard: &mut crate::epoch::LocalRetireGuard,
+        generation_exhausted: bool,
+    ) {
         measure_zone!(b"debug.ds.substrate.zone.return_slot_from_reclaim", T, {
-            self.keg.return_slot_without_slab_retire(slot);
+            self.keg
+                .return_slot_from_reclaim(slot, local_guard, generation_exhausted);
         });
     }
 

@@ -146,14 +146,13 @@ mod page_data_lease_projection_tests {
 
     #[test]
     fn projection_transfers_only_neutral_sources() {
-        let projection = PageDataLeaseProjection::new(alloc::boxed::Box::new([
-            IoDataSource::page_cache(
+        let projection =
+            PageDataLeaseProjection::new(alloc::boxed::Box::new([IoDataSource::page_cache(
                 IoDataLeaseId::new(7),
                 PageFrameRef::new(Ppn(0x42)),
                 0,
                 4096,
-            ),
-        ]));
+            )]));
 
         assert!(matches!(
             projection.into_sources().as_ref(),

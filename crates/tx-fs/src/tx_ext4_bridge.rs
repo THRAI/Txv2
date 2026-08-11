@@ -456,13 +456,21 @@ mod tests {
         .expect("page container cap");
         let binder = Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(&FILE_IO_REGISTRATION));
 
-        tx_ext4::mount::FilePageContainerBinder::bind_file_page_container(&binder, container);
+        tx_ext4::mount::FilePageContainerBinder::bind_file_page_container(
+            &binder,
+            container.clone(),
+        );
 
         let runtimes = tx_subsystems::device::page_container_file_io_service_runtimes_snapshot();
         assert_eq!(runtimes.len(), 1);
+        assert!(runtimes[0].container().is_some());
         assert_eq!(
             runtimes[0].handle().registration().devt,
             FILE_IO_REGISTRATION.devt
+        );
+        drop(container);
+        assert!(
+            tx_subsystems::device::page_container_file_io_service_runtimes_snapshot().is_empty()
         );
         tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     }

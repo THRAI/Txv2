@@ -6,10 +6,10 @@
 
 use crate::cred::adapter::step_engine::Cap;
 use crate::cred::{
-    commit_prepared_exec_cred, prepare_exec_cred, prepare_setid_for_exec, step_apply_suid_for_exec,
-    step_set_capability_sets, step_setgid, step_setregid, step_setresgid, step_setresuid,
-    step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, CredSnapshot,
-    ExecSetidPolicy, Gid, Uid,
+    commit_prepared_exec_cred, placeholder_restrictions_cap, prepare_exec_cred,
+    prepare_setid_for_exec, step_apply_suid_for_exec, step_set_capability_sets, step_setgid,
+    step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid, Capability,
+    CapabilitySet, Cred, CredChange, CredSnapshot, ExecSetidPolicy, Gid, Uid,
 };
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
@@ -106,6 +106,16 @@ fn bootstrap_init_process_starts_with_root_cred() {
     let _g = setup();
     let init = bootstrap();
     assert_eq!(cred_of(&init), Cred::root());
+}
+
+#[test]
+fn placeholder_restrictions_cap_reuses_one_cached_slot() {
+    let _g = setup();
+    let first = placeholder_restrictions_cap().expect("placeholder restrictions cap");
+    let second = placeholder_restrictions_cap().expect("cached placeholder restrictions cap");
+
+    assert_eq!(first.key(), second.key());
+    assert!(first.retain_count() >= 3);
 }
 
 #[test]

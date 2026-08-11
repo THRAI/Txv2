@@ -20,7 +20,7 @@ use super::helpers::{bootstrap_block_on, exec_error_tag};
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
 #[cfg(test)]
-use crate::adapter::step_engine::{StepOutcome, page_allocator};
+use crate::adapter::step_engine::{page_allocator, StepOutcome};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -278,8 +278,8 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
             let sdcard_envp: &[&[u8]] = &[
-                b"PATH=/bin:/usr/bin:/tx-ltp/bin:/glibc:/musl/musl",
-                b"LD_LIBRARY_PATH=/glibc/lib:/lib",
+                b"PATH=/bin:/usr/bin:/tx-ltp/bin:/musl/glibc:/musl/musl",
+                b"LD_LIBRARY_PATH=/musl/glibc/lib:/lib",
             ];
             let test_init_argv: [&[u8]; 2] = [b"tx-test-init", sdcard_cmd.as_bytes()];
             let direct_argv: [&[u8]; 3] = [b"sh", b"-c", sdcard_cmd.as_bytes()];
@@ -803,7 +803,12 @@ impl<P: TxPlatform> CoreInit<P> {
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
-    let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
+    let mut cmd = String::from(
+        "tx_musl_root=/musl/musl; \
+         [ -d \"$tx_musl_root/basic\" ] || tx_musl_root=/musl; \
+         tx_bb=\"$tx_musl_root/busybox\"; \
+         cd \"$tx_musl_root\"",
+    );
     let bench_observe_enabled = oscomp_bench_observe_enabled::<P>();
     let bench_observe_threshold = oscomp_bench_observe_threshold::<P>();
     let mut selected = 0usize;
@@ -939,7 +944,7 @@ fn append_filtered_glibc_libctest(cmd: &mut alloc::string::String, filter: &str)
 
     let _ = write!(
         cmd,
-        "; cd /glibc; {} ./busybox echo \"#### OS COMP TEST GROUP START libctest-glibc ####\"",
+        "; cd /musl/glibc; {} ./busybox echo \"#### OS COMP TEST GROUP START libctest-glibc ####\"",
         glibc_non_ltp_prelude()
     );
     append_filtered_libctest_cases(cmd, filter);
@@ -1017,9 +1022,9 @@ fn append_filtered_musl_libctest_case(cmd: &mut alloc::string::String, entry: &s
     } else if libctest_case_missing_from_sdcard(entry, case) {
         append_synthetic_libctest_pass(cmd, entry, case);
     } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
-        append_dynamic_libctest_cwd_dso_case(cmd, case);
+        append_musl_dynamic_libctest_cwd_dso_case(cmd, case);
     } else if entry == "entry-dynamic.exe" {
-        append_dynamic_libctest_direct_case(cmd, case);
+        append_musl_dynamic_libctest_direct_case(cmd, case);
     } else {
         let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
     }
@@ -1050,23 +1055,10 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
     );
 }
 
-fn append_dynamic_libctest_direct_case(cmd: &mut alloc::string::String, case: &str) {
+fn append_musl_dynamic_libctest_direct_case(cmd: &mut alloc::string::String, case: &str) {
     use core::fmt::Write as _;
 
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
-    );
-    let _ = write!(cmd, "; ./busybox chmod 755 ./lib/libc.so");
-    let _ = write!(cmd, "; ./lib/libc.so ./entry-dynamic.exe {case}");
-    let _ = write!(
-        cmd,
-        "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
-    );
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
-    );
+    let _ = write!(cmd, "; ./runtest.exe -w entry-dynamic.exe {case}");
 }
 
 fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
@@ -1088,6 +1080,38 @@ fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &
         cmd,
         "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
     );
+}
+
+fn append_musl_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    append_musl_dynamic_libctest_workdir(cmd, case);
+    let _ = write!(
+        cmd,
+        "; ./busybox cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work/lib\""
+    );
+    let _ = write!(
+        cmd,
+        "; (cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe {case})"
+    );
+    append_musl_dynamic_libctest_workdir_cleanup(cmd);
+}
+
+fn append_musl_dynamic_libctest_workdir(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; tx_libctest_dyn_work=/tmp/tx-libctest-dyn-{case}");
+    let _ = write!(cmd, "; ./busybox rm -rf \"$tx_libctest_dyn_work\"");
+    let _ = write!(cmd, "; ./busybox mkdir -p \"$tx_libctest_dyn_work\"");
+    let _ = write!(
+        cmd,
+        "; ./busybox cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work\""
+    );
+    let _ = write!(cmd, "; ./busybox cp -r ./lib \"$tx_libctest_dyn_work\"");
+}
+
+fn append_musl_dynamic_libctest_workdir_cleanup(cmd: &mut alloc::string::String) {
+    cmd.push_str("; ./busybox rm -rf \"$tx_libctest_dyn_work\"");
 }
 
 fn append_musl_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
@@ -1271,7 +1295,58 @@ fn append_oscomp_musl_script_with_observe(
         append_busybox_script(cmd, "busybox-musl", "./busybox");
         return;
     }
+    if script == "basic_testcode.sh" {
+        append_basic_script(cmd);
+        return;
+    }
+    if script == "iozone_testcode.sh" {
+        append_iozone_script(cmd);
+        return;
+    }
+    if script == "lmbench_testcode.sh" {
+        append_lmbench_script(cmd);
+        return;
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+fn append_basic_script(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; ./busybox echo \"#### OS COMP TEST GROUP START basic-musl ####\"\
+         ; tx_basic_work=/tmp/tx-basic-musl; ./busybox rm -rf \"$tx_basic_work\"\
+         ; ./busybox mkdir -p \"$tx_basic_work\"\
+         ; ./busybox cp -r \"$tx_musl_root/basic/.\" \"$tx_basic_work\"\
+         ; (cd \"$tx_basic_work\"; for tx_basic_case in brk chdir clone close dup2 dup execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do \"$tx_bb\" echo \"Testing $tx_basic_case :\"; \"$tx_musl_root/lib/libc.so\" \"./$tx_basic_case\"; done)\
+         ; ./busybox echo \"#### OS COMP TEST GROUP END basic-musl ####\"",
+    );
+}
+
+fn append_iozone_script(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; tx_iozone_work=/tmp/tx-iozone-musl; ./busybox rm -rf \"$tx_iozone_work\"\
+         ; ./busybox mkdir -p \"$tx_iozone_work\"\
+         ; ./busybox cp ./iozone ./iozone_testcode.sh ./busybox \"$tx_iozone_work\"\
+         ; ./busybox cp -r ./lib \"$tx_iozone_work\"\
+         ; (cd \"$tx_iozone_work\"; ./busybox sh iozone_testcode.sh)\
+         ; ./busybox rm -rf \"$tx_iozone_work\"",
+    );
+}
+
+fn append_lmbench_script(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; tx_lmbench_work=/tmp/tx-lmbench-musl; ./busybox rm -rf \"$tx_lmbench_work\"\
+         ; ./busybox mkdir -p \"$tx_lmbench_work\"\
+         ; ./busybox cp ./lmbench_testcode.sh ./lmbench_all ./lmbench ./lat_syscall ./lat_select ./lat_sig ./lat_pipe ./lat_proc ./lat_pagefault ./lat_mmap ./lat_fs ./bw_pipe ./bw_file_rd ./bw_mmap_rd ./lat_ctx ./lmdd ./busybox \"$tx_lmbench_work\"\
+         ; ./busybox cp -r ./lib \"$tx_lmbench_work\"\
+         ; ./busybox printf '#!/bin/sh\\nexec /code/lmbench_src/bin/build/lmbench_all hello \"$@\"\\n' > \"$tx_lmbench_work/hello\"\
+         ; ./busybox chmod 755 \"$tx_lmbench_work/hello\"\
+         ; ./busybox rm -f /tmp/hello\
+         ; ./busybox cp \"$tx_lmbench_work/hello\" /tmp/hello\
+         ; ./busybox chmod 755 /tmp/hello\
+         ; (cd \"$tx_lmbench_work\"; ./busybox sh lmbench_testcode.sh)\
+         ; ./busybox rm -f /tmp/hello\
+         ; ./busybox rm -rf \"$tx_lmbench_work\"",
+    );
 }
 
 fn append_lmbench_probe(cmd: &mut alloc::string::String) {
@@ -1283,11 +1358,19 @@ fn append_lmbench_probe(cmd: &mut alloc::string::String) {
          ; ./busybox rm -f /tmp/hello\
          ; ./busybox cp hello /tmp/hello\
          ; ./busybox echo lmbench-probe:cp-status:$?\
+         ; ./busybox chmod 755 /tmp/hello\
          ; ./busybox ls -l hello /tmp/hello\
+         ; ./busybox ls -l /lib/ld-musl-riscv64.so.1 ./lib/libc.so\
+         ; ./busybox readlink /lib/ld-musl-riscv64.so.1\
+         ; ./busybox echo lmbench-probe:loader-readlink-status:$?\
          ; ./busybox readlink hello\
          ; ./busybox echo lmbench-probe:readlink-status:$?\
          ; ./busybox cat hello\
          ; ./busybox echo\
+         ; ./lib/libc.so /tmp/hello\
+         ; ./busybox echo lmbench-probe:local-loader-tmp-status:$?\
+         ; ./lib/libc.so hello\
+         ; ./busybox echo lmbench-probe:local-loader-src-status:$?\
          ; ./busybox ls -l /code /code/lmbench_src/bin/build/lmbench_all\
          ; ./busybox sh /tmp/hello\
          ; ./busybox echo lmbench-probe:sh-status:$?\
@@ -1351,27 +1434,43 @@ fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
 fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
 
+    if script == "basic_testcode.sh" {
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\
+             ; tx_basic_work=/tmp/tx-basic-glibc; ./busybox rm -rf \"$tx_basic_work\"\
+             ; ./busybox mkdir -p \"$tx_basic_work\"\
+             ; tx_glibc_root=/musl/glibc; [ -d \"$tx_glibc_root/basic\" ] || tx_glibc_root=/glibc\
+             ; tx_glibc_lib=/lib/ld-linux-riscv64-lp64d.so.1\
+             ; ./busybox cp \"$tx_glibc_root/busybox\" \"$tx_basic_work\"\
+             ; ./busybox cp -r \"$tx_glibc_root/basic/.\" \"$tx_basic_work\"\
+             ; (cd \"$tx_basic_work\"; for tx_basic_case in brk chdir clone close dup2 dup execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do ./busybox echo \"Testing $tx_basic_case :\"; \"$tx_glibc_lib\" \"./$tx_basic_case\"; done)\
+             ; ./busybox echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\
+             ; ./busybox rm -rf \"$tx_basic_work\""
+        );
+        return;
+    }
     if script == "ltp_testcode.sh" {
         // Same env contract as the musl walk, rooted at the glibc tree;
         // run in a subshell so the glibc LTPROOT/PATH don't leak into
         // groups queued after this one.
         let mut env = alloc::string::String::new();
-        append_ltp_walk_env(&mut env, "/glibc");
+        append_ltp_walk_env(&mut env, "/musl/glibc");
         let _ = write!(
             cmd,
-            "; cd /glibc; (true{env}; /musl/musl/busybox sh {script}); cd /musl/musl"
+            "; cd /musl/glibc; (true{env}; \"$tx_bb\" sh {script}); cd \"$tx_musl_root\""
         );
         return;
     }
     if script == "busybox_testcode.sh" {
-        let _ = write!(cmd, "; cd /glibc");
-        append_busybox_script(cmd, "busybox-glibc", "/musl/musl/busybox");
-        let _ = write!(cmd, "; cd /musl/musl");
+        let _ = write!(cmd, "; cd /musl/glibc");
+        append_busybox_script(cmd, "busybox-glibc", "\"$tx_bb\"");
+        let _ = write!(cmd, "; cd \"$tx_musl_root\"");
         return;
     }
     let _ = write!(
         cmd,
-        "; cd /glibc; {} /musl/musl/busybox sh {script}; cd /musl/musl",
+        "; cd /musl/glibc; {} \"$tx_bb\" sh {script}; cd \"$tx_musl_root\"",
         glibc_non_ltp_prelude()
     );
 }
@@ -1391,13 +1490,20 @@ fn append_busybox_script(cmd: &mut alloc::string::String, group: &str, sh: &str)
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"\
+         ; tx_busybox_work=/tmp/tx-{group}; ./busybox rm -rf \"$tx_busybox_work\"\
+         ; ./busybox mkdir -p \"$tx_busybox_work\"\
+         ; ./busybox cp ./busybox busybox_cmd.txt busybox_testcode.sh \"$tx_busybox_work\"\
+         ; (cd \"$tx_busybox_work\"\
+         ; ./busybox --install -s . 2>/dev/null\
+         ; ./busybox rm -f test\
+         ; export PATH=.:$PATH\
          ; {}\
-         ; ./busybox sh -c 'sleep 5' & tx_kill_pid=$!; ./busybox kill $tx_kill_pid\
+         ; ./busybox sh -c './busybox sleep 5' & tx_kill_pid=$!; ./busybox kill $tx_kill_pid\
          ; tx_kill_rc=$?; if [ $tx_kill_rc -eq 0 ]; then \
          ./busybox echo 'testcase busybox kill 10 success'; else \
          ./busybox echo 'testcase busybox kill 10 fail'; fi\
          ; ./busybox sed '/OS COMP TEST GROUP /d' busybox_testcode.sh > /tmp/tx-busybox-body.sh\
-         ; {sh} sh /tmp/tx-busybox-body.sh\
+         ; {sh} sh /tmp/tx-busybox-body.sh)\
          ; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\"",
         busybox_case_name_prelude()
     );
@@ -1706,7 +1812,7 @@ fn append_ltp_script_env_with_default_ifaces(
     append_busybox_bin_install(cmd);
     let _ = write!(
         cmd,
-        "; export LTPROOT=/musl/musl/ltp; export PATH=/tx-ltp/bin:/bin:/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+        "; export LTPROOT=/musl/musl/ltp; export PATH=/tx-ltp/bin:/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
     );
     if install_default_ifaces {
         let _ = write!(
@@ -1734,7 +1840,7 @@ fn append_ltp_walk_env(cmd: &mut alloc::string::String, lane_root: &str) {
     // helpers and every test TBROKs ("timeout need to be >= 1", empty `$!`).
     let _ = write!(
         cmd,
-        "; if [ -d {lane_root}/ltp ]; then LROOT={lane_root}; elif [ -d /musl/ltp ]; then LROOT=/musl; else LROOT={lane_root}; fi; export LTPROOT=$LROOT/ltp; export PATH=/tx-ltp/bin:/bin:$LROOT/ltp/testcases/bin:$LROOT/ltp/bin:$LROOT/ltp/testscripts:$LROOT:/glibc:/musl/musl"
+        "; if [ -d {lane_root}/ltp ]; then LROOT={lane_root}; elif [ -d /musl/ltp ]; then LROOT=/musl; else LROOT={lane_root}; fi; export LTPROOT=$LROOT/ltp; export PATH=/tx-ltp/bin:/bin:$LROOT/ltp/testcases/bin:$LROOT/ltp/bin:$LROOT/ltp/testscripts:$LROOT:/musl/glibc:/musl/musl"
     );
     let _ = write!(
         cmd,
@@ -1928,7 +2034,7 @@ fn append_ltp_bin_walk(
     let lane = lane.trim();
     let files = files.trim();
     let (group, lane_root) = match lane {
-        "glibc" => ("ltp-glibc", "/glibc"),
+        "glibc" => ("ltp-glibc", "/musl/glibc"),
         _ => ("ltp-musl", "/musl/musl"),
     };
     let lane_ok = matches!(lane, "musl" | "glibc");
@@ -1976,7 +2082,8 @@ fn libctest_case_needs_cwd_dso(case: &str) -> bool {
     matches!(case, "dlopen" | "tls_get_new_dtv")
 }
 
-const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_STATIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch setjmp snprintf socket sscanf sscanf_long stat \
      strftime string string_memcpy string_memmem string_memset string_strchr string_strcspn \
@@ -1994,7 +2101,8 @@ const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_ge
      scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof statvfs strverscmp \
      syscall_sign_extend uselocale_0 wcsncpy_read_overflow wcsstr_false_negative";
 
-const LIBCTEST_DYNAMIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch sem_init setjmp snprintf socket sscanf \
      sscanf_long stat strftime string string_memcpy string_memmem string_memset string_strchr \
@@ -2035,8 +2143,15 @@ mod tests {
 
         assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
         assert!(cmd.contains("SKIP entry-static.exe dlopen"));
-        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
-        assert!(cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains("tx_libctest_dyn_work=/tmp/tx-libctest-dyn-dlopen"));
+        assert!(cmd
+            .contains("cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work\""));
+        assert!(cmd.contains(
+            "cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work/lib\""
+        ));
+        assert!(cmd.contains(
+            "(cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe dlopen)"
+        ));
     }
 
     #[test]
@@ -2053,7 +2168,7 @@ mod tests {
         let mut cmd = String::from("cd /musl/musl");
         append_filtered_glibc_libctest(&mut cmd, "dynamic:pthread_cancel_points");
 
-        assert!(cmd.contains("; cd /glibc; "));
+        assert!(cmd.contains("; cd /musl/glibc; "));
         assert!(cmd.contains("[ -e lib/libc.so.6 ] || ./busybox cp lib/libc.so lib/libc.so.6"));
         assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-glibc ####"));
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
@@ -2067,13 +2182,17 @@ mod tests {
         let mut cmd = String::new();
         append_full_libctest(&mut cmd);
 
-        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
-        assert!(cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains("tx_libctest_dyn_work=/tmp/tx-libctest-dyn-dlopen"));
+        assert!(cmd.contains(
+            "(cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe dlopen)"
+        ));
         assert!(
-            cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe tls_get_new_dtv)")
+            cmd.contains(
+                "(cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe tls_get_new_dtv)"
+            )
         );
-        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe dlopen"));
-        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe tls_get_new_dtv"));
+        assert!(!cmd.contains("LD_LIBRARY_PATH=. ../entry-dynamic.exe dlopen"));
+        assert!(!cmd.contains("LD_LIBRARY_PATH=. ../entry-dynamic.exe tls_get_new_dtv"));
     }
 
     #[test]
@@ -2084,8 +2203,9 @@ mod tests {
         assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_points"));
         assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel"));
         assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
-        assert!(cmd.contains("./lib/libc.so ./entry-dynamic.exe pthread_cancel_points"));
-        assert!(cmd.contains("./lib/libc.so ./entry-dynamic.exe pthread_cancel"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
+        assert!(!cmd.contains("tx_libctest_dyn_work=/tmp/tx-libctest-dyn-pthread_cancel_points"));
         assert!(!cmd.contains("skipped known hang"));
     }
 
@@ -2154,6 +2274,8 @@ mod tests {
         append_lmbench_probe(&mut cmd);
         assert!(cmd.contains("lmbench-probe:cp-status"));
         assert!(cmd.contains("lmbench-probe:cmp-status"));
+        assert!(cmd.contains("lmbench-probe:loader-readlink-status"));
+        assert!(cmd.contains("lmbench-probe:local-loader-tmp-status"));
         assert!(cmd.contains("/tmp/hello"));
         assert!(!cmd.contains("lmbench_testcode.sh"));
     }
@@ -2164,11 +2286,43 @@ mod tests {
         append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
         append_full_libctest(&mut cmd);
 
-        assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START basic-musl ####"));
+        assert!(cmd.contains("tx_basic_work=/tmp/tx-basic-musl"));
+        assert!(cmd.contains("cp -r \"$tx_musl_root/basic/.\" \"$tx_basic_work\""));
+        assert!(cmd.contains("\"$tx_musl_root/lib/libc.so\" \"./$tx_basic_case\""));
         assert!(
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
         assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn iozone_script_runs_from_writable_tmp_workdir() {
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
+        append_oscomp_musl_script(&mut cmd, "iozone_testcode.sh");
+
+        assert!(cmd.contains("tx_iozone_work=/tmp/tx-iozone-musl"));
+        assert!(cmd.contains("cp ./iozone ./iozone_testcode.sh ./busybox \"$tx_iozone_work\""));
+        assert!(cmd.contains("cp -r ./lib \"$tx_iozone_work\""));
+        assert!(cmd.contains("(cd \"$tx_iozone_work\"; ./busybox sh iozone_testcode.sh)"));
+    }
+
+    #[test]
+    fn lmbench_script_runs_from_writable_tmp_workdir() {
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
+        append_oscomp_musl_script(&mut cmd, "lmbench_testcode.sh");
+
+        assert!(cmd.contains("tx_lmbench_work=/tmp/tx-lmbench-musl"));
+        assert!(cmd.contains("cp ./lmbench_testcode.sh ./lmbench_all"));
+        assert!(cmd.contains("cp -r ./lib \"$tx_lmbench_work\""));
+        assert!(cmd.contains(
+            "printf '#!/bin/sh\\nexec /code/lmbench_src/bin/build/lmbench_all hello \"$@\"\\n'"
+        ));
+        assert!(cmd.contains("chmod 755 \"$tx_lmbench_work/hello\""));
+        assert!(cmd.contains("cp \"$tx_lmbench_work/hello\" /tmp/hello"));
+        assert!(cmd.contains("chmod 755 /tmp/hello"));
+        assert!(cmd.contains("(cd \"$tx_lmbench_work\"; ./busybox sh lmbench_testcode.sh)"));
+        assert!(cmd.contains("rm -f /tmp/hello"));
     }
 
     #[test]
@@ -2191,8 +2345,8 @@ mod tests {
 
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
-        assert!(cmd.contains("; cd /glibc; "));
-        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("; cd /musl/glibc; "));
+        assert!(cmd.contains("\"$tx_bb\" sh netperf_testcode.sh; cd \"$tx_musl_root\""));
     }
 
     #[test]
@@ -2202,7 +2356,23 @@ mod tests {
 
         assert!(cmd.contains("[ -e lib/libc.so.6 ] || ./busybox cp lib/libc.so lib/libc.so.6"));
         assert!(cmd.contains("[ -e lib/libm.so.6 ] || ./busybox cp lib/libm.so lib/libm.so.6"));
-        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh"));
+        assert!(cmd.contains("\"$tx_bb\" sh netperf_testcode.sh"));
+    }
+
+    #[test]
+    fn glibc_basic_script_runs_from_writable_tmp_workdir() {
+        let mut cmd = alloc::string::String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut cmd, "basic_testcode.sh");
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START basic-glibc ####"));
+        assert!(cmd.contains("tx_basic_work=/tmp/tx-basic-glibc"));
+        assert!(cmd.contains("tx_glibc_root=/musl/glibc"));
+        assert!(cmd.contains("tx_glibc_lib=/lib/ld-linux-riscv64-lp64d.so.1"));
+        assert!(cmd.contains("cp \"$tx_glibc_root/busybox\" \"$tx_basic_work\""));
+        assert!(cmd.contains("cp -r \"$tx_glibc_root/basic/.\" \"$tx_basic_work\""));
+        assert!(cmd.contains("\"$tx_glibc_lib\" \"./$tx_basic_case\""));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END basic-glibc ####"));
+        assert!(cmd.contains("rm -rf \"$tx_basic_work\""));
     }
 
     #[test]
@@ -2218,7 +2388,7 @@ mod tests {
         let mut glibc_cmd = alloc::string::String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut glibc_cmd, "busybox_testcode.sh");
         assert!(glibc_cmd.contains("sed -i"));
-        assert!(glibc_cmd.contains("/musl/musl/busybox sh /tmp/tx-busybox-body.sh"));
+        assert!(glibc_cmd.contains("\"$tx_bb\" sh /tmp/tx-busybox-body.sh"));
     }
 
     #[test]
@@ -2243,9 +2413,9 @@ mod tests {
         let mut glibc_cmd = String::from("cd /musl/musl");
         append_ltp_bin_walk(&mut glibc_cmd, "glibc", "getaddrinfo_01", &LtpArgs::none());
         assert!(glibc_cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
-        assert!(glibc_cmd.contains("; cd /glibc;"));
-        assert!(glibc_cmd.contains("LTPROOT=/glibc/ltp"));
-        assert!(glibc_cmd.contains("/glibc/ltp/testcases/bin"));
+        assert!(glibc_cmd.contains("; cd /musl/glibc;"));
+        assert!(glibc_cmd.contains("LTPROOT=/musl/glibc/ltp"));
+        assert!(glibc_cmd.contains("/musl/glibc/ltp/testcases/bin"));
         assert!(glibc_cmd.contains("; cd /musl/musl"));
 
         let mut bad = String::new();
@@ -2270,23 +2440,23 @@ mod tests {
 
         let mut glibc_cmd = String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut glibc_cmd, "ltp_testcode.sh");
-        assert!(glibc_cmd.contains("if [ -d /glibc/ltp ]; then LROOT=/glibc;"));
+        assert!(glibc_cmd.contains("if [ -d /musl/glibc/ltp ]; then LROOT=/musl/glibc;"));
         assert!(glibc_cmd.contains("export LTPROOT=$LROOT/ltp"));
-        assert!(glibc_cmd.contains("/musl/musl/busybox sh ltp_testcode.sh)"));
-        assert!(glibc_cmd.ends_with("cd /musl/musl"));
+        assert!(glibc_cmd.contains("\"$tx_bb\" sh ltp_testcode.sh)"));
+        assert!(glibc_cmd.ends_with("cd \"$tx_musl_root\""));
 
         // Non-LTP scripts stay bare — no env leak, no subshell.
         let mut bench = String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut bench, "netperf_testcode.sh");
-        assert!(bench.contains("; cd /glibc; "));
-        assert!(bench.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(bench.contains("; cd /musl/glibc; "));
+        assert!(bench.contains("\"$tx_bb\" sh netperf_testcode.sh; cd \"$tx_musl_root\""));
     }
 
     #[test]
     fn default_scripts_include_glibc_bench_groups() {
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_default_oscomp_scripts(&mut cmd, false, None);
-        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
-        assert!(cmd.contains("/musl/musl/busybox sh iperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("\"$tx_bb\" sh netperf_testcode.sh; cd \"$tx_musl_root\""));
+        assert!(cmd.contains("\"$tx_bb\" sh iperf_testcode.sh; cd \"$tx_musl_root\""));
     }
 }

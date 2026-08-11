@@ -1,11 +1,11 @@
 use tx_ext4_format::journal::{
-    JBD2_BLOCK_SIZE, JBD2_BLOCK_SUPERBLOCK_V2, JBD2_MAGIC, Jbd2MetadataUpdate, Jbd2Revoke,
-    Jbd2Superblock, Jbd2TransactionImage,
+    Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
+    JBD2_BLOCK_SUPERBLOCK_V2, JBD2_MAGIC,
 };
-use tx_ext4_format::ondisk::{Superblock, crc32c_append};
+use tx_ext4_format::ondisk::{crc32c_append, Superblock};
 use tx_ext4_format::pager::{BlockImage, JournalGeometry, Page4K};
 use tx_ext4_format::{
-    Ext4FormatError, RecoveryReport, clean_replayed_journal, recover_if_required, replay_journal,
+    clean_replayed_journal, recover_if_required, replay_journal, Ext4FormatError, RecoveryReport,
 };
 
 #[derive(Clone)]

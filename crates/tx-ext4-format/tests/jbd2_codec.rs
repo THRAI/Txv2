@@ -1,9 +1,9 @@
-use tx_ext4_format::Ext4FormatError;
 use tx_ext4_format::journal::{
-    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC, Jbd2Commit,
-    Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Superblock, Jbd2Tag,
+    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Superblock, Jbd2Tag, JBD2_BLOCK_COMMIT,
+    JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC,
 };
 use tx_ext4_format::ondisk::crc32c_append;
+use tx_ext4_format::Ext4FormatError;
 
 const BLOCK_SIZE: usize = 4096;
 

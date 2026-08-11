@@ -9,7 +9,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub mod adapter;
 pub mod notification;
@@ -97,6 +97,11 @@ static PAGE_CONTAINER_RECLAIM_REGISTRY: SpinMutex<alloc::vec::Vec<Weak<PageConta
 
 const PAGE_CACHE_RECLAIM_BATCH: usize = 256;
 const PAGE_CACHE_RECLAIM_LOW_WATERMARK: usize = 1024;
+
+#[cfg(test)]
+fn page_container_reclaim_registry_len_for_test() -> usize {
+    PAGE_CONTAINER_RECLAIM_REGISTRY.lock().len()
+}
 
 unsafe impl ZoneAllocated for PageContainer {
     fn zone() -> &'static Zone<Self> {
@@ -750,7 +755,15 @@ pub struct PageContainer {
     kind: PageContainerKind,
     page_count: u64,
     size_bytes: AtomicU64,
+    reclaim_self: SpinMutex<Option<Weak<PageContainer>>>,
+    reclaim_registered: AtomicBool,
     state: PageContainerStateCell,
+}
+
+impl Drop for PageContainer {
+    fn drop(&mut self) {
+        self.kick_file_io_service(IoServiceKind::Page);
+    }
 }
 
 // `PageCacheIndex` (inside `PageContainerState`) is a `BTreeMap<PageIndex,
@@ -1064,6 +1077,8 @@ impl PageContainer {
             kind,
             page_count,
             size_bytes: AtomicU64::new(capacity),
+            reclaim_self: SpinMutex::new(None),
+            reclaim_registered: AtomicBool::new(false),
             state: PageContainerStateCell::new(PageContainerState {
                 pages: PageCacheIndex::new(),
                 file_page_slots: BTreeMap::new(),
@@ -1108,10 +1123,34 @@ impl PageContainer {
             page_count,
         )?;
         container.set_size_bytes(size_bytes);
-        PAGE_CONTAINER_RECLAIM_REGISTRY
-            .lock()
-            .push(container.downgrade());
+        Self::attach_file_reclaim_self_weak(&container);
         Ok(container)
+    }
+
+    fn attach_file_reclaim_self_weak(container: &Cap<PageContainer>) {
+        if !matches!(container.kind(), PageContainerKind::File { .. }) {
+            return;
+        }
+        let mut slot = container.reclaim_self.lock();
+        if slot.is_none() {
+            *slot = Some(container.downgrade());
+        }
+    }
+
+    fn register_for_file_reclaim_if_needed(&self) {
+        if !matches!(self.kind(), PageContainerKind::File { .. }) {
+            return;
+        }
+        if self
+            .reclaim_registered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(weak) = *self.reclaim_self.lock() {
+            PAGE_CONTAINER_RECLAIM_REGISTRY.lock().push(weak);
+        }
     }
 
     pub const fn kind(&self) -> &PageContainerKind {
@@ -2616,30 +2655,41 @@ impl PageContainer {
         cached: CachedFrame,
     ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
         let ppn = cached.ppn;
-        let mut state = self.state.lock();
-        let installed_ppn = match state.pages.lookup(page) {
-            Some(current) => current,
-            None => match state.pages.install_if_absent(page, cached) {
-                Ok(()) => ppn,
-                Err(PageCacheError::AlreadyPresent { current }) => current,
-                Err(error) => {
-                    let Some(slot) = state.file_page_slots.get(&page) else {
-                        return Err(PageSlotCompletionError::NotFetching {
-                            state: PageSlotState::Empty,
-                            generation: PageGeneration::new(0),
-                        });
-                    };
-                    return slot.complete_fetch(generation, Err(page_cache_error_to_errno(error)));
-                }
-            },
+        let (_installed_ppn, installed, result) = {
+            let mut state = self.state.lock();
+            let (installed_ppn, installed) = match state.pages.lookup(page) {
+                Some(current) => (current, false),
+                None => match state.pages.install_if_absent(page, cached) {
+                    Ok(()) => (ppn, true),
+                    Err(PageCacheError::AlreadyPresent { current }) => (current, false),
+                    Err(error) => {
+                        let Some(slot) = state.file_page_slots.get(&page) else {
+                            return Err(PageSlotCompletionError::NotFetching {
+                                state: PageSlotState::Empty,
+                                generation: PageGeneration::new(0),
+                            });
+                        };
+                        return slot
+                            .complete_fetch(generation, Err(page_cache_error_to_errno(error)));
+                    }
+                },
+            };
+            let Some(slot) = state.file_page_slots.get(&page) else {
+                return Err(PageSlotCompletionError::NotFetching {
+                    state: PageSlotState::Empty,
+                    generation: PageGeneration::new(0),
+                });
+            };
+            (
+                installed_ppn,
+                installed,
+                slot.complete_fetch(generation, Ok(installed_ppn)),
+            )
         };
-        let Some(slot) = state.file_page_slots.get(&page) else {
-            return Err(PageSlotCompletionError::NotFetching {
-                state: PageSlotState::Empty,
-                generation: PageGeneration::new(0),
-            });
-        };
-        slot.complete_fetch(generation, Ok(installed_ppn))
+        if installed && result.is_ok() {
+            self.register_for_file_reclaim_if_needed();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -3457,6 +3507,9 @@ impl PageContainer {
             notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
                 mailbox.post(event)
             });
+        }
+        if matches!(installed_dirty, Ok(Some(_))) {
+            self.register_for_file_reclaim_if_needed();
         }
         match installed_dirty {
             Ok(Some(dirty)) => StepOutcome::Done(MaterializedPage {

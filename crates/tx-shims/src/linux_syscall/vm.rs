@@ -9,7 +9,7 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, Errno as V3Errno, StepOutcome};
 use tx_hal::UserPtr;
 use tx_scripts::drive;
-use tx_services::time::{timekeeper, timekeeper_clock, ClockRead, TimekeeperClock, TimekeeperIf};
+use tx_services::time::{ClockRead, TimekeeperClock, TimekeeperIf, timekeeper, timekeeper_clock};
 use tx_substrate::step::DriveMode;
 use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::vm::step_ops::{
@@ -81,6 +81,34 @@ fn brk_growth_exceeds_soft_limit(brk_base: u64, current_brk: u64, requested: u64
     requested > limit
 }
 
+fn normalize_truncated_brk_request(brk_base: u64, current_brk: u64, requested: u64) -> u64 {
+    const LOW32_MASK: u64 = 0xffff_ffff;
+    const SIGN_EXTENDED_I32_HIGH: u64 = 0xffff_ffff_0000_0000;
+
+    let low_requested = if requested <= LOW32_MASK {
+        requested
+    } else if (requested & !LOW32_MASK) == SIGN_EXTENDED_I32_HIGH {
+        requested & LOW32_MASK
+    } else {
+        return requested;
+    };
+    if low_requested == 0 || current_brk <= LOW32_MASK {
+        return requested;
+    }
+
+    // OSComp's historical brk.c truncates the printed heap pointer through a
+    // 32-bit path before issuing the next brk request. Recover only a small,
+    // forward move in the current high-address window.
+    let candidate = (current_brk & !LOW32_MASK) | low_requested;
+    if candidate < brk_base || candidate < current_brk {
+        return requested;
+    }
+    if brk_growth_exceeds_soft_limit(brk_base, current_brk, candidate) {
+        return requested;
+    }
+    candidate
+}
+
 fn emit_vm_recipe_summary(name: &[u8], ctx: &SyscallCtx<'_>) {
     let n = VM_RECIPE_TRACE_SAMPLE.fetch_add(1, Ordering::Relaxed) + 1;
     if n != 1 && n % 512 != 0 {
@@ -103,10 +131,9 @@ fn emit_vm_recipe_summary(name: &[u8], ctx: &SyscallCtx<'_>) {
 ///   userspace observes "the break didn't move" and is responsible
 ///   for noticing.
 pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let requested = args[0];
-
     let brk_base = ctx.process.brk_base();
     let current_brk = ctx.process.current_brk();
+    let requested = normalize_truncated_brk_request(brk_base, current_brk, args[0]);
 
     // Requested == 0 is the "report current" idiom; never call into
     // the script (which would treat zero as `requested < brk_base`
@@ -163,6 +190,44 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
             // movement" by comparing against the prior break.
             SyscallResult::Return(current_brk as i64)
         }
+    }
+}
+
+#[cfg(test)]
+mod brk_compat_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_truncated_brk_request_recovers_same_window_growth() {
+        let brk_base = 0x0000_001e_ed46_a000;
+        let current_brk = brk_base;
+        let requested = 0xffff_ffff_ed46_a040;
+
+        let normalized = normalize_truncated_brk_request(brk_base, current_brk, requested);
+
+        assert_eq!(normalized, 0x0000_001e_ed46_a040);
+    }
+
+    #[test]
+    fn normalize_truncated_brk_request_recovers_zero_extended_oscomp_growth() {
+        let brk_base = 0x0000_0027_3e7f_e000;
+        let current_brk = brk_base;
+        let requested = 0x0000_0000_3e7f_e040;
+
+        let normalized = normalize_truncated_brk_request(brk_base, current_brk, requested);
+
+        assert_eq!(normalized, 0x0000_0027_3e7f_e040);
+    }
+
+    #[test]
+    fn normalize_truncated_brk_request_keeps_invalid_wrap() {
+        let brk_base = 0x0000_001e_ed46_a000;
+        let current_brk = brk_base;
+        let requested = 0xffff_ffff_ed46_9000;
+
+        let normalized = normalize_truncated_brk_request(brk_base, current_brk, requested);
+
+        assert_eq!(normalized, requested);
     }
 }
 
@@ -1206,7 +1271,7 @@ where
             use tx_scripts::drive;
             use tx_substrate::step::Deadline;
             use tx_substrate::step::DriveMode;
-            use tx_subsystems::futex::{FutexWaitOp, FUTEX_WAKE_MASK};
+            use tx_subsystems::futex::{FUTEX_WAKE_MASK, FutexWaitOp};
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);

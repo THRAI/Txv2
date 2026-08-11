@@ -463,7 +463,7 @@ fn oscomp_qemu_boot_cmdline(boot_suite: Option<&str>) -> Option<String> {
         );
     }
     Some(format!(
-        "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe_dump=0 tx.oscomp.groups={suite} console=ttyS0"
+        "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe=0 tx.oscomp.observe_dump=0 tx.oscomp.groups={suite} console=ttyS0"
     ))
 }
 
@@ -775,7 +775,7 @@ mod tests {
     fn oscomp_qemu_boot_suite_uses_explicit_boot_mode_and_groups() {
         assert_eq!(
             oscomp_qemu_boot_cmdline(Some("libctest-musl")),
-            Some("tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe_dump=0 tx.oscomp.groups=libctest-musl console=ttyS0".to_string())
+            Some("tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe=0 tx.oscomp.observe_dump=0 tx.oscomp.groups=libctest-musl console=ttyS0".to_string())
         );
     }
 

@@ -44,11 +44,11 @@ use alloc::vec::Vec;
 
 use tx_hal::{Arch, EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{
-    Capability, ExecSetidPolicy, Gid, Uid, commit_prepared_exec_cred, prepare_exec_cred_in,
+    commit_prepared_exec_cred, prepare_exec_cred_in, Capability, ExecSetidPolicy, Gid, Uid,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{MountFlags, MountNamespace};
-use tx_subsystems::page_backed::{PageContainer, read_exact_at};
+use tx_subsystems::page_backed::{read_exact_at, PageContainer};
 use tx_subsystems::process::{
     InstallBrkForExecOp, ProcessExecPrep, ProcessIdentity, ResetSignalDispositionsForExecOp,
 };
@@ -58,14 +58,14 @@ use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
     LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_INITIAL_RESERVATION,
 };
-use tx_subsystems::vm::{VdsoLayout, VdsoMapping, VmMapError, map_vdso_into_aspace};
+use tx_subsystems::vm::{map_vdso_into_aspace, VdsoLayout, VdsoMapping, VmMapError};
 
-use super::image_reader::{ImageReadError, ImageRole, read_elf_image};
+use super::image_reader::{read_elf_image, ImageReadError, ImageRole};
 use super::loader::{
-    ELF64_PHENT, ElfLayoutError, ExecImagePlan, ImageRange, LoadSegment as ParsedLoadSegment,
-    SegmentFlags as ParsedSegmentFlags,
+    ElfLayoutError, ExecImagePlan, ImageRange, LoadSegment as ParsedLoadSegment,
+    SegmentFlags as ParsedSegmentFlags, ELF64_PHENT,
 };
-use super::stack::{AuxvFacts, StackBuildError, build_initial_user_stack};
+use super::stack::{build_initial_user_stack, AuxvFacts, StackBuildError};
 use crate::adapter::step_engine::{
     self as step_engine, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome,
 };
@@ -701,8 +701,12 @@ pub struct ExecScriptOp<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> {
     argv: &'a [&'a [u8]],
     envp: &'a [&'a [u8]],
     cred: &'a Credential,
+    oom_pressure_retries: usize,
     _platform: core::marker::PhantomData<fn() -> P>,
 }
+
+const EXEC_OOM_PRESSURE_RETRY_LIMIT: usize = 16;
+const EXEC_OOM_PRESSURE_SPIN_ROUNDS: usize = 65536;
 
 impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> ExecScriptOp<'a, P> {
     pub const fn new(
@@ -720,6 +724,7 @@ impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> ExecScriptOp<'a, P> {
             argv,
             envp,
             cred,
+            oom_pressure_retries: 0,
             _platform: core::marker::PhantomData,
         }
     }
@@ -738,12 +743,24 @@ impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> StepOp<ProcessIdentity> for Exe
             self.envp,
             self.cred,
         );
-        exec_result_to_step_outcome(poll_ready_synchronously(future))
+        exec_result_to_step_outcome_with_pressure_retry(
+            poll_ready_synchronously(future),
+            &mut self.oom_pressure_retries,
+        )
     }
 }
 
+#[cfg(test)]
 pub(crate) fn exec_result_to_step_outcome(
     result: Option<Result<(), ExecError>>,
+) -> StepOutcome<(), NoProgress> {
+    let mut oom_pressure_retries = EXEC_OOM_PRESSURE_RETRY_LIMIT;
+    exec_result_to_step_outcome_with_pressure_retry(result, &mut oom_pressure_retries)
+}
+
+fn exec_result_to_step_outcome_with_pressure_retry(
+    result: Option<Result<(), ExecError>>,
+    oom_pressure_retries: &mut usize,
 ) -> StepOutcome<(), NoProgress> {
     match result {
         Some(Ok(())) => StepOutcome::done(()),
@@ -751,6 +768,18 @@ pub(crate) fn exec_result_to_step_outcome(
             progress: NoProgress,
             shape,
         },
+        Some(Err(ExecError::OutOfMemory))
+            if *oom_pressure_retries < EXEC_OOM_PRESSURE_RETRY_LIMIT =>
+        {
+            *oom_pressure_retries += 1;
+            tx_subsystems::zones::try_memory_pressure_maintenance_tick();
+            for _ in 0..EXEC_OOM_PRESSURE_SPIN_ROUNDS {
+                core::hint::spin_loop();
+            }
+            StepOutcome::Continue {
+                progress: NoProgress,
+            }
+        }
         Some(Err(ExecError::Retry)) | None => StepOutcome::Continue {
             progress: NoProgress,
         },
@@ -1445,10 +1474,6 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     }
     let _cred_outcome = commit_prepared_exec_cred(prepared_exec_cred)
         .expect("checked address-space swap preserves the authoritative exec binding");
-    // vfork completion: if the parent is waiting on CLONE_VFORK,
-    // unblock it now that exec has completed.
-    process.fire_exit_source_with_post(1, |mailbox, event| mailbox.post(event));
-
     // ===== Phase 8 — userspace re-entry ==============================
     //
     // The script does not directly re-enter userspace. The next

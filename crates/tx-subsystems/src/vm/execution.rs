@@ -14,7 +14,7 @@ use tx_substrate::wake::WaitEndpoint;
 
 use crate::execution::Guard;
 use crate::execution::WaitToken;
-use crate::page_backed::{PageContainerKind, step_fsync};
+use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::adapter::step_engine::{
     self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
     DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
@@ -27,10 +27,10 @@ use crate::vm::pmap::PmapBatchPage;
 use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
     AccessMode, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard,
-    USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault,
-    VmFaultError, VmFaultMaterialization, VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit,
-    VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement,
-    VmRemapRequest,
+    UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault, VmFaultError,
+    VmFaultMaterialization, VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError,
+    VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
+    USER_PAGE_SIZE,
 };
 
 const PRIVATE_ANON_FAULT_BATCH_PAGES: usize = 16;

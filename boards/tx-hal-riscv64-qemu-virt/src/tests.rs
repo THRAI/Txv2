@@ -6,11 +6,11 @@ use tx_hal::{
 };
 
 use crate::{
-    Platform, RV64_PERCPU_AREAS, Rv64TrapFrame, asid_residency_mask, clear_asid_residency,
-    clear_current_asid_residency, dispatch_trap_frame, enter_irq_context,
-    for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu, mark_ipi_ack,
-    percpu_tls_for_cpu, remote_sfence_targets_for_asid_from, remote_sfence_targets_from,
-    trap::classify_rv64_trap,
+    asid_residency_mask, clear_asid_residency, clear_current_asid_residency, dispatch_trap_frame,
+    enter_irq_context, for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu,
+    mark_ipi_ack, percpu_tls_for_cpu, remote_sfence_targets_for_asid_from,
+    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
+    RV64_PERCPU_AREAS,
 };
 
 static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

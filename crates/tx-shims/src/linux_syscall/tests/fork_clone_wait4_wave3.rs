@@ -6,6 +6,7 @@ use alloc::sync::Arc;
 use tx_hal::UserTrapContext;
 use tx_subsystems::process::{step_exit_group_with_posts, ExitStatus};
 use tx_subsystems::reactor_submit::{self, SubmitChildThreadStatus};
+use tx_subsystems::signal::adapter::step_engine::SignalRouting;
 use tx_subsystems::signal::adapter::step_engine::TaskMailbox;
 
 fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
@@ -279,6 +280,114 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
         }
     }
     panic!("dispatch_wait4 did not resolve after child zombified; last poll = {last:?}");
+}
+
+/// Same blocking shape as
+/// `dispatch_wait4_blocking_resolves_when_child_zombifies`, but with a
+/// positive pid selector. OSComp `basic-*` `waitpid` uses
+/// `waitpid(child_pid, &status, 0)`, so keep this selector wired as a
+/// first-class regression instead of only covering `wait4(-1, ...)`.
+#[test]
+fn dispatch_wait4_blocking_specific_pid_resolves_when_child_zombifies() {
+    let _setup = setup();
+    install_noop_submit_seam();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    seed_parent_trap_context(&thread);
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(Arc::new(TaskMailbox::new()));
+
+    let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
+    let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
+    let child = proc_cap.children()[0].clone();
+    let child_pid_i64 = child.pid.0 as i64;
+    assert!(!child.is_zombie());
+
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+
+    let req = SyscallRequest::new(NR_WAIT4, [child_pid_i64 as u64, 0, 0, 0, 0, 0]);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    let first = pinned.as_mut().poll(&mut cx);
+    assert!(
+        matches!(first, Poll::Pending),
+        "blocking wait4(child_pid) with a live child should park; got {first:?}"
+    );
+
+    finish_process_group_for_test(&child, ExitStatus::Exited(3));
+    assert!(child.is_zombie());
+
+    let mut last = Poll::Pending;
+    for _ in 0..256 {
+        last = pinned.as_mut().poll(&mut cx);
+        if let Poll::Ready(value) = last {
+            assert_eq!(
+                value,
+                SyscallResult::Return(child_pid_i64),
+                "wait4(child_pid) should observe the now-zombie child"
+            );
+            assert_eq!(proc_cap.children().len(), 0);
+            return;
+        }
+    }
+    panic!("dispatch_wait4(child_pid) did not resolve after child zombified; last poll = {last:?}");
+}
+
+/// Blocking wait4 must survive the guest ordering where SIGCHLD reaches the
+/// parent's task mailbox before the child-zombified exit source. The signal
+/// wake should only make the waiter retry; the following SourceFired event must
+/// still drive the same wait4 future to reap the now-zombie child.
+#[test]
+fn dispatch_wait4_blocking_resolves_after_sigchld_then_exit_source() {
+    let _setup = setup();
+    install_noop_submit_seam();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    seed_parent_trap_context(&thread);
+    let mailbox = Arc::new(TaskMailbox::new());
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(Arc::clone(&mailbox));
+
+    let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
+    let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
+    let child = proc_cap.children()[0].clone();
+    let child_pid_i64 = child.pid.0 as i64;
+    assert!(!child.is_zombie());
+
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+
+    let req = SyscallRequest::new(NR_WAIT4, [(-1i64) as u64, 0, 0, 0, 0, 0]);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    let first = pinned.as_mut().poll(&mut cx);
+    assert!(
+        matches!(first, Poll::Pending),
+        "blocking wait4 with no ready zombie should park; got {first:?}"
+    );
+
+    assert!(mailbox.post(MailboxEvent::SignalDelivered {
+        signum: SIGCHLD as u32,
+        routing: SignalRouting::ProcessDirected,
+    }));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
+    assert!(child.is_zombie());
+
+    let mut last = Poll::Pending;
+    for _ in 0..256 {
+        last = pinned.as_mut().poll(&mut cx);
+        if let Poll::Ready(value) = last {
+            assert_eq!(
+                value,
+                SyscallResult::Return(child_pid_i64),
+                "wait4 should survive a preceding SIGCHLD mailbox event"
+            );
+            assert_eq!(proc_cap.children().len(), 0);
+            return;
+        }
+    }
+    panic!("dispatch_wait4 did not resolve after SIGCHLD + child zombified; last poll = {last:?}");
 }
 
 /// Non-NULL `rusage` receives a zero-filled raw Linux LP64

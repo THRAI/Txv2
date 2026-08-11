@@ -1,14 +1,14 @@
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin, SetAttr};
 use tx_ext4_format::ondisk::{
-    BitmapMut, BitmapView, CommitHeader, DirEntryIter, DxCountLimit, DxEntry, DxEntryIter,
-    DxRootInfo, Ext4FormatError, Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode,
-    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC, JournalBlockTag, JournalHeader,
-    Superblock, block_bitmap_csum32, crc32c, crc32c_append, dirblock_csum32, group_desc_csum16,
-    inode_bitmap_csum32, inode_csum32, metadata_csum32, superblock_csum32,
+    block_bitmap_csum32, crc32c, crc32c_append, dirblock_csum32, group_desc_csum16,
+    inode_bitmap_csum32, inode_csum32, metadata_csum32, superblock_csum32, BitmapMut, BitmapView,
+    CommitHeader, DirEntryIter, DxCountLimit, DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError,
+    Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode, JournalBlockTag, JournalHeader,
+    Superblock, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{
-    BLOCK_SIZE, BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead,
-    WritebackReceipt,
+    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead, WritebackReceipt,
+    BLOCK_SIZE,
 };
 
 #[derive(Clone)]
@@ -1464,11 +1464,10 @@ fn pager_grows_full_depth_one_root_for_unwritten_conversion_without_data_claim()
 
     assert_eq!(plan.data[0].physical_block, 17_357);
     assert_eq!(plan.allocations.len(), 3);
-    assert!(
-        plan.allocations
-            .iter()
-            .all(|claim| claim.physical_block != plan.data[0].physical_block)
-    );
+    assert!(plan
+        .allocations
+        .iter()
+        .all(|claim| claim.physical_block != plan.data[0].physical_block));
     assert_eq!(
         plan.metadata
             .iter()
@@ -2480,11 +2479,10 @@ fn destroy_plan_frees_zero_link_fast_symlink_without_data_blocks() {
 
     assert!(plan.revokes.is_empty());
     assert!(plan.deferred_frees.is_empty());
-    assert!(
-        plan.metadata
-            .iter()
-            .all(|block| block.role != tx_ext4_format::mutation::MetaRole::BlockBitmap)
-    );
+    assert!(plan
+        .metadata
+        .iter()
+        .all(|block| block.role != tx_ext4_format::mutation::MetaRole::BlockBitmap));
     let inode_bitmap = plan
         .metadata
         .iter()
@@ -2645,11 +2643,9 @@ fn namespace_plan_links_regular_file_and_increments_nlink_without_home_write() {
     let entries: Vec<_> = DirEntryIter::new(&dir_block.after)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.name == b"alias" && entry.inode == 12)
-    );
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"alias" && entry.inode == 12));
 
     let inode_table = plan
         .metadata
@@ -2760,11 +2756,9 @@ fn namespace_plan_creates_regular_file_without_home_write() {
     let entries: Vec<_> = DirEntryIter::new(&dir.after)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.name == b"created" && entry.inode == 14)
-    );
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"created" && entry.inode == 14));
 
     assert_eq!(pager.image().block(3), &inode_bitmap_before);
     assert_eq!(pager.image().block(1), &group_desc_before);
@@ -2895,11 +2889,9 @@ fn namespace_plan_creates_directory_without_home_write() {
     let parent_entries: Vec<_> = DirEntryIter::new(&parent_dir.after)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(
-        parent_entries
-            .iter()
-            .any(|entry| entry.name == b"newdir" && entry.inode == 14 && entry.file_type == 2)
-    );
+    assert!(parent_entries
+        .iter()
+        .any(|entry| entry.name == b"newdir" && entry.inode == 14 && entry.file_type == 2));
 
     let child_dir = plan.metadata.iter().find(|block| block.home == 48).unwrap();
     assert_eq!(
@@ -2910,16 +2902,12 @@ fn namespace_plan_creates_directory_without_home_write() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(child_entries.len(), 2);
-    assert!(
-        child_entries
-            .iter()
-            .any(|entry| entry.name == b"." && entry.inode == 14)
-    );
-    assert!(
-        child_entries
-            .iter()
-            .any(|entry| entry.name == b".." && entry.inode == 2)
-    );
+    assert!(child_entries
+        .iter()
+        .any(|entry| entry.name == b"." && entry.inode == 14));
+    assert!(child_entries
+        .iter()
+        .any(|entry| entry.name == b".." && entry.inode == 2));
     let tail = &child_dir.after[BLOCK_SIZE - 12..];
     assert_eq!(&tail[0..4], &[0, 0, 0, 0]);
     assert_eq!(u16::from_le_bytes(tail[4..6].try_into().unwrap()), 12);
@@ -3126,11 +3114,9 @@ fn namespace_plan_creates_fast_symlink_without_home_write() {
     let entries: Vec<_> = DirEntryIter::new(&dir.after)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.name == b"alink" && entry.inode == 14 && entry.file_type == 7)
-    );
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"alink" && entry.inode == 14 && entry.file_type == 7));
 
     assert_eq!(pager.image().block(3), &inode_bitmap_before);
     assert_eq!(pager.image().block(1), &group_desc_before);
@@ -3172,11 +3158,9 @@ fn namespace_plan_renames_regular_file_in_place_without_home_write() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(!entries.iter().any(|entry| entry.name == b"hello"));
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.name == b"moved" && entry.inode == 12)
-    );
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"moved" && entry.inode == 12));
     assert_eq!(pager.image().block(16), &dir_before);
 }
 
@@ -3224,11 +3208,9 @@ fn namespace_plan_cross_dir_renames_regular_file_without_home_write() {
     let new_entries: Vec<_> = DirEntryIter::new(&new_dir.after)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(
-        new_entries
-            .iter()
-            .any(|entry| entry.name == b"moved" && entry.inode == 12)
-    );
+    assert!(new_entries
+        .iter()
+        .any(|entry| entry.name == b"moved" && entry.inode == 12));
     assert!(!new_entries.iter().any(|entry| entry.name == b"hello"));
 
     assert_eq!(pager.image().block(16), &old_dir_before);
@@ -3295,16 +3277,12 @@ fn namespace_plan_rename_overwrites_regular_file_without_home_write() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(!entries.iter().any(|entry| entry.name == b"hello"));
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.name == b"other" && entry.inode == 12)
-    );
-    assert!(
-        !entries
-            .iter()
-            .any(|entry| entry.name == b"other" && entry.inode == 14)
-    );
+    assert!(entries
+        .iter()
+        .any(|entry| entry.name == b"other" && entry.inode == 12));
+    assert!(!entries
+        .iter()
+        .any(|entry| entry.name == b"other" && entry.inode == 14));
 
     let inode_table = plan
         .metadata

@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
     self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
-    SubjectIdentity,
+    SubjectIdentity, Weak,
 };
 use crate::adapter::wait_routing::WaitOutcome;
 
@@ -19,15 +19,16 @@ use crate::io_manager::block::{
     BlockFlags, BlockOp, BlockQueue, BlockServiceDriver, BlockServiceNext, BlockTagTable,
     DeviceKey,
 };
-use crate::io_manager::page::PageIoOp;
 use crate::io_manager::page::service::{
     PageService, PageServiceBackendDriven, PageServiceTaggedBlockCompletionError,
 };
+use crate::io_manager::page::PageIoOp;
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
 };
 use crate::page_backed::{FileBlockServiceTurn, Frame, PageContainer};
 use tx_services::time::DeadlineRegistrar;
+use tx_substrate::epoch;
 
 const MAX_STATIC_BLOCK_DEVICES: usize = 16;
 const FILE_IO_SERVICE_SOURCE_ID_BASE: u64 = 0x7200;
@@ -725,7 +726,7 @@ pub struct PageContainerFileIoServiceTaskReport {
 
 #[derive(Clone)]
 pub struct PageContainerFileIoServiceRuntime {
-    container: Cap<PageContainer>,
+    container: Weak<PageContainer>,
     handle: BlockDeviceHandle,
     wake_source: Arc<ServiceWakeSource>,
 }
@@ -737,14 +738,15 @@ impl PageContainerFileIoServiceRuntime {
         wake_source: Arc<ServiceWakeSource>,
     ) -> Self {
         Self {
-            container,
+            container: container.downgrade(),
             handle,
             wake_source,
         }
     }
 
-    pub fn container(&self) -> &Cap<PageContainer> {
-        &self.container
+    pub fn container(&self) -> Option<Cap<PageContainer>> {
+        let guard = epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        self.container.upgrade(&guard)
     }
 
     pub const fn handle(&self) -> BlockDeviceHandle {
@@ -757,6 +759,10 @@ impl PageContainerFileIoServiceRuntime {
 
     pub fn kick(&self, service: IoServiceKind) -> usize {
         post_file_io_service_kick(&self.wake_source, ServiceKick::new(service)) as usize
+    }
+
+    fn container_is_live(&self) -> bool {
+        self.container().is_some()
     }
 }
 
@@ -780,6 +786,10 @@ static FILE_IO_SERVICE_RUNTIME_SPAWNER: SpinMutex<Option<Arc<dyn FileIoServiceRu
     SpinMutex::new(None);
 static NEXT_FILE_IO_SERVICE_SOURCE_ID: AtomicU64 = AtomicU64::new(FILE_IO_SERVICE_SOURCE_ID_BASE);
 
+fn prune_dead_file_io_service_runtimes_locked(runtimes: &mut Vec<RegisteredFileIoServiceRuntime>) {
+    runtimes.retain(|entry| entry.runtime.container_is_live());
+}
+
 pub fn register_page_container_file_io_service(
     container: Cap<PageContainer>,
     handle: BlockDeviceHandle,
@@ -788,12 +798,14 @@ pub fn register_page_container_file_io_service(
     let wake_source = Arc::new(ServiceWakeSource::new(source_id));
     let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
     let runtime = PageContainerFileIoServiceRuntime::new(container, handle, wake_source);
-    FILE_IO_SERVICE_RUNTIMES
-        .lock()
-        .push(RegisteredFileIoServiceRuntime {
+    {
+        let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+        prune_dead_file_io_service_runtimes_locked(&mut runtimes);
+        runtimes.push(RegisteredFileIoServiceRuntime {
             runtime: runtime.clone(),
             submitted: false,
         });
+    }
     let _ = submit_pending_file_io_service_runtimes();
     runtime
 }
@@ -823,6 +835,7 @@ pub fn submit_pending_file_io_service_runtimes() -> usize {
     };
     let pending = {
         let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+        prune_dead_file_io_service_runtimes_locked(&mut runtimes);
         let mut pending = Vec::new();
         for entry in runtimes.iter_mut() {
             if !entry.submitted {
@@ -841,28 +854,71 @@ pub fn submit_pending_file_io_service_runtimes() -> usize {
 
 pub fn page_container_file_io_service_runtimes_snapshot() -> Vec<PageContainerFileIoServiceRuntime>
 {
-    FILE_IO_SERVICE_RUNTIMES
-        .lock()
-        .iter()
-        .map(|entry| entry.runtime.clone())
-        .collect()
+    let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+    prune_dead_file_io_service_runtimes_locked(&mut runtimes);
+    runtimes.iter().map(|entry| entry.runtime.clone()).collect()
 }
 
 pub fn page_container_file_io_service_runtime_count() -> usize {
-    FILE_IO_SERVICE_RUNTIMES.lock().len()
+    let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+    prune_dead_file_io_service_runtimes_locked(&mut runtimes);
+    runtimes.len()
 }
 
 pub async fn page_container_file_io_service_task_loop_owned(
     runtime: PageContainerFileIoServiceRuntime,
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
-    page_container_file_io_service_task_loop(
-        &runtime.container,
-        runtime.handle,
-        &runtime.wake_source,
-        config,
-    )
-    .await
+    let mut report = PageContainerFileIoServiceTaskReport::default();
+    while config
+        .max_ready_turns
+        .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+    {
+        let wait = crate::wait_source::wait_on_registered_endpoint(
+            runtime.wake_source.wake_endpoint(),
+            file_io_service_interest_mask(),
+        );
+        if wait.await != WaitOutcome::Ready {
+            report.waits_failed += 1;
+            break;
+        }
+
+        let Some(container) = runtime.container() else {
+            break;
+        };
+
+        report.waits_ready += 1;
+        report.ready_turns += 1;
+        let guard = step_engine::guard();
+        let turn = match drive_page_container_file_io_service_once(
+            &container,
+            config.page_budget,
+            config.block_budget,
+            runtime.handle,
+            &guard,
+            |kick| post_file_io_service_kick(&runtime.wake_source, kick),
+        ) {
+            Ok(turn) => turn,
+            Err(_) => {
+                report.waits_failed += 1;
+                break;
+            }
+        };
+
+        report.dispatched += turn.block.dispatched;
+        report.device_completions += turn.block.device_completions;
+        report.page_completions += turn.block.page_completions;
+        report.self_kicks += turn.block.kicks
+            + turn
+                .page_before
+                .as_ref()
+                .map(|turn| turn.kicks)
+                .unwrap_or(0)
+            + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
+        report.last_turn = Some(turn);
+    }
+
+    report
 }
 
 pub async fn page_container_file_io_service_task_loop(
@@ -1237,7 +1293,7 @@ mod tests {
 
     #[test]
     fn block_device_handle_translates_partition_relative_lbas() {
-        use crate::adapter::step_engine::{StepOutcome as V3, guard};
+        use crate::adapter::step_engine::{guard, StepOutcome as V3};
         tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
@@ -1324,8 +1380,14 @@ mod tests {
 
         assert_eq!(page_container_file_io_service_runtime_count(), 1);
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(runtime.container().page_count(), 1);
-        assert_eq!(snapshot[0].container().page_count(), 1);
+        assert_eq!(runtime.container().expect("live container").page_count(), 1);
+        assert_eq!(
+            snapshot[0]
+                .container()
+                .expect("live snapshot container")
+                .page_count(),
+            1
+        );
         assert_eq!(snapshot[0].handle().registration().devt, BLOCK_REG.devt);
         assert_eq!(snapshot[0].handle().start_lba(), 0);
         assert_eq!(snapshot[0].handle().len_lba(), BLOCK_REG.ops.total_blocks());
@@ -1336,6 +1398,31 @@ mod tests {
 
         reset_page_container_file_io_service_registry_for_test();
         assert!(page_container_file_io_service_runtimes_snapshot().is_empty());
+    }
+
+    #[test]
+    fn file_io_runtime_drops_dead_container_and_prunes_registry() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+
+        let runtime = {
+            let pc = PageContainer::new_cap(
+                PageContainerKind::Anon {
+                    swap_policy: AnonSwapPolicy::Reclaimable,
+                },
+                1,
+            )
+            .expect("page container cap");
+            register_page_container_file_io_service(pc, BlockDeviceHandle::whole(&BLOCK_REG))
+        };
+        drop(runtime);
+
+        assert!(page_container_file_io_service_runtimes_snapshot().is_empty());
+        assert_eq!(page_container_file_io_service_runtime_count(), 0);
     }
 
     #[test]

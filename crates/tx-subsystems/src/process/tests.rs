@@ -1421,6 +1421,32 @@ fn zombie_process_pid_remains_resolvable_until_reap() {
 }
 
 #[test]
+fn zombie_leader_tid_is_withdrawn_at_reap() {
+    let _g = setup();
+    let parent = bootstrap();
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let child_pid = child.pid;
+
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
+
+    assert!(
+        matches!(
+            resolve_pid_number_as(child_pid.0 as u64, PidNameKind::Thread),
+            Some(PidName::Thread(_))
+        ),
+        "leader TID remains visible while the process is a zombie"
+    );
+
+    drop(child);
+    let _ = step_waitpid_nohang(&parent, WaitTarget::Pid(child_pid)).expect("reap");
+
+    assert!(
+        resolve_pid_number_as(child_pid.0 as u64, PidNameKind::Thread).is_none(),
+        "reap must withdraw the leader TID binding"
+    );
+}
+
+#[test]
 fn bootstrap_and_topology_steps_register_role_capable_names() {
     let _g = setup();
     let parent = bootstrap();

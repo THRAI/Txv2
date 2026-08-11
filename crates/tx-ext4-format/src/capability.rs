@@ -120,7 +120,9 @@ impl Tier1Capabilities {
         let geometry = facts.geometry;
         if geometry.block_size != self.geometry.block_size
             || (geometry.inode_size != 128 && geometry.inode_size != self.geometry.inode_size)
-            || features.compat & !self.feature_bits.compat != 0
+            || features.compat
+                & !(self.feature_bits.compat | Superblock::FEATURE_COMPAT_ORPHAN_FILE)
+                != 0
             || features.incompat & !self.feature_bits.incompat != 0
             || features.incompat & Superblock::FEATURE_INCOMPAT_EXTENTS == 0
             || features.ro_compat & !self.feature_bits.ro_compat != 0

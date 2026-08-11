@@ -8,8 +8,8 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_subsystems::mount::MountPayload;
-use tx_subsystems::vfs::FsObjectId;
 use tx_subsystems::vfs::structure::RNode;
+use tx_subsystems::vfs::FsObjectId;
 
 const MAX_HANDLE_BYTES: u32 = 128;
 const TXV2_HANDLE_BYTES: u32 = 16;

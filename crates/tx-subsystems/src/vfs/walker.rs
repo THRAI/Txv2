@@ -84,8 +84,8 @@ use crate::vfs::adapter::step_engine::{self, Cap, NoProgress, StepOutcome, Weak}
 
 use crate::execution::{Errno, Guard};
 use crate::mount::{MountIdentity, MountNamespace, MountPayload};
-use crate::vfs::FsOps;
 use crate::vfs::structure::{Credential, DEntry, InodeKind, OpenFile, OpenFileFlags, RNode};
+use crate::vfs::FsOps;
 
 /// POSIX symlink-loop budget. Matches Linux's `MAXSYMLINKS = 40`.
 /// The 41st observed symlink (after 40 hops have already been

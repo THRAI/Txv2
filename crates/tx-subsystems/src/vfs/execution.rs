@@ -2068,8 +2068,8 @@ mod step_op_wraps {
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
     use crate::vfs::adapter::step_engine::{
-        Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp, StepOutcome as V3, reserve_for,
-        sign_for,
+        reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome as V3,
     };
     use crate::vfs::structure::{
         DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,

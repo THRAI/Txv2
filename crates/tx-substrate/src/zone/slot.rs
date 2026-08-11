@@ -64,7 +64,10 @@ impl<T: 'static> Slot<T> {
     }
 }
 
-pub(crate) unsafe fn reclaim_slot<T: 'static>(slot: NonNull<Slot<T>>) {
+pub(crate) unsafe fn reclaim_slot<T: 'static>(
+    slot: NonNull<Slot<T>>,
+    local_guard: &mut crate::epoch::LocalRetireGuard,
+) {
     let trace_seq = reclaim_slot_trace_sample();
     if let Some(seq) = trace_seq {
         emit_reclaim_slot_trace(b"debug.zone.reclaim_slot.begin", seq);
@@ -90,11 +93,12 @@ pub(crate) unsafe fn reclaim_slot<T: 'static>(slot: NonNull<Slot<T>>) {
                 .compare_exchange(cur, new, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                if !new.generation_exhausted() {
-                    let slab = ZoneSlab::from_slot(slot);
-                    // Whole-slab retirement is skipped inside EBR callbacks.
-                    slab.as_ref().zone().return_slot_from_reclaim(slot);
-                }
+                let slab = ZoneSlab::from_slot(slot);
+                slab.as_ref().zone().return_slot_from_reclaim(
+                    slot,
+                    local_guard,
+                    new.generation_exhausted(),
+                );
                 break;
             }
         }

@@ -9,12 +9,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_ext4_format::Ext4FormatError;
 use tx_ext4_format::journal::{
-    JBD2_BLOCK_SIZE, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage,
+    Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
 };
 use tx_ext4_format::mutation::Ext4MutationPlan;
 use tx_ext4_format::pager::{JournalGeometry, Page4K};
+use tx_ext4_format::Ext4FormatError;
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::fs_iface::{

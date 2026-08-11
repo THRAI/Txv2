@@ -5,8 +5,8 @@
 //! state, so callers can replay the image before exposing the filesystem.
 
 use crate::journal::{
-    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC, Jbd2Commit,
-    Jbd2Descriptor, Jbd2Header, Jbd2Revoke,
+    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR,
+    JBD2_BLOCK_REVOKE, JBD2_MAGIC,
 };
 use crate::ondisk::Superblock;
 use crate::pager::{BlockImage, JournalGeometry, Page4K};

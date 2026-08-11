@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::adapter::step_engine::{
-    self as step_engine, Cap, SpinMutex, StepOp, StepOutcome, guard, page_allocator, reserve_for,
-    sign_for,
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOp,
+    StepOutcome,
 };
 use crate::adapter::vfs_exec::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
@@ -46,15 +46,15 @@ use tx_subsystems::page_backed::{
     PageIndex,
 };
 use tx_subsystems::process::{
-    ChdirOutcome, ProcessIdentity, bootstrap_init_process, step_chdir, step_chdir_with_mount,
-    step_set_mount_namespace,
+    bootstrap_init_process, step_chdir, step_chdir_with_mount, step_set_mount_namespace,
+    ChdirOutcome, ProcessIdentity,
 };
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE, UserVirtAddr};
+use tx_subsystems::vm::{AddressSpace, UserVirtAddr, USER_PAGE_SIZE};
 use tx_subsystems::zones;
 
-use super::{ExecError, exec_script};
+use super::{exec_script, ExecError};
 
 // ---------------------------------------------------------------------------
 // Test platform — minimal `PmapIf` that satisfies `AddressSpace::new`.
@@ -1813,7 +1813,11 @@ fn dynamic_exec_layout_retries_after_recoverable_candidate_error() {
         super::select_combined_layout(large_dynamic_layout_plan(), None, 64 * 1024 * 1024, || {
             let call = calls.get();
             calls.set(call + 1);
-            if call == 0 { u64::MAX } else { 0 }
+            if call == 0 {
+                u64::MAX
+            } else {
+                0
+            }
         })
         .expect("second layout candidate should fit");
 
@@ -2597,7 +2601,7 @@ fn bootstrap_with_file_meta(
 /// `drop_to` helper but routed through public mutators since
 /// `payload` is `pub(crate)` to tx-scripts.
 fn set_non_root_cred(process: &Cap<ProcessIdentity>, uid: u32) {
-    use tx_subsystems::cred::{CredChange, Uid as CredUid, step_setresuid};
+    use tx_subsystems::cred::{step_setresuid, CredChange, Uid as CredUid};
     let outcome = step_setresuid(
         process,
         Some(CredUid(uid)),
@@ -2781,6 +2785,40 @@ fn exec_setid_prepare_rolls_back_when_aspace_build_fails() {
     assert_eq!(
         process.cred().expect("failed exec keeps process alive"),
         before
+    );
+}
+
+#[test]
+fn exec_script_op_retries_after_pre_ponr_oom_pressure_reclaim() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o755, 0, 0);
+    let before_aspace = process.aspace_cap().expect("pre-exec aspace").key();
+    let argv: [&[u8]; 0] = [];
+    let envp: [&[u8]; 0] = [];
+    let cred = Credential::root();
+    let mut op = super::ExecScriptOp::<ScriptsTestPmap>::new(
+        &process, &thread, b"/init", &argv, &envp, &cred,
+    );
+    let mut ctx = step_engine::ScriptCtx::new();
+
+    fail_next_pmap_root_creation();
+    assert_eq!(
+        op.step(&mut ctx),
+        StepOutcome::Continue {
+            progress: step_engine::NoProgress,
+        },
+        "a pre-PoNR ENOMEM should trigger pressure reclaim and retry"
+    );
+
+    assert_eq!(
+        op.step(&mut ctx),
+        StepOutcome::Done(()),
+        "the retry restarts reversible exec preparation and can commit"
+    );
+    assert_ne!(
+        process.aspace_cap().expect("post-exec aspace").key(),
+        before_aspace
     );
 }
 

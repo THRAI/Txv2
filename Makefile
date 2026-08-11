@@ -263,7 +263,7 @@ OSCOMP_TEST_INIT ?= 1
 OSCOMP_TEST_INITRD_RV ?= target/images/test-init-initramfs-rv64-qemu.cpio
 OSCOMP_TEST_INITRD_LA ?= target/images/test-init-initramfs-la64-qemu.cpio
 OSCOMP_TEST_INIT_CMDLINE = $(if $(filter 1,$(OSCOMP_TEST_INIT)),init=/tx-test-init tx.test_init=1,)
-OSCOMP_CMDLINE = $(strip tx.boot.mode=oscomp $(OSCOMP_TEST_INIT_CMDLINE) $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
+OSCOMP_CMDLINE = $(strip tx.boot.mode=oscomp $(OSCOMP_TEST_INIT_CMDLINE) tx.oscomp.observe=0 tx.oscomp.observe_dump=0 $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
 OSCOMP_APPEND_RV = $(if $(filter 1,$(OSCOMP_TEST_INIT)),-initrd $(OSCOMP_TEST_INITRD_RV),) $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
 OSCOMP_APPEND_LA = $(if $(filter 1,$(OSCOMP_TEST_INIT)),-initrd $(OSCOMP_TEST_INITRD_LA) -fw_cfg name=opt/tx.initrd$(COMMA)file=$(OSCOMP_TEST_INITRD_LA),) $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)' -fw_cfg name=opt/tx.cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)
 OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase

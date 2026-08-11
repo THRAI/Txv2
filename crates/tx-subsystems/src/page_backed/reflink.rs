@@ -29,7 +29,10 @@ pub fn install_shared_page(
         pin: PageCachePin::Allocated(cache_pin),
     };
     let mut state = pc.state.lock();
-    state.pages.install_if_absent(page, frame)
+    state.pages.install_if_absent(page, frame)?;
+    drop(state);
+    pc.register_for_file_reclaim_if_needed();
+    Ok(())
 }
 
 /// Replace `pc`'s currently cached frame at `page` with a fresh private

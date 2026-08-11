@@ -138,27 +138,44 @@ impl<P: TxPlatform> CoreInit<P> {
             .clone();
         let cred = Credential::root();
         let root_fs_object_id = root_mount.root().fs_object_id();
+        let root_dentry = root_mount.root_dentry().clone();
         let fs_ops = &rootfs_payload.fs_ops;
 
         // /tmp (world-writable, sticky-style — the slice doesn't
         // honour the sticky bit yet so 0o777 is the practical
         // equivalent).
-        if mkdir_or_find(fs_ops, root_fs_object_id, b"tmp", 0o777, &cred).is_none() {
+        if mkdir_or_find_dir_dentry(
+            fs_ops,
+            root_fs_object_id,
+            &root_dentry,
+            b"tmp",
+            0o777,
+            &cred,
+        )
+        .is_none()
+        {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-tmp\n");
             return;
         }
 
         // /var and /var/tmp
-        let var_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"var", 0o755, &cred) {
-            Some(id) => id,
+        let (var_id, var_dentry) = match mkdir_or_find_dir_dentry(
+            fs_ops,
+            root_fs_object_id,
+            &root_dentry,
+            b"var",
+            0o755,
+            &cred,
+        ) {
+            Some(out) => out,
             None => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-var\n");
                 return;
             }
         };
-        if mkdir_or_find(fs_ops, var_id, b"tmp", 0o777, &cred).is_none() {
+        if mkdir_or_find_dir_dentry(fs_ops, var_id, &var_dentry, b"tmp", 0o777, &cred).is_none() {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":tmp-dirs:err:mkdir-var-tmp\n");
             return;
@@ -168,11 +185,20 @@ impl<P: TxPlatform> CoreInit<P> {
         // namespace here (`ln -s /proc/<pid>/ns/net /var/run/netns/ltp_ns`) and
         // reads the pid back via `readlink`. Pre-create the chain so the symlink
         // (and the LTP_NETNS pid derived from it) succeed.
-        if let Some(run_id) = mkdir_or_find(fs_ops, var_id, b"run", 0o755, &cred) {
-            let _ = mkdir_or_find(fs_ops, run_id, b"netns", 0o755, &cred);
+        if let Some((run_id, run_dentry)) =
+            mkdir_or_find_dir_dentry(fs_ops, var_id, &var_dentry, b"run", 0o755, &cred)
+        {
+            let _ = mkdir_or_find_dir_dentry(fs_ops, run_id, &run_dentry, b"netns", 0o755, &cred);
         }
         // /sys — mountpoint for `mount -t sysfs` inside the netns.
-        let _ = mkdir_or_find(fs_ops, root_fs_object_id, b"sys", 0o755, &cred);
+        let _ = mkdir_or_find_dir_dentry(
+            fs_ops,
+            root_fs_object_id,
+            &root_dentry,
+            b"sys",
+            0o755,
+            &cred,
+        );
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":tmp-dirs:ok\n");
@@ -1932,6 +1958,39 @@ fn mkdir_or_find(
         }
         _ => None,
     }
+}
+
+/// Create-or-find a directory and publish the corresponding child dentry under
+/// `parent_dentry`.
+///
+/// Several boot shims seed plain rootfs directories before userspace starts.
+/// The underlying tmpfs entry alone is not enough for the current VFS walker:
+/// mountpoints are visible because boot publishes their dentries, while
+/// ordinary pre-created directories can otherwise be re-discovered as ENOENT
+/// by absolute user paths such as `/tmp/`. Keep the helper local to the boot
+/// shims so runtime mkdir/link paths still own their normal cache invalidation.
+fn mkdir_or_find_dir_dentry(
+    fs_ops: &alloc::sync::Arc<dyn tx_subsystems::vfs::FsOps>,
+    parent: tx_subsystems::vfs::FsObjectId,
+    parent_dentry: &Cap<DEntry>,
+    name: &[u8],
+    mode: u16,
+    cred: &Credential,
+) -> Option<(tx_subsystems::vfs::FsObjectId, Cap<DEntry>)> {
+    let object_id = mkdir_or_find(fs_ops, parent, name, mode, cred)?;
+    let meta = {
+        let guard = step_engine::guard();
+        match fs_ops.load_inode_meta(object_id, &guard) {
+            StepOutcome::Done(meta) => meta,
+            _ => return None,
+        }
+    };
+    let rnode = RNode::new_cap(object_id, meta, RNodeBacking::Directory).ok()?;
+    let mut raw = DEntry::new(InlineName::new(name).ok()?, rnode);
+    raw.set_parent_hint(parent_dentry);
+    let dentry = step_engine::sign(raw).ok()?;
+    let canonical = parent_dentry.cache_child(dentry);
+    Some((object_id, canonical))
 }
 
 /// Best-effort symlink — ignores errors so a re-boot doesn't panic

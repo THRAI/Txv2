@@ -1280,6 +1280,23 @@ fn file_page_container_cap(
     .expect("page container cap")
 }
 
+fn file_page_container_mount_pin(
+    fs_v3: Arc<dyn FsOps>,
+    page_backing_v3: Arc<dyn FsPageBacking>,
+) -> MountPayloadPin {
+    let mount = MountPayload::new_cap(
+        fs_v3,
+        page_backing_v3,
+        None,
+        DevId::new(8),
+        MountOptions::default(),
+        "mockfs",
+        SourceLabel::Static("mock"),
+    )
+    .expect("mount payload");
+    MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount))
+}
+
 fn file_page_container_with_planner(
     fs_v3: Arc<dyn FsOps>,
     page_backing_v3: Arc<dyn FsPageBacking>,
@@ -1859,24 +1876,22 @@ fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
             && source.raw() == 0x7103
             && interests.raw() == IoServiceKind::Page.mask_bits()
     ));
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(
-                pc.io_manager_key(),
-                PageIoRange::new(page.as_u64(), 1),
-                PageIoOp::Writeback,
-            )
-            .is_some()
-    );
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
-            .is_none()
-    );
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+        )
+        .is_some());
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
+        .is_none());
     assert_eq!(
         pc.file_page_slot_snapshot_for_test(page)
             .expect("slot")
@@ -4198,13 +4213,12 @@ fn fsync_op_calls_backing_after_an_empty_frontier_without_l4_fsync() {
 
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-            .is_none()
-    );
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+        .is_none());
 }
 
 #[test]
@@ -4231,13 +4245,12 @@ fn vfs_fsync_op_calls_backing_once_after_an_empty_frontier_without_l4_fsync() {
 
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-            .is_none()
-    );
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+        .is_none());
 }
 
 #[test]
@@ -4286,13 +4299,12 @@ fn fsync_op_waits_for_dirty_frontier_before_calling_backing() {
         .cloned()
         .expect("writeback precedes fsync");
     let _ = pc.prepare_owned_file_io_request(&writeback);
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-            .is_none()
-    );
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+        .is_none());
     pc.state
         .lock()
         .file_io_service
@@ -4309,13 +4321,12 @@ fn fsync_op_waits_for_dirty_frontier_before_calling_backing() {
 
     assert_eq!(op.step(&mut ctx), V3Out::done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
-            .is_none()
-    );
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+        .is_none());
 }
 
 #[test]
@@ -4406,6 +4417,42 @@ fn reclaim_clean_file_pages_drops_clean_cache_entries() {
     assert_eq!(pc.reclaim_clean_file_pages(1), 1);
     assert_eq!(pc.resident_pages(), 0);
     assert!(page_allocator::acquire_map_pin(ppn).is_err());
+}
+
+#[test]
+fn new_file_page_containers_register_reclaim_only_after_cache_install() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let mount = file_page_container_mount_pin(fs.clone(), fs.clone());
+    let baseline = page_container_reclaim_registry_len_for_test();
+    let mut empty_files = Vec::new();
+
+    for index in 0..64 {
+        empty_files.push(
+            PageContainer::new_file_cap(mount.clone(), FsObjectId::new(1_000 + index), 0)
+                .expect("empty file page container"),
+        );
+    }
+    assert_eq!(page_container_reclaim_registry_len_for_test(), baseline);
+
+    let guard = step_engine::guard();
+    let pc = PageContainer::new_file_cap(
+        mount,
+        FsObjectId::new(2_000),
+        crate::vm::USER_PAGE_SIZE as u64,
+    )
+    .expect("file page container");
+    assert_eq!(page_container_reclaim_registry_len_for_test(), baseline);
+
+    pc.materialize_page_now(PageIndex::new(0), MaterializeAccess::Read, &guard)
+        .expect("materialize file page");
+    assert_eq!(pc.resident_pages(), 1);
+    assert_eq!(page_container_reclaim_registry_len_for_test(), baseline + 1);
+
+    pc.materialize_page_now(PageIndex::new(0), MaterializeAccess::Read, &guard)
+        .expect("rematerialize cached file page");
+    assert_eq!(page_container_reclaim_registry_len_for_test(), baseline + 1);
 }
 
 #[test]

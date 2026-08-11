@@ -8,8 +8,8 @@ use crate::adapter::reactor_entry;
 use crate::adapter::step_engine::Cap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use tx_services::time::{ClockRead, TimekeeperClock, timekeeper_clock};
-use tx_subsystems::vfs::{FdReadyMask, FdReadyQuery, FdReadyReport, FdWait, query_fd_ready};
+use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
+use tx_subsystems::vfs::{query_fd_ready, FdReadyMask, FdReadyQuery, FdReadyReport, FdWait};
 
 const PSELECT_READY_YIELD_INTERVAL: usize = 4;
 const PSELECT_EMPTY_POLL_YIELD_INTERVAL: usize = 4;
@@ -382,7 +382,7 @@ fn read_ppoll_sigmask(
 fn set_thread_signal_mask(ctx: &SyscallCtx<'_>, mask_bits: u64) -> Result<u64, SyscallResult> {
     use tx_subsystems::{
         signal::SignalMask,
-        thread_runtime::execution::{SigmaskHow, SigprocmaskChange, step_sigprocmask},
+        thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange},
     };
 
     match step_sigprocmask(&ctx.thread, SigmaskHow::SetMask, SignalMask::new(mask_bits)) {
@@ -696,8 +696,8 @@ where
     use tx_substrate::step::DriveMode;
     use tx_subsystems::tty::adapter::step_engine::StepOutcome;
     use tx_subsystems::tty::execution::{
-        ReadForProcessOp, TtyReadWaitPlan, step_read_after_vtime_for_process,
-        step_read_for_process, tty_read_wait_plan,
+        step_read_after_vtime_for_process, step_read_for_process, tty_read_wait_plan,
+        ReadForProcessOp, TtyReadWaitPlan,
     };
 
     if nonblocking {
@@ -849,29 +849,57 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         None
     };
     if let Some(file) = stdio_tty_file {
-        let mut combined = alloc::vec::Vec::new();
+        let mut total: i64 = 0;
+        let mut chunk_buf = alloc::vec![0u8; TTY_WRITE_MAX_INLINE];
         for i in 0..iovcnt as u64 {
             let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
             let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
             if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
                 return SyscallResult::error_from(errno);
             }
             let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
-            let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
+            let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap()) as usize;
             if len == 0 {
                 continue;
             }
 
-            let old_len = combined.len();
-            combined.resize(old_len + len as usize, 0);
-            if let Err(errno) =
-                bootstrap_copy_from_user(&ctx.aspace, &mut combined[old_len..], base)
-            {
-                return SyscallResult::error_from(errno);
+            let mut copied = 0usize;
+            while copied < len {
+                let chunk = core::cmp::min(len - copied, TTY_WRITE_MAX_INLINE);
+                if let Err(errno) = bootstrap_copy_from_user(
+                    &ctx.aspace,
+                    &mut chunk_buf[..chunk],
+                    base.wrapping_add(copied as u64),
+                ) {
+                    if total > 0 {
+                        return SyscallResult::Return(total);
+                    }
+                    return SyscallResult::error_from(errno);
+                }
+                match sys_write_buffered(&file, &chunk_buf[..chunk], ctx).await {
+                    SyscallResult::Return(n) => {
+                        total += n;
+                        if (n as usize) < chunk {
+                            return SyscallResult::Return(total);
+                        }
+                    }
+                    SyscallResult::Error(e) => {
+                        if total > 0 {
+                            return SyscallResult::Return(total);
+                        }
+                        return SyscallResult::Error(e);
+                    }
+                    other => return other,
+                }
+                copied += chunk;
+                drop(step_engine::guard());
             }
         }
 
-        return sys_write_buffered(&file, &combined, ctx).await;
+        return SyscallResult::Return(total);
     }
 
     let mut total: i64 = 0;
@@ -1718,7 +1746,7 @@ async fn sys_direct_pagebacked<'a>(
         DirectIoBuffer, DirectIoBufferError, DirectIoCompletionError, PageIndex, PageRange,
     };
     use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
-    use tx_subsystems::vm::{USER_PAGE_SIZE, UserAccessKind};
+    use tx_subsystems::vm::{UserAccessKind, USER_PAGE_SIZE};
 
     if len == 0 {
         return SyscallResult::Return(0);

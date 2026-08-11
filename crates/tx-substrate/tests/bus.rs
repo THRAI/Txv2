@@ -14,8 +14,8 @@ use tx_substrate::bus::{
     DeclaredPort, DeclaredQueue, DeclaredSubscriptionError, DeclaredSubscriptionGraphKey,
     DeclaredWireError, RawPort, RawQueue, RawSubscriptionError, RawSubscriptionState, RawTrace,
     RawWireError, StaticRawPort, StaticRawQueue, SubscriptionGraph, SubscriptionGraphError,
-    SubscriptionGraphReady, TraceDeclaration, TracePayload, WireDeclaration,
-    WireDeclarationError, WireEventSet, WireKind,
+    SubscriptionGraphReady, TraceDeclaration, TracePayload, WireDeclaration, WireDeclarationError,
+    WireEventSet, WireKind,
 };
 use tx_substrate::epoch;
 use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};

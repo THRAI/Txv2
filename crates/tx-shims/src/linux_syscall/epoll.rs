@@ -100,11 +100,14 @@ fn fd_ready_report_for_epoll(
     now_monotonic_ns: Option<u64>,
 ) -> FdReadyReport {
     let guard = crate::adapter::step_engine::guard();
-    query_fd_ready(FdReadyQuery {
-        file,
-        interest: epoll_to_fd_ready_mask(interests),
-        now_monotonic_ns,
-    }, &guard)
+    query_fd_ready(
+        FdReadyQuery {
+            file,
+            interest: epoll_to_fd_ready_mask(interests),
+            now_monotonic_ns,
+        },
+        &guard,
+    )
 }
 
 fn rtc_wait_source(

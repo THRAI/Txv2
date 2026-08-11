@@ -19,8 +19,8 @@ extern crate alloc;
 
 use alloc::borrow::ToOwned;
 use alloc::format;
-use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -32,14 +32,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::adapter::step_engine::{
-    self as epoch, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3, page_allocator,
+    self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3,
 };
 use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
 use tx_ext4_format::ondisk::{
     BitmapMut, BitmapView, Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode,
     Superblock,
 };
-use tx_ext4_format::pager::{BLOCK_SIZE, BlockImage, Ext4Pager, InodeNo, Page4K};
+use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeNo, Page4K, BLOCK_SIZE};
 use tx_substrate::step::PageProgress;
 use tx_subsystems::fs_iface::{
     BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
@@ -54,13 +54,13 @@ use tx_subsystems::mount::{
     SourceLabel,
 };
 use tx_subsystems::page_backed::{
-    Frame, FsPageBacking, PageContainer, PageContainerKind, PageIndex, step_write,
+    step_write, Frame, FsPageBacking, PageContainer, PageContainerKind, PageIndex,
 };
-use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vfs::structure::{
     DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
     RNode, RNodeBacking,
 };
+use tx_subsystems::vfs::FsOps;
 
 use crate::planner::{Ext4BlockGeometry, Ext4FsyncPlanSource, Ext4PlannerBinding};
 use crate::read_backend::{Ext4FsInstance, Ext4PagerMutationPlanSource};
@@ -279,7 +279,10 @@ impl DockerFixture {
         let root = std::env::current_dir()
             .expect("current directory")
             .join("target")
-            .join(format!("tx-ext4-runtime-docker-{}-{unique}", std::process::id()));
+            .join(format!(
+                "tx-ext4-runtime-docker-{}-{unique}",
+                std::process::id()
+            ));
         fs::create_dir_all(&root).expect("create Docker fixture directory");
         Self { root }
     }
@@ -585,6 +588,16 @@ fn build_tier1_mount_image() -> MemImage {
     superblock
         .encode(&mut image.block_mut(0)[1024..2048])
         .expect("encode Tier 1 superblock");
+    image
+}
+
+fn build_tier1_mount_image_with_orphan_file_compat() -> MemImage {
+    let mut image = build_tier1_mount_image();
+    let mut superblock = Superblock::parse(&image.block_mut(0)[1024..2048]).expect("superblock");
+    superblock.feature_compat |= Superblock::FEATURE_COMPAT_ORPHAN_FILE;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .expect("encode Tier 1 orphan_file-compatible superblock");
     image
 }
 
@@ -3259,6 +3272,24 @@ fn rw_mount_stores_the_accepted_tier1_profile_hash() {
     assert_eq!(
         mounted.capability_profile_hash().map(|hash| hash.0),
         Some(tx_ext4_format::capability::Tier1Capabilities::generated().profile_hash()),
+    );
+}
+
+#[test]
+fn rw_mount_accepts_orphan_file_compat_without_claiming_orphan_file_operations() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let mounted = mount_ext4_read_write(build_tier1_mount_image_with_orphan_file_compat())
+        .expect("OSComp-shaped orphan_file compat mount");
+    assert_eq!(
+        mounted.capability_profile_hash().map(|hash| hash.0),
+        Some(tx_ext4_format::capability::Tier1Capabilities::generated().profile_hash()),
+    );
+    assert_eq!(
+        tx_ext4_format::capability::Tier1Capabilities::generated()
+            .admit(tx_ext4_format::capability::Tier1Request::OrphanFile),
+        Err(tx_ext4_format::capability::Tier1Reject::Unsupported)
     );
 }
 

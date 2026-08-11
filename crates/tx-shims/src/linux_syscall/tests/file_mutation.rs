@@ -6,16 +6,16 @@ use alloc::vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
-    self as step_engine, Cap, StepOutcome, guard, page_allocator, reserve_for, sign_for,
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome,
 };
-use tx_fs::tmpfs::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
+use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
     Propagation, SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::pipe::{PipeFlags, step_pipe2};
+use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
@@ -23,8 +23,8 @@ use tx_subsystems::vfs::structure::{
 };
 use tx_subsystems::vfs::{DirEntry, FsOps};
 use tx_subsystems::vm::{
-    MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
-    VmMapRequest,
+    MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
+    USER_PAGE_SIZE,
 };
 
 use crate::linux_syscall::{
@@ -642,6 +642,30 @@ fn dispatch_mkdirat_creates_directory() {
     drop(path);
 }
 
+/// BusyBox `mkdir -p /usr/bin` may first issue `mkdirat("/usr/", ...)`.
+/// Linux treats that as creating `/usr`; keep that compatibility so
+/// test-init can build writable OSComp helper directories on the tmpfs root.
+#[test]
+fn dispatch_mkdirat_trailing_slash_creates_directory() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/usr/");
+    let req = SyscallRequest::new(
+        NR_MKDIRAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0o755, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        lookup_exists(&tmpfs, b"usr"),
+        "/usr should exist after mkdirat with trailing slash"
+    );
+    drop(path);
+}
+
 /// `mkdirat` against an existing entry returns `-EEXIST`.
 #[test]
 fn dispatch_mkdirat_existing_returns_neg_eexist() {
@@ -725,6 +749,70 @@ fn dispatch_unlinkat_closed_regular_file_destroys_inode_immediately() {
         destroy_calls.load(Ordering::Acquire),
         1,
         "unlinkat of a closed zero-link file must run backend destroy"
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_closed_cached_regular_file_destroys_inode_immediately() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"cached");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry.clone());
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/cached");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /cached: {other:?}"),
+    };
+    assert!(
+        root_dentry
+            .cached_child(InlineName::new(b"cached").expect("inline"))
+            .is_some(),
+        "openat should publish the child into the parent dentry cache"
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_CLOSE, [fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"cached"),
+        "/cached should be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "a stale weak dentry cache entry must not keep a closed zero-link file inode alive"
+    );
+    assert!(
+        root_dentry
+            .cached_child(InlineName::new(b"cached").expect("inline"))
+            .is_none(),
+        "unlinkat should evict the removed name from the parent dentry cache"
     );
     drop(path);
 }

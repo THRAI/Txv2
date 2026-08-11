@@ -43,8 +43,8 @@ use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmEntry, VmEntryBacking,
-    VmFault, VmFaultError, VmFaultMaterializationStep, VmFaultOutcome,
+    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmEntry, VmEntryBacking, VmFault,
+    VmFaultError, VmFaultMaterializationStep, VmFaultOutcome, USER_PAGE_SIZE,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 

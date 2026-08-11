@@ -4,6 +4,12 @@ use crate::TimerKey;
 
 use super::queue::TimerQueue;
 
+const TOMBSTONE_COMPACT_MIN_SLOTS: usize = 4096;
+const KEY_SLOT_GROWTH_NUMERATOR: usize = 4;
+const KEY_SLOT_GROWTH_DENOMINATOR: usize = 3;
+const KEY_SLOT_HEADROOM_DIVISOR: usize = 4;
+const KEY_SLOT_MIN_INSERT_HEADROOM: usize = 64;
+
 #[derive(Clone, Copy)]
 struct HeapEntry {
     key: TimerKey,
@@ -41,6 +47,20 @@ impl MinHeap {
         }
     }
 
+    pub(super) fn with_insert_capacity(prepared_inserts: usize) -> Self {
+        let mut queue = Self::new();
+        if prepared_inserts == 0 {
+            return queue;
+        }
+
+        queue.heap.reserve(prepared_inserts);
+        queue.slots.reserve(prepared_inserts);
+        let key_slot_capacity = Self::key_slot_capacity_for(prepared_inserts)
+            .expect("timer key index capacity exhausted");
+        queue.key_slots.resize(key_slot_capacity, None);
+        queue
+    }
+
     pub(super) fn has_insert_capacity(&self) -> bool {
         self.heap.len() < self.heap.capacity()
             && self.slots.len() < self.slots.capacity()
@@ -49,25 +69,51 @@ impl MinHeap {
 
     /// Reserve one insertion slot while the engine state is not spin-locked.
     pub(super) fn reserve_for_insert(&mut self) {
+        self.compact_tombstones_if_sparse();
+        if self.has_insert_capacity() {
+            return;
+        }
+
         self.heap.reserve(1);
         self.slots.reserve(1);
         if self.key_slots_can_insert() {
             return;
         }
 
-        let required = self
-            .slots
-            .len()
-            .checked_add(1)
-            .and_then(|count| count.checked_mul(2))
-            .expect("timer key index capacity exhausted")
-            .max(8);
+        let prepared_slots =
+            Self::prepared_slot_count_for_growth(self.slots.len().saturating_add(1))
+                .expect("timer slot growth capacity exhausted");
+        let required = Self::key_slot_capacity_for(prepared_slots)
+            .expect("timer key index capacity exhausted");
         let mut key_slots = Vec::with_capacity(required);
         key_slots.resize(required, None);
         for (slot_index, slot) in self.slots.iter().enumerate() {
             Self::insert_key_slot_into(&mut key_slots, slot.key, slot_index);
         }
         self.key_slots = key_slots;
+    }
+
+    fn compact_tombstones_if_sparse(&mut self) {
+        let live = self.heap.len();
+        let total = self.slots.len();
+        if total < TOMBSTONE_COMPACT_MIN_SLOTS || live.saturating_mul(2) > total {
+            return;
+        }
+
+        self.slots.clear();
+        self.key_slots.fill(None);
+
+        for (heap_index, entry) in self.heap.iter().copied().enumerate() {
+            let slot_index = self.slots.len();
+            self.slots.push(Slot {
+                key: entry.key,
+                deadline_ns: entry.deadline_ns,
+                generation: entry.generation,
+                heap_index,
+                live: true,
+            });
+            Self::insert_key_slot_into(&mut self.key_slots, entry.key, slot_index);
+        }
     }
 
     pub(super) fn due_count(&self, now_ns: u64) -> usize {
@@ -79,12 +125,23 @@ impl MinHeap {
 
     fn key_slots_can_insert(&self) -> bool {
         self.key_slots.len() != 0
-            && self
-                .slots
-                .len()
-                .checked_add(1)
-                .and_then(|count| count.checked_mul(2))
-                .is_some_and(|required| required <= self.key_slots.len())
+            && self.slots.len().checked_add(1).is_some_and(|required| {
+                Self::key_slot_capacity_for(required)
+                    .is_some_and(|capacity| capacity <= self.key_slots.len())
+            })
+    }
+
+    fn key_slot_capacity_for(slot_count: usize) -> Option<usize> {
+        let grown = slot_count
+            .checked_mul(KEY_SLOT_GROWTH_NUMERATOR)?
+            .checked_add(KEY_SLOT_GROWTH_DENOMINATOR - 1)?
+            / KEY_SLOT_GROWTH_DENOMINATOR;
+        Some(grown.max(8))
+    }
+
+    fn prepared_slot_count_for_growth(slot_count: usize) -> Option<usize> {
+        let headroom = (slot_count / KEY_SLOT_HEADROOM_DIVISOR).max(KEY_SLOT_MIN_INSERT_HEADROOM);
+        slot_count.checked_add(headroom)
     }
 
     fn hash(key: TimerKey) -> usize {
@@ -357,5 +414,49 @@ mod tests {
         queue.drain_due(30, &mut out);
         assert_eq!(out, vec![keys[0], keys[4], keys[3], keys[2]]);
         assert_eq!(queue.next_deadline_ns(), None);
+    }
+
+    #[test]
+    fn reserve_compacts_cancelled_timer_tombstones() {
+        let mut queue = MinHeap::with_insert_capacity(8192);
+        for raw in 1..=5000 {
+            let key = TimerKey::new(raw);
+            queue.insert(key, raw);
+            assert!(queue.remove(key));
+        }
+        assert_eq!(queue.heap.len(), 0);
+        assert!(queue.slots.len() >= 5000);
+
+        insert(&mut queue, TimerKey::new(6000), 1);
+
+        assert_eq!(queue.heap.len(), 1);
+        assert_eq!(queue.slots.len(), 1);
+        assert!(queue.slots.capacity() >= 5000);
+        assert!(queue.key_slots.len() >= 5000);
+        assert!(queue.rearm(TimerKey::new(6000), 2));
+        assert!(!queue.rearm(TimerKey::new(1), 2));
+    }
+
+    #[test]
+    fn compaction_keeps_followup_insert_headroom() {
+        let mut queue = MinHeap::with_insert_capacity(8192);
+        let key_slots_ptr = queue.key_slots.as_ptr();
+        let key_slots_len = queue.key_slots.len();
+        for raw in 1..=5000 {
+            let key = TimerKey::new(raw);
+            queue.insert(key, raw);
+            assert!(queue.remove(key));
+        }
+
+        insert(&mut queue, TimerKey::new(6000), 1);
+
+        for raw in 6001..=6032 {
+            let key = TimerKey::new(raw);
+            insert(&mut queue, key, raw);
+            assert!(queue.remove(key));
+        }
+
+        assert_eq!(queue.key_slots.as_ptr(), key_slots_ptr);
+        assert_eq!(queue.key_slots.len(), key_slots_len);
     }
 }

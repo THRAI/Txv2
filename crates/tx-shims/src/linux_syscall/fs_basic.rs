@@ -9,7 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use tx_services::time::{
-    ClockRead, DeadlineRegistrarHandle, TimekeeperClock, TimekeeperIf, timekeeper,
+    timekeeper, ClockRead, DeadlineRegistrarHandle, TimekeeperClock, TimekeeperIf,
 };
 use tx_subsystems::device::{RtcAlarmEmulation, RtcTime};
 use tx_subsystems::tty::execution::{
@@ -77,6 +77,44 @@ pub(crate) fn clear_stat_meta_overrides() {
 
 fn apply_stat_meta_override(fs_object_id: FsObjectId, meta: &mut InodeMeta) {
     *meta = stat_meta_override_or(fs_object_id, *meta);
+}
+
+fn resolve_stat_target(
+    ctx: &SyscallCtx<'_>,
+    rooted_at: &Cap<DEntry>,
+    path: &[u8],
+    cred: &Credential,
+    nofollow: bool,
+) -> Result<Cap<DEntry>, i32> {
+    let mode = if nofollow {
+        tx_subsystems::vfs::resolution::state::WalkMode::EntityUnfollowed
+    } else {
+        tx_subsystems::vfs::resolution::state::WalkMode::Entity
+    };
+    let policy = if nofollow {
+        tx_subsystems::vfs::resolution::state::FinalSymlinkPolicy::NoFollow
+    } else {
+        tx_subsystems::vfs::resolution::state::FinalSymlinkPolicy::Follow
+    };
+    let mount_namespace = ctx.process.mount_namespace_cap();
+    let origin_mount = ctx.process.cwd_binding().map(|binding| binding.mount);
+    let guard = step_engine::guard();
+    let resolved =
+        tx_subsystems::vfs::resolution::driver::walk_to_completion_with_mount_namespace_and_origin(
+            rooted_at.clone(),
+            path,
+            mode,
+            policy,
+            cred,
+            mount_namespace.as_ref(),
+            origin_mount.as_ref(),
+            &guard,
+        );
+    drop(guard);
+    match resolved {
+        Ok(resolved) => Ok(resolved.dentry),
+        Err(errno) => Err(errno_to_i32(Errno::from(errno))),
+    }
 }
 
 fn allocate_fd_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult> {
@@ -664,7 +702,12 @@ fn maybe_destroy_zero_link_inode_after_fd_remove(file: &Cap<OpenFile>) {
         StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => return,
     };
     if meta.nlinks == 0 {
-        let _ = fs_ops.destroy_inode(fs_object_id, &guard);
+        if matches!(
+            fs_ops.destroy_inode(fs_object_id, &guard),
+            StepOutcome::Done(())
+        ) {
+            zero_link_destroy_pressure_maintenance();
+        }
     }
 }
 
@@ -2930,14 +2973,19 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 (StatxResult { meta }, ino, rmaj, rmin)
             } else {
                 let walker_cred = ctx.walker_cred();
+                let nofollow = flags & AT_SYMLINK_NOFOLLOW as u32 != 0;
+                let target = match resolve_stat_target(ctx, &cwd, &path, &walker_cred, nofollow) {
+                    Ok(target) => target,
+                    Err(e) => return SyscallResult::Error(e),
+                };
                 let result = {
                     let mut script_ctx = build_subject_script_ctx(ctx);
-                    if flags & AT_SYMLINK_NOFOLLOW as u32 != 0 {
+                    if nofollow {
                         let mut op = LstatxOp {
                             rooted_at: &cwd,
                             path: &path,
                             cred: &walker_cred,
-                            target: None,
+                            target: Some(target),
                         };
                         step_engine::drive_oneshot(&mut op, &mut script_ctx)
                     } else {
@@ -2945,7 +2993,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                             rooted_at: &cwd,
                             path: &path,
                             cred: &walker_cred,
-                            target: None,
+                            target: Some(target),
                         };
                         step_engine::drive_oneshot(&mut op, &mut script_ctx)
                     }
@@ -3047,14 +3095,19 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             }
         } else {
             let walker_cred = ctx.walker_cred();
+            let nofollow = flags & AT_SYMLINK_NOFOLLOW as u32 != 0;
+            let target = match resolve_stat_target(ctx, &cwd, &path, &walker_cred, nofollow) {
+                Ok(target) => target,
+                Err(e) => return SyscallResult::Error(e),
+            };
             let result = {
                 let mut script_ctx = build_subject_script_ctx(ctx);
-                if flags & AT_SYMLINK_NOFOLLOW as u32 != 0 {
+                if nofollow {
                     let mut op = LstatOp {
                         rooted_at: &cwd,
                         path: &path,
                         cred: &walker_cred,
-                        target: None,
+                        target: Some(target),
                     };
                     step_engine::drive_oneshot(&mut op, &mut script_ctx)
                 } else {
@@ -3062,7 +3115,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                         rooted_at: &cwd,
                         path: &path,
                         cred: &walker_cred,
-                        target: None,
+                        target: Some(target),
                     };
                     step_engine::drive_oneshot(&mut op, &mut script_ctx)
                 }

@@ -713,8 +713,8 @@ mod v3_tests {
     use crate::execution::{Errno as V4Errno, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::page_backed::{
-        AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
-        allocate_cached_frame,
+        allocate_cached_frame, AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind,
+        PageIndex,
     };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};

@@ -1,10 +1,10 @@
 use crate::journal::Jbd2Superblock;
 use crate::ondisk::{
-    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent,
-    ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout,
-    Superblock, block_bitmap_csum32, crc32c, encode_dir_entry, encode_journal_commit,
+    block_bitmap_csum32, crc32c, encode_dir_entry, encode_journal_commit,
     encode_journal_descriptor, group_desc_csum16, inode_bitmap_csum32, inode_csum32,
-    parse_journal_descriptor, superblock_csum32,
+    parse_journal_descriptor, superblock_csum32, BitmapMut, BitmapView, BlockMapping, CommitHeader,
+    DirEntry, DirEntryIter, Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode,
+    InodeLocation, InodeTableLayout, Superblock,
 };
 use crate::ondisk::{
     dirblock_csum32, extent_block_csum32, read_u16_le, read_u32_le, write_u16_le, write_u32_le,
@@ -2230,12 +2230,8 @@ impl<I: BlockImage> Ext4Pager<I> {
             if block.role != MetaRole::ExtentNode {
                 continue;
             }
-            let checksum = extent_block_csum32(
-                seed,
-                inode.get(),
-                disk_inode.generation,
-                &block.after,
-            );
+            let checksum =
+                extent_block_csum32(seed, inode.get(), disk_inode.generation, &block.after);
             block.after[BLOCK_SIZE - 4..].copy_from_slice(&checksum.to_le_bytes());
         }
     }

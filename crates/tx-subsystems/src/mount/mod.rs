@@ -21,12 +21,11 @@ use crate::fs_iface::{
     BackendPageRequest, BackendPlan, BackendPlanResume, BackendPlanner, FsObjectKey, IoDataSource,
     IoDataTarget,
 };
-use crate::io_manager::page::{PageIoRequest, service::PageServiceBackendContext};
+use crate::io_manager::page::{service::PageServiceBackendContext, PageIoRequest};
 use crate::page_backed::{ErrorCursor, FsPageBacking, PageContainer};
 use crate::vfs::{
-    DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
     adapter::step_engine::{Guard, NoProgress, StepOutcome},
-    render_dentry_path,
+    render_dentry_path, DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
 };
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
@@ -1771,12 +1770,12 @@ mod tests {
     };
     use crate::io_manager::block::BlockQueue;
     use crate::io_manager::page::{
-        PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp,
-        PageIoPriority, PageIoRange, PageIoRequestId, PageIoResult,
         service::{
             PageService, PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceDriver,
             PageServiceNext, PageServiceTurn, PageServiceWake, PageServiceWork,
         },
+        PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp,
+        PageIoPriority, PageIoRange, PageIoRequestId, PageIoResult,
     };
     use crate::io_manager::runtime::{IoServiceKind, ServiceBudget, ServiceKick};
     use crate::page_backed::{Frame, PageContainerKind};
@@ -2470,10 +2469,9 @@ mod tests {
         assert_eq!(payload.payload_pin_count(), 1);
         assert_eq!(child_payload.payload_pin_count(), 1);
         assert!(pins.iter().any(|pin| pin.payload().key() == payload.key()));
-        assert!(
-            pins.iter()
-                .any(|pin| pin.payload().key() == child_payload.key())
-        );
+        assert!(pins
+            .iter()
+            .any(|pin| pin.payload().key() == child_payload.key()));
 
         drop(pins);
         assert_eq!(payload.payload_pin_count(), 0);

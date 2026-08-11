@@ -5,11 +5,11 @@ use core::marker::PhantomData;
 use crate::adapter::step_engine::{NoProgress, StepOutcome};
 use tx_hal::{Arch, TxPlatform};
 use tx_subsystems::device::{
-    BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT, PhysicalBlockNumber,
-    register_block_devices,
+    register_block_devices, BlockDevice, BlockDeviceOps, BlockDeviceRegistration, DevT,
+    PhysicalBlockNumber,
 };
 use tx_subsystems::execution::Guard;
-use tx_subsystems::net::{NetDeviceRegistration, register_net_devices};
+use tx_subsystems::net::{register_net_devices, NetDeviceRegistration};
 use tx_subsystems::page_backed::Frame;
 
 pub struct KernelBlockDevices<P: TxPlatform> {

@@ -42,6 +42,7 @@ pub struct Superblock {
 
 impl Superblock {
     pub const FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+    pub const FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
     pub const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
     pub const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
     pub const FEATURE_INCOMPAT_64BIT: u32 = 0x0080;

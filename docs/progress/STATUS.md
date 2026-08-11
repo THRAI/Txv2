@@ -1,3 +1,13 @@
+- 2026-08-11 (OSComp ext4/runtime layout follow-up).
+  Continued the non-net submission by keeping the ext4-format, ext4, fs,
+  kernel init, script, shims, substrate, process, timer, and xtask oscomp
+  runtime fixes together while leaving the current net subtree untouched.
+  Verification passed `cargo test -p tx-kernel init::exec::tests --
+  --nocapture` and `cargo test -p tx-ext4-format --lib -- --nocapture`.
+  Next step: keep the remaining net-specific edits out of this commit series
+  and split any still-pending runtime or filesystem follow-ups from the
+  unrelated socketpair work.
+
 - 2026-08-11 (SMP commit boundary closeout).
   Staged the non-PELT SMP scheduler / userspace / witness slice into a
   clean commit boundary and left ext4/layout, net/socketpair, and other

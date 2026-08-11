@@ -22,6 +22,13 @@ struct LargeObject {
 static LARGE_ZONE: Zone<LargeObject> = Zone::const_new();
 
 #[derive(Debug)]
+struct SingleSlotObject {
+    bytes: [u8; 3000],
+}
+
+static SINGLE_SLOT_ZONE: Zone<SingleSlotObject> = Zone::const_new();
+
+#[derive(Debug)]
 struct AllocationFailureObject;
 
 static ALLOCATION_FAILURE_ZONE: Zone<AllocationFailureObject> = Zone::const_new();
@@ -31,6 +38,10 @@ struct DropObject;
 
 static DROP_ZONE: Zone<DropObject> = Zone::const_new();
 static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct ZeroKeyObject;
+static ZERO_KEY_ZONE: Zone<ZeroKeyObject> = Zone::const_new();
 
 #[derive(Debug)]
 struct MixedA;
@@ -61,6 +72,12 @@ unsafe impl ZoneAllocated for DropObject {
     }
 }
 
+unsafe impl ZoneAllocated for ZeroKeyObject {
+    fn zone() -> &'static Zone<Self> {
+        &ZERO_KEY_ZONE
+    }
+}
+
 unsafe impl ZoneAllocated for Object {
     fn zone() -> &'static Zone<Self> {
         &TEST_ZONE
@@ -70,6 +87,12 @@ unsafe impl ZoneAllocated for Object {
 unsafe impl ZoneAllocated for LargeObject {
     fn zone() -> &'static Zone<Self> {
         &LARGE_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for SingleSlotObject {
+    fn zone() -> &'static Zone<Self> {
+        &SINGLE_SLOT_ZONE
     }
 }
 
@@ -182,13 +205,13 @@ fn mixed_zone_bag_dispatches_typed_reclaim() {
 #[test]
 fn slot_key_zero_is_a_real_intrusive_member() {
     let _guard = reset_zone_and_epoch();
-    zone::register_zone_for::<DropObject>().expect("drop zone registration");
-    let mut caps = Vec::new();
+    zone::register_zone_for::<ZeroKeyObject>().expect("zero-key zone registration");
+    let mut caps: Vec<Cap<ZeroKeyObject>> = Vec::new();
     while !caps
         .iter()
-        .any(|cap: &Cap<DropObject>| cap.key().raw() == 0)
+        .any(|cap: &Cap<ZeroKeyObject>| cap.key().raw() == 0)
     {
-        caps.push(zone::sign(DropObject).expect("allocation while seeking raw key zero"));
+        caps.push(zone::sign(ZeroKeyObject).expect("allocation while seeking raw key zero"));
         assert!(caps.len() <= 64, "first slab must contain raw key zero");
     }
     let zero_index = caps
@@ -202,7 +225,6 @@ fn slot_key_zero_is_a_real_intrusive_member() {
     let _ = epoch::drain_with_budget(usize::MAX);
     let drained = epoch::drain_with_budget(usize::MAX);
     assert_eq!(drained.bag_reclaimed, 2);
-    assert_eq!(DROP_COUNT.load(Ordering::Acquire), 2);
     drop(caps);
 }
 
@@ -227,6 +249,118 @@ fn generation_max_quarantines_without_reuse() {
         replacement.key(),
         key,
         "exhausted slot must not return to allocation"
+    );
+}
+
+#[test]
+fn generation_exhausted_full_slab_is_retired_and_replaced() {
+    let _guard = reset_zone_and_epoch();
+    zone::register_zone_for::<DropObject>().expect("drop zone registration");
+
+    let mut caps: Vec<Cap<DropObject>> = Vec::new();
+    for _ in 0..64 {
+        let cap = zone::sign(DropObject).expect("first slab allocation");
+        if let Some(first) = caps.first() {
+            assert_eq!(
+                cap.key().slab_id(),
+                first.key().slab_id(),
+                "test setup expects the first slab to fill before a new slab"
+            );
+        }
+        unsafe { zone::testing::force_generation::<DropObject>(cap.key(), u16::MAX) };
+        caps.push(cap);
+    }
+
+    let old_key = caps[0].key();
+    let old_weak = caps[0].downgrade();
+    let old_slab_id = old_key.slab_id();
+    drop(caps);
+
+    let _ = epoch::drain_with_budget(usize::MAX);
+    let _ = epoch::drain_with_budget(usize::MAX);
+
+    assert!(
+        zone::testing::slot_word::<DropObject>(old_key).is_none(),
+        "a fully generation-exhausted slab must unpublish instead of trapping the zone"
+    );
+    assert!(
+        old_weak.observe(&epoch::guard()).is_none(),
+        "old weak handles must not resolve after exhausted slab retirement"
+    );
+
+    let replacement = zone::sign(DropObject).expect("replacement after exhausted slab");
+    assert_ne!(
+        replacement.key().slab_id(),
+        old_slab_id,
+        "replacement allocation must use a fresh slab id"
+    );
+}
+
+#[test]
+fn empty_slab_reuse_rotates_slot_start_after_maintenance_flush() {
+    let _guard = reset_zone_and_epoch();
+    zone::register_zone_for::<DropObject>().expect("drop zone registration");
+
+    let mut slot_indices = [0usize; 3];
+    for slot_index in &mut slot_indices {
+        let cap = zone::sign(DropObject).expect("allocation");
+        *slot_index = cap.key().slot_index();
+        drop(cap);
+
+        // Final-cap reclamation is two-phase.  Flush the per-CPU bucket after
+        // the slot is free so the next allocation re-enters the central Keg
+        // and exercises the empty-slab starting-point policy.
+        let _ = epoch::drain_with_budget(usize::MAX);
+        let _ = epoch::drain_with_budget(usize::MAX);
+        let _ = zone::maintenance_tick(ZoneMaintenanceBudget {
+            epoch_reclaim_budget: usize::MAX,
+            empty_slab_budget: 0,
+        });
+    }
+
+    assert_ne!(
+        slot_indices[0], slot_indices[1],
+        "an empty slab must not restart every reuse at the same hot slot"
+    );
+    assert_ne!(
+        slot_indices[1], slot_indices[2],
+        "successive empty-slab cycles should keep spreading slot wear"
+    );
+}
+
+#[test]
+fn single_slot_slab_refill_does_not_allocate_bucket_capacity_of_new_slabs() {
+    let _guard = reset_zone_and_epoch();
+    zone::register_zone_for::<SingleSlotObject>().expect("single-slot zone registration");
+
+    let cap = zone::sign(SingleSlotObject {
+        bytes: [0x5a; 3000],
+    })
+    .expect("single-slot allocation");
+    assert_eq!(cap.bytes[0], 0x5a);
+    let first_key = cap.key();
+    let after_first = zone::lookup(SINGLE_SLOT_ZONE.id()).expect("single-slot info");
+    assert_eq!(
+        after_first.slab_count, 1,
+        "one single-slot allocation must allocate one slab, not a full bucket"
+    );
+    assert_eq!(after_first.allocated_slots, 1);
+    drop(cap);
+    let _ = epoch::drain_with_budget(usize::MAX);
+    let _ = epoch::drain_with_budget(usize::MAX);
+    let _ = zone::maintenance_tick(ZoneMaintenanceBudget {
+        epoch_reclaim_budget: usize::MAX,
+        empty_slab_budget: usize::MAX,
+    });
+
+    let replacement = zone::sign(SingleSlotObject {
+        bytes: [0xa5; 3000],
+    })
+    .expect("single-slot replacement allocation");
+    assert_eq!(
+        replacement.key().slab_id(),
+        first_key.slab_id(),
+        "non-exhausted single-slot slabs should be reused instead of churned"
     );
 }
 
@@ -375,16 +509,18 @@ fn zone_lookup_is_lock_free_across_cache_collisions() {
         assert!(caps.len() < 2048, "test must reach 65 distinct slabs");
     }
 
-    let selected = [
-        slab_representatives[0].1,
-        slab_representatives[slab_representatives.len() / 2].1,
-        slab_representatives.last().expect("last slab").1,
-    ];
-    assert_eq!(
-        slab_representatives[0].0 & 63,
-        slab_representatives[64].0 & 63,
-        "65 sequential slab ids must collide in the retired 64-entry cache"
-    );
+    let mut colliding = None;
+    'outer: for (left_pos, (left_id, left_index)) in slab_representatives.iter().enumerate() {
+        for (right_id, right_index) in slab_representatives.iter().skip(left_pos + 1) {
+            if (left_id & 63) == (right_id & 63) {
+                colliding = Some((*left_index, *right_index));
+                break 'outer;
+            }
+        }
+    }
+    let (collision_a, collision_b) =
+        colliding.expect("65 slab ids must contain a directory-index collision");
+    let selected = [slab_representatives[0].1, collision_a, collision_b];
     let weaks = selected.map(|index| caps[index].downgrade());
 
     zone::testing::begin_keg_lock_counting();

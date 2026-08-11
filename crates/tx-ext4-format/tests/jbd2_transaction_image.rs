@@ -1,6 +1,6 @@
 use tx_ext4_format::journal::{
-    JBD2_BLOCK_SIZE, JBD2_MAGIC, Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2Revoke,
-    Jbd2TransactionImage,
+    Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage,
+    JBD2_BLOCK_SIZE, JBD2_MAGIC,
 };
 
 #[test]
