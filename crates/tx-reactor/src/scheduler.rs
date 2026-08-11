@@ -1724,7 +1724,8 @@ impl Phase1Scheduler {
                 } else if meta.remaining_budget_ns > 0 {
                     (
                         Phase1QueueKind::Preempted,
-                        !meta.userspace_thread || hint == WakeHint::WakeHandoff,
+                        hint == WakeHint::WakeHandoff
+                            || (!meta.userspace_thread && hint != WakeHint::SelfYield),
                     )
                 } else {
                     (Phase1QueueKind::New, false)

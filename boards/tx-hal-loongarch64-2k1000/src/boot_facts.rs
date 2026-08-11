@@ -20,7 +20,14 @@ const DEVICE_TREE_GUID: [u8; 16] = [
     0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
 ];
 
-static STATE: AtomicU8 = AtomicU8::new(0);
+const STATE_UNPUBLISHED: u8 = 0x51;
+const STATE_PUBLISHING: u8 = 0xa3;
+const STATE_READY: u8 = 0x7e;
+// A zero-initialized state at the BSS tail turned a downward stack overwrite
+// into a silent second firmware parse. Keep the lifecycle byte in `.data` and
+// reserve zero as corruption evidence instead.
+#[link_section = ".data.tx_boot_facts_state"]
+static STATE: AtomicU8 = AtomicU8::new(STATE_UNPUBLISHED);
 static mut CMDLINE: [u8; CMDLINE_CAPACITY] = [0; CMDLINE_CAPACITY];
 static MEMORY_REGIONS: [MemoryRegion; 6] = [
     MemoryRegion {
@@ -168,18 +175,29 @@ pub(crate) fn linked_kernel_image() -> PhysRange {
 pub(crate) fn ensure_static_boot_facts() {
     loop {
         match STATE.load(Ordering::Acquire) {
-            2 => return,
-            0 => {
+            STATE_READY => return,
+            STATE_UNPUBLISHED => {
                 if STATE
-                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        STATE_UNPUBLISHED,
+                        STATE_PUBLISHING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     publish();
-                    STATE.store(2, Ordering::Release);
+                    STATE.store(STATE_READY, Ordering::Release);
                     return;
                 }
             }
-            _ => core::hint::spin_loop(),
+            STATE_PUBLISHING => core::hint::spin_loop(),
+            corrupt => {
+                console_write_literal(b"txkernel:loongson-2k1000:bootinfo:state-corrupt:value=0x");
+                console_write_hex(corrupt as usize);
+                console_write_literal(b"\n");
+                panic!("2K1000 immutable boot-fact state was corrupted");
+            }
         }
     }
 }
@@ -474,6 +492,16 @@ fn read_cells(data: &[u8], cells: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_fact_lifecycle_reserves_zero_as_corruption_evidence() {
+        assert_ne!(STATE_UNPUBLISHED, 0);
+        assert_ne!(STATE_PUBLISHING, 0);
+        assert_ne!(STATE_READY, 0);
+        assert_ne!(STATE_UNPUBLISHED, STATE_PUBLISHING);
+        assert_ne!(STATE_UNPUBLISHED, STATE_READY);
+        assert_ne!(STATE_PUBLISHING, STATE_READY);
+    }
 
     #[test]
     fn firmware_addresses_accept_only_physical_or_known_dmw_tags() {

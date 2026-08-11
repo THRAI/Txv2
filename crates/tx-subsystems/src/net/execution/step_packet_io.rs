@@ -43,17 +43,13 @@ pub fn step_packet_ingress_fanout(
         return PacketIngressOutcome::default();
     }
 
-    let Some(link) = net_namespace
-        .link_snapshot()
-        .into_iter()
-        .find(|link| {
-            link.ifindex != 0
-                && link.is_up
-                && net_namespace
-                    .find_device_by_ifindex(link.ifindex)
-                    .is_some_and(|candidate| candidate.devt == registration.devt)
-        })
-    else {
+    let Some(link) = net_namespace.link_snapshot().into_iter().find(|link| {
+        link.ifindex != 0
+            && link.is_up
+            && net_namespace
+                .find_device_by_ifindex(link.ifindex)
+                .is_some_and(|candidate| candidate.devt == registration.devt)
+    }) else {
         return PacketIngressOutcome::default();
     };
 

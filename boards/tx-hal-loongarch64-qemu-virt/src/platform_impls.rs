@@ -836,7 +836,7 @@ impl PercpuIf for Platform {
     }
 }
 
-fn la64_unpin_cpu(cpu: CpuId) {
+fn la64_unpin_cpu(cpu: CpuId, _reason: CpuPinReason) {
     debug_assert_eq!(cpu, la64_current_cpu_id());
     let previous = LA64_CPU_PIN_DEPTHS[cpu.0].fetch_sub(1, Ordering::Release);
     assert!(previous != 0, "LA64 CPU pin nesting underflow");

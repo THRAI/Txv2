@@ -1,3 +1,44 @@
+- 2026-08-11 (**Loongson 2K1000 CPU-pin、持续服务公平性与完整
+  clone/post-clone 均已实板闭合**).
+  **Changed**：checkpoint 保持 `3a757495`；没有重新调查或回退共享 LA QEMU
+  TLB 修复，也没有重复采集硬件事实。CPU-pin 根因已收敛为旧 64 KiB BSP
+  runtime stack 向下覆盖相邻 BSS；BSP/AP long-lived stack 扩为 128 KiB、各带
+  4 KiB canary lower guard，并保留非零 boot lifecycle、pin reason/ring、checked
+  decrement 与水位观测。两次 direct-root 启动和最终标准根启动均无
+  pin/guard/cmdline/state/panic 报告；CPU0/1 最低余量为 `0x1ace0`（109,792 B）
+  和 `0x1b700`（112,384 B）。
+  **Fairness**：host 红→绿回归锁定每个 file-I/O ready turn 后的 cooperative
+  poll boundary、`fair().pinned()` service metadata，以及 fair 非用户任务
+  `SelfYield` 的队尾轮转；普通 wake 与 `WakeHandoff` 不变。90 秒实板探针中
+  3 次后台和 1 次前台 TLS `git ls-remote` 全部完成，host ping 90 发/89 收，
+  shell 与网络持续可用。
+  **Full clone**：可写 tmpfs 根使用标准 `/lib`/`/usr/lib` 动态 Git/TLS 闭包，
+  `HOME=/root`，没有创建或挂载 `/musl`。自动脚本首次因 resolver 错配使
+  `/proj` clone 失败，并因只检查残留 `.git` 错报 POSTCLONE ok；在同一启动中
+  live 写入 `nameserver 10.248.98.30` 后，`/proj3` 完成 7818/7818 objects、
+  4137/4137 deltas、17.47 MiB。仓库为 non-shallow，HEAD 为
+  `0c8e312f82c34335d78073334c40c253c70df23c`；`--no-pager log`、文件写入读回、
+  dirty status、普通 shell 和 8 秒 idle 后继续执行均通过。clone 全程 host ping
+  543 发/543 收、0% loss，RTT min/avg/max/mdev
+  `1.467/1.869/20.649/1.417 ms`，串口边界仍无 panic。
+  **Verification**：定点 host 回归、2K HAL 29/29、substrate AP/pin 9/9、
+  2K1000/LA QEMU full-build 与 LA SMP4 sentinel 已通过。脚本已修正 DNS、clone
+  生命周期误判和 pager，`sh -n`、CPIO inventory、uImage header/payload 校验通过。
+  修正版 raw CPIO 为 18,300,416 bytes，SHA-256
+  `125f45352f5f6179f87011c81fc98b5f0c14fd570ed010ef8dda3c1f517d2c26`；
+  uImage 为 18,300,480 bytes，SHA-256
+  `6a2acabff627775cf55b304d6898db57663116c0ceccd2e23e20d8d3c3051ea6`，已与
+  `/srv/tftp/txv2/txv2-la2k1000-alpine-min-initrd.uimage` 逐字节核对；载荷范围为
+  `0x98800040..0x99973e40`，size `0x1173e00`。LA QEMU 的无关 8 MiB fw_cfg
+  上限仍不作修改。`jq empty` 与 `git diff --check` 通过；
+  `cargo xtask progress validate` 仍仅被未触碰的 2026-07-24 plan 旧状态
+  `completed` 阻断，`cargo xtask lint docs` 仍报告既有 31 个断链和 6 个退役
+  词汇警告，均未命中本次更新文件。
+  **Blocker / Next**：没有 board clone、CPU-pin 或 fairness blocker，也不需再次
+  复位。handoff 保持 open，仅剩用户持有凭据的 push、网页修改和实板 pull；
+  修正版自动脚本已部署但未用额外复位重复现场语义。详细证据见
+  `msp/debug-logs/2026-08-10-la2k1000-pin-fairness-operation-ledger.md`。
+
 - 2026-08-10 (**Loongson 2K1000 完整 clone 已成功，但 clone 后 CPU-pin panic 阻断最终 Git 验收**).
   **Changed**：当前代码位于 `335321ef`，包含 zone contention、2K UART
   串行化/延迟 level IRQ、可恢复线程退出、DWMAC3 IRQ/RX budget 修复；共享

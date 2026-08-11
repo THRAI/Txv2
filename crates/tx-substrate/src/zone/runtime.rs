@@ -8,7 +8,8 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use tx_hal::{
-    CpuId, CpuPinGuard, IrqIf, LocalExecutionGuard, PercpuIf, PhysAddr, SmpIf, TxPlatform,
+    CpuId, CpuPinGuard, CpuPinReason, IrqIf, LocalExecutionGuard, PercpuIf, PhysAddr, SmpIf,
+    TxPlatform,
 };
 
 use super::ZoneError;
@@ -157,9 +158,9 @@ pub fn freeze_for_shutdown() -> Result<(), ZoneError> {
     }
 }
 
-pub fn pin_current_cpu() -> Result<CpuPinGuard, ZoneError> {
+pub fn pin_current_cpu(reason: CpuPinReason) -> Result<CpuPinGuard, ZoneError> {
     ensure_running()?;
-    let guard = unsafe { ((*HOOKS.get()).pin_current_cpu)() };
+    let guard = unsafe { ((*HOOKS.get()).pin_current_cpu)(reason) };
     if is_possible_cpu(guard.cpu_id()) {
         Ok(guard)
     } else {
@@ -209,7 +210,7 @@ pub unsafe fn reset_for_test() {
 }
 
 struct RuntimeHooks {
-    pin_current_cpu: fn() -> CpuPinGuard,
+    pin_current_cpu: fn(CpuPinReason) -> CpuPinGuard,
     exclude_local_execution: fn() -> LocalExecutionGuard,
 }
 
@@ -226,14 +227,14 @@ impl RuntimeHooks {
         P: IrqIf + PercpuIf + SmpIf,
     {
         Self {
-            pin_current_cpu: P::pin_current_cpu,
+            pin_current_cpu: P::pin_current_cpu_for,
             exclude_local_execution: P::exclude_local_execution,
         }
     }
 }
 
-fn default_pin_current_cpu() -> CpuPinGuard {
-    CpuPinGuard::new(CpuId(0))
+fn default_pin_current_cpu(reason: CpuPinReason) -> CpuPinGuard {
+    CpuPinGuard::new(CpuId(0)).with_reason(reason)
 }
 
 fn default_exclude_local_execution() -> LocalExecutionGuard {

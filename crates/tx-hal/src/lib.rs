@@ -76,14 +76,34 @@ impl CpuMask {
 #[must_use]
 pub struct CpuPinGuard {
     cpu_id: CpuId,
-    unpin: Option<fn(CpuId)>,
+    reason: CpuPinReason,
+    unpin: Option<fn(CpuId, CpuPinReason)>,
     _not_send_sync: PhantomData<*mut ()>,
+}
+
+/// Stable, low-cardinality reason attached to a platform CPU pin.
+///
+/// Platforms may use this value for bounded diagnostics. It is deliberately
+/// semantic rather than caller-address based so observation does not require
+/// stack walking or serial output on the pin/unpin hot path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CpuPinReason {
+    Unclassified = 0,
+    EpochGuard = 1,
+    EpochBorrow = 2,
+    EpochRetire = 3,
+    EpochDrain = 4,
+    ZoneBucketPop = 5,
+    ZoneBucketMerge = 6,
+    ZoneBucketFlush = 7,
 }
 
 impl CpuPinGuard {
     pub const fn new(cpu_id: CpuId) -> Self {
         Self {
             cpu_id,
+            reason: CpuPinReason::Unclassified,
             unpin: None,
             _not_send_sync: PhantomData,
         }
@@ -92,23 +112,43 @@ impl CpuPinGuard {
     /// Construct a platform-backed CPU pin. The platform must have already
     /// entered its non-migratable section. `unpin` leaves that section when
     /// the guard drops.
-    pub const fn with_unpin(cpu_id: CpuId, unpin: fn(CpuId)) -> Self {
+    pub const fn with_unpin(cpu_id: CpuId, unpin: fn(CpuId, CpuPinReason)) -> Self {
+        Self::with_reasoned_unpin(cpu_id, CpuPinReason::Unclassified, unpin)
+    }
+
+    /// Construct a platform-backed CPU pin with a bounded diagnostic reason.
+    pub const fn with_reasoned_unpin(
+        cpu_id: CpuId,
+        reason: CpuPinReason,
+        unpin: fn(CpuId, CpuPinReason),
+    ) -> Self {
         Self {
             cpu_id,
+            reason,
             unpin: Some(unpin),
             _not_send_sync: PhantomData,
         }
     }
 
+    /// Attach a diagnostic reason while preserving ownership of this guard.
+    pub const fn with_reason(mut self, reason: CpuPinReason) -> Self {
+        self.reason = reason;
+        self
+    }
+
     pub const fn cpu_id(&self) -> CpuId {
         self.cpu_id
+    }
+
+    pub const fn reason(&self) -> CpuPinReason {
+        self.reason
     }
 }
 
 impl Drop for CpuPinGuard {
     fn drop(&mut self) {
         if let Some(unpin) = self.unpin {
-            unpin(self.cpu_id);
+            unpin(self.cpu_id, self.reason);
         }
     }
 }
@@ -1537,6 +1577,13 @@ pub trait PercpuIf {
 
     fn pin_current_cpu() -> CpuPinGuard {
         CpuPinGuard::new(Self::current_cpu_id())
+    }
+
+    /// Pin the current CPU and attach a bounded semantic reason for platform
+    /// diagnostics. Platforms that need the reason at acquisition time may
+    /// override this method; existing platform pins inherit it automatically.
+    fn pin_current_cpu_for(reason: CpuPinReason) -> CpuPinGuard {
+        Self::pin_current_cpu().with_reason(reason)
     }
 
     /// Current nesting depth of platform CPU pins.

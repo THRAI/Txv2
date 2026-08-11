@@ -28,12 +28,19 @@
     "DWMAC3 Address0 must be written high word before low word so the 3.70a perfect filter latches the unicast MAC. Before that change broadcast RX and TX/ARP worked but unicast ingress did not; after it, a clean kernel at 192.168.1.27 answered 5 of 5 host pings with zero loss and approximately 1.5 ms steady-state RTT.",
     "The accepted DWMAC3 level-IRQ path masks RIE while the delegate drains RX, acknowledges every CSR5 low-17 W1C cause, enables only normal completion IRQs, masks unsupported MAC/MMC sources, and re-enables RIE only after an empty descriptor probe. The generic delegate re-kicks POLL whenever its 32-event RX budget is exhausted, so a finite burst cannot leave the device permanently masked.",
     "UART TX now has a 2K1000 port-level owner and bounded THRE recovery shared by normal, early, and diagnostic output. RX pending chunks are drained by one boot-hart ingest owner in FIFO order, so polling cannot overtake an IRQ-buffered chunk.",
-    "The current checkpoint is 335321ef. The relevant follow-ups are 9c961237 (bus TLB progress), 275ced59 (bounded network delegate polling), b71e7b6e (TTY echo transport), 9f3d9123 (zone contention progress), d3d003a7 (2K1000 UART serialization), d9810c20 (resumable thread exit), 24a5826d (DWMAC3 IRQ recovery), e3c63602 (IRQ-safe UART polling), b87ee76d (RX-budget liveness), and 335321ef (deferred contended UART level IRQs). The original LA QEMU generation shootdown protocol remains unchanged and passes fresh four-vCPU witnesses.",
+    "The current checkpoint is 3a757495; compared with execution baseline 335321ef it only adds progress/handoff records. The relevant execution follow-ups remain 9c961237 (bus TLB progress), 275ced59 (bounded network delegate polling), b71e7b6e (TTY echo transport), 9f3d9123 (zone contention progress), d3d003a7 (2K1000 UART serialization), d9810c20 (resumable thread exit), 24a5826d (DWMAC3 IRQ recovery), e3c63602 (IRQ-safe UART polling), b87ee76d (RX-budget liveness), and 335321ef (deferred contended UART level IRQs). The original LA QEMU generation shootdown protocol remains unchanged and passes fresh four-vCPU witnesses.",
     "Stage 6 is complete on real hardware for the current boot: eth1 is 192.168.1.20/24 with default gateway 192.168.1.2; host and public ICMP pass; DNS 10.248.98.30 resolves github.com; UTC was set from the trusted host; /etc/ssl/cert.pem is present; HTTPS certificate validation remained enabled.",
-    "Stage 7 is not complete. git -h/help and /proj init/add/commit/log pass. A full non-shallow clone of https://github.com/LLLPPPS/tx-push-test.git has completed 7818 objects, 4137 deltas, and 17.47 MiB with TLS verification enabled, but the latest manual run panicked on the next interactive command before the post-clone shallow/log/echo checks could establish a stable result.",
+    "Stage 7 full-clone/post-clone acceptance is complete on the repaired image. In one standard-root tmpfs boot, the live-corrected HTTPS clone of https://github.com/LLLPPPS/tx-push-test.git completed 7818 objects, 4137 deltas, and 17.47 MiB with TLS verification enabled. The repository is non-shallow at HEAD 0c8e312f82c34335d78073334c40c253c70df23c; no-pager log, file write/readback, dirty status, ordinary shell, and an eight-second idle/recovery check passed without panic.",
     "The latest manual image was built from checkpoint 335321ef and copied to TFTP with matching source/deployed SHA-256: kernel c079f4250c228251ccdf73db041e8ec1fc50b8dc264a6e106d91f18e8f73c9aa and initrd fa32cf5f71839178f39755317f748146a1f5189a5ddd1759a94528e6bbfe0df8. Legacy uImage timestamps explain why these hashes differ from earlier builds.",
-    "The current hard blocker is a real-board panic immediately after the successful manual clone: boards/tx-hal-loongarch64-2k1000/src/platform_impls.rs:713 reports LA64 CPU pin nesting underflow. Do not suppress the assertion; first prove whether CpuPinGuard ownership, zone staging from 9f3d9123, CPU migration, or an independent overwrite caused an unpin to observe depth zero.",
-    "A separate liveness witness remains: one clone stopped near 64 percent while host ping stopped, but Ctrl-C immediately restored the shell and host ping 5/5 without DWMAC reset. Treat this as task-context service starvation; current read-only audits identify file-I/O run-forever polling and kernel/non-userspace SelfYield fairness as the next host-test boundaries, not as a reason to reopen verified hardware discovery.",
+    "A bounded direct-root rerun reproduced the failure without a full clone: tx.root=sda, init=/bin/sh, and tx.mount.sdcard=0 reached Alpine with no /musl mount; LAN, DNS, trusted UTC, CA, and TLS-verified git ls-remote passed; the immediately following ls -la /proj emitted bootinfo:cmdline-invalid-utf8, then serial and host ping stopped and Ctrl-C did not recover. Direct-root ext4 write attempts separately return Invalid argument or writeback Truncated, so the next full-clone workspace still needs a non-/musl writable-root arrangement.",
+    "The 2026-08-10 host audit found no safe-Rust double-drop path: epoch and zone scopes are balanced, the dev-image same-CPU assertion would have fired before the observed underflow, and the 2K platform depth has no runtime reset/store. A diagnostic change now classifies epoch guard/borrow/retire/drain and zone bucket pop/merge/flush, writes a 32-word atomic ring on pin/unpin, and uses a checked decrement that leaves zero unchanged before preserving the panic. The ring is linked in .data so the existing CPU-pin-depth BSS neighbours remain adjacent.",
+    "The new witness and ELF layout identify one common cause for cmdline-invalid-utf8 and CPU-pin underflow: CPU0 never switches off its downward-growing 64 KiB boot stack, user traps only borrow a separate 16 KiB trap stack and restore the boot-stack SP, and the BSS tail is only 0xb60 below stack bottom. The overwrite order reaches boot-fact STATE/CMDLINE and CPU-pin depth at total depths near 68-73 KiB. This matches the earlier 2K ext4 66,448-byte-frame BSS overwrite incident and removes safe-Rust double-drop as the leading explanation.",
+    "The evidence-backed repair expands both BSP and AP runtime stacks to 128 KiB, inserts a 4 KiB lower guard under each, fills both stack/guard ranges with a canary before Rust entry, and checks the guard plus atomic minimum SP at every user-entry with threshold-only serial output. Boot-fact STATE now uses nonzero lifecycle values in .data so zero reports corruption instead of silently republishing from damaged firmware bytes. Host regressions lock exact nested 0->1->2->1->0 pin accounting, stack range classification, linker stack/guard sizes, and nonzero boot-state values. The 2K HAL suite is 29/29, substrate AP is 9/9, the 2K full-build and LA four-vCPU QEMU sentinel pass, and __kernel_end 0x987a2000 remains 0x5e000 below initrd transport.",
+    "The guarded-stack image passed two direct-root real-board boots with tx.mount.sdcard=0 and no /musl shim. CPU0 and CPU1 minimum-stack reports left 0x1ace0 (109792 bytes) and 0x1b700 (112384 bytes). The formerly destructive git ls-remote then ls -la /proj sequence returned normally, subsequent shell and host ping remained usable, and the latest boot boundary contains no CPU-pin underflow, stack-guard/canary failure, cmdline/state corruption, or panic. This closes the original underflow as a 64 KiB BSP runtime-stack overwrite rather than an epoch/zone ownership defect.",
+    "The sustained-load witness is narrower than a kernel hang: one HTTPS git ls-remote succeeded, the first request of a bounded ten-request loop then made no progress for about 60 seconds, Ctrl-C restored the shell immediately, and host ping returned 3/3 at about 1.735 ms average without a network reset. The serial log independently proves prompt recovery and no kernel invariant failure but has no timestamps or encoded Ctrl-C byte.",
+    "Host red-to-green regressions now close both identified service-fairness gaps. The file-I/O service yields after every ready turn so a latched self-kick cannot consume multiple turns in one Future::poll; its task metadata is fair, pinned, non-kernel and non-userspace. The scheduler now queues only fair non-userspace SelfYield at the preempted tail, so an already-runnable fair userspace peer runs next while normal wake and WakeHandoff behavior remain unchanged.",
+    "The deployed fairness image passed its real-board bounded-load witness. During a 90-second continuous host ping, 90 packets were sent and 89 received (1.111% loss, RTT min/avg/max 1.453/1.623/1.839 ms); three background and one foreground TLS-verified git ls-remote commands all returned HEAD 0c8e312f..., the shell and network remained usable, and the boot boundary has no pin, stack, cmdline/state, or panic report.",
+    "The standard-root initramfs uses Alpine's normal /lib and /usr/lib dynamic Git/TLS closure, sets HOME=/root, and never creates or mounts /musl. Its first automated boot exposed two harness defects: the baked resolver used the gateway instead of DNS 10.248.98.30, and a failed partial clone could still print POSTCLONE ok. The script now writes the correct resolver, gates POSTCLONE on this invocation's successful clone, fail-fast chains every check, and disables the Git pager. The corrected raw CPIO is 18300416 bytes with SHA-256 125f45352f5f6179f87011c81fc98b5f0c14fd570ed010ef8dda3c1f517d2c26; the ramdisk uImage is 18300480 bytes with SHA-256 6a2acabff627775cf55b304d6898db57663116c0ceccd2e23e20d8d3c3051ea6 and matches /srv/tftp/txv2 byte-for-byte. Its payload range is 0x98800040..0x99973e40, size 0x1173e00. No additional reset is required because the same live corrections already closed the real-board semantics.",
     "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
   ],
   "changed_files": [
@@ -147,11 +154,55 @@
     },
     {
       "path": "crates/tx-substrate/src/zone",
-      "reason": "Commit 9f3d9123 changed per-CPU bucket staging and central-lock IRQ/TLB-progress behavior. It is the first audit boundary for the observed real-board CPU-pin underflow, but is not yet proven to be the root cause."
+      "reason": "Commit 9f3d9123 changed per-CPU bucket staging and central-lock IRQ/TLB-progress behavior. Its safe-Rust pin scopes audited as balanced; the current diagnostic labels bucket pop/merge/flush without changing the staging algorithm."
     },
     {
       "path": "boards/tx-hal-loongarch64-2k1000/src/platform_impls.rs",
-      "reason": "Lines 695-713 implement the LA64 CPU pin depth increment and CpuPinGuard unpin assertion that failed immediately after the successful manual full clone."
+      "reason": "Implements classified low-disturbance pin events, a 32-word failure ring, same-CPU enforcement, and checked decrement while preserving the underflow panic."
+    },
+    {
+      "path": "crates/tx-hal/src/lib.rs",
+      "reason": "Adds stable CpuPinReason metadata while preserving CpuPinGuard RAII ownership and !Send/!Sync behavior."
+    },
+    {
+      "path": "crates/tx-substrate/tests/ap_init.rs",
+      "reason": "Locks nested/non-LIFO CPU-pin balance and zero depth at every host poll boundary."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-2k1000/linker-la64-2k1000.ld",
+      "reason": "Expands the long-lived BSP/AP reactor stacks to 128 KiB and places a 4 KiB canary guard below each while retaining the initrd-overlap assertion."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-2k1000/src/boot_asm.rs",
+      "reason": "Fills both runtime stack and guard ranges with the diagnostic canary before entering Rust."
+    },
+    {
+      "path": "boards/tx-hal-loongarch64-2k1000/src/boot_facts.rs",
+      "reason": "Moves boot-fact lifecycle state to nonzero .data values and reports corruption instead of silently republishing from a damaged command line."
+    },
+    {
+      "path": "crates/tx-subsystems/src/device.rs",
+      "reason": "Creates a cooperative poll boundary after every ready file-I/O service turn so a latched self-kick cannot consume multiple backlog turns in one Future::poll."
+    },
+    {
+      "path": "crates/tx-subsystems/src/page_backed/core_tests.rs",
+      "reason": "Locks the file-I/O poll boundary with a two-turn backlog regression that was red when the first poll completed both turns."
+    },
+    {
+      "path": "crates/tx-kernel/src/init.rs",
+      "reason": "Submits the file-I/O service as pinned fair non-userspace work instead of strict kernel-lane work."
+    },
+    {
+      "path": "crates/tx-kernel/src/init/tests.rs",
+      "reason": "Verifies the file-I/O service is fair, pinned, non-kernel, non-userspace, and enters the New rather than Kernel queue."
+    },
+    {
+      "path": "crates/tx-reactor/src/scheduler.rs",
+      "reason": "Rotates fair non-userspace SelfYield work to the preempted tail while preserving normal-wake and WakeHandoff priority."
+    },
+    {
+      "path": "crates/tx-reactor/tests/reactor_smoke.rs",
+      "reason": "Reproduces service-to-service unfairness and locks the repaired service-to-userspace-peer scheduling order."
     }
   ],
   "verification": [
@@ -356,6 +407,61 @@
       "notes": "Fresh final-code regressions observed the LA four-vCPU boot sentinel and the RV four-vCPU boot plus owner-wake SMP sentinels. The xtask busybox-boot test lane rejects la64-qemu by design, so LA used full-build followed by qemu --expect-sentinel."
     },
     {
+      "command": "cargo test -p tx-substrate --test ap_init; cargo test -p tx-hal-loongarch64-2k1000 --lib",
+      "status": "passed",
+      "notes": "The diagnostic-image host boundary passes 9/9 substrate AP tests and 26/26 2K HAL tests. New witnesses cover exact nested 0->1->2->1->0 accounting, non-LIFO drop, zero depth after Pending/Ready poll boundaries, !Send/!Sync ownership, zone reason propagation, and stable trace encoding."
+    },
+    {
+      "command": "cargo xtask full-build --target la64-2k1000 --skip-doctor; cargo xtask full-build --target la64-qemu --skip-doctor; cargo xtask qemu --target la64-qemu --profile busybox --expect-sentinel --timeout-ms 60000 --smp 4; cargo xtask test busybox-boot --target rv64-qemu --timeout-ms 60000",
+      "status": "passed",
+      "notes": "The classified CPU-pin API builds for the physical target and both QEMU architectures. LA reached the four-vCPU boot sentinel; RV reached boot plus owner-wake SMP sentinels. The diagnostic ring is in ELF .data while the CPU-pin depth retains its original BSS-neighbour pattern."
+    },
+    {
+      "command": "sha256sum target/images/txv2-la2k1000.uimage target/images/txv2-la2k1000-initrd.uimage",
+      "status": "passed",
+      "notes": "The diagnostic artifacts are kernel bfe3ebf6eb47bebab7e87e684c20a6397f6db9d211bf475a12058992af92678f and initrd d91380c3e4fe6c80e9d0c0d01349c2d53baf0c33fead723af95c015f0783363d. Source and /srv/tftp/txv2 copies match for both files."
+    },
+    {
+      "command": "cargo test -p tx-hal-loongarch64-2k1000 --lib; cargo test -p tx-substrate --test ap_init; cargo xtask full-build --target la64-2k1000 --skip-doctor; cargo xtask full-build --target la64-qemu --skip-doctor; cargo xtask qemu --target la64-qemu --profile busybox --expect-sentinel --timeout-ms 30000 --smp 4 --no-block",
+      "status": "passed",
+      "notes": "The guarded-runtime-stack repair passes 29/29 board HAL tests and 9/9 substrate AP/pin tests. The physical target links with BSP/AP 128 KiB stacks, 4 KiB guards, __kernel_end 0x987a2000, and 0x5e000 remaining before initrd transport. The LA QEMU SMP4 boot sentinel remains green."
+    },
+    {
+      "command": "sha256sum target/images/txv2-la2k1000.uimage target/images/txv2-la2k1000-initrd.uimage /srv/tftp/txv2/txv2-la2k1000.uimage /srv/tftp/txv2/txv2-la2k1000-initrd.uimage",
+      "status": "passed",
+      "notes": "The guarded-stack kernel 12ca3d9aec2841bfedab105fed6627250ef656945cdb93c1cf6b13d257c130c8 and initrd 4b8c6db422042a110df53f59c99bc69e5a8f15b7c16013d8e36875d02cd629bb match their TFTP deployments byte-for-byte."
+    },
+    {
+      "command": "real 2K1000 direct-root guarded image: git ls-remote; ls -la /proj; bounded repeated HTTPS probe; Ctrl-C; host ping -c 3",
+      "status": "passed",
+      "notes": "The old cmdline-corruption trigger returned normally. Both harts retained more than 109 KiB stack, and the latest boot has no CPU-pin, guard, cmdline/state, or panic report. One HTTPS request passed; the repeated loop stalled before its first progress marker, but Ctrl-C immediately restored the shell and host ping returned 3/3 at about 1.735 ms average, separating the request stall from a whole-kernel starvation or pin failure."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib file_page_io_service_; cargo test -p tx-kernel --lib file_io_runtime_task_submission_is_pinned_fair_work; cargo test -p tx-reactor --test reactor_smoke fair_pinned_self_yield_rotates_to_runnable_userspace_peer -- --exact",
+      "status": "passed",
+      "notes": "The focused fairness results are 4/4, 1/1 and 1/1. Before the fixes, the file-I/O first poll returned Ready after consuming two turns, the metadata test observed kernel_only, and the scheduler selected service twice instead of rotating to the runnable peer."
+    },
+    {
+      "command": "cargo test -p tx-reactor --test scheduler; cargo test -p tx-reactor --test reactor_smoke -- --test-threads=1",
+      "status": "failed",
+      "notes": "The new SelfYield regression and related normal-wake/WakeHandoff cases pass. Existing signal-delivery promotion remains red at scheduler 43/44 and serial smoke 57/58; this path takes the boosted branch and does not execute the changed SelfYield placement condition. Parallel smoke also exposes pre-existing shared-global-state interference, which collapses to the one signal case under --test-threads=1."
+    },
+    {
+      "command": "cargo test -p tx-hal-loongarch64-2k1000 --lib; cargo test -p tx-substrate --test ap_init; cargo xtask full-build --target la64-2k1000 --skip-doctor; cargo xtask full-build --target la64-qemu --skip-doctor; cargo xtask qemu --target la64-qemu --profile busybox --expect-sentinel --timeout-ms 30000 --smp 4 --no-block",
+      "status": "passed",
+      "notes": "Final fairness code preserves the 29/29 board HAL and 9/9 substrate pin boundaries, builds both LoongArch targets, and reaches the LA QEMU SMP4 boot sentinel. cargo fmt --all -- --check and git diff --check also pass."
+    },
+    {
+      "command": "sha256sum target/images/txv2-la2k1000.uimage target/images/txv2-la2k1000-initrd.uimage /srv/tftp/txv2/txv2-la2k1000.uimage /srv/tftp/txv2/txv2-la2k1000-initrd.uimage",
+      "status": "passed",
+      "notes": "The fairness kernel cab1a8945816e1cf42101aaead9d0f1cc2afc2295868c2a8783e4b078dca340c and initrd 4174af52005b138a176818b1e1d6679c959b9d536938fffbe074ae2fa31d4227 match their TFTP deployments byte-for-byte."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Workspace build, tx-ext4 38/38 and tx-scripts 167/167 passed. The gate remains red on the current dirty-tree tx-shims dispatch set and two tx-kernel libctest chmod assertions; the first kernel failure is init::exec::tests::filtered_dynamic_only_libctest_case_does_not_run_missing_static_entry. Focused CPU-pin tests and all target builds pass."
+    },
+    {
       "command": "sha256sum target/images/txv2-la2k1000*.uimage /srv/tftp/txv2/txv2-la2k1000*.uimage",
       "status": "passed",
       "notes": "The manual-run kernel hash c079f4250c228251ccdf73db041e8ec1fc50b8dc264a6e106d91f18e8f73c9aa and initrd hash fa32cf5f71839178f39755317f748146a1f5189a5ddd1759a94528e6bbfe0df8 matched between the build tree and TFTP deployment."
@@ -369,28 +475,48 @@
       "command": "cargo xtask progress validate",
       "status": "failed",
       "notes": "Validation remains blocked by untouched docs/progress/plans/2026-07-24-network-time-integration.json using legacy step status completed instead of complete; the Stage 5 handoff parses successfully with jq."
+    },
+    {
+      "command": "real 2K1000 fairness image: 90-second continuous host ping; three background plus one foreground TLS-verified git ls-remote",
+      "status": "passed",
+      "notes": "Host ping sent 90 and received 89 packets (1.111% loss, RTT min/avg/max 1.453/1.623/1.839 ms). All four Git requests returned HEAD 0c8e312f..., the shell and network remained responsive, and the boot boundary contains no pin/stack/cmdline/state/panic report. This closes bounded service fairness on hardware while leaving full clone/post-clone acceptance open."
+    },
+    {
+      "command": "sh -n target/rootfs/alpine-minimal-la64-2k1000/root/board-git-verify.sh; cpio -itv < target/images/alpine-minimal-initramfs-la64-2k1000.cpio; tools/mkimage-loongarch -l target/images/txv2-la2k1000-alpine-min-initrd.uimage; compare uImage payload SHA-256 to raw CPIO",
+      "status": "passed",
+      "notes": "The corrected archive contains executable /usr/bin/git, git-remote-http plus the HTTPS link, the dynamic loader and complete libcurl dependency closure under standard /lib and /usr/lib paths, CA bundle, resolver, and the executable fail-fast board probe. Raw CPIO size is 18300416 bytes; uImage payload and CPIO both hash to 125f45352f5f6179f87011c81fc98b5f0c14fd570ed010ef8dda3c1f517d2c26. The complete image cannot use LA QEMU's unrelated fixed 8 MiB fw_cfg initrd buffer because the mandatory Git/TLS file data alone is about 15.67 MiB; no QEMU or TLB code was changed."
+    },
+    {
+      "command": "qemu-loongarch64 -L target/rootfs/alpine-minimal-la64-2k1000 target/rootfs/alpine-minimal-la64-2k1000/usr/bin/git --version/--exec-path/--list-cmds=builtins",
+      "status": "passed",
+      "notes": "The extracted dynamic Git executes in host LoongArch user mode as version 2.47.3, reports /usr/libexec/git-core, and exposes clone, fetch, fetch-pack, index-pack, unpack-objects, checkout, config, ls-remote, rev-parse and status as builtins. This validates the loader and shared-library closure without changing the 8 MiB LA QEMU boot transport."
+    },
+    {
+      "command": "real 2K1000 automated standard-root boot before harness correction",
+      "status": "failed",
+      "notes": "The image reached the writable tmpfs root with HOME=/root, standard library paths, CA, shell, both cores, and no /musl. The baked resolver incorrectly named gateway 192.168.1.2, so /proj clone failed DNS resolution; the partial .git then exposed a script bug that incorrectly printed POSTCLONE ok. This is a harness/configuration failure, not an automated acceptance pass or kernel failure."
+    },
+    {
+      "command": "real 2K1000 same boot after live resolver correction: full HTTPS clone to /proj3; rev-parse shallow/HEAD; no-pager log; write/readback; status; shell and idle; continuous host ping",
+      "status": "passed",
+      "notes": "After writing nameserver 10.248.98.30, DNS and GitHub ICMP passed. The clone completed 7818/7818 objects, 4137/4137 deltas, and 17.47 MiB. is-shallow-repository=false, HEAD is 0c8e312f82c34335d78073334c40c253c70df23c, no-pager log passed, TXVERIFY.txt was written and read back, status reported the untracked file, and shell progress survived an eight-second idle. Host ping was 543/543 with 0% loss and RTT min/avg/max/mdev 1.467/1.869/20.649/1.417 ms. Serial lines 1150 through 1288 contain no CPU-pin, stack-guard/canary, cmdline/state, or panic report."
+    },
+    {
+      "command": "rebuild corrected standard-root CPIO/uImage; compare payload; install to /srv/tftp/txv2; cmp source and deployed image",
+      "status": "passed",
+      "notes": "The corrected script writes DNS 10.248.98.30, enters POSTCLONE only after this invocation's successful clone, chains all post-clone checks, and uses --no-pager. The raw CPIO is 18300416 bytes at SHA-256 125f45352f5f6179f87011c81fc98b5f0c14fd570ed010ef8dda3c1f517d2c26. The 18300480-byte uImage is SHA-256 6a2acabff627775cf55b304d6898db57663116c0ceccd2e23e20d8d3c3051ea6 and matches the TFTP copy byte-for-byte. The corrected wrapper was not rebooted because its exact semantic corrections were already live-proven in the successful boot."
     }
   ],
   "next_actions": [
     {
       "id": "next-5",
-      "title": "Fix the post-clone LA64 CPU pin underflow before more scoring work",
+      "title": "Preserve the validated guarded 128 KiB runtime-stack boundary",
       "paths": [
         "boards/tx-hal-loongarch64-2k1000/src/platform_impls.rs",
         "crates/tx-hal/src/lib.rs",
         "crates/tx-substrate/src/zone"
       ],
-      "notes": "The latest manual clone completed, then the next command panicked at platform_impls.rs:713 because unpin observed depth zero. Add host coverage and low-volume pin/unpin evidence before another long board run. Do not suppress the assertion or assume commit 9f3d9123 is causal without proof."
-    },
-    {
-      "id": "next-6",
-      "title": "Close sustained service fairness and rerun post-clone stability",
-      "paths": [
-        "crates/tx-subsystems/src/device.rs",
-        "crates/tx-reactor/src/scheduler.rs",
-        "crates/tx-reactor/tests"
-      ],
-      "notes": "One clone stalled with ping starvation and recovered immediately after Ctrl-C. Add failing host tests for self-kicking file-I/O/kernel or non-userspace fair service work before changing poll boundaries or scheduler policy. Then rerun a full clone plus continuous host ping and post-clone shallow/log/echo commands."
+      "notes": "Two direct-root boots, the formerly destructive ls-remote then ls sequence, and the final standard-root full clone/post-clone boot pass with more than 109 KiB remaining on each hart and no pin/guard/cmdline/state failure. Do not reopen 9f3d9123 or the shared LA QEMU TLB repair. Keep the stack waterline, guard and pin ring through the remaining user push/pull witness."
     },
     {
       "id": "next-7",
@@ -398,7 +524,7 @@
       "paths": [
         "local-images/alpine-linux-loongarch64-ext4fs.img"
       ],
-      "notes": "Only after next-5 and next-6 pass on real hardware should the user create or reuse la-board-test, commit the README change, push with private credentials, edit README on GitHub, then pull and verify it on the board. Never expose the PAT."
+      "notes": "The kernel-owned clone/post-clone gate is complete. The user may now create or reuse la-board-test, commit the README change, push with private credentials, edit README on GitHub, then pull and verify it on the board. Never expose the PAT."
     },
     {
       "id": "next-8",
@@ -417,6 +543,7 @@
     "U-Boot and txKernel may program different IP and MAC values while taking turns controlling the same physical Ethernet hardware; U-Boot network state does not automatically carry into txKernel.",
     "The 2K1000 target has no implemented persistent RTC or authenticated network-time client. UTC and TLS are valid only after restoring time on each reboot; certificate verification must remain enabled.",
     "The Alpine sidecar boot uses a writable tmpfs root. /proj and /home clones disappear on reset; do not mistake a reboot for persistent Git storage.",
+    "The full standard-root Git/TLS initramfs is larger than LA QEMU's fixed 8 MiB fw_cfg initrd buffer. This is a QEMU transport limit, not a physical U-Boot limit; do not raise the QEMU capacity, change the LA QEMU TLB baseline, or delete mandatory dynamic libraries merely to make this physical-board witness boot in QEMU.",
     "A completed clone is not the final witness until ordinary post-clone shell and Git commands run without scheduling starvation or LA64 CPU-pin panic.",
     "Keep commands short: avoid unnecessary shell variables, if branches, printf scaffolding, generated helper scripts, and destructive cleanup commands.",
     "The verified LIOINTC setup owns the shared UART hwirq0 route. Stage 4 models AHCI hwirq19/public IRQ20 as level-high but deliberately leaves it masked because the accepted bootstrap transport is polling. Stage 5 routes GMAC1 hwirq14/public IRQ15 level-high and masks each deferred claim until device ACK and controller completion.",

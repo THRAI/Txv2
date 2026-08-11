@@ -289,7 +289,10 @@ fn physical_device_tx_does_not_consume_loopback_tcp_handshake_packets() {
         SocketOptionSet::default_tcp(),
     )
     .expect("listener");
-    assert_eq!(step_bind(&listener, inet(40_234), &guard), StepOutcome::Done(()));
+    assert_eq!(
+        step_bind(&listener, inet(40_234), &guard),
+        StepOutcome::Done(())
+    );
     assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
 
     let client = registry::create_socket_for_test_or_bootstrap(
@@ -297,7 +300,10 @@ fn physical_device_tx_does_not_consume_loopback_tcp_handshake_packets() {
         SocketOptionSet::default_tcp(),
     )
     .expect("client");
-    assert_eq!(step_bind(&client, inet(50_234), &guard), StepOutcome::Done(()));
+    assert_eq!(
+        step_bind(&client, inet(50_234), &guard),
+        StepOutcome::Done(())
+    );
     assert!(matches!(
         step_connect(&client, inet(40_234), &guard),
         StepOutcome::Yield { .. }

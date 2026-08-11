@@ -493,9 +493,9 @@ impl ExecError {
     fn from_vdso_map_error(error: VmMapError) -> Self {
         match error {
             VmMapError::WouldBlock => Self::Retry,
-            VmMapError::NoFreeRange
-            | VmMapError::Private(_)
-            | VmMapError::PageAlloc(_) => Self::OutOfMemory,
+            VmMapError::NoFreeRange | VmMapError::Private(_) | VmMapError::PageAlloc(_) => {
+                Self::OutOfMemory
+            }
             VmMapError::Pmap(_) => Self::IoError,
             VmMapError::AlreadyMapped
             | VmMapError::InvalidRange
@@ -1752,10 +1752,7 @@ fn open_executable_candidate(
     // Keeping the load on the mount selected by the namespace walk also
     // matters for bind mounts: ascending an arbitrary dentry parent chain can
     // select the wrong filesystem after a concurrent namespace operation.
-    let mount_payload = opened
-        .mount
-        .payload_cap()
-        .map_err(|_| ExecError::Retry)?;
+    let mount_payload = opened.mount.payload_cap().map_err(|_| ExecError::Retry)?;
     let meta = match mount_payload
         .fs_ops()
         .load_inode_meta(file.rnode().fs_object_id(), &guard)

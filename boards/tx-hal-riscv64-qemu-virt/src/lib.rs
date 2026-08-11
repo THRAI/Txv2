@@ -32,6 +32,7 @@ use boot_static::{
 };
 use dtb::parse_boot_info_from_fdt;
 use pmap::topology as pmap_topology;
+use tx_hal::CpuPinReason;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
@@ -856,7 +857,7 @@ impl PercpuIf for Platform {
     }
 }
 
-fn rv64_unpin_cpu(cpu: CpuId) {
+fn rv64_unpin_cpu(cpu: CpuId, _reason: CpuPinReason) {
     debug_assert_eq!(cpu, current_cpu_id());
     let previous = current_percpu_area()
         .expect("RV64 per-CPU area must exist while dropping CPU pin")

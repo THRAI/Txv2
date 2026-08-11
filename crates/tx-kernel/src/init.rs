@@ -1029,7 +1029,8 @@ impl<P: TxPlatform> CoreInit<P> {
     {
         let config = Self::file_io_service_task_config();
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-        let meta = tx_reactor::InitialSchedMeta::kernel()
+        let meta = tx_reactor::InitialSchedMeta::fair()
+            .pinned()
             .with_affinity(tx_hal::CpuMask::single(current_cpu).bits());
         submit(runtime, config, meta)
     }

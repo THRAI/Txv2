@@ -51,13 +51,19 @@ SECTIONS
     }
 
     .bss.stack (NOLOAD) : AT(ADDR(.bss.stack) - KERNEL_LINK_OFFSET) ALIGN(4K) {
+        __tx_boot_stack_guard_bottom = .;
+        . += 4K;
+        __tx_boot_stack_guard_top = .;
         __tx_boot_stack_bottom = .;
-        . += 64K;
+        . += 128K;
         . = ALIGN(16);
         __tx_boot_stack_top = .;
 
+        __tx_ap_boot_stack_guard_bottom = .;
+        . += 4K;
+        __tx_ap_boot_stack_guard_top = .;
         __tx_ap_boot_stack_bottom = .;
-        . += 64K;
+        . += 128K;
         . = ALIGN(16);
         __tx_ap_boot_stack_top = .;
     }

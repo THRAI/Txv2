@@ -18,11 +18,140 @@ unsafe extern "C" {
         pgdh: usize,
         switch_required: usize,
     );
+    static __tx_boot_stack_guard_bottom: u8;
+    static __tx_boot_stack_guard_top: u8;
+    static __tx_boot_stack_bottom: u8;
+    static __tx_boot_stack_top: u8;
+    static __tx_ap_boot_stack_guard_bottom: u8;
+    static __tx_ap_boot_stack_guard_top: u8;
+    static __tx_ap_boot_stack_bottom: u8;
+    static __tx_ap_boot_stack_top: u8;
 }
 
 #[cfg(target_arch = "loongarch64")]
 static LA64_USER_ENTRY_PROBE_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+const LA64_RUNTIME_STACK_CANARY: usize = 0x6b65_726e_656c_7374;
+#[cfg(target_arch = "loongarch64")]
+const LA64_RUNTIME_STACK_REPORT_GRANULE: usize = 16 * 1024;
+
+// Keep the stack diagnostics away from the BSS tail that a downward-growing
+// runtime stack would reach first. A nonzero initializer plus an explicit data
+// section also keeps a short overwrite from erasing the evidence before it is
+// reported.
+#[cfg(target_arch = "loongarch64")]
+#[link_section = ".data.tx_runtime_stack_diag"]
+static LA64_RUNTIME_STACK_MIN_SP: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; LA64_MAX_BOOT_CPUS];
+#[cfg(target_arch = "loongarch64")]
+#[link_section = ".data.tx_runtime_stack_diag"]
+static LA64_RUNTIME_STACK_REPORTED_BUCKET: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; LA64_MAX_BOOT_CPUS];
+
+#[cfg(target_arch = "loongarch64")]
+#[derive(Clone, Copy)]
+struct La64RuntimeStackLayout {
+    guard_bottom: usize,
+    guard_top: usize,
+    stack_bottom: usize,
+    stack_top: usize,
+}
+
+const fn la64_runtime_stack_remaining(
+    stack_bottom: usize,
+    stack_top: usize,
+    sp: usize,
+) -> Option<usize> {
+    if sp < stack_bottom || sp > stack_top {
+        None
+    } else {
+        Some(sp - stack_bottom)
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn la64_runtime_stack_layout(cpu: CpuId) -> La64RuntimeStackLayout {
+    if cpu.0 == 0 {
+        La64RuntimeStackLayout {
+            guard_bottom: (&raw const __tx_boot_stack_guard_bottom) as usize,
+            guard_top: (&raw const __tx_boot_stack_guard_top) as usize,
+            stack_bottom: (&raw const __tx_boot_stack_bottom) as usize,
+            stack_top: (&raw const __tx_boot_stack_top) as usize,
+        }
+    } else {
+        La64RuntimeStackLayout {
+            guard_bottom: (&raw const __tx_ap_boot_stack_guard_bottom) as usize,
+            guard_top: (&raw const __tx_ap_boot_stack_guard_top) as usize,
+            stack_bottom: (&raw const __tx_ap_boot_stack_bottom) as usize,
+            stack_top: (&raw const __tx_ap_boot_stack_top) as usize,
+        }
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn la64_runtime_stack_guard_intact(layout: La64RuntimeStackLayout) -> bool {
+    let mut cursor = layout.guard_bottom;
+    while cursor < layout.guard_top {
+        if unsafe { core::ptr::read_volatile(cursor as *const usize) } != LA64_RUNTIME_STACK_CANARY
+        {
+            return false;
+        }
+        cursor += core::mem::size_of::<usize>();
+    }
+    true
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn trace_la64_runtime_stack(cpu: CpuId) -> usize {
+    let sp: usize;
+    unsafe {
+        core::arch::asm!(
+            "move {sp}, $sp",
+            sp = out(reg) sp,
+            options(nomem, nostack)
+        );
+    }
+
+    let layout = la64_runtime_stack_layout(cpu);
+    let remaining = la64_runtime_stack_remaining(layout.stack_bottom, layout.stack_top, sp);
+    let guard_intact = la64_runtime_stack_guard_intact(layout);
+    let previous_min = LA64_RUNTIME_STACK_MIN_SP[cpu.0].fetch_min(sp, Ordering::Relaxed);
+    let minimum_sp = core::cmp::min(previous_min, sp);
+    let minimum_remaining =
+        la64_runtime_stack_remaining(layout.stack_bottom, layout.stack_top, minimum_sp);
+
+    if !guard_intact || remaining.is_none() {
+        console_write_literal(b"txkernel:loongson-2k1000:runtime-stack-violation:cpu=0x");
+        console_write_hex(cpu.0);
+        console_write_literal(b":sp=0x");
+        console_write_hex(sp);
+        console_write_literal(b":bottom=0x");
+        console_write_hex(layout.stack_bottom);
+        console_write_literal(b":top=0x");
+        console_write_hex(layout.stack_top);
+        console_write_literal(b":guard-intact=0x");
+        console_write_hex(guard_intact as usize);
+        console_write_literal(b"\n");
+        panic!("LA64 runtime stack escaped its guarded range");
+    }
+
+    let minimum_remaining = minimum_remaining.expect("checked LA64 runtime stack range");
+    let bucket = minimum_remaining / LA64_RUNTIME_STACK_REPORT_GRANULE;
+    let previous_bucket =
+        LA64_RUNTIME_STACK_REPORTED_BUCKET[cpu.0].fetch_min(bucket, Ordering::Relaxed);
+    if previous_bucket == usize::MAX || (bucket < previous_bucket && bucket <= 2) {
+        console_write_literal(b"txkernel:loongson-2k1000:runtime-stack:cpu=0x");
+        console_write_hex(cpu.0);
+        console_write_literal(b":min-sp=0x");
+        console_write_hex(minimum_sp);
+        console_write_literal(b":remaining=0x");
+        console_write_hex(minimum_remaining);
+        console_write_literal(b"\n");
+    }
+
+    sp
+}
 
 pub(crate) unsafe fn la64_copy_from_user_raw(
     _dst: *mut u8,
@@ -330,6 +459,10 @@ impl TrapIf for Platform {
     }
 
     fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
+        #[cfg(target_arch = "loongarch64")]
+        let cpu = <Platform as SmpIf>::current_cpu_id();
+        #[cfg(target_arch = "loongarch64")]
+        let kernel_sp = trace_la64_runtime_stack(cpu);
         assert_eq!(
             <Platform as PercpuIf>::cpu_pin_depth(),
             0,
@@ -337,13 +470,12 @@ impl TrapIf for Platform {
         );
         #[cfg(target_arch = "loongarch64")]
         unsafe {
-            let cpu = <Platform as SmpIf>::current_cpu_id();
             let frame = la64_entry_trap_frame_ptr_for_cpu(cpu);
             (*frame).restore_user_context(ctx);
             let pmap_switch = prepare_la64_pmap_switch(root).expect("LA64 user pmap switch");
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
-            trace_la64_user_entry_probe(cpu, ctx, &*frame, &pmap_switch, stack_top);
+            trace_la64_user_entry_probe(cpu, ctx, &*frame, &pmap_switch, stack_top, kernel_sp);
             tx_la64_activate_enter_userspace(
                 resume_ctx,
                 frame,
@@ -376,6 +508,7 @@ fn trace_la64_user_entry_probe(
     frame: &La64TrapFrame,
     pmap_switch: &La64PmapSwitch,
     stack_top: usize,
+    kernel_sp: usize,
 ) {
     let pc_is_user = (ctx.pc < LA64_USER_TOP) as usize;
     let frame_pc_is_user = (frame.era < LA64_USER_TOP) as usize;
@@ -421,6 +554,8 @@ fn trace_la64_user_entry_probe(
     console_write_hex(pmap_switch.switch_required as usize);
     console_write_literal(b":trap_stack=0x");
     console_write_hex(stack_top);
+    console_write_literal(b":kernel_sp=0x");
+    console_write_hex(kernel_sp);
     console_write_literal(b"\n");
 }
 impl SignalFrameIf for Platform {
@@ -675,6 +810,89 @@ impl DeadlineTimerIf for Platform {
 
 impl PersistentClockIf for Platform {}
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum La64CpuPinTraceKind {
+    Pin = 0,
+    Unpin = 1,
+    Underflow = 2,
+    CpuMismatch = 3,
+}
+
+const fn encode_la64_cpu_pin_trace_event(
+    sequence: u64,
+    kind: La64CpuPinTraceKind,
+    reason: CpuPinReason,
+    captured_cpu: CpuId,
+    current_cpu: CpuId,
+    before: usize,
+    after: usize,
+) -> u64 {
+    (1u64 << 63)
+        | (sequence & 0xffff)
+        | ((kind as u64 & 0x3) << 16)
+        | ((reason as u64 & 0xf) << 18)
+        | ((captured_cpu.0 as u64 & 0xf) << 22)
+        | ((current_cpu.0 as u64 & 0xf) << 26)
+        | ((before as u64 & 0xffff) << 30)
+        | ((after as u64 & 0xffff) << 46)
+}
+
+fn record_la64_cpu_pin_trace_event(
+    kind: La64CpuPinTraceKind,
+    reason: CpuPinReason,
+    captured_cpu: CpuId,
+    current_cpu: CpuId,
+    before: usize,
+    after: usize,
+) {
+    let sequence = LA64_CPU_PIN_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let event = encode_la64_cpu_pin_trace_event(
+        sequence,
+        kind,
+        reason,
+        captured_cpu,
+        current_cpu,
+        before,
+        after,
+    );
+    LA64_CPU_PIN_TRACE_EVENTS[sequence as usize % LA64_CPU_PIN_TRACE_CAPACITY]
+        .store(event, Ordering::Release);
+}
+
+fn dump_la64_cpu_pin_trace(kind: &[u8], captured_cpu: CpuId, current_cpu: CpuId, depth: usize) {
+    #[cfg(target_arch = "loongarch64")]
+    let _ = trace_la64_runtime_stack(current_cpu);
+
+    let next = LA64_CPU_PIN_TRACE_SEQUENCE.load(Ordering::Acquire);
+    let count = core::cmp::min(next as usize, LA64_CPU_PIN_TRACE_CAPACITY);
+    let start = next.saturating_sub(count as u64);
+
+    console_write_literal(b"txkernel:loongson-2k1000:cpu-pin-violation:kind=");
+    console_write_literal(kind);
+    console_write_literal(b":captured=0x");
+    console_write_hex(captured_cpu.0);
+    console_write_literal(b":current=0x");
+    console_write_hex(current_cpu.0);
+    console_write_literal(b":depth=0x");
+    console_write_hex(depth);
+    console_write_literal(b":trace-next=0x");
+    console_write_hex(next as usize);
+    console_write_literal(b"\n");
+
+    let mut sequence = start;
+    while sequence < next {
+        let event = LA64_CPU_PIN_TRACE_EVENTS[sequence as usize % LA64_CPU_PIN_TRACE_CAPACITY]
+            .load(Ordering::Acquire);
+        console_write_literal(b"txkernel:loongson-2k1000:cpu-pin-trace:seq=0x");
+        console_write_hex(sequence as usize);
+        console_write_literal(b":word=0x");
+        console_write_hex(event as usize);
+        console_write_literal(b"\n");
+        sequence += 1;
+    }
+}
+
 impl PercpuIf for Platform {
     fn current_cpu_id() -> CpuId {
         la64_current_cpu_id()
@@ -693,9 +911,25 @@ impl PercpuIf for Platform {
     }
 
     fn pin_current_cpu() -> CpuPinGuard {
+        Self::pin_current_cpu_for(CpuPinReason::Unclassified)
+    }
+
+    fn pin_current_cpu_for(reason: CpuPinReason) -> CpuPinGuard {
         let cpu = la64_current_cpu_id();
-        LA64_CPU_PIN_DEPTHS[cpu.0].fetch_add(1, Ordering::Relaxed);
-        CpuPinGuard::with_unpin(cpu, la64_unpin_cpu)
+        let before = LA64_CPU_PIN_DEPTHS[cpu.0]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                depth.checked_add(1)
+            })
+            .expect("LA64 CPU pin nesting overflow");
+        record_la64_cpu_pin_trace_event(
+            La64CpuPinTraceKind::Pin,
+            reason,
+            cpu,
+            cpu,
+            before,
+            before + 1,
+        );
+        CpuPinGuard::with_reasoned_unpin(cpu, reason, la64_unpin_cpu)
     }
 
     fn cpu_pin_depth() -> usize {
@@ -707,10 +941,46 @@ impl PercpuIf for Platform {
     }
 }
 
-fn la64_unpin_cpu(cpu: CpuId) {
-    debug_assert_eq!(cpu, la64_current_cpu_id());
-    let previous = LA64_CPU_PIN_DEPTHS[cpu.0].fetch_sub(1, Ordering::Release);
-    assert!(previous != 0, "LA64 CPU pin nesting underflow");
+fn la64_unpin_cpu(cpu: CpuId, reason: CpuPinReason) {
+    let current_cpu = la64_current_cpu_id();
+    if cpu != current_cpu {
+        let depth = LA64_CPU_PIN_DEPTHS[cpu.0].load(Ordering::Relaxed);
+        record_la64_cpu_pin_trace_event(
+            La64CpuPinTraceKind::CpuMismatch,
+            reason,
+            cpu,
+            current_cpu,
+            depth,
+            depth,
+        );
+        dump_la64_cpu_pin_trace(b"cpu-mismatch", cpu, current_cpu, depth);
+        panic!("LA64 CPU pin dropped on a different CPU");
+    }
+
+    match LA64_CPU_PIN_DEPTHS[cpu.0].fetch_update(Ordering::Release, Ordering::Relaxed, |depth| {
+        depth.checked_sub(1)
+    }) {
+        Ok(before) => record_la64_cpu_pin_trace_event(
+            La64CpuPinTraceKind::Unpin,
+            reason,
+            cpu,
+            current_cpu,
+            before,
+            before - 1,
+        ),
+        Err(depth) => {
+            record_la64_cpu_pin_trace_event(
+                La64CpuPinTraceKind::Underflow,
+                reason,
+                cpu,
+                current_cpu,
+                depth,
+                depth,
+            );
+            dump_la64_cpu_pin_trace(b"underflow", cpu, current_cpu, depth);
+            panic!("LA64 CPU pin nesting underflow");
+        }
+    }
 }
 impl CacheIf for Platform {
     fn fence_all() {
@@ -884,3 +1154,55 @@ impl PowerIf for Platform {
 }
 
 impl EntropyIf for Platform {}
+
+#[cfg(test)]
+mod cpu_pin_trace_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_pin_trace_event_has_stable_decodable_fields() {
+        let event = encode_la64_cpu_pin_trace_event(
+            0x12345,
+            La64CpuPinTraceKind::Unpin,
+            CpuPinReason::ZoneBucketMerge,
+            CpuId(1),
+            CpuId(2),
+            0x2345,
+            0x1234,
+        );
+
+        assert_eq!(event & 0xffff, 0x2345);
+        assert_eq!((event >> 16) & 0x3, La64CpuPinTraceKind::Unpin as u64);
+        assert_eq!((event >> 18) & 0xf, CpuPinReason::ZoneBucketMerge as u64);
+        assert_eq!((event >> 22) & 0xf, 1);
+        assert_eq!((event >> 26) & 0xf, 2);
+        assert_eq!((event >> 30) & 0xffff, 0x2345);
+        assert_eq!((event >> 46) & 0xffff, 0x1234);
+        assert_ne!(event & (1u64 << 63), 0);
+    }
+
+    #[test]
+    fn runtime_stack_remaining_rejects_escape_and_counts_from_bottom() {
+        assert_eq!(
+            la64_runtime_stack_remaining(0x1000, 0x3000, 0x2800),
+            Some(0x1800)
+        );
+        assert_eq!(
+            la64_runtime_stack_remaining(0x1000, 0x3000, 0x1000),
+            Some(0)
+        );
+        assert_eq!(la64_runtime_stack_remaining(0x1000, 0x3000, 0x0ff8), None);
+        assert_eq!(la64_runtime_stack_remaining(0x1000, 0x3000, 0x3008), None);
+        assert_ne!(LA64_RUNTIME_STACK_CANARY, 0);
+    }
+
+    #[test]
+    fn linker_reserves_guarded_128k_runtime_stacks() {
+        let script = include_str!("../linker-la64-2k1000.ld");
+        assert_eq!(script.matches(". += 128K;").count(), 2);
+        assert_eq!(script.matches(". += 4K;").count(), 2);
+        assert!(script.contains("__tx_boot_stack_guard_bottom"));
+        assert!(script.contains("__tx_ap_boot_stack_guard_bottom"));
+        assert!(script.contains("INITRD_TRANSPORT_BASE"));
+    }
+}

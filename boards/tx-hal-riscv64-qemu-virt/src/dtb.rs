@@ -728,9 +728,9 @@ mod tests {
         PhysRange, PlatformInfoIf,
     };
 
-    use super::{DtbBootInfo, DtbDeviceClass, classify_compatible, parse_boot_info_from_fdt};
-    use crate::Platform;
+    use super::{classify_compatible, parse_boot_info_from_fdt, DtbBootInfo, DtbDeviceClass};
     use crate::boot_static::{BootStaticBag, IdentityLive};
+    use crate::Platform;
 
     #[test]
     fn classifies_visionfive2_vendor_eqos_as_dwmac() {
@@ -1076,10 +1076,9 @@ mod tests {
             .filter(|d| d.kind == tx_hal::DeviceKind::SdController)
             .collect();
         assert_eq!(sd.len(), 2);
-        assert!(
-            sd.iter()
-                .any(|d| d.mmio.start == PhysAddr(0x1602_0000) && d.irq == Some(75))
-        );
+        assert!(sd
+            .iter()
+            .any(|d| d.mmio.start == PhysAddr(0x1602_0000) && d.irq == Some(75)));
 
         // No virtio anywhere on real hardware.
         assert_eq!(

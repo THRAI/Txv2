@@ -3254,6 +3254,44 @@ fn phase1_scheduler_prioritizes_kernel_then_new_then_preempted() {
 }
 
 #[test]
+fn fair_pinned_self_yield_rotates_to_runnable_userspace_peer() {
+    let mut scheduler = Phase1Scheduler::new();
+    let hart = HartId(0);
+    let peer = TaskId(3);
+    let service = TaskId(4);
+
+    scheduler.task_submitted(
+        peer,
+        TaskHandle::new(peer),
+        InitialSchedMeta::fair().userspace_thread().pinned(),
+    );
+    assert_eq!(
+        scheduler.pick_next(hart).map(|(task, _)| task.id()),
+        Some(peer)
+    );
+    scheduler.task_stopped(peer, StopReason::Blocked, 0, hart);
+    scheduler.task_runnable(peer, WakeHint::Normal);
+
+    scheduler.task_submitted(
+        service,
+        TaskHandle::new(service),
+        InitialSchedMeta::fair().pinned(),
+    );
+    assert_eq!(
+        scheduler.pick_next(hart).map(|(task, _)| task.id()),
+        Some(service)
+    );
+    scheduler.task_stopped(service, StopReason::Blocked, 0, hart);
+    scheduler.task_runnable(service, WakeHint::SelfYield);
+
+    assert_eq!(
+        scheduler.pick_next(hart).map(|(task, _)| task.id()),
+        Some(peer),
+        "a fair self-yielding service must rotate behind an already-runnable fair peer"
+    );
+}
+
+#[test]
 fn phase1_scheduler_preserves_remaining_budget_after_blocked_wake() {
     let mut scheduler = Phase1Scheduler::new();
     let task = TaskId(7);

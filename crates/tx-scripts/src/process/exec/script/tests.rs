@@ -2719,8 +2719,7 @@ fn executable_permission_uses_live_inode_meta_after_cached_rnode_chmod() {
     let bytes = minimal_elf_bytes();
     let root_id = FsObjectId::new(2);
     let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
-    let file_id =
-        fs.add_regular_with_bytes_meta(root_id, b"minibuild", &bytes, 0o644, 0, 0);
+    let file_id = fs.add_regular_with_bytes_meta(root_id, b"minibuild", &bytes, 0o644, 0, 0);
     let namespace = MountNamespace::new_cap(mount.clone()).expect("mount namespace");
 
     // Keep the pre-chmod dentry/RNode alive, reproducing the VFS cache shape

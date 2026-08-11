@@ -49,8 +49,8 @@ pub mod boot_runtime {
     pub use tx_reactor::{
         ast, current_deadline_registrar, current_delegate_registry, current_task_mailbox,
         hart_loop, userspace, wait, yield_now, HartId, HartPollBudget, InitialSchedMeta,
-        Phase1QueueKind, Reactor, RescheduleSignal, SharedReactor, SliceClock, SubscriberId, TaskId,
-        TaskKey, TaskRunOwner, TaskStatus, WaitSource,
+        Phase1QueueKind, Reactor, RescheduleSignal, SharedReactor, SliceClock, SubscriberId,
+        TaskId, TaskKey, TaskRunOwner, TaskStatus, WaitSource,
     };
     pub use tx_services::time::TimerGuard;
     pub use tx_substrate::step::{

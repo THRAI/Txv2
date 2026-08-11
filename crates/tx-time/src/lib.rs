@@ -170,9 +170,9 @@ pub use driver::CurrentHartDeadlineTimer;
 pub use keeper::reset_for_test;
 pub use keeper::{
     install_monotonic_ns_source, install_realtime_timer_notifier, install_vvar_publish_hook,
-    realtime_now_ns_hooked, timekeeper, timekeeper_clock,
-    RealtimeSeedError, RealtimeTimerNotifier, RealtimeWritebackPolicy, Timekeeper, TimekeeperClock,
-    TimekeeperIf, VvarPublishHook, VvarSnapshot, WallClockError, DEFAULT_REALTIME_EPOCH_BASE_NS,
+    realtime_now_ns_hooked, timekeeper, timekeeper_clock, RealtimeSeedError, RealtimeTimerNotifier,
+    RealtimeWritebackPolicy, Timekeeper, TimekeeperClock, TimekeeperIf, VvarPublishHook,
+    VvarSnapshot, WallClockError, DEFAULT_REALTIME_EPOCH_BASE_NS,
 };
 pub use realtime::{RealtimeControl, RealtimeSetPolicy, RealtimeSetReport, VvarPublisher};
 pub use rtc::RtcDeviceOps;

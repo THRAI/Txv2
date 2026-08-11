@@ -1022,13 +1022,7 @@ fn external_udp_sendto_reaches_device_tx() {
 
     let dst = IpEndpoint::new(REMOTE_IP, 53);
     assert_eq!(
-        step_send_to_kernel_bytes(
-            &udp,
-            Some(dst),
-            b"",
-            SendRecvFlags::empty(),
-            &guard,
-        ),
+        step_send_to_kernel_bytes(&udp, Some(dst), b"", SendRecvFlags::empty(), &guard,),
         StepOutcome::Done(0),
         "an empty UDP payload must still enqueue one wire datagram"
     );

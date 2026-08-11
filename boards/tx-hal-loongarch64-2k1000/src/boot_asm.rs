@@ -64,6 +64,19 @@ tx_la2k1000_high_start:
     b       1b
 
 2:
+    // The BSP and AP keep using their linker-provided boot stacks as their
+    // long-lived reactor stacks. Fill both stacks and their lower guard pages
+    // before entering Rust so the runtime can detect downward growth before it
+    // reaches the tail of `.bss`.
+    la.local $t0, __tx_boot_stack_guard_bottom
+    la.local $t1, __tx_ap_boot_stack_top
+    li.d    $t2, 0x6b65726e656c7374
+.Ltx_la2k1000_fill_runtime_stacks:
+    bgeu    $t0, $t1, .Ltx_la2k1000_runtime_stacks_filled
+    st.d    $t2, $t0, 0
+    addi.d  $t0, $t0, 8
+    b       .Ltx_la2k1000_fill_runtime_stacks
+.Ltx_la2k1000_runtime_stacks_filled:
     // U-Boot may leave controller and timer admission state behind. Stage 2
     // starts with every external source masked and admits only the local timer
     // after the full kernel vector is installed.

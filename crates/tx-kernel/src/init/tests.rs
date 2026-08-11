@@ -481,7 +481,7 @@ fn boot_init_submits_registered_file_io_service_runtimes() {
 }
 
 #[test]
-fn file_io_runtime_task_submission_owns_one_runtime() {
+fn file_io_runtime_task_submission_is_pinned_fair_work() {
     let _serial = setup();
     let pc = tx_subsystems::page_backed::PageContainer::new_cap(
         tx_subsystems::page_backed::PageContainerKind::Anon {
@@ -495,15 +495,32 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
         tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
     );
     let mut submitted = 0;
+    let mut submitted_meta = None;
 
     assert!(CoreInit::<TestPlatform>::submit_file_io_runtime_task_with(
         runtime,
-        |_runtime, _config, _meta| {
+        |_runtime, _config, meta| {
             submitted += 1;
+            submitted_meta = Some(meta);
             true
         },
     ));
     assert_eq!(submitted, 1);
+
+    let meta = submitted_meta.expect("file I/O runtime scheduling metadata");
+    assert_eq!(meta.class, tx_reactor::SchedClass::Fair);
+    assert!(!meta.kernel_only);
+    assert!(!meta.userspace_thread);
+    assert_eq!(meta.migration, tx_reactor::MigrationPolicy::Pinned);
+    assert_eq!(meta.affinity, 0b1);
+
+    let mut scheduler = tx_reactor::Phase1Scheduler::new();
+    let task = tx_reactor::TaskId(0);
+    scheduler.task_submitted(task, tx_reactor::TaskHandle::new(task), meta);
+    let depths = scheduler.queue_depths(tx_reactor::HartId(0));
+    assert_eq!(depths.kernel, 0);
+    assert_eq!(depths.new, 1);
+    assert!(!scheduler.can_migrate(task));
 }
 
 #[test]

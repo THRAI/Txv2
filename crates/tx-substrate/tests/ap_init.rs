@@ -3,9 +3,10 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tx_hal::{
     Arch, AuxvIf, BootInfo, BootInfoIf, BootPlatformIf, BootProtocol, CacheIf, ConsoleIf, CpuId,
-    CpuMask, CpuPinGuard, DeadlineTimerIf, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion,
-    MonotonicCounterIf, ObserverIf, PercpuIf, PersistentClockIf, PhysRange, PlatformConfig,
-    PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TrapIf, VirtAddr,
+    CpuMask, CpuPinGuard, CpuPinReason, DeadlineTimerIf, DmaIf, EntropyIf, InitIf, IrqIf,
+    MemoryRegion, MonotonicCounterIf, ObserverIf, PercpuIf, PersistentClockIf, PhysRange,
+    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TrapIf,
+    VirtAddr,
 };
 use tx_substrate::zone::{Zone, ZoneAllocated};
 use tx_substrate::{epoch, zone};
@@ -20,6 +21,36 @@ static CPU_PIN_DEPTHS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 static LOCAL_EXCLUSION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PINS_WHILE_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
 static UNPINS_WHILE_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+const CPU_PIN_EVENT_CAPACITY: usize = 128;
+static CPU_PIN_EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CPU_PIN_EVENTS: [AtomicUsize; CPU_PIN_EVENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; CPU_PIN_EVENT_CAPACITY];
+
+static_assertions::assert_not_impl_any!(CpuPinGuard: Send, Sync);
+static_assertions::assert_not_impl_any!(epoch::Guard<'static>: Send, Sync);
+
+fn encode_cpu_pin_event(pin: bool, reason: CpuPinReason, before: usize, after: usize) -> usize {
+    usize::from(pin) | ((reason as usize) << 1) | ((before & 0xff) << 8) | ((after & 0xff) << 16)
+}
+
+fn record_cpu_pin_event(pin: bool, reason: CpuPinReason, before: usize, after: usize) {
+    let index = CPU_PIN_EVENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    if index < CPU_PIN_EVENT_CAPACITY {
+        CPU_PIN_EVENTS[index].store(
+            encode_cpu_pin_event(pin, reason, before, after),
+            Ordering::Release,
+        );
+    }
+}
+
+fn cpu_pin_events_contain_reason(reason: CpuPinReason) -> bool {
+    let count = CPU_PIN_EVENT_COUNT
+        .load(Ordering::Acquire)
+        .min(CPU_PIN_EVENT_CAPACITY);
+    CPU_PIN_EVENTS[..count]
+        .iter()
+        .any(|event| (event.load(Ordering::Acquire) >> 1) & 0x7f == reason as usize)
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct ApZoneObject(u64);
@@ -140,21 +171,27 @@ impl PercpuIf for TestPlatform {
     }
 
     fn pin_current_cpu() -> CpuPinGuard {
+        Self::pin_current_cpu_for(CpuPinReason::Unclassified)
+    }
+
+    fn pin_current_cpu_for(reason: CpuPinReason) -> CpuPinGuard {
         let cpu = CURRENT_CPU.load(Ordering::Acquire);
         if LOCAL_EXECUTION_DEPTHS[cpu].load(Ordering::Acquire) > 0 {
             PINS_WHILE_EXCLUDED.fetch_add(1, Ordering::AcqRel);
         }
-        CPU_PIN_DEPTHS[cpu].fetch_add(1, Ordering::AcqRel);
-        CpuPinGuard::with_unpin(CpuId(cpu), unpin_test_cpu)
+        let before = CPU_PIN_DEPTHS[cpu].fetch_add(1, Ordering::AcqRel);
+        record_cpu_pin_event(true, reason, before, before + 1);
+        CpuPinGuard::with_reasoned_unpin(CpuId(cpu), reason, unpin_test_cpu)
     }
 }
 
-fn unpin_test_cpu(cpu: CpuId) {
+fn unpin_test_cpu(cpu: CpuId, reason: CpuPinReason) {
     if LOCAL_EXECUTION_DEPTHS[cpu.0].load(Ordering::Acquire) > 0 {
         UNPINS_WHILE_EXCLUDED.fetch_add(1, Ordering::AcqRel);
     }
     let previous = CPU_PIN_DEPTHS[cpu.0].fetch_sub(1, Ordering::AcqRel);
     assert!(previous > 0);
+    record_cpu_pin_event(false, reason, previous, previous - 1);
 }
 
 impl ObserverIf for TestPlatform {}
@@ -192,6 +229,10 @@ fn reset_runtime(possible_cpus: CpuMask, current_cpu: CpuId, online_cpus: CpuMas
     LOCAL_EXCLUSION_CALLS.store(0, Ordering::Release);
     PINS_WHILE_EXCLUDED.store(0, Ordering::Release);
     UNPINS_WHILE_EXCLUDED.store(0, Ordering::Release);
+    CPU_PIN_EVENT_COUNT.store(0, Ordering::Release);
+    for event in &CPU_PIN_EVENTS {
+        event.store(0, Ordering::Release);
+    }
     for depth in &LOCAL_EXECUTION_DEPTHS {
         depth.store(0, Ordering::Release);
     }
@@ -233,6 +274,76 @@ fn substrate_ap_init_makes_epoch_guard_valid_on_secondary_cpu() {
 }
 
 #[test]
+fn nested_epoch_cpu_pins_balance_in_non_lifo_drop_order() {
+    let _guard = AP_INIT_TEST_LOCK.lock().expect("ap init test lock");
+    reset_runtime(
+        CpuMask::from_bits(0b11),
+        CpuId(0),
+        CpuMask::single(CpuId(0)),
+    );
+
+    let outer = epoch::guard();
+    assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 1);
+    let inner = epoch::guard();
+    assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 2);
+
+    drop(outer);
+    assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 1);
+    drop(inner);
+    assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 0);
+
+    let expected = [
+        encode_cpu_pin_event(true, CpuPinReason::EpochGuard, 0, 1),
+        encode_cpu_pin_event(true, CpuPinReason::EpochGuard, 1, 2),
+        encode_cpu_pin_event(false, CpuPinReason::EpochGuard, 2, 1),
+        encode_cpu_pin_event(false, CpuPinReason::EpochGuard, 1, 0),
+    ];
+    assert_eq!(CPU_PIN_EVENT_COUNT.load(Ordering::Acquire), expected.len());
+    for (index, expected) in expected.into_iter().enumerate() {
+        assert_eq!(CPU_PIN_EVENTS[index].load(Ordering::Acquire), expected);
+    }
+}
+
+#[test]
+fn epoch_cpu_pin_is_zero_at_every_poll_boundary() {
+    use std::future::{poll_fn, Future};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct NoopWake;
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let _guard = AP_INIT_TEST_LOCK.lock().expect("ap init test lock");
+    reset_runtime(
+        CpuMask::from_bits(0b11),
+        CpuId(0),
+        CpuMask::single(CpuId(0)),
+    );
+
+    let mut polls = 0usize;
+    let mut future = std::pin::pin!(poll_fn(|cx| {
+        let _pin = epoch::guard();
+        assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 1);
+        polls += 1;
+        if polls == 1 {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }));
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+
+    assert!(Future::poll(future.as_mut(), &mut context).is_pending());
+    assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 0);
+    assert!(Future::poll(future.as_mut(), &mut context).is_ready());
+    assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn zone_bucket_and_keg_exclude_local_execution_on_each_cpu() {
     let _guard = AP_INIT_TEST_LOCK.lock().expect("ap init test lock");
     reset_runtime(
@@ -259,6 +370,8 @@ fn zone_bucket_and_keg_exclude_local_execution_on_each_cpu() {
     assert!(LOCAL_EXCLUSION_CALLS.load(Ordering::Acquire) > 0);
     assert!(PINS_WHILE_EXCLUDED.load(Ordering::Acquire) > 0);
     assert!(UNPINS_WHILE_EXCLUDED.load(Ordering::Acquire) > 0);
+    assert!(cpu_pin_events_contain_reason(CpuPinReason::ZoneBucketPop));
+    assert!(cpu_pin_events_contain_reason(CpuPinReason::ZoneBucketMerge));
     assert_eq!(LOCAL_EXECUTION_DEPTHS[0].load(Ordering::Acquire), 0);
     assert_eq!(LOCAL_EXECUTION_DEPTHS[1].load(Ordering::Acquire), 0);
     assert_eq!(CPU_PIN_DEPTHS[0].load(Ordering::Acquire), 0);

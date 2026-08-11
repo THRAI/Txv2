@@ -3,6 +3,7 @@
 #[cfg(test)]
 extern crate std;
 
+use tx_hal::CpuPinReason;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
@@ -234,6 +235,15 @@ static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
     [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_CPU_PIN_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
     [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+const LA64_CPU_PIN_TRACE_CAPACITY: usize = 32;
+// Keep the diagnostic ring out of `.bss` so it does not insert padding between
+// the existing BSS neighbours of `LA64_CPU_PIN_DEPTHS`. The real-board witness
+// must not accidentally hide a short adjacent overwrite by moving the counter.
+#[link_section = ".data.tx_cpu_pin_trace"]
+static LA64_CPU_PIN_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[link_section = ".data.tx_cpu_pin_trace"]
+static LA64_CPU_PIN_TRACE_EVENTS: [AtomicU64; LA64_CPU_PIN_TRACE_CAPACITY] =
+    [const { AtomicU64::new(0) }; LA64_CPU_PIN_TRACE_CAPACITY];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
 static LA2K1000_UART_IRQ_OBSERVED: AtomicBool = AtomicBool::new(false);
 static LA2K1000_UART_PORT_OWNED: AtomicBool = AtomicBool::new(false);

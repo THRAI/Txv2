@@ -303,6 +303,7 @@ struct PageBackedServiceBlockDevice;
 static PAGE_BACKED_SERVICE_BLOCK_DEVICE: PageBackedServiceBlockDevice =
     PageBackedServiceBlockDevice;
 static PAGE_BACKED_SERVICE_LAST_READ: AtomicU64 = AtomicU64::new(u64::MAX);
+static PAGE_BACKED_SERVICE_READS: AtomicUsize = AtomicUsize::new(0);
 static PAGE_BACKED_SERVICE_BLOCK_REG: BlockDeviceRegistration = BlockDeviceRegistration {
     devt: DevT::new(0, 8),
     name: "pagebacked-service-block",
@@ -317,6 +318,7 @@ impl BlockDeviceOps for PageBackedServiceBlockDevice {
         _guard: &Guard<'_>,
     ) -> V3Out<(), NoProgress> {
         PAGE_BACKED_SERVICE_LAST_READ.store(block_id.as_u64(), Ordering::SeqCst);
+        PAGE_BACKED_SERVICE_READS.fetch_add(1, Ordering::SeqCst);
         V3Out::Done(())
     }
 
@@ -2808,33 +2810,26 @@ fn file_page_io_service_op_drives_aggregate_turn_as_step_op() {
 }
 
 #[test]
-fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
-    fn block_on_ready<F: core::future::Future>(future: F) -> F::Output {
-        let waker = core::task::Waker::noop();
-        let mut cx = core::task::Context::from_waker(waker);
-        let mut future = core::pin::pin!(future);
-        match future.as_mut().poll(&mut cx) {
-            core::task::Poll::Ready(output) => output,
-            core::task::Poll::Pending => panic!("expected service task loop to complete"),
-        }
-    }
+fn file_page_io_service_task_loop_yields_between_self_kicked_turns() {
+    use core::future::Future as _;
 
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = Arc::new(RecordingFs::new());
-    struct DeviceBioPlanner {
-        buffer_ppn: Ppn,
-    }
+    struct DeviceBioPlanner;
 
     impl BackendPlanner for DeviceBioPlanner {
-        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            let crate::fs_iface::IoDataTarget::PageCache { frame, .. } = request.target else {
+                return BackendPlan::Err(Errno::EINVAL);
+            };
             BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
                 DeviceKey::new(8),
                 BlockOp::Read,
-                LbaRange::new(64, 1),
+                LbaRange::new(64 + request.range.start_page(), 1),
                 alloc::vec![BioVec::new(
-                    self.buffer_ppn.0 as u64,
+                    frame.ppn().0 as u64,
                     0,
                     crate::vm::USER_PAGE_SIZE as u32,
                 )],
@@ -2843,17 +2838,16 @@ fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
         }
     }
 
-    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
-    let planner = Arc::new(DeviceBioPlanner {
-        buffer_ppn: completion_ppn,
-    });
+    let planner = Arc::new(DeviceBioPlanner);
     let pc =
         file_page_container_with_planner(fs.clone(), fs.clone(), FsObjectId::new(99), 4, planner);
-    let page = PageIndex::new(1);
+    let pages = [PageIndex::new(1), PageIndex::new(2)];
 
-    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
-        V3Out::Yield { .. } => {}
-        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    for page in pages {
+        match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+            V3Out::Yield { .. } => {}
+            other => panic!("expected async yield after bio-only plan, got {other:?}"),
+        }
     }
     drop(guard);
 
@@ -2862,31 +2856,50 @@ fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
         mailbox.post(event)
     });
     PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+    PAGE_BACKED_SERVICE_READS.store(0, Ordering::SeqCst);
 
-    let report = block_on_ready(crate::device::page_container_file_io_service_task_loop(
+    let mut task = core::pin::pin!(crate::device::page_container_file_io_service_task_loop(
         &pc,
         BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
         &wake_source,
         crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
-            1,
+            2,
             ServiceBudget::new(1),
             ServiceBudget::new(1),
         ),
     ));
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
 
-    assert_eq!(report.waits_ready, 1);
-    assert_eq!(report.ready_turns, 1);
+    assert!(matches!(
+        task.as_mut().poll(&mut cx),
+        core::task::Poll::Pending
+    ));
+    assert_eq!(
+        PAGE_BACKED_SERVICE_READS.load(Ordering::SeqCst),
+        1,
+        "one Future::poll must advance at most one ready service turn"
+    );
+
+    let report = match task.as_mut().poll(&mut cx) {
+        core::task::Poll::Ready(report) => report,
+        core::task::Poll::Pending => panic!("second poll should finish the bounded service task"),
+    };
+
+    assert_eq!(report.waits_ready, 2);
+    assert_eq!(report.ready_turns, 2);
     assert_eq!(report.waits_failed, 0);
+    assert_eq!(report.dispatched, 1);
+    assert_eq!(report.device_completions, 1);
+    assert_eq!(report.page_completions, 2);
     let turn = report.last_turn.expect("service turn");
-    assert_eq!(turn.block.dispatched, 1);
-    assert_eq!(turn.block.device_completions, 1);
-    assert_eq!(turn.block.page_completions, 1);
     assert_eq!(
         turn.next,
         crate::device::PageContainerFileIoServiceNext::Sleeping
     );
-    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
-    assert_eq!(pc.lookup(page), Some(completion_ppn));
+    assert_eq!(PAGE_BACKED_SERVICE_READS.load(Ordering::SeqCst), 1);
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 65);
+    assert!(pages.into_iter().all(|page| pc.lookup(page).is_some()));
 }
 
 #[test]

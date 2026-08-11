@@ -11,7 +11,7 @@ use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use super::guard::Guard;
 use super::local::CpuLocalEpochState;
 use super::retired::{allocate_bag_page, BagQueue, RetiredEntry, SealedBag, RETIRED_BAG_CAPACITY};
-use tx_hal::{CpuId, CpuPinGuard, IrqIf, PercpuIf, SmpIf};
+use tx_hal::{CpuId, CpuPinGuard, CpuPinReason, IrqIf, PercpuIf, SmpIf};
 
 const INITIAL_EPOCH: u64 = 1;
 const COLLECT_STEPS: usize = 8;
@@ -209,7 +209,7 @@ impl EpochDomain {
             "epoch guards must not be created in IRQ context"
         );
 
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochGuard);
         let cpu_id = cpu_pin.cpu_id();
         let local = self
             .cpu_state(cpu_id)
@@ -255,7 +255,7 @@ impl EpochDomain {
             return None;
         }
         let hooks = self.hooks();
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochBorrow);
         let cpu_id = cpu_pin.cpu_id();
         let local = self.cpu_state(cpu_id)?;
         if !local.is_pinned() {
@@ -296,7 +296,7 @@ impl EpochDomain {
         let hooks = self.hooks();
         let mut retried_after_drain = false;
         loop {
-            let cpu_pin = (hooks.pin_current_cpu)();
+            let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochRetire);
             let cpu_id = cpu_pin.cpu_id();
             let local = self.cpu_state(cpu_id).ok_or(EpochError::InvalidCpu)?;
             if !local.is_initialized() {
@@ -401,7 +401,7 @@ impl EpochDomain {
             return stats;
         }
 
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochDrain);
         let cpu_id = cpu_pin.cpu_id();
         if !self.is_possible_cpu(cpu_id)
             || !(hooks.is_cpu_online)(cpu_id)
@@ -625,7 +625,7 @@ fn emit_epoch_trace(name: &[u8], value: i64) {
 
 #[derive(Clone, Copy)]
 struct PlatformHooks {
-    pin_current_cpu: fn() -> CpuPinGuard,
+    pin_current_cpu: fn(CpuPinReason) -> CpuPinGuard,
     in_irq_context: fn() -> bool,
     in_trap_context: fn() -> bool,
     is_cpu_online: fn(CpuId) -> bool,
@@ -646,7 +646,7 @@ impl PlatformHooks {
         P: PercpuIf + SmpIf + IrqIf,
     {
         Self {
-            pin_current_cpu: P::pin_current_cpu,
+            pin_current_cpu: P::pin_current_cpu_for,
             in_irq_context: P::in_irq_context,
             in_trap_context: P::in_trap_context,
             is_cpu_online: P::is_cpu_online,
@@ -654,8 +654,8 @@ impl PlatformHooks {
     }
 }
 
-fn default_pin_current_cpu() -> CpuPinGuard {
-    CpuPinGuard::new(CpuId(0))
+fn default_pin_current_cpu(reason: CpuPinReason) -> CpuPinGuard {
+    CpuPinGuard::new(CpuId(0)).with_reason(reason)
 }
 
 fn default_in_irq_context() -> bool {

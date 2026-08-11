@@ -867,7 +867,6 @@ fn resolve_user_page(
     }
 }
 
-
 /// PROBE(git fork-exec EFAULT hunt): stable small codes for
 /// `VmFaultError` variants so the vmwatch line can carry the cause.
 fn vm_fault_error_probe_code(e: &crate::vm::VmFaultError) -> u64 {

@@ -38,11 +38,11 @@ pub use execution::{
 pub use fd_ready::{query_fd_ready, FdReadyMask, FdReadyQuery, FdReadyReport, FdWait};
 pub use notification::{VFS_READABLE, VFS_WRITABLE};
 pub use structure::{
-    render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
-    InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
-    ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload, Timespec, VfsName,
-    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID,
-    S_ISVTX, VFS_NAME_MAX, render_dentry_path_in_namespace,
+    render_dentry_path, render_dentry_path_in_namespace, Credential, DEntry, DirCursor, DirEntry,
+    FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl,
+    OpenFileIoctlCaller, OpenFileIoctlResult, ProjectionKey, ProjectionSchemaId, RNode,
+    RNodeBacking, StructPayload, Timespec, VfsName, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
+    S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, VFS_NAME_MAX,
 };
 pub use walker::{
     step_open, step_open_in_mount_namespace, step_open_in_mount_namespace_with_mount,

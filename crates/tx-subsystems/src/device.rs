@@ -870,15 +870,18 @@ pub async fn page_container_file_io_service_task_loop(
 
         report.waits_ready += 1;
         report.ready_turns += 1;
-        let guard = step_engine::guard();
-        let turn = match drive_page_container_file_io_service_once(
-            container,
-            config.page_budget,
-            config.block_budget,
-            handle,
-            &guard,
-            |kick| post_file_io_service_kick(wake_source, kick),
-        ) {
+        let driven = {
+            let guard = step_engine::guard();
+            drive_page_container_file_io_service_once(
+                container,
+                config.page_budget,
+                config.block_budget,
+                handle,
+                &guard,
+                |kick| post_file_io_service_kick(wake_source, kick),
+            )
+        };
+        let turn = match driven {
             Ok(turn) => turn,
             Err(_) => {
                 report.waits_failed += 1;
@@ -897,6 +900,12 @@ pub async fn page_container_file_io_service_task_loop(
                 .unwrap_or(0)
             + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
         report.last_turn = Some(turn);
+        if config
+            .max_ready_turns
+            .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+        {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
