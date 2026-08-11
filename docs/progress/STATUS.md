@@ -1,4 +1,4 @@
-- 2026-08-11 (**Loongson 2K1000 AHCI 可写传输已完成 host 与实板只读准入，实板写入仍受安全门约束**).
+- 2026-08-11 (**Loongson 2K1000 AHCI 可写传输已完成 host、实板只读准入与板载文件级持久化闭环**).
   **Changed**：以 `42cd4396` 为实现基线，先新增
   `2026-08-11-la2k1000-ahci-write` 计划与逐阶段实验协议，再按红→绿顺序实现。
   AHCI 现通过原有单 slot、4 KiB、32-bit bounce workspace 发出 LBA48
@@ -24,10 +24,19 @@
   legacy CRC 通过，AHCI 识别 `62533296x512`，`/dev/sda / ext4 ro`，Alpine
   3.21 与 `/bin/busybox` 全量哈希读取、shell、双核 stack 水位和 1/1 host ping
   通过。246 行日志没有 AHCI 首错或 kernel invariant 报告。
-  **Blocker / Next**：实现计划保持 active；phase 0–6 与 host commit 已闭合，
-  板载盘仍未发生本实验写入。必须由用户明确指定 clone/spare medium，才能执行
-  文件级 write/fsync/rename/reset/offline-fsck；否则停在当前安全边界。不得猜测
-  裸 LBA，也不得把板载比赛盘默认为 disposable。详细实验协议见
+  **Real-board write**：用户明确批准当前 Kingchuxing 板载 raw ext4 后，使用同一
+  `73819f58` kernel-only 镜像和 `HOME=/root`，未加载 initrd、未挂载 `/musl`。
+  `rw` 启动中只在 `/root/tx-ahci-write-probe` 写入 4096 bytes，文件 fsync 后
+  rename、目录 fsync 和 `sync`；临时名与 durable 名 SHA-256 均为
+  `1e6144a0...cd7cb`。随后 `ro` 复位仍读到同一大小/哈希；清理 `rw` 启动删除
+  文件、fsync 探针目录、删除目录、fsync `/root` 并 `sync`，最终 `ro` 复位输出
+  `PROBE_ABSENT_AFTER_RESET`。完整 959 行串口日志 SHA-256 为
+  `07473538...2d71`，无 AHCI io-error、panic、CPU-pin underflow、stack-guard 或
+  cmdline/state corruption。未猜测裸 LBA、未改分区、未替换本地 Alpine 母镜像。
+  **Blocker / Next**：实现计划保持 active；板载文件/barrier/reset/delete 持久化
+  已通过，但 phase 8 的 resolver/CA 普通文件持久化、板载 Git
+  init/clone/post-clone、持续 TLS/fairness 与可信离线 `e2fsck -f -n` 尚未执行。
+  当前没有可用的未挂载 fsck 环境，且绝不自动修复文件系统。详细实验协议见
   `docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md`，host 账本见
   `msp/debug-logs/2026-08-11-la2k1000-ahci-write-host-admission.md`。
 

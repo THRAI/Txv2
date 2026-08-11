@@ -350,6 +350,43 @@ log is `msp/serial/2026-08-11-ahci-write-ro.log`; it contains no
 `txkernel:ahci:io-error`, panic, CPU-pin, guard, or cmdline/state corruption
 marker.
 
-B1 remains blocked on media authorization. The running board stays read-only.
-No remount, create, write, rename, fsync, raw-LBA operation, or filesystem
-repair command was issued.
+B1 remained blocked on a disposable clone, but the user subsequently gave
+explicit approval to substitute the exact onboard Kingchuxing filesystem for
+the bounded B2 probe. The B0 boot itself issued no remount, create, write,
+rename, fsync, raw-LBA, or filesystem-repair command.
+
+## 10. B2 onboard bounded-durability result
+
+The first B2 item passed on 2026-08-11 using the existing onboard raw ext4
+filesystem, not a rebuilt or replacement image. Kernel-only boots used the
+deployed `73819f58` uImage and alternated the root argument between `rw` for
+mutation and `ro` for post-reset observation; every shell used `HOME=/root`,
+and no `/musl` mount or initrd was involved.
+
+On the first writable boot, `/dev/sda / ext4 rw` was confirmed before creating
+`/root/tx-ahci-write-probe`. Exactly 4096 bytes from `/bin/busybox` were written
+to `phase-73819f58.tmp`, file-fsynced, hashed, renamed to
+`phase-73819f58.durable`, directory-fsynced, and supplemented by `sync`. The
+hash before and after the rename was
+`1e6144a04fda80986ded3536e3ba38b86204154d7c85b21f4fa41c3b47dcd7cb`.
+After reset, `/dev/sda / ext4 ro` was confirmed and the durable file remained
+4096 bytes with the same hash.
+
+The cleanup boot again confirmed `rw`, observed the durable file, deleted it,
+fsynced the probe directory, removed that directory, fsynced `/root`, and ran
+`sync`. A final reset mounted the same disk `ro` and printed
+`PROBE_ABSENT_AFTER_RESET`. No transport failure was retried because none
+occurred.
+
+The complete serial boundary is
+`msp/serial/2026-08-11-ahci-write-ro.log`: 959 lines, SHA-256
+`074735383bcea5ae27e181b8129d9baed5cb2aa2c1bade2bb5d803939c932d71`.
+It contains no `txkernel:ahci:io-error`, panic, CPU-pin underflow, stack-guard
+failure, or cmdline/state corruption marker. No raw-LBA command, partition
+change, root-image replacement, or filesystem repair was performed.
+
+This closes the onboard file/barrier/reset/delete durability probe, not all of
+B2. Resolver and CA persistence, an onboard Git init/clone/post-clone workload,
+sustained TLS/fairness observation, and a trusted offline `e2fsck -f -n`
+remain pending. In particular, absence of a transport error is not a substitute
+for the offline filesystem-consistency witness.

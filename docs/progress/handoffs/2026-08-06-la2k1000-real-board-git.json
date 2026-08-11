@@ -44,6 +44,7 @@
     "Host implementation is complete for the direct-root AHCI write experiment at baseline 42cd4396: one-page LBA48 WRITE DMA EXT, non-data FLUSH CACHE EXT, direction-correct DMA sync, a fail-closed first-error boundary, first-failure-only register observation, real BlockImage barrier delegation, and EROFS/EIO fidelity all have red-to-green tests. AHCI is 19/19, tx-drivers 43/43, tx-fs 106/106, tx-ext4-format 51/51, tx-ext4 39/39, and the la64-2k1000 full-build --no-image gate passes. No board reset, serial run, root-image rebuild, or disk write has occurred for this phase.",
     "The RV64 VF2 MMC comparison confirms only the Frame-to-eight-sector mutation shape: it loops CMD24 for each 512-byte chunk and stops on failure, but both MMC barriers are successful no-ops. The 2K1000 implementation therefore uses one eight-sector AHCI command plus real ATA cache flush and requires reset/persistence/offline-fsck evidence before claiming durability.",
     "The 2026-08-11 B0 read-only board control is complete for commit 73819f58. The deployed kernel uImage SHA-256 is 1bb5134d56bf463ca11638b54ae257fc86ce6c515d14c5a37c706312677d43cb and the previous kernel is backed up. Both legacy CRCs passed, AHCI reported 62533296x512, /dev/sda mounted ext4 ro, Alpine 3.21 and the full /bin/busybox hash read succeeded, stack waterlines remained safe, and one host ping passed. The 246-line B0 log contains no AHCI io-error or kernel invariant report. No filesystem or raw-media write was issued.",
+    "The user then explicitly approved the exact onboard Kingchuxing raw-ext4 filesystem for a bounded B2 mutation. Kernel-only rw/ro boots used HOME=/root with no initrd or /musl. A 4096-byte probe was file-fsynced, renamed, directory-fsynced and synced at SHA-256 1e6144a04fda80986ded3536e3ba38b86204154d7c85b21f4fa41c3b47dcd7cb; after reset it remained byte-identical on a ro mount. A second rw boot deleted the file and directory with containing-directory fsyncs and sync; the final ro reset confirmed PROBE_ABSENT_AFTER_RESET. The 959-line serial boundary has SHA-256 074735383bcea5ae27e181b8129d9baed5cb2aa2c1bade2bb5d803939c932d71 and no AHCI io-error, panic, CPU-pin underflow, stack-guard failure, or cmdline/state corruption marker. This closes the onboard file/barrier/reset/delete probe, not the remaining resolver/CA, onboard Git/TLS load, or offline-fsck acceptance.",
     "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
   ],
   "changed_files": [
@@ -536,18 +537,23 @@
       "command": "real 2K1000 B0 read-only control from commit 73819f58",
       "status": "passed",
       "notes": "The new 7164144-byte kernel payload and unchanged bootstrap initrd passed U-Boot CRCs. With tx.root=sda ro, txKernel identified 62533296x512 and mounted /dev/sda as ext4 ro; Alpine 3.21, /bin/busybox SHA-256 ee648c5338186ee244098b09f0e691dcb49ca7bd75028ec24629cc817789ed60, shell, stack waterlines and 1/1 host ping passed. msp/serial/2026-08-11-ahci-write-ro.log has 246 lines and no AHCI io-error, panic, CPU-pin, guard or cmdline/state corruption marker. No disk write was issued."
+    },
+    {
+      "command": "real 2K1000 onboard B2 bounded write/reset/delete/reset protocol from commit 73819f58",
+      "status": "passed",
+      "notes": "After explicit user approval of the onboard Kingchuxing raw-ext4 filesystem, rw create/write/file-fsync/rename/directory-fsync/sync produced a durable 4096-byte file at SHA-256 1e6144a04fda80986ded3536e3ba38b86204154d7c85b21f4fa41c3b47dcd7cb. A ro reset preserved it. A second rw boot deleted the file and directory with probe-directory and /root fsyncs plus sync; the final ro reset printed PROBE_ABSENT_AFTER_RESET. The 959-line serial log SHA-256 is 074735383bcea5ae27e181b8129d9baed5cb2aa2c1bade2bb5d803939c932d71 and contains no AHCI or kernel invariant failure. No raw-LBA, partition, image-replacement, /musl, or repair command was used."
     }
   ],
   "next_actions": [
     {
       "id": "next-9",
-      "title": "Run the AHCI write implementation through read-only board control before authorizing media mutation",
+      "title": "Complete onboard Git/TLS and offline filesystem acceptance after the passed AHCI durability probe",
       "paths": [
         "crates/tx-drivers/src/ahci/mod.rs",
         "crates/tx-fs/src/tx_ext4_bridge.rs",
         "docs/progress/plans/2026-08-11-la2k1000-ahci-write.json"
       ],
-      "notes": "First deploy only the newly built kernel and boot the existing Alpine disk with tx.root=sda ro. Verify identify, ext4 mount, known reads, shell/network and absence of txkernel:ahci:io-error or kernel invariant reports. Do not remount writable. After this control passes, ask the user to identify or explicitly approve a clone/spare medium for a filesystem-level write/fsync/rename/reset/offline-fsck probe; never guess a raw LBA or treat the competition disk as disposable. The user resets when requested; Codex operates serial capture and diagnosis."
+      "notes": "B0 read-only control and the explicitly approved onboard 4096-byte write/fsync/rename/reset/delete/reset probe pass on commit 73819f58. Next persist only the intended resolver and CA/config files through ordinary filesystem calls, run bounded local Git plus HTTPS clone/post-clone and sustained TLS/fairness witnesses on the onboard root, and finish with trusted offline e2fsck -f -n when an unmounted environment is available. Keep TLS verification enabled, HOME=/root, and no /musl. Never guess a raw LBA or run filesystem repair automatically. The user resets when requested; Codex owns serial commands and diagnosis."
     },
     {
       "id": "next-5",
