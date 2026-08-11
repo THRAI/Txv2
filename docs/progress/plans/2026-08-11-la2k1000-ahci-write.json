@@ -219,7 +219,7 @@
         "Persist resolver and CA/config changes through ordinary filesystem calls; never disable TLS verification.",
         "Run bounded Git init/add/commit, clone/post-clone, sustained TLS requests, shell responsiveness, host ping, and final filesystem-check acceptance with no AHCI or kernel invariant failure."
       ],
-      "notes": "The user explicitly approved the onboard filesystem and performed the requested resets; Codex owned every command, serial capture, diagnosis, and stop/go decision. The first verification item is complete: a deterministic 4096-byte file survived reset at SHA-256 1e6144a04fda80986ded3536e3ba38b86204154d7c85b21f4fa41c3b47dcd7cb, then its fsynced deletion survived another reset. Resolver/CA persistence, onboard Git/TLS load, and offline fsck remain pending. date -u changes realtime state but is not itself a filesystem persistence test."
+      "notes": "The user explicitly approved the onboard filesystem and performed the requested resets; Codex owned every command, serial capture, diagnosis, and stop/go decision. The deterministic 4096-byte probe survived reset at SHA-256 1e6144a04fda80986ded3536e3ba38b86204154d7c85b21f4fa41c3b47dcd7cb and its fsynced deletion survived another reset. Resolver persistence, unchanged CA verification, local Git commit, full HTTPS clone/post-clone, concurrent TLS fairness, host ping, post-reset readback, and cleanup all pass. Only trusted offline e2fsck remains pending, so this phase stays in-progress. date -u changed runtime state only."
     },
     {
       "id": "phase-9-catch-up-and-commit",
@@ -293,6 +293,11 @@
       "command": "real 2K1000 onboard B2 bounded write: rw create/write/fsync/rename/dir-fsync/sync/hash; ro reset/hash; rw delete/dir-fsync/parent-fsync/sync; ro reset/absence",
       "status": "passed",
       "notes": "The user explicitly approved the onboard Kingchuxing raw-ext4 filesystem. Kernel-only boots used tx.root=sda with init=/bin/sh and alternated rw/ro exactly as required. /root/tx-ahci-write-probe/phase-73819f58.durable contained 4096 bytes at SHA-256 1e6144a04fda80986ded3536e3ba38b86204154d7c85b21f4fa41c3b47dcd7cb before and after reset. The file and directory were then deleted, their containing directories fsynced, and PROBE_ABSENT_AFTER_RESET confirmed after the final read-only reset. The 959-line serial log SHA-256 is 074735383bcea5ae27e181b8129d9baed5cb2aa2c1bade2bb5d803939c932d71 and contains no AHCI io-error, panic, CPU-pin underflow, stack-guard failure, or cmdline/state corruption marker. No raw-LBA command, image replacement, /musl mount, or filesystem repair was used."
+    },
+    {
+      "command": "real 2K1000 onboard B2 Git/TLS: persist resolver, verify CA, local commit, full HTTPS clone/post-clone, concurrent TLS plus host ping, ro reset/readback, rw cleanup",
+      "status": "passed",
+      "notes": "Resolver nameserver 10.248.98.30 persisted at SHA-256 9dfddf66c8db57849b6870e85538219f933a99c25d29d2defeb5a4c56f9608fb; the existing 226088-byte CA remained ab9437683f2759f33358733e9a20f511cba6603301d2d8fd51cf88b17bdf96d4 and TLS verification stayed enabled. Local Git commit 0e75a2450b5c892db0eef8bcf83fea046ce439b6 persisted. The full clone completed 7818 objects, 4137 deltas and 17.47 MiB; it is non-shallow at HEAD 0c8e312f82c34335d78073334c40c253c70df23c. Post-clone file SHA-256 c1b9ff8f446368ecdd4bcca63bae60795a8eef497d13d3b3b634be7a12cd84e8, three background and one foreground TLS requests, and post-reset ro readback all passed. Host ping was 300/300 during clone and 120/120 during TLS, both 0% loss. The 17.9 MiB test directory was removed and /root fsynced/synced, restoring 209.4 MiB free; resolver and CA were retained. The final 1610-line serial log SHA-256 is 74171b9c69ae351d608dbae131c3296487f9b381b06fa082fb417ed549dcf66c and contains no AHCI or kernel invariant failure."
     }
   ],
   "risks": [
@@ -306,7 +311,6 @@
     "Existing active progress records contain a legacy completed step status and broad overlapping scopes, so repository-wide progress validation may remain red independently of this new record."
   ],
   "blockers": [
-    "The approved onboard filesystem passed the bounded durability probe, but resolver/CA persistence plus onboard Git clone/post-clone and sustained TLS/fairness acceptance remain to be run before phase 8 can close.",
     "Offline e2fsck requires the tested filesystem not to be mounted and an available trusted fsck environment; no repair may be run automatically."
   ],
   "handoff": {

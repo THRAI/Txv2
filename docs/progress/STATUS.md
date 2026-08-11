@@ -1,4 +1,4 @@
-- 2026-08-11 (**Loongson 2K1000 AHCI 可写传输已完成 host、实板只读准入与板载文件级持久化闭环**).
+- 2026-08-11 (**Loongson 2K1000 AHCI 可写传输、板载持久化与完整 Git/TLS 负载均已实板闭合**).
   **Changed**：以 `42cd4396` 为实现基线，先新增
   `2026-08-11-la2k1000-ahci-write` 计划与逐阶段实验协议，再按红→绿顺序实现。
   AHCI 现通过原有单 slot、4 KiB、32-bit bounce workspace 发出 LBA48
@@ -33,10 +33,21 @@
   `PROBE_ABSENT_AFTER_RESET`。完整 959 行串口日志 SHA-256 为
   `07473538...2d71`，无 AHCI io-error、panic、CPU-pin underflow、stack-guard 或
   cmdline/state corruption。未猜测裸 LBA、未改分区、未替换本地 Alpine 母镜像。
-  **Blocker / Next**：实现计划保持 active；板载文件/barrier/reset/delete 持久化
-  已通过，但 phase 8 的 resolver/CA 普通文件持久化、板载 Git
-  init/clone/post-clone、持续 TLS/fairness 与可信离线 `e2fsck -f -n` 尚未执行。
-  当前没有可用的未挂载 fsck 环境，且绝不自动修复文件系统。详细实验协议见
+  **Onboard Git/TLS**：`/etc/resolv.conf` 以普通写入+fsync 持久化
+  `nameserver 10.248.98.30`（SHA-256 `9dfddf66...08fb`），原有 226088-byte CA
+  保持 `ab943768...96d4`；UTC 仅在运行期恢复，TLS 校验未关闭。板载专用目录内
+  本地 Git init/add/commit 得到 `0e75a245...39b6`，完整 HTTPS clone 完成
+  7818/7818 objects、4137/4137 deltas、17.47 MiB，non-shallow HEAD 为
+  `0c8e312f...253c`。post-clone log/status/文件写回通过；3 个后台和 1 个前台
+  TLS `ls-remote` 均成功。clone 窗口 host ping 300/300，额外 TLS 窗口 120/120，
+  均 0% loss。复位后的 `ro` 启动逐项复核 resolver/CA、本地 commit、clone HEAD
+  和文件哈希；随后测试目录已在 `rw` 启动清理、fsync/sync，空间恢复到
+  209.4 MiB，resolver/CA 保留不变。最终 1610 行串口边界 SHA-256 为
+  `74171b9c...f66c`，仍无 AHCI 或 kernel invariant failure。
+  **Blocker / Next**：板载 Git/TLS、持久化与公平性验收无功能 blocker；计划仅因
+  缺少可信未挂载环境而保留 `in-progress`，尚未运行只读离线
+  `e2fsck -f -n`，且绝不自动修复文件系统。用户持有凭据的 push/web-edit/pull
+  仍是外部操作。详细实验协议见
   `docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md`，host 账本见
   `msp/debug-logs/2026-08-11-la2k1000-ahci-write-host-admission.md`。
 

@@ -385,8 +385,59 @@ It contains no `txkernel:ahci:io-error`, panic, CPU-pin underflow, stack-guard
 failure, or cmdline/state corruption marker. No raw-LBA command, partition
 change, root-image replacement, or filesystem repair was performed.
 
-This closes the onboard file/barrier/reset/delete durability probe, not all of
-B2. Resolver and CA persistence, an onboard Git init/clone/post-clone workload,
-sustained TLS/fairness observation, and a trusted offline `e2fsck -f -n`
-remain pending. In particular, absence of a transport error is not a substitute
-for the offline filesystem-consistency witness.
+This closes the onboard file/barrier/reset/delete durability probe. The next
+section records the higher-level B2 workload; a trusted offline
+`e2fsck -f -n` remains separate because absence of a transport error is not a
+substitute for an offline filesystem-consistency witness.
+
+## 11. B2 onboard Git/TLS and persistence result
+
+The higher-level workload passed on the same explicitly approved onboard
+filesystem. The writable boot first confirmed `/dev/sda / ext4 rw`, exported
+`HOME=/root`, and verified that the dedicated
+`/root/tx-board-git-probe-30333cb3` path did not exist. Git 2.47.3 used the
+standard system loader and libraries; no initrd or `/musl` path participated.
+
+The existing 226088-byte `/etc/ssl/cert.pem` was not rewritten and retained
+SHA-256
+`ab9437683f2759f33358733e9a20f511cba6603301d2d8fd51cf88b17bdf96d4`.
+The empty resolver file was changed through ordinary filesystem calls to
+`nameserver 10.248.98.30`, file- and directory-fsynced, and recorded at
+SHA-256
+`9dfddf66c8db57849b6870e85538219f933a99c25d29d2defeb5a4c56f9608fb`.
+UTC was restored from the trusted host only as runtime state. Gateway and
+GitHub ping passed, and TLS-verified `git ls-remote` returned
+`0c8e312f82c34335d78073334c40c253c70df23c`.
+
+The dedicated path then exercised two Git shapes. A local init/add/commit
+produced commit `0e75a2450b5c892db0eef8bcf83fea046ce439b6`; its WITNESS payload hashed
+to `741b1920314f680eeb7656f2d22ddb5ff40dbb2200f272ac6bbebffb687786e3`.
+The full HTTPS clone completed 7818/7818 objects, 4137/4137 deltas, and
+17.47 MiB. It was non-shallow at HEAD
+`0c8e312f82c34335d78073334c40c253c70df23c`; no-pager log and clean status
+passed. The post-clone untracked file hashed to
+`c1b9ff8f446368ecdd4bcca63bae60795a8eef497d13d3b3b634be7a12cd84e8`
+and appeared in `git status --short`.
+
+During the full clone the host received 300/300 pings with zero loss and RTT
+min/avg/max/mdev `1.432/3.684/306.360/20.711 ms`. A second window ran three
+background plus one foreground TLS-verified `ls-remote`; all four returned the
+expected HEAD while host ping received 120/120 with zero loss and RTT
+`1.640/6.431/327.658/33.352 ms`. The large RTT outliers did not become a lost
+packet, stalled request, or unresponsive shell.
+
+After file/directory fsyncs and `sync`, a reset mounted the disk read-only and
+revalidated the resolver and CA hashes, local commit and WITNESS hash,
+non-shallow clone HEAD, post-clone file hash/status, and all three saved TLS
+outputs. A final writable cleanup confirmed the dedicated directory was
+17.9 MiB, removed only that exact path, fsynced `/root`, ran `sync`, and restored
+free space from 191.5 MiB to 209.4 MiB. Resolver and CA hashes remained
+unchanged.
+
+The final serial boundary is the same log at 1610 lines and SHA-256
+`74171b9c69ae351d608dbae131c3296487f9b381b06fa082fb417ed549dcf66c`.
+It contains no `txkernel:ahci:io-error`, panic, CPU-pin underflow, stack-guard
+failure, or cmdline/state corruption marker. Onboard Git/TLS, persistence, and
+bounded fairness have no remaining functional blocker. Phase B2 remains
+in-progress only because no trusted environment has yet mounted this raw ext4
+filesystem offline for read-only `e2fsck -f -n`; no repair was attempted.
