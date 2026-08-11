@@ -1,0 +1,154 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-11-rcu-on-vm-to-smp-migration",
+  "title": "Migrate RCU-on-VM resident publication into the SMP worktree",
+  "status": "active",
+  "created": "2026-08-11",
+  "updated": "2026-08-11",
+  "owner": "smp-rcu-vm-migration",
+  "summary": "Port only the verified ResidentRoot/EBR VM slices from codex/rcu-on-vm into codex/test-remote-network, then wire them to the existing SMP per-hart lifecycle with bounded maintenance and 1-hart/2-hart gates.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/page_backed/",
+      "crates/tx-subsystems/src/io_manager/page/",
+      "crates/tx-substrate/src/publication/",
+      "xtask/src/lint_pagecontainer_resident_rcu.rs",
+      "crates/tx-kernel/src/init.rs",
+      "crates/tx-kernel/src/init/exec.rs",
+      "crates/tx-reactor/src/scheduler.rs",
+      "crates/tx-reactor/src/task.rs"
+    ],
+    "out": [
+      "crates/tx-reactor/src/pelt.rs",
+      "crates/tx-subsystems/src/net/",
+      "crates/tx-ext4/",
+      "boards/",
+      "source-progress-metadata",
+      "whole-worktree-merge"
+    ],
+    "write_sets": [
+      {
+        "owner": "smp-rcu-vm-migration",
+        "paths": ["crates/tx-reactor/src/scheduler.rs", "crates/tx-reactor/src/task.rs", "crates/tx-kernel/src/init.rs", "crates/tx-kernel/src/init/exec.rs", "crates/tx-kernel/src/trap.rs", "crates/tx-subsystems/src/page_backed/", "crates/tx-subsystems/src/io_manager/page/", "crates/tx-substrate/src/publication/", "xtask/src/lint_pagecontainer_resident_rcu.rs"],
+        "notes": "Claimed only for this migration; preserve unrelated dirty hunks and exclude network, ext4, PELT, and broad HAL changes."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/Txv3/10_SCHED_SMP_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-08-11-smp-rcu-on-vm-fusion-audit.md",
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": [
+      "source worktree /Users/3y/.config/superpowers/worktrees/Tx/rcu-on-vm on codex/rcu-on-vm",
+      "source commits: 244e3a13, 8edab988, 0952234d, 23562c9b, 9bf73b25, 326ec51b, 1d4030bb, 0abe389d, e9dd900f, 90722e17, 44542315, 10ba5bf2",
+      "target worktree /Users/3y/Downloads/Tx on codex/test-remote-network",
+      "selection: verified RCU/VM slices only; exclude source progress metadata, ext4, network, PELT, and unrelated HAL/reactor WIP",
+      "dirty-state rule: preserve all pre-existing target user and SMP/ext4 WIP; overlapping files require narrow patches"
+    ]
+  },
+  "steps": [
+    {
+      "id": "smp-rcu-p0-freeze",
+      "title": "Freeze baselines and write claims",
+      "status": "complete",
+      "depends_on": [],
+      "paths": ["docs/progress/plans/2026-08-11-rcu-on-vm-to-smp-migration.json", "docs/progress/STATUS.md"],
+      "verification": ["git status --short --branch", "git diff --check", "cargo xtask progress validate"],
+      "notes": "Record source/target identity by path and branch, preserve dirty state, and reject broad migration."
+    },
+    {
+      "id": "smp-rcu-p1-scheduler-linearization",
+      "title": "Close SMP queue/owner and runnable/polling linearization gaps",
+      "status": "complete",
+      "depends_on": ["smp-rcu-p0-freeze"],
+      "paths": ["crates/tx-reactor/src/scheduler.rs", "crates/tx-reactor/src/task.rs", "crates/tx-reactor/tests/scheduler.rs"],
+      "verification": ["cargo test -p tx-reactor --test scheduler", "cargo test -p tx-reactor --test userspace_run --test hart_loop"],
+      "notes": "Queue membership, TaskRunOwner, and TaskTable lifecycle must become observable as one transition."
+    },
+    {
+      "id": "smp-rcu-p2-vm-hart-init",
+      "title": "Initialize VM cleanup/range transaction state on BSP and AP harts",
+      "status": "in-progress",
+      "depends_on": ["smp-rcu-p1-scheduler-linearization"],
+      "paths": ["crates/tx-kernel/src/init.rs", "crates/tx-kernel/src/init/exec.rs", "crates/tx-subsystems/src/vm/"],
+      "verification": ["cargo test -p tx-subsystems --lib vm", "cargo test -p tx-kernel --lib init"],
+      "notes": "Each admitted hart owns initialized VM range reservation and cleanup state before scheduling VM work."
+    },
+    {
+      "id": "smp-rcu-p3-maintenance-service",
+      "title": "Run bounded EBR drain, VM cleanup, and zone maintenance per hart",
+      "status": "pending",
+      "depends_on": ["smp-rcu-p2-vm-hart-init"],
+      "paths": ["crates/tx-kernel/src/trap.rs", "crates/tx-kernel/src/init.rs", "crates/tx-substrate/src/epoch/", "crates/tx-substrate/src/zone/"],
+      "verification": ["cargo test -p tx-substrate --test epoch", "cargo test -p tx-kernel --lib maintenance", "1-hart/2-hart maintenance acknowledgement smoke"],
+      "notes": "Maintenance IPI only acknowledges and marks pending; normal context performs bounded service before WFI."
+    },
+    {
+      "id": "smp-rcu-p4-resident-root",
+      "title": "Port ResidentRoot publication and guarded resident hit path",
+      "status": "pending",
+      "depends_on": ["smp-rcu-p3-maintenance-service"],
+      "paths": ["crates/tx-subsystems/src/page_backed/", "crates/tx-substrate/src/publication/", "crates/tx-subsystems/src/page_backed/resident_tests.rs"],
+      "verification": ["cargo test -p tx-subsystems --lib resident_ -- --test-threads=1", "cargo xtask lint invariants pagecontainer-resident-rcu"],
+      "notes": "Publish immutable resident roots with detached allocation and bounded retire reservation; guards never cross Yield."
+    },
+    {
+      "id": "smp-rcu-p5-withdrawal-consumers",
+      "title": "Port generation-checked withdrawal and the required VM/page consumers",
+      "status": "pending",
+      "depends_on": ["smp-rcu-p4-resident-root"],
+      "paths": ["crates/tx-subsystems/src/page_backed/", "crates/tx-subsystems/src/io_manager/page/", "crates/tx-subsystems/src/vm/"],
+      "verification": ["focused page_backed lifecycle/range/direct-I/O/reflink tests", "focused VM tests", "cargo check -p tx-shims"],
+      "notes": "Withdraw exact cell, PPN, and generation before compatibility-index release; retain existing MapPin and shootdown protocol."
+    },
+    {
+      "id": "smp-rcu-p6-acceptance",
+      "title": "Run 1-hart/2-hart acceptance and close progress records",
+      "status": "pending",
+      "depends_on": ["smp-rcu-p5-withdrawal-consumers"],
+      "paths": ["docs/progress/STATUS.md", "docs/progress/research/"],
+      "verification": ["cargo test -p tx-reactor --test scheduler", "cargo test -p tx-reactor --test userspace_run --test hart_loop", "cargo xtask progress validate", "git diff --check", "1-hart/2-hart QEMU or documented environment blocker"],
+      "notes": "Use paired one-hart/two-hart evidence; do not widen the matrix or include LTP/network."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Mandatory after every progress-record update."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Run on all claimed edits and newly created records."
+    },
+    {
+      "command": "cargo test -p tx-reactor --test scheduler --test userspace_run --test hart_loop",
+      "status": "passed",
+      "notes": "Focused SMP host gate; pair with one-hart/two-hart runtime evidence when available."
+    }
+  ],
+  "blockers": [
+    "Target worktree has extensive pre-existing dirty WIP; overlapping files require narrow patches.",
+    "Source worktree has unrelated ext4/network/HAL/reactor dirty changes that are explicitly excluded.",
+    "Real 2-hart QEMU evidence may be unavailable; host tests do not prove all hart interleavings.",
+    "Existing docs lint may remain blocked by the untracked .io-submission-patch/ artifact and external links."
+  ],
+  "risks": [
+    "Target and source both modify PageBacked, VM, init, and reactor surfaces; a broad cherry-pick can overwrite SMP or ext4 WIP.",
+    "Guard, MapPin, RangeGuard, and retire reservations must not cross Yield, I/O, callbacks, or completion.",
+    "The source branch is dirty and contains unrelated ext4/network/HAL/reactor edits; those changes are not evidence for this migration.",
+    "Host tests are deterministic and do not prove every two-hart interleaving; a missing QEMU gate remains a documented blocker."
+  ],
+  "handoff": {
+    "needed": true,
+    "path": "docs/progress/research/2026-08-11-smp-rcu-on-vm-fusion-audit.md"
+  }
+}

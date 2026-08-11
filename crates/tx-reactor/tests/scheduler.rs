@@ -29,9 +29,9 @@ fn pick_id_and_slice(
     scheduler: &mut Phase1Scheduler,
     hart: HartId,
 ) -> Option<(TaskId, SliceConfig)> {
-    scheduler
-        .pick_next(hart)
-        .map(|(handle, slice)| (handle.id(), slice))
+    let (handle, slice) = scheduler.pick_next(hart)?;
+    assert!(scheduler.mark_dispatching_polling(handle.id(), hart));
+    Some((handle.id(), slice))
 }
 
 #[test]

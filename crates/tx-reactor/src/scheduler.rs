@@ -271,6 +271,11 @@ pub enum TaskRunOwner {
         hart: HartId,
         queue: Phase1QueueKind,
     },
+    /// The task has been removed from a run queue and is being handed to the
+    /// task table.  It must not be re-enqueued until that handoff completes.
+    Dispatching {
+        hart: HartId,
+    },
     Polling {
         hart: HartId,
     },
@@ -765,7 +770,9 @@ impl Phase1Scheduler {
                     },
                 )))
             }
-            TaskRunOwner::Polling { hart } if !hart_allowed(new_affinity, hart) => {
+            TaskRunOwner::Dispatching { hart } | TaskRunOwner::Polling { hart }
+                if !hart_allowed(new_affinity, hart) =>
+            {
                 self.shared
                     .with_meta_mut(task, |meta| {
                         meta.must_migrate_on_stop = true;
@@ -773,9 +780,10 @@ impl Phase1Scheduler {
                     .ok_or(SchedulerAffinityError::UnknownTask)?;
                 Ok(None)
             }
-            TaskRunOwner::Parked | TaskRunOwner::Queued { .. } | TaskRunOwner::Polling { .. } => {
-                Ok(None)
-            }
+            TaskRunOwner::Parked
+            | TaskRunOwner::Queued { .. }
+            | TaskRunOwner::Dispatching { .. }
+            | TaskRunOwner::Polling { .. } => Ok(None),
             TaskRunOwner::Terminal => Err(SchedulerAffinityError::TerminalTask),
         }
     }
@@ -1062,12 +1070,32 @@ impl Phase1Scheduler {
             return None;
         }
 
-        let queue = Phase1QueueKind::Preempted;
-        let task = {
-            let mut queues = Self::lock_queues_from_local(victim_local);
-            queues.preempted_queue.pop_front()?
+        // Lock both queue shards in hart-id order.  The metadata owner changes
+        // while both shards are locked, and the task reaches the thief queue
+        // before either lock is released.
+        let handle = if thief.0 < victim.0 {
+            let mut thief_queues = Self::lock_queues_from_local(thief_local);
+            let mut victim_queues = Self::lock_queues_from_local(victim_local);
+            self.steal_preempted_locked(thief, victim, &mut thief_queues, &mut victim_queues)?
+        } else {
+            let mut victim_queues = Self::lock_queues_from_local(victim_local);
+            let mut thief_queues = Self::lock_queues_from_local(thief_local);
+            self.steal_preempted_locked(thief, victim, &mut thief_queues, &mut victim_queues)?
         };
+        Self::mark_need_resched_local(thief_local);
+        self.shared.record_work_steal();
+        Some(handle)
+    }
 
+    fn steal_preempted_locked(
+        &self,
+        thief: HartId,
+        victim: HartId,
+        thief_queues: &mut HartRunQueues,
+        victim_queues: &mut HartRunQueues,
+    ) -> Option<TaskHandle> {
+        let queue = Phase1QueueKind::Preempted;
+        let task = victim_queues.preempted_queue.pop_front()?;
         let Some((reject_still_queued, stolen_handle)) = self.shared.with_meta_mut(task, |meta| {
             let eligible = meta.can_migrate
                 && !meta.kernel_only
@@ -1087,14 +1115,12 @@ impl Phase1Scheduler {
         };
 
         if reject_still_queued {
-            Self::push_to_local_queue(victim_local, task, queue, true);
+            victim_queues.preempted_queue.push_front(task);
             return None;
         }
 
         let handle = stolen_handle?;
-        Self::push_to_local_queue(thief_local, task, queue, true);
-        Self::mark_need_resched_local(thief_local);
-        self.shared.record_work_steal();
+        thief_queues.preempted_queue.push_front(task);
         Some(handle)
     }
 
@@ -1503,7 +1529,7 @@ impl Phase1Scheduler {
             self.shared.advance_turn();
             meta.queued = false;
             meta.latency_wake = false;
-            meta.owner = TaskRunOwner::Polling { hart };
+            meta.owner = TaskRunOwner::Dispatching { hart };
             meta.current_slice_ns = match slice {
                 SliceConfig::Cooperative => 0,
                 SliceConfig::Preemptive { slice_ns } => slice_ns,
@@ -1513,6 +1539,20 @@ impl Phase1Scheduler {
             }
             Some((meta.handle, slice))
         })?
+    }
+
+    /// Complete the queue-to-task-table handoff after the task table has
+    /// changed `Runnable` to `Polling` and removed the future.
+    pub fn mark_dispatching_polling(&self, task: TaskId, hart: HartId) -> bool {
+        self.shared
+            .with_meta_mut(task, |meta| {
+                if meta.owner != (TaskRunOwner::Dispatching { hart }) {
+                    return false;
+                }
+                meta.owner = TaskRunOwner::Polling { hart };
+                true
+            })
+            .unwrap_or(false)
     }
 
     fn task_runnable_inner_for_locals(
@@ -1547,6 +1587,12 @@ impl Phase1Scheduler {
         };
 
         if meta.owner == TaskRunOwner::Terminal {
+            return None;
+        }
+
+        if matches!(meta.owner, TaskRunOwner::Dispatching { .. }) {
+            // A wake observed during the queue-to-task-table handoff is
+            // retained by TaskTable's wake state and consumed after polling.
             return None;
         }
 

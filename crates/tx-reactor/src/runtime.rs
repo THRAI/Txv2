@@ -527,6 +527,14 @@ impl SharedReactor {
                     .take_runnable_future_by_id(handle.id())
                 {
                     Ok((key, future, wake_state, mailbox)) => {
+                        let transitioned = view
+                            .shared
+                            .scheduler
+                            .mark_dispatching_polling(key.id(), hart);
+                        debug_assert!(
+                            transitioned,
+                            "picked task must transition Dispatching -> Polling"
+                        );
                         crate::task::set_current_mailbox(hart.0, Some(mailbox));
                         crate::task::set_current_deadline_registrar(
                             hart.0,
@@ -1068,6 +1076,14 @@ impl HartRuntimeView<'_> {
                     .take_runnable_future_by_id(handle.id())
                 {
                     Ok((key, future, wake_state, mailbox)) => {
+                        let transitioned = self
+                            .shared
+                            .scheduler
+                            .mark_dispatching_polling(key.id(), hart);
+                        debug_assert!(
+                            transitioned,
+                            "picked task must transition Dispatching -> Polling"
+                        );
                         crate::task::set_current_mailbox(hart.0, Some(mailbox));
                         crate::task::set_current_deadline_registrar(
                             hart.0,
