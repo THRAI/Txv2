@@ -103,19 +103,16 @@ struct FileIoRuntimeTaskSpawner<P: TxPlatform>(PhantomData<fn() -> P>);
 impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
     for FileIoRuntimeTaskSpawner<P>
 {
-    fn spawn_file_io_service(
-        &self,
-        runtime: tx_subsystems::device::PageContainerFileIoServiceRuntime,
-    ) {
+    fn spawn_file_io_service(&self, claim: tx_subsystems::device::FileIoManagerRuntimeClaim) {
         let submitted = CoreInit::<P>::submit_file_io_runtime_task_with(
-            runtime,
-            |runtime, config, meta| {
+            claim,
+            |claim, config, meta| {
                 BOOT_REACTOR
                     .with(|reactor| {
                         reactor.submit_task_with_meta(
                             async move {
                                 let _report = tx_subsystems::device::page_container_file_io_service_task_loop_owned(
-                                    runtime, config,
+                                    claim, config,
                                 )
                                 .await;
                             },
@@ -786,12 +783,12 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn submit_file_io_runtime_task_with<F>(
-        runtime: tx_subsystems::device::PageContainerFileIoServiceRuntime,
+        claim: tx_subsystems::device::FileIoManagerRuntimeClaim,
         mut submit: F,
     ) -> bool
     where
         F: FnMut(
-            tx_subsystems::device::PageContainerFileIoServiceRuntime,
+            tx_subsystems::device::FileIoManagerRuntimeClaim,
             tx_subsystems::device::PageContainerFileIoServiceTaskConfig,
             tx_reactor::InitialSchedMeta,
         ) -> bool,
@@ -800,30 +797,31 @@ impl<P: TxPlatform> CoreInit<P> {
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         let meta = tx_reactor::InitialSchedMeta::kernel()
             .with_affinity(tx_hal::CpuMask::single(current_cpu).bits());
-        submit(runtime, config, meta)
-    }
-
-    #[cfg(test)]
-    fn submit_file_io_runtime_tasks_with<F>(mut submit: F) -> usize
-    where
-        F: FnMut(
-            tx_subsystems::device::PageContainerFileIoServiceRuntime,
-            tx_subsystems::device::PageContainerFileIoServiceTaskConfig,
-            tx_reactor::InitialSchedMeta,
-        ) -> bool,
-    {
-        let mut submitted = 0;
-        for runtime in tx_subsystems::device::page_container_file_io_service_runtimes_snapshot() {
-            if Self::submit_file_io_runtime_task_with(runtime, &mut submit) {
-                submitted += 1;
-            }
-        }
-        submitted
+        submit(claim, config, meta)
     }
 
     #[cfg(test)]
     pub(crate) fn submit_file_io_runtime_tasks_for_test() -> usize {
-        Self::submit_file_io_runtime_tasks_with(|_runtime, _config, _meta| true)
+        struct CountingSpawner(core::sync::atomic::AtomicUsize);
+
+        impl tx_subsystems::device::FileIoServiceRuntimeSpawner for CountingSpawner {
+            fn spawn_file_io_service(
+                &self,
+                claim: tx_subsystems::device::FileIoManagerRuntimeClaim,
+            ) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                let _ = claim.retire();
+            }
+        }
+
+        let spawner = Arc::new(CountingSpawner(core::sync::atomic::AtomicUsize::new(0)));
+        let Some(submitted) =
+            tx_subsystems::device::install_file_io_service_runtime_spawner(spawner.clone())
+        else {
+            return 0;
+        };
+        debug_assert_eq!(submitted, spawner.0.load(Ordering::Acquire));
+        submitted
     }
 
     #[cfg(tx_demo_boot)]
@@ -2513,7 +2511,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // not the authoritative hart identity once the reactor is running.
             let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
             crate::trap::service_pending_maintenance::<P>();
-            let _ = step_engine::service_local_drain_request(usize::MAX);
+            let _ = step_engine::service_local_drain_request(crate::trap::MAINTENANCE_DRAIN_BUDGET);
             if Self::run_secondary_reactor_once(cpu_id) {
                 continue;
             }

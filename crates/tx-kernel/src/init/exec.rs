@@ -575,7 +575,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // do not carry a pre-entry CpuId local across reactor iterations.
             let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
             crate::trap::service_pending_maintenance::<P>();
-            let _ = step_engine::service_local_drain_request(usize::MAX);
+            let _ = step_engine::service_local_drain_request(crate::trap::MAINTENANCE_DRAIN_BUDGET);
             let step = match Self::boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
                 None => {

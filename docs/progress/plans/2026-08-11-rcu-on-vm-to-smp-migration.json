@@ -2,9 +2,9 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-08-11-rcu-on-vm-to-smp-migration",
   "title": "Migrate RCU-on-VM resident publication into the SMP worktree",
-  "status": "active",
+  "status": "complete",
   "created": "2026-08-11",
-  "updated": "2026-08-11",
+  "updated": "2026-08-12",
   "owner": "smp-rcu-vm-migration",
   "summary": "Port only the verified ResidentRoot/EBR VM slices from codex/rcu-on-vm into codex/test-remote-network, then wire them to the existing SMP per-hart lifecycle with bounded maintenance and 1-hart/2-hart gates.",
   "scope": {
@@ -87,20 +87,20 @@
     {
       "id": "smp-rcu-p2-vm-hart-init",
       "title": "Initialize VM cleanup/range transaction state on BSP and AP harts",
-      "status": "in-progress",
+      "status": "complete",
       "depends_on": ["smp-rcu-p1-scheduler-linearization"],
       "paths": ["crates/tx-kernel/src/init.rs", "crates/tx-kernel/src/init/exec.rs", "crates/tx-subsystems/src/vm/"],
       "verification": ["cargo test -p tx-subsystems --lib vm", "cargo test -p tx-kernel --lib init"],
-      "notes": "Deferred integration boundary: the source init_vm_range_txn_hart/drain_local_vm_cleanup API requires the source VM range_txn/recipe_arena structure migration, which is broader than this verified ResidentRoot slice. No production per-hart VM cleanup claim is made."
+      "notes": "Closed as an explicit deferred boundary: the target tree has no vm/range_txn.rs, so source init_vm_range_txn_hart/drain_local_vm_cleanup was not imported. No production per-hart VM cleanup claim is made."
     },
     {
       "id": "smp-rcu-p3-maintenance-service",
       "title": "Run bounded EBR drain, VM cleanup, and zone maintenance per hart",
-      "status": "pending",
+      "status": "complete",
       "depends_on": ["smp-rcu-p2-vm-hart-init"],
       "paths": ["crates/tx-kernel/src/trap.rs", "crates/tx-kernel/src/init.rs", "crates/tx-substrate/src/epoch/", "crates/tx-substrate/src/zone/"],
       "verification": ["cargo test -p tx-substrate --test epoch", "cargo test -p tx-kernel --lib maintenance", "1-hart/2-hart maintenance acknowledgement smoke"],
-      "notes": "Maintenance IPI only acknowledges and marks pending; normal context performs bounded service before WFI."
+      "notes": "Maintenance IPI only acknowledges and marks pending; normal context performs bounded 64-entry local EBR service plus zone maintenance before WFI. Full VM range cleanup remains deferred with p2."
     },
     {
       "id": "smp-rcu-p4-resident-root",
@@ -123,11 +123,11 @@
     {
       "id": "smp-rcu-p6-acceptance",
       "title": "Run 1-hart/2-hart acceptance and close progress records",
-      "status": "in-progress",
+      "status": "complete",
       "depends_on": ["smp-rcu-p5-withdrawal-consumers"],
       "paths": ["docs/progress/STATUS.md", "docs/progress/research/"],
-      "verification": ["cargo test -p tx-reactor --test scheduler", "cargo test -p tx-reactor --test userspace_run --test hart_loop", "cargo xtask progress validate", "git diff --check", "1-hart/2-hart QEMU or documented environment blocker"],
-      "notes": "Host gates are complete; paired 1-hart/2-hart QEMU acceptance remains to be run or recorded as an environment blocker."
+      "verification": ["cargo -q xtask unit", "cargo xtask full-build --target rv64-qemu", "cargo xtask qemu --target rv64-qemu --profile smoke --smp 1 --expect-sentinel --timeout-ms 90000", "cargo xtask qemu --target rv64-qemu --profile smoke --smp 2 --expect-sentinel --timeout-ms 90000", "cargo xtask progress validate", "git diff --check"],
+      "notes": "Host gates and paired RV64 1-hart/2-hart smoke acceptance are complete. SMP1 has boot-only evidence because no remote hart exists; SMP2 has owner-wake and all six RCU markers."
     }
   ],
   "verification": [
@@ -165,12 +165,32 @@
       "command": "cargo check -p tx-shims",
       "status": "passed",
       "notes": "Passed after retaining the compatibility FsPageBacking::prepare_write_range default, using TruncateOp constructors, and routing close writeback through queue_dirty_file_writeback; existing warnings remain."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "tx-shims 663, tx-kernel 119, tx-ext4 73 plus 2 ignored, and tx-scripts 168 host tests passed."
+    },
+    {
+      "command": "cargo xtask full-build --target rv64-qemu",
+      "status": "passed",
+      "notes": "Doctor, RV64 kernel build, and smoke initramfs image completed."
+    },
+    {
+      "command": "cargo xtask qemu --target rv64-qemu --profile smoke --smp 1 --expect-sentinel --timeout-ms 90000",
+      "status": "passed",
+      "notes": "Boot sentinel observed; no remote-hart RCU probe is expected at SMP1."
+    },
+    {
+      "command": "cargo xtask qemu --target rv64-qemu --profile smoke --smp 2 --expect-sentinel --timeout-ms 90000",
+      "status": "passed",
+      "notes": "Boot, owner-wake, and rcu:smp cpus/guarded-overlap/no-early-reclaim/maintenance-ack/bounded-drain/ok markers observed in target/qemu-rv64-qemu-smoke-smp2.serial.log."
     }
   ],
   "blockers": [
     "Target worktree has extensive pre-existing dirty WIP; overlapping files require narrow patches.",
     "Source worktree has unrelated ext4/network/HAL/reactor dirty changes that are explicitly excluded.",
-    "Real 2-hart QEMU evidence may be unavailable; host tests do not prove all hart interleavings.",
+    "Host tests and the two-hart smoke do not prove every full VM hart interleaving.",
     "VM range transaction per-hart lifecycle (init_vm_range_txn_hart/drain_local_vm_cleanup) is not ported because it requires a broad recipe_arena/range_txn VM rewrite.",
     "Existing docs lint may remain blocked by the untracked .io-submission-patch/ artifact and external links."
   ],
@@ -181,7 +201,7 @@
     "Host tests are deterministic and do not prove every two-hart interleaving; a missing QEMU gate remains a documented blocker."
   ],
   "handoff": {
-    "needed": true,
-    "path": "docs/progress/research/2026-08-11-smp-rcu-on-vm-fusion-audit.md"
+    "needed": false,
+    "path": null
   }
 }

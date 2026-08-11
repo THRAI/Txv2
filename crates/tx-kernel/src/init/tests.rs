@@ -478,9 +478,12 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
         1,
     )
     .expect("file io runtime test page container");
-    let runtime = tx_subsystems::device::register_page_container_file_io_service(
+    let runtime = tx_subsystems::device::FileIoManagerRuntimeClaim::detached_for_test(
         pc,
         tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
+        alloc::sync::Arc::new(tx_subsystems::io_manager::runtime::ServiceWakeSource::new(
+            0x72ff,
+        )),
     );
     let mut submitted = 0;
 

@@ -438,6 +438,7 @@ fn docker_e2fsck(image_name: &str, fixture: &DockerFixture, image: &Path) {
 
 fn init_substrate() {
     tx_test_support::init_host();
+    tx_test_support::drain_to_quiescence();
     tx_subsystems::zones::register_all().expect("tx-subsystems zones");
     match page_allocator::claim_zero_frame() {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
@@ -1681,11 +1682,19 @@ fn ext4_depth_two_truncate_public_path_checkpoints_descendant_after_images() {
         .expect("plan depth-two truncate");
     assert_eq!(plan.metadata.len(), 5);
     assert_eq!(plan.revokes.len(), 4);
-    let direct_runtime = mutation_runtime_for_test_with_metadata(46, 5, true);
-    assert!(
-        direct_runtime.begin_mutation(&plan, &guard).is_ok(),
-        "depth-two truncate runtime admission must stage every metadata and revoke record"
-    );
+    {
+        let direct_runtime = mutation_runtime_for_test_with_metadata(46, 5, true);
+        assert!(
+            direct_runtime.begin_mutation(&plan, &guard).is_ok(),
+            "depth-two truncate runtime admission must stage every metadata and revoke record"
+        );
+    }
+    // The direct admission witness owns staged journal resources. Release it
+    // before exercising the mounted path so the production runtime starts
+    // with a clean pool and a fresh epoch observation.
+    drop(guard);
+    tx_test_support::drain_to_quiescence();
+    let guard = epoch::guard();
     let (mounted, runtime, writes, image) = mounted_shared_counting_depth_two_truncate_fs(46);
 
     assert_eq!(
@@ -2401,6 +2410,9 @@ fn ext4_chmod_public_path_admits_new_file_after_buffered_write_settlement() {
         other => panic!("create file for chmod-after-write: {other:?}"),
     };
     assert_metadata_settled(&runtime, &writes);
+    drop(guard);
+    tx_test_support::drain_to_quiescence();
+    let guard = epoch::guard();
 
     let pc = page_container_for_mounted_file(&mounted, file_id, 0, 8);
     let of = open_file_for_page_container(&pc);
@@ -2443,6 +2455,9 @@ fn ext4_chmod_public_path_admits_new_file_with_dirty_buffered_write() {
         other => panic!("create file for chmod-dirty: {other:?}"),
     };
     assert_metadata_settled(&runtime, &writes);
+    drop(guard);
+    tx_test_support::drain_to_quiescence();
+    let guard = epoch::guard();
 
     let pc = page_container_for_mounted_file(&mounted, file_id, 0, 8);
     let of = open_file_for_page_container(&pc);
@@ -2475,6 +2490,9 @@ fn ext4_chmod_vfs_path_admits_new_file_with_dirty_buffered_write() {
         other => panic!("create file for vfs chmod-dirty: {other:?}"),
     };
     assert_metadata_settled(&runtime, &writes);
+    drop(guard);
+    tx_test_support::drain_to_quiescence();
+    let guard = epoch::guard();
 
     let pc = page_container_for_mounted_file(&mounted, file_id, 0, 8);
     let of = open_file_for_page_container(&pc);

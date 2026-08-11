@@ -1,3 +1,20 @@
+- 2026-08-12 (RCU-on-VM to SMP migration closeout).
+  Completed the scoped migration from the `rcu-on-vm` worktree into the SMP
+  tree: immutable `ResidentRoot` publication, generation-checked withdrawal,
+  EBR/publication/zone support, PageBacked consumers, and the existing SMP
+  queue/owner linearization. Maintenance IPIs remain ack/pending-bit only;
+  normal context now drains the CPU-local EBR request with a bounded 64-entry
+  budget and performs zone maintenance. A resident-root `EAGAIN` is retryable,
+  while ext4 tests release long-lived Guards and staged journal admission
+  resources between semantic operations. Verification passed `cargo -q xtask
+  unit`, full tx-ext4 (`73 passed, 2 ignored`), scheduler/userspace/hart-loop
+  (`45/21/7`), RV64 full-build, SMP1 boot, and SMP2 boot plus owner-wake and
+  all six RCU markers. The VM `range_txn` per-hart cleanup seam remains
+  explicitly deferred because the target tree does not contain that structure;
+  PELT, network, and broad VM rewrites remain out of scope.
+  Next step: keep this migration boundary stable and handle the deferred VM
+  range cleanup in a separate plan.
+
 - 2026-08-11 (OSComp ext4/runtime layout follow-up).
   Continued the non-net submission by keeping the ext4-format, ext4, fs,
   kernel init, script, shims, substrate, process, timer, and xtask oscomp

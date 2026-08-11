@@ -3644,6 +3644,27 @@ impl PageContainer {
         if self.file_page_access_conflicts_with_reservation(page, access) {
             return StepOutcome::Err(V3Errno::EBUSY);
         }
+        if access == MaterializeAccess::Write {
+            let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+                return StepOutcome::Err(V3Errno::EINVAL);
+            };
+            match mount.payload().fs_page_backing.prepare_write_range(
+                fs_object_id,
+                offset,
+                crate::vm::USER_PAGE_SIZE,
+                guard,
+            ) {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Continue { .. } => return StepOutcome::Err(V3Errno::EAGAIN),
+                StepOutcome::Yield { shape, .. } => {
+                    if let Some((carrier, interests)) = notification::wait_source_parts(&shape) {
+                        return notification::yield_on_wait_source(NoProgress, carrier, interests);
+                    }
+                    return StepOutcome::Err(V3Errno::EIO);
+                }
+                StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            }
+        }
         let fetch_id = match self.begin_file_page_fetch(page, access) {
             FilePageFetchStart::Cached(materialized) => {
                 return match materialized {
@@ -3735,7 +3756,6 @@ impl PageContainer {
         let first = self.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)?;
         let mut waits_for_async_completion =
             file_service_work_waits_for_async_completion(first.work.as_slice());
-        let mut terminal_error = file_service_work_terminal_error(first.work.as_slice());
 
         if first.next == PageServiceNext::Runnable {
             if let Some(second) =
@@ -3743,8 +3763,6 @@ impl PageContainer {
             {
                 waits_for_async_completion |=
                     file_service_work_waits_for_async_completion(second.work.as_slice());
-                terminal_error = terminal_error
-                    .or_else(|| file_service_work_terminal_error(second.work.as_slice()));
             }
         }
 
@@ -3763,10 +3781,6 @@ impl PageContainer {
             // the page-ready endpoint.
             self.kick_file_io_service(IoServiceKind::Block);
             return self.yield_on_file_page_fetch(page, access, fetch_id);
-        }
-
-        if let Some(errno) = terminal_error {
-            return Some(StepOutcome::Err(errno.into()));
         }
 
         None
@@ -4163,6 +4177,12 @@ impl PageContainer {
                     Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
                 }
             }
+            // Resident-root publication can be temporarily backpressured by
+            // the CPU-local retire budget. Keep the fault owner retryable;
+            // the next drive turn re-enters with a fresh epoch guard.
+            Err(PageCacheError::Backend(Errno::EAGAIN)) => StepOutcome::Continue {
+                progress: NoProgress,
+            },
             Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
         }
     }
@@ -4717,17 +4737,6 @@ fn file_service_work_waits_for_async_completion(work: &[PageServiceDrivenWork]) 
                     | PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. }
             )
         )
-    })
-}
-
-fn file_service_work_terminal_error(work: &[PageServiceDrivenWork]) -> Option<Errno> {
-    work.iter().find_map(|item| match item {
-        PageServiceDrivenWork::BackendSubmission(PageServiceBackendSubmitOutcome::Err(errno)) => {
-            Some(*errno)
-        }
-        PageServiceDrivenWork::BackendSubmitError(_) => Some(Errno::EAGAIN),
-        PageServiceDrivenWork::UnplannedSubmission(_) => Some(Errno::ENOSYS),
-        _ => None,
     })
 }
 

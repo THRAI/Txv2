@@ -12,6 +12,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static MAINTENANCE_SERVICE_PENDING: AtomicU64 = AtomicU64::new(0);
 
+/// Bound normal-context EBR work per maintenance turn so an IPI cannot
+/// convert into an unbounded reactor tail latency spike.
+pub(crate) const MAINTENANCE_DRAIN_BUDGET: usize = 64;
+
 pub struct KernelTrapDispatcher;
 
 impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
@@ -154,7 +158,7 @@ pub(crate) fn service_pending_maintenance<P: TxPlatform>() -> bool {
         return false;
     }
 
-    let _ = crate::adapter::step_engine::service_local_drain_request(usize::MAX);
+    let _ = crate::adapter::step_engine::service_local_drain_request(MAINTENANCE_DRAIN_BUDGET);
     crate::zones::try_bounded_maintenance_tick();
     true
 }
