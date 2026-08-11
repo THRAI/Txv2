@@ -1,4 +1,5 @@
 use super::*;
+use alloc::vec::Vec;
 
 #[test]
 fn ipv4_address_preserves_octets() {
@@ -87,6 +88,84 @@ fn isolated_net_namespaces_allow_same_tcp_endpoint_bind() {
     assert_eq!(found_a.raw(), sock_a.raw());
     assert_eq!(found_b.raw(), sock_b.raw());
     assert_ne!(found_a.raw(), found_b.raw());
+}
+
+#[test]
+fn unix_socketpair_peer_table_supports_hackbench_scale_and_reuse() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let netns = crate::net::create_isolated_net_namespace_for_test("unix-pairs-hackbench")
+        .expect("net namespace")
+        .payload_cap()
+        .expect("net namespace payload");
+    let table = netns.socket_table();
+    let mut pairs = Vec::new();
+
+    for _ in 0..300 {
+        let first = registry::create_socket_in_namespace(
+            SocketKind::UnixStream,
+            SocketOptionSet::default_tcp(),
+            netns.clone(),
+        )
+        .expect("first socket");
+        let second = registry::create_socket_in_namespace(
+            SocketKind::UnixStream,
+            SocketOptionSet::default_tcp(),
+            netns.clone(),
+        )
+        .expect("second socket");
+
+        assert_eq!(
+            step_unix_socketpair_connect(&first, &second, &guard),
+            StepOutcome::Done(())
+        );
+        assert_eq!(
+            table
+                .lookup_unix_stream_peer(first.raw(), &guard)
+                .expect("first peer")
+                .raw(),
+            second.raw()
+        );
+        assert_eq!(
+            table
+                .lookup_unix_stream_peer(second.raw(), &guard)
+                .expect("second peer")
+                .raw(),
+            first.raw()
+        );
+        pairs.push((first, second));
+    }
+
+    for (first, second) in &pairs {
+        assert!(matches!(
+            step_socket_close(first, &guard),
+            StepOutcome::Done(_)
+        ));
+        assert!(table.lookup_unix_stream_peer(first.raw(), &guard).is_none());
+        assert!(table
+            .lookup_unix_stream_peer(second.raw(), &guard)
+            .is_none());
+    }
+
+    let first = registry::create_socket_in_namespace(
+        SocketKind::UnixStream,
+        SocketOptionSet::default_tcp(),
+        netns.clone(),
+    )
+    .expect("reuse first socket");
+    let second = registry::create_socket_in_namespace(
+        SocketKind::UnixStream,
+        SocketOptionSet::default_tcp(),
+        netns,
+    )
+    .expect("reuse second socket");
+    assert_eq!(
+        step_unix_socketpair_connect(&first, &second, &guard),
+        StepOutcome::Done(())
+    );
 }
 
 #[test]

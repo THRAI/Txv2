@@ -37,8 +37,8 @@ use crate::net::execution::{
     step_send_udp_loopback_kernel_bytes_with_post, step_shutdown, step_socket_close,
     step_socket_create, step_tcp_backlog_cleanup, step_tcp_close_staging,
     step_tcp_connection_cleanup, step_tcp_loopback_handshake, step_tcp_loopback_handshake_on_iface,
-    step_tcp_loopback_transfer, DeviceTxBudget, LoopbackPollBudget, NET_EVENT_BUDGET,
-    TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    step_tcp_loopback_transfer, step_unix_socketpair_connect, DeviceTxBudget, LoopbackPollBudget,
+    NET_EVENT_BUDGET, TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 use crate::net::facade::{
     drive_socket_nonblocking, socket_create_facade, socket_listen_facade, socket_poll_ready_facade,
