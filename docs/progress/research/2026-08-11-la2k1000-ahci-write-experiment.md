@@ -328,3 +328,28 @@ For every completed phase, record:
 The plan remains active after host implementation. It is complete only when
 the authorized hardware phase being claimed has evidence; code compilation
 alone does not claim competition-disk durability.
+
+## 9. B0 read-only result
+
+The first real-board control passed on 2026-08-11 without authorizing a media
+write. Commit `73819f58` produced a kernel uImage with a 7,164,144-byte payload
+and deployed SHA-256
+`1bb5134d56bf463ca11638b54ae257fc86ce6c515d14c5a37c706312677d43cb`.
+The previous kernel remains recoverable as
+`txv2-la2k1000.pre-73819f58.uimage`; the validated Alpine initrd was not
+replaced.
+
+U-Boot verified both legacy image CRCs. The exact root boundary was
+`tx.root=sda ro tx.mount.sdcard=0 init=/bin/sh`; txKernel identified
+62,533,296 512-byte sectors, mounted `/dev/sda / ext4 ro`, entered the Alpine
+3.21 shell, and read `/bin/busybox` as SHA-256
+`ee648c5338186ee244098b09f0e691dcb49ca7bd75028ec24629cc817789ed60`.
+Both runtime-stack waterlines remained at the prior safe values, the GMAC
+interface remained available, and one host ping passed. The complete 246-line
+log is `msp/serial/2026-08-11-ahci-write-ro.log`; it contains no
+`txkernel:ahci:io-error`, panic, CPU-pin, guard, or cmdline/state corruption
+marker.
+
+B1 remains blocked on media authorization. The running board stays read-only.
+No remount, create, write, rename, fsync, raw-LBA operation, or filesystem
+repair command was issued.

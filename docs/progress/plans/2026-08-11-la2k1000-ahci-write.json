@@ -181,7 +181,7 @@
     {
       "id": "phase-6-real-board-read-only-control",
       "title": "Boot the new driver read-only and prove no read-path regression",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "phase-5-host-and-build-admission"
       ],
@@ -283,6 +283,11 @@
       "command": "cargo fmt --all -- --check && git diff --check",
       "status": "passed",
       "notes": "Formatting and whitespace checks passed after the implementation edits."
+    },
+    {
+      "command": "real 2K1000 B0: new kernel plus existing bootstrap initrd; tx.root=sda ro; read/hash/shell/interface/one-ping control",
+      "status": "passed",
+      "notes": "Commit 73819f58 kernel uImage payload 7164144 bytes booted with both legacy CRCs OK. AHCI identified 62533296x512, /dev/sda mounted ext4 ro, Alpine 3.21 and /bin/busybox SHA-256 ee648c5338186ee244098b09f0e691dcb49ca7bd75028ec24629cc817789ed60 read successfully, and host ping passed 1/1. The 246-line msp/serial/2026-08-11-ahci-write-ro.log contains no AHCI io-error, panic, CPU-pin, stack-guard, or cmdline/state corruption marker."
     }
   ],
   "risks": [

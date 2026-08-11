@@ -1,4 +1,4 @@
-- 2026-08-11 (**Loongson 2K1000 AHCI 可写传输已完成 host/LA64 编译准入，实板写入仍受安全门约束**).
+- 2026-08-11 (**Loongson 2K1000 AHCI 可写传输已完成 host 与实板只读准入，实板写入仍受安全门约束**).
   **Changed**：以 `42cd4396` 为实现基线，先新增
   `2026-08-11-la2k1000-ahci-write` 计划与逐阶段实验协议，再按红→绿顺序实现。
   AHCI 现通过原有单 slot、4 KiB、32-bit bounce workspace 发出 LBA48
@@ -19,12 +19,15 @@
   `cargo xtask full-build --target la64-2k1000 --skip-doctor --no-image` 均通过。
   `cargo -q xtask unit` 仍仅被既有 tx-shims dispatch 群和两个 tx-kernel
   libctest 命令断言阻断；progress validate 和 docs lint 仍分别是未触碰的旧
-  `completed` 状态、31 个断链/6 个旧词警告。
-  **Blocker / Next**：实现计划保持 active；host 阶段已闭合，但尚无新的实板串口
-  或磁盘写入证据。下一步只部署新 kernel，并以现有 Alpine 盘
-  `tx.root=sda ro` 做只读控制；该控制通过后，必须由用户明确指定 clone/spare
-  medium，才能执行文件级 write/fsync/rename/reset/offline-fsck。不得猜测裸 LBA，
-  也不得把板载比赛盘默认为 disposable。详细实验协议见
+  `completed` 状态、31 个断链/6 个旧词警告。提交 `73819f58` 的新 kernel
+  uImage 已以 SHA-256 `1bb5134d...43cb` 部署，旧 kernel 可回滚；B0 中两个
+  legacy CRC 通过，AHCI 识别 `62533296x512`，`/dev/sda / ext4 ro`，Alpine
+  3.21 与 `/bin/busybox` 全量哈希读取、shell、双核 stack 水位和 1/1 host ping
+  通过。246 行日志没有 AHCI 首错或 kernel invariant 报告。
+  **Blocker / Next**：实现计划保持 active；phase 0–6 与 host commit 已闭合，
+  板载盘仍未发生本实验写入。必须由用户明确指定 clone/spare medium，才能执行
+  文件级 write/fsync/rename/reset/offline-fsck；否则停在当前安全边界。不得猜测
+  裸 LBA，也不得把板载比赛盘默认为 disposable。详细实验协议见
   `docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md`，host 账本见
   `msp/debug-logs/2026-08-11-la2k1000-ahci-write-host-admission.md`。
 
