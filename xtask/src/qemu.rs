@@ -23,6 +23,7 @@ struct QemuOptions {
     timeout: Duration,
     smp: Option<usize>,
     memory_mib: Option<usize>,
+    boot_hartid: Option<usize>,
     /// Skip the busybox-profile virtio-blk drive wiring. Used by smoke
     /// runs that only need the initramfs to come up; it sidesteps the
     /// `mkfs.ext4` host-tool dependency.
@@ -174,6 +175,13 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
                 })
         })
         .transpose()?;
+    let boot_hartid = optional_option_value(args, "--boot-hartid")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|err| format!("invalid --boot-hartid value '{value}': {err}"))
+        })
+        .transpose()?;
 
     let expect_sentinel = args.iter().any(|arg| arg == "--expect-sentinel");
     let expect_markers = option_values(args, "--expect-marker")?;
@@ -191,6 +199,7 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
         timeout,
         smp,
         memory_mib,
+        boot_hartid,
         no_block: args.iter().any(|arg| arg == "--no-block"),
         interactive: args.iter().any(|arg| arg == "--interactive"),
         boot_mode,
@@ -387,10 +396,18 @@ fn qemu_command(
 
     let kernel = target.kernel_path(root);
     let serial_log = serial_log_relative(target, profile);
+    let machine = if let Some(boot_hartid) = options.boot_hartid {
+        if target != TxTarget::Rv64Qemu {
+            return Err("--boot-hartid is only supported for rv64-qemu".into());
+        }
+        format!("{},boot-hartid={boot_hartid}", target.qemu_machine())
+    } else {
+        target.qemu_machine().to_string()
+    };
     let mut args = vec![
         target.qemu_binary().to_string(),
         "-machine".to_string(),
-        target.qemu_machine().to_string(),
+        machine,
     ];
 
     if let Some(cpu) = qemu_cpu(target) {
@@ -1029,6 +1046,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             smp: None,
             memory_mib: None,
+            boot_hartid: None,
             no_block: false,
             interactive: false,
             boot_mode: None,

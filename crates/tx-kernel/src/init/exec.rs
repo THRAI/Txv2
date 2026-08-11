@@ -499,8 +499,13 @@ impl<P: TxPlatform> CoreInit<P> {
         let submit_thread = thread.clone();
         let current_hart = boot_runtime::HartId(current_cpu.0);
         let mut signal = super::SmpRescheduleSignal::<P>::new();
+        // Initial userspace can be published to a remote hart (CPU0-safe entry
+        // when the boot hart is nonzero). Enable the poll-lease path before
+        // publishing so a reschedule IPI cannot wake the target AP into the
+        // legacy lock-held poll path.
+        super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
         let submitted = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task_with_meta_from_hart(
+            reactor.submit_task_publish_ack(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
                     thread.clone(),
                     wrapper_payload,
@@ -511,18 +516,24 @@ impl<P: TxPlatform> CoreInit<P> {
                 &mut signal,
             )
         });
-        let Some((task_key, _report)) = submitted else {
+        let Some(report) = submitted else {
             // Boot reactor not initialised; nothing to drive.
             return;
         };
+        let task_key = report.task;
         Self::register_thread_reactor_task(thread.tid.0, task_key);
+        Self::emit_smp_witness_initial_submit(
+            current_hart,
+            report.publish.hart,
+            report.dispatch.placements,
+            report.dispatch.remote_ipis,
+            report.dispatch.local_reschedules,
+        );
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
         Self::deadline_timer().enable_timer_wakeups();
-
-        // Enable concurrent poll on all harts (Phase 1a poll lease).
-        super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
+        let mut smp_witness_drive_logs = 0usize;
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -563,11 +574,21 @@ impl<P: TxPlatform> CoreInit<P> {
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
             let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-            let _ = step_engine::service_local_drain_request(64);
+            crate::trap::service_pending_maintenance::<P>();
+            let _ = step_engine::service_local_drain_request(usize::MAX);
             let step = match Self::boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
-                None => break,
+                None => {
+                    if smp_witness_drive_logs < 8 {
+                        Self::emit_smp_witness_drive_none(smp_witness_drive_logs, loop_cpu);
+                    }
+                    break;
+                }
             };
+            if smp_witness_drive_logs < 8 {
+                Self::emit_smp_witness_drive_step(smp_witness_drive_logs, loop_cpu, step);
+                smp_witness_drive_logs += 1;
+            }
             let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
             let submitted_child_after_poll = Self::drain_pending_child_submits();
 
@@ -594,6 +615,7 @@ impl<P: TxPlatform> CoreInit<P> {
             } else {
                 Default::default()
             };
+            crate::zones::try_bounded_maintenance_tick();
             // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
             // may have called wake_by_ref() on parked tasks, which is
             // invisible to step.should_idle() computed before the drain) or
@@ -669,6 +691,75 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:exited:");
         Self::write_signed_decimal(status_word);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    fn emit_smp_witness_initial_submit(
+        current_hart: boot_runtime::HartId,
+        publish_hart: boot_runtime::HartId,
+        placements: usize,
+        remote_ipis: usize,
+        local_reschedules: usize,
+    ) {
+        if !cfg!(tx_smp_scheduler_witness) {
+            let _ = (
+                current_hart,
+                publish_hart,
+                placements,
+                remote_ipis,
+                local_reschedules,
+            );
+            return;
+        }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sched-witness:init-submit:current=");
+        Self::write_signed_decimal(current_hart.0 as i32);
+        tx_hal::console_write_str::<P>(":publish=");
+        Self::write_signed_decimal(publish_hart.0 as i32);
+        tx_hal::console_write_str::<P>(":placements=");
+        Self::write_signed_decimal(placements as i32);
+        tx_hal::console_write_str::<P>(":remote-ipis=");
+        Self::write_signed_decimal(remote_ipis as i32);
+        tx_hal::console_write_str::<P>(":local-reschedules=");
+        Self::write_signed_decimal(local_reschedules as i32);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    fn emit_smp_witness_drive_none(index: usize, loop_cpu: tx_hal::CpuId) {
+        if !cfg!(tx_smp_scheduler_witness) {
+            let _ = (index, loop_cpu);
+            return;
+        }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sched-witness:drive-none:index=");
+        Self::write_decimal_unsigned(index);
+        tx_hal::console_write_str::<P>(":hart=");
+        Self::write_signed_decimal(loop_cpu.0 as i32);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    pub(super) fn emit_smp_witness_drive_step(
+        index: usize,
+        loop_cpu: tx_hal::CpuId,
+        step: boot_runtime::hart_loop::HartLoopStep,
+    ) {
+        if !cfg!(tx_smp_scheduler_witness) {
+            let _ = (index, loop_cpu, step);
+            return;
+        }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sched-witness:drive-step:index=");
+        Self::write_decimal_unsigned(index);
+        tx_hal::console_write_str::<P>(":hart=");
+        Self::write_signed_decimal(loop_cpu.0 as i32);
+        tx_hal::console_write_str::<P>(":polled=");
+        Self::write_decimal_unsigned(step.stats.polled);
+        tx_hal::console_write_str::<P>(":idle=");
+        Self::write_decimal_unsigned(step.should_idle() as usize);
+        tx_hal::console_write_str::<P>(":resched=");
+        Self::write_decimal_unsigned(step.consumed_reschedule_marker() as usize);
+        tx_hal::console_write_str::<P>(":placements=");
+        Self::write_decimal_unsigned(step.wake_dispatch.placements);
         tx_hal::console_write_str::<P>("\n");
     }
 

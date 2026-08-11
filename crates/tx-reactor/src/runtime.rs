@@ -1310,7 +1310,7 @@ impl HartRuntimeView<'_> {
                 .get(victim)
                 .map(|local| {
                     let depths = local.scheduler().queue_depths();
-                    depths.boosted + depths.new + depths.preempted
+                    depths.preempted
                 })
                 .unwrap_or(0);
             if depth > best_depth {

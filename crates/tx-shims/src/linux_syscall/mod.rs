@@ -42,8 +42,9 @@
 extern crate alloc;
 
 use crate::adapter::reactor_entry;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use reactor_entry::userspace::SyscallRequest;
 use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf};
@@ -70,8 +71,10 @@ use tx_subsystems::signal::{
 use tx_subsystems::thread_runtime::execution::{
     step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange, SigprocmaskOp,
 };
+use tx_subsystems::thread_runtime::adapter::step_engine::{MailboxEvent, TaskMailbox};
 use tx_subsystems::thread_runtime::{
-    step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillWithPostOp, ThreadPayload,
+    step_thread_exit, step_thread_exit_with_posts, ThreadExitOp, ThreadIdentity,
+    ThreadKillWithPostOp, ThreadPayload,
 };
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
@@ -298,6 +301,16 @@ pub const TTY_WRITE_MAX_INLINE: usize = 4096;
 /// from the pre-rebase net tree; the rebase dropped it with the socket I/O lane).
 pub const SOCKET_IO_MAX_INLINE: usize = 64 * 1024;
 
+const ZERO_LINK_DESTROY_MAINTENANCE_PERIOD: usize = 64;
+static ZERO_LINK_DESTROY_MAINTENANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn zero_link_destroy_pressure_maintenance() {
+    let seq = ZERO_LINK_DESTROY_MAINTENANCE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    if seq % ZERO_LINK_DESTROY_MAINTENANCE_PERIOD == 0 {
+        tx_subsystems::zones::try_memory_pressure_maintenance_tick();
+    }
+}
+
 /// Maximum path-name length accepted by `execve(2)` (Linux's
 /// `PATH_MAX`). Mirrors the `TTY_WRITE_MAX_INLINE = 4096` discipline
 /// for inline buffer copies. A longer path returns `-ENAMETOOLONG`
@@ -522,11 +535,7 @@ where
     result
 }
 
-fn maybe_log_efault_syscall<P: tx_hal::ConsoleIf>(
-    nr: u64,
-    args: [u64; 6],
-    result: &SyscallResult,
-) {
+fn maybe_log_efault_syscall<P: tx_hal::ConsoleIf>(nr: u64, args: [u64; 6], result: &SyscallResult) {
     if !cfg!(debug_assertions) || *result != SyscallResult::Error(EFAULT_VALUE) {
         return;
     }
@@ -588,7 +597,7 @@ pub fn dispatch_pthread_hot_oneshot(
 /// This keeps pthread `CLONE_THREAD` and regular non-vfork fork out of the
 /// broad async dispatcher carried by `run_thread`. `CLONE_VFORK` is excluded
 /// because it intentionally parks the parent until child exec/exit.
-pub fn dispatch_clone_oneshot<P: PmapIf>(
+pub fn dispatch_clone_oneshot<P: PmapIf + tx_hal::ConsoleIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -639,6 +648,37 @@ pub fn dispatch_thread_exit_oneshot(
             SyscallResult::Error(EAGAIN_VALUE)
         }
     };
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
+/// Fast dispatch for `exit(2)` with caller-provided mailbox post hooks.
+///
+/// The kernel thread loop uses this variant so the final-thread exit
+/// cascade can wake waiters with the current hart hint, matching the
+/// `exit_group` fast path.
+pub fn dispatch_thread_exit_oneshot_with_posts<F, G>(
+    req: &SyscallRequest,
+    thread: &Cap<ThreadIdentity>,
+    signal_post: F,
+    wake_post: G,
+) -> Option<SyscallResult>
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    if req.nr != NR_EXIT {
+        return None;
+    }
+    let l0_span = emit_syscall_enter(req);
+    let result =
+        match step_thread_exit_with_posts(thread.clone(), req.args[0] as i32, signal_post, wake_post)
+        {
+        tx_subsystems::thread_runtime::ThreadExitOutcome::Completed => SyscallResult::NoReturn,
+        tx_subsystems::thread_runtime::ThreadExitOutcome::Retry => {
+            SyscallResult::Error(EAGAIN_VALUE)
+        }
+        };
     emit_syscall_exit(l0_span, &result);
     Some(result)
 }
@@ -1066,13 +1106,13 @@ where
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_UNSHARE => sys_unshare(req.args, ctx),
         nr if nr == NR_SETNS => sys_setns(req.args, ctx),
-        nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
+        nr if nr == NR_WAIT4 => sys_wait4::<P>(req.args, ctx).await,
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args, ctx),
         nr if nr == NR_GET_ROBUST_LIST => sys_get_robust_list(req.args, ctx),
-        nr if nr == NR_GETCPU => sys_getcpu(req.args, ctx),
+        nr if nr == NR_GETCPU => sys_getcpu::<P>(req.args, ctx),
         nr if nr == NR_PERSONALITY => sys_personality(req.args, ctx),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`

@@ -1,3 +1,130 @@
+- 2026-08-11 (SMP commit boundary closeout).
+  Staged the non-PELT SMP scheduler / userspace / witness slice into a
+  clean commit boundary and left ext4/layout, net/socketpair, and other
+  module follow-ups unstaged. Verification passed `cargo test -p tx-reactor
+  --test scheduler -- --nocapture`, `cargo test -p tx-reactor --test
+  userspace_run -- --nocapture`, `cargo test -p tx-kernel
+  initial_userspace_sched_meta_ -- --nocapture`, `cargo test -p tx-kernel
+  timer_preempt_consumption_clears_userspace_slot_before_repoll -- --nocapture`,
+  and `cargo test -p xtask smp_scheduler_witness -- --nocapture`. Next step:
+  keep the remaining non-SMP workspace drift out of this submission and
+  revisit the other module-specific blockers separately.
+
+- 2026-08-11 (RV64 SMP wait4/exit wake-race fix).
+  Fixed the reactor wake race that could drop a child-exit wake while the
+  waiting task was still `Polling`: wake consumption now only happens once the
+  task is actually `Parked`, so an early `drain_wakes` pass no longer steals
+  the last hop before `wait4` completion. Verification: focused
+  `cargo test -p tx-reactor polling_wake_survives_early_wake_queue_drain` and
+  `cargo test -p tx-shims --lib dispatch_wait4_blocking_resolves_when_child_zombifies`
+  both pass. I also cleaned up the temporary `:dbg:*` probes from the syscall
+  path. Guest OSComp still needs follow-up: a fresh `cargo xtask oscomp test
+  --target rv64-qemu --boot-suite basic-glibc` run stalled early at
+  `Testing brk :` and was killed after no further serial progress, so the full
+  non-LTP matrix is not green yet. Next step: retest the SMP4 witness that was
+  originally stuck in `test_exit`, then rerun the non-LTP OSComp shards.
+
+- 2026-08-11 (RV64 SMP4 OSComp glibc basic loader fix).
+  Fixed the glibc basic lane to run from a writable `/tmp/tx-basic-glibc`
+  copy of `/musl/glibc/basic` and to invoke the glibc interpreter
+  `/lib/ld-linux-riscv64-lp64d.so.1` instead of trying to exec
+  `/musl/glibc/lib/libc.so`. Host verification passed
+  `cargo test -p tx-kernel init::exec::tests -- --nocapture` (20/20).
+  Fresh SMP4 focused witnesses now reach `#### OS COMP TEST GROUP START
+  basic-glibc ####` and case execution without the earlier
+  `Permission denied` on `run-all.sh`/`libc.so`; the remaining work is to
+  let the refreshed full non-LTP SMP4 run continue and see which later suite
+  becomes the next blocker.
+
+- 2026-08-11 (RV64 SMP4 lmbench timer compaction progress).
+  `tx-time` timer heap now compacts cancelled/expired tombstones before insert
+  growth, keeps `KeySlot` semantics, rebuilds live slots/key-index entries in
+  already-allocated storage, and retains bounded follow-up insert headroom.
+  This avoids the earlier `ReactorTimerDomain::register_deadline` contiguous
+  allocation failures without taking the rejected compressed-index path that
+  trapped in allocator dealloc. Verification: `cargo test -p tx-time --lib --
+  --nocapture` (32/32), `cargo -q xtask unit`, RV64 release build + OSComp
+  submit, and focused SMP4 `lmbench-musl` private-image runs. The best fresh
+  witness progressed through `fork+/bin/sh -c`, file write bandwidth,
+  `Pagefaults`, `lat_mmap`, and into fs latency with judge
+  `19.61694744919675/36` before host SIGTERM truncated QEMU; this is forward
+  progress, not full completion. Next: obtain a non-truncated full
+  `lmbench-musl` group-end, then run all non-LTP/non-netperf suites on SMP4.
+  Local ledger:
+  `msp/debug-logs/2026-08-09-oscomp-multicore-performance-operation-ledger.md`.
+
+- 2026-08-10 (RV64 SMP4 non-LTP follow-up: libctest/iozone/cred cache).
+  Kept the BSP-hart initial userspace placement fix, then made three runtime
+  repairs for the SMP4 non-LTP OSComp path: `libctest-musl` no longer builds a
+  fresh placeholder restriction cap on every syscall entry (the cached
+  `Cap<RestrictionStackHandle>` now clones in place), `iozone-musl` runs from a
+  writable `/tmp/tx-iozone-musl` copy instead of the read-only sdcard cwd, and
+  `lmbench-musl` now runs from `/tmp/tx-lmbench-musl` so its temp-file probes
+  stop tripping ROFS. Verification: host `cargo -q xtask unit`,
+  `cargo xtask progress validate`, `git diff --check`, focused
+  `libctest-musl` `220/220`, focused `iozone-musl` `20.502667201680186/20`,
+  and focused `lmbench-musl` progressed past the early latency suite without
+  the earlier ROFS/OOM collapse. Remaining blocker: the broad non-LTP shard
+  still needs a longer `lmbench-musl` run to reach group end; the current tail
+  is a long-run/perf issue, not a PELT dependency. See
+  `target/oscomp/fix-nonltp/libctest/libctest-musl-smp4-20260810-timerprep-r2.txt`,
+  `target/oscomp/fix-nonltp/iozone/iozone-musl-smp4-20260810-writable-tmp.txt`,
+  and `target/oscomp/fix-nonltp/lmbench/lmbench-musl-smp4-20260810-restriction-cache-tmp.txt`.
+
+- 2026-08-10 (RV64 SMP4 non-LTP libctest focus fixes).
+  Restored CPU0-first initial userspace publication for nonzero boot harts,
+  kept cfg-gated child spread limited to the witness lane, and cleaned up the
+  per-case dynamic libctest temp workdirs so the focused SMP4 `tls_get_new_dtv`
+  and `pthread_cancel_points` witnesses both pass again. Verified with
+  `cargo test -p tx-kernel initial_userspace_sched_meta_ -- --nocapture`,
+  focused SMP4 `libctest-musl:dynamic:tls_get_new_dtv`, and focused SMP4
+  `libctest-musl:static:pthread_cancel_points` logs. Full non-LTP still has a
+  later `libctest-musl dynamic tls_get_new_dtv` timeout inside the long musl
+  sequence, and the broad 20-suite SMP4 run is still stuck before the guest
+  reaches `tx-test-init:setup:start`; next step is to narrow that startup
+  shape further before claiming full non-LTP closure. See
+  `target/oscomp/fix-nonltp/os_serial_out_rv_smp4-libctest-tls-new-dtv-cpu0first-20260810.txt`,
+  `target/oscomp/fix-nonltp/os_serial_out_rv_smp4-libctest-pthread-cancel-points-cpu0first-20260810.txt`,
+  and `target/oscomp/fix-nonltp/os_serial_out_rv_smp4-nonltp-muslfirst-cpu0first-20260810.txt`.
+
+- 2026-08-09 (RV64 SMP4 OSComp non-LTP layout fixes).
+  Fixed the first TestInit/sdcard layout blockers for focused
+  `basic-musl,busybox-musl`: TestInit now seeds rootfs scratch dirs, stat
+  syscalls resolve through the mount namespace, BusyBox and basic mutable cases
+  run from writable `/tmp`, and basic uses explicit loader/compat symlinks.
+  Fresh SMP4 focused score is `155/157` (`basic-musl 100/102`,
+  `busybox-musl 55/55`) versus the earlier same-shape `29/157`. Remaining
+  basic loss is `brk` partial credit; full non-LTP still has the
+  cyclictest/libctest/lmbench blockers recorded in the full-run note. See
+  `docs/progress/research/2026-08-09-oscomp-nonltp-layout-fixes.md`.
+
+- 2026-08-09 (RV64 SMP4 OSComp full non-LTP coverage).
+  Ran all OSComp suites except LTP with `-smp 4` using ordered shards because
+  the one-shot run blocks. The first blocker is `cyclictest-musl` after
+  high-resolution timer/cpumask warnings. Bypassing that exposes a
+  `libctest-musl static pthread_cancel_points` Zone enqueue panic; bypassing
+  that exposes an `lmbench-musl` allocation/OOM panic with
+  `RestrictionStackHandle` growth. `iperf-musl`, `libcbench-musl`, and
+  `lua-musl` reach group end, while many other losses are image/layout issues
+  (`/glibc`, writable `/var/tmp`, helper and benchmark binaries). A post
+  basic-tmpfs bounded prefix now shows `155/377` partial before reproducing the
+  `libctest-musl` Zone panic in the explicit non-LTP group order. See
+  `docs/progress/research/2026-08-09-oscomp-full-nonltp-smp4.md`.
+
+- 2026-08-09 (SMP OSComp libcbench multicore check).
+  The ext4 sdcard mount fix now lets RV64 OSComp `libcbench-musl` start and
+  reach group end under both `-smp 1` and `-smp 4`. OSComp/LTP sdcard workload
+  boots skip the startup-only RCU SMP smoke that otherwise blocks 4-core before
+  userspace; the ordinary smoke path remains the owner of that invariant.
+  Fresh 2x results do not show a performance win: SMP1 default summed 5.877901s
+  across 27 `time:` rows with judge 31.17261685982155/27, while SMP4 default
+  summed 6.091749s with judge 30.67807807933117/27. A cfg-only
+  `tx_userspace_child_spread_smp4` oracle improved SMP4 slightly to 6.039818s
+  and judge 30.874192297415338/27, but still lost to SMP1. PELT remains
+  canceled; next is an explicit non-PELT child-spread/movable boot gate plus
+  owner counters before any OSComp performance promotion claim. See
+  `docs/progress/research/2026-08-09-smp-oscomp-libcbench-multicore.md`.
+
 - 2026-08-09 (ext4 M1 rustc materialization path).
   Added a current-interface TEST/SCRATCH/WORKLOAD materializer, a
   WORKLOAD-copy-only resolver installer, and a guest runner that uses named
@@ -226,6 +353,168 @@
   worktree has no historical Tier 1 acceptance receipt for integrity-only
   verification, so this is host regression evidence rather than renewed
   crash/e2fsck/xfstests acceptance.
+- 2026-08-09 (SMP non-PELT closeout).
+  Reframed the SMP rollout to exclude PELT entirely and close on the
+  already-landed non-PELT path: static and movable userspace placement,
+  migration-safe unwind, idle-first direct steal, forced affinity migration,
+  and periodic rebalance. The plan now cancels the PELT and storage-sharding
+  steps, and records the final matrix as 2x guest evidence on `pipe` and
+  `affinity` plus host scheduler/reactor tests. `stress`, `mixed`, and `timer`
+  still surface separate clone/waker timing faults, so they are left as
+  follow-up bugs rather than closeout criteria. Verification passed `cargo
+  test -p tx-reactor --test scheduler -- --nocapture`, `cargo test -p
+  tx-reactor --test reactor_smoke -- --nocapture`, `cargo xtask test
+  smp-scheduler-witness --target rv64-qemu --case pipe --timeout-ms 120000`,
+  `cargo xtask test smp-scheduler-witness --target rv64-qemu --case affinity
+  --timeout-ms 120000`, `cargo xtask progress validate`, and `git diff
+  --check`.
+
+- 2026-08-09 (SMP movable case driver wired).
+  Added a real `--case static|movable` driver for the SMP scheduler witness:
+  `xtask` now maps `--case movable` to `tx.sched.smp=movable
+  tx.sched.load=depth`, `tx-test-init.sh` reads `tx.sched.smp` from
+  `/proc/cmdline`, and the freestanding witness records the selected case in
+  both begin/result markers. Verification passed
+  `cargo test -p xtask smp_scheduler_witness -- --nocapture` plus two guest
+  runs of `cargo xtask test smp-scheduler-witness --target rv64-qemu --case
+  movable --timeout-ms 120000`. Next step: extend the same case driver to the
+  remaining S3 witnesses (`pipe`, `affinity`, `timer`, `pthread`, `mixed`,
+  `stress`) or decide the smallest remaining gate that is enough to promote
+  movable userspace. Blocker: broader S3 guest coverage still pending.
+
+- 2026-08-09 (SMP migration-safe and direct-steal slices completed).
+  Closed the `userspace-migration-safe` audit by hardening the userspace-run
+  slot contract around the actual enter hart, adding a trap-shell-only
+  `complete_running_trap` path that rejects pending entry tokens and stale
+  request ids, and proving the timer-preempt placeholder can still be replaced
+  by the later real trap. Then closed the `direct-steal-affinity` slice by
+  narrowing steal/rebalance to the victim's `preempted_queue.front` only,
+  preserving ineligible fronts in place, and updating victim selection to use
+  preempted depth only. Verification passed `cargo test -p tx-reactor --test
+  userspace_run -- --nocapture`, `cargo test -p tx-kernel thread_future --
+  --nocapture`, `cargo test -p tx-kernel trap_handoff -- --nocapture`, `cargo
+  test -p tx-subsystems --lib thread_runtime -- --nocapture`, `cargo test -p
+  tx-reactor --test scheduler -- --nocapture`, `cargo test -p tx-reactor
+  --test reactor_smoke -- --nocapture`, `cargo test -p tx-shims --lib
+  dispatch_sched_setaffinity -- --nocapture`, `cargo check -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`, scoped
+  rustfmt, `git diff --check`, `cargo xtask progress validate`, and two guest
+  runs of `cargo xtask test smp-scheduler-witness --target rv64-qemu
+  --timeout-ms 120000`. The broader `cargo test -p tx-subsystems thread_runtime
+  -- --nocapture` command is still blocked by existing integration-test
+  private wait-source access errors in `v3_*waitsource` / `v3_userfaultfd_e2e`;
+  the lib-scoped thread-runtime tests passed. Next step: move to
+  `s3-movable-userspace` and re-check whether the current static witness is
+  enough evidence or whether movable stress needs a further code slice before
+  PELT/sharding.
+
+- 2026-08-09 (SMP userspace migration-safe slot cleanup in progress).
+  Advanced the `userspace-migration-safe` step by closing a hart-local
+  userspace-slot leak on timer preemption: `run_thread` now records the
+  actual enter-userspace hart and clears that hart's userspace payload and
+  identity after the userspace-run wait resolves, even if the future is
+  repolled on a different hart. Added a host regression that simulates
+  enter on hart0 and timer-preempt consumption on hart2, proving the old
+  hart slot and active request are cleared before repoll. Verification
+  passed `cargo test -p tx-kernel
+  timer_preempt_consumption_clears_userspace_slot_before_repoll --
+  --nocapture`, `cargo test -p tx-reactor --test userspace_run --
+  --nocapture`, `cargo test -p tx-subsystems --lib thread_runtime --
+  --nocapture`, `cargo test -p tx-kernel thread_future -- --nocapture`,
+  `cargo test -p tx-kernel trap_handoff -- --nocapture`, `cargo check -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`, scoped
+  rustfmt, `git diff --check`, and two guest runs of `cargo xtask test
+  smp-scheduler-witness --target rv64-qemu --timeout-ms 120000`. The broader
+  `cargo test -p tx-subsystems thread_runtime -- --nocapture` command is
+  currently blocked before filtering by existing integration-test private
+  wait-source access errors in `v3_*waitsource` / `v3_userfaultfd_e2e`; the
+  lib-scoped thread-runtime tests passed. Next step: finish the remaining
+  migration-safe audit around TaskKey/run-seq/hart ownership and stale
+  active-request rejection before enabling direct steal/affinity.
+
+- 2026-08-09 (SMP scheduler witness lane completed).
+  Finished the RV64/QEMU SMP witness slice by narrowing the spread gate to
+  non-leader witness clones, keeping non-spread children on the submit hart,
+  and making the guest witness use slot-derived diagnostics instead of the
+  unstable stack-local clone parameter. The host verifier now accepts the
+  worker-window publish sequence `[0,1,2,3]` and ignores earlier script/setup
+  child-submit noise; `done`/`errors` remain diagnostic. Verification passed
+  `cargo test -p tx-kernel initial_userspace_sched_meta_stays_on_current_hart_when_boot_hart_is_nonzero -- --nocapture`,
+  `cargo test -p xtask smp_scheduler_witness -- --nocapture`, and two guest
+  matrix runs of `cargo xtask test smp-scheduler-witness --target rv64-qemu
+  --timeout-ms 120000`. Next step: continue with the remaining SMP rollout
+  steps (`userspace-migration-safe`, then direct steal/affinity), but the
+  witness lane itself is now stable. Blocker: none on this slice.
+
+- 2026-08-08 (ext4 four-worktree reconciliation plan).
+  Added
+  `docs/progress/research/2026-08-08-ext4-worktree-reconciliation.md`
+  and proposed
+  `docs/progress/plans/2026-08-08-ext4-worktree-reconciliation.json` after a
+  read-only audit and isolated merge exercises for `ext4-jbd2-revoke`,
+  `ext4-journal-settlement`, `ext4-rustc-performance`, and
+  `rsext4-migration-p0`. None is a whole-branch merge candidate. The plan keeps
+  the accepted Tier 1 lifecycle and receipt as the floor, splits current-missing
+  work into A1-A6 Tier 2 revoke/extent/allocation/truncate slices and M1-M3
+  HAL/QEMU/resolver/rustc-performance handoff slices, drops superseded runtime
+  and tooling paths, and defers cross-transaction replay plus mixed VM writable
+  mapping experiments behind separate design gates. No implementation changed.
+  Verification passed `cargo xtask progress validate` (44 records) and scoped
+  whitespace checks for the two new files plus this additive status entry.
+  `cargo xtask lint docs` is blocked by the user-owned untracked
+  `.io-submission-patch/` duplicate repository tree; the root-wide linter has
+  no exclusion for it, and no reported finding named the new reconciliation
+  artifacts. Next: preserve the dirty primary checkout, create a clean
+  `codex/ext4-worktree-reconciliation` worktree, and activate only
+  `g0-clean-integration-baseline`. Blockers: Docker e2fsprogs is required for
+  image oracles; rustc performance promotion waits on the proposed I/O
+  SubmissionManager `canonical-contracts`, `c0-ext4-frontier`, and P0 stages.
+
+- 2026-08-08 (SMP scheduler witness image run and current blocker).
+  Added a bounded guest witness lane for the narrowed "normal heuristic SMP
+  scheduling, no direct stealing yet" slice: `cargo xtask test
+  smp-scheduler-witness --target rv64-qemu --timeout-ms N` now builds the
+  RV64 kernel with `--cfg tx_userspace_child_spread_smp4`, rebuilds the
+  test-init initramfs, overlays `/smp-scheduler-witness`, boots QEMU with
+  `-smp 4`, and parses a `sched-smp:result` marker. `getcpu(2)` now reports
+  `P::current_cpu_id()` instead of hard-coded CPU0 so guest evidence can name
+  the executing hart. Also restored initial userspace entry to CPU0 when CPU0
+  is online, keeping first entry CPU0-safe while cfg-gated clone children use
+  online affinity plus `spread_on_submit`. Verification passed `cargo -q xtask
+  unit`, `cargo test -p tx-kernel
+  initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero --
+  --nocapture`, `cargo xtask test smoke --target rv64-qemu --timeout-ms 90000
+  --trap-trace`, and a cfg-only image/QEMU check waiting for
+  `tx-test-init:setup:start`. A fresh self-built witness image now also proves
+  the scheduler path can publish and poll clone children on APs: cfg-gated
+  markers observed child `tid=4` entering on hart1 and `tid=6` entering on
+  hart2 with normal `pc`/`ra`/`sp` user context. The full witness image still
+  does not pass: depending on SMP timing it either times out during early
+  userspace entry after `userspace:submitted`, or reaches multiple clone
+  workers and then trips an S-mode trap in the userspace trap/exit/recycle
+  path (`atomic_load` from a null-ish `0x239`, or a prior direct-map PC after
+  concurrent worker writes). The witness has been narrowed so workers no
+  longer write stdout or exit before the parent result, reducing TTY and
+  terminal-child noise. Next: fix the AP userspace trap/resume stability issue
+  enough to produce the final `sched-smp:result pass=1 seen-mask=0x0f`
+  receipt; do not advance to direct stealing, PELT, or S5 sharding until this
+  normal heuristic witness is stable.
+
+- 2026-08-08 (self-built RV64 smoke image run).
+  Built the current checkout's RV64 QEMU kernel and test-init initramfs via
+  `cargo xtask test smoke --target rv64-qemu --timeout-ms 90000 --trap-trace`;
+  the run completed successfully and observed the boot sentinel plus the SMP
+  owner-wake and RCU markers:
+  `txkernel:qemu-riscv64-virt:boot:ok`,
+  `txkernel:qemu-riscv64-virt:reactor:owner-wake:smp:ok`,
+  `txkernel:qemu-riscv64-virt:rcu:smp:cpus:ok`, and
+  `txkernel:qemu-riscv64-virt:rcu:smp:ok`. Artifacts:
+  `target/images/test-init-initramfs-rv64-qemu.cpio`,
+  `target/qemu-rv64-qemu-smoke.serial.log`, and
+  `target/qemu-rv64-qemu-smoke.log`. Next: run the scheduler witness matrix if
+  guest-level scheduling evidence is needed; otherwise keep direct stealing and
+  S5 sharding untouched. Blocker: this smoke run proves boot/AP/reactor/RCU
+  markers, not the full userspace scheduler acceptance matrix.
 
 - 2026-08-05 (I/O SubmissionManager performance implementation plan).
   Added the approved 19-task implementation plan at

@@ -30,15 +30,18 @@ use crate::Result;
 const DEFAULT_TARGET: &str = "rv64-qemu";
 const VDSO_WITNESS_SOURCE: &str = "tools/shell-tests/vdso-phase5-probe.c";
 const VVAR_SMP_WITNESS_SOURCE: &str = "tools/shell-tests/vdso-vvar-smp-probe.c";
+const SMP_SCHEDULER_WITNESS_SOURCE: &str = "tools/shell-tests/smp-scheduler-witness.c";
 const VDSO_WITNESS_START: &str = "tools/shell-tests/vdso-phase5-start.S";
 const VDSO_WITNESS_BINARY: &str = "vdso-phase5-probe";
 const VVAR_SMP_WITNESS_BINARY: &str = "vdso-vvar-smp-probe";
+const SMP_SCHEDULER_WITNESS_BINARY: &str = "smp-scheduler-witness";
 const VDSO_WITNESS_PASS_MARKER: &str = "vdso-phase5:pass";
 const VDSO_WITNESS_FALLBACK_MARKER: &str = "vdso-phase5:fallback=clock_gettime-syscall";
 const VDSO_WITNESS_LAYOUT_PREFIX: &str = "vdso-phase5:layout ";
 const VDSO_WITNESS_SIGNAL_RESTORER_MARKER: &str = "vdso-phase5:signal-restorer=pass";
 const VDSO_WITNESS_VVAR_SMP_MARKER_PREFIX: &str = "vdso-phase5:vvar-smp=pass";
 const VDSO_WITNESS_VVAR_SMP_MARKER: &str = "vdso-phase5:vvar-smp=pass writer-updates=1024 reader-reads=500000 writer-mask=0x0000000000000002 reader-mask=0x0000000000000001 writer-affinity=ok reader-affinity=ok reader-path=direct-vdso writer-done=1 reader-done=1 reader-errors=0";
+const SMP_SCHEDULER_WITNESS_MARKER_PREFIX: &str = "sched-smp:result";
 const VDSO_GLIBC_WITNESS_SELECTOR: &str = "libctest-glibc:dynamic:clock_gettime";
 const VDSO_GLIBC_WITNESS_START: &str =
     "========== START entry-dynamic.exe clock_gettime ==========";
@@ -58,7 +61,51 @@ enum TestLane {
     Busybox,
     VdsoWitness,
     VvarSmpWitness,
+    SmpSchedulerWitness,
     VdsoGlibcWitness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmpSchedulerCase {
+    Static,
+    Movable,
+    Pipe,
+    Affinity,
+    Timer,
+    Pthread,
+    Mixed,
+    Stress,
+}
+
+impl SmpSchedulerCase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Movable => "movable",
+            Self::Pipe => "pipe",
+            Self::Affinity => "affinity",
+            Self::Timer => "timer",
+            Self::Pthread => "pthread",
+            Self::Mixed => "mixed",
+            Self::Stress => "stress",
+        }
+    }
+}
+
+fn parse_smp_scheduler_case(value: &str) -> Result<SmpSchedulerCase> {
+    match value {
+        "static" | "spread" | "witness-spread" => Ok(SmpSchedulerCase::Static),
+        "movable" => Ok(SmpSchedulerCase::Movable),
+        "pipe" => Ok(SmpSchedulerCase::Pipe),
+        "affinity" => Ok(SmpSchedulerCase::Affinity),
+        "timer" => Ok(SmpSchedulerCase::Timer),
+        "pthread" => Ok(SmpSchedulerCase::Pthread),
+        "mixed" => Ok(SmpSchedulerCase::Mixed),
+        "stress" => Ok(SmpSchedulerCase::Stress),
+        other => Err(format!(
+            "invalid smp-scheduler-witness case '{other}', expected static, movable, pipe, affinity, timer, pthread, mixed, or stress"
+        )),
+    }
 }
 
 fn parse_test_lane(lane: &str) -> Result<TestLane> {
@@ -67,9 +114,10 @@ fn parse_test_lane(lane: &str) -> Result<TestLane> {
         "busybox-boot" | "busybox" => Ok(TestLane::Busybox),
         "vdso-witness" => Ok(TestLane::VdsoWitness),
         "vdso-vvar-smp-witness" => Ok(TestLane::VvarSmpWitness),
+        "smp-scheduler-witness" => Ok(TestLane::SmpSchedulerWitness),
         "vdso-glibc-witness" => Ok(TestLane::VdsoGlibcWitness),
         other => Err(format!(
-            "unknown test lane '{other}', expected smoke, busybox-boot, vdso-witness, vdso-vvar-smp-witness, or vdso-glibc-witness"
+            "unknown test lane '{other}', expected smoke, busybox-boot, vdso-witness, vdso-vvar-smp-witness, smp-scheduler-witness, or vdso-glibc-witness"
         )),
     }
 }
@@ -106,6 +154,7 @@ pub(crate) fn test(root: &Path, args: Vec<String>) -> Result<()> {
         TestLane::Busybox => smoke(root, target, rest, /*with_busybox=*/ true),
         TestLane::VdsoWitness => vdso_witness(root, target, rest),
         TestLane::VvarSmpWitness => vvar_smp_witness(root, target, rest),
+        TestLane::SmpSchedulerWitness => smp_scheduler_witness(root, target, rest),
         TestLane::VdsoGlibcWitness => vdso_glibc_witness(root, target, rest),
     }
 }
@@ -255,6 +304,56 @@ fn vvar_smp_witness(root: &Path, target: TxTarget, rest: &[String]) -> Result<()
     verify_vvar_smp_witness_evidence(&body)
 }
 
+fn smp_scheduler_witness(root: &Path, target: TxTarget, rest: &[String]) -> Result<()> {
+    let timeout = optional_option_value(rest, "--timeout-ms").or_else(|| Some("60000".to_string()));
+    let dry_run = rest.iter().any(|arg| arg == "--dry-run");
+    let case = match optional_option_value(rest, "--case") {
+        Some(value) => parse_smp_scheduler_case(&value)?,
+        None => SmpSchedulerCase::Static,
+    };
+
+    println!(
+        "test: build {} with tx_userspace_child_spread_smp4",
+        target.name()
+    );
+    build_kernel_with_extra_rustflags(
+        root,
+        target,
+        "--cfg tx_userspace_child_spread_smp4 --cfg tx_smp_scheduler_witness",
+    )?;
+    println!(
+        "test: image test-init --profile busybox --target {}",
+        target.name()
+    );
+    image::image(
+        root,
+        vec![
+            "test-init".to_string(),
+            "--profile".to_string(),
+            "busybox".to_string(),
+            "--target".to_string(),
+            target.name().to_string(),
+        ],
+    )?;
+    let probe = compile_smp_scheduler_witness(root)?;
+    image::append_test_init_overlay(root, target, &probe, SMP_SCHEDULER_WITNESS_BINARY)?;
+    qemu::qemu(
+        root,
+        qemu_args_for_smp_scheduler_witness(target, timeout, dry_run, case),
+    )?;
+    if dry_run {
+        return Ok(());
+    }
+
+    let serial = root.join(qemu::serial_log_relative(
+        target,
+        crate::target::Profile::Smoke,
+    ));
+    let body = fs::read_to_string(&serial)
+        .map_err(|err| format!("failed to read {}: {err}", serial.display()))?;
+    verify_smp_scheduler_witness_evidence(&body, case)
+}
+
 fn vdso_glibc_witness(root: &Path, target: TxTarget, rest: &[String]) -> Result<()> {
     let dry_run = rest.iter().any(|arg| arg == "--dry-run");
     let timeout = optional_option_value(rest, "--timeout-ms")
@@ -315,6 +414,14 @@ fn compile_vvar_smp_witness(root: &Path) -> Result<PathBuf> {
     compile_freestanding_witness(root, VVAR_SMP_WITNESS_SOURCE, VVAR_SMP_WITNESS_BINARY)
 }
 
+fn compile_smp_scheduler_witness(root: &Path) -> Result<PathBuf> {
+    compile_freestanding_witness(
+        root,
+        SMP_SCHEDULER_WITNESS_SOURCE,
+        SMP_SCHEDULER_WITNESS_BINARY,
+    )
+}
+
 fn compile_freestanding_witness(
     root: &Path,
     source_relative: &str,
@@ -363,6 +470,42 @@ fn compile_freestanding_witness(
     Ok(output)
 }
 
+fn build_kernel_with_extra_rustflags(
+    root: &Path,
+    target: TxTarget,
+    extra_rustflags: &str,
+) -> Result<()> {
+    let triple = crate::target::target_triple(target)?;
+    let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
+    if rustflags.is_empty() {
+        rustflags = extra_rustflags.to_string();
+    } else {
+        rustflags.push(' ');
+        rustflags.push_str(extra_rustflags);
+    }
+
+    println!(
+        "$ RUSTFLAGS=\"{}\" cargo build -p {} --target {}",
+        rustflags,
+        target.package(),
+        triple
+    );
+    let status = Command::new("cargo")
+        .args(["build", "-p", target.package(), "--target", triple.as_str()])
+        .env("RUSTFLAGS", rustflags)
+        .current_dir(root)
+        .status()
+        .map_err(|err| format!("failed to run cargo build for {}: {err}", target.name()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo build for {} exited with {status}",
+            target.name()
+        ))
+    }
+}
+
 fn qemu_args_for_vdso_witness(
     target: TxTarget,
     timeout: Option<String>,
@@ -394,6 +537,45 @@ fn qemu_args_for_vdso_witness(
         "--expect-marker".to_string(),
         VDSO_WITNESS_SIGNAL_RESTORER_MARKER.to_string(),
     ]);
+    args
+}
+
+fn qemu_args_for_smp_scheduler_witness(
+    target: TxTarget,
+    timeout: Option<String>,
+    dry_run: bool,
+    case: SmpSchedulerCase,
+) -> Vec<String> {
+    let mut args = vec![
+        "--target".to_string(),
+        target.name().to_string(),
+        "--profile".to_string(),
+        "smoke".to_string(),
+        "--expect-sentinel".to_string(),
+        "--smp".to_string(),
+        "4".to_string(),
+        "--expect-marker".to_string(),
+        format!(
+            "{SMP_SCHEDULER_WITNESS_MARKER_PREFIX} case={}",
+            case.as_str()
+        ),
+    ];
+    if case != SmpSchedulerCase::Static {
+        args.extend([
+            "--append-cmdline".to_string(),
+            format!(
+                "tx.sched.smp=movable tx.sched.load=depth tx.sched.case={}",
+                case.as_str()
+            ),
+        ]);
+    }
+    if let Some(value) = timeout {
+        args.push("--timeout-ms".to_string());
+        args.push(value);
+    }
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
     args
 }
 
@@ -519,6 +701,183 @@ fn verify_vvar_smp_witness_evidence(serial: &str) -> Result<()> {
         "vdso-vvar-smp:evidence: writer-updates={writer_updates} reader-reads={reader_reads} writer-mask={writer_mask:#x} reader-mask={reader_mask:#x} affinity=ok reader-path=direct-vdso completion=ok reader-errors=0"
     );
     Ok(())
+}
+
+fn verify_smp_scheduler_witness_evidence(serial: &str, case: SmpSchedulerCase) -> Result<()> {
+    let markers: Vec<_> = serial
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| line.starts_with(SMP_SCHEDULER_WITNESS_MARKER_PREFIX))
+        .collect();
+    if markers.len() != 1 {
+        return Err(format!(
+            "expected exactly one scheduler SMP pass marker, saw {}",
+            markers.len()
+        ));
+    }
+
+    let marker = markers[0];
+    if marker.split_whitespace().next() != Some(SMP_SCHEDULER_WITNESS_MARKER_PREFIX) {
+        return Err(format!("invalid scheduler SMP pass marker token: {marker}"));
+    }
+    let observed_case = required_text_field(marker, "case=")?;
+    if observed_case != case.as_str() {
+        return Err(format!(
+            "scheduler SMP witness expected case={}, saw {observed_case}",
+            case.as_str()
+        ));
+    }
+
+    let pass = required_decimal_field(marker, "pass=")?;
+    let spawned = required_decimal_field(marker, "spawned=")?;
+    let ready = required_decimal_field(marker, "ready=")?;
+    let done = required_decimal_field(marker, "done=")?;
+    let workers = required_decimal_field(marker, "workers=")?;
+    let errors = required_decimal_field(marker, "errors=")?;
+    let seen_mask = required_vvar_smp_hex_field(marker, "seen-mask=")?;
+    let cpu0 = required_decimal_field(marker, "cpu0=")?;
+    let cpu1 = required_decimal_field(marker, "cpu1=")?;
+    let cpu2 = required_decimal_field(marker, "cpu2=")?;
+    let cpu3 = required_decimal_field(marker, "cpu3=")?;
+
+    if pass != 1 {
+        return Err(format!("scheduler SMP witness did not pass: pass={pass}"));
+    }
+    if spawned != 4 {
+        return Err(format!(
+            "scheduler SMP witness expected 4 spawned workers, saw {spawned}"
+        ));
+    }
+    if ready != 4 {
+        return Err(format!(
+            "scheduler SMP witness expected 4 ready workers, saw {ready}"
+        ));
+    }
+    if workers != 4 {
+        return Err(format!(
+            "scheduler SMP witness expected 4 workers, saw {workers}"
+        ));
+    }
+    if errors != 0 {
+        return Err(format!(
+            "scheduler SMP witness expected errors=0, saw {errors}"
+        ));
+    }
+
+    let child_publishes = scheduler_witness_child_publish_harts(serial)?;
+    if child_publishes != [0, 1, 2, 3] {
+        return Err(format!(
+            "scheduler SMP witness expected child publish rotation [0, 1, 2, 3], saw {:?}",
+            child_publishes
+        ));
+    }
+    verify_smp_scheduler_case_evidence(marker, case)?;
+
+    println!(
+        "sched-smp:evidence: spawned=4 ready=4 done={done} child-publish=[0,1,2,3] observed-slots=0x{seen_mask:016x} cpu0={cpu0} cpu1={cpu1} cpu2={cpu2} cpu3={cpu3}"
+    );
+    Ok(())
+}
+
+fn verify_smp_scheduler_case_evidence(marker: &str, case: SmpSchedulerCase) -> Result<()> {
+    match case {
+        SmpSchedulerCase::Static | SmpSchedulerCase::Movable => Ok(()),
+        SmpSchedulerCase::Pipe => {
+            require_zero(marker, "pipe-errors=")?;
+            require_at_least(marker, "pipe-rounds=", 8)
+        }
+        SmpSchedulerCase::Affinity => {
+            require_zero(marker, "affinity-errors=")?;
+            require_at_least(marker, "affinity-migrations=", 4)?;
+            let mask = required_vvar_smp_hex_field(marker, "affinity-mask=")?;
+            if mask & 0xf != 0xf {
+                return Err(format!(
+                    "scheduler SMP affinity case expected affinity-mask to cover harts 0-3, saw {mask:#x}"
+                ));
+            }
+            Ok(())
+        }
+        SmpSchedulerCase::Timer => {
+            require_zero(marker, "timer-errors=")?;
+            require_at_least(marker, "timer-sleeps=", 8)
+        }
+        SmpSchedulerCase::Pthread => {
+            require_zero(marker, "pthread-errors=")?;
+            require_at_least(marker, "pthread-joins=", 1)?;
+            require_at_least(marker, "futex-wakes=", 1)
+        }
+        SmpSchedulerCase::Mixed => {
+            require_zero(marker, "pipe-errors=")?;
+            require_zero(marker, "timer-errors=")?;
+            require_at_least(marker, "pipe-rounds=", 4)?;
+            require_at_least(marker, "timer-sleeps=", 4)
+        }
+        SmpSchedulerCase::Stress => {
+            require_zero(marker, "affinity-errors=")?;
+            require_zero(marker, "pipe-errors=")?;
+            require_zero(marker, "timer-errors=")?;
+            require_zero(marker, "pthread-errors=")?;
+            require_at_least(marker, "affinity-migrations=", 4)?;
+            require_at_least(marker, "pipe-rounds=", 4)?;
+            require_at_least(marker, "timer-sleeps=", 4)?;
+            require_at_least(marker, "pthread-joins=", 1)
+        }
+    }
+}
+
+fn require_zero(marker: &str, field: &str) -> Result<()> {
+    let value = required_decimal_field(marker, field)?;
+    if value != 0 {
+        return Err(format!(
+            "scheduler SMP marker expected {field}0, saw {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_at_least(marker: &str, field: &str, minimum: u64) -> Result<()> {
+    let value = required_decimal_field(marker, field)?;
+    if value < minimum {
+        return Err(format!(
+            "scheduler SMP marker expected {field}>={minimum}, saw {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn scheduler_witness_child_publish_harts(serial: &str) -> Result<Vec<u64>> {
+    let mut in_worker_window = false;
+    let mut publishes = Vec::new();
+    for line in serial.lines().map(|line| line.trim_end_matches('\r')) {
+        if line.starts_with("sched-smp:begin ") {
+            in_worker_window = true;
+            continue;
+        }
+        if line.starts_with(SMP_SCHEDULER_WITNESS_MARKER_PREFIX) {
+            break;
+        }
+        if in_worker_window && line.contains(":sched-witness:child-submit:") {
+            publishes.push(required_delimited_decimal_field(line, "publish=")?);
+            if publishes.len() == 4 {
+                break;
+            }
+        }
+    }
+    Ok(publishes)
+}
+
+fn required_delimited_decimal_field(line: &str, field: &str) -> Result<u64> {
+    let start = line
+        .find(field)
+        .ok_or_else(|| format!("scheduler SMP marker is missing {field}<decimal>"))?
+        + field.len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|ch: char| ch == ':' || ch.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    rest[..end]
+        .parse::<u64>()
+        .map_err(|err| format!("scheduler SMP marker has invalid {field}<decimal>: {err}"))
 }
 
 fn verify_vdso_witness_syscall_evidence(serial: &str) -> Result<()> {
@@ -800,6 +1159,10 @@ mod tests {
             parse_test_lane("vdso-vvar-smp-witness"),
             Ok(TestLane::VvarSmpWitness)
         );
+        assert_eq!(
+            parse_test_lane("smp-scheduler-witness"),
+            Ok(TestLane::SmpSchedulerWitness)
+        );
     }
 
     #[test]
@@ -907,6 +1270,87 @@ mod tests {
         );
 
         assert!(verify_vvar_smp_witness_evidence(serial).is_ok());
+    }
+
+    #[test]
+    fn smp_scheduler_witness_qemu_args_require_four_harts_and_pass_marker() {
+        let args = qemu_args_for_smp_scheduler_witness(
+            TxTarget::Rv64Qemu,
+            None,
+            false,
+            SmpSchedulerCase::Static,
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--smp", "4"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--expect-marker", "sched-smp:result case=static"]));
+    }
+
+    #[test]
+    fn smp_scheduler_witness_qemu_args_append_cmdline_for_movable_case() {
+        let args = qemu_args_for_smp_scheduler_witness(
+            TxTarget::Rv64Qemu,
+            Some("60000".to_string()),
+            false,
+            SmpSchedulerCase::Movable,
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--append-cmdline",
+                "tx.sched.smp=movable tx.sched.load=depth tx.sched.case=movable",
+            ]
+        }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--expect-marker", "sched-smp:result case=movable"]));
+    }
+
+    #[test]
+    fn smp_scheduler_witness_evidence_rejects_missing_hart_spread() {
+        let serial = concat!(
+            "sched-smp:begin case=static workers=4\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=0:queue=4:placements=1:remote-ipis=0:local-reschedules=1\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=1:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=0:queue=4:placements=1:remote-ipis=0:local-reschedules=1\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=1:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "sched-smp:result case=static pass=1 spawned=4 ready=4 done=4 errors=0 workers=4 seen-mask=0x0000000000000003 ",
+            "cpu0=0 cpu1=1 cpu2=0 cpu3=1\n"
+        );
+
+        let err =
+            verify_smp_scheduler_witness_evidence(serial, SmpSchedulerCase::Static).unwrap_err();
+        assert!(err.contains("child publish rotation"));
+    }
+
+    #[test]
+    fn smp_scheduler_witness_evidence_accepts_worker_completion_and_publish_rotation() {
+        let serial = concat!(
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=3:queue=4:placements=1:remote-ipis=0:local-reschedules=1\n",
+            "sched-smp:begin case=static workers=4\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=0:queue=4:placements=1:remote-ipis=0:local-reschedules=1\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=1:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=2:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=3:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "sched-smp:result case=static pass=1 spawned=4 ready=4 done=4 errors=0 workers=4 seen-mask=0x000000000000000f ",
+            "cpu0=0 cpu1=1 cpu2=2 cpu3=3\n"
+        );
+
+        assert!(verify_smp_scheduler_witness_evidence(serial, SmpSchedulerCase::Static).is_ok());
+    }
+
+    #[test]
+    fn smp_scheduler_witness_evidence_accepts_movable_case() {
+        let serial = concat!(
+            "sched-smp:begin case=movable workers=4\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=0:queue=4:placements=1:remote-ipis=0:local-reschedules=1\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=1:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=2:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "txkernel:qemu-riscv64-virt:sched-witness:child-submit:submit=0:publish=3:queue=4:placements=1:remote-ipis=1:local-reschedules=0\n",
+            "sched-smp:result case=movable pass=1 spawned=4 ready=4 done=4 errors=0 workers=4 seen-mask=0x000000000000000f ",
+            "cpu0=0 cpu1=1 cpu2=2 cpu3=3\n"
+        );
+
+        assert!(verify_smp_scheduler_witness_evidence(serial, SmpSchedulerCase::Movable).is_ok());
     }
 
     #[test]

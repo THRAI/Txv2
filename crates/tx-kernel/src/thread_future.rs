@@ -8,7 +8,7 @@
 //! 1. Open a `UserspaceRunSlot::start_request` and record the token on
 //!    the thread payload (`set_active_userspace_request`). The trap
 //!    shell consults this token to resolve the wait via
-//!    `complete_interesting_trap` per
+//!    `complete_running_trap` per
 //!    `txdoc:REACTOR-USERSPACE-RUN-AS-A-WAIT`.
 //! 2. `.await` the wait. The future yields `Pending` until a userspace
 //!    trap fires and the trap shell resolves the slot.
@@ -42,7 +42,7 @@
 //! future first issues `start_request` so the trap shell has a token
 //! to resolve, then `await`s the wait — that yields `Pending`, the
 //! adapter clears the per-hart slot, the reactor returns control. The
-//! trap arrives, the shell calls `complete_interesting_trap`, the
+//! trap arrives, the shell calls `complete_running_trap`, the
 //! reactor re-polls, the future runs the syscall dispatch and then
 //! calls `enter_userspace_with_context(ctx)` which diverges into the
 //! trap vector. Control never returns to this future call site; the
@@ -492,12 +492,11 @@ pub async fn run_thread<P: TxPlatform>(
         // exit_group between userspace round-trips, in which case
         // bailing out cleanly here is safer than dereferencing a
         // stale Cap.
-        if matches!(
-            enter_userspace_once::<P>(&thread, &payload, entry_token, state.last_entry_sysno),
-            ThreadLoopControl::Exit
-        ) {
+        let Some(entry_hart) =
+            enter_userspace_once::<P>(&thread, &payload, entry_token, state.last_entry_sysno)
+        else {
             return;
-        }
+        };
 
         // ----------------------------------------------------------------
         // (3) AWAIT THE RESOLVED WAIT.
@@ -512,11 +511,8 @@ pub async fn run_thread<P: TxPlatform>(
         // ----------------------------------------------------------------
         let trap = entry_wait.await;
 
-        let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
-        if !matches!(trap, UserspaceTrapInfo::TimerPreempt) {
-            let _ = clear_current_userspace_payload(entry_hart);
-            let _ = clear_current_userspace_thread_identity(entry_hart);
-        }
+        let _ = clear_current_userspace_payload(entry_hart);
+        let _ = clear_current_userspace_thread_identity(entry_hart);
 
         payload.set_active_userspace_request(None);
 
@@ -717,12 +713,12 @@ fn enter_userspace_once<P: TxPlatform>(
     payload: &PayloadCap<ThreadPayload>,
     entry_token: UserspaceRunRequest,
     last_entry_sysno: Option<u64>,
-) -> ThreadLoopControl {
+) -> Option<usize> {
     let Some(process) = thread.upgrade_owner_proc() else {
-        return ThreadLoopControl::Exit;
+        return None;
     };
     let Some(aspace) = process.aspace_cap() else {
-        return ThreadLoopControl::Exit;
+        return None;
     };
 
     let root = aspace.pmap().root_handle();
@@ -749,7 +745,7 @@ fn enter_userspace_once<P: TxPlatform>(
         emit_syscall_roundtrip_marker(sysno, b"debug.thread.enter.before");
     }
     <P as TrapIf>::enter_userspace_with_context(&ctx, root);
-    ThreadLoopControl::Continue
+    Some(entry_hart)
 }
 
 async fn dispatch_userspace_trap<P: TxPlatform>(
@@ -831,7 +827,20 @@ async fn run_syscall_dispatch<P: TxPlatform>(
     process: &Cap<ProcessIdentity>,
     req: SyscallRequest,
 ) -> Option<SyscallResult> {
-    if let Some(result) = tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, thread) {
+    if let Some(result) = tx_shims::linux_syscall::dispatch_thread_exit_oneshot_with_posts(
+        &req,
+        thread,
+        |mailbox, event| {
+            crate::init::post_mailbox_event_from_current_hart::<P>(mailbox, event);
+        },
+        |mailbox, event| {
+            crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(
+                mailbox,
+                event,
+                MailboxSchedulerHint::LifecycleWake,
+            )
+        },
+    ) {
         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
         return Some(result);
     }

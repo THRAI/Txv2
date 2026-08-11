@@ -495,7 +495,7 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
 }
 
 #[test]
-fn initial_userspace_sched_meta_stays_on_current_hart_when_boot_hart_is_nonzero() {
+fn initial_userspace_sched_meta_stays_on_current_boot_hart() {
     let _serial = setup();
     TEST_CURRENT_CPU.store(3, Ordering::Release);
     TEST_ONLINE_CPUS.store(0b1111, Ordering::Release);
@@ -505,7 +505,24 @@ fn initial_userspace_sched_meta_stays_on_current_hart_when_boot_hart_is_nonzero(
     assert_eq!(
         meta.affinity,
         CpuMask::single(CpuId(3)).bits(),
-        "initial userspace stays on the submit hart until userspace handoff is migration-safe",
+        "initial userspace stays on the BSP hart so the local userspace reactor loop can drive it",
+    );
+    assert!(meta.userspace_thread);
+    assert!(!meta.spread_on_submit);
+}
+
+#[test]
+fn initial_userspace_sched_meta_ignores_other_online_cpus() {
+    let _serial = setup();
+    TEST_CURRENT_CPU.store(3, Ordering::Release);
+    TEST_ONLINE_CPUS.store(0b1000, Ordering::Release);
+
+    let meta = CoreInit::<TestPlatform>::userspace_thread_sched_meta();
+
+    assert_eq!(
+        meta.affinity,
+        CpuMask::single(CpuId(3)).bits(),
+        "initial userspace stays on the current boot hart even when other CPUs are online",
     );
     assert!(meta.userspace_thread);
     assert!(!meta.spread_on_submit);

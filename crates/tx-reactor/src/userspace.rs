@@ -373,6 +373,54 @@ impl UserspaceRunSlot {
         Ok(status)
     }
 
+    /// Resolve a trap that came from an already-dispatched userspace run.
+    ///
+    /// Trap-shell handoff uses this stricter form: a pending entry token means
+    /// the thread future has not reached the platform userspace-entry path yet,
+    /// so a syscall/page-fault/fatal handoff against that token is stale. The
+    /// one exception is a late interesting trap after timer preemption, where
+    /// the hardware can report the real trap after the scheduler has already
+    /// recorded a soft timer event; that still replaces the timer-preempt
+    /// placeholder.
+    pub fn complete_running_trap(
+        &self,
+        request: UserspaceRunRequest,
+        trap: UserspaceTrapInfo,
+    ) -> Result<UserspaceRunStatus, UserspaceRunError> {
+        let (status, waker) = {
+            let mut state = self.state.lock();
+            let active = state
+                .active
+                .as_mut()
+                .ok_or(UserspaceRunError::NoActiveRequest)?;
+            if active.request != request {
+                return Err(UserspaceRunError::StaleRequest {
+                    attempted: request,
+                    active: active.request,
+                });
+            }
+            match active.phase {
+                ActivePhase::Pending => return Err(UserspaceRunError::NotRunning(request)),
+                ActivePhase::Running => {
+                    active.phase = ActivePhase::Resolved(trap);
+                    (active.status(), active.waker.take())
+                }
+                ActivePhase::Resolved(_) => {
+                    if !active.phase.replace_timer_preempt_with(trap) {
+                        return Err(UserspaceRunError::AlreadyResolved(request));
+                    }
+                    (active.status(), active.waker.take())
+                }
+            }
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+
+        Ok(status)
+    }
+
     pub fn cancel(&self, request: UserspaceRunRequest) -> Result<(), UserspaceRunError> {
         let mut state = self.state.lock();
         let active = state

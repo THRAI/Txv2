@@ -8,6 +8,10 @@ use tx_shims::linux_syscall::SyscallResult;
 
 use crate::{adapter::boot_runtime, trap_handoff};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static MAINTENANCE_SERVICE_PENDING: AtomicU64 = AtomicU64::new(0);
+
 pub struct KernelTrapDispatcher;
 
 impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
@@ -113,6 +117,10 @@ fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
     let mut action = TrapAction::Resume;
     if P::pending_ipi(IpiKind::Maintenance) {
         P::ack_ipi(IpiKind::Maintenance);
+        let cpu = P::current_cpu_id().0;
+        if cpu < u64::BITS as usize {
+            MAINTENANCE_SERVICE_PENDING.fetch_or(1u64 << cpu, Ordering::AcqRel);
+        }
         action = TrapAction::Reschedule;
     }
     if P::pending_ipi(IpiKind::Membarrier) {
@@ -126,6 +134,29 @@ fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
         P::ack_ipi(IpiKind::TlbShootdown);
     }
     action
+}
+
+/// Service a maintenance IPI after the trap shell has returned to normal
+/// kernel context.
+///
+/// The IPI handler itself runs with IRQ admission disabled, so it must not
+/// enter the epoch/zone retirement path. It only records the current hart in
+/// `MAINTENANCE_SERVICE_PENDING`; the BSP/AP reactor loop calls this helper
+/// before polling userspace work and performs the actual local drain and zone
+/// bucket flush there.
+pub(crate) fn service_pending_maintenance<P: TxPlatform>() -> bool {
+    let cpu = <P as PercpuIf>::current_cpu_id().0;
+    if cpu >= u64::BITS as usize {
+        return false;
+    }
+    let bit = 1u64 << cpu;
+    if MAINTENANCE_SERVICE_PENDING.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
+        return false;
+    }
+
+    let _ = crate::adapter::step_engine::service_local_drain_request(usize::MAX);
+    crate::zones::try_bounded_maintenance_tick();
+    true
 }
 
 #[cfg(test)]
@@ -156,12 +187,15 @@ mod ipi_tests {
     fn maintenance_ipi_only_acknowledges_and_reschedules() {
         MAINTENANCE_ACKED.store(false, Ordering::Release);
         MAINTENANCE_PENDING.store(true, Ordering::Release);
+        MAINTENANCE_SERVICE_PENDING.store(0, Ordering::Release);
 
         let action = dispatch_pending_ipis::<TestSmp>();
 
         assert_eq!(action, TrapAction::Reschedule);
         assert!(MAINTENANCE_ACKED.load(Ordering::Acquire));
         assert!(!MAINTENANCE_PENDING.load(Ordering::Acquire));
+        assert_ne!(MAINTENANCE_SERVICE_PENDING.load(Ordering::Acquire), 0);
+        MAINTENANCE_SERVICE_PENDING.store(0, Ordering::Release);
     }
 }
 

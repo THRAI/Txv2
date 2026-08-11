@@ -111,8 +111,8 @@ fn print_usage() {
            cargo xtask ci-slow\n\
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
-           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox|alpine [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--memory-mib N] [--no-block] [--interactive] [--append-cmdline TEXT] [--extra-rv64-ext4 PATH ...]\n\
-           cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
+           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox|alpine [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--memory-mib N] [--boot-hartid N] [--no-block] [--interactive] [--append-cmdline TEXT] [--extra-rv64-ext4 PATH ...]\n\
+           cargo xtask test [smoke|busybox-boot|smp-scheduler-witness] [--target rv64-qemu] [--timeout-ms N] [--case static|movable] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
            cargo xtask shell-test --target rv64-qemu --script PATH [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--smp N] [--memory-mib N] [--extra-rv64-ext4 PATH ...] [--ext4-test-image PATH] [--ext4-scratch-image PATH] [--ext4-workload-image PATH] [--group NAME[,NAME...]] [--list-groups] [--keep-going]\n\

@@ -20,6 +20,20 @@ find_busybox() {
 
 bb=$(find_busybox)
 
+cmdline_value() {
+    key=$1
+    cmdline=$("$bb" cat /proc/cmdline 2>/dev/null || cat /proc/cmdline 2>/dev/null)
+    for token in $cmdline; do
+        case "$token" in
+            "$key"=*)
+                printf '%s\n' "${token#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 mkdir_p() {
     "$bb" mkdir -p "$@" 2>/dev/null || mkdir -p "$@"
 }
@@ -214,6 +228,22 @@ run_payload() {
 }
 
 log "setup:start"
+
+# The scheduler witness runs before the broader boot overlays so it can
+# record the raw hart spread from a fresh test-init rootfs.
+if [ -x /smp-scheduler-witness ]; then
+    scheduler_case=$(cmdline_value tx.sched.case 2>/dev/null)
+    if [ -z "$scheduler_case" ]; then
+        scheduler_case=$(cmdline_value tx.sched.smp 2>/dev/null)
+    fi
+    if [ -z "$scheduler_case" ]; then
+        scheduler_case=static
+    fi
+    log "smp-scheduler-witness:run:case=$scheduler_case"
+    exec /smp-scheduler-witness --case "$scheduler_case"
+    log "smp-scheduler-witness:exec-failed:$?"
+    exit 127
+fi
 
 # The SMP VVAR witness owns its raw clone/futex coordination so its reader and
 # writer run on explicitly disjoint CPU masks without shell scheduling noise.

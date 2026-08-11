@@ -9,7 +9,7 @@ use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect, AstSlot},
     scheduler::StopReason,
     spin_lock::SpinLock,
-    waker::{task_waker, TaskWakeState},
+    waker::{TaskWakeState, task_waker},
 };
 
 // Per REACTOR_v0 §Submission: submitted futures must be `Send + 'static`.
@@ -245,7 +245,6 @@ impl TaskTable {
         }
         let future = task.future.take().ok_or(TakeRunnableError::Missing)?;
         task.status = TaskStatus::Polling;
-        task.wake_state.clear();
         task.consume_ast_markers();
         let wake_state = Arc::clone(&task.wake_state);
         let mailbox = Arc::clone(&task.mailbox);
@@ -406,16 +405,15 @@ impl TaskTable {
         id: TaskId,
     ) -> Option<(TaskKey, MailboxSchedulerHint)> {
         let task = self.slots.get_mut(id.index())?.task.as_mut()?;
+        if task.status != TaskStatus::Parked {
+            return None;
+        }
         if !task.wake_state.take_wake() {
             return None;
         }
-        if task.status == TaskStatus::Parked {
-            task.status = TaskStatus::Runnable;
-            let hint = task.mailbox.take_scheduler_hint();
-            Some((task.handle(), hint))
-        } else {
-            None
-        }
+        task.status = TaskStatus::Runnable;
+        let hint = task.mailbox.take_scheduler_hint();
+        Some((task.handle(), hint))
     }
 
     pub(crate) fn make_owner_runnable_with_hint(
@@ -430,7 +428,11 @@ impl TaskTable {
         match task.status {
             TaskStatus::Parked => task.status = TaskStatus::Runnable,
             TaskStatus::Runnable => {}
-            TaskStatus::Polling | TaskStatus::Completed | TaskStatus::Cancelled => return None,
+            TaskStatus::Polling => {
+                task.wake_state.wake();
+                return None;
+            }
+            TaskStatus::Completed | TaskStatus::Cancelled => return None,
         }
         let hint = task.mailbox.take_scheduler_hint();
         Some((task.handle(), hint))
@@ -672,4 +674,87 @@ pub fn current_delegate_registry(hart: usize) -> Option<Arc<DelegateRegistry>> {
     CURRENT_DELEGATE_REGISTRY
         .get(hart)
         .and_then(|slot| slot.lock().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use core::future::pending;
+
+    use super::*;
+    use tx_substrate::step::{InterestMask, WaitSourceId};
+    use tx_substrate::wake::mailbox::{MailboxEvent, WaitGeneration};
+
+    #[test]
+    fn polling_wake_survives_early_wake_queue_drain() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let (key, future, wake_state, _mailbox) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("submitted task should be runnable");
+
+        let waker = task_waker(wake_state);
+        waker.wake_by_ref();
+
+        assert!(
+            tasks.drain_wakes().is_empty(),
+            "a Polling task wake should not be consumed before the task parks"
+        );
+
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken { .. })
+        ));
+    }
+
+    #[test]
+    fn runnable_wake_survives_poll_handoff() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let waker = tasks.waker(handle).expect("submitted task should be live");
+        waker.wake_by_ref();
+
+        let (key, future, wake_state, _mailbox) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("submitted task should be runnable");
+
+        drop(wake_state);
+
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken { .. })
+        ));
+    }
+
+    #[test]
+    fn owner_mailbox_post_during_polling_survives_pending_commit() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let (key, future, _wake_state, mailbox) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("submitted task should be runnable");
+
+        assert!(mailbox.post_with_scheduler_hint(
+            MailboxEvent::SourceFired {
+                generation: WaitGeneration::new(1),
+                source: WaitSourceId::new(7),
+                interests: InterestMask::new(0b1),
+            },
+            MailboxSchedulerHint::LifecycleWake,
+        ));
+        assert!(
+            tasks
+                .make_owner_runnable_with_hint(key.id(), key.generation())
+                .is_none(),
+            "Polling owner wake should be committed after poll returns"
+        );
+
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken {
+                hint: MailboxSchedulerHint::LifecycleWake,
+                mailbox_event: true,
+                ..
+            })
+        ));
+    }
 }
