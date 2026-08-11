@@ -41,6 +41,8 @@
     "Host red-to-green regressions now close both identified service-fairness gaps. The file-I/O service yields after every ready turn so a latched self-kick cannot consume multiple turns in one Future::poll; its task metadata is fair, pinned, non-kernel and non-userspace. The scheduler now queues only fair non-userspace SelfYield at the preempted tail, so an already-runnable fair userspace peer runs next while normal wake and WakeHandoff behavior remain unchanged.",
     "The deployed fairness image passed its real-board bounded-load witness. During a 90-second continuous host ping, 90 packets were sent and 89 received (1.111% loss, RTT min/avg/max 1.453/1.623/1.839 ms); three background and one foreground TLS-verified git ls-remote commands all returned HEAD 0c8e312f..., the shell and network remained usable, and the boot boundary has no pin, stack, cmdline/state, or panic report.",
     "The standard-root initramfs uses Alpine's normal /lib and /usr/lib dynamic Git/TLS closure, sets HOME=/root, and never creates or mounts /musl. Its first automated boot exposed two harness defects: the baked resolver used the gateway instead of DNS 10.248.98.30, and a failed partial clone could still print POSTCLONE ok. The script now writes the correct resolver, gates POSTCLONE on this invocation's successful clone, fail-fast chains every check, and disables the Git pager. The corrected raw CPIO is 18300416 bytes with SHA-256 125f45352f5f6179f87011c81fc98b5f0c14fd570ed010ef8dda3c1f517d2c26; the ramdisk uImage is 18300480 bytes with SHA-256 6a2acabff627775cf55b304d6898db57663116c0ceccd2e23e20d8d3c3051ea6 and matches /srv/tftp/txv2 byte-for-byte. Its payload range is 0x98800040..0x99973e40, size 0x1173e00. No additional reset is required because the same live corrections already closed the real-board semantics.",
+    "Host implementation is complete for the direct-root AHCI write experiment at baseline 42cd4396: one-page LBA48 WRITE DMA EXT, non-data FLUSH CACHE EXT, direction-correct DMA sync, a fail-closed first-error boundary, first-failure-only register observation, real BlockImage barrier delegation, and EROFS/EIO fidelity all have red-to-green tests. AHCI is 19/19, tx-drivers 43/43, tx-fs 106/106, tx-ext4-format 51/51, tx-ext4 39/39, and the la64-2k1000 full-build --no-image gate passes. No board reset, serial run, root-image rebuild, or disk write has occurred for this phase.",
+    "The RV64 VF2 MMC comparison confirms only the Frame-to-eight-sector mutation shape: it loops CMD24 for each 512-byte chunk and stops on failure, but both MMC barriers are successful no-ops. The 2K1000 implementation therefore uses one eight-sector AHCI command plus real ATA cache flush and requires reset/persistence/offline-fsck evidence before claiming durability.",
     "Do not write or reorganize the LA knowledge handbook while bringing the board up. Complete the hardware chain first; documentation is a separate user-directed task afterward."
   ],
   "changed_files": [
@@ -118,7 +120,7 @@
     },
     {
       "path": "crates/tx-drivers/src/ahci",
-      "reason": "Provides the bounded, pinned, read-only AHCI polling transport used for 2K1000 bootstrap storage; teardown releases pages only after port quiescence and otherwise quarantines the pinned workspace."
+      "reason": "Provides the bounded, pinned AHCI polling transport used for 2K1000 bootstrap storage. The 2026-08-11 host-admitted path adds one-page WRITE DMA EXT, non-data FLUSH CACHE EXT, direction-correct bounce synchronization, fail-closed transport errors and first-failure-only observation; teardown still quarantines a workspace unless the port quiesces."
     },
     {
       "path": "crates/tx-kernel/src/devices/ahci_block.rs",
@@ -130,7 +132,15 @@
     },
     {
       "path": "crates/tx-ext4/src/read_backend.rs",
-      "reason": "Moves the 512-entry lookup cache storage to the heap so ext4 mount does not overflow the 64 KiB board boot stack."
+      "reason": "Moves the lookup cache off the boot stack and maps block-backend ReadOnly/Io classifications back to EROFS/EIO without treating transport failure as malformed ext4 bytes."
+    },
+    {
+      "path": "crates/tx-fs/src/tx_ext4_bridge.rs",
+      "reason": "Delegates BlockImage barriers to the typed block device and preserves retry, read-only and I/O error identity across the 4 KiB ext4-to-sector adapter."
+    },
+    {
+      "path": "crates/tx-ext4-format/src/lib.rs",
+      "reason": "Adds kernel-independent ReadOnly and Io error variants so the bridge does not collapse device failures into Truncated/EINVAL."
     },
     {
       "path": "crates/tx-drivers/src/dwmac3",
@@ -505,9 +515,34 @@
       "command": "rebuild corrected standard-root CPIO/uImage; compare payload; install to /srv/tftp/txv2; cmp source and deployed image",
       "status": "passed",
       "notes": "The corrected script writes DNS 10.248.98.30, enters POSTCLONE only after this invocation's successful clone, chains all post-clone checks, and uses --no-pager. The raw CPIO is 18300416 bytes at SHA-256 125f45352f5f6179f87011c81fc98b5f0c14fd570ed010ef8dda3c1f517d2c26. The 18300480-byte uImage is SHA-256 6a2acabff627775cf55b304d6898db57663116c0ceccd2e23e20d8d3c3051ea6 and matches the TFTP copy byte-for-byte. The corrected wrapper was not rebooted because its exact semantic corrections were already live-proven in the successful boot."
+    },
+    {
+      "command": "cargo test -p tx-drivers --lib; cargo test -p tx-fs --lib; cargo test -p tx-ext4-format; cargo test -p tx-ext4 --lib",
+      "status": "passed",
+      "notes": "The host-admitted AHCI write/barrier slice passes tx-drivers 43/43 (AHCI 19/19), tx-fs 106/106 (bridge 7/7), tx-ext4-format 51/51 including journal/recovery integration tests, and tx-ext4 39/39. Red witnesses first proved the write/flush layout and barrier delegation were absent."
+    },
+    {
+      "command": "cargo xtask full-build --target la64-2k1000 --skip-doctor --no-image",
+      "status": "passed",
+      "notes": "The physical target completed full-build: ok. The no-image boundary compiled the changed driver/bridge into the kernel without rebuilding or replacing the Alpine root image."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "The repository gate remains red in the pre-existing tx-shims dispatch group and two tx-kernel libctest command assertions. The changed tx-ext4 lane passes 39/39 and tx-scripts passes 167/167 inside the same run."
     }
   ],
   "next_actions": [
+    {
+      "id": "next-9",
+      "title": "Run the AHCI write implementation through read-only board control before authorizing media mutation",
+      "paths": [
+        "crates/tx-drivers/src/ahci/mod.rs",
+        "crates/tx-fs/src/tx_ext4_bridge.rs",
+        "docs/progress/plans/2026-08-11-la2k1000-ahci-write.json"
+      ],
+      "notes": "First deploy only the newly built kernel and boot the existing Alpine disk with tx.root=sda ro. Verify identify, ext4 mount, known reads, shell/network and absence of txkernel:ahci:io-error or kernel invariant reports. Do not remount writable. After this control passes, ask the user to identify or explicitly approve a clone/spare medium for a filesystem-level write/fsync/rename/reset/offline-fsck probe; never guess a raw LBA or treat the competition disk as disposable. The user resets when requested; Codex operates serial capture and diagnosis."
+    },
     {
       "id": "next-5",
       "title": "Preserve the validated guarded 128 KiB runtime-stack boundary",
@@ -561,6 +596,8 @@
     "commit:b87ee76d",
     "commit:335321ef",
     "docs/progress/STATUS.md",
+    "docs/progress/plans/2026-08-11-la2k1000-ahci-write.json",
+    "docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md",
     "msp/debug-logs/2026-08-10-la2k1000-real-board-git-handoff.md",
     "docs/progress/plans/2026-08-04-portable-network-device.json",
     "docs/progress/plans/2026-08-04-userspace-dhcp-client.json",

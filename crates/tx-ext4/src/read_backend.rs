@@ -912,6 +912,8 @@ pub(crate) fn map_format_error(err: Ext4FormatError) -> Errno {
         Ext4FormatError::Unsupported => Errno::ENOSYS,
         Ext4FormatError::ExtentTreeFull { .. } => Errno::EFBIG,
         Ext4FormatError::WouldBlock => Errno::EAGAIN,
+        Ext4FormatError::ReadOnly => Errno::EROFS,
+        Ext4FormatError::Io => Errno::EIO,
         Ext4FormatError::NotEmpty => Errno::ENOTEMPTY,
         Ext4FormatError::IsDirectory => Errno::EISDIR,
         Ext4FormatError::NotDirectory => Errno::ENOTDIR,
@@ -928,12 +930,20 @@ fn timespec(sec: u32) -> Timespec {
 
 #[cfg(test)]
 mod lookup_cache_layout_tests {
-    use super::{LookupCache, LookupCacheEntry, LOOKUP_CACHE_ENTRIES};
+    use super::{map_format_error, LookupCache, LookupCacheEntry, LOOKUP_CACHE_ENTRIES};
+    use tx_ext4_format::Ext4FormatError;
+    use tx_subsystems::execution::Errno;
 
     #[test]
     fn lookup_cache_keeps_its_large_entry_store_off_stack() {
         let cache = LookupCache::empty();
         assert_eq!(cache.entries.len(), LOOKUP_CACHE_ENTRIES);
         assert!(core::mem::size_of::<LookupCache>() < core::mem::size_of::<LookupCacheEntry>() * 2);
+    }
+
+    #[test]
+    fn block_backend_errors_keep_linux_errno_identity() {
+        assert_eq!(map_format_error(Ext4FormatError::ReadOnly), Errno::EROFS);
+        assert_eq!(map_format_error(Ext4FormatError::Io), Errno::EIO);
     }
 }

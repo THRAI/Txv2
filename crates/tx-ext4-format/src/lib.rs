@@ -30,6 +30,12 @@ pub enum Ext4FormatError {
         entries: u16,
     },
     WouldBlock,
+    /// The kernel-facing block backend rejected a mutation because the
+    /// underlying device or mount is read-only.
+    ReadOnly,
+    /// The kernel-facing block backend reported a transport or media I/O
+    /// failure. This is distinct from malformed ext4 bytes.
+    Io,
     NotEmpty,
     IsDirectory,
     NotDirectory,

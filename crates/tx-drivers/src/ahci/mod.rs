@@ -38,15 +38,19 @@ const BOUNCE_LEN: usize = PAGE_SIZE;
 const WORKSPACE_LEN: usize = BOUNCE_OFFSET + BOUNCE_LEN;
 
 const COMMAND_HEADER_CFL_DWORDS: u16 = 5;
+const COMMAND_HEADER_WRITE: u16 = 1 << 6;
 const COMMAND_SLOT: u32 = 1;
 const ATA_CMD_IDENTIFY_DEVICE: u8 = 0xec;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
+const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xea;
 const FIS_TYPE_REG_H2D: u8 = 0x27;
 const FIS_COMMAND: u8 = 1 << 7;
 const ATA_DEVICE_LBA: u8 = 1 << 6;
 
 const HOST_TIMEOUT_NS: u64 = 1_000_000_000;
 const COMMAND_TIMEOUT_NS: u64 = 5_000_000_000;
+const FLUSH_TIMEOUT_NS: u64 = 60_000_000_000;
 const POLL_ITERATION_LIMIT: usize = 10_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +78,7 @@ pub enum AhciError {
     CommandTimeout,
     TaskFileError,
     InvalidIdentify,
+    UnsupportedAddressing,
     UnsupportedLogicalBlockSize(u32),
     OutOfRange,
     FrameMapping,
@@ -99,6 +104,7 @@ impl AhciError {
             Self::CommandTimeout => "command-timeout",
             Self::TaskFileError => "task-file-error",
             Self::InvalidIdentify => "invalid-identify",
+            Self::UnsupportedAddressing => "unsupported-addressing",
             Self::UnsupportedLogicalBlockSize(_) => "unsupported-logical-block-size",
             Self::OutOfRange => "out-of-range",
             Self::FrameMapping => "frame-mapping",
@@ -113,7 +119,57 @@ pub struct AhciBlock<P: TxPlatform> {
     initialized: AtomicBool,
     total_blocks: AtomicU64,
     block_size: AtomicU32,
+    runtime_failures: RuntimeFailureObservation,
     _platform: PhantomData<fn() -> P>,
+}
+
+struct RuntimeFailureObservation {
+    count: AtomicU64,
+    first_reported: AtomicBool,
+}
+
+impl RuntimeFailureObservation {
+    const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            first_reported: AtomicBool::new(false),
+        }
+    }
+
+    fn observe(&self) -> bool {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.first_reported
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeOperation {
+    Read,
+    Write,
+    Flush,
+}
+
+impl RuntimeOperation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Flush => "flush",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeFailureSnapshot {
+    operation: RuntimeOperation,
+    lba: u64,
+    error: AhciError,
+    interrupt_status: u32,
+    task_file: u32,
+    sata_error: u32,
+    command_issue: u32,
 }
 
 struct AhciState<P: TxPlatform> {
@@ -121,6 +177,7 @@ struct AhciState<P: TxPlatform> {
     port: usize,
     workspace: ManuallyDrop<DmaWorkspace<P>>,
     identity: AhciIdentity,
+    faulted: bool,
 }
 
 impl<P: TxPlatform> Drop for AhciState<P> {
@@ -145,6 +202,7 @@ impl<P: TxPlatform> AhciBlock<P> {
             initialized: AtomicBool::new(false),
             total_blocks: AtomicU64::new(0),
             block_size: AtomicU32::new(LOGICAL_BLOCK_SIZE),
+            runtime_failures: RuntimeFailureObservation::new(),
             _platform: PhantomData,
         }
     }
@@ -169,6 +227,19 @@ impl<P: TxPlatform> AhciBlock<P> {
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
     }
+
+    fn observe_runtime_failure(
+        &self,
+        state: &AhciState<P>,
+        operation: RuntimeOperation,
+        lba: u64,
+        error: AhciError,
+    ) {
+        if !self.runtime_failures.observe() {
+            return;
+        }
+        report_runtime_failure::<P>(capture_runtime_failure(state, operation, lba, error));
+    }
 }
 
 impl<P: TxPlatform> BlockDeviceOps for AhciBlock<P> {
@@ -185,15 +256,15 @@ impl<P: TxPlatform> BlockDeviceOps for AhciBlock<P> {
         if target.is_empty() {
             return StepOutcome::Done(());
         }
+        if state.faulted {
+            return StepOutcome::Err(Errno::EIO);
+        }
 
         let start = block_id.as_u64();
         let Some(sector_count) = (target.len() as u64).checked_mul(SECTORS_PER_PAGE) else {
             return StepOutcome::Err(Errno::EINVAL);
         };
-        let Some(end) = start.checked_add(sector_count) else {
-            return StepOutcome::Err(Errno::EINVAL);
-        };
-        if end > state.identity.total_blocks {
+        if validate_io_range(start, sector_count, state.identity.total_blocks).is_err() {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -201,7 +272,9 @@ impl<P: TxPlatform> BlockDeviceOps for AhciBlock<P> {
             let Some(lba) = start.checked_add(index as u64 * SECTORS_PER_PAGE) else {
                 return StepOutcome::Err(Errno::EINVAL);
             };
-            if issue_read_dma_ext::<P>(state, lba).is_err() {
+            if let Err(error) = issue_read_dma_ext::<P>(state, lba) {
+                state.faulted = true;
+                self.observe_runtime_failure(state, RuntimeOperation::Read, lba, error);
                 return StepOutcome::Err(Errno::EIO);
             }
             let Ok(src) = state.workspace.ptr_at(BOUNCE_OFFSET) else {
@@ -226,15 +299,65 @@ impl<P: TxPlatform> BlockDeviceOps for AhciBlock<P> {
 
     fn write_blocks(
         &self,
-        _block_id: PhysicalBlockNumber,
-        _source: &[Frame],
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::Err(Errno::EROFS)
+        let mut state = self.state.lock();
+        let Some(state) = state.as_mut() else {
+            return StepOutcome::Err(Errno::ENODEV);
+        };
+        if source.is_empty() {
+            return StepOutcome::Done(());
+        }
+        if state.faulted {
+            return StepOutcome::Err(Errno::EIO);
+        }
+
+        let start = block_id.as_u64();
+        let Some(sector_count) = (source.len() as u64).checked_mul(SECTORS_PER_PAGE) else {
+            return StepOutcome::Err(Errno::EINVAL);
+        };
+        if validate_io_range(start, sector_count, state.identity.total_blocks).is_err() {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+
+        for (index, frame) in source.iter().enumerate() {
+            let Some(lba) = start.checked_add(index as u64 * SECTORS_PER_PAGE) else {
+                return StepOutcome::Err(Errno::EINVAL);
+            };
+            let Ok(src) = frame_kernel_ptr::<P>(frame) else {
+                return StepOutcome::Err(Errno::EIO);
+            };
+            let Ok(dst) = state.workspace.ptr_at(BOUNCE_OFFSET) else {
+                return StepOutcome::Err(Errno::EIO);
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.cast_const(), dst, PAGE_SIZE);
+            }
+            if let Err(error) = issue_write_dma_ext::<P>(state, lba) {
+                state.faulted = true;
+                self.observe_runtime_failure(state, RuntimeOperation::Write, lba, error);
+                return StepOutcome::Err(Errno::EIO);
+            }
+        }
+        StepOutcome::Done(())
     }
 
     fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
-        StepOutcome::Err(Errno::EROFS)
+        let mut state = self.state.lock();
+        let Some(state) = state.as_mut() else {
+            return StepOutcome::Err(Errno::ENODEV);
+        };
+        if state.faulted {
+            return StepOutcome::Err(Errno::EIO);
+        }
+        if let Err(error) = issue_flush_cache_ext::<P>(state) {
+            state.faulted = true;
+            self.observe_runtime_failure(state, RuntimeOperation::Flush, 0, error);
+            return StepOutcome::Err(Errno::EIO);
+        }
+        StepOutcome::Done(())
     }
 }
 
@@ -322,6 +445,7 @@ fn initialize_controller<P: TxPlatform>(
             total_blocks: 0,
             logical_block_size: LOGICAL_BLOCK_SIZE,
         },
+        faulted: false,
     };
     let port_base = |register| regs::port_reg(port, register);
     regs.write32(port_base(regs::PORT_CLB), command_list as u32);
@@ -526,7 +650,7 @@ fn wait_until(
 
 fn issue_identify<P: TxPlatform>(state: &mut AhciState<P>) -> Result<[u8; 512], AhciError> {
     let fis = identify_fis();
-    issue_data_in_command::<P>(state, fis, 512)?;
+    issue_command::<P>(state, fis, CommandTransfer::DataIn(512), COMMAND_TIMEOUT_NS)?;
     let mut identify = [0u8; 512];
     let source = state
         .workspace
@@ -539,17 +663,95 @@ fn issue_identify<P: TxPlatform>(state: &mut AhciState<P>) -> Result<[u8; 512], 
 }
 
 fn issue_read_dma_ext<P: TxPlatform>(state: &mut AhciState<P>, lba: u64) -> Result<(), AhciError> {
-    if lba >> 48 != 0 {
-        return Err(AhciError::OutOfRange);
-    }
+    validate_io_range(lba, SECTORS_PER_PAGE, state.identity.total_blocks)?;
     let fis = read_dma_ext_fis(lba, SECTORS_PER_PAGE as u16);
-    issue_data_in_command::<P>(state, fis, PAGE_SIZE)
+    issue_command::<P>(
+        state,
+        fis,
+        CommandTransfer::DataIn(PAGE_SIZE),
+        COMMAND_TIMEOUT_NS,
+    )
 }
 
-fn issue_data_in_command<P: TxPlatform>(
+fn issue_write_dma_ext<P: TxPlatform>(state: &mut AhciState<P>, lba: u64) -> Result<(), AhciError> {
+    validate_io_range(lba, SECTORS_PER_PAGE, state.identity.total_blocks)?;
+    let fis = write_dma_ext_fis(lba, SECTORS_PER_PAGE as u16);
+    issue_command::<P>(
+        state,
+        fis,
+        CommandTransfer::DataOut(PAGE_SIZE),
+        COMMAND_TIMEOUT_NS,
+    )
+}
+
+fn issue_flush_cache_ext<P: TxPlatform>(state: &mut AhciState<P>) -> Result<(), AhciError> {
+    issue_command::<P>(
+        state,
+        flush_cache_ext_fis(),
+        CommandTransfer::NonData,
+        FLUSH_TIMEOUT_NS,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandTransfer {
+    DataIn(usize),
+    DataOut(usize),
+    NonData,
+}
+
+impl CommandTransfer {
+    const fn data_len(self) -> Option<usize> {
+        match self {
+            Self::DataIn(len) | Self::DataOut(len) => Some(len),
+            Self::NonData => None,
+        }
+    }
+
+    const fn dma_direction(self) -> Option<DmaDirection> {
+        match self {
+            Self::DataIn(_) => Some(DmaDirection::FromDevice),
+            Self::DataOut(_) => Some(DmaDirection::ToDevice),
+            Self::NonData => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommandLayout {
+    header_flags: u16,
+    prdt_length: u16,
+    prdt_byte_count: Option<u32>,
+}
+
+fn command_layout(transfer: CommandTransfer) -> Result<CommandLayout, AhciError> {
+    let Some(transfer_len) = transfer.data_len() else {
+        return Ok(CommandLayout {
+            header_flags: COMMAND_HEADER_CFL_DWORDS,
+            prdt_length: 0,
+            prdt_byte_count: None,
+        });
+    };
+    if transfer_len == 0 || transfer_len > BOUNCE_LEN {
+        return Err(AhciError::OutOfRange);
+    }
+    let write_flag = if matches!(transfer, CommandTransfer::DataOut(_)) {
+        COMMAND_HEADER_WRITE
+    } else {
+        0
+    };
+    Ok(CommandLayout {
+        header_flags: COMMAND_HEADER_CFL_DWORDS | write_flag,
+        prdt_length: 1,
+        prdt_byte_count: Some((transfer_len - 1) as u32),
+    })
+}
+
+fn issue_command<P: TxPlatform>(
     state: &mut AhciState<P>,
     fis: [u8; 20],
-    transfer_len: usize,
+    transfer: CommandTransfer,
+    timeout_ns: u64,
 ) -> Result<(), AhciError> {
     let regs = state.regs;
     let port = state.port;
@@ -569,7 +771,7 @@ fn issue_data_in_command<P: TxPlatform>(
         return Err(AhciError::PortBusyTimeout);
     }
 
-    prepare_data_in_command(&state.workspace, fis, transfer_len)?;
+    prepare_command(&state.workspace, fis, transfer)?;
     clear_port_status(&regs, port);
     state
         .workspace
@@ -595,20 +797,16 @@ fn issue_data_in_command<P: TxPlatform>(
             DmaDirection::FromDevice,
         )
         .map_err(map_dma_runtime_error)?;
-    state
-        .workspace
-        .sync_for_device(BOUNCE_OFFSET, transfer_len, DmaDirection::FromDevice)
-        .map_err(map_dma_runtime_error)?;
+    if let (Some(transfer_len), Some(direction)) = (transfer.data_len(), transfer.dma_direction()) {
+        state
+            .workspace
+            .sync_for_device(BOUNCE_OFFSET, transfer_len, direction)
+            .map_err(map_dma_runtime_error)?;
+    }
     <P as DmaIf>::publish_to_device();
     regs.write32(port_base(regs::PORT_CI), COMMAND_SLOT);
 
-    poll_command_with(
-        &regs,
-        port,
-        P::read_ns,
-        COMMAND_TIMEOUT_NS,
-        POLL_ITERATION_LIMIT,
-    )?;
+    poll_command_with(&regs, port, P::read_ns, timeout_ns, POLL_ITERATION_LIMIT)?;
     state
         .workspace
         .sync_for_cpu(
@@ -625,28 +823,34 @@ fn issue_data_in_command<P: TxPlatform>(
             DmaDirection::FromDevice,
         )
         .map_err(map_dma_runtime_error)?;
-    state
-        .workspace
-        .sync_for_cpu(BOUNCE_OFFSET, transfer_len, DmaDirection::FromDevice)
-        .map_err(map_dma_runtime_error)?;
+    if let CommandTransfer::DataIn(transfer_len) = transfer {
+        state
+            .workspace
+            .sync_for_cpu(BOUNCE_OFFSET, transfer_len, DmaDirection::FromDevice)
+            .map_err(map_dma_runtime_error)?;
+    }
     fence(Ordering::Acquire);
 
-    let transferred = read_command_byte_count(&state.workspace)?;
+    let transferred = if transfer.data_len().is_some() {
+        Some(read_command_byte_count(&state.workspace)?)
+    } else {
+        None
+    };
     clear_port_status(&regs, port);
-    if transferred != transfer_len as u32 {
-        return Err(AhciError::TaskFileError);
+    if let (Some(transferred), Some(expected)) = (transferred, transfer.data_len()) {
+        if transferred != expected as u32 {
+            return Err(AhciError::TaskFileError);
+        }
     }
     Ok(())
 }
 
-fn prepare_data_in_command<P: TxPlatform>(
+fn prepare_command<P: TxPlatform>(
     workspace: &DmaWorkspace<P>,
     fis: [u8; 20],
-    transfer_len: usize,
+    transfer: CommandTransfer,
 ) -> Result<(), AhciError> {
-    if transfer_len == 0 || transfer_len > BOUNCE_LEN {
-        return Err(AhciError::OutOfRange);
-    }
+    let layout = command_layout(transfer)?;
     workspace
         .clear(COMMAND_LIST_OFFSET, COMMAND_LIST_LEN)
         .map_err(map_dma_runtime_error)?;
@@ -660,22 +864,13 @@ fn prepare_data_in_command<P: TxPlatform>(
     let command_table = workspace
         .dma_addr_at(COMMAND_TABLE_OFFSET)
         .map_err(map_dma_runtime_error)?;
-    let bounce = workspace
-        .dma_addr_at(BOUNCE_OFFSET)
-        .map_err(map_dma_runtime_error)?;
     let header = CommandHeader {
-        flags: COMMAND_HEADER_CFL_DWORDS,
-        prdt_length: 1,
+        flags: layout.header_flags,
+        prdt_length: layout.prdt_length,
         prd_byte_count: 0,
         command_table_base: command_table as u32,
         command_table_base_upper: (command_table >> 32) as u32,
         reserved: [0; 4],
-    };
-    let prdt = PrdtEntry {
-        data_base: bounce as u32,
-        data_base_upper: (bounce >> 32) as u32,
-        reserved: 0,
-        byte_count_and_interrupt: (transfer_len - 1) as u32,
     };
     unsafe {
         core::ptr::write(
@@ -692,13 +887,24 @@ fn prepare_data_in_command<P: TxPlatform>(
                 .map_err(map_dma_runtime_error)?,
             fis.len(),
         );
-        core::ptr::write(
-            workspace
-                .ptr_at(PRDT_OFFSET)
-                .map_err(map_dma_runtime_error)?
-                .cast::<PrdtEntry>(),
-            prdt,
-        );
+        if let Some(byte_count_and_interrupt) = layout.prdt_byte_count {
+            let bounce = workspace
+                .dma_addr_at(BOUNCE_OFFSET)
+                .map_err(map_dma_runtime_error)?;
+            let prdt = PrdtEntry {
+                data_base: bounce as u32,
+                data_base_upper: (bounce >> 32) as u32,
+                reserved: 0,
+                byte_count_and_interrupt,
+            };
+            core::ptr::write(
+                workspace
+                    .ptr_at(PRDT_OFFSET)
+                    .map_err(map_dma_runtime_error)?
+                    .cast::<PrdtEntry>(),
+                prdt,
+            );
+        }
     }
     Ok(())
 }
@@ -709,6 +915,67 @@ fn read_command_byte_count<P: TxPlatform>(workspace: &DmaWorkspace<P>) -> Result
         .map_err(map_dma_runtime_error)?
         .cast::<CommandHeader>();
     Ok(unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*header).prd_byte_count)) })
+}
+
+fn capture_runtime_failure<P: TxPlatform>(
+    state: &AhciState<P>,
+    operation: RuntimeOperation,
+    lba: u64,
+    error: AhciError,
+) -> RuntimeFailureSnapshot {
+    let port_base = |register| regs::port_reg(state.port, register);
+    RuntimeFailureSnapshot {
+        operation,
+        lba,
+        error,
+        interrupt_status: state.regs.read32(port_base(regs::PORT_IS)),
+        task_file: state.regs.read32(port_base(regs::PORT_TFD)),
+        sata_error: state.regs.read32(port_base(regs::PORT_SERR)),
+        command_issue: state.regs.read32(port_base(regs::PORT_CI)),
+    }
+}
+
+fn report_runtime_failure<P: TxPlatform>(snapshot: RuntimeFailureSnapshot) {
+    let mut line = [0u8; 256];
+    let len = format_runtime_failure(snapshot, &mut line);
+    tx_hal::console_write_bytes::<P>(&line[..len]);
+}
+
+fn format_runtime_failure(snapshot: RuntimeFailureSnapshot, out: &mut [u8]) -> usize {
+    let mut len = 0;
+    append_bytes(out, &mut len, b"txkernel:ahci:io-error:op=");
+    append_bytes(out, &mut len, snapshot.operation.label().as_bytes());
+    append_bytes(out, &mut len, b":lba=");
+    append_hex(out, &mut len, snapshot.lba, 16);
+    append_bytes(out, &mut len, b":error=");
+    append_bytes(out, &mut len, snapshot.error.label().as_bytes());
+    append_bytes(out, &mut len, b":is=");
+    append_hex(out, &mut len, u64::from(snapshot.interrupt_status), 8);
+    append_bytes(out, &mut len, b":tfd=");
+    append_hex(out, &mut len, u64::from(snapshot.task_file), 8);
+    append_bytes(out, &mut len, b":serr=");
+    append_hex(out, &mut len, u64::from(snapshot.sata_error), 8);
+    append_bytes(out, &mut len, b":ci=");
+    append_hex(out, &mut len, u64::from(snapshot.command_issue), 8);
+    append_bytes(out, &mut len, b"\n");
+    len
+}
+
+fn append_bytes(out: &mut [u8], len: &mut usize, bytes: &[u8]) {
+    let remaining = out.len().saturating_sub(*len);
+    let count = remaining.min(bytes.len());
+    out[*len..*len + count].copy_from_slice(&bytes[..count]);
+    *len += count;
+}
+
+fn append_hex(out: &mut [u8], len: &mut usize, value: u64, digits: usize) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    append_bytes(out, len, b"0x");
+    for index in 0..digits {
+        let shift = (digits - index - 1) * 4;
+        let nibble = ((value >> shift) & 0xf) as usize;
+        append_bytes(out, len, &HEX[nibble..nibble + 1]);
+    }
 }
 
 fn clear_port_status<R: AhciRegisterIo>(regs: &R, port: usize) {
@@ -727,10 +994,12 @@ fn poll_command_with<R: AhciRegisterIo>(
     iteration_limit: usize,
 ) -> Result<(), AhciError> {
     let started = now_ns();
+    let mut last_now = started;
+    let mut stagnant_iterations = 0usize;
     let command_issue = regs::port_reg(port, regs::PORT_CI);
     let interrupt_status = regs::port_reg(port, regs::PORT_IS);
     let task_file = regs::port_reg(port, regs::PORT_TFD);
-    for _ in 0..iteration_limit {
+    loop {
         let port_is = regs.read32(interrupt_status);
         let tfd = regs.read32(task_file);
         if port_is & regs::PORT_IS_ERROR != 0 || tfd & regs::PORT_TFD_ERR != 0 {
@@ -739,12 +1008,21 @@ fn poll_command_with<R: AhciRegisterIo>(
         if regs.read32(command_issue) & COMMAND_SLOT == 0 {
             return Ok(());
         }
-        if now_ns().wrapping_sub(started) >= timeout_ns {
+        let now = now_ns();
+        if now.wrapping_sub(started) >= timeout_ns {
             return Err(AhciError::CommandTimeout);
+        }
+        if now == last_now {
+            stagnant_iterations = stagnant_iterations.saturating_add(1);
+            if stagnant_iterations >= iteration_limit {
+                return Err(AhciError::CommandTimeout);
+            }
+        } else {
+            last_now = now;
+            stagnant_iterations = 0;
         }
         core::hint::spin_loop();
     }
-    Err(AhciError::CommandTimeout)
 }
 
 fn identify_fis() -> [u8; 20] {
@@ -753,6 +1031,14 @@ fn identify_fis() -> [u8; 20] {
 
 fn read_dma_ext_fis(lba: u64, sectors: u16) -> [u8; 20] {
     register_h2d_fis(ATA_CMD_READ_DMA_EXT, lba, sectors, true)
+}
+
+fn write_dma_ext_fis(lba: u64, sectors: u16) -> [u8; 20] {
+    register_h2d_fis(ATA_CMD_WRITE_DMA_EXT, lba, sectors, true)
+}
+
+fn flush_cache_ext_fis() -> [u8; 20] {
+    register_h2d_fis(ATA_CMD_FLUSH_CACHE_EXT, 0, 0, false)
 }
 
 fn register_h2d_fis(command: u8, lba: u64, sectors: u16, lba_mode: bool) -> [u8; 20] {
@@ -770,6 +1056,37 @@ fn register_h2d_fis(command: u8, lba: u64, sectors: u16, lba_mode: bool) -> [u8;
     fis[12] = sectors as u8;
     fis[13] = (sectors >> 8) as u8;
     fis
+}
+
+fn validate_io_range(start: u64, sector_count: u64, total_blocks: u64) -> Result<(), AhciError> {
+    let end = start
+        .checked_add(sector_count)
+        .ok_or(AhciError::OutOfRange)?;
+    if start >> 48 != 0 || end > (1u64 << 48) || end > total_blocks {
+        return Err(AhciError::OutOfRange);
+    }
+    Ok(())
+}
+
+fn frame_kernel_ptr<P: TxPlatform>(frame: &Frame) -> Result<*mut u8, AhciError> {
+    let frame_start = frame
+        .ppn()
+        .0
+        .checked_mul(PAGE_SIZE)
+        .ok_or(AhciError::FrameMapping)?;
+    let frame_end = frame_start
+        .checked_add(PAGE_SIZE)
+        .ok_or(AhciError::FrameMapping)?;
+    let kernel = <P as tx_hal::BootInfoIf>::boot_info().kernel_image;
+    let kernel_end = kernel
+        .start
+        .0
+        .checked_add(kernel.size)
+        .ok_or(AhciError::FrameMapping)?;
+    if frame_start < kernel_end && kernel.start.0 < frame_end {
+        return Err(AhciError::DmaKernelImageOverlap);
+    }
+    page_allocator::frame_kernel_addr(frame.ppn()).map_err(|_| AhciError::FrameMapping)
 }
 
 fn parse_identify(bytes: &[u8; 512]) -> Result<AhciIdentity, AhciError> {
@@ -791,14 +1108,13 @@ fn parse_identify(bytes: &[u8; 512]) -> Result<AhciIdentity, AhciError> {
     }
 
     let lba48_supported = word(83) & (1 << 10) != 0;
-    let total_blocks = if lba48_supported {
-        u64::from(word(100))
-            | (u64::from(word(101)) << 16)
-            | (u64::from(word(102)) << 32)
-            | (u64::from(word(103)) << 48)
-    } else {
-        u64::from(word(60)) | (u64::from(word(61)) << 16)
-    };
+    if !lba48_supported {
+        return Err(AhciError::UnsupportedAddressing);
+    }
+    let total_blocks = u64::from(word(100))
+        | (u64::from(word(101)) << 16)
+        | (u64::from(word(102)) << 32)
+        | (u64::from(word(103)) << 48);
     if total_blocks == 0 {
         return Err(AhciError::InvalidIdentify);
     }
@@ -917,6 +1233,70 @@ mod tests {
     }
 
     #[test]
+    fn write_dma_ext_fis_encodes_lba48_and_sector_count() {
+        let fis = write_dma_ext_fis(0x1234_5678_9abc, 8);
+        assert_eq!(fis[0], FIS_TYPE_REG_H2D);
+        assert_eq!(fis[1], FIS_COMMAND);
+        assert_eq!(fis[2], ATA_CMD_WRITE_DMA_EXT);
+        assert_eq!(&fis[4..7], &[0xbc, 0x9a, 0x78]);
+        assert_eq!(fis[7], ATA_DEVICE_LBA);
+        assert_eq!(&fis[8..11], &[0x56, 0x34, 0x12]);
+        assert_eq!(&fis[12..14], &[8, 0]);
+    }
+
+    #[test]
+    fn command_header_direction_and_prdt_shape_match_protocol() {
+        let read = command_layout(CommandTransfer::DataIn(PAGE_SIZE)).unwrap();
+        assert_eq!(read.header_flags, COMMAND_HEADER_CFL_DWORDS);
+        assert_eq!(read.prdt_length, 1);
+        assert_eq!(read.prdt_byte_count, Some((PAGE_SIZE - 1) as u32));
+        assert_eq!(
+            CommandTransfer::DataIn(PAGE_SIZE).dma_direction(),
+            Some(DmaDirection::FromDevice)
+        );
+
+        let write = command_layout(CommandTransfer::DataOut(PAGE_SIZE)).unwrap();
+        assert_eq!(
+            write.header_flags,
+            COMMAND_HEADER_CFL_DWORDS | COMMAND_HEADER_WRITE
+        );
+        assert_eq!(write.prdt_length, 1);
+        assert_eq!(write.prdt_byte_count, Some((PAGE_SIZE - 1) as u32));
+        assert_eq!(
+            CommandTransfer::DataOut(PAGE_SIZE).dma_direction(),
+            Some(DmaDirection::ToDevice)
+        );
+    }
+
+    #[test]
+    fn flush_cache_ext_is_non_data_and_has_no_prdt() {
+        let fis = flush_cache_ext_fis();
+        assert_eq!(fis[0], FIS_TYPE_REG_H2D);
+        assert_eq!(fis[1], FIS_COMMAND);
+        assert_eq!(fis[2], ATA_CMD_FLUSH_CACHE_EXT);
+
+        let flush = command_layout(CommandTransfer::NonData).unwrap();
+        assert_eq!(flush.header_flags, COMMAND_HEADER_CFL_DWORDS);
+        assert_eq!(flush.prdt_length, 0);
+        assert_eq!(flush.prdt_byte_count, None);
+        assert_eq!(CommandTransfer::NonData.dma_direction(), None);
+    }
+
+    #[test]
+    fn io_range_validation_rejects_overflow_capacity_and_non_lba48() {
+        assert_eq!(validate_io_range(8, 8, 16), Ok(()));
+        assert_eq!(
+            validate_io_range(u64::MAX - 3, 8, u64::MAX),
+            Err(AhciError::OutOfRange)
+        );
+        assert_eq!(validate_io_range(9, 8, 16), Err(AhciError::OutOfRange));
+        assert_eq!(
+            validate_io_range(1 << 48, 1, u64::MAX),
+            Err(AhciError::OutOfRange)
+        );
+    }
+
+    #[test]
     fn identify_prefers_lba48_capacity() {
         let mut identify = [0u8; 512];
         set_identify_word(&mut identify, 83, 1 << 10);
@@ -937,6 +1317,16 @@ mod tests {
         assert_eq!(
             parse_identify(&identify),
             Err(AhciError::UnsupportedLogicalBlockSize(4096))
+        );
+    }
+
+    #[test]
+    fn identify_rejects_non_lba48_devices() {
+        let mut identify = [0u8; 512];
+        set_identify_word(&mut identify, 60, 1);
+        assert_eq!(
+            parse_identify(&identify),
+            Err(AhciError::UnsupportedAddressing)
         );
     }
 
@@ -981,6 +1371,65 @@ mod tests {
             Err(AhciError::CommandTimeout)
         );
         assert_eq!(regs.ci_reads.get(), 4);
+    }
+
+    #[test]
+    fn command_poll_does_not_cap_a_progressing_clock_by_total_iterations() {
+        let regs = MockRegisters::new();
+        regs.set(regs::port_reg(0, regs::PORT_CI), COMMAND_SLOT);
+        regs.clear_ci_after.set(Some(6));
+        let ticks = Cell::new(0u64);
+        assert_eq!(
+            poll_command_with(
+                &regs,
+                0,
+                || {
+                    let next = ticks.get() + 1;
+                    ticks.set(next);
+                    next
+                },
+                100,
+                2,
+            ),
+            Ok(())
+        );
+        assert_eq!(regs.ci_reads.get(), 6);
+    }
+
+    #[test]
+    fn runtime_failure_observation_latches_first_error() {
+        let observation = RuntimeFailureObservation::new();
+        assert!(observation.observe());
+        assert!(!observation.observe());
+        assert_eq!(observation.count.load(Ordering::Relaxed), 2);
+        assert!(observation.first_reported.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn successful_commands_do_not_emit_runtime_failure() {
+        let observation = RuntimeFailureObservation::new();
+        assert_eq!(observation.count.load(Ordering::Relaxed), 0);
+        assert!(!observation.first_reported.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn runtime_failure_record_keeps_the_first_hardware_witness_compact() {
+        let snapshot = RuntimeFailureSnapshot {
+            operation: RuntimeOperation::Write,
+            lba: 0x1234,
+            error: AhciError::TaskFileError,
+            interrupt_status: 0x4000_0000,
+            task_file: 0x51,
+            sata_error: 0x10,
+            command_issue: 1,
+        };
+        let mut line = [0u8; 256];
+        let len = format_runtime_failure(snapshot, &mut line);
+        let line = core::str::from_utf8(&line[..len]).unwrap();
+        assert_eq!(
+            line,
+            "txkernel:ahci:io-error:op=write:lba=0x0000000000001234:error=task-file-error:is=0x40000000:tfd=0x00000051:serr=0x00000010:ci=0x00000001\n"
+        );
     }
 
     #[test]

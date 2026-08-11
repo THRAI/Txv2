@@ -17,6 +17,7 @@ use tx_ext4::planner::Ext4BlockGeometry;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
 use tx_subsystems::device::{self, BlockDevice, BlockDeviceHandle, PhysicalBlockNumber};
+use tx_subsystems::execution::Errno;
 use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::page_backed::{Frame, PageContainer};
 
@@ -124,7 +125,7 @@ impl BlockDeviceImage {
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 return Err(Ext4FormatError::WouldBlock);
             }
-            StepOutcome::Err(_) => return Err(Ext4FormatError::Truncated),
+            StepOutcome::Err(error) => return Err(map_device_error(error)),
         }
 
         let mut blocks = Vec::with_capacity(count);
@@ -243,8 +244,31 @@ impl BlockImage for BlockDeviceImage {
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 Err(Ext4FormatError::WouldBlock)
             }
-            StepOutcome::Err(_) => Err(Ext4FormatError::Truncated),
+            StepOutcome::Err(error) => Err(map_device_error(error)),
         }
+    }
+
+    fn barrier(&mut self) -> Result<()> {
+        let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
+        let outcome = self.device.barrier(&guard);
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(()) => Ok(()),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                Err(Ext4FormatError::WouldBlock)
+            }
+            StepOutcome::Err(error) => Err(map_device_error(error)),
+        }
+    }
+}
+
+fn map_device_error(error: Errno) -> Ext4FormatError {
+    if error == Errno::EROFS {
+        Ext4FormatError::ReadOnly
+    } else if error == Errno::EINVAL {
+        Ext4FormatError::InvalidInput
+    } else {
+        Ext4FormatError::Io
     }
 }
 
@@ -375,7 +399,7 @@ mod tests {
         }
 
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
-            StepOutcome::done(())
+            self.outcome()
         }
     }
 
@@ -392,9 +416,53 @@ mod tests {
     static CONTINUE_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Continue);
     static YIELD_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Yield);
 
+    struct ErrorBlockDevice {
+        error: Errno,
+    }
+
+    impl BlockDeviceOps for ErrorBlockDevice {
+        fn read_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::Err(self.error)
+        }
+
+        fn write_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::Err(self.error)
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::Err(self.error)
+        }
+    }
+
+    impl BlockDevice for ErrorBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            64
+        }
+
+        fn block_size(&self) -> u32 {
+            512
+        }
+    }
+
+    static READ_ONLY_DEVICE: ErrorBlockDevice = ErrorBlockDevice {
+        error: Errno::EROFS,
+    };
+    static IO_ERROR_DEVICE: ErrorBlockDevice = ErrorBlockDevice { error: Errno::EIO };
+
     struct RecordingBlockDevice {
         reads: AtomicUsize,
         last_frames: AtomicUsize,
+        barriers: AtomicUsize,
     }
 
     impl RecordingBlockDevice {
@@ -402,12 +470,14 @@ mod tests {
             Self {
                 reads: AtomicUsize::new(0),
                 last_frames: AtomicUsize::new(0),
+                barriers: AtomicUsize::new(0),
             }
         }
 
         fn reset(&self) {
             self.reads.store(0, Ordering::Release);
             self.last_frames.store(0, Ordering::Release);
+            self.barriers.store(0, Ordering::Release);
         }
     }
 
@@ -447,6 +517,7 @@ mod tests {
         }
 
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            self.barriers.fetch_add(1, Ordering::AcqRel);
             StepOutcome::done(())
         }
     }
@@ -505,6 +576,45 @@ mod tests {
             BlockDeviceImage::new(&YIELD_DEVICE).write_block(0, &data),
             Err(Ext4FormatError::WouldBlock)
         );
+    }
+
+    #[test]
+    fn ext4_bridge_delegates_barrier() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        RECORDING_DEVICE.reset();
+        let mut image = BlockDeviceImage::new(&RECORDING_DEVICE);
+
+        assert_eq!(image.barrier(), Ok(()));
+        assert_eq!(RECORDING_DEVICE.barriers.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn ext4_bridge_maps_retrying_barrier_to_would_block() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+
+        let mut continuing = BlockDeviceImage::new(&CONTINUE_DEVICE);
+        assert_eq!(continuing.barrier(), Err(Ext4FormatError::WouldBlock));
+        let mut yielding = BlockDeviceImage::new(&YIELD_DEVICE);
+        assert_eq!(yielding.barrier(), Err(Ext4FormatError::WouldBlock));
+    }
+
+    #[test]
+    fn ext4_bridge_preserves_barrier_device_errors() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+
+        let mut read_only = BlockDeviceImage::new(&READ_ONLY_DEVICE);
+        assert_eq!(read_only.barrier(), Err(Ext4FormatError::ReadOnly));
+        let mut io_error = BlockDeviceImage::new(&IO_ERROR_DEVICE);
+        assert_eq!(io_error.barrier(), Err(Ext4FormatError::Io));
     }
 
     #[test]

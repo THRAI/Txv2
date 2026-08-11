@@ -1,3 +1,33 @@
+- 2026-08-11 (**Loongson 2K1000 AHCI 可写传输已完成 host/LA64 编译准入，实板写入仍受安全门约束**).
+  **Changed**：以 `42cd4396` 为实现基线，先新增
+  `2026-08-11-la2k1000-ahci-write` 计划与逐阶段实验协议，再按红→绿顺序实现。
+  AHCI 现通过原有单 slot、4 KiB、32-bit bounce workspace 发出 LBA48
+  `WRITE DMA EXT`（`0x35`，W=1，单 PRDT）和非数据
+  `FLUSH CACHE EXT`（`0xea`，W=0，PRDTL=0）；写 bounce 使用 `ToDevice`
+  cache sync，flush 使用 60 秒 wall-clock deadline，时钟停滞 escape 不再误伤正常
+  长 flush。首个传输错误后 port fail-closed，并且每次启动只输出一条包含
+  op/LBA/error/PxIS/PxTFD/PxSERR/PxCI 的低扰动记录。
+  **Filesystem bridge**：`BlockDeviceImage::barrier()` 不再继承成功 no-op，而是
+  下沉到 `BlockDeviceOps::barrier()`；设备 `EROFS/EIO` 分别保持为
+  `ReadOnly/Io` 并映回 Linux errno，不再统一伪装为 `Truncated/EINVAL`。RV64
+  VF2 MMC 的 CMD24 循环只作为 4 KiB Frame→8 sectors 的对照；其 barrier
+  仍是 no-op，不能作为掉电持久性模型。没有修改 LA QEMU TLB、CPU-pin/stack、
+  fairness、MMC、硬件资源事实或 Alpine mother image，也没有制作新 root image。
+  **Verification**：AHCI 19/19、tx-drivers 43/43、ext4 bridge 7/7、tx-fs
+  106/106、tx-ext4-format 51/51（含 journal/recovery integration）、tx-ext4
+  39/39、`cargo fmt --all -- --check`、`git diff --check` 与
+  `cargo xtask full-build --target la64-2k1000 --skip-doctor --no-image` 均通过。
+  `cargo -q xtask unit` 仍仅被既有 tx-shims dispatch 群和两个 tx-kernel
+  libctest 命令断言阻断；progress validate 和 docs lint 仍分别是未触碰的旧
+  `completed` 状态、31 个断链/6 个旧词警告。
+  **Blocker / Next**：实现计划保持 active；host 阶段已闭合，但尚无新的实板串口
+  或磁盘写入证据。下一步只部署新 kernel，并以现有 Alpine 盘
+  `tx.root=sda ro` 做只读控制；该控制通过后，必须由用户明确指定 clone/spare
+  medium，才能执行文件级 write/fsync/rename/reset/offline-fsck。不得猜测裸 LBA，
+  也不得把板载比赛盘默认为 disposable。详细实验协议见
+  `docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md`，host 账本见
+  `msp/debug-logs/2026-08-11-la2k1000-ahci-write-host-admission.md`。
+
 - 2026-08-11 (**Loongson 2K1000 CPU-pin、持续服务公平性与完整
   clone/post-clone 均已实板闭合**).
   **Changed**：checkpoint 保持 `3a757495`；没有重新调查或回退共享 LA QEMU

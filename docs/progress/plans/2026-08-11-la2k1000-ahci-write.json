@@ -1,0 +1,306 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-11-la2k1000-ahci-write",
+  "title": "Loongson 2K1000 AHCI write and durability validation",
+  "status": "active",
+  "created": "2026-08-11",
+  "updated": "2026-08-11",
+  "owner": "codex",
+  "summary": "Add bounded polling WRITE DMA EXT and FLUSH CACHE EXT support to the existing 2K1000 AHCI transport, connect ext4 BlockImage barriers to the block device, establish failure-only diagnostics and host regressions, then admit real-board media writes only through explicit safety gates.",
+  "scope": {
+    "in": [
+      "the existing one-slot polling AHCI transport and its private 4 KiB bounce buffer",
+      "LBA48 WRITE DMA EXT data-out commands and FLUSH CACHE EXT non-data commands",
+      "direction-correct command-header, PRDT, DMA cache, publication, completion, and timeout behavior",
+      "kernel ext4 BlockImage-to-BlockDevice barrier delegation",
+      "first-failure-only AHCI runtime diagnostics suitable for serial capture",
+      "host command-layout, bridge, error, and regression tests",
+      "LA64 2K1000 compile/build admission before any real-board reset request",
+      "staged read-only, disposable-media, persistence, filesystem-check, and workload real-board experiments"
+    ],
+    "out": [
+      "LA QEMU Pmap, IPI, or TLB protocol changes",
+      "repeating CPU-pin, stack, fairness, or hardware-fact investigations already closed at 42cd4396",
+      "AHCI interrupts, NCQ, multi-slot scheduling, direct caller-frame DMA, hotplug, port multipliers, or recovery reset machinery",
+      "changing the RV64 VF2 MMC implementation or treating its no-op barrier as a durability model",
+      "raw writes to guessed free LBAs, partition-table edits, mkfs, resizing, or destructive fsck",
+      "modifying local-images/alpine-linux-loongarch64-ext4fs.img or creating a replacement root image",
+      "writing the onboard competition disk before explicit user approval of the exact filesystem-level probe",
+      "rebasing or merging the updated main branch during this implementation slice"
+    ],
+    "write_sets": [
+      {
+        "owner": "codex",
+        "paths": [
+          "crates/tx-drivers/src/ahci/mod.rs",
+          "crates/tx-fs/src/tx_ext4_bridge.rs",
+          "crates/tx-ext4-format/src/lib.rs",
+          "crates/tx-ext4/src/read_backend.rs",
+          "docs/progress/plans/2026-08-11-la2k1000-ahci-write.json",
+          "docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md"
+        ],
+        "notes": "One local implementation lane. Existing board HAL resource facts, DMA mapping policy, QEMU TLB code, the Alpine mother image, and the real disk remain outside the write set. Ext4 error-type edits are admitted only if the phase-3 red test proves the bridge otherwise destroys EROFS/EIO identity."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/Txv3/02_INVARIANTS_v5.md#txdoc:INV-V5-DEVRES",
+      "docs/design/01_substrate/HAL_v1.md#txdoc:HAL-DMAIF-1",
+      "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md",
+      "docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md#txdoc:TX-EXT4-PLAN-BLOCKDEVICE-TRAIT-CONSUMED-TX-EXT4-1",
+      "docs/design/05_filesystem/BDEV_FS.md#txdoc:BDEV-FS-OPEN-QUESTIONS-1",
+      "docs/design/06_devices/DEVICE.md#txdoc:DEVICE-TIER-2-STATIC-DEVICES-1"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/handoffs/2026-08-06-la2k1000-real-board-git.json",
+      "docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md",
+      "msp/debug-logs/2026-08-08-la2k1000-ahci-alpine-root.md",
+      "msp/debug-logs/2026-08-10-la2k1000-real-board-git-handoff.md"
+    ],
+    "external_refs": [
+      "https://www.thailand.intel.com/content/dam/www/public/us/en/documents/technical-specifications/serial-ata-ahci-spec-rev1-3-1.pdf",
+      "https://tc.gts3.org/cs3210/2016/spring/r/hardware/ATA8-ACS.pdf"
+    ]
+  },
+  "steps": [
+    {
+      "id": "phase-0-freeze-experiment-contract",
+      "title": "Freeze the implementation and media-safety experiment contract",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md",
+        "docs/progress/plans/2026-08-11-la2k1000-ahci-write.json"
+      ],
+      "verification": [
+        "cargo xtask progress validate",
+        "cargo xtask lint docs",
+        "git diff --check"
+      ],
+      "notes": "The protocol names hypotheses, canonical gates, red tests, expected register/DMA behavior, stop conditions, rollback, and the explicit approval boundary before any board-media write. A repository-wide progress/docs failure is recorded with exact pre-existing findings rather than hidden."
+    },
+    {
+      "id": "phase-1-command-layout-red-tests",
+      "title": "Add host regressions for AHCI write and non-data command layout",
+      "status": "complete",
+      "depends_on": [
+        "phase-0-freeze-experiment-contract"
+      ],
+      "paths": [
+        "crates/tx-drivers/src/ahci/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-drivers --lib ahci::tests::write_dma_ext_fis_encodes_lba48_and_sector_count -- --exact",
+        "cargo test -p tx-drivers --lib ahci::tests::command_header_direction_and_prdt_shape_match_protocol -- --exact",
+        "cargo test -p tx-drivers --lib ahci::tests::flush_cache_ext_is_non_data_and_has_no_prdt -- --exact",
+        "cargo test -p tx-drivers --lib ahci::tests::io_range_validation_rejects_overflow_capacity_and_non_lba48 -- --exact"
+      ],
+      "notes": "The tests must first fail because 0x35, 0xEA, the W flag, and non-data command preparation do not exist. READ DMA EXT layout remains a locked control."
+    },
+    {
+      "id": "phase-2-ahci-write-transport",
+      "title": "Implement bounded WRITE DMA EXT through the existing bounce workspace",
+      "status": "complete",
+      "depends_on": [
+        "phase-1-command-layout-red-tests"
+      ],
+      "paths": [
+        "crates/tx-drivers/src/ahci/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-drivers --lib ahci::tests::",
+        "cargo test -p tx-drivers --lib"
+      ],
+      "notes": "Retain one slot, polling, 32-bit constrained DMA and one page per command. Copy source Frame to bounce, sync bounce ToDevice, set command-header W, publish before PxCI, wait for completion/error, and require PRDBC=4096. Keep empty, overflow, capacity, frame-mapping, kernel-overlap, and 48-bit-LBA checks explicit. Do not add NCQ or direct Frame DMA."
+    },
+    {
+      "id": "phase-3-durable-barrier-and-error-fidelity",
+      "title": "Implement FLUSH CACHE EXT and connect the ext4 BlockImage barrier",
+      "status": "complete",
+      "depends_on": [
+        "phase-2-ahci-write-transport"
+      ],
+      "paths": [
+        "crates/tx-drivers/src/ahci/mod.rs",
+        "crates/tx-fs/src/tx_ext4_bridge.rs",
+        "crates/tx-ext4-format/src/lib.rs",
+        "crates/tx-ext4/src/read_backend.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-drivers --lib ahci::tests::",
+        "cargo test -p tx-fs --lib tx_ext4_bridge::tests::ext4_bridge_delegates_barrier -- --exact",
+        "cargo test -p tx-fs --lib tx_ext4_bridge::tests::ext4_bridge_maps_retrying_barrier_to_would_block -- --exact",
+        "cargo test -p tx-ext4 --lib"
+      ],
+      "notes": "FLUSH CACHE EXT uses a register H2D FIS with PRDTL=0 and W=0, no bounce sync, and a flush-specific deadline long enough for ATA cache drain. BlockDeviceImage must override BlockImage::barrier and drive BlockDeviceOps::barrier. Preserve EROFS/EIO if a small format-error extension is required; never continue collapsing all transport failures into Truncated/EINVAL."
+    },
+    {
+      "id": "phase-4-low-disturbance-observation",
+      "title": "Add first-failure-only AHCI runtime observation",
+      "status": "complete",
+      "depends_on": [
+        "phase-3-durable-barrier-and-error-fidelity"
+      ],
+      "paths": [
+        "crates/tx-drivers/src/ahci/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-drivers --lib ahci::tests::runtime_failure_observation_latches_first_error -- --exact",
+        "cargo test -p tx-drivers --lib ahci::tests::successful_commands_do_not_emit_runtime_failure -- --exact"
+      ],
+      "notes": "Record cumulative failure count plus the first operation/LBA/error/PxIS/PxTFD/PxSERR/PxCI snapshot. Emit at most one compact serial record per boot and nothing per successful command. Expected input/range errors do not count as transport failures."
+    },
+    {
+      "id": "phase-5-host-and-build-admission",
+      "title": "Run host, formatting, boundary, and LA64 build admission",
+      "status": "complete",
+      "depends_on": [
+        "phase-4-low-disturbance-observation"
+      ],
+      "paths": [
+        "crates/tx-drivers/src/ahci/mod.rs",
+        "crates/tx-fs/src/tx_ext4_bridge.rs",
+        "crates/tx-ext4-format/src/lib.rs",
+        "crates/tx-ext4/src/read_backend.rs"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo test -p tx-drivers --lib ahci::tests::",
+        "cargo test -p tx-drivers --lib",
+        "cargo test -p tx-fs --lib tx_ext4_bridge::tests::",
+        "cargo test -p tx-ext4-format --lib",
+        "cargo test -p tx-ext4 --lib",
+        "cargo fmt --all -- --check",
+        "cargo xtask full-build --target la64-2k1000 --skip-doctor --no-image",
+        "git diff --check"
+      ],
+      "notes": "No reset request and no image deployment before all changed-path focused gates and the physical-target build pass. Pre-existing unrelated workspace failures are preserved verbatim and separated from changed-path regressions."
+    },
+    {
+      "id": "phase-6-real-board-read-only-control",
+      "title": "Boot the new driver read-only and prove no read-path regression",
+      "status": "pending",
+      "depends_on": [
+        "phase-5-host-and-build-admission"
+      ],
+      "paths": [],
+      "verification": [
+        "Real board boots with tx.root=sda ro, identifies 62533296x512, mounts ext4, enters Alpine shell, and reads known files.",
+        "The boot boundary contains no AHCI runtime-failure record, CPU-pin/stack/cmdline failure, panic, or unexpected disk-write witness."
+      ],
+      "notes": "This is the first point at which Codex asks the user to reset. The board remains read-only; no media mutation is authorized by this phase. Codex operates the serial bridge and debugging; the user only resets when requested."
+    },
+    {
+      "id": "phase-7-approved-disposable-write-probe",
+      "title": "Run a filesystem-level write, barrier, persistence, and offline-check probe on approved disposable media",
+      "status": "pending",
+      "depends_on": [
+        "phase-6-real-board-read-only-control"
+      ],
+      "paths": [],
+      "verification": [
+        "On a user-approved clone/spare medium, create one uniquely named file, write a deterministic 4 KiB pattern, fsync, rename, fsync the directory, read and hash it, delete it, fsync again, and observe no AHCI error.",
+        "After power-cycle, the expected durable state is present and an offline e2fsck -f -n reports no new error."
+      ],
+      "notes": "Never probe a guessed raw LBA. If no disposable clone/spare medium exists, stop after the read-only control and ask for explicit approval before substituting the onboard filesystem. Do not modify the local Alpine mother image."
+    },
+    {
+      "id": "phase-8-onboard-filesystem-acceptance",
+      "title": "Accept the onboard ext4 filesystem only after disposable-media closure and explicit approval",
+      "status": "pending",
+      "depends_on": [
+        "phase-7-approved-disposable-write-probe"
+      ],
+      "paths": [],
+      "verification": [
+        "Repeat the bounded file/fsync/rename/power-cycle check in a dedicated /root/tx-ahci-write-probe directory on the explicitly approved onboard filesystem.",
+        "Persist resolver and CA/config changes through ordinary filesystem calls; never disable TLS verification.",
+        "Run bounded Git init/add/commit, clone/post-clone, sustained TLS requests, shell responsiveness, host ping, and final filesystem-check acceptance with no AHCI or kernel invariant failure."
+      ],
+      "notes": "The user owns reset and media approval; Codex owns commands, serial capture, diagnosis, and stop/go decisions. date -u changes realtime state but is not itself a filesystem persistence test."
+    },
+    {
+      "id": "phase-9-catch-up-and-commit",
+      "title": "Record evidence, close the implementation slice, and commit only scoped files",
+      "status": "complete",
+      "depends_on": [
+        "phase-5-host-and-build-admission"
+      ],
+      "paths": [
+        "docs/progress/STATUS.md",
+        "docs/progress/plans/2026-08-11-la2k1000-ahci-write.json",
+        "docs/progress/handoffs/2026-08-06-la2k1000-real-board-git.json",
+        "docs/progress/research/2026-08-11-la2k1000-ahci-write-experiment.md"
+      ],
+      "verification": [
+        "cargo xtask progress validate",
+        "cargo xtask lint docs",
+        "git diff --check",
+        "git status --short"
+      ],
+      "notes": "Host implementation may be committed before hardware mutation. Keep real-board phases pending until their exact evidence exists; do not mark the whole plan complete merely because code builds. Do not add a coauthor."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "The new record parses with jq, but repository-wide validation stops at the untouched docs/progress/plans/2026-07-24-network-time-integration.json because it uses step status completed instead of complete."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "failed",
+      "notes": "The repository reports the same existing 31 broken links and 6 stale-vocabulary warnings. Neither new experiment file appears in the findings."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "The changed tx-ext4 lane passes 39/39 and tx-scripts passes 167/167, but the repository gate remains red in the existing tx-shims dispatch group and two tx-kernel libctest command assertions."
+    },
+    {
+      "command": "cargo test -p tx-drivers --lib ahci::tests::",
+      "status": "passed",
+      "notes": "19/19 AHCI tests passed, including write/flush layout, LBA48 range, progressing/stalled clock behavior, and first-failure observation. Full tx-drivers is 43/43."
+    },
+    {
+      "command": "cargo test -p tx-fs --lib tx_ext4_bridge::tests::",
+      "status": "passed",
+      "notes": "7/7 bridge tests passed, including the red-to-green barrier delegation counter, retry mapping, and EROFS/EIO fidelity. Full tx-fs is 106/106."
+    },
+    {
+      "command": "cargo xtask full-build --target la64-2k1000 --skip-doctor --no-image",
+      "status": "passed",
+      "notes": "The physical target completed full-build: ok. --no-image deliberately avoided rebuilding or replacing the Alpine root image."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format && cargo test -p tx-ext4 --lib",
+      "status": "passed",
+      "notes": "tx-ext4-format passed 51 unit/integration tests including journal and recovery coverage; tx-ext4 passed 39/39 including ReadOnly/Io errno mapping."
+    },
+    {
+      "command": "cargo fmt --all -- --check && git diff --check",
+      "status": "passed",
+      "notes": "Formatting and whitespace checks passed after the implementation edits."
+    }
+  ],
+  "risks": [
+    "Setting ATA opcode 0x35 without AHCI Command Header W=1 reverses the HBA transfer interpretation and is a hard stop covered by host layout tests.",
+    "Using FromDevice cache synchronization for the write bounce buffer may send stale data on non-coherent LA64; command planning and implementation must use ToDevice.",
+    "Returning success from BlockImage::barrier without delegating to BlockDeviceOps violates ext4 journal ordering even when the SATA driver has a correct flush command.",
+    "A total polling-iteration cap can expire far earlier than the ATA flush time on a fast CPU; the wall-clock deadline and stalled-clock escape must be distinct.",
+    "After a TFES, interface, host-bus, or timeout error, blindly issuing another command may reuse an unsafe port state. The first implementation fails closed for the current request and reports the register snapshot; automatic port recovery remains out of scope.",
+    "The onboard SATA filesystem is the competition environment and currently has no declared disposable clone. Raw-LBA experiments or early writable boot could corrupt it; the plan requires read-only control and explicit media approval.",
+    "The existing bridge collapses all block errors to Truncated/EINVAL. Without narrow error fidelity or a first-failure driver record, real-board diagnosis would misclassify transport errors as ext4 format failures.",
+    "Existing active progress records contain a legacy completed step status and broad overlapping scopes, so repository-wide progress validation may remain red independently of this new record."
+  ],
+  "blockers": [
+    "Real-board write phases require the user to identify or approve the exact disposable/competition medium and reset when requested.",
+    "Offline e2fsck requires the tested filesystem not to be mounted and an available trusted fsck environment; if unavailable, hardware acceptance stops before original-media promotion."
+  ],
+  "handoff": {
+    "needed": true,
+    "path": "docs/progress/handoffs/2026-08-06-la2k1000-real-board-git.json"
+  }
+}
