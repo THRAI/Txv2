@@ -45,6 +45,78 @@ fn page_slot_rejects_stale_generation_completion() {
 }
 
 #[test]
+fn page_slot_withdrawal_requires_the_observed_generation_and_ppn() {
+    let slot = PageSlot::new();
+    let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+        panic!("first miss must own the fetch");
+    };
+    slot.complete_fetch(generation, Ok(Ppn(10)))
+        .expect("setup resident page");
+
+    assert!(matches!(
+        slot.withdraw_if_matches(generation, Ppn(11)),
+        Err(PageSlotCompletionError::MismatchedFrame {
+            expected: Ppn(11),
+            current: Ppn(10),
+        })
+    ));
+    let withdrawn = slot
+        .withdraw_if_matches(generation, Ppn(10))
+        .expect("matching binding withdraws");
+    assert_eq!(withdrawn.state, PageSlotState::Empty);
+    assert_ne!(withdrawn.generation, generation);
+    assert!(matches!(
+        slot.withdraw_if_matches(generation, Ppn(10)),
+        Err(PageSlotCompletionError::GenerationMismatch { completed, .. }) if completed == generation
+    ));
+}
+
+#[test]
+fn page_slot_replacement_requires_the_observed_generation_and_ppn() {
+    let slot = PageSlot::new();
+    let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+        panic!("first miss must own the fetch");
+    };
+    slot.complete_fetch(generation, Ok(Ppn(15)))
+        .expect("setup resident page");
+
+    assert!(matches!(
+        slot.replace_if_matches(generation, Ppn(16), Ppn(17)),
+        Err(PageSlotCompletionError::MismatchedFrame {
+            expected: Ppn(16),
+            current: Ppn(15),
+        })
+    ));
+    let replacement = slot
+        .replace_if_matches(generation, Ppn(15), Ppn(17))
+        .expect("matching binding is replaced");
+    assert_eq!(replacement.state, PageSlotState::Resident { ppn: Ppn(17) });
+    assert_ne!(replacement.generation, generation);
+}
+
+#[test]
+fn page_slot_cleaning_preserves_a_newer_dirty_generation() {
+    let slot = PageSlot::new();
+    let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+        panic!("first miss must own the fetch");
+    };
+    slot.complete_fetch(generation, Ok(Ppn(12)))
+        .expect("setup resident page");
+    let first_dirty = slot.mark_dirty().expect("first dirty generation");
+    let second_dirty = slot.mark_dirty().expect("redirty generation");
+
+    assert!(matches!(
+        slot.mark_clean_if_matches(first_dirty.generation, Ppn(12)),
+        Err(PageSlotCompletionError::GenerationMismatch { completed, .. })
+            if completed == first_dirty.generation
+    ));
+    let clean = slot
+        .mark_clean_if_matches(second_dirty.generation, Ppn(12))
+        .expect("current dirty generation can become clean");
+    assert_eq!(clean.state, PageSlotState::Resident { ppn: Ppn(12) });
+}
+
+#[test]
 fn page_slot_tracks_dirty_writeback_and_error_states() {
     let slot = PageSlot::new();
     let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {

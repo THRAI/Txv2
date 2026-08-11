@@ -712,7 +712,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let mailbox_arc = script_ctx.mailbox().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let timer_registrar_handle = script_ctx.timer_registrar().cloned();
-    let op = TruncateOp { pc: &pc, new_size };
+    let op = TruncateOp::new(&pc, new_size);
     match drive(
         op,
         &mut script_ctx,
@@ -758,10 +758,7 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     // Op acquires its own epoch guard inside `step()`; the syscall
     // handler holds no guard across `drive(...).await` (EBR-7).
-    let op = FdTruncateOp {
-        pc: &pc,
-        new_size: new_size as u64,
-    };
+    let op = FdTruncateOp::new(&pc, new_size as u64);
     match drive(
         op,
         &mut script_ctx,

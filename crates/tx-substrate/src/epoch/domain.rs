@@ -6,11 +6,14 @@
 //! left its guard or advanced past the retire epoch.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::guard::Guard;
-use super::local::{CpuLocalEpochState, CpuMembership};
+use super::local::{
+    CpuLocalEpochState, CpuMembership, LOCAL_RETIRE_RESERVATION_CAPACITY as LOCAL_RETIRE_CAPACITY,
+};
 use super::RcuHead;
 use tx_hal::{CpuId, CpuPinGuard, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
 
@@ -31,6 +34,29 @@ pub enum EpochError {
     CpuNotOnline,
     LocalRetireReentered,
     RetireBagOccupied,
+    LocalRetireExhausted,
+    LocalRetireOutstanding,
+}
+
+pub const LOCAL_RETIRE_RESERVATION_CAPACITY: usize = LOCAL_RETIRE_CAPACITY;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalRetireSlot(usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservedRetireInvariant {
+    WrongCpu,
+    SlotNotReserved,
+    SlotAlreadyFilled,
+}
+
+#[must_use = "local-retire reservations must be committed or canceled"]
+#[derive(Debug)]
+pub struct LocalRetireReservation {
+    cpu_id: CpuId,
+    slot: LocalRetireSlot,
+    armed: bool,
+    _not_send_sync: PhantomData<*mut ()>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -120,10 +146,6 @@ impl LocalRetireGuard {
         self.cpu_id
     }
 
-    fn local(&self) -> &'static CpuLocalEpochState {
-        self.local
-    }
-
     pub(crate) fn sample_epoch_after_barrier(&self) -> u64 {
         // The caller establishes its no-new-reader barrier before sampling.
         // AcqRel RMW observes the immediately preceding modification-order
@@ -142,12 +164,16 @@ impl LocalRetireGuard {
         Ok(())
     }
 
-    pub(crate) fn prepare_head_bags_after_barrier(&mut self, epoch: u64) -> Result<(), EpochError> {
-        let next = epoch.saturating_add(1);
-        for candidate in [epoch, next] {
-            self.reclaim_conflicting_bag_after_barrier(candidate)?;
-        }
+    pub(crate) fn preflight_head_bags_after_barrier(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), EpochError> {
+        // This is the final publication preflight. It must remain O(1) and
+        // callback-free so callers can keep it inside a short commit window.
+        // Reclaimable collisions are maintenance work for the caller to run
+        // before retrying.
         let state = unsafe { &mut *self.local.retire_state_ptr() };
+        let next = epoch.saturating_add(1);
         for candidate in [epoch, next] {
             let bag = &state.bags[candidate as usize % super::bag::EPOCH_BAG_COUNT];
             if !bag.is_empty() && bag.epoch != candidate {
@@ -156,9 +182,99 @@ impl LocalRetireGuard {
         }
         for candidate in [epoch, next] {
             let bag = &mut state.bags[candidate as usize % super::bag::EPOCH_BAG_COUNT];
-            debug_assert!(bag.reset_if_empty(candidate));
+            let prepared = bag.reset_if_empty(candidate);
+            debug_assert!(prepared);
         }
         Ok(())
+    }
+
+    fn reclaim_reclaimable_bags(
+        &mut self,
+        safe_epoch: u64,
+        budget: usize,
+    ) -> (usize, usize, usize) {
+        let mut zone_reclaim_head = None;
+        let mut intrusive_reclaim_head: *mut RcuHead = core::ptr::null_mut();
+        let mut detach_count = 0usize;
+        let mut examined = 0usize;
+
+        {
+            let state = unsafe { &mut *self.local.retire_state_ptr() };
+            for bag in &mut state.bags {
+                examined += 1;
+                if bag.is_empty() || safe_epoch < bag.epoch.saturating_add(2) {
+                    continue;
+                }
+                while detach_count < budget {
+                    if let Some(key) = bag.zone_head {
+                        bag.zone_head = crate::zone::retiring_next(key);
+                        crate::zone::set_retiring_next(key, zone_reclaim_head);
+                        zone_reclaim_head = Some(key);
+                        bag.zone_count -= 1;
+                    } else if !bag.rcu_head.is_null() {
+                        let head = bag.rcu_head;
+                        let next = unsafe { (*head).next };
+                        debug_assert!(!next.is_null());
+                        bag.rcu_head = if next == head {
+                            core::ptr::null_mut()
+                        } else {
+                            next
+                        };
+                        unsafe {
+                            (*head).next = if intrusive_reclaim_head.is_null() {
+                                head
+                            } else {
+                                intrusive_reclaim_head
+                            };
+                        }
+                        intrusive_reclaim_head = head;
+                        bag.rcu_count -= 1;
+                    } else {
+                        break;
+                    }
+                    detach_count += 1;
+                    examined += 1;
+                }
+                if bag.is_empty() {
+                    bag.epoch = 0;
+                }
+            }
+            self.local.publish_retire_summary(state);
+        }
+
+        let reclaimed = self.domain.reclaim_zone_list(self, zone_reclaim_head)
+            + self
+                .domain
+                .reclaim_intrusive_list(self, intrusive_reclaim_head);
+        let remaining = self.local.bag_only_retired_count();
+        (reclaimed, remaining, examined)
+    }
+
+    fn reclaim_reclaimable_reserved(
+        &mut self,
+        safe_epoch: u64,
+        budget: usize,
+    ) -> (usize, usize, usize) {
+        let (head, detached, examined) = unsafe {
+            self.local
+                .reserved_retire()
+                .detach_reclaimable(safe_epoch, budget)
+        };
+        let reclaimed = self.domain.reclaim_intrusive_list(self, head);
+        debug_assert_eq!(reclaimed, detached);
+        (
+            reclaimed,
+            self.local.reserved_retire().ready_count(),
+            examined,
+        )
+    }
+
+    pub(crate) fn head_bag_summary(&self) -> [(u64, usize, usize); super::bag::EPOCH_BAG_COUNT] {
+        let state = unsafe { &*self.local.retire_state_ptr() };
+        core::array::from_fn(|index| {
+            let bag = &state.bags[index];
+            (bag.epoch, bag.zone_count, bag.rcu_count)
+        })
     }
 
     pub(crate) unsafe fn enqueue_prepared_head_after_barrier(
@@ -168,8 +284,6 @@ impl LocalRetireGuard {
     ) {
         let state = unsafe { &mut *self.local.retire_state_ptr() };
         let bag = &mut state.bags[epoch as usize % super::bag::EPOCH_BAG_COUNT];
-        debug_assert_eq!(bag.epoch, epoch);
-        debug_assert!(unsafe { !head.as_ref().is_queued() });
         let previous = bag.rcu_head;
         unsafe {
             head.as_mut().next = if previous.is_null() {
@@ -188,63 +302,20 @@ impl LocalRetireGuard {
             .expect("post-barrier RCU head enqueue must be infallible");
     }
 
-    pub(crate) unsafe fn enqueue_slot_after_barrier(
+    pub(crate) unsafe fn try_enqueue_slot_after_barrier(
         &mut self,
         key: crate::zone::SlotKey,
         epoch: u64,
         link: impl FnOnce(Option<crate::zone::SlotKey>),
-    ) {
-        let mut epoch = epoch;
-        loop {
-            if self.reclaim_conflicting_bag_after_barrier(epoch).is_err() {
-                epoch = self.sample_epoch_after_barrier();
-                continue;
-            }
-            let state = unsafe { &mut *self.local.retire_state_ptr() };
-            let Some(bag) = state.bag_for_epoch_mut(epoch) else {
-                epoch = self.sample_epoch_after_barrier();
-                continue;
-            };
-            let previous_head = bag.zone_head;
-            link(previous_head);
-            bag.zone_head = Some(key);
-            bag.zone_count += 1;
-            self.local.publish_retire_summary(state);
-            return;
-        }
-    }
-
-    fn reclaim_conflicting_bag_after_barrier(&mut self, epoch: u64) -> Result<(), EpochError> {
+    ) -> Result<(), EpochError> {
         let state = unsafe { &mut *self.local.retire_state_ptr() };
-        let bag = &mut state.bags[epoch as usize % super::bag::EPOCH_BAG_COUNT];
-        if bag.is_empty() || bag.epoch == epoch {
-            return Ok(());
-        }
-
-        if bag.epoch > epoch {
-            debug_assert!(
-                false,
-                "post-barrier retire enqueue encountered a future retire epoch"
-            );
-            return Err(EpochError::RetireBagOccupied);
-        }
-
-        let zone_head = bag.zone_head.take();
-        let rcu_head = core::mem::replace(&mut bag.rcu_head, core::ptr::null_mut());
-        bag.zone_count = 0;
-        bag.rcu_count = 0;
-        bag.epoch = 0;
-        self.local.publish_retire_summary(state);
-
-        let domain = self.domain;
-        if let Some(head) = zone_head {
-            domain.reclaim_zone_list(self, Some(head));
-        }
-        if !rcu_head.is_null() {
-            domain.reclaim_intrusive_list(self, rcu_head);
-        }
-
-        let state = unsafe { &mut *self.local.retire_state_ptr() };
+        let bag = state
+            .bag_for_epoch_mut(epoch)
+            .ok_or(EpochError::RetireBagOccupied)?;
+        let previous_head = bag.zone_head;
+        link(previous_head);
+        bag.zone_head = Some(key);
+        bag.zone_count += 1;
         self.local.publish_retire_summary(state);
         Ok(())
     }
@@ -282,6 +353,58 @@ impl Drop for LocalRetireGuard {
         self.local.end_retire();
         drop(self.local_execution.take());
         self.local.unpin();
+    }
+}
+
+impl LocalRetireReservation {
+    pub(crate) fn validate_for(
+        &self,
+        guard: &LocalRetireGuard,
+    ) -> Result<(), ReservedRetireInvariant> {
+        if guard.cpu_id() != self.cpu_id {
+            return Err(ReservedRetireInvariant::WrongCpu);
+        }
+        match guard.local.reserved_retire().validate_reserved(self.slot.0) {
+            Ok(()) if self.armed => Ok(()),
+            Ok(()) | Err(false) => Err(ReservedRetireInvariant::SlotNotReserved),
+            Err(true) => Err(ReservedRetireInvariant::SlotAlreadyFilled),
+        }
+    }
+
+    pub(crate) unsafe fn enqueue_after_barrier(
+        mut self,
+        guard: &mut LocalRetireGuard,
+        head: NonNull<RcuHead>,
+        retired_at: u64,
+    ) -> Result<(), ReservedRetireInvariant> {
+        self.validate_for(guard)?;
+        unsafe {
+            guard
+                .local
+                .reserved_retire()
+                .fill_reserved(self.slot.0, head, retired_at);
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for LocalRetireReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let cpu_pin = (GLOBAL_DOMAIN.hooks().pin_current_cpu)();
+        assert_eq!(
+            cpu_pin.cpu_id(),
+            self.cpu_id,
+            "local-retire reservation dropped on another CPU"
+        );
+        let local = GLOBAL_DOMAIN
+            .cpu_state(self.cpu_id)
+            .expect("local-retire reservation CPU remains initialized");
+        local.reserved_retire().cancel(self.slot.0);
+        self.armed = false;
     }
 }
 
@@ -411,6 +534,34 @@ impl EpochDomain {
         })
     }
 
+    fn try_reserve_local_retire(&'static self) -> Result<LocalRetireReservation, EpochError> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(EpochError::NotInitialized);
+        }
+        let hooks = self.hooks();
+        if (hooks.in_irq_context)() {
+            return Err(EpochError::CpuNotOnline);
+        }
+        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_id = cpu_pin.cpu_id();
+        let local = self.cpu_state(cpu_id).ok_or(EpochError::InvalidCpu)?;
+        if !local.try_pin_online() {
+            return Err(EpochError::CpuNotOnline);
+        }
+        let slot = local
+            .reserved_retire()
+            .try_reserve()
+            .ok_or(EpochError::LocalRetireExhausted);
+        local.unpin();
+        drop(cpu_pin);
+        Ok(LocalRetireReservation {
+            cpu_id,
+            slot: LocalRetireSlot(slot?),
+            armed: true,
+            _not_send_sync: PhantomData,
+        })
+    }
+
     #[track_caller]
     fn guard(&'static self) -> Guard<'static> {
         assert!(
@@ -486,7 +637,8 @@ impl EpochDomain {
     }
 
     fn try_drain(&'static self, budget: usize) -> DrainStats {
-        let trace_seq = epoch_trace_sample(&DRAIN_TRACE_SAMPLE);
+        let trace_seq =
+            epoch_trace_sample_if_enabled(tx_observe::is_enabled(), &DRAIN_TRACE_SAMPLE);
         if let Some(seq) = trace_seq {
             emit_epoch_trace(b"debug.epoch.drain.enter", seq);
             emit_epoch_trace(b"debug.epoch.drain.budget", budget as i64);
@@ -511,64 +663,19 @@ impl EpochDomain {
         // Nodes retired in epoch E are reclaimable only once the global epoch
         // reaches at least E + 2.
         let safe_epoch = self.global_epoch.0.load(Ordering::Acquire);
-        let mut zone_reclaim_head = None;
-        let mut intrusive_reclaim_head: *mut RcuHead = core::ptr::null_mut();
-        let mut detach_count = 0usize;
-
         let mut local_guard = match self.local_retire_guard() {
             Ok(guard) => guard,
             Err(_) => return stats,
         };
         let cpu_id = local_guard.cpu_id();
-
-        {
-            let state = unsafe { &mut *local_guard.local().retire_state_ptr() };
-            for bag in &mut state.bags {
-                stats.examined += 1;
-                if bag.is_empty() || safe_epoch < bag.epoch.saturating_add(2) {
-                    continue;
-                }
-                while detach_count < budget {
-                    if let Some(key) = bag.zone_head {
-                        bag.zone_head = crate::zone::retiring_next(key);
-                        crate::zone::set_retiring_next(key, zone_reclaim_head);
-                        zone_reclaim_head = Some(key);
-                        bag.zone_count -= 1;
-                    } else if !bag.rcu_head.is_null() {
-                        let head = bag.rcu_head;
-                        let next = unsafe { (*head).next };
-                        debug_assert!(!next.is_null());
-                        bag.rcu_head = if next == head {
-                            core::ptr::null_mut()
-                        } else {
-                            next
-                        };
-                        unsafe {
-                            (*head).next = if intrusive_reclaim_head.is_null() {
-                                head
-                            } else {
-                                intrusive_reclaim_head
-                            };
-                        }
-                        intrusive_reclaim_head = head;
-                        bag.rcu_count -= 1;
-                    } else {
-                        break;
-                    }
-                    detach_count += 1;
-                    stats.examined += 1;
-                }
-                if bag.is_empty() {
-                    bag.epoch = 0;
-                }
-            }
-            local_guard.local().publish_retire_summary(state);
-        }
-
-        stats.bag_reclaimed = self.reclaim_zone_list(&mut local_guard, zone_reclaim_head);
-        stats.bag_reclaimed = stats.bag_reclaimed
-            + self.reclaim_intrusive_list(&mut local_guard, intrusive_reclaim_head);
-        stats.bag_remaining = local_guard.local().bag_retired_count();
+        let (bag_reclaimed, bag_remaining, bag_examined) =
+            local_guard.reclaim_reclaimable_bags(safe_epoch, budget);
+        let reserved_budget = budget.saturating_sub(bag_reclaimed);
+        let (reserved_reclaimed, reserved_remaining, reserved_examined) =
+            local_guard.reclaim_reclaimable_reserved(safe_epoch, reserved_budget);
+        stats.bag_reclaimed = bag_reclaimed + reserved_reclaimed;
+        stats.bag_remaining = bag_remaining + reserved_remaining;
+        stats.examined += bag_examined + reserved_examined;
         stats.publication_remaining = crate::publication::deferred_drop_count(cpu_id);
         drop(local_guard);
         if let Some(seq) = trace_seq {
@@ -720,28 +827,56 @@ impl EpochDomain {
                 || target_state.retire_active()
             {
                 Err(EpochError::CpuNotOnline)
+            } else if target_state.reserved_retire().unfilled_count() != 0 {
+                assert!(target_state
+                    .transition_membership(CpuMembership::Draining, CpuMembership::Online));
+                self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+                Err(EpochError::LocalRetireOutstanding)
             } else {
-                let coordinator_retire = unsafe { &mut *coordinator.retire_state_ptr() };
-                let target_retire = unsafe { &mut *target_state.retire_state_ptr() };
-                match unsafe { coordinator_retire.merge_from(target_retire) } {
-                    Ok(()) => {
-                        unsafe {
-                            crate::publication::transfer_deferred_drops(target, coordinator_cpu);
+                let target_reserved = target_state.reserved_retire();
+                let coordinator_reserved = coordinator.reserved_retire();
+                let transfer_count = target_reserved.ready_count();
+                let mut transfer_slots = [usize::MAX; LOCAL_RETIRE_CAPACITY];
+                if !coordinator_reserved.reserve_transfer_slots(transfer_count, &mut transfer_slots)
+                {
+                    assert!(target_state
+                        .transition_membership(CpuMembership::Draining, CpuMembership::Online));
+                    self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+                    Err(EpochError::LocalRetireExhausted)
+                } else {
+                    let coordinator_retire = unsafe { &mut *coordinator.retire_state_ptr() };
+                    let target_retire = unsafe { &mut *target_state.retire_state_ptr() };
+                    match unsafe { coordinator_retire.merge_from(target_retire) } {
+                        Ok(()) => {
+                            unsafe {
+                                target_reserved.transfer_ready_to_reserved(
+                                    coordinator_reserved,
+                                    &transfer_slots[..transfer_count],
+                                );
+                                crate::publication::transfer_deferred_drops(
+                                    target,
+                                    coordinator_cpu,
+                                );
+                            }
+                            coordinator.publish_retire_summary(coordinator_retire);
+                            target_state.publish_retire_summary(target_retire);
+                            assert!(target_state.transition_membership(
+                                CpuMembership::Draining,
+                                CpuMembership::Offline,
+                            ));
+                            self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+                            Ok(())
                         }
-                        coordinator.publish_retire_summary(coordinator_retire);
-                        target_state.publish_retire_summary(target_retire);
-                        assert!(target_state.transition_membership(
-                            CpuMembership::Draining,
-                            CpuMembership::Offline,
-                        ));
-                        self.membership_version.0.fetch_add(1, Ordering::AcqRel);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        assert!(target_state
-                            .transition_membership(CpuMembership::Draining, CpuMembership::Online));
-                        self.membership_version.0.fetch_add(1, Ordering::AcqRel);
-                        Err(error)
+                        Err(error) => {
+                            coordinator_reserved
+                                .cancel_transfer_slots(&transfer_slots[..transfer_count]);
+                            assert!(target_state.transition_membership(
+                                CpuMembership::Draining,
+                                CpuMembership::Online,
+                            ));
+                            self.membership_version.0.fetch_add(1, Ordering::AcqRel);
+                            Err(error)
+                        }
                     }
                 }
             }
@@ -791,8 +926,8 @@ impl EpochDomain {
         while let Some(current) = head {
             head = crate::zone::retiring_next(current);
             crate::zone::set_retiring_next(current, Some(current));
-            local_guard.with_local_execution_open(|local_guard| unsafe {
-                crate::zone::reclaim_retired_slot(current, local_guard);
+            local_guard.with_local_execution_open(|_| unsafe {
+                crate::zone::reclaim_retired_slot(current);
             });
             reclaimed += 1;
         }
@@ -869,9 +1004,37 @@ fn epoch_trace_sample(counter: &AtomicU64) -> Option<i64> {
     (seq < 128 || seq.is_power_of_two()).then_some(seq as i64)
 }
 
+#[inline]
+fn epoch_trace_sample_if_enabled(enabled: bool, counter: &AtomicU64) -> Option<i64> {
+    enabled.then(|| epoch_trace_sample(counter)).flatten()
+}
+
 fn emit_epoch_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
         observer.debug_counter(name, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn disabled_drain_trace_does_not_touch_the_shared_sample_counter() {
+        let counter = AtomicU64::new(17);
+
+        assert_eq!(epoch_trace_sample_if_enabled(false, &counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), 17);
+    }
+
+    #[test]
+    fn enabled_drain_trace_keeps_the_existing_first_sample() {
+        let counter = AtomicU64::new(0);
+
+        assert_eq!(epoch_trace_sample_if_enabled(true, &counter), Some(0));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -994,6 +1157,15 @@ pub(crate) fn with_local_retire_guard<R>(
 ) -> Result<R, EpochError> {
     let mut guard = GLOBAL_DOMAIN.local_retire_guard()?;
     Ok(action(&mut guard))
+}
+
+pub fn try_reserve_local_retire() -> Result<LocalRetireReservation, EpochError> {
+    GLOBAL_DOMAIN.try_reserve_local_retire()
+}
+
+pub(crate) fn local_head_bag_summary(
+) -> Result<[(u64, usize, usize); super::bag::EPOCH_BAG_COUNT], EpochError> {
+    with_local_retire_guard(|local_guard| local_guard.head_bag_summary())
 }
 
 pub fn try_drain(budget: usize) -> DrainStats {

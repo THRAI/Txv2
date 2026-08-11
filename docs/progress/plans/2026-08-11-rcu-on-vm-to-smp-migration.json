@@ -9,9 +9,21 @@
   "summary": "Port only the verified ResidentRoot/EBR VM slices from codex/rcu-on-vm into codex/test-remote-network, then wire them to the existing SMP per-hart lifecycle with bounded maintenance and 1-hart/2-hart gates.",
   "scope": {
     "in": [
-      "crates/tx-subsystems/src/page_backed/",
-      "crates/tx-subsystems/src/io_manager/page/",
+      "crates/tx-hal/src/pmap.rs",
+      "crates/tx-substrate/Cargo.toml",
+      "crates/tx-substrate/src/lib.rs",
+      "crates/tx-substrate/src/epoch/",
       "crates/tx-substrate/src/publication/",
+      "crates/tx-substrate/src/zone/",
+      "crates/tx-substrate/src/slab.rs",
+      "crates/tx-subsystems/src/page_backed/",
+      "crates/tx-subsystems/src/adapter.rs",
+      "crates/tx-subsystems/src/device.rs",
+      "crates/tx-subsystems/src/io_manager/backend/",
+      "crates/tx-subsystems/src/io_manager/block/",
+      "crates/tx-subsystems/src/io_manager/page/",
+      "crates/tx-subsystems/Cargo.toml",
+      "crates/tx-subsystems/src/zones.rs",
       "xtask/src/lint_pagecontainer_resident_rcu.rs",
       "crates/tx-kernel/src/init.rs",
       "crates/tx-kernel/src/init/exec.rs",
@@ -29,7 +41,7 @@
     "write_sets": [
       {
         "owner": "smp-rcu-vm-migration",
-        "paths": ["crates/tx-reactor/src/scheduler.rs", "crates/tx-reactor/src/task.rs", "crates/tx-kernel/src/init.rs", "crates/tx-kernel/src/init/exec.rs", "crates/tx-kernel/src/trap.rs", "crates/tx-subsystems/src/page_backed/", "crates/tx-subsystems/src/io_manager/page/", "crates/tx-substrate/src/publication/", "xtask/src/lint_pagecontainer_resident_rcu.rs"],
+        "paths": ["crates/tx-reactor/src/scheduler.rs", "crates/tx-reactor/src/task.rs", "crates/tx-kernel/src/init.rs", "crates/tx-kernel/src/init/exec.rs", "crates/tx-kernel/src/trap.rs", "crates/tx-hal/src/pmap.rs", "crates/tx-substrate/Cargo.toml", "crates/tx-substrate/src/lib.rs", "crates/tx-substrate/src/epoch/", "crates/tx-substrate/src/publication/", "crates/tx-substrate/src/zone/", "crates/tx-substrate/src/slab.rs", "crates/tx-subsystems/Cargo.toml", "crates/tx-subsystems/src/adapter.rs", "crates/tx-subsystems/src/device.rs", "crates/tx-subsystems/src/io_manager/backend/", "crates/tx-subsystems/src/io_manager/block/", "crates/tx-subsystems/src/io_manager/page/", "crates/tx-subsystems/src/page_backed/", "crates/tx-subsystems/src/zones.rs", "xtask/src/lint_pagecontainer_resident_rcu.rs"],
         "notes": "Claimed only for this migration; preserve unrelated dirty hunks and exclude network, ext4, PELT, and broad HAL changes."
       }
     ]
@@ -47,9 +59,9 @@
     ],
     "external_refs": [
       "source worktree /Users/3y/.config/superpowers/worktrees/Tx/rcu-on-vm on codex/rcu-on-vm",
-      "source commits: 244e3a13, 8edab988, 0952234d, 23562c9b, 9bf73b25, 326ec51b, 1d4030bb, 0abe389d, e9dd900f, 90722e17, 44542315, 10ba5bf2",
+      "source commits: 5c11e5a1, 12bc7071, 959a4668, 1431518a, 244e3a13, 8edab988, 0952234d, 235712eb, 9bf73b25, 326ec51b, 1d4030bb, 0abe389d, e9dd900f, 90722e17, 44542315, 10ba5bf2",
       "target worktree /Users/3y/Downloads/Tx on codex/test-remote-network",
-      "selection: verified RCU/VM slices only; exclude source progress metadata, ext4, network, PELT, and unrelated HAL/reactor WIP",
+      "selection: verified RCU/VM slices only; include the bounded pmap gather API required by those slices; exclude source progress metadata, ext4, network, PELT, and unrelated HAL/reactor WIP",
       "dirty-state rule: preserve all pre-existing target user and SMP/ext4 WIP; overlapping files require narrow patches"
     ]
   },
@@ -79,7 +91,7 @@
       "depends_on": ["smp-rcu-p1-scheduler-linearization"],
       "paths": ["crates/tx-kernel/src/init.rs", "crates/tx-kernel/src/init/exec.rs", "crates/tx-subsystems/src/vm/"],
       "verification": ["cargo test -p tx-subsystems --lib vm", "cargo test -p tx-kernel --lib init"],
-      "notes": "Each admitted hart owns initialized VM range reservation and cleanup state before scheduling VM work."
+      "notes": "Deferred integration boundary: the source init_vm_range_txn_hart/drain_local_vm_cleanup API requires the source VM range_txn/recipe_arena structure migration, which is broader than this verified ResidentRoot slice. No production per-hart VM cleanup claim is made."
     },
     {
       "id": "smp-rcu-p3-maintenance-service",
@@ -93,29 +105,29 @@
     {
       "id": "smp-rcu-p4-resident-root",
       "title": "Port ResidentRoot publication and guarded resident hit path",
-      "status": "pending",
-      "depends_on": ["smp-rcu-p3-maintenance-service"],
+      "status": "complete",
+      "depends_on": ["smp-rcu-p1-scheduler-linearization"],
       "paths": ["crates/tx-subsystems/src/page_backed/", "crates/tx-substrate/src/publication/", "crates/tx-subsystems/src/page_backed/resident_tests.rs"],
       "verification": ["cargo test -p tx-subsystems --lib resident_ -- --test-threads=1", "cargo xtask lint invariants pagecontainer-resident-rcu"],
-      "notes": "Publish immutable resident roots with detached allocation and bounded retire reservation; guards never cross Yield."
+      "notes": "Verified ResidentRoot/publication and guarded hit path ported independently of the deferred VM hart lifecycle; production reclaim still depends on p2/p3."
     },
     {
       "id": "smp-rcu-p5-withdrawal-consumers",
       "title": "Port generation-checked withdrawal and the required VM/page consumers",
-      "status": "pending",
+      "status": "complete",
       "depends_on": ["smp-rcu-p4-resident-root"],
       "paths": ["crates/tx-subsystems/src/page_backed/", "crates/tx-subsystems/src/io_manager/page/", "crates/tx-subsystems/src/vm/"],
       "verification": ["focused page_backed lifecycle/range/direct-I/O/reflink tests", "focused VM tests", "cargo check -p tx-shims"],
-      "notes": "Withdraw exact cell, PPN, and generation before compatibility-index release; retain existing MapPin and shootdown protocol."
+      "notes": "Generation-checked withdrawal, page consumers, IO manager closure, and focused lifecycle/direct-I/O/reflink coverage are ported. Existing VM RangeLock/MapPin/shootdown ownership is unchanged."
     },
     {
       "id": "smp-rcu-p6-acceptance",
       "title": "Run 1-hart/2-hart acceptance and close progress records",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": ["smp-rcu-p5-withdrawal-consumers"],
       "paths": ["docs/progress/STATUS.md", "docs/progress/research/"],
       "verification": ["cargo test -p tx-reactor --test scheduler", "cargo test -p tx-reactor --test userspace_run --test hart_loop", "cargo xtask progress validate", "git diff --check", "1-hart/2-hart QEMU or documented environment blocker"],
-      "notes": "Use paired one-hart/two-hart evidence; do not widen the matrix or include LTP/network."
+      "notes": "Host gates are complete; paired 1-hart/2-hart QEMU acceptance remains to be run or recorded as an environment blocker."
     }
   ],
   "verification": [
@@ -133,12 +145,33 @@
       "command": "cargo test -p tx-reactor --test scheduler --test userspace_run --test hart_loop",
       "status": "passed",
       "notes": "Focused SMP host gate; pair with one-hart/two-hart runtime evidence when available."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib resident_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "ResidentRoot focused suite: 13 passed, 0 failed."
+    },
+    {
+      "command": "cargo test -p tx-substrate --lib epoch -- --test-threads=1",
+      "status": "passed",
+      "notes": "Epoch/publication focused suite: 4 passed, 0 failed."
+    },
+    {
+      "command": "cargo test -p xtask --lib current_pagecontainer_sources_satisfy_ratchet_shapes -- --nocapture",
+      "status": "passed",
+      "notes": "Resident-root ratchet unit test passed; direct xtask lint also passed."
+    },
+    {
+      "command": "cargo check -p tx-shims",
+      "status": "passed",
+      "notes": "Passed after retaining the compatibility FsPageBacking::prepare_write_range default, using TruncateOp constructors, and routing close writeback through queue_dirty_file_writeback; existing warnings remain."
     }
   ],
   "blockers": [
     "Target worktree has extensive pre-existing dirty WIP; overlapping files require narrow patches.",
     "Source worktree has unrelated ext4/network/HAL/reactor dirty changes that are explicitly excluded.",
     "Real 2-hart QEMU evidence may be unavailable; host tests do not prove all hart interleavings.",
+    "VM range transaction per-hart lifecycle (init_vm_range_txn_hart/drain_local_vm_cleanup) is not ported because it requires a broad recipe_arena/range_txn VM rewrite.",
     "Existing docs lint may remain blocked by the untracked .io-submission-patch/ artifact and external links."
   ],
   "risks": [

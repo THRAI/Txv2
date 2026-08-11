@@ -14,45 +14,21 @@ pub(super) struct PageDataLease {
 
 impl PageDataLease {
     pub(super) fn single(id: IoDataLeaseId, page: PageLease) -> Self {
-        Self::from_pages(id, alloc::vec![page]).expect("single page lease is non-empty")
-    }
-
-    pub(super) fn from_pages(
-        id: IoDataLeaseId,
-        pages: Vec<PageLease>,
-    ) -> Result<Self, PageDataLeaseError> {
-        if pages.is_empty() {
-            return Err(PageDataLeaseError::Empty);
-        }
-        Ok(Self {
+        Self {
             id,
-            pages: pages.into_boxed_slice(),
-        })
+            pages: alloc::boxed::Box::new([page]),
+        }
     }
 
     pub(super) fn source(&self) -> IoDataSource {
-        if self.pages.len() == 1 {
-            let page = &self.pages[0];
-            return IoDataSource::page_cache(
-                self.id,
-                PageFrameRef::new(page.ppn()),
-                0,
-                crate::vm::USER_PAGE_SIZE as u32,
-            );
-        }
-        IoDataSource::direct(
+        let page = &self.pages[0];
+        IoDataSource::page_cache(
             self.id,
-            self.pages
-                .iter()
-                .map(|page| BioVec::new(page.ppn().0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32))
-                .collect(),
+            PageFrameRef::new(page.ppn()),
+            0,
+            crate::vm::USER_PAGE_SIZE as u32,
         )
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PageDataLeaseError {
-    Empty,
 }
 
 #[derive(Debug)]
@@ -77,7 +53,7 @@ pub(super) enum FileIoTerminalResult {
 /// The sole PageBacked record that retains a request's page-cache resources
 /// until the terminal route consumes it.
 #[derive(Debug)]
-pub(super) struct OwnedFileIoRequest {
+pub(crate) struct OwnedFileIoRequest {
     request: PageIoRequest,
     payload: FileIoPayload,
 }
@@ -104,18 +80,18 @@ impl OwnedFileIoRequest {
         }
     }
 
-    pub(super) fn request(&self) -> &PageIoRequest {
+    pub(crate) fn request(&self) -> &PageIoRequest {
         &self.request
     }
 
-    pub(super) fn source(&self) -> IoDataSource {
+    pub(crate) fn source(&self) -> IoDataSource {
         match &self.payload {
             FileIoPayload::Writeback { lease } => lease.source(),
             FileIoPayload::Read { .. } | FileIoPayload::Control => IoDataSource::None,
         }
     }
 
-    pub(super) fn target(&self) -> IoDataTarget {
+    pub(crate) fn target(&self) -> IoDataTarget {
         match &self.payload {
             FileIoPayload::Read { target } => IoDataTarget::page_cache(
                 IoDataLeaseId::new(self.request.id.raw()),
@@ -141,55 +117,65 @@ impl OwnedFileIoRequest {
                 | (FileIoPayload::Read { .. }, PageIoOp::Read)
         )
     }
-
-    #[cfg(test)]
-    pub(super) fn is_writeback(&self) -> bool {
-        matches!(self.payload, FileIoPayload::Writeback { .. })
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_read(&self) -> bool {
-        matches!(self.payload, FileIoPayload::Read { .. })
-    }
 }
 
 impl PageCacheIndex {
-    fn withdraw_from(&mut self, first: PageIndex) {
-        self.erase_from(first);
-    }
-
-    fn dirty_pages(&self) -> Vec<(PageIndex, Ppn)> {
-        if !self.marked(PageCacheMark::Dirty) {
-            return Vec::new();
-        }
-        self.collect_marked(PageCacheMark::Dirty)
-            .into_iter()
-            .map(|(page, entry)| (page, entry.ppn))
+    fn pages_from(&self, first: PageIndex) -> Vec<(PageIndex, Ppn)> {
+        self.pages
+            .range(first..)
+            .map(|(page, entry)| (*page, entry.ppn()))
             .collect()
-    }
-
-    fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn) {
-        let Some(entry) = self.load(page) else {
-            return;
-        };
-        if entry.ppn == ppn {
-            let _ = self.clear_mark(page, PageCacheMark::Dirty);
-            let _ = self.clear_mark(page, PageCacheMark::Writeback);
-        }
     }
 }
 
 impl PageContainer {
-    fn withdraw_cached_pages_from(&self, first: PageIndex) {
+    fn reserve_truncate_tail(
+        &self,
+        new_size: u64,
+    ) -> Result<RangeReservation, RangeReservationError> {
+        let page_size = crate::vm::USER_PAGE_SIZE as u64;
+        let first = PageIndex::new(new_size / page_size);
+        let page_count = self
+            .page_count
+            .checked_sub(first.as_u64())
+            .ok_or(RangeReservationError::Overflow)?;
+        self.state.lock().range_reservations.try_reserve(
+            PageRange::new(first, page_count),
+            RangeReservationKind::Truncate,
+        )
+    }
+
+    fn release_truncate_tail(&self, reservation: RangeReservation) {
+        let released = self
+            .state
+            .lock()
+            .range_reservations
+            .release(reservation.id());
+        debug_assert!(
+            released,
+            "truncate reservation remains live through root publication"
+        );
+    }
+
+    fn withdraw_cached_pages_from(&self, first: PageIndex) -> Result<(), PageCacheError> {
+        let cached = self.state.lock().pages.pages_from(first);
+        self.withdraw_resident_batch_published(&cached, false)?;
         let notify_ready: Vec<notification::PageReadyNotifier> = {
             let mut state = self.state.lock();
-            state.pages.withdraw_from(first);
             state
                 .in_flight_file_pages
                 .split_off(&first)
                 .into_iter()
                 .filter_map(|(page, fetch)| {
-                    Self::retire_file_page_fetch_wait(&mut state, page, fetch)
+                    if let Some(slot) = state.page_slots.get(&page) {
+                        let _ = slot.invalidate_if_generation(fetch.generation);
+                    }
+                    Self::retire_file_page_fetch_wait(
+                        &mut state,
+                        &self.page_submission,
+                        page,
+                        fetch,
+                    )
                 })
                 .collect()
         };
@@ -198,47 +184,43 @@ impl PageContainer {
                 mailbox.post(event)
             });
         }
+        Ok(())
     }
 
-    fn dirty_pages_snapshot(&self) -> Vec<(PageIndex, Ppn)> {
-        self.state.lock().pages.dirty_pages()
-    }
-
-    fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn) {
-        self.state.lock().pages.clear_dirty_if_match(page, ppn);
-    }
-
-    /// Flush dirty file-cache pages for close-time visibility without taking
-    /// an fsync durability frontier.
-    pub fn flush_dirty_pages_for_close_visibility(
+    fn preflight_cached_pages_withdrawal_from(
         &self,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<(), PageProgress> {
-        match flush_dirty_pages_to_file_backing(self, guard) {
-            StepOutcome::Done(pages) => {
-                if pages > 0 {
-                    self.sync_file_size_for_close_visibility(guard);
-                }
-                StepOutcome::done(())
-            }
-            StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
-            StepOutcome::Yield { progress, shape } => StepOutcome::Yield { progress, shape },
-            StepOutcome::Err(errno) => StepOutcome::Err(errno),
-        }
+        first: PageIndex,
+    ) -> Result<(), PageCacheError> {
+        let cached = self.state.lock().pages.pages_from(first);
+        self.preflight_resident_batch_withdrawal(&cached)
     }
 
-    fn sync_file_size_for_close_visibility(&self, guard: &Guard<'_>) {
-        let PageContainerKind::File {
-            mount,
-            fs_object_id,
-        } = self.kind()
-        else {
-            return;
-        };
-        let _ = mount
-            .payload()
-            .fs_page_backing
-            .truncate(*fs_object_id, self.size_bytes(), guard);
+    fn dirty_pages_snapshot(&self) -> Vec<(PageIndex, Ppn, PageGeneration)> {
+        let state = self.state.lock();
+        state
+            .page_slots
+            .iter()
+            .filter_map(|(page, slot)| {
+                let snapshot = slot.snapshot();
+                let PageSlotState::Dirty { ppn } = snapshot.state else {
+                    return None;
+                };
+                (state.pages.lookup(*page) == Some(ppn)).then_some((
+                    *page,
+                    ppn,
+                    snapshot.generation,
+                ))
+            })
+            .collect()
+    }
+
+    fn clear_dirty_if_match(&self, page: PageIndex, ppn: Ppn, generation: PageGeneration) {
+        let state = self.state.lock();
+        if state.pages.lookup(page) == Some(ppn) {
+            if let Some(slot) = state.page_slots.get(&page) {
+                let _ = slot.mark_clean_if_matches(generation, ppn);
+            }
+        }
     }
 }
 
@@ -277,26 +259,6 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
 }
 
 pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), PageProgress> {
-    step_fsync_with_logical_size(pc, guard, true)
-}
-
-/// Flush dirty raw-block pages and submit their durability barrier.
-///
-/// A block device has no mutable logical file length, so this deliberately
-/// omits the ordinary-file `truncate` phase while retaining the matching-
-/// generation dirty completion and data-before-barrier ordering.
-pub fn step_raw_block_fsync(
-    pc: &PageContainer,
-    guard: &Guard<'_>,
-) -> StepOutcome<(), PageProgress> {
-    step_fsync_with_logical_size(pc, guard, false)
-}
-
-fn step_fsync_with_logical_size(
-    pc: &PageContainer,
-    guard: &Guard<'_>,
-    persist_logical_size: bool,
-) -> StepOutcome<(), PageProgress> {
     // observe
     // upgrade
     // reserve
@@ -312,17 +274,52 @@ fn step_fsync_with_logical_size(
         return V3::done(());
     };
 
-    let pages_so_far = match flush_dirty_pages_to_file_backing(pc, guard) {
-        StepOutcome::Done(pages) => pages,
-        StepOutcome::Continue { progress } => return StepOutcome::Continue { progress },
-        StepOutcome::Yield { progress, shape } => return StepOutcome::Yield { progress, shape },
-        StepOutcome::Err(errno) => return StepOutcome::Err(errno),
-    };
+    let mut pages_so_far: u32 = 0;
+    for (page, ppn, generation) in pc.dirty_pages_snapshot() {
+        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+            return V3::err(Errno::EINVAL.into());
+        };
+        match mount.payload().fs_page_backing.flush_page(
+            *fs_object_id,
+            offset,
+            &Frame::new(ppn),
+            guard,
+        ) {
+            V3::Done(()) => {
+                pc.clear_dirty_if_match(page, ppn, generation);
+                pages_so_far = pages_so_far.saturating_add(1);
+            }
+            V3::Continue { progress: _ } => {
+                let progress = if pages_so_far == 0 {
+                    PageProgress::EMPTY
+                } else {
+                    PageProgress::new(pages_so_far)
+                };
+                return V3::continue_with(progress);
+            }
+            V3::Yield { progress: _, shape } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    return V3::err(step_engine::Errno::EIO);
+                };
+                let progress = if pages_so_far == 0 {
+                    PageProgress::EMPTY
+                } else {
+                    PageProgress::new(pages_so_far)
+                };
+                return crate::page_backed::notification::yield_on_wait_source(
+                    progress, carrier, interests,
+                );
+            }
+            V3::Err(v3_errno) => return V3::err(v3_errno),
+        }
+    }
 
     // Persist the logical size once data blocks are written back:
     // `flush_page` writes data only, so without this a fresh reopen
     // sees the inode's stale (create-time) size and reads zero bytes.
-    if persist_logical_size && pages_so_far > 0 {
+    if pages_so_far > 0 {
         let size = pc.size_bytes();
         match mount
             .payload()
@@ -378,63 +375,14 @@ fn step_fsync_with_logical_size(
     }
 }
 
-fn flush_dirty_pages_to_file_backing(
+/// Compatibility entry point for block-device fsync callers. Device-backed
+/// containers are already outside the file logical-size path, so the common
+/// fsync operation is sufficient and keeps this boundary source-compatible.
+pub fn step_raw_block_fsync(
     pc: &PageContainer,
     guard: &Guard<'_>,
-) -> StepOutcome<u32, PageProgress> {
-    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
-
-    let PageContainerKind::File {
-        mount,
-        fs_object_id,
-    } = pc.kind()
-    else {
-        return V3::done(0);
-    };
-
-    let mut pages_so_far: u32 = 0;
-    for (page, ppn) in pc.dirty_pages_snapshot() {
-        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
-            return V3::err(Errno::EINVAL.into());
-        };
-        match mount.payload().fs_page_backing.flush_page(
-            *fs_object_id,
-            offset,
-            &Frame::new(ppn),
-            guard,
-        ) {
-            V3::Done(()) => {
-                pc.clear_dirty_if_match(page, ppn);
-                pages_so_far = pages_so_far.saturating_add(1);
-            }
-            V3::Continue { progress: _ } => {
-                let progress = if pages_so_far == 0 {
-                    PageProgress::EMPTY
-                } else {
-                    PageProgress::new(pages_so_far)
-                };
-                return V3::continue_with(progress);
-            }
-            V3::Yield { progress: _, shape } => {
-                let Some((carrier, interests)) =
-                    crate::page_backed::notification::wait_source_parts(&shape)
-                else {
-                    return V3::err(step_engine::Errno::EIO);
-                };
-                let progress = if pages_so_far == 0 {
-                    PageProgress::EMPTY
-                } else {
-                    PageProgress::new(pages_so_far)
-                };
-                return crate::page_backed::notification::yield_on_wait_source(
-                    progress, carrier, interests,
-                );
-            }
-            V3::Err(v3_errno) => return V3::err(v3_errno),
-        }
-    }
-
-    V3::done(pages_so_far)
+) -> StepOutcome<(), PageProgress> {
+    step_fsync(pc, guard)
 }
 
 /// `step_truncate` — v3 outcome shape over `PageProgress`.
@@ -456,74 +404,116 @@ fn flush_dirty_pages_to_file_backing(
 /// `PageProgress::EMPTY`. If interim page-step accounting for truncate
 /// is ever needed, extend `FsPageBacking::truncate` to expose a
 /// `pages` count or track it externally at call sites.
+fn validate_truncate(pc: &PageContainer, new_size: u64) -> Result<(), Errno> {
+    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
+        return Err(Errno::EINVAL);
+    }
+    let Some(capacity) = pc.byte_capacity() else {
+        return Err(Errno::EINVAL);
+    };
+    if new_size > capacity {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// Allocate the replacement resident root before a file backing may mutate
+/// externally. This holds no reservation, epoch guard, or writer claim across
+/// a filesystem yield; the exact root is rebuilt and revalidated at commit.
+fn preflight_file_truncate(pc: &PageContainer, new_size: u64, old_size: u64) -> Result<(), Errno> {
+    if new_size < old_size {
+        let first_drop = first_page_after_size(new_size).ok_or(Errno::EINVAL)?;
+        pc.preflight_cached_pages_withdrawal_from(first_drop)
+            .map_err(page_cache_error_to_errno)?;
+    }
+    Ok(())
+}
+
+/// Perform the non-yielding PageContainer half of truncate. Reservations and
+/// resident-root retirement are admitted and released within this one call.
+fn commit_truncate(pc: &PageContainer, new_size: u64, old_size: u64) -> Result<(), Errno> {
+    let truncate_reservation = if new_size < old_size {
+        Some(match pc.reserve_truncate_tail(new_size) {
+            Ok(reservation) => reservation,
+            Err(RangeReservationError::Conflict { .. }) => return Err(Errno::EBUSY),
+            Err(RangeReservationError::EmptyRange | RangeReservationError::Overflow) => {
+                return Err(Errno::EINVAL);
+            }
+        })
+    } else {
+        None
+    };
+
+    let result = (|| {
+        if new_size < old_size {
+            let first_drop = first_page_after_size(new_size).ok_or(Errno::EINVAL)?;
+            pc.withdraw_cached_pages_from(first_drop)
+                .map_err(page_cache_error_to_errno)?;
+            zero_partial_eof_tail(pc, new_size);
+        }
+        pc.set_size_bytes(new_size);
+        Ok(())
+    })();
+
+    if let Some(reservation) = truncate_reservation {
+        pc.release_truncate_tail(reservation);
+    }
+    result
+}
+
 pub fn step_truncate(
     pc: &PageContainer,
     new_size: u64,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), PageProgress> {
-    // observe
-    // upgrade
-    // reserve
-    // commit
-    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
 
-    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return V3::err(Errno::EINVAL.into());
+    if let Err(errno) = validate_truncate(pc, new_size) {
+        return V3::err(errno.into());
     }
 
-    let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
-    };
-    if new_size > capacity {
-        return V3::err(Errno::EINVAL.into());
-    }
-
-    let fs_advanced = match pc.kind() {
+    let old_size = pc.size_bytes();
+    match pc.kind() {
         PageContainerKind::File {
             mount,
             fs_object_id,
-        } => match mount
-            .payload()
-            .fs_page_backing
-            .truncate(*fs_object_id, new_size, guard)
-        {
-            V3::Done(()) => false,
-            V3::Continue { progress: _ } => true,
-            V3::Yield { progress: _, shape } => {
-                let Some((carrier, interests)) =
-                    crate::page_backed::notification::wait_source_parts(&shape)
-                else {
-                    return V3::err(step_engine::Errno::EIO);
-                };
-                return crate::page_backed::notification::yield_on_wait_source(
-                    PageProgress::EMPTY,
-                    carrier,
-                    interests,
-                );
+        } => {
+            if let Err(errno) = preflight_file_truncate(pc, new_size, old_size) {
+                return V3::err(errno.into());
             }
-            V3::Err(v3_errno) => return V3::err(v3_errno),
+            match mount
+                .payload()
+                .fs_page_backing
+                .truncate(*fs_object_id, new_size, guard)
+            {
+                V3::Done(()) => match commit_truncate(pc, new_size, old_size) {
+                    Ok(()) => V3::done(()),
+                    Err(errno) => V3::err(errno.into()),
+                },
+                V3::Continue { progress: _ } => match commit_truncate(pc, new_size, old_size) {
+                    Ok(()) => V3::continue_with(PageProgress::EMPTY),
+                    Err(errno) => V3::err(errno.into()),
+                },
+                V3::Yield { progress: _, shape } => {
+                    let Some((carrier, interests)) =
+                        crate::page_backed::notification::wait_source_parts(&shape)
+                    else {
+                        return V3::err(step_engine::Errno::EIO);
+                    };
+                    crate::page_backed::notification::yield_on_wait_source(
+                        PageProgress::EMPTY,
+                        carrier,
+                        interests,
+                    )
+                }
+                V3::Err(errno) => V3::err(errno),
+            }
+        }
+        PageContainerKind::Anon { .. } => match commit_truncate(pc, new_size, old_size) {
+            Ok(()) => V3::done(()),
+            Err(errno) => V3::err(errno.into()),
         },
-        PageContainerKind::Anon { .. } => false,
-        // Device PC is rejected above; fall through safely.
-        PageContainerKind::Device { .. } => false,
-    };
-
-    let old_size = pc.size_bytes();
-    pc.set_size_bytes(new_size);
-
-    if new_size < old_size {
-        let Some(first_drop) = first_page_after_size(new_size) else {
-            return V3::err(Errno::EINVAL.into());
-        };
-        pc.withdraw_cached_pages_from(first_drop);
-        zero_partial_eof_tail(pc, new_size);
-    }
-
-    if fs_advanced {
-        V3::continue_with(PageProgress::EMPTY)
-    } else {
-        V3::done(())
+        PageContainerKind::Device { .. } => unreachable!("validated device truncate"),
     }
 }
 
@@ -680,14 +670,98 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
 pub struct TruncateOp<'a> {
     pub pc: &'a PageContainer,
     pub new_size: u64,
+    phase: TruncatePhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TruncatePhase {
+    FsPending,
+    CommitPending { old_size: u64 },
+}
+
+impl<'a> TruncateOp<'a> {
+    pub fn new(pc: &'a PageContainer, new_size: u64) -> Self {
+        Self {
+            pc,
+            new_size,
+            phase: TruncatePhase::FsPending,
+        }
+    }
+
+    fn commit_pending(&mut self, old_size: u64) -> StepOutcome<(), PageProgress> {
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
+        match commit_truncate(self.pc, self.new_size, old_size) {
+            Ok(()) => V3::done(()),
+            // Preserve CommitPending: the backing already succeeded, and an
+            // EAGAIN from root publication must never replay that side effect.
+            // Continue keeps this StepOp alive for a bounded commit retry.
+            Err(Errno::EAGAIN) => V3::continue_with(PageProgress::EMPTY),
+            Err(errno) => V3::err(errno.into()),
+        }
+    }
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
     type Output = ();
     type Progress = PageProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
         let guard = step_engine::guard();
-        step_truncate(self.pc, self.new_size, &guard)
+        match self.phase {
+            TruncatePhase::CommitPending { old_size } => self.commit_pending(old_size),
+            TruncatePhase::FsPending => {
+                if let Err(errno) = validate_truncate(self.pc, self.new_size) {
+                    return V3::err(errno.into());
+                }
+
+                let old_size = self.pc.size_bytes();
+                match self.pc.kind() {
+                    PageContainerKind::File {
+                        mount,
+                        fs_object_id,
+                    } => {
+                        if let Err(errno) =
+                            preflight_file_truncate(self.pc, self.new_size, old_size)
+                        {
+                            return V3::err(errno.into());
+                        }
+                        match mount.payload().fs_page_backing.truncate(
+                            *fs_object_id,
+                            self.new_size,
+                            &guard,
+                        ) {
+                            V3::Done(()) => {
+                                self.phase = TruncatePhase::CommitPending { old_size };
+                                self.commit_pending(old_size)
+                            }
+                            V3::Continue { progress: _ } => {
+                                self.phase = TruncatePhase::CommitPending { old_size };
+                                self.commit_pending(old_size)
+                            }
+                            V3::Yield { progress: _, shape } => {
+                                let Some((carrier, interests)) =
+                                    crate::page_backed::notification::wait_source_parts(&shape)
+                                else {
+                                    return V3::err(step_engine::Errno::EIO);
+                                };
+                                crate::page_backed::notification::yield_on_wait_source(
+                                    PageProgress::EMPTY,
+                                    carrier,
+                                    interests,
+                                )
+                            }
+                            V3::Err(errno) => V3::err(errno),
+                        }
+                    }
+                    // Anon has no external backing phase, so its bounded
+                    // PageContainer commit can run directly in this step.
+                    PageContainerKind::Anon { .. } => self.commit_pending(old_size),
+                    PageContainerKind::Device { .. } => unreachable!("validated device truncate"),
+                }
+            }
+        }
     }
 }
 
@@ -997,64 +1071,6 @@ mod v3_tests {
         allocate_cached_frame().expect("cached frame")
     }
 
-    fn page_lease_for_test() -> PageLease {
-        let frame = cached_frame_for_test();
-        PageLease {
-            ppn: frame.ppn,
-            cache_pin: frame.pin,
-        }
-    }
-
-    #[test]
-    fn page_data_lease_projects_multi_page_source_without_copying_payload() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
-        setup_host_substrate();
-
-        assert!(matches!(
-            PageDataLease::from_pages(IoDataLeaseId::new(7), Vec::new()),
-            Err(PageDataLeaseError::Empty)
-        ));
-
-        let first = page_lease_for_test();
-        let second = page_lease_for_test();
-        let first_ppn = first.ppn();
-        let second_ppn = second.ppn();
-        let lease = PageDataLease::from_pages(IoDataLeaseId::new(7), alloc::vec![first, second])
-            .expect("multi-page lease");
-
-        assert_eq!(
-            lease.source(),
-            IoDataSource::direct(
-                IoDataLeaseId::new(7),
-                alloc::vec![
-                    BioVec::new(first_ppn.0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32),
-                    BioVec::new(second_ppn.0 as u64, 0, crate::vm::USER_PAGE_SIZE as u32),
-                ],
-            )
-        );
-    }
-
-    #[test]
-    fn page_data_lease_keeps_single_page_projection_stable() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
-        setup_host_substrate();
-        let page = page_lease_for_test();
-        let ppn = page.ppn();
-
-        let lease = PageDataLease::from_pages(IoDataLeaseId::new(8), alloc::vec![page])
-            .expect("single-page lease");
-
-        assert_eq!(
-            lease.source(),
-            IoDataSource::page_cache(
-                IoDataLeaseId::new(8),
-                PageFrameRef::new(ppn),
-                0,
-                crate::vm::USER_PAGE_SIZE as u32,
-            )
-        );
-    }
-
     // ------- step_fsync -------------------------------------------------
 
     #[test]
@@ -1092,13 +1108,20 @@ mod v3_tests {
         let pc = file_page_container(fs.clone(), FsObjectId::new(92));
         for page in [0u64, 1, 2] {
             let mut state = pc.state.lock();
+            let page = PageIndex::new(page);
+            let frame = cached_frame_for_test();
+            let ppn = frame.ppn;
             state
-                .pages
-                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+                .install_resident_if_absent(page, frame)
                 .expect("seed page");
             state
-                .pages
-                .mark_dirty(PageIndex::new(page))
+                .ensure_resident_page_slot(page, ppn)
+                .expect("seed resident slot");
+            state
+                .page_slots
+                .get(&page)
+                .expect("resident slot")
+                .mark_dirty()
                 .expect("mark dirty");
         }
         assert_eq!(step_fsync(&pc, &guard), V3Outcome::done(()));
@@ -1115,13 +1138,20 @@ mod v3_tests {
         let pc = file_page_container(fs.clone(), FsObjectId::new(93));
         for page in [0u64, 1] {
             let mut state = pc.state.lock();
+            let page = PageIndex::new(page);
+            let frame = cached_frame_for_test();
+            let ppn = frame.ppn;
             state
-                .pages
-                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+                .install_resident_if_absent(page, frame)
                 .expect("seed page");
             state
-                .pages
-                .mark_dirty(PageIndex::new(page))
+                .ensure_resident_page_slot(page, ppn)
+                .expect("seed resident slot");
+            state
+                .page_slots
+                .get(&page)
+                .expect("resident slot")
+                .mark_dirty()
                 .expect("mark dirty");
         }
         assert_eq!(
@@ -1147,13 +1177,20 @@ mod v3_tests {
         let pc = file_page_container(fs.clone(), FsObjectId::new(94));
         for page in [0u64, 1] {
             let mut state = pc.state.lock();
+            let page = PageIndex::new(page);
+            let frame = cached_frame_for_test();
+            let ppn = frame.ppn;
             state
-                .pages
-                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+                .install_resident_if_absent(page, frame)
                 .expect("seed page");
             state
-                .pages
-                .mark_dirty(PageIndex::new(page))
+                .ensure_resident_page_slot(page, ppn)
+                .expect("seed resident slot");
+            state
+                .page_slots
+                .get(&page)
+                .expect("resident slot")
+                .mark_dirty()
                 .expect("mark dirty");
         }
         assert_eq!(
@@ -1186,11 +1223,9 @@ mod v3_tests {
             4,
         );
         for page in 0..4 {
-            pc.state
-                .lock()
-                .pages
-                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
-                .expect("seed page");
+            assert!(pc
+                .install_resident_if_absent_published(PageIndex::new(page), cached_frame_for_test())
+                .expect("publish page"));
         }
         assert_eq!(
             step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
@@ -1340,7 +1375,7 @@ mod step_op_wraps {
         let new_size = crate::vm::USER_PAGE_SIZE as u64;
         // No outer epoch guard — `TruncateOp::step` acquires its own,
         // per STEP_MODEL_v2 §1.
-        let mut op = TruncateOp { pc: &pc, new_size };
+        let mut op = TruncateOp::new(&pc, new_size);
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }

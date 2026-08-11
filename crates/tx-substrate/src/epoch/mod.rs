@@ -13,9 +13,10 @@ mod local;
 
 pub use domain::{
     cpu_summary, init_on_ap, init_on_bsp, offline_cpu, service_local_drain_request, summary,
-    try_drain, CpuEpochSummary, DrainStats, EpochError, EpochSummary,
+    try_drain, try_reserve_local_retire, CpuEpochSummary, DrainStats, EpochError, EpochSummary,
+    LocalRetireReservation, ReservedRetireInvariant, LOCAL_RETIRE_RESERVATION_CAPACITY,
 };
-pub(crate) use domain::{LocalRetireGuard, MAX_EPOCH_CPUS};
+pub(crate) use domain::{local_head_bag_summary, LocalRetireGuard, MAX_EPOCH_CPUS};
 pub use guard::Guard;
 
 #[repr(C)]

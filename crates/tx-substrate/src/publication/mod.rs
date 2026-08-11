@@ -1,5 +1,6 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
@@ -10,6 +11,11 @@ use crate::epoch::{self, EpochError, Guard, LocalRetireGuard, RcuHead, MAX_EPOCH
 use node::PublishedNode;
 
 mod node;
+
+const PUBLICATION_RETRY_DRAIN_BUDGET: usize = 64;
+
+#[cfg(test)]
+static RETRY_DRAIN_TEST_EPOCH_ADVANCES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublishError {
@@ -42,6 +48,54 @@ pub struct PublishReservation<'a, T: Send + 'static> {
     owner: &'a Published<T>,
     next: Option<NonNull<PublishedNode<T>>>,
     committed: bool,
+    claim: Option<WriterClaimGuard<'a, T>>,
+}
+
+/// An allocated publication node that owns no writer authority.
+#[must_use = "detached publication nodes must be committed or explicitly dropped"]
+pub struct DetachedPublication<T: Send + 'static> {
+    next: Option<NonNull<PublishedNode<T>>>,
+}
+
+#[must_use = "reserved detached publication storage must be initialized or released"]
+pub struct DetachedPublicationSlot<T: Send + 'static> {
+    node: Option<NonNull<MaybeUninit<PublishedNode<T>>>>,
+}
+
+pub struct DetachedPublicationParts<T: Send + 'static> {
+    pub value: T,
+    pub allocation: DetachedNodeAllocation<T>,
+}
+
+#[must_use = "detached publication wrapper allocations must be released"]
+pub struct DetachedNodeAllocation<T: Send + 'static> {
+    node: Option<NonNull<MaybeUninit<PublishedNode<T>>>>,
+}
+
+unsafe impl<T: Send + 'static> Send for DetachedPublicationSlot<T> {}
+unsafe impl<T: Send + 'static> Send for DetachedNodeAllocation<T> {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublishRetryReason {
+    WriterBusy,
+    RetireBackpressure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservedCommitInvariant {
+    WriterBusy,
+    WrongCpu,
+    MissingRetireCredit,
+}
+
+#[must_use = "publication retries retain the detached node"]
+pub struct PublishCommitRetry<T: Send + 'static> {
+    reason: PublishRetryReason,
+    publication: DetachedPublication<T>,
+}
+
+struct WriterClaimGuard<'a, T: Send + 'static> {
+    owner: &'a Published<T>,
 }
 
 impl<T: Send + 'static> Published<T> {
@@ -62,21 +116,215 @@ impl<T: Send + 'static> Published<T> {
 
     pub fn prepare_replace(&self, next: T) -> Result<PublishReservation<'_, T>, PublishError> {
         let next = node::try_allocate(next, defer_node::<T>)?;
-        self.acquire_writer();
+        let claim = self.acquire_writer();
         Ok(PublishReservation {
             owner: self,
             next: Some(next),
             committed: false,
+            claim: Some(claim),
         })
     }
 
-    fn acquire_writer(&self) {
+    pub fn prepare_detached(&self, next: T) -> Result<DetachedPublication<T>, PublishError> {
+        let next = node::try_allocate(next, defer_node::<T>)?;
+        Ok(DetachedPublication { next: Some(next) })
+    }
+
+    pub fn prepare_detached_reserved(
+        &self,
+        next: T,
+        mut slot: DetachedPublicationSlot<T>,
+    ) -> DetachedPublication<T> {
+        let raw = slot
+            .node
+            .take()
+            .expect("reserved detached publication slot");
+        unsafe {
+            raw.as_ptr()
+                .write(MaybeUninit::new(PublishedNode::new(next, defer_node::<T>)));
+        }
+        DetachedPublication {
+            next: Some(raw.cast()),
+        }
+    }
+
+    /// Attempt one bounded publication commit.
+    ///
+    /// The final retire preflight, writer claim, root swap, and enqueue are one
+    /// callback-free local-retire interval. Contention and retire pressure are
+    /// reported before the root changes, with the detached node returned for a
+    /// lock-external retry.
+    pub fn try_commit(
+        &self,
+        mut publication: DetachedPublication<T>,
+    ) -> Result<(), PublishCommitRetry<T>> {
+        let next = publication.next.expect("detached publication node");
+        let outcome = epoch::with_local_retire_guard(|local_guard| {
+            let prepared_epoch = local_guard.sample_epoch_after_barrier();
+            if local_guard
+                .preflight_head_bags_after_barrier(prepared_epoch)
+                .is_err()
+            {
+                return Err(PublishRetryReason::RetireBackpressure);
+            }
+            let Some(_writer) = self.try_acquire_writer() else {
+                return Err(PublishRetryReason::WriterBusy);
+            };
+            let old = self.root.swap(next.as_ptr(), Ordering::AcqRel);
+            // A continuously active LocalRetireGuard permits at most the one
+            // epoch advance already covered by the two preflighted bags.
+            let retired_at = local_guard.sample_epoch_after_barrier();
+            unsafe {
+                local_guard.enqueue_prepared_head_after_barrier(
+                    NonNull::new_unchecked(old.cast::<RcuHead>()),
+                    retired_at,
+                );
+            }
+            publication.next = None;
+            Ok(())
+        })
+        .expect("Published::try_commit requires an initialized online epoch CPU");
+
+        outcome.map_err(|reason| PublishCommitRetry {
+            reason,
+            publication,
+        })
+    }
+
+    pub fn commit_reserved(
+        &self,
+        mut publication: DetachedPublication<T>,
+        retire: epoch::LocalRetireReservation,
+    ) -> Result<(), ReservedCommitInvariant> {
+        let next = publication.next.expect("detached publication node");
+        epoch::with_local_retire_guard(|local_guard| {
+            retire
+                .validate_for(local_guard)
+                .map_err(map_reserved_retire_invariant)?;
+            let Some(_writer) = self.try_acquire_writer() else {
+                return Err(ReservedCommitInvariant::WriterBusy);
+            };
+            let old = self.root.swap(next.as_ptr(), Ordering::AcqRel);
+            publication.next = None;
+            let retired_at = local_guard.sample_epoch_after_barrier();
+            unsafe {
+                retire
+                    .enqueue_after_barrier(
+                        local_guard,
+                        NonNull::new_unchecked(old.cast::<RcuHead>()),
+                        retired_at,
+                    )
+                    .expect("validated local-retire credit changed during reserved commit");
+            }
+            Ok(())
+        })
+        .map_err(|_| ReservedCommitInvariant::MissingRetireCredit)?
+    }
+
+    fn acquire_writer(&self) -> WriterClaimGuard<'_, T> {
         while self
             .writer_claimed
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             core::hint::spin_loop();
+        }
+        WriterClaimGuard { owner: self }
+    }
+
+    fn try_acquire_writer(&self) -> Option<WriterClaimGuard<'_, T>> {
+        self.writer_claimed
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| WriterClaimGuard { owner: self })
+    }
+}
+
+fn map_reserved_retire_invariant(
+    invariant: epoch::ReservedRetireInvariant,
+) -> ReservedCommitInvariant {
+    match invariant {
+        epoch::ReservedRetireInvariant::WrongCpu => ReservedCommitInvariant::WrongCpu,
+        epoch::ReservedRetireInvariant::SlotNotReserved
+        | epoch::ReservedRetireInvariant::SlotAlreadyFilled => {
+            ReservedCommitInvariant::MissingRetireCredit
+        }
+    }
+}
+
+impl<T: Send + 'static> DetachedPublicationSlot<T> {
+    pub fn try_new() -> Result<Self, PublishError> {
+        Ok(Self {
+            node: Some(node::try_allocate_uninit()?),
+        })
+    }
+}
+
+impl<T: Send + 'static> DetachedNodeAllocation<T> {
+    pub fn into_slot(mut self) -> DetachedPublicationSlot<T> {
+        DetachedPublicationSlot {
+            node: self.node.take(),
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for DetachedPublicationSlot<T> {
+    fn drop(&mut self) {
+        if let Some(node) = self.node.take() {
+            unsafe {
+                node::deallocate_uninit(node);
+            }
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for DetachedNodeAllocation<T> {
+    fn drop(&mut self) {
+        if let Some(node) = self.node.take() {
+            unsafe {
+                node::deallocate_uninit(node);
+            }
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for WriterClaimGuard<'_, T> {
+    fn drop(&mut self) {
+        self.owner.writer_claimed.store(false, Ordering::Release);
+    }
+}
+
+impl<T: Send + 'static> PublishCommitRetry<T> {
+    pub fn reason(&self) -> PublishRetryReason {
+        self.reason
+    }
+
+    pub fn into_publication(mut self) -> DetachedPublication<T> {
+        DetachedPublication {
+            next: self.publication.next.take(),
+        }
+    }
+}
+
+impl<T: Send + 'static> DetachedPublication<T> {
+    pub fn into_deferred_parts(mut self) -> DetachedPublicationParts<T> {
+        let node = self.next.take().expect("detached publication node");
+        let value = unsafe { core::ptr::read(core::ptr::addr_of!((*node.as_ptr()).value)) };
+        DetachedPublicationParts {
+            value,
+            allocation: DetachedNodeAllocation {
+                node: Some(node.cast()),
+            },
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for DetachedPublication<T> {
+    fn drop(&mut self) {
+        if let Some(next) = self.next.take() {
+            unsafe {
+                node::destroy(next);
+            }
         }
     }
 }
@@ -93,19 +341,18 @@ impl<T: Send + 'static> Drop for Published<T> {
 }
 
 impl<T: Send + 'static> PublishReservation<'_, T> {
+    #[track_caller]
     pub fn commit(mut self) {
+        let caller = core::panic::Location::caller();
         let next = self.next.expect("prepared publication node");
-        let mut retried_after_drain = false;
+        let mut retry_drain = None;
         loop {
             let preflight = epoch::with_local_retire_guard(|local_guard| {
                 let prepared_epoch = local_guard.sample_epoch_after_barrier();
-                local_guard.prepare_head_bags_after_barrier(prepared_epoch)?;
+                local_guard.preflight_head_bags_after_barrier(prepared_epoch)?;
                 let old = self.owner.root.swap(next.as_ptr(), Ordering::AcqRel);
                 self.committed = true;
                 let retired_at = local_guard.sample_epoch_after_barrier();
-                debug_assert!(
-                    retired_at == prepared_epoch || retired_at == prepared_epoch.saturating_add(1)
-                );
                 unsafe {
                     local_guard.enqueue_prepared_head_after_barrier(
                         NonNull::new_unchecked(old.cast::<RcuHead>()),
@@ -118,27 +365,39 @@ impl<T: Send + 'static> PublishReservation<'_, T> {
 
             match preflight {
                 Ok(()) => break,
-                Err(EpochError::RetireBagOccupied) if !retried_after_drain => {
-                    retried_after_drain = true;
-                    let _ = epoch::drain_with_budget(usize::MAX);
+                Err(EpochError::RetireBagOccupied) => {
+                    drop(self.claim.take());
+                    retry_drain = Some(epoch::drain_with_budget(PUBLICATION_RETRY_DRAIN_BUDGET));
+                    #[cfg(test)]
+                    for _ in 0..RETRY_DRAIN_TEST_EPOCH_ADVANCES.swap(0, Ordering::AcqRel) {
+                        let _ = epoch::drain_with_budget(0);
+                    }
+                    self.claim = Some(self.owner.acquire_writer());
                 }
-                Err(err) => panic!("Published::commit retire bag preflight: {err:?}"),
+                Err(err) => panic!(
+                    "Published::commit retire bag preflight: {err:?}; caller={}:{}; retry_drain={retry_drain:?}; epoch={:?}; bags={:?}",
+                    caller.file(),
+                    caller.line(),
+                    epoch::summary(),
+                    epoch::local_head_bag_summary(),
+                ),
             }
         }
         self.next = None;
+        drop(self.claim.take());
     }
 }
 
 impl<T: Send + 'static> Drop for PublishReservation<'_, T> {
     fn drop(&mut self) {
         if !self.committed {
+            drop(self.claim.take());
             if let Some(next) = self.next.take() {
                 unsafe {
                     node::destroy(next);
                 }
             }
         }
-        self.owner.writer_claimed.store(false, Ordering::Release);
     }
 }
 
@@ -228,6 +487,35 @@ pub(crate) fn fail_next_allocations_for_test(count: usize) {
 
 pub(crate) fn deferred_drop_count(cpu: CpuId) -> usize {
     DEFERRED_DROPS[cpu.0].count.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_recovers_when_epoch_advances_again_after_retry_drain() {
+        crate::testing::init_host_for_test_once();
+        for _ in 0..4 {
+            let _ = epoch::drain_with_budget(usize::MAX);
+        }
+
+        let cell = Published::try_new(0usize).expect("initial publication");
+        for value in 1..=3 {
+            cell.prepare_replace(value)
+                .expect("prepared replacement")
+                .commit();
+            let _ = epoch::drain_with_budget(0);
+        }
+
+        RETRY_DRAIN_TEST_EPOCH_ADVANCES.store(2, Ordering::Release);
+        cell.prepare_replace(4)
+            .expect("prepared replacement after a second epoch advance")
+            .commit();
+
+        let guard = epoch::guard();
+        assert_eq!(*cell.read(&guard), 4);
+    }
 }
 
 unsafe fn defer_node<T: Send + 'static>(head: *mut RcuHead, local_guard: &mut LocalRetireGuard) {

@@ -36,10 +36,9 @@ mod wait_source {
     impl PageReadyWait {
         fn new() -> Self {
             let source_id = crate::allocate_notification_source_id();
-            Self {
-                source_id,
-                source: wait_routing::new_wait_source(source_id),
-            }
+            let source = wait_routing::new_wait_source(source_id);
+            crate::wait_source::register_wait_source_with_id(source_id, Arc::clone(&source));
+            Self { source_id, source }
         }
 
         pub(crate) fn ready_endpoint(&self) -> &Arc<WaitSource> {
@@ -63,6 +62,7 @@ mod wait_source {
 
     impl Drop for PageReadyWait {
         fn drop(&mut self) {
+            crate::wait_source::release_wait_source(self.source_id);
             wait_routing::unregister_source(self.source_id);
         }
     }
@@ -116,6 +116,9 @@ mod wait_source {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use alloc::boxed::Box;
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
 
         #[test]
         fn page_ready_endpoint_matches_source_id() {
@@ -125,6 +128,24 @@ mod wait_source {
                 tx_substrate::wake::WaitEndpoint::source_id(page_ready_endpoint(&wait)).raw(),
                 page_ready_source_id(&wait)
             );
+        }
+
+        #[test]
+        fn page_ready_wait_is_registered_for_token_driven_async_retry() {
+            let wait = new_page_ready_wait();
+            let source_id = page_ready_source_id(&wait);
+            let mut future = Box::pin(
+                crate::wait_source::wait_on_registered_source_id(source_id, PAGE_READY)
+                    .expect("page-ready source must resolve from its yielded token"),
+            );
+            let waker = Waker::noop().clone();
+            let mut cx = Context::from_waker(&waker);
+
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+            notify_page_ready_with_post(&wait.notifier(), |mailbox, event| mailbox.post(event));
+
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(_)));
         }
     }
 }

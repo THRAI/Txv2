@@ -139,7 +139,7 @@ struct RegisteredZone {
     /// Resolve a logical key to a typed slot pointer, erased for storage.
     slot_from_key: fn(*const (), SlotKey) -> Option<*mut ()>,
     /// Reclaim one typed slot selected from a mixed Zone retirement bag.
-    reclaim_slot: unsafe fn(*const (), SlotKey, &mut crate::epoch::LocalRetireGuard),
+    reclaim_slot: unsafe fn(*const (), SlotKey),
 }
 
 static NEXT_ZONE_ID: AtomicUsize = AtomicUsize::new(1);
@@ -200,8 +200,8 @@ pub(crate) fn slot_meta(key: SlotKey) -> Option<NonNull<super::meta::SlotMeta>> 
     REGISTRY.slot_meta(key)
 }
 
-pub(crate) unsafe fn reclaim_slot(key: SlotKey, local_guard: &mut crate::epoch::LocalRetireGuard) {
-    unsafe { REGISTRY.reclaim_slot(key, local_guard) }
+pub(crate) unsafe fn reclaim_slot(key: SlotKey) {
+    unsafe { REGISTRY.reclaim_slot(key) }
 }
 
 pub(crate) fn slot_lookup_debug<T: 'static>(key: SlotKey) -> SlotLookupDebug {
@@ -242,16 +242,12 @@ fn slot_from_key<T: 'static>(erased: *const (), key: SlotKey) -> Option<*mut ()>
     zone.slot_from_key(key).map(|slot| slot.as_ptr() as *mut ())
 }
 
-unsafe fn reclaim_slot_for<T: 'static>(
-    erased: *const (),
-    key: SlotKey,
-    local_guard: &mut crate::epoch::LocalRetireGuard,
-) {
+unsafe fn reclaim_slot_for<T: 'static>(erased: *const (), key: SlotKey) {
     let zone = unsafe { &*(erased as *const Zone<T>) };
     let slot = zone
         .slot_from_key(key)
         .expect("retired Zone slot must remain directory-resolvable");
-    unsafe { super::slot::reclaim_slot(slot, local_guard) };
+    unsafe { super::slot::reclaim_slot(slot) };
 }
 
 struct ZoneRegistry {
@@ -406,7 +402,7 @@ impl ZoneRegistry {
         NonNull::new(ptr.cast::<super::meta::SlotMeta>())
     }
 
-    unsafe fn reclaim_slot(&self, key: SlotKey, local_guard: &mut crate::epoch::LocalRetireGuard) {
+    unsafe fn reclaim_slot(&self, key: SlotKey) {
         let zone_id = key.zone_id();
         let entry = self
             .entry_at(
@@ -416,7 +412,7 @@ impl ZoneRegistry {
                     .expect("retired key has nonzero zone id"),
             )
             .expect("retired key has registered zone");
-        unsafe { (entry.reclaim_slot)(entry.erased, key, local_guard) };
+        unsafe { (entry.reclaim_slot)(entry.erased, key) };
     }
 
     fn slot_lookup_debug<T: 'static>(&self, key: SlotKey) -> SlotLookupDebug {

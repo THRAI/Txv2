@@ -26,9 +26,10 @@ use crate::io_manager::page::PageIoOp;
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
 };
-use crate::page_backed::{FileBlockServiceTurn, Frame, PageContainer};
+use crate::page_backed::{
+    BlockSubmissionHandle, FileBlockServiceTurn, Frame, PageContainer, PageIoSubmissionHandle,
+};
 use tx_services::time::DeadlineRegistrar;
-use tx_substrate::epoch;
 
 const MAX_STATIC_BLOCK_DEVICES: usize = 16;
 const FILE_IO_SERVICE_SOURCE_ID_BASE: u64 = 0x7200;
@@ -724,29 +725,33 @@ pub struct PageContainerFileIoServiceTaskReport {
     pub last_turn: Option<PageContainerFileIoServiceTurn>,
 }
 
-#[derive(Clone)]
-pub struct PageContainerFileIoServiceRuntime {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FileIoManagerRuntimeRegistrationId(u64);
+
+impl FileIoManagerRuntimeRegistrationId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Move-only reactor custody for one file-I/O manager pair.
+///
+/// The weak endpoint is used only to check whether the PageBacked semantic
+/// owner is still live for a bounded service turn. It is never upgraded across
+/// an await. The typed L4/L6 handles keep request and block-manager state out
+/// of the PageContainer lifetime.
+pub struct FileIoManagerRuntimeClaim {
+    registration: FileIoManagerRuntimeRegistrationId,
     container: Weak<PageContainer>,
+    page_submission: PageIoSubmissionHandle,
+    block_submission: BlockSubmissionHandle,
     handle: BlockDeviceHandle,
     wake_source: Arc<ServiceWakeSource>,
 }
 
-impl PageContainerFileIoServiceRuntime {
-    pub fn new(
-        container: Cap<PageContainer>,
-        handle: BlockDeviceHandle,
-        wake_source: Arc<ServiceWakeSource>,
-    ) -> Self {
-        Self {
-            container: container.downgrade(),
-            handle,
-            wake_source,
-        }
-    }
-
-    pub fn container(&self) -> Option<Cap<PageContainer>> {
-        let guard = epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        self.container.upgrade(&guard)
+impl FileIoManagerRuntimeClaim {
+    pub const fn registration_id(&self) -> FileIoManagerRuntimeRegistrationId {
+        self.registration
     }
 
     pub const fn handle(&self) -> BlockDeviceHandle {
@@ -761,14 +766,75 @@ impl PageContainerFileIoServiceRuntime {
         post_file_io_service_kick(&self.wake_source, ServiceKick::new(service)) as usize
     }
 
-    fn container_is_live(&self) -> bool {
-        self.container().is_some()
+    fn retain_manager_custody(&self) {
+        // These handles are intentionally owned by the claim, rather than by
+        // a long-lived PageContainer capability held in a reactor future.
+        let _ = (&self.page_submission, &self.block_submission);
+    }
+
+    /// End this claim's reactor ownership and release its typed manager
+    /// handles. The registration removal is idempotent against test cleanup.
+    pub fn retire(self) -> bool {
+        retire_file_io_manager_runtime(self.registration)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn detached_for_test(
+        container: Cap<PageContainer>,
+        handle: BlockDeviceHandle,
+        wake_source: Arc<ServiceWakeSource>,
+    ) -> Self {
+        let (page_submission, block_submission) = container.file_io_runtime_handles();
+        Self {
+            registration: FileIoManagerRuntimeRegistrationId(0),
+            container: container.downgrade(),
+            page_submission,
+            block_submission,
+            handle,
+            wake_source,
+        }
     }
 }
 
+struct FileIoManagerRuntimePayload {
+    page_submission: PageIoSubmissionHandle,
+    block_submission: BlockSubmissionHandle,
+    handle: BlockDeviceHandle,
+    wake_source: Arc<ServiceWakeSource>,
+}
+
+enum FileIoManagerRuntimeState {
+    Pending(FileIoManagerRuntimePayload),
+    Claimed,
+}
+
 struct RegisteredFileIoServiceRuntime {
-    runtime: PageContainerFileIoServiceRuntime,
-    submitted: bool,
+    id: FileIoManagerRuntimeRegistrationId,
+    container: Weak<PageContainer>,
+    handle: BlockDeviceHandle,
+    source_id: u64,
+    state: FileIoManagerRuntimeState,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PageContainerFileIoServiceRuntimeSnapshot {
+    container: Weak<PageContainer>,
+    handle: BlockDeviceHandle,
+    source_id: u64,
+}
+
+impl PageContainerFileIoServiceRuntimeSnapshot {
+    pub const fn handle(&self) -> BlockDeviceHandle {
+        self.handle
+    }
+
+    pub const fn source_id(&self) -> u64 {
+        self.source_id
+    }
+
+    pub fn is_live(&self, guard: &Guard<'_>) -> bool {
+        self.container.upgrade(guard).is_some()
+    }
 }
 
 /// Kernel-owned task submission for a registered file-I/O service runtime.
@@ -777,7 +843,7 @@ struct RegisteredFileIoServiceRuntime {
 /// state. The reactor owner installs this narrow callback after it is ready to
 /// accept long-lived service futures.
 pub trait FileIoServiceRuntimeSpawner: Send + Sync {
-    fn spawn_file_io_service(&self, runtime: PageContainerFileIoServiceRuntime);
+    fn spawn_file_io_service(&self, claim: FileIoManagerRuntimeClaim);
 }
 
 static FILE_IO_SERVICE_RUNTIMES: SpinMutex<Vec<RegisteredFileIoServiceRuntime>> =
@@ -785,29 +851,35 @@ static FILE_IO_SERVICE_RUNTIMES: SpinMutex<Vec<RegisteredFileIoServiceRuntime>> 
 static FILE_IO_SERVICE_RUNTIME_SPAWNER: SpinMutex<Option<Arc<dyn FileIoServiceRuntimeSpawner>>> =
     SpinMutex::new(None);
 static NEXT_FILE_IO_SERVICE_SOURCE_ID: AtomicU64 = AtomicU64::new(FILE_IO_SERVICE_SOURCE_ID_BASE);
-
-fn prune_dead_file_io_service_runtimes_locked(runtimes: &mut Vec<RegisteredFileIoServiceRuntime>) {
-    runtimes.retain(|entry| entry.runtime.container_is_live());
-}
+static NEXT_FILE_IO_SERVICE_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn register_page_container_file_io_service(
     container: Cap<PageContainer>,
     handle: BlockDeviceHandle,
-) -> PageContainerFileIoServiceRuntime {
+) -> FileIoManagerRuntimeRegistrationId {
     let source_id = NEXT_FILE_IO_SERVICE_SOURCE_ID.fetch_add(1, Ordering::AcqRel);
     let wake_source = Arc::new(ServiceWakeSource::new(source_id));
     let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
-    let runtime = PageContainerFileIoServiceRuntime::new(container, handle, wake_source);
-    {
-        let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
-        prune_dead_file_io_service_runtimes_locked(&mut runtimes);
-        runtimes.push(RegisteredFileIoServiceRuntime {
-            runtime: runtime.clone(),
-            submitted: false,
+    let (page_submission, block_submission) = container.file_io_runtime_handles();
+    let id = FileIoManagerRuntimeRegistrationId(
+        NEXT_FILE_IO_SERVICE_RUNTIME_ID.fetch_add(1, Ordering::AcqRel),
+    );
+    FILE_IO_SERVICE_RUNTIMES
+        .lock()
+        .push(RegisteredFileIoServiceRuntime {
+            id,
+            container: container.downgrade(),
+            handle,
+            source_id,
+            state: FileIoManagerRuntimeState::Pending(FileIoManagerRuntimePayload {
+                page_submission,
+                block_submission,
+                handle,
+                wake_source,
+            }),
         });
-    }
     let _ = submit_pending_file_io_service_runtimes();
-    runtime
+    id
 }
 
 /// Install the single kernel-owned spawner and drain every runtime registered
@@ -833,16 +905,31 @@ pub fn submit_pending_file_io_service_runtimes() -> usize {
     let Some(spawner) = FILE_IO_SERVICE_RUNTIME_SPAWNER.lock().clone() else {
         return 0;
     };
+    let guard = step_engine::guard();
     let pending = {
         let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
-        prune_dead_file_io_service_runtimes_locked(&mut runtimes);
         let mut pending = Vec::new();
-        for entry in runtimes.iter_mut() {
-            if !entry.submitted {
-                entry.submitted = true;
-                pending.push(entry.runtime.clone());
+        runtimes.retain_mut(|entry| {
+            if entry.container.upgrade(&guard).is_none() {
+                return false;
             }
-        }
+            if matches!(entry.state, FileIoManagerRuntimeState::Pending(_)) {
+                let FileIoManagerRuntimeState::Pending(payload) =
+                    core::mem::replace(&mut entry.state, FileIoManagerRuntimeState::Claimed)
+                else {
+                    unreachable!("pending claim state was checked above");
+                };
+                pending.push(FileIoManagerRuntimeClaim {
+                    registration: entry.id,
+                    container: entry.container,
+                    page_submission: payload.page_submission,
+                    block_submission: payload.block_submission,
+                    handle: payload.handle,
+                    wake_source: payload.wake_source,
+                });
+            }
+            true
+        });
         pending
     };
     let submitted = pending.len();
@@ -852,21 +939,44 @@ pub fn submit_pending_file_io_service_runtimes() -> usize {
     submitted
 }
 
-pub fn page_container_file_io_service_runtimes_snapshot() -> Vec<PageContainerFileIoServiceRuntime>
-{
-    let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
-    prune_dead_file_io_service_runtimes_locked(&mut runtimes);
-    runtimes.iter().map(|entry| entry.runtime.clone()).collect()
+pub fn page_container_file_io_service_runtimes_snapshot(
+) -> Vec<PageContainerFileIoServiceRuntimeSnapshot> {
+    FILE_IO_SERVICE_RUNTIMES
+        .lock()
+        .iter()
+        .map(|entry| PageContainerFileIoServiceRuntimeSnapshot {
+            container: entry.container,
+            handle: entry.handle,
+            source_id: entry.source_id,
+        })
+        .collect()
 }
 
 pub fn page_container_file_io_service_runtime_count() -> usize {
+    FILE_IO_SERVICE_RUNTIMES.lock().len()
+}
+
+fn retire_file_io_manager_runtime(id: FileIoManagerRuntimeRegistrationId) -> bool {
+    if id.raw() == 0 {
+        return false;
+    }
     let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
-    prune_dead_file_io_service_runtimes_locked(&mut runtimes);
-    runtimes.len()
+    let initial_len = runtimes.len();
+    runtimes.retain(|entry| entry.id != id);
+    runtimes.len() != initial_len
 }
 
 pub async fn page_container_file_io_service_task_loop_owned(
-    runtime: PageContainerFileIoServiceRuntime,
+    claim: FileIoManagerRuntimeClaim,
+    config: PageContainerFileIoServiceTaskConfig,
+) -> PageContainerFileIoServiceTaskReport {
+    let report = page_container_file_io_service_task_loop_claim(&claim, config).await;
+    let _ = claim.retire();
+    report
+}
+
+async fn page_container_file_io_service_task_loop_claim(
+    claim: &FileIoManagerRuntimeClaim,
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
     let mut report = PageContainerFileIoServiceTaskReport::default();
@@ -875,7 +985,7 @@ pub async fn page_container_file_io_service_task_loop_owned(
         .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
     {
         let wait = crate::wait_source::wait_on_registered_endpoint(
-            runtime.wake_source.wake_endpoint(),
+            claim.wake_source.wake_endpoint(),
             file_io_service_interest_mask(),
         );
         if wait.await != WaitOutcome::Ready {
@@ -883,20 +993,21 @@ pub async fn page_container_file_io_service_task_loop_owned(
             break;
         }
 
-        let Some(container) = runtime.container() else {
-            break;
-        };
-
         report.waits_ready += 1;
         report.ready_turns += 1;
         let guard = step_engine::guard();
+        let Some(container) = claim.container.upgrade(&guard) else {
+            report.waits_failed += 1;
+            break;
+        };
+        claim.retain_manager_custody();
         let turn = match drive_page_container_file_io_service_once(
             &container,
             config.page_budget,
             config.block_budget,
-            runtime.handle,
+            claim.handle,
             &guard,
-            |kick| post_file_io_service_kick(&runtime.wake_source, kick),
+            |kick| post_file_io_service_kick(&claim.wake_source, kick),
         ) {
             Ok(turn) => turn,
             Err(_) => {
@@ -904,6 +1015,7 @@ pub async fn page_container_file_io_service_task_loop_owned(
                 break;
             }
         };
+        drop(container);
 
         report.dispatched += turn.block.dispatched;
         report.device_completions += turn.block.device_completions;
@@ -1203,6 +1315,7 @@ pub fn reset_page_container_file_io_service_registry_for_test() {
     FILE_IO_SERVICE_RUNTIMES.lock().clear();
     *FILE_IO_SERVICE_RUNTIME_SPAWNER.lock() = None;
     NEXT_FILE_IO_SERVICE_SOURCE_ID.store(FILE_IO_SERVICE_SOURCE_ID_BASE, Ordering::Release);
+    NEXT_FILE_IO_SERVICE_RUNTIME_ID.store(1, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -1357,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn file_io_service_registry_snapshots_owned_runtime_for_reactor_submission() {
+    fn file_io_service_registry_keeps_only_weak_liveness_and_manager_metadata() {
         tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
@@ -1372,7 +1485,7 @@ mod tests {
         )
         .expect("page container cap");
 
-        let runtime = register_page_container_file_io_service(
+        let registration = register_page_container_file_io_service(
             pc.clone(),
             BlockDeviceHandle::whole(&BLOCK_REG),
         );
@@ -1380,58 +1493,59 @@ mod tests {
 
         assert_eq!(page_container_file_io_service_runtime_count(), 1);
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(runtime.container().expect("live container").page_count(), 1);
-        assert_eq!(
-            snapshot[0]
-                .container()
-                .expect("live snapshot container")
-                .page_count(),
-            1
-        );
+        assert_eq!(registration.raw(), 1);
+        let guard = step_engine::guard();
+        assert!(snapshot[0].is_live(&guard));
+        drop(guard);
         assert_eq!(snapshot[0].handle().registration().devt, BLOCK_REG.devt);
         assert_eq!(snapshot[0].handle().start_lba(), 0);
         assert_eq!(snapshot[0].handle().len_lba(), BLOCK_REG.ops.total_blocks());
-        assert_eq!(
-            snapshot[0].wake_source().source_id(),
-            FILE_IO_SERVICE_SOURCE_ID_BASE
-        );
+        assert_eq!(snapshot[0].source_id(), FILE_IO_SERVICE_SOURCE_ID_BASE);
 
         reset_page_container_file_io_service_registry_for_test();
         assert!(page_container_file_io_service_runtimes_snapshot().is_empty());
     }
 
     #[test]
-    fn file_io_runtime_drops_dead_container_and_prunes_registry() {
+    fn file_io_runtime_registry_does_not_retain_page_container() {
         tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
         crate::zones::register_all().expect("kernel zones");
         reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        register_page_container_file_io_service(pc.clone(), BlockDeviceHandle::whole(&BLOCK_REG));
+        let snapshot = page_container_file_io_service_runtimes_snapshot();
+        drop(pc);
 
-        let runtime = {
-            let pc = PageContainer::new_cap(
-                PageContainerKind::Anon {
-                    swap_policy: AnonSwapPolicy::Reclaimable,
-                },
-                1,
-            )
-            .expect("page container cap");
-            register_page_container_file_io_service(pc, BlockDeviceHandle::whole(&BLOCK_REG))
-        };
-        drop(runtime);
-
-        assert!(page_container_file_io_service_runtimes_snapshot().is_empty());
-        assert_eq!(page_container_file_io_service_runtime_count(), 0);
+        let guard = step_engine::guard();
+        assert!(
+            !snapshot[0].is_live(&guard),
+            "registry metadata must not keep a PageContainer capability alive"
+        );
+        drop(guard);
+        reset_page_container_file_io_service_registry_for_test();
     }
 
     #[test]
-    fn file_io_runtime_spawner_drains_boot_backlog_and_submits_late_registration_once() {
-        struct CountingSpawner(AtomicUsize);
+    fn file_io_runtime_spawner_drains_boot_backlog_and_retires_claims_once() {
+        struct CountingSpawner {
+            spawned: AtomicUsize,
+            retired: AtomicUsize,
+        }
 
         impl FileIoServiceRuntimeSpawner for CountingSpawner {
-            fn spawn_file_io_service(&self, _runtime: PageContainerFileIoServiceRuntime) {
-                self.0.fetch_add(1, Ordering::AcqRel);
+            fn spawn_file_io_service(&self, claim: FileIoManagerRuntimeClaim) {
+                self.spawned.fetch_add(1, Ordering::AcqRel);
+                self.retired
+                    .fetch_add(usize::from(claim.retire()), Ordering::AcqRel);
             }
         }
 
@@ -1449,15 +1563,23 @@ mod tests {
             1,
         )
         .expect("first page container");
-        register_page_container_file_io_service(first, BlockDeviceHandle::whole(&BLOCK_REG));
+        register_page_container_file_io_service(
+            first.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
 
-        let spawner = Arc::new(CountingSpawner(AtomicUsize::new(0)));
+        let spawner = Arc::new(CountingSpawner {
+            spawned: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
+        });
         assert_eq!(
             install_file_io_service_runtime_spawner(spawner.clone()),
             Some(1)
         );
-        assert_eq!(spawner.0.load(Ordering::Acquire), 1);
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 1);
+        assert_eq!(spawner.retired.load(Ordering::Acquire), 1);
         assert_eq!(submit_pending_file_io_service_runtimes(), 0);
+        assert_eq!(page_container_file_io_service_runtime_count(), 0);
 
         let second = PageContainer::new_cap(
             PageContainerKind::Anon {
@@ -1466,14 +1588,20 @@ mod tests {
             1,
         )
         .expect("second page container");
-        register_page_container_file_io_service(second, BlockDeviceHandle::whole(&BLOCK_REG));
+        register_page_container_file_io_service(
+            second.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
 
-        assert_eq!(spawner.0.load(Ordering::Acquire), 2);
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 2);
+        assert_eq!(spawner.retired.load(Ordering::Acquire), 2);
         assert_eq!(submit_pending_file_io_service_runtimes(), 0);
+        assert_eq!(page_container_file_io_service_runtime_count(), 0);
         assert_eq!(
-            install_file_io_service_runtime_spawner(Arc::new(CountingSpawner(
-                AtomicUsize::new(0,)
-            ))),
+            install_file_io_service_runtime_spawner(Arc::new(CountingSpawner {
+                spawned: AtomicUsize::new(0),
+                retired: AtomicUsize::new(0),
+            })),
             None
         );
 

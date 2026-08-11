@@ -18,6 +18,43 @@ use super::{runtime, Zone, ZoneError};
 
 const MAX_SLAB_SLOTS: usize = 64;
 
+struct SlabLayout {
+    header_size: usize,
+    slot_count: usize,
+}
+
+fn slab_layout<T: 'static>(page_size: usize) -> Option<SlabLayout> {
+    let header_size = align_up(mem::size_of::<ZoneSlab<T>>(), mem::align_of::<Slot<T>>())?;
+    let slot_size = mem::size_of::<Slot<T>>().max(1);
+    let slot_count = page_size.checked_sub(header_size)? / slot_size;
+    let slot_count = slot_count.min(MAX_SLAB_SLOTS);
+    (slot_count != 0).then_some(SlabLayout {
+        header_size,
+        slot_count,
+    })
+}
+
+#[cfg(any(test, feature = "layout-probe"))]
+pub struct ZoneLayoutProbe {
+    pub value_offset: usize,
+    pub slot_size: usize,
+    pub slab_header_size: usize,
+    pub slots_per_slab: usize,
+}
+
+#[cfg(any(test, feature = "layout-probe"))]
+impl ZoneLayoutProbe {
+    pub fn for_type<T: 'static>() -> Self {
+        let layout = slab_layout::<T>(4096).expect("test page must fit one zone slot");
+        Self {
+            value_offset: layout.header_size,
+            slot_size: mem::size_of::<Slot<T>>().max(1),
+            slab_header_size: layout.header_size,
+            slots_per_slab: layout.slot_count,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlabList {
     /// Not linked into any Keg list.
@@ -49,15 +86,8 @@ pub struct ZoneSlab<T: 'static> {
     slot_count: usize,
     /// Number of bits currently set in `free_bitmap`.
     free_count: usize,
-    /// Number of reclaimed slots whose generation reached the non-wrapping
-    /// ceiling. These slots are logically free, but are intentionally absent
-    /// from `free_bitmap` so stale `Weak` handles cannot observe ABA reuse.
-    exhausted_count: usize,
     /// One bit per slot: 1 means free, 0 means claimed/live/reserved.
     free_bitmap: u64,
-    /// Rotating start index for the next claim. This spreads repeated
-    /// allocate/free cycles across a slab instead of hammering slot 0.
-    claim_cursor: u8,
     /// Which Keg list currently owns this slab.
     list: SlabList,
     /// Intrusive next pointer for Keg lists.
@@ -71,17 +101,9 @@ impl<T: 'static> ZoneSlab<T> {
     pub(crate) fn allocate(zone: &'static Zone<T>, id: usize) -> Result<NonNull<Self>, ZoneError> {
         let page_size = runtime::page_size();
         // The slot array starts immediately after an aligned slab header.
-        let header_size = align_up(mem::size_of::<Self>(), mem::align_of::<Slot<T>>())
-            .ok_or(ZoneError::AllocationFailed)?;
-        let slot_size = mem::size_of::<Slot<T>>().max(1);
-        let slot_capacity = page_size
-            .checked_sub(header_size)
-            .ok_or(ZoneError::AllocationFailed)?
-            / slot_size;
-        let slot_count = slot_capacity.min(MAX_SLAB_SLOTS);
-        if slot_count == 0 {
-            return Err(ZoneError::AllocationFailed);
-        }
+        let layout = slab_layout::<T>(page_size).ok_or(ZoneError::AllocationFailed)?;
+        let header_size = layout.header_size;
+        let slot_count = layout.slot_count;
 
         // Keep the owned run live across all fallible address calculations so
         // an early error returns the frame automatically. The slab header takes
@@ -114,9 +136,7 @@ impl<T: 'static> ZoneSlab<T> {
                 page_count: 1,
                 slot_count,
                 free_count: slot_count,
-                exhausted_count: 0,
                 free_bitmap: initial_free_bitmap(slot_count),
-                claim_cursor: 0,
                 list: SlabList::Unlinked,
                 next: ptr::null_mut(),
             });
@@ -164,10 +184,6 @@ impl<T: 'static> ZoneSlab<T> {
         self.free_count == 0
     }
 
-    pub fn is_depleted(&self) -> bool {
-        self.exhausted_count != 0 && self.free_count + self.exhausted_count == self.slot_count
-    }
-
     pub(crate) fn list(&self) -> SlabList {
         self.list
     }
@@ -188,11 +204,7 @@ impl<T: 'static> ZoneSlab<T> {
         if self.free_bitmap == 0 {
             return None;
         }
-        let start = usize::from(self.claim_cursor) % self.slot_count.max(1);
-        let rotated = self.free_bitmap.rotate_right(start as u32);
-        let offset = rotated.trailing_zeros() as usize;
-        let index = (start + offset) % 64;
-        debug_assert!(index < self.slot_count);
+        let index = self.free_bitmap.trailing_zeros() as usize;
         self.free_bitmap &= !(1u64 << index);
         self.free_count -= 1;
         unsafe { Some(NonNull::new_unchecked(self.slot_base().add(index))) }
@@ -203,29 +215,8 @@ impl<T: 'static> ZoneSlab<T> {
             .slot_index(slot)
             .expect("returned slot must belong to this slab");
         debug_assert!(index < self.slot_count);
-        debug_assert_eq!(
-            self.free_bitmap & (1u64 << index),
-            0,
-            "returned slot must not already be free"
-        );
         self.free_bitmap |= 1u64 << index;
         self.free_count += 1;
-        if self.free_count == self.slot_count {
-            self.claim_cursor = self.claim_cursor.wrapping_add(1);
-        }
-    }
-
-    pub(crate) fn mark_slot_exhausted(&mut self, slot: NonNull<Slot<T>>) {
-        let index = self
-            .slot_index(slot)
-            .expect("exhausted slot must belong to this slab");
-        debug_assert!(index < self.slot_count);
-        debug_assert_eq!(
-            self.free_bitmap & (1u64 << index),
-            0,
-            "exhausted slot must not already be on the free list"
-        );
-        self.exhausted_count += 1;
     }
 
     pub(crate) fn slot_at(&self, index: usize) -> Option<NonNull<Slot<T>>> {
@@ -306,6 +297,23 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
     }
     let mask = align - 1;
     value.checked_add(mask).map(|v| v & !mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_probe_matches_allocator_formula_with_64_slot_cap() {
+        let probe = ZoneLayoutProbe::for_type::<u8>();
+        assert_eq!(
+            probe.value_offset,
+            align_up(mem::size_of::<ZoneSlab<u8>>(), mem::align_of::<Slot<u8>>()).unwrap()
+        );
+        assert_eq!(probe.slot_size, mem::size_of::<Slot<u8>>().max(1));
+        assert_eq!(probe.slab_header_size, probe.value_offset);
+        assert_eq!(probe.slots_per_slab, 64);
+    }
 }
 
 fn initial_free_bitmap(slot_count: usize) -> u64 {

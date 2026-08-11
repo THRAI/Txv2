@@ -1,10 +1,9 @@
 use crate::adapter::step_engine::{
-    drain_with_budget, guard, page_allocator, summary as epoch_summary, zone, Zone, ZoneAllocated,
-    ZoneError,
+    drain_with_budget, freeze_for_shutdown as freeze_zones_for_shutdown, guard, is_initialized,
+    maintenance_tick, page_allocator, register_zone_for, registered_zone_count, reserve_for,
+    sign_for, snapshot, summary as epoch_summary, Zone, ZoneAllocated, ZoneError,
+    ZoneMaintenanceBudget, ZoneMaintenanceStats,
 };
-use tx_hal::{console_write_str, ConsoleIf, TxPlatform};
-use tx_substrate::slab;
-
 use crate::{
     mount::{MountIdentity, MountNamespace, MountPayload},
     net,
@@ -13,6 +12,8 @@ use crate::{
     vfs::{DEntry, OpenFile, RNode},
     vm::AddressSpace,
 };
+use tx_hal::{console_write_str, TxPlatform};
+use tx_substrate::slab;
 
 pub(crate) struct ZoneSmokeObj {
     pub(crate) value: usize,
@@ -55,8 +56,8 @@ pub fn register_all() -> Result<(), ZoneError> {
 pub fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
     register_all()?;
 
-    let reservation = zone::reserve_for::<ZoneSmokeObj>()?;
-    let cap = zone::sign_for(reservation, ZoneSmokeObj { value: 7 });
+    let reservation = reserve_for::<ZoneSmokeObj>()?;
+    let cap = sign_for(reservation, ZoneSmokeObj { value: 7 });
     let weak = cap.downgrade();
     let upgraded = {
         let guard = guard();
@@ -89,49 +90,49 @@ pub struct KernelZoneSummary {
 
 pub(crate) fn summary() -> KernelZoneSummary {
     let mut zones = [const { None }; 64];
-    let captured_zones = zone::snapshot(&mut zones);
+    let captured_zones = snapshot(&mut zones);
     KernelZoneSummary {
         epoch: epoch_summary(),
-        zone_count: zone::registered_zone_count(),
+        zone_count: registered_zone_count(),
         captured_zones,
         zones,
     }
 }
 
 pub(crate) fn freeze_for_shutdown() -> Result<(), ZoneError> {
-    zone::freeze_for_shutdown()
+    freeze_zones_for_shutdown()
 }
 
-pub(crate) fn best_effort_maintenance_tick() -> zone::ZoneMaintenanceStats {
-    zone::maintenance_tick(zone::ZoneMaintenanceBudget {
+pub(crate) fn best_effort_maintenance_tick() -> ZoneMaintenanceStats {
+    maintenance_tick(ZoneMaintenanceBudget {
         epoch_reclaim_budget: usize::MAX,
         empty_slab_budget: usize::MAX,
     })
 }
 
-pub(crate) fn bounded_maintenance_tick() -> zone::ZoneMaintenanceStats {
-    zone::maintenance_tick(zone::ZoneMaintenanceBudget {
-        epoch_reclaim_budget: 512,
-        empty_slab_budget: 512,
+pub(crate) fn bounded_maintenance_tick() -> ZoneMaintenanceStats {
+    maintenance_tick(ZoneMaintenanceBudget {
+        epoch_reclaim_budget: 128,
+        empty_slab_budget: 256,
     })
 }
 
 pub fn try_bounded_maintenance_tick() {
-    if !zone::is_initialized() {
+    if !is_initialized() {
         return;
     }
     let _ = bounded_maintenance_tick();
 }
 
-pub fn try_best_effort_maintenance_tick() {
-    if !zone::is_initialized() {
+pub(crate) fn try_best_effort_maintenance_tick() {
+    if !is_initialized() {
         return;
     }
     let _ = best_effort_maintenance_tick();
 }
 
 pub fn try_memory_pressure_maintenance_tick() {
-    if !zone::is_initialized() {
+    if !is_initialized() {
         return;
     }
     let _ = crate::page_backed::reclaim_clean_file_pages(usize::MAX);
@@ -160,7 +161,7 @@ pub fn shutdown_with_quiet_zone_cleanup<P: TxPlatform>() -> ! {
     P::system_off()
 }
 
-pub fn dump_summary<P: ConsoleIf>() {
+pub fn dump_summary<P: tx_hal::ConsoleIf>() {
     let summary = summary();
     console_write_str::<P>("txkernel:zone:summary:epoch=");
     write_usize::<P>(summary.epoch.global_epoch as usize);
@@ -194,8 +195,8 @@ pub fn dump_summary<P: ConsoleIf>() {
         write_usize::<P>(fail.total_count);
         console_write_str::<P>(":max_run=");
         write_usize::<P>(fail.max_contiguous_free_run);
-        console_write_str::<P>(":caller_ra=0x");
-        write_hex_usize::<P>(fail.caller_ra);
+        console_write_str::<P>(":caller=0x");
+        write_hex_usize::<P>(fail.caller);
         console_write_str::<P>("\n");
     }
 
@@ -237,7 +238,7 @@ pub fn dump_summary<P: ConsoleIf>() {
     }
 }
 
-fn dump_process_summary<P: ConsoleIf>() {
+fn dump_process_summary<P: tx_hal::ConsoleIf>() {
     let pids = crate::process::all_pids();
     let mut live = 0usize;
     let mut zombies = 0usize;
@@ -310,13 +311,13 @@ fn proc_comm_bytes(bytes: &[u8; 16]) -> &str {
     core::str::from_utf8(&bytes[..len]).unwrap_or("?")
 }
 
-fn write_char<P: ConsoleIf>(value: char) {
+fn write_char<P: tx_hal::ConsoleIf>(value: char) {
     let mut buf = [0u8; 4];
     let s = value.encode_utf8(&mut buf);
     console_write_str::<P>(s);
 }
 
-fn write_usize<P: ConsoleIf>(value: usize) {
+fn write_usize<P: tx_hal::ConsoleIf>(value: usize) {
     let mut digits = [0u8; 20];
     let mut len = 0usize;
     let mut n = value;
@@ -336,32 +337,27 @@ fn write_usize<P: ConsoleIf>(value: usize) {
     console_write_str::<P>(core::str::from_utf8(&out[..len]).unwrap_or("?"));
 }
 
-fn write_hex_usize<P: ConsoleIf>(value: usize) {
+fn write_hex_usize<P: tx_hal::ConsoleIf>(value: usize) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut digits = [0u8; core::mem::size_of::<usize>() * 2];
+    let mut digits = [0u8; 16];
     let mut len = 0usize;
-    let mut n = value;
-    loop {
-        digits[len] = HEX[n & 0xf];
-        len += 1;
-        n >>= 4;
-        if n == 0 {
-            break;
+    let mut started = false;
+    for shift in (0..usize::BITS).step_by(4).rev() {
+        let digit = ((value >> shift) & 0xf) as usize;
+        if digit != 0 || started || shift == 0 {
+            digits[len] = HEX[digit];
+            len += 1;
+            started = true;
         }
     }
-
-    let mut out = [0u8; core::mem::size_of::<usize>() * 2];
-    for (dst, src) in out[..len].iter_mut().zip(digits[..len].iter().rev()) {
-        *dst = *src;
-    }
-    console_write_str::<P>(core::str::from_utf8(&out[..len]).unwrap_or("?"));
+    console_write_str::<P>(core::str::from_utf8(&digits[..len]).unwrap_or("?"));
 }
 
 mod smoke {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<ZoneSmokeObj>()?;
+        register_zone_for::<ZoneSmokeObj>()?;
         Ok(())
     }
 }
@@ -371,10 +367,10 @@ mod process {
     use crate::process::structure::{ProcessGroup, ProcessIdentity, ProcessPayload, Session};
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<ProcessIdentity>()?;
-        zone::register_zone_for::<ProcessPayload>()?;
-        zone::register_zone_for::<ProcessGroup>()?;
-        zone::register_zone_for::<Session>()?;
+        register_zone_for::<ProcessIdentity>()?;
+        register_zone_for::<ProcessPayload>()?;
+        register_zone_for::<ProcessGroup>()?;
+        register_zone_for::<Session>()?;
         Ok(())
     }
 }
@@ -384,8 +380,8 @@ mod thread {
     use crate::thread_runtime::structure::{ThreadIdentity, ThreadPayload};
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<ThreadIdentity>()?;
-        zone::register_zone_for::<ThreadPayload>()?;
+        register_zone_for::<ThreadIdentity>()?;
+        register_zone_for::<ThreadPayload>()?;
         Ok(())
     }
 }
@@ -395,8 +391,8 @@ mod vm {
     use crate::vm::PrivatePageSet;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<AddressSpace>()?;
-        zone::register_zone_for::<PrivatePageSet>()?;
+        register_zone_for::<AddressSpace>()?;
+        register_zone_for::<PrivatePageSet>()?;
         Ok(())
     }
 }
@@ -405,7 +401,7 @@ mod page_backed {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<PageContainer>()?;
+        register_zone_for::<PageContainer>()?;
         Ok(())
     }
 }
@@ -414,10 +410,10 @@ mod mount {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<MountIdentity>()?;
-        zone::register_zone_for::<MountPayload>()?;
-        zone::register_zone_for::<MountNamespace>()?;
-        zone::register_zone_for::<crate::mount::MountApiFile>()?;
+        register_zone_for::<MountIdentity>()?;
+        register_zone_for::<MountPayload>()?;
+        register_zone_for::<MountNamespace>()?;
+        register_zone_for::<crate::mount::MountApiFile>()?;
         Ok(())
     }
 }
@@ -426,10 +422,10 @@ mod vfs {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<DEntry>()?;
-        zone::register_zone_for::<RNode>()?;
-        zone::register_zone_for::<OpenFile>()?;
-        zone::register_zone_for::<FsNotifyInstance>()?;
+        register_zone_for::<DEntry>()?;
+        register_zone_for::<RNode>()?;
+        register_zone_for::<OpenFile>()?;
+        register_zone_for::<FsNotifyInstance>()?;
         Ok(())
     }
 }
@@ -471,7 +467,7 @@ mod cred {
     use crate::cred::Cred;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<Cred>()?;
+        register_zone_for::<Cred>()?;
         Ok(())
     }
 }
@@ -551,8 +547,7 @@ mod subject_placeholders {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<crate::adapter::step_engine::RestrictionStackHandle>()
-            .map(|_| ())?;
+        register_zone_for::<crate::adapter::step_engine::RestrictionStackHandle>().map(|_| ())?;
         Ok(())
     }
 }

@@ -3,8 +3,8 @@ use crate::execution::Errno;
 use crate::io_manager::page::{service::PageCompletionRoute, PageIoCompletion};
 use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
 use crate::page_backed::adapter::step_engine::{
-    self as step_engine, NoProgress, PageProgress as V3PageProgress, StepOutcome as V3Outcome,
-    StepOutcome as V3Out, YieldShape as V3YieldShape,
+    self as step_engine, NoProgress, PageProgress as V3PageProgress, PlaceholderProcessSubject,
+    ScriptCtx, StepOp, StepOutcome as V3Outcome, StepOutcome as V3Out, YieldShape as V3YieldShape,
 };
 use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
 use alloc::sync::Arc;
@@ -110,11 +110,10 @@ fn owned_request_submit_failure_restores_writeback_and_releases_owner() {
     let generation = {
         let mut state = pc.state.lock();
         state
-            .pages
-            .install_if_absent(page, frame)
+            .install_resident_if_absent(page, frame)
             .expect("seed cached page");
         let generation = {
-            let slot = state.file_page_slots.entry(page).or_default();
+            let slot = state.page_slots.entry(page).or_default();
             let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
                 panic!("test must own fetch generation");
             };
@@ -123,7 +122,6 @@ fn owned_request_submit_failure_restores_writeback_and_releases_owner() {
             slot.mark_dirty().expect("mark page dirty");
             slot.generation()
         };
-        state.pages.mark_dirty(page).expect("set dirty mark");
         generation
     };
     let request_id = pc.queue_file_page_writeback(page).expect("admit writeback");
@@ -137,7 +135,6 @@ fn owned_request_submit_failure_restores_writeback_and_releases_owner() {
             PageIoOp::Writeback,
         )
         .filter(|request| request.id == request_id)
-        .cloned()
         .expect("admitted writeback request");
 
     let (source, target) = pc.prepare_owned_file_io_request(&request);
@@ -150,7 +147,7 @@ fn owned_request_submit_failure_restores_writeback_and_releases_owner() {
     assert_eq!(pc.file_io_owner_count_for_test(), 0);
     assert_eq!(pc.file_io_lease_count_for_test(), 0);
     assert_eq!(
-        pc.file_page_slot_snapshot_for_test(page)
+        pc.page_slot_snapshot_for_test(page)
             .expect("writeback slot")
             .state,
         PageSlotState::Dirty { ppn }
@@ -170,7 +167,7 @@ fn owned_request_submit_failure_restores_writeback_and_releases_owner() {
     };
     assert_eq!(pc.apply_file_io_completion_route(&duplicate), None);
     assert_eq!(
-        pc.file_page_slot_snapshot_for_test(page)
+        pc.page_slot_snapshot_for_test(page)
             .expect("writeback slot")
             .state,
         PageSlotState::Dirty { ppn }
@@ -190,11 +187,10 @@ fn duplicate_writeback_completion_has_no_second_terminal_action() {
     let generation = {
         let mut state = pc.state.lock();
         state
-            .pages
-            .install_if_absent(page, frame)
+            .install_resident_if_absent(page, frame)
             .expect("seed cached page");
         let generation = {
-            let slot = state.file_page_slots.entry(page).or_default();
+            let slot = state.page_slots.entry(page).or_default();
             let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
                 panic!("test must own fetch generation");
             };
@@ -203,7 +199,6 @@ fn duplicate_writeback_completion_has_no_second_terminal_action() {
             slot.mark_dirty().expect("mark page dirty");
             slot.generation()
         };
-        state.pages.mark_dirty(page).expect("set dirty mark");
         generation
     };
     let request_id = pc.queue_file_page_writeback(page).expect("admit writeback");
@@ -217,7 +212,6 @@ fn duplicate_writeback_completion_has_no_second_terminal_action() {
             PageIoOp::Writeback,
         )
         .filter(|request| request.id == request_id)
-        .cloned()
         .expect("admitted writeback request");
     let completion = PageCompletionRoute {
         completion: PageIoCompletion::new(
@@ -234,7 +228,7 @@ fn duplicate_writeback_completion_has_no_second_terminal_action() {
     assert!(pc.apply_file_io_completion_route(&completion).is_some());
     assert_eq!(pc.file_io_owner_count_for_test(), 0);
     assert_eq!(
-        pc.file_page_slot_snapshot_for_test(page)
+        pc.page_slot_snapshot_for_test(page)
             .expect("writeback slot")
             .state,
         PageSlotState::Resident { ppn }
@@ -242,7 +236,7 @@ fn duplicate_writeback_completion_has_no_second_terminal_action() {
     assert_eq!(pc.apply_file_io_completion_route(&completion), None);
     assert_eq!(pc.file_io_owner_count_for_test(), 0);
     assert_eq!(
-        pc.file_page_slot_snapshot_for_test(page)
+        pc.page_slot_snapshot_for_test(page)
             .expect("writeback slot")
             .state,
         PageSlotState::Resident { ppn }
@@ -262,10 +256,9 @@ fn control_only_writeback_completion_cannot_settle_page_slot() {
     let generation = {
         let mut state = pc.state.lock();
         state
-            .pages
-            .install_if_absent(page, frame)
+            .install_resident_if_absent(page, frame)
             .expect("seed cached page");
-        let slot = state.file_page_slots.entry(page).or_default();
+        let slot = state.page_slots.entry(page).or_default();
         let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
             panic!("test must own fetch generation");
         };
@@ -273,11 +266,6 @@ fn control_only_writeback_completion_cannot_settle_page_slot() {
             .expect("make page resident");
         slot.mark_dirty().expect("mark page dirty");
         let writeback = slot.begin_writeback().expect("begin writeback");
-        state.pages.mark_dirty(page).expect("set dirty mark");
-        state
-            .pages
-            .set_mark(page, PageCacheMark::Writeback)
-            .expect("set writeback mark");
         writeback.generation
     };
     let request = PageIoRequest::new(
@@ -289,10 +277,9 @@ fn control_only_writeback_completion_cannot_settle_page_slot() {
         PageIoFlags::WRITEBACK,
         Some(generation),
     );
-    pc.state
-        .lock()
-        .owned_file_requests
-        .insert(request.id, OwnedFileIoRequest::control(request.clone()));
+    assert!(pc
+        .page_submission
+        .admit_file_request(OwnedFileIoRequest::control(request.clone())));
     let completion = PageCompletionRoute {
         completion: PageIoCompletion::new(
             request.id,
@@ -308,7 +295,7 @@ fn control_only_writeback_completion_cannot_settle_page_slot() {
     assert_eq!(pc.apply_file_io_completion_route(&completion), None);
     assert_eq!(pc.file_io_owner_count_for_test(), 0);
     assert_eq!(
-        pc.file_page_slot_snapshot_for_test(page)
+        pc.page_slot_snapshot_for_test(page)
             .expect("writeback slot")
             .state,
         PageSlotState::Writeback {
@@ -334,11 +321,10 @@ fn stale_writeback_completion_consumes_owner_without_mutating_slot() {
     let generation = {
         let mut state = pc.state.lock();
         state
-            .pages
-            .install_if_absent(page, frame)
+            .install_resident_if_absent(page, frame)
             .expect("seed cached page");
         let generation = {
-            let slot = state.file_page_slots.entry(page).or_default();
+            let slot = state.page_slots.entry(page).or_default();
             let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
                 panic!("test must own fetch generation");
             };
@@ -347,7 +333,6 @@ fn stale_writeback_completion_consumes_owner_without_mutating_slot() {
             slot.mark_dirty().expect("mark page dirty");
             slot.generation()
         };
-        state.pages.mark_dirty(page).expect("set dirty mark");
         generation
     };
     let request_id = pc.queue_file_page_writeback(page).expect("admit writeback");
@@ -361,7 +346,6 @@ fn stale_writeback_completion_consumes_owner_without_mutating_slot() {
             PageIoOp::Writeback,
         )
         .filter(|request| request.id == request_id)
-        .cloned()
         .expect("admitted writeback request");
     let stale = PageCompletionRoute {
         completion: PageIoCompletion::new(
@@ -382,7 +366,7 @@ fn stale_writeback_completion_consumes_owner_without_mutating_slot() {
     assert_eq!(pc.file_io_owner_count_for_test(), 0);
     assert_eq!(pc.file_io_lease_count_for_test(), 0);
     assert_eq!(
-        pc.file_page_slot_snapshot_for_test(page)
+        pc.page_slot_snapshot_for_test(page)
             .expect("writeback slot")
             .state,
         PageSlotState::Writeback {
@@ -407,11 +391,9 @@ fn pagebacked_step_truncate_withdraws_pages_at_or_beyond_new_size() {
         4,
     );
     for page in 0..4 {
-        pc.state
-            .lock()
-            .pages
-            .install_if_absent(PageIndex::new(page), cached_frame_for_test())
-            .expect("seed page");
+        assert!(pc
+            .install_resident_if_absent_published(PageIndex::new(page), cached_frame_for_test())
+            .expect("publish page"));
     }
 
     assert_eq!(
@@ -459,11 +441,9 @@ fn pagebacked_step_truncate_asks_file_backing_before_withdrawal() {
     let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::new());
     let pc = file_page_container(fs.clone(), FsObjectId::new(44));
-    pc.state
-        .lock()
-        .pages
-        .install_if_absent(PageIndex::new(3), cached_frame_for_test())
-        .expect("seed page");
+    assert!(pc
+        .install_resident_if_absent_published(PageIndex::new(3), cached_frame_for_test())
+        .expect("publish page"));
 
     assert_eq!(
         step_truncate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
@@ -480,6 +460,60 @@ fn pagebacked_step_truncate_asks_file_backing_before_withdrawal() {
 }
 
 #[test]
+fn pagebacked_truncate_op_retries_only_commit_after_root_backpressure() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let fs = Arc::new(LifecycleFs::new());
+    let pc = file_page_container(fs.clone(), FsObjectId::new(0x4a));
+    let page = PageIndex::new(3);
+    assert!(pc
+        .install_resident_if_absent_published(page, cached_frame_for_test())
+        .expect("publish page"));
+    let original_ppn = pc.lookup(page).expect("resident compatibility row");
+    let original_size = pc.size_bytes();
+    let original_slot = pc.page_slot_snapshot_for_test(page).expect("resident slot");
+    let new_size = 2 * crate::vm::USER_PAGE_SIZE as u64;
+    let mut op = TruncateOp::new(&pc, new_size);
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    PageContainer::force_resident_retire_backpressure_for_test();
+    assert_eq!(
+        op.step(&mut ctx),
+        V3Out::Continue {
+            progress: V3PageProgress::EMPTY
+        }
+    );
+    assert_eq!(fs.truncates.load(Ordering::Acquire), 1);
+    assert_eq!(pc.size_bytes(), original_size);
+    assert_eq!(pc.lookup(page), Some(original_ppn));
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(page).expect("resident slot"),
+        original_slot,
+        "batch root prepare must leave the slot unchanged on EAGAIN"
+    );
+    let guard = step_engine::guard();
+    assert_eq!(
+        pc.lookup_resident_with_guard_for_test(&guard, page)
+            .expect("old root binding")
+            .ppn(),
+        original_ppn,
+        "batch root prepare must leave the published root unchanged on EAGAIN"
+    );
+    drop(guard);
+
+    assert_eq!(op.step(&mut ctx), V3Out::Done(()));
+    assert_eq!(
+        fs.truncates.load(Ordering::Acquire),
+        1,
+        "commit retry must not replay the completed filesystem truncate"
+    );
+    assert_eq!(pc.size_bytes(), new_size);
+    assert_eq!(pc.lookup(page), None);
+}
+
+#[test]
 fn pagebacked_step_truncate_leaves_state_unchanged_when_file_backing_fails() {
     let _lock = EPOCH_TEST_LOCK
         .lock()
@@ -488,11 +522,9 @@ fn pagebacked_step_truncate_leaves_state_unchanged_when_file_backing_fails() {
     let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::failing_truncate(Errno::EROFS));
     let pc = file_page_container(fs.clone(), FsObjectId::new(45));
-    pc.state
-        .lock()
-        .pages
-        .install_if_absent(PageIndex::new(3), cached_frame_for_test())
-        .expect("seed page");
+    assert!(pc
+        .install_resident_if_absent_published(PageIndex::new(3), cached_frame_for_test())
+        .expect("publish page"));
     let original_size = pc.size_bytes();
 
     assert_eq!(
@@ -547,13 +579,20 @@ fn pagebacked_step_fsync_flushes_dirty_file_pages_in_order_and_cleans_marks() {
     let pc = file_page_container(fs.clone(), FsObjectId::new(51));
     for page in [2, 0] {
         let mut state = pc.state.lock();
+        let page = PageIndex::new(page);
+        let frame = cached_frame_for_test();
+        let ppn = frame.ppn;
         state
-            .pages
-            .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+            .install_resident_if_absent(page, frame)
             .expect("seed page");
         state
-            .pages
-            .mark_dirty(PageIndex::new(page))
+            .ensure_resident_page_slot(page, ppn)
+            .expect("install resident slot");
+        state
+            .page_slots
+            .get(&page)
+            .expect("resident slot")
+            .mark_dirty()
             .expect("mark dirty");
     }
 
@@ -581,13 +620,20 @@ fn pagebacked_step_fsync_returns_advanced_then_blocked_after_flush_progress() {
     let pc = file_page_container(fs.clone(), FsObjectId::new(52));
     for page in 0..2 {
         let mut state = pc.state.lock();
+        let page = PageIndex::new(page);
+        let frame = cached_frame_for_test();
+        let ppn = frame.ppn;
         state
-            .pages
-            .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+            .install_resident_if_absent(page, frame)
             .expect("seed page");
         state
-            .pages
-            .mark_dirty(PageIndex::new(page))
+            .ensure_resident_page_slot(page, ppn)
+            .expect("install resident slot");
+        state
+            .page_slots
+            .get(&page)
+            .expect("resident slot")
+            .mark_dirty()
             .expect("mark dirty");
     }
 
@@ -643,11 +689,9 @@ fn pagebacked_step_truncate_zeros_partial_eof_tail_in_cached_page() {
         4,
     );
     for page in 0..4 {
-        pc.state
-            .lock()
-            .pages
-            .install_if_absent(PageIndex::new(page), cached_frame_for_test())
-            .expect("seed page");
+        assert!(pc
+            .install_resident_if_absent_published(PageIndex::new(page), cached_frame_for_test())
+            .expect("publish page"));
     }
     let ppn_page1 = pc.lookup(PageIndex::new(1)).expect("page 1 cached");
 
@@ -685,11 +729,9 @@ fn pagebacked_step_truncate_does_not_touch_surviving_pages_at_page_aligned_shrin
         4,
     );
     for page in 0..4 {
-        pc.state
-            .lock()
-            .pages
-            .install_if_absent(PageIndex::new(page), cached_frame_for_test())
-            .expect("seed page");
+        assert!(pc
+            .install_resident_if_absent_published(PageIndex::new(page), cached_frame_for_test())
+            .expect("publish page"));
     }
     let ppn_page0 = pc.lookup(PageIndex::new(0)).expect("page 0 cached");
     let pattern = alloc::vec![0xAFu8; crate::vm::USER_PAGE_SIZE];

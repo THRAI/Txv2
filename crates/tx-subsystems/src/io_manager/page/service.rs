@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use crate::execution::{Errno, Guard};
 use crate::fs_iface::{IoDataSource, IoDataTarget};
+use crate::io_manager::backend::graph::BackendGraphStage;
 use crate::io_manager::backend::{
     dispatch_backend_plan, plan_backend_request, BackendBioCompletion, BackendBioGraph,
     BackendBioNodeId, BackendDispatch, BackendGraphAdvance, BackendGraphScheduler,
@@ -19,7 +20,8 @@ use crate::io_manager::block::{
 };
 use crate::io_manager::page::{
     PageContainerKey, PageIoCompletion, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
-    PageIoRequest, PageIoRequestId, PageQueueError, PageRequestQueue,
+    PageIoRequest, PageIoRequestId, PageL6Action, PageL6ActionId, PageL6Receipt,
+    PageL6SubmitFailure, PageQueueError, PageRequestQueue,
 };
 use crate::io_manager::runtime::{IoServiceKind, QueueDepth, ServiceBudget, ServiceKick};
 
@@ -108,6 +110,7 @@ pub enum PageServiceBackendSubmitError {
     BlockQueue(QueueError),
     Graph(BackendGraphSchedulerError),
     DuplicateGraph(PageIoRequestId),
+    UnknownL6Action(PageL6ActionId),
 }
 
 impl From<QueueError> for PageServiceBackendSubmitError {
@@ -151,6 +154,24 @@ pub struct PageServiceBlockCompletionOutcome {
     pub queued: usize,
     pub wake: Option<PageServiceWake>,
     pub block_submitted: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PageServiceBlockCompletionPrepared {
+    pub(crate) outcome: PageServiceBlockCompletionOutcome,
+    pub(crate) actions: Vec<PageL6Action>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PageServiceBackendPrepared {
+    Local(PageServiceBackendSubmitOutcome),
+    Submit(PageL6Action),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PageServiceL6Applied {
+    pub(crate) outcome: PageServiceBackendSubmitOutcome,
+    pub(crate) failure: Option<PageL6SubmitFailure>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,10 +330,8 @@ impl PageServiceDriver {
                         };
                         let dispatch = dispatch_backend_plan(plan);
                         let outcome = service.consume_backend_dispatch(dispatch);
-                        let page_request = request.clone();
                         match service.queue_backend_outcome(outcome, block_queue, request) {
                             Ok(outcome) => {
-                                register_metadata_outcome(service, page_request, &outcome);
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                             }
                             Err(error) => {
@@ -330,10 +349,8 @@ impl PageServiceDriver {
                         };
                         let dispatch = dispatch_backend_plan(plan);
                         let outcome = service.consume_backend_dispatch(dispatch);
-                        let original_page_request = page_request.clone();
                         match service.queue_backend_outcome(outcome, block_queue, page_request) {
                             Ok(outcome) => {
-                                register_metadata_outcome(service, original_page_request, &outcome);
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                             }
                             Err(error) => {
@@ -368,6 +385,8 @@ pub struct PageService {
     backend_resumes: VecDeque<(PageIoRequest, BackendPlanResume)>,
     metadata: BTreeMap<BlockRequestId, Vec<MetadataContinuation>>,
     graphs: BTreeMap<PageIoRequestId, BackendGraphExecution>,
+    pending_l6: BTreeMap<PageL6ActionId, PendingPageL6>,
+    next_l6_action: u64,
     waiters: BTreeMap<PageIoRequestId, Vec<PageWaiter>>,
     next: PageServiceNext,
 }
@@ -387,6 +406,24 @@ struct BackendGraphExecution {
     scheduler: BackendGraphScheduler,
 }
 
+#[derive(Debug)]
+enum PendingPageL6 {
+    PageBios {
+        request: PageIoRequest,
+        expected: usize,
+    },
+    MetadataFirst {
+        page_request: PageIoRequest,
+        backend_request: BackendPageRequest,
+        resume: PagerResumeToken,
+        expected: usize,
+    },
+    GraphReady {
+        graph: PageIoRequestId,
+        nodes: Vec<BackendBioNodeId>,
+    },
+}
+
 impl PageService {
     pub fn new(max_pending_submissions: usize) -> Self {
         Self {
@@ -395,6 +432,8 @@ impl PageService {
             backend_resumes: VecDeque::new(),
             metadata: BTreeMap::new(),
             graphs: BTreeMap::new(),
+            pending_l6: BTreeMap::new(),
+            next_l6_action: 1,
             waiters: BTreeMap::new(),
             next: PageServiceNext::Sleeping,
         }
@@ -495,12 +534,29 @@ impl PageService {
         &mut self,
         tracker: &mut BlockPageRequestTracker,
         completion: BlockCompletion,
-        mut frame_for: F,
+        frame_for: F,
     ) -> Result<PageServiceBlockCompletionOutcome, PageServiceBlockCompletionError>
     where
         F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
     {
         let completions = tracker.complete(completion)?;
+        self.push_block_page_completions(completions, frame_for)
+            .map_err(PageServiceBlockCompletionError::from)
+    }
+
+    /// Route page completions already removed from the owning L6 tracker.
+    ///
+    /// L4 converts these opaque routes into page completion work, but never
+    /// retains a second page-request tracker. That makes a consumed L6 route
+    /// incapable of being replayed against a later page request.
+    fn push_block_page_completions<F>(
+        &mut self,
+        completions: Vec<BlockPageCompletion>,
+        mut frame_for: F,
+    ) -> Result<PageServiceBlockCompletionOutcome, BlockPageCompletionError>
+    where
+        F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
+    {
         let mut entries = Vec::new();
         for completion in completions {
             let completion = match frame_for(&completion) {
@@ -585,7 +641,87 @@ impl PageService {
     where
         F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
     {
-        let graph = self.complete_graph_block(&completion, block_queue)?;
+        let mut prepared = self.prepare_completed_block_completion_with_graphs(
+            tracker,
+            completion,
+            allow_external_completion,
+            frame_for,
+        )?;
+        for action in prepared.actions {
+            let receipt = submit_l6_action_to_queue(action, block_queue);
+            prepared.outcome.block_submitted += receipt.submitted.len();
+            let applied = self
+                .apply_l6_receipt(receipt)
+                .map_err(backend_submit_error_to_tagged)?;
+            if let PageServiceBackendSubmitOutcome::QueuedPageCompletions { queued, wake } =
+                applied.outcome
+            {
+                prepared.outcome.queued += queued;
+                prepared.outcome.wake = merge_page_wake(prepared.outcome.wake, wake);
+            }
+            if let Some(failure) = applied.failure {
+                return Err(PageServiceTaggedBlockCompletionError::Graph(
+                    BackendGraphSchedulerError::Queue(failure.error),
+                ));
+            }
+        }
+        Ok(prepared.outcome)
+    }
+
+    /// Complete L4 graph and metadata state using routes that L6 removed
+    /// together with the completed tag. L4 must not reconstruct those routes
+    /// from its own tracker.
+    pub(crate) fn prepare_block_completion_routes<F>(
+        &mut self,
+        completion: BlockCompletion,
+        page_routes: Vec<BlockPageCompletion>,
+        allow_external_completion: bool,
+        frame_for: F,
+    ) -> Result<PageServiceBlockCompletionPrepared, PageServiceTaggedBlockCompletionError>
+    where
+        F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
+    {
+        let graph = self.complete_graph_block(&completion)?;
+        let (metadata_handled, metadata_wake) =
+            self.complete_metadata_block(completion.id, completion.result);
+        let graph_handled = graph.is_some();
+        if page_routes.is_empty()
+            && !metadata_handled
+            && !graph_handled
+            && !allow_external_completion
+        {
+            return Err(PageServiceBlockCompletionError::Tracker(
+                BlockPageRequestTrackerError::UnknownBlockRequest(completion.id),
+            )
+            .into());
+        }
+
+        let mut outcome = self
+            .push_block_page_completions(page_routes, frame_for)
+            .map_err(PageServiceBlockCompletionError::from)?;
+        let actions = if let Some((queued, graph_wake, actions)) = graph {
+            outcome.queued += queued;
+            outcome.wake =
+                merge_page_wake(merge_page_wake(metadata_wake, graph_wake), outcome.wake);
+            actions
+        } else {
+            outcome.wake = merge_page_wake(metadata_wake, outcome.wake);
+            Vec::new()
+        };
+        Ok(PageServiceBlockCompletionPrepared { outcome, actions })
+    }
+
+    pub(crate) fn prepare_completed_block_completion_with_graphs<F>(
+        &mut self,
+        tracker: &mut BlockPageRequestTracker,
+        completion: BlockCompletion,
+        allow_external_completion: bool,
+        frame_for: F,
+    ) -> Result<PageServiceBlockCompletionPrepared, PageServiceTaggedBlockCompletionError>
+    where
+        F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
+    {
+        let graph = self.complete_graph_block(&completion)?;
         let (metadata_handled, metadata_wake) =
             self.complete_metadata_block(completion.id, completion.result);
         let tracked = tracker.contains(completion.id);
@@ -596,29 +732,36 @@ impl PageService {
                 )
                 .into());
             }
-            let (queued, graph_wake, block_submitted) = graph.unwrap_or((0, None, 0));
-            return Ok(PageServiceBlockCompletionOutcome {
-                queued,
-                wake: metadata_wake.or(graph_wake),
-                block_submitted,
+            let (queued, graph_wake, actions) = graph.unwrap_or((0, None, Vec::new()));
+            return Ok(PageServiceBlockCompletionPrepared {
+                outcome: PageServiceBlockCompletionOutcome {
+                    queued,
+                    wake: merge_page_wake(metadata_wake, graph_wake),
+                    block_submitted: 0,
+                },
+                actions,
             });
         }
         let mut outcome = self.push_tracked_block_completion(tracker, completion, frame_for)?;
-        if let Some((queued, graph_wake, block_submitted)) = graph {
+        let actions = if let Some((queued, graph_wake, actions)) = graph {
             outcome.queued += queued;
-            outcome.wake = metadata_wake.or(graph_wake).or(outcome.wake);
-            outcome.block_submitted = block_submitted;
+            outcome.wake =
+                merge_page_wake(merge_page_wake(metadata_wake, graph_wake), outcome.wake);
+            actions
         } else {
-            outcome.wake = metadata_wake.or(outcome.wake);
-        }
-        Ok(outcome)
+            outcome.wake = merge_page_wake(metadata_wake, outcome.wake);
+            Vec::new()
+        };
+        Ok(PageServiceBlockCompletionPrepared { outcome, actions })
     }
 
     fn complete_graph_block(
         &mut self,
         completion: &BlockCompletion,
-        block_queue: &mut BlockQueue,
-    ) -> Result<Option<(usize, Option<PageServiceWake>, usize)>, BackendGraphSchedulerError> {
+    ) -> Result<
+        Option<(usize, Option<PageServiceWake>, Vec<PageL6Action>)>,
+        BackendGraphSchedulerError,
+    > {
         let graph_ids = self
             .graphs
             .iter()
@@ -635,19 +778,28 @@ impl PageService {
 
         let mut queued = 0usize;
         let mut wake = None;
-        let mut block_submitted = 0usize;
+        let mut actions = Vec::new();
         for graph_id in graph_ids {
-            let advance = self
+            let stage = self
                 .graphs
                 .get_mut(&graph_id)
                 .expect("graph id came from the registry")
                 .scheduler
-                .complete(completion.id, completion.result, block_queue)?;
-            match advance {
-                BackendGraphAdvance::Pending { submitted } => {
-                    block_submitted += submitted.len();
+                .complete(completion.id, completion.result)?;
+            match stage {
+                BackendGraphStage::Ready { nodes, bios } => {
+                    let id = self.allocate_l6_action();
+                    self.pending_l6.insert(
+                        id,
+                        PendingPageL6::GraphReady {
+                            graph: graph_id,
+                            nodes,
+                        },
+                    );
+                    actions.push(PageL6Action::GraphReady { id, bios });
                 }
-                BackendGraphAdvance::Complete(result) => {
+                BackendGraphStage::Waiting => {}
+                BackendGraphStage::Complete(result) => {
                     let execution = self
                         .graphs
                         .remove(&graph_id)
@@ -667,7 +819,7 @@ impl PageService {
                 }
             }
         }
-        Ok(Some((queued, wake, block_submitted)))
+        Ok(Some((queued, wake, actions)))
     }
 
     pub fn register_metadata_continuation(
@@ -826,6 +978,193 @@ impl PageService {
         }
     }
 
+    pub(crate) fn prepare_backend_outcome(
+        &mut self,
+        outcome: PageServiceBackendOutcome,
+        request: PageIoRequest,
+    ) -> Result<PageServiceBackendPrepared, PageServiceBackendSubmitError> {
+        match outcome {
+            PageServiceBackendOutcome::QueuedPageCompletions { queued, wake } => {
+                Ok(PageServiceBackendPrepared::Local(
+                    PageServiceBackendSubmitOutcome::QueuedPageCompletions { queued, wake },
+                ))
+            }
+            PageServiceBackendOutcome::BlockBios(bios) => {
+                let expected = bios.as_slice().len();
+                let id = self.allocate_l6_action();
+                self.pending_l6
+                    .insert(id, PendingPageL6::PageBios { request, expected });
+                Ok(PageServiceBackendPrepared::Submit(PageL6Action::PageBios {
+                    id,
+                    bios,
+                }))
+            }
+            PageServiceBackendOutcome::MetadataFirst {
+                request: backend_request,
+                bios,
+                resume,
+            } => {
+                let expected = bios.as_slice().len();
+                let id = self.allocate_l6_action();
+                self.pending_l6.insert(
+                    id,
+                    PendingPageL6::MetadataFirst {
+                        page_request: request,
+                        backend_request,
+                        resume,
+                        expected,
+                    },
+                );
+                Ok(PageServiceBackendPrepared::Submit(
+                    PageL6Action::MetadataFirst { id, bios },
+                ))
+            }
+            PageServiceBackendOutcome::BlockGraph(graph) => {
+                if self.graphs.contains_key(&request.id) {
+                    return Err(PageServiceBackendSubmitError::DuplicateGraph(request.id));
+                }
+                let mut scheduler = BackendGraphScheduler::new(graph);
+                match scheduler.stage_ready() {
+                    BackendGraphStage::Ready { nodes, bios } => {
+                        let graph = request.id;
+                        self.graphs
+                            .insert(graph, BackendGraphExecution { request, scheduler });
+                        let id = self.allocate_l6_action();
+                        self.pending_l6
+                            .insert(id, PendingPageL6::GraphReady { graph, nodes });
+                        Ok(PageServiceBackendPrepared::Submit(
+                            PageL6Action::GraphReady { id, bios },
+                        ))
+                    }
+                    BackendGraphStage::Waiting => {
+                        self.graphs.insert(
+                            request.id,
+                            BackendGraphExecution {
+                                request: request.clone(),
+                                scheduler,
+                            },
+                        );
+                        Ok(PageServiceBackendPrepared::Local(
+                            PageServiceBackendSubmitOutcome::BlockGraphQueued {
+                                request,
+                                submitted: Vec::new(),
+                            },
+                        ))
+                    }
+                    BackendGraphStage::Complete(result) => {
+                        let wake = self.queue_graph_terminal_completion(request, result);
+                        Ok(PageServiceBackendPrepared::Local(
+                            PageServiceBackendSubmitOutcome::QueuedPageCompletions {
+                                queued: 1,
+                                wake: Some(wake),
+                            },
+                        ))
+                    }
+                }
+            }
+            PageServiceBackendOutcome::Yield(wait) => Ok(PageServiceBackendPrepared::Local(
+                PageServiceBackendSubmitOutcome::Yield(wait),
+            )),
+            PageServiceBackendOutcome::Err(errno) => Ok(PageServiceBackendPrepared::Local(
+                PageServiceBackendSubmitOutcome::Err(errno),
+            )),
+        }
+    }
+
+    pub(crate) fn apply_l6_receipt(
+        &mut self,
+        receipt: PageL6Receipt,
+    ) -> Result<PageServiceL6Applied, PageServiceBackendSubmitError> {
+        let Some(pending) = self.pending_l6.get(&receipt.id) else {
+            return Err(PageServiceBackendSubmitError::UnknownL6Action(receipt.id));
+        };
+        let expected = match pending {
+            PendingPageL6::PageBios { expected, .. }
+            | PendingPageL6::MetadataFirst { expected, .. } => *expected,
+            PendingPageL6::GraphReady { nodes, .. } => nodes.len(),
+        };
+        if receipt.submitted.len() > expected
+            || receipt
+                .failure
+                .is_some_and(|failure| failure.failed_index != receipt.submitted.len())
+            || (receipt.failure.is_none() && receipt.submitted.len() != expected)
+        {
+            return Err(PageServiceBackendSubmitError::Graph(
+                BackendGraphSchedulerError::InvalidSubmissionReceipt,
+            ));
+        }
+
+        let pending = self
+            .pending_l6
+            .remove(&receipt.id)
+            .expect("pending action validated above");
+        let failure = receipt.failure;
+        let outcome = match pending {
+            PendingPageL6::PageBios { request, .. } => {
+                PageServiceBackendSubmitOutcome::BlockBiosQueued {
+                    request,
+                    submitted: receipt.submitted,
+                }
+            }
+            PendingPageL6::MetadataFirst {
+                page_request,
+                backend_request,
+                resume,
+                ..
+            } => {
+                self.register_metadata_submission(
+                    page_request.clone(),
+                    backend_request.clone(),
+                    resume,
+                    &receipt.submitted,
+                );
+                PageServiceBackendSubmitOutcome::MetadataFirstQueued {
+                    request: page_request,
+                    backend_request,
+                    submitted: receipt.submitted,
+                    resume,
+                }
+            }
+            PendingPageL6::GraphReady { graph, nodes } => {
+                let execution = self
+                    .graphs
+                    .get_mut(&graph)
+                    .expect("pending graph action retains its execution");
+                let failure_errno = failure.map(|failure| queue_error_errno(failure.error));
+                match execution.scheduler.apply_submission_receipt(
+                    &nodes,
+                    &receipt.submitted,
+                    failure_errno,
+                )? {
+                    BackendGraphAdvance::Pending { submitted } => {
+                        PageServiceBackendSubmitOutcome::BlockGraphQueued {
+                            request: execution.request.clone(),
+                            submitted,
+                        }
+                    }
+                    BackendGraphAdvance::Complete(result) => {
+                        let execution = self
+                            .graphs
+                            .remove(&graph)
+                            .expect("terminal graph remains registered");
+                        let wake = self.queue_graph_terminal_completion(execution.request, result);
+                        PageServiceBackendSubmitOutcome::QueuedPageCompletions {
+                            queued: 1,
+                            wake: Some(wake),
+                        }
+                    }
+                }
+            }
+        };
+        Ok(PageServiceL6Applied { outcome, failure })
+    }
+
+    fn allocate_l6_action(&mut self) -> PageL6ActionId {
+        let id = PageL6ActionId::new(self.next_l6_action);
+        self.next_l6_action = self.next_l6_action.wrapping_add(1).max(1);
+        id
+    }
+
     pub fn consume_backend_submission<P>(
         &mut self,
         object: FsObjectKey,
@@ -849,30 +1188,15 @@ impl PageService {
         block_queue: &mut BlockQueue,
         request: PageIoRequest,
     ) -> Result<PageServiceBackendSubmitOutcome, PageServiceBackendSubmitError> {
-        let PageServiceBackendOutcome::BlockGraph(graph) = outcome else {
-            return queue_backend_outcome(outcome, block_queue, request);
-        };
-        if self.graphs.contains_key(&request.id) {
-            return Err(PageServiceBackendSubmitError::DuplicateGraph(request.id));
-        }
-        let mut scheduler = BackendGraphScheduler::new(graph);
-        match scheduler.start(block_queue)? {
-            BackendGraphAdvance::Pending { submitted } => {
-                self.graphs.insert(
-                    request.id,
-                    BackendGraphExecution {
-                        request: request.clone(),
-                        scheduler,
-                    },
-                );
-                Ok(PageServiceBackendSubmitOutcome::BlockGraphQueued { request, submitted })
-            }
-            BackendGraphAdvance::Complete(result) => {
-                let wake = self.queue_graph_terminal_completion(request, result);
-                Ok(PageServiceBackendSubmitOutcome::QueuedPageCompletions {
-                    queued: 1,
-                    wake: Some(wake),
-                })
+        match self.prepare_backend_outcome(outcome, request)? {
+            PageServiceBackendPrepared::Local(outcome) => Ok(outcome),
+            PageServiceBackendPrepared::Submit(action) => {
+                let receipt = submit_l6_action_to_queue(action, block_queue);
+                let applied = self.apply_l6_receipt(receipt)?;
+                match applied.failure {
+                    Some(failure) => Err(PageServiceBackendSubmitError::BlockQueue(failure.error)),
+                    None => Ok(applied.outcome),
+                }
             }
         }
     }
@@ -1034,68 +1358,66 @@ impl PageService {
     }
 }
 
-fn queue_bio_plans(
-    block_queue: &mut BlockQueue,
-    bios: BioPlanList,
-) -> Result<Vec<SubmitOutcome>, PageServiceBackendSubmitError> {
+fn submit_l6_action_to_queue(action: PageL6Action, block_queue: &mut BlockQueue) -> PageL6Receipt {
+    let id = action.id();
     let mut submitted = Vec::new();
-    for bio in bios.into_vec() {
-        submitted.push(block_queue.submit(bio)?);
+    let mut failure = None;
+    for (index, bio) in action.into_bios().into_vec().into_iter().enumerate() {
+        match block_queue.submit(bio) {
+            Ok(outcome) => submitted.push(outcome),
+            Err(error) => {
+                failure = Some(PageL6SubmitFailure {
+                    failed_index: index,
+                    error,
+                });
+                break;
+            }
+        }
     }
-    Ok(submitted)
-}
-
-fn queue_backend_outcome(
-    outcome: PageServiceBackendOutcome,
-    block_queue: &mut BlockQueue,
-    request: PageIoRequest,
-) -> Result<PageServiceBackendSubmitOutcome, PageServiceBackendSubmitError> {
-    match outcome {
-        PageServiceBackendOutcome::QueuedPageCompletions { queued, wake } => {
-            Ok(PageServiceBackendSubmitOutcome::QueuedPageCompletions { queued, wake })
-        }
-        PageServiceBackendOutcome::BlockBios(bios) => {
-            Ok(PageServiceBackendSubmitOutcome::BlockBiosQueued {
-                request,
-                submitted: queue_bio_plans(block_queue, bios)?,
-            })
-        }
-        PageServiceBackendOutcome::BlockGraph(_) => {
-            Ok(PageServiceBackendSubmitOutcome::Err(Errno::ENOSYS))
-        }
-        PageServiceBackendOutcome::MetadataFirst {
-            request: backend_request,
-            bios,
-            resume,
-        } => Ok(PageServiceBackendSubmitOutcome::MetadataFirstQueued {
-            request,
-            backend_request,
-            submitted: queue_bio_plans(block_queue, bios)?,
-            resume,
-        }),
-        PageServiceBackendOutcome::Yield(wait) => Ok(PageServiceBackendSubmitOutcome::Yield(wait)),
-        PageServiceBackendOutcome::Err(errno) => Ok(PageServiceBackendSubmitOutcome::Err(errno)),
-    }
-}
-
-fn register_metadata_outcome(
-    service: &mut PageService,
-    page_request: PageIoRequest,
-    outcome: &PageServiceBackendSubmitOutcome,
-) {
-    if let PageServiceBackendSubmitOutcome::MetadataFirstQueued {
-        backend_request,
+    PageL6Receipt {
+        id,
         submitted,
-        resume,
-        ..
-    } = outcome
-    {
-        service.register_metadata_submission(
-            page_request,
-            backend_request.clone(),
-            *resume,
-            submitted,
-        );
+        failure,
+    }
+}
+
+const fn queue_error_errno(error: QueueError) -> Errno {
+    match error {
+        QueueError::EmptyRange => Errno::EINVAL,
+        QueueError::Full | QueueError::DispatchDepthFull => Errno::EAGAIN,
+    }
+}
+
+const fn merge_page_wake(
+    left: Option<PageServiceWake>,
+    right: Option<PageServiceWake>,
+) -> Option<PageServiceWake> {
+    match (left, right) {
+        (Some(PageServiceWake::Wake), _) | (_, Some(PageServiceWake::Wake)) => {
+            Some(PageServiceWake::Wake)
+        }
+        (Some(PageServiceWake::AlreadyRunnable), _)
+        | (_, Some(PageServiceWake::AlreadyRunnable)) => Some(PageServiceWake::AlreadyRunnable),
+        (None, None) => None,
+    }
+}
+
+const fn backend_submit_error_to_tagged(
+    error: PageServiceBackendSubmitError,
+) -> PageServiceTaggedBlockCompletionError {
+    match error {
+        PageServiceBackendSubmitError::Graph(error) => {
+            PageServiceTaggedBlockCompletionError::Graph(error)
+        }
+        PageServiceBackendSubmitError::BlockQueue(error) => {
+            PageServiceTaggedBlockCompletionError::Graph(BackendGraphSchedulerError::Queue(error))
+        }
+        PageServiceBackendSubmitError::DuplicateGraph(_)
+        | PageServiceBackendSubmitError::UnknownL6Action(_) => {
+            PageServiceTaggedBlockCompletionError::Graph(
+                BackendGraphSchedulerError::InvalidSubmissionReceipt,
+            )
+        }
     }
 }
 
@@ -1843,6 +2165,237 @@ mod tests {
             PageServiceBackendOutcome::BlockBios(BioPlanList::from_vec(alloc::vec![bio]))
         );
         assert!(!service.has_work());
+    }
+
+    #[test]
+    fn page_service_l6_receipt_preserves_partial_admission_routes() {
+        let mut service = PageService::new(4);
+        let request = submission_request(PageIoRequestId::new(79));
+        let prepared = service
+            .prepare_backend_outcome(
+                PageServiceBackendOutcome::BlockBios(BioPlanList::from_vec(alloc::vec![
+                    read_bio(),
+                    graph_bio(48, 2),
+                ])),
+                request.clone(),
+            )
+            .expect("prepare L6 action");
+        let PageServiceBackendPrepared::Submit(action) = prepared else {
+            panic!("BIO plans must leave L4 as an immutable action");
+        };
+        assert!(matches!(&action, PageL6Action::PageBios { .. }));
+        assert_eq!(action.bios().as_slice().len(), 2);
+
+        let accepted = SubmitOutcome::Queued(BlockRequestId::new(201));
+        let applied = service
+            .apply_l6_receipt(PageL6Receipt {
+                id: action.id(),
+                submitted: alloc::vec![accepted],
+                failure: Some(PageL6SubmitFailure {
+                    failed_index: 1,
+                    error: QueueError::Full,
+                }),
+            })
+            .expect("apply partial receipt");
+
+        assert_eq!(
+            applied.failure,
+            Some(PageL6SubmitFailure {
+                failed_index: 1,
+                error: QueueError::Full,
+            })
+        );
+        assert!(matches!(
+            applied.outcome,
+            PageServiceBackendSubmitOutcome::BlockBiosQueued {
+                request: applied_request,
+                submitted,
+            } if applied_request == request && submitted == alloc::vec![accepted]
+        ));
+    }
+
+    #[test]
+    fn page_service_l6_metadata_receipt_registers_one_resume_route() {
+        let mut service = PageService::new(4);
+        let page_request = submission_request(PageIoRequestId::new(790));
+        let backend_request =
+            BackendPageRequest::from_page_io_request(FsObjectKey::new(790), page_request.clone());
+        let prepared = service
+            .prepare_backend_outcome(
+                PageServiceBackendOutcome::MetadataFirst {
+                    request: backend_request.clone(),
+                    bios: BioPlanList::from_vec(alloc::vec![read_bio()]),
+                    resume: PagerResumeToken::new(790),
+                },
+                page_request.clone(),
+            )
+            .expect("prepare metadata action");
+        let PageServiceBackendPrepared::Submit(action) = prepared else {
+            panic!("metadata dispatch must cross L6 as an action");
+        };
+
+        service
+            .apply_l6_receipt(PageL6Receipt {
+                id: action.id(),
+                submitted: alloc::vec![SubmitOutcome::Queued(BlockRequestId::new(790))],
+                failure: None,
+            })
+            .expect("accept metadata receipt");
+        service
+            .prepare_block_completion_routes(
+                BlockCompletion {
+                    tag: BlockTag::new(790),
+                    id: BlockRequestId::new(790),
+                    plan: read_bio(),
+                    result: Ok(()),
+                },
+                alloc::vec![],
+                false,
+                |_| None,
+            )
+            .expect("metadata completion must resume through L4");
+
+        match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut work) => match work.remove(0) {
+                PageServiceWork::BackendResume {
+                    page_request: resumed,
+                    resume,
+                } => {
+                    assert_eq!(resumed, page_request);
+                    assert_eq!(resume.request, Some(backend_request));
+                    assert_eq!(resume.token, PagerResumeToken::new(790));
+                    assert_eq!(resume.completions.len(), 1);
+                }
+                other => panic!("expected metadata resume, got {other:?}"),
+            },
+            other => panic!("expected one metadata resume, got {other:?}"),
+        }
+        assert_eq!(
+            service.drain_turn(ServiceBudget::new(1)),
+            PageServiceTurn::Sleep
+        );
+    }
+
+    #[test]
+    fn page_service_consumes_l6_page_routes_once_without_a_second_tracker() {
+        let mut service = PageService::new(4);
+        let request = submission_request(PageIoRequestId::new(791));
+        let completion = BlockCompletion {
+            tag: BlockTag::new(71),
+            id: BlockRequestId::new(701),
+            plan: read_bio(),
+            result: Ok(()),
+        };
+        let route = BlockPageCompletion::new(request.clone(), completion.clone());
+
+        let first = service
+            .prepare_block_completion_routes(completion.clone(), alloc::vec![route], false, |_| {
+                Some(PageFrameRef::new(tx_hal::Ppn(701)))
+            })
+            .expect("L6 route must reach L4 once");
+        assert_eq!(first.outcome.queued, 1);
+        assert!(first.actions.is_empty());
+
+        assert_eq!(
+            service.prepare_block_completion_routes(completion, alloc::vec![], false, |_| None),
+            Err(PageServiceTaggedBlockCompletionError::Page(
+                PageServiceBlockCompletionError::Tracker(
+                    BlockPageRequestTrackerError::UnknownBlockRequest(BlockRequestId::new(701))
+                )
+            ))
+        );
+        assert!(matches!(
+            service.drain_turn(ServiceBudget::new(1)),
+            PageServiceTurn::Work(work)
+                if matches!(work.as_slice(), [PageServiceWork::Completion(route)] if route.completion.id == request.id)
+        ));
+    }
+
+    #[test]
+    fn page_service_graph_completion_emits_followup_l6_action_without_queue_borrow() {
+        let mut service = PageService::new(4);
+        let request = submission_request(PageIoRequestId::new(80));
+        let prepared = service
+            .prepare_backend_outcome(
+                PageServiceBackendOutcome::BlockGraph(join_graph()),
+                request.clone(),
+            )
+            .expect("prepare graph roots");
+        let PageServiceBackendPrepared::Submit(roots) = prepared else {
+            panic!("graph roots must leave L4 as an immutable action");
+        };
+        assert_eq!(roots.bios().as_slice().len(), 2);
+        service
+            .apply_l6_receipt(PageL6Receipt {
+                id: roots.id(),
+                submitted: alloc::vec![
+                    SubmitOutcome::Queued(BlockRequestId::new(211)),
+                    SubmitOutcome::Queued(BlockRequestId::new(212)),
+                ],
+                failure: None,
+            })
+            .expect("apply graph-root receipt");
+
+        let first = service
+            .prepare_block_completion_routes(
+                BlockCompletion {
+                    tag: BlockTag::new(1),
+                    id: BlockRequestId::new(211),
+                    plan: read_bio(),
+                    result: Ok(()),
+                },
+                alloc::vec![],
+                false,
+                |_| None,
+            )
+            .expect("first root completion");
+        assert!(first.actions.is_empty());
+
+        let second = service
+            .prepare_block_completion_routes(
+                BlockCompletion {
+                    tag: BlockTag::new(2),
+                    id: BlockRequestId::new(212),
+                    plan: read_bio(),
+                    result: Ok(()),
+                },
+                alloc::vec![],
+                false,
+                |_| None,
+            )
+            .expect("second root completion");
+        assert_eq!(second.actions.len(), 1);
+        let join = second.actions.into_iter().next().expect("join action");
+        assert!(matches!(&join, PageL6Action::GraphReady { .. }));
+        assert_eq!(join.bios().as_slice().len(), 1);
+        service
+            .apply_l6_receipt(PageL6Receipt {
+                id: join.id(),
+                submitted: alloc::vec![SubmitOutcome::Queued(BlockRequestId::new(213))],
+                failure: None,
+            })
+            .expect("apply join receipt");
+
+        let terminal = service
+            .prepare_block_completion_routes(
+                BlockCompletion {
+                    tag: BlockTag::new(3),
+                    id: BlockRequestId::new(213),
+                    plan: read_bio(),
+                    result: Ok(()),
+                },
+                alloc::vec![],
+                false,
+                |_| None,
+            )
+            .expect("join completion");
+        assert_eq!(terminal.outcome.queued, 1);
+        assert!(terminal.actions.is_empty());
+        assert!(matches!(
+            service.drain_turn(ServiceBudget::new(1)),
+            PageServiceTurn::Work(work)
+                if matches!(work.as_slice(), [PageServiceWork::Completion(route)] if route.completion.id == request.id)
+        ));
     }
 
     #[test]

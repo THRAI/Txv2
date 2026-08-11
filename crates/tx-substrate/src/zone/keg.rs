@@ -88,18 +88,15 @@ impl<T: 'static> Keg<T> {
         self.empty_count.load(Ordering::Acquire)
     }
 
-    unsafe fn pop_free_slot_locked(
+    pub(crate) fn pop_free_slot(
         &self,
         zone: &'static Zone<T>,
-        allow_allocate: bool,
-    ) -> Result<Option<NonNull<Slot<T>>>, ZoneError> {
+    ) -> Result<NonNull<Slot<T>>, ZoneError> {
+        let _guard = self.lock();
         unsafe {
             // Empty slabs are reusable; allocate only when both reusable lists
             // are empty.
             if (*self.partial_head.get()).is_null() && (*self.empty_head.get()).is_null() {
-                if !allow_allocate {
-                    return Ok(None);
-                }
                 let slab = self.allocate_slab_locked(zone)?;
                 self.push_slab_locked(slab, SlabList::Empty);
             }
@@ -118,7 +115,7 @@ impl<T: 'static> Keg<T> {
                 .ok_or(ZoneError::InvalidState)?;
 
             self.relink_after_claim_locked(slab, old_list);
-            Ok(Some(slot))
+            Ok(slot)
         }
     }
 
@@ -126,43 +123,24 @@ impl<T: 'static> Keg<T> {
         self.return_slot_inner(slot, true);
     }
 
-    pub(crate) fn return_slot_from_reclaim(
-        &self,
-        slot: NonNull<Slot<T>>,
-        local_guard: &mut epoch::LocalRetireGuard,
-        generation_exhausted: bool,
-    ) {
-        let retire_candidate = {
+    pub(crate) fn return_slot_without_slab_retire(&self, slot: NonNull<Slot<T>>) {
+        // EBR reclaim callbacks use this path. They may return a slot to the
+        // Keg, but must not recursively enqueue a whole slab into EBR.
+        self.return_slot_inner(slot, false);
+    }
+
+    fn return_slot_inner(&self, slot: NonNull<Slot<T>>, allow_slab_retire: bool) {
+        if !allow_slab_retire {
             let _guard = self.lock();
             unsafe {
                 let mut slab = slot.as_ref().slab();
                 let old_list = slab.as_ref().list();
-                if generation_exhausted {
-                    slab.as_mut().mark_slot_exhausted(slot);
-                } else {
-                    slab.as_mut().return_slot(slot);
-                }
-                if slab.as_ref().is_depleted() {
-                    self.directory
-                        .unpublish(slab)
-                        .expect("linked depleted slab must be published");
-                    self.remove_slab_locked(slab, old_list);
-                    Some(slab)
-                } else {
-                    if !generation_exhausted {
-                        self.relink_after_return_locked(slab, old_list);
-                    }
-                    None
-                }
+                slab.as_mut().return_slot(slot);
+                self.relink_after_return_locked(slab, old_list);
             }
-        };
-
-        if let Some(slab) = retire_candidate {
-            self.retire_slab_with_guard(slab, local_guard);
+            return;
         }
-    }
 
-    fn return_slot_inner(&self, slot: NonNull<Slot<T>>, allow_slab_retire: bool) {
         epoch::with_local_retire_guard(|local_guard| {
             let retire_candidate = {
                 let _guard = self.lock();
@@ -170,33 +148,34 @@ impl<T: 'static> Keg<T> {
                     let mut slab = slot.as_ref().slab();
                     let old_list = slab.as_ref().list();
                     slab.as_mut().return_slot(slot);
-                    if slab.as_ref().is_depleted() {
+                    self.relink_after_return_locked(slab, old_list);
+                    if slab.as_ref().is_empty()
+                        && self.empty_count.load(Ordering::Acquire) > EMPTY_SLAB_LOW_WATER
+                    {
                         self.directory
                             .unpublish(slab)
-                            .expect("linked depleted slab must be published");
-                        self.remove_slab_locked(slab, old_list);
+                            .expect("linked empty slab must be published");
+                        self.remove_slab_locked(slab, SlabList::Empty);
                         Some(slab)
                     } else {
-                        self.relink_after_return_locked(slab, old_list);
-                        if allow_slab_retire
-                            && slab.as_ref().is_empty()
-                            && self.empty_count.load(Ordering::Acquire) > EMPTY_SLAB_LOW_WATER
-                        {
-                            self.directory
-                                .unpublish(slab)
-                                .expect("linked empty slab must be published");
-                            self.remove_slab_locked(slab, SlabList::Empty);
-                            Some(slab)
-                        } else {
-                            None
-                        }
+                        None
                     }
                 }
             };
-            let Some(slab) = retire_candidate else {
+            let Some(mut slab) = retire_candidate else {
                 return;
             };
-            self.retire_slab_with_guard(slab, local_guard);
+            let (zone, slots, head) = unsafe {
+                (
+                    slab.as_ref().zone(),
+                    slab.as_ref().slot_count(),
+                    slab.as_mut().retire_head(),
+                )
+            };
+            zone.note_released_slots(slots);
+            self.slab_count.fetch_sub(1, Ordering::AcqRel);
+            let epoch = local_guard.sample_epoch_after_barrier();
+            unsafe { local_guard.enqueue_head_after_barrier(head, epoch) };
         })
         .expect("slab return requires initialized local epoch retirement");
     }
@@ -210,26 +189,14 @@ impl<T: 'static> Keg<T> {
         zone: &'static Zone<T>,
         bucket: &mut super::bucket::ZoneBucket<T, N>,
     ) -> Result<(), ZoneError> {
-        let mut filled = 0usize;
         while !bucket.is_full() {
-            let slot = {
-                let _guard = self.lock();
-                unsafe { self.pop_free_slot_locked(zone, filled == 0)? }
-            };
-            let Some(slot) = slot else {
-                break;
-            };
+            let slot = self.pop_free_slot(zone)?;
             if bucket.push(slot).is_err() {
                 self.return_slot(slot);
                 break;
             }
-            filled += 1;
         }
-        if filled == 0 {
-            Err(ZoneError::AllocationFailed)
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     pub(crate) fn trim_empty_slabs(&self, limit: usize) -> usize {
@@ -254,10 +221,20 @@ impl<T: 'static> Keg<T> {
                         slab.take()
                     }
                 };
-                let Some(slab) = retire_candidate else {
+                let Some(mut slab) = retire_candidate else {
                     return false;
                 };
-                self.retire_slab_with_guard(slab, local_guard);
+                let (zone, slots, head) = unsafe {
+                    (
+                        slab.as_ref().zone(),
+                        slab.as_ref().slot_count(),
+                        slab.as_mut().retire_head(),
+                    )
+                };
+                zone.note_released_slots(slots);
+                self.slab_count.fetch_sub(1, Ordering::AcqRel);
+                let epoch = local_guard.sample_epoch_after_barrier();
+                unsafe { local_guard.enqueue_head_after_barrier(head, epoch) };
                 true
             })
             .expect("slab trim requires initialized local epoch retirement");
@@ -287,24 +264,6 @@ impl<T: 'static> Keg<T> {
             zone.note_allocated_slots(slab.as_ref().slot_count());
         }
         Ok(slab)
-    }
-
-    fn retire_slab_with_guard(
-        &self,
-        mut slab: NonNull<ZoneSlab<T>>,
-        local_guard: &mut epoch::LocalRetireGuard,
-    ) {
-        let (zone, slots, head) = unsafe {
-            (
-                slab.as_ref().zone(),
-                slab.as_ref().slot_count(),
-                slab.as_mut().retire_head(),
-            )
-        };
-        zone.note_released_slots(slots);
-        self.slab_count.fetch_sub(1, Ordering::AcqRel);
-        let epoch = local_guard.sample_epoch_after_barrier();
-        unsafe { local_guard.enqueue_head_after_barrier(head, epoch) };
     }
 
     unsafe fn relink_after_claim_locked(&self, slab: NonNull<ZoneSlab<T>>, old_list: SlabList) {

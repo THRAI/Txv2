@@ -4,6 +4,8 @@
 //! subsystems a place to express whether operational evidence is the identity
 //! `Cap<T>` itself or a separate payload/contribution handle.
 
+use crate::epoch::Guard;
+
 use super::{Cap, Dead, IdentRef, PayloadCap};
 
 pub trait Entity: Sized + 'static {
@@ -13,6 +15,16 @@ pub trait Entity: Sized + 'static {
     /// Upgrade identity-retaining evidence into the operational evidence shape
     /// that payload-using paths should carry across step boundaries.
     fn upgrade_operational(identity: &Cap<Self>) -> Result<Self::OperationalEvidence, Dead>;
+
+    /// Upgrade with a caller-owned epoch guard. Split entities whose payload
+    /// binding is RCU-published override this entry point to avoid opening a
+    /// second guard; other entity families retain their existing behavior.
+    fn upgrade_operational_with_guard(
+        identity: &Cap<Self>,
+        _guard: &Guard<'_>,
+    ) -> Result<Self::OperationalEvidence, Dead> {
+        Self::upgrade_operational(identity)
+    }
 
     /// Guard-scoped helper: revalidate the observation, retain identity if
     /// needed, then upgrade into operational evidence.
@@ -37,11 +49,23 @@ impl<T: CoLocatedEntity> Entity for T {
 
 pub trait OperationalCapExt<T: Entity> {
     fn upgrade_operational(&self) -> Result<T::OperationalEvidence, Dead>;
+
+    fn upgrade_operational_with_guard(
+        &self,
+        guard: &Guard<'_>,
+    ) -> Result<T::OperationalEvidence, Dead>;
 }
 
 impl<T: Entity> OperationalCapExt<T> for Cap<T> {
     fn upgrade_operational(&self) -> Result<T::OperationalEvidence, Dead> {
         T::upgrade_operational(self)
+    }
+
+    fn upgrade_operational_with_guard(
+        &self,
+        guard: &Guard<'_>,
+    ) -> Result<T::OperationalEvidence, Dead> {
+        T::upgrade_operational_with_guard(self, guard)
     }
 }
 

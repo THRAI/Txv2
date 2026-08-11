@@ -670,19 +670,12 @@ fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
 }
 
 fn queue_file_close_writeback(file: &Cap<OpenFile>) {
-    if !file.flags().write {
-        return;
-    }
     let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) else {
         return;
     };
-
-    // close(2) is not a durability fence: fsync/sync/umount still own the
-    // waitable transaction frontier and durable error reporting. This is only
-    // a same-kernel visibility flush so an immediately-following open/chmod or
-    // exec does not trip over a stale buffered-write reservation.
-    let guard = step_engine::guard();
-    let _ = pc.flush_dirty_pages_for_close_visibility(&guard);
+    // close(2) is not a durability fence; admit dirty pages to the existing
+    // PageBacked writeback service and leave ordered settlement to fsync/sync.
+    let _ = pc.queue_dirty_file_writeback();
 }
 
 fn maybe_destroy_zero_link_inode_after_fd_remove(file: &Cap<OpenFile>) {

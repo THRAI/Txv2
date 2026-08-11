@@ -32643,3 +32643,77 @@
   the converted leaf home. This preserves the ext4/JBD2 ownership sequence;
   Linux-to-Tx and Tx-to-Linux deep-shape fixtures remain required before A6 can
   close.
+- 2026-08-11 (SMP and RCU-on-VM fusion audit).
+  Audited `/Users/3y/.config/superpowers/worktrees/Tx/rcu-on-vm` against the
+  current non-PELT SMP lane. The resident-root work is a guarded immutable
+  PageContainer read path; EBR already has a Maintenance-IPI to normal-context
+  drain path, while SMP owns per-hart queues, wake routing, stealing, and WFI.
+  Fusion should happen in one per-hart normal-context progress service, keeping
+  Reschedule, Maintenance, and TlbShootdown distinct. No source code changed.
+  Next: close the scheduler wake/steal ownership linearization gap, then port
+  only the committed ResidentRoot slices. Blockers: the RCU worktree is dirty
+  across unrelated modules, its closed record is not unit-green, and drain
+  budgeting is inconsistent. See
+  `docs/progress/research/2026-08-11-smp-rcu-on-vm-fusion-audit.md`.
+
+- 2026-08-11 (SMP/RCU fusion recheck).
+  Rechecked both worktrees after the fusion audit. The current SMP checkout
+  still has no `init_vm_range_txn_hart` or `drain_local_vm_cleanup` lifecycle
+  wiring; those calls exist only in the dirty `rcu-on-vm` init/exec path. The
+  first integration step is therefore BSP/AP VM-hart initialization plus one
+  bounded normal-context maintenance service. The scheduler remains on the
+  shared-metadata ownership path, while the active SMP contract requires
+  queue-lock/current-hart recheck linearization. Verification: source-only
+  comparison with line-numbered callsites, `cargo xtask progress validate`
+  (46 records), and scoped `git diff --check` passed; no kernel/QEMU tests ran
+  and no PELT/network work was included. `cargo xtask lint docs` remains blocked
+  by the existing untracked `.io-submission-patch/` duplicate-doc tree. Next:
+  close scheduler ownership ordering, then port only the committed
+  ResidentRoot/EBR slices. Blocker: dirty/non-green RCU worktree and missing VM
+  lifecycle wiring on the SMP branch.
+
+- 2026-08-11 (SMP/RCU concurrency-boundary recheck).
+  Confirmed two scheduler linearization windows: steal changes victim queue,
+  shared owner metadata, and thief queue in separate critical sections; pick
+  changes scheduler ownership before `TaskTable` changes `Runnable` to
+  `Polling`. A concurrent wake or affinity move can therefore observe a mixed
+  physical/logical owner state. Production userspace round-trips use the
+  per-thread `ThreadPayload.userspace_slot`, and `ReactorLocals::ensure_hart`
+  has a locked Release/Acquire publication path, so neither is the immediate
+  correctness blocker. The remaining per-hart trampoline tables are limited
+  to eight harts versus the 64-hart reactor/thread registries; this is outside
+  the requested 1-hart/2-hart witness but remains an expansion gap.
+  Verification passed the 45 scheduler tests and 21 userspace-run plus 7
+  hart-loop tests. Those deterministic tests do not cover the identified
+  double-hart interleavings. Next: make queue membership, scheduler owner, and
+  task lifecycle one queue-locked or sequence-checked transition before using
+  scheduler boundaries as the RCU/EBR progress contract.
+
+### 2026-08-11 RCU-on-VM to SMP migration
+
+- Plan opened: `docs/progress/plans/2026-08-11-rcu-on-vm-to-smp-migration.json`.
+- Scope is limited to verified ResidentRoot/EBR VM slices and the SMP lifecycle hooks needed to run them per hart.
+- Explicitly excluded: PELT, network, ext4 dirty WIP, unrelated HAL/boot changes, VM range-transaction rewrite, and whole-worktree merge. The bounded pmap gather required by the resident slice is included.
+- Completed p0 and p1: source/target claims are frozen; scheduler steal and dispatch handoff now linearize queue ownership with task lifecycle. Focused verification passed scheduler 45/45, userspace 21/21, and hart-loop 7/7. Current gate: p2 BSP/AP VM hart initialization.
+- Verification target: focused host tests plus paired 1-hart/2-hart acceptance; `cargo xtask progress validate` and `git diff --check` are mandatory.
+- 2026-08-11 (RCU-on-VM resident slice ported into SMP tree).
+  Ported the verified ResidentRoot/PageSlot/withdrawal/reflink/page-I/O
+  closure together with its EBR epoch/publication/zone substrate, bounded pmap
+  invalidation gather, device and IO-manager adapters, and the
+  `pagecontainer-resident-rcu` xtask ratchet. Added the missing
+  `layout-probe` feature declarations so the migrated zone layout probes are
+  declared by both `tx-substrate` and `tx-subsystems`. The migration is kept
+  separate from the existing ext4, network, PELT, and unrelated dirty WIP.
+  Verification passed `cargo test -p tx-subsystems --lib resident_ --
+  --test-threads=1` (13/13), `cargo test -p tx-substrate --lib epoch --
+  --test-threads=1` (4/4), `cargo xtask lint invariants
+  pagecontainer-resident-rcu`, the matching xtask ratchet unit test,
+  `cargo check -p tx-shims`, and `cargo xtask progress validate` (47 records).
+  A compatibility default for `FsPageBacking::prepare_write_range`, truncate
+  constructors, and close-writeback routing keep the existing ext4/shims
+  callers building without importing their unrelated changes. The source VM
+  `init_vm_range_txn_hart`/`drain_local_vm_cleanup` range-transaction rewrite
+  is intentionally deferred as a separate integration slice; no per-hart VM
+  cleanup production claim is made yet. The RCU/PageBacked closure is now an
+  isolated commit. Next: run the paired 1-hart/2-hart acceptance or record the
+  QEMU environment blocker.

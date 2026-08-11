@@ -38,6 +38,134 @@ pub enum PmapRangeError {
     MissingReservation,
 }
 
+/// A bounded, in-place collection of ordered invalidation runs.
+///
+/// The storage is fixed at the call site's capacity. Adjacent invalidations
+/// are merged into the last run without allocating or moving a second
+/// coalesced buffer. `next_cursor` advances only when an invalidation is
+/// accepted, so a full gather identifies the exact retry prefix.
+pub struct InvalidationRunGather<const N: usize> {
+    entries: [MaybeUninit<PmapInvalidation>; N],
+    len: usize,
+    next_cursor: VirtAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidationRunGatherError {
+    kind: InvalidationRunGatherErrorKind,
+    next_cursor: VirtAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidationRunGatherErrorKind {
+    Capacity,
+    InvalidCursor,
+    AddressOverflow,
+}
+
+impl InvalidationRunGatherError {
+    pub const fn kind(self) -> InvalidationRunGatherErrorKind {
+        self.kind
+    }
+
+    pub const fn next_cursor(self) -> VirtAddr {
+        self.next_cursor
+    }
+}
+
+impl<const N: usize> InvalidationRunGather<N> {
+    pub const fn new(next_cursor: VirtAddr) -> Self {
+        Self {
+            entries: [const { MaybeUninit::uninit() }; N],
+            len: 0,
+            next_cursor,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn next_cursor(&self) -> VirtAddr {
+        self.next_cursor
+    }
+
+    /// Append one invalidation and the cursor immediately after its source
+    /// page. A rejected append leaves both the stored prefix and cursor intact.
+    pub fn push(
+        &mut self,
+        invalidation: PmapInvalidation,
+        next_cursor: VirtAddr,
+    ) -> Result<(), InvalidationRunGatherError> {
+        let Some(invalidation_end) = invalidation.virt().0.checked_add(invalidation.size()) else {
+            return Err(InvalidationRunGatherError {
+                kind: InvalidationRunGatherErrorKind::AddressOverflow,
+                next_cursor: self.next_cursor,
+            });
+        };
+        if next_cursor.0 <= self.next_cursor.0 || next_cursor.0 < invalidation_end {
+            return Err(InvalidationRunGatherError {
+                kind: InvalidationRunGatherErrorKind::InvalidCursor,
+                next_cursor: self.next_cursor,
+            });
+        }
+        if let Some(last) = self.last_mut() {
+            let Some(last_end) = last.virt().0.checked_add(last.size()) else {
+                return Err(InvalidationRunGatherError {
+                    kind: InvalidationRunGatherErrorKind::AddressOverflow,
+                    next_cursor: self.next_cursor,
+                });
+            };
+            if last_end == invalidation.virt().0 {
+                let Some(size) = last.size().checked_add(invalidation.size()) else {
+                    return Err(InvalidationRunGatherError {
+                        kind: InvalidationRunGatherErrorKind::AddressOverflow,
+                        next_cursor: self.next_cursor,
+                    });
+                };
+                *last = PmapInvalidation::new(last.virt(), size);
+                self.next_cursor = next_cursor;
+                return Ok(());
+            }
+        }
+        if self.len == N {
+            return Err(InvalidationRunGatherError {
+                kind: InvalidationRunGatherErrorKind::Capacity,
+                next_cursor: self.next_cursor,
+            });
+        }
+        self.entries[self.len].write(invalidation);
+        self.len += 1;
+        self.next_cursor = next_cursor;
+        Ok(())
+    }
+
+    /// Borrow the coalesced prefix directly from the fixed block.
+    pub fn as_slice(&self) -> &[PmapInvalidation] {
+        // SAFETY: entries [0, len) are initialized by `push`; the storage is
+        // contiguous and `MaybeUninit<T>` has the same layout as `T`.
+        unsafe { core::slice::from_raw_parts(self.entries.as_ptr().cast(), self.len) }
+    }
+
+    pub fn clear(&mut self, next_cursor: VirtAddr) {
+        self.len = 0;
+        self.next_cursor = next_cursor;
+    }
+
+    fn last_mut(&mut self) -> Option<&mut PmapInvalidation> {
+        if self.len == 0 {
+            None
+        } else {
+            // SAFETY: every slot below len was initialized by `push`.
+            Some(unsafe { self.entries[self.len - 1].assume_init_mut() })
+        }
+    }
+}
+
 impl From<PmapError> for PmapRangeError {
     fn from(value: PmapError) -> Self {
         Self::Pmap(value)

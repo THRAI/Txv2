@@ -1,6 +1,6 @@
 //! L6 block-submission values and queue helpers.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use crate::execution::Errno;
@@ -440,6 +440,7 @@ pub struct BlockQueue {
     next_id: u64,
     max_pending: usize,
     pending: VecDeque<Bio>,
+    dispatch_blocked: BTreeSet<BlockRequestId>,
 }
 
 impl BlockQueue {
@@ -448,6 +449,7 @@ impl BlockQueue {
             next_id: 1,
             max_pending,
             pending: VecDeque::new(),
+            dispatch_blocked: BTreeSet::new(),
         }
     }
 
@@ -487,10 +489,24 @@ impl BlockQueue {
         Ok(SubmitOutcome::Queued(id))
     }
 
+    /// Hold an admitted BIO in L6 until its owner has committed every
+    /// completion route needed before device dispatch.
+    pub fn block_dispatch(&mut self, id: BlockRequestId) {
+        self.dispatch_blocked.insert(id);
+    }
+
+    /// Make a previously held BIO eligible for ordinary queue dispatch.
+    pub fn unblock_dispatch(&mut self, id: BlockRequestId) {
+        self.dispatch_blocked.remove(&id);
+    }
+
     pub fn can_dispatch_next(&self, depth: &QueueDepth) -> bool {
         let Some(front) = self.pending.front() else {
             return false;
         };
+        if self.dispatch_blocked.contains(&front.id) {
+            return false;
+        }
         if front.plan.requires_fence() {
             depth.in_flight() == 0 && depth.has_capacity()
         } else {
@@ -518,6 +534,9 @@ impl BlockQueue {
         let Some(front) = self.pending.front() else {
             return false;
         };
+        if self.dispatch_blocked.contains(&front.id) {
+            return false;
+        }
         if front.plan.requires_fence() {
             depth.in_flight() == 0 && tags.is_empty() && depth.has_capacity()
         } else {

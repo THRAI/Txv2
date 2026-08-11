@@ -32,6 +32,7 @@ mod lint_invariants_time_wake;
 mod lint_invariants_wait;
 mod lint_invariants_witness;
 mod lint_invariants_zone;
+mod lint_pagecontainer_resident_rcu;
 #[path = "lint_step_guard.rs"]
 mod lint_step_guard;
 mod observe;
@@ -134,7 +135,7 @@ fn print_usage() {
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
            cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|kernel-user-layouts|syscall-status\n\
-             invariants rule includes api-language, boot-setup, observe-producer-boundary, time-layering, time-wake-retired, no-adhoc-drive, syscall-no-await, step, and related discipline checks\n\
+             invariants rule includes api-language, boot-setup, pagecontainer-resident-rcu, observe-producer-boundary, time-layering, time-wake-retired, no-adhoc-drive, syscall-no-await, step, and related discipline checks\n\
            cargo xtask boundary-report [--top N] [--json]\n\
            cargo xtask observe-schema check [--schema schema/txobserve.toml]\n\
            cargo xtask syscall-status [<NAME>...] [--regen|--check|--list-missing]\n\

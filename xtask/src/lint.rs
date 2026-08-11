@@ -224,6 +224,9 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "syscall-ctx-bridge" => {
             crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge(root)
         }
+        "pagecontainer-resident-rcu" => {
+            crate::lint_pagecontainer_resident_rcu::lint_pagecontainer_resident_rcu(root)
+        }
         "all" => {
             type LintRule = fn(&Path) -> Result<()>;
             let rules: &[(&str, LintRule)] = &[
@@ -328,6 +331,10 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                     "syscall-ctx-bridge",
                     crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge,
                 ),
+                (
+                    "pagecontainer-resident-rcu",
+                    crate::lint_pagecontainer_resident_rcu::lint_pagecontainer_resident_rcu,
+                ),
             ];
             let mut errors: Vec<String> = Vec::new();
             for (name, rule) in rules {
@@ -343,7 +350,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         other => Err(format!(
-            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step-interface, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, zone-interface, api-language, notification-boundary, observe-producer-boundary, time-layering, time-wake-retired, boot-setup, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step-interface, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, zone-interface, api-language, notification-boundary, observe-producer-boundary, time-layering, time-wake-retired, boot-setup, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, pagecontainer-resident-rcu, all"
         )),
     }
 }

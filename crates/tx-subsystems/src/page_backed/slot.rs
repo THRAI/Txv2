@@ -62,6 +62,10 @@ pub enum PageSlotCompletionError {
         current: PageGeneration,
         completed: PageGeneration,
     },
+    MismatchedFrame {
+        expected: Ppn,
+        current: Ppn,
+    },
     NotFetching {
         state: PageSlotState,
         generation: PageGeneration,
@@ -325,6 +329,121 @@ impl PageSlot {
         inner.bump_generation();
         inner.state = PageSlotState::Empty;
         inner.snapshot()
+    }
+
+    /// Withdraw the exact resident binding before its cache entry is removed.
+    ///
+    /// The caller supplies the binding generation and PPN observed while it
+    /// still owns the PageContainer mutation boundary. A stale completion or a
+    /// replacement binding therefore cannot be invalidated by an older owner.
+    pub fn withdraw_if_matches(
+        &self,
+        expected_generation: PageGeneration,
+        expected_ppn: Ppn,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
+        let mut inner = self.inner.lock();
+        Self::ensure_generation(&inner, expected_generation)?;
+        let current = match inner.state {
+            PageSlotState::Resident { ppn }
+            | PageSlotState::Dirty { ppn }
+            | PageSlotState::Writeback { ppn, .. } => ppn,
+            state => {
+                return Err(PageSlotCompletionError::NotFetching {
+                    state,
+                    generation: inner.generation,
+                });
+            }
+        };
+        if current != expected_ppn {
+            return Err(PageSlotCompletionError::MismatchedFrame {
+                expected: expected_ppn,
+                current,
+            });
+        }
+
+        inner.bump_generation();
+        inner.state = PageSlotState::Empty;
+        Ok(inner.snapshot())
+    }
+
+    /// Rebind an exact non-writeback resident generation to a replacement
+    /// frame. CoW uses this while holding the PageContainer mutation boundary:
+    /// an in-flight writeback cannot be retargeted because its completion owns
+    /// the old frame and generation.
+    pub fn replace_if_matches(
+        &self,
+        expected_generation: PageGeneration,
+        expected_ppn: Ppn,
+        replacement_ppn: Ppn,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
+        let mut inner = self.inner.lock();
+        Self::ensure_generation(&inner, expected_generation)?;
+        let replacement = match inner.state {
+            PageSlotState::Resident { ppn } if ppn == expected_ppn => PageSlotState::Resident {
+                ppn: replacement_ppn,
+            },
+            PageSlotState::Dirty { ppn } if ppn == expected_ppn => PageSlotState::Dirty {
+                ppn: replacement_ppn,
+            },
+            PageSlotState::Resident { ppn } | PageSlotState::Dirty { ppn } => {
+                return Err(PageSlotCompletionError::MismatchedFrame {
+                    expected: expected_ppn,
+                    current: ppn,
+                });
+            }
+            state @ PageSlotState::Writeback { .. } => {
+                return Err(PageSlotCompletionError::NotFetching {
+                    state,
+                    generation: inner.generation,
+                });
+            }
+            state => {
+                return Err(PageSlotCompletionError::NotFetching {
+                    state,
+                    generation: inner.generation,
+                });
+            }
+        };
+        inner.bump_generation();
+        inner.state = replacement;
+        Ok(inner.snapshot())
+    }
+
+    /// Set one dirty generation clean only when the matching resident binding
+    /// has not been redirtied or replaced since the caller captured it.
+    pub fn mark_clean_if_matches(
+        &self,
+        expected_generation: PageGeneration,
+        expected_ppn: Ppn,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
+        let mut inner = self.inner.lock();
+        Self::ensure_generation(&inner, expected_generation)?;
+        let PageSlotState::Dirty { ppn: current } = inner.state else {
+            return Err(PageSlotCompletionError::NotFetching {
+                state: inner.state,
+                generation: inner.generation,
+            });
+        };
+        if current != expected_ppn {
+            return Err(PageSlotCompletionError::MismatchedFrame {
+                expected: expected_ppn,
+                current,
+            });
+        }
+        inner.state = PageSlotState::Resident { ppn: current };
+        Ok(inner.snapshot())
+    }
+
+    /// Cancel a fetch only if it is still the generation the caller owns.
+    pub fn invalidate_if_generation(
+        &self,
+        expected_generation: PageGeneration,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
+        let mut inner = self.inner.lock();
+        Self::ensure_generation(&inner, expected_generation)?;
+        inner.bump_generation();
+        inner.state = PageSlotState::Empty;
+        Ok(inner.snapshot())
     }
 
     fn ensure_generation(

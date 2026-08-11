@@ -4,9 +4,222 @@
 //! Callers must pin the CPU before mutating the retired list.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use super::bag::{LocalRetireState, EPOCH_BAG_COUNT};
+use super::RcuHead;
+
+pub(crate) const LOCAL_RETIRE_RESERVATION_CAPACITY: usize = 16;
+const LOCAL_RETIRE_ALL_FREE: u16 = u16::MAX;
+
+#[derive(Clone, Copy)]
+struct ReservedRetireRecord {
+    head: *mut RcuHead,
+    retired_at: u64,
+}
+
+impl ReservedRetireRecord {
+    const EMPTY: Self = Self {
+        head: core::ptr::null_mut(),
+        retired_at: 0,
+    };
+}
+
+pub(crate) struct LocalRetirePool {
+    free_mask: AtomicU16,
+    ready_mask: AtomicU16,
+    records: UnsafeCell<[ReservedRetireRecord; LOCAL_RETIRE_RESERVATION_CAPACITY]>,
+}
+
+unsafe impl Sync for LocalRetirePool {}
+
+impl LocalRetirePool {
+    const fn new() -> Self {
+        Self {
+            free_mask: AtomicU16::new(LOCAL_RETIRE_ALL_FREE),
+            ready_mask: AtomicU16::new(0),
+            records: UnsafeCell::new(
+                [ReservedRetireRecord::EMPTY; LOCAL_RETIRE_RESERVATION_CAPACITY],
+            ),
+        }
+    }
+
+    pub(crate) fn try_reserve(&self) -> Option<usize> {
+        let mut free = self.free_mask.load(Ordering::Acquire);
+        loop {
+            let slot = free.trailing_zeros() as usize;
+            if slot == LOCAL_RETIRE_RESERVATION_CAPACITY {
+                return None;
+            }
+            let bit = 1u16 << slot;
+            match self.free_mask.compare_exchange_weak(
+                free,
+                free & !bit,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(slot),
+                Err(observed) => free = observed,
+            }
+        }
+    }
+
+    pub(crate) fn validate_reserved(&self, slot: usize) -> Result<(), bool> {
+        let bit = 1u16 << slot;
+        if self.free_mask.load(Ordering::Acquire) & bit != 0 {
+            return Err(false);
+        }
+        if self.ready_mask.load(Ordering::Acquire) & bit != 0 {
+            return Err(true);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&self, slot: usize) {
+        assert!(
+            self.validate_reserved(slot).is_ok(),
+            "local-retire cancellation requires a live unfilled reservation"
+        );
+        let bit = 1u16 << slot;
+        let previous = self.free_mask.fetch_or(bit, Ordering::AcqRel);
+        assert_eq!(previous & bit, 0, "local-retire slot released twice");
+    }
+
+    pub(crate) unsafe fn fill_reserved(
+        &self,
+        slot: usize,
+        head: NonNull<RcuHead>,
+        retired_at: u64,
+    ) {
+        assert!(
+            self.validate_reserved(slot).is_ok(),
+            "local-retire fill requires a live unfilled reservation"
+        );
+        unsafe {
+            (*self.records.get())[slot] = ReservedRetireRecord {
+                head: head.as_ptr(),
+                retired_at,
+            };
+        }
+        let bit = 1u16 << slot;
+        let previous = self.ready_mask.fetch_or(bit, Ordering::Release);
+        assert_eq!(previous & bit, 0, "local-retire slot filled twice");
+    }
+
+    pub(crate) unsafe fn detach_reclaimable(
+        &self,
+        safe_epoch: u64,
+        budget: usize,
+    ) -> (*mut RcuHead, usize, usize) {
+        let mut ready = self.ready_mask.load(Ordering::Acquire);
+        let mut reclaim_head: *mut RcuHead = core::ptr::null_mut();
+        let mut detached = 0usize;
+        let mut examined = 0usize;
+        while ready != 0 && detached < budget {
+            let slot = ready.trailing_zeros() as usize;
+            let bit = 1u16 << slot;
+            ready &= !bit;
+            examined += 1;
+            let record = unsafe { (*self.records.get())[slot] };
+            if safe_epoch < record.retired_at.saturating_add(2) {
+                continue;
+            }
+            let mut head = NonNull::new(record.head).expect("filled local-retire record head");
+            unsafe {
+                head.as_mut().next = if reclaim_head.is_null() {
+                    head.as_ptr()
+                } else {
+                    reclaim_head
+                };
+                (*self.records.get())[slot] = ReservedRetireRecord::EMPTY;
+            }
+            self.ready_mask.fetch_and(!bit, Ordering::AcqRel);
+            let previous = self.free_mask.fetch_or(bit, Ordering::Release);
+            assert_eq!(
+                previous & bit,
+                0,
+                "filled local-retire slot was already free"
+            );
+            reclaim_head = head.as_ptr();
+            detached += 1;
+        }
+        (reclaim_head, detached, examined)
+    }
+
+    pub(crate) fn ready_count(&self) -> usize {
+        self.ready_mask.load(Ordering::Acquire).count_ones() as usize
+    }
+
+    pub(crate) fn unfilled_count(&self) -> usize {
+        let free = self.free_mask.load(Ordering::Acquire);
+        let ready = self.ready_mask.load(Ordering::Acquire);
+        ((!free) & (!ready)).count_ones() as usize
+    }
+
+    pub(crate) fn reserve_transfer_slots(
+        &self,
+        count: usize,
+        slots: &mut [usize; LOCAL_RETIRE_RESERVATION_CAPACITY],
+    ) -> bool {
+        debug_assert!(count <= slots.len());
+        for index in 0..count {
+            let Some(slot) = self.try_reserve() else {
+                self.cancel_transfer_slots(&slots[..index]);
+                return false;
+            };
+            slots[index] = slot;
+        }
+        true
+    }
+
+    pub(crate) fn cancel_transfer_slots(&self, slots: &[usize]) {
+        for &slot in slots {
+            self.cancel(slot);
+        }
+    }
+
+    pub(crate) unsafe fn transfer_ready_to_reserved(&self, target: &Self, target_slots: &[usize]) {
+        let mut ready = self.ready_mask.load(Ordering::Acquire);
+        assert_eq!(
+            ready.count_ones() as usize,
+            target_slots.len(),
+            "local-retire transfer target count changed"
+        );
+        for &target_slot in target_slots {
+            let source_slot = ready.trailing_zeros() as usize;
+            let source_bit = 1u16 << source_slot;
+            ready &= !source_bit;
+            let record = unsafe { (*self.records.get())[source_slot] };
+            let head = NonNull::new(record.head).expect("filled local-retire record head");
+            unsafe {
+                target.fill_reserved(target_slot, head, record.retired_at);
+                (*self.records.get())[source_slot] = ReservedRetireRecord::EMPTY;
+            }
+            let previous_ready = self.ready_mask.fetch_and(!source_bit, Ordering::AcqRel);
+            assert_ne!(
+                previous_ready & source_bit,
+                0,
+                "transferred slot was not ready"
+            );
+            let previous_free = self.free_mask.fetch_or(source_bit, Ordering::Release);
+            assert_eq!(
+                previous_free & source_bit,
+                0,
+                "transferred slot was already free"
+            );
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        self.ready_mask.store(0, Ordering::Release);
+        self.free_mask
+            .store(LOCAL_RETIRE_ALL_FREE, Ordering::Release);
+        unsafe {
+            *self.records.get() = [ReservedRetireRecord::EMPTY; LOCAL_RETIRE_RESERVATION_CAPACITY];
+        }
+    }
+}
 
 /// Per-CPU EBR state.
 #[repr(align(64))]
@@ -27,6 +240,8 @@ pub(crate) struct CpuLocalEpochState {
     callback_depth: AtomicUsize,
     /// Current CPU's intrusive retirement bags.
     retire_state: UnsafeCell<LocalRetireState>,
+    /// Pre-reserved publication retire records, independent of bag occupancy.
+    reserved_retire: LocalRetirePool,
     /// Remotely readable occupied epoch for each bag; zero means empty.
     bag_epochs: [AtomicU64; EPOCH_BAG_COUNT],
     /// Remotely readable bag node count. Only the owning CPU writes it.
@@ -58,6 +273,7 @@ impl CpuLocalEpochState {
             drain_requested: AtomicBool::new(false),
             callback_depth: AtomicUsize::new(0),
             retire_state: UnsafeCell::new(LocalRetireState::new()),
+            reserved_retire: LocalRetirePool::new(),
             bag_epochs: [const { AtomicU64::new(0) }; EPOCH_BAG_COUNT],
             bag_retired: AtomicUsize::new(0),
         }
@@ -74,6 +290,7 @@ impl CpuLocalEpochState {
         unsafe {
             (*self.retire_state.get()).reset();
         }
+        self.reserved_retire.reset();
     }
 
     pub(crate) fn reset(&self) {
@@ -88,6 +305,7 @@ impl CpuLocalEpochState {
         unsafe {
             (*self.retire_state.get()).reset();
         }
+        self.reserved_retire.reset();
     }
 
     pub(crate) fn is_initialized(&self) -> bool {
@@ -233,6 +451,10 @@ impl CpuLocalEpochState {
     }
 
     pub(crate) fn bag_retired_count(&self) -> usize {
+        self.bag_retired.load(Ordering::Acquire) + self.reserved_retire.ready_count()
+    }
+
+    pub(crate) fn bag_only_retired_count(&self) -> usize {
         self.bag_retired.load(Ordering::Acquire)
     }
 
@@ -264,6 +486,10 @@ impl CpuLocalEpochState {
 
     pub(crate) fn retire_state_ptr(&self) -> *mut LocalRetireState {
         self.retire_state.get()
+    }
+
+    pub(crate) fn reserved_retire(&self) -> &LocalRetirePool {
+        &self.reserved_retire
     }
 }
 
