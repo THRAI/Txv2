@@ -496,41 +496,8 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
             }
         };
 
-        // la64's image busybox lacks applets (notably awk) required by the
-        // LTP shell helpers.  Keep main's full-applet fallback while retaining
-        // final-smp's surrounding mount/bootstrap ordering.
-        #[cfg(target_arch = "loongarch64")]
-        {
-            static LA_BUSYBOX_FULL: &[u8] = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tools/images/vendor/busybox-loongarch64-musl"
-            ));
-            if !create_file_with_data(
-                &create_ctx,
-                tx_ltp_id,
-                b"busybox-full",
-                0o755,
-                LA_BUSYBOX_FULL,
-            ) {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":network-db:err:create-busybox-full\n");
-                return;
-            }
-        }
-
-        // On RV the hot-path cat/cut/grep applets are provided by tx-netfast
-        // below.  Other architectures retain the image busybox forwarding.
-        #[cfg(target_arch = "riscv64")]
-        let bb_forward_names: &[&[u8]] = &[
-            b"arp",
-            b"id",
-            b"ln",
-            b"mkdir",
-            b"mount",
-            b"readlink",
-            b"seq",
-        ];
-        #[cfg(not(target_arch = "riscv64"))]
+        // Forward to the competition image's BusyBox through /bin/busybox;
+        // no architecture-specific helper binary is embedded in the kernel.
         let bb_forward_names: &[&[u8]] = &[
             b"arp",
             b"cat",
@@ -545,43 +512,6 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
         ];
         for name in bb_forward_names {
             let _ = symlink_into(fs_ops, tx_ltp_bin_id, name, b"/bin/busybox", &cred);
-        }
-
-        // Main's RV multicall fast path is independent of final-smp's SMP
-        // correctness changes and must survive the merge.  Unsupported argv
-        // shapes fall back to the original scripts/busybox.
-        #[cfg(target_arch = "riscv64")]
-        {
-            static TX_NETFAST: &[u8] = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tools/images/vendor/tx-netfast-riscv64"
-            ));
-            if !create_file_with_data(&create_ctx, tx_ltp_bin_id, b"tx-netfast", 0o755, TX_NETFAST)
-            {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":network-db:err:create-tx-netfast\n");
-                return;
-            }
-            for name in [
-                b"ping".as_slice(),
-                b"ping6".as_slice(),
-                b"ip".as_slice(),
-                b"tst_ns_exec".as_slice(),
-                b"awk".as_slice(),
-                b"grep".as_slice(),
-                b"cut".as_slice(),
-                b"cat".as_slice(),
-                b"pgrep".as_slice(),
-                b"tst_sleep".as_slice(),
-            ] {
-                let _ = symlink_into(
-                    fs_ops,
-                    tx_ltp_bin_id,
-                    name,
-                    b"/tx-ltp/bin/tx-netfast",
-                    &cred,
-                );
-            }
         }
 
         // `sysctl` is a thin shim: LTP tst_net setup does
@@ -1171,9 +1101,7 @@ echo "--- $target ping statistics ---"
 echo "$count packets transmitted, $count packets received, 0% packet loss"
 exit 0
 "#;
-        #[cfg(target_arch = "riscv64")]
-        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) = (b"ping.nf", b"ping6.nf");
-        #[cfg(not(target_arch = "riscv64"))]
+        // No embedded tx-netfast binary shadows these names.
         let (ping_script_name, ping6_script_name): (&[u8], &[u8]) = (b"ping", b"ping6");
         if !create_file_with_data(
             &create_ctx,
@@ -1711,9 +1639,7 @@ if [ \"$1\" = \"maddr\" ]; then\n\
     esac\n\
 fi\n\
 tx_ltp_exec \"$bb\" ip \"$@\"\n";
-        #[cfg(target_arch = "riscv64")]
-        let ip_script_name: &[u8] = b"ip.fallback";
-        #[cfg(not(target_arch = "riscv64"))]
+        // No embedded tx-netfast binary shadows this name.
         let ip_script_name: &[u8] = b"ip";
         if !create_file_with_data(&create_ctx, tx_ltp_bin_id, ip_script_name, 0o755, ip_script) {
             Self::write_board_sentinel_prefix();
