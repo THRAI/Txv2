@@ -40,7 +40,7 @@ struct TestTimespec {
 const SIGCHLD_BIT: u64 = 1u64 << (17 - 1);
 
 #[test]
-fn sigsuspend_pending_signal_returns_eintr_and_restores_mask() {
+fn sigsuspend_pending_signal_defers_mask_restore_to_ast() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -70,8 +70,15 @@ fn sigsuspend_pending_signal_returns_eintr_and_restores_mask() {
     assert_eq!(result, SyscallResult::Error(E_INTR));
     assert_eq!(
         payload.signal_mask().raw_bits(),
-        0,
-        "sigsuspend must restore the caller's previous signal mask"
+        SIGCHLD_BIT,
+        "the temporary suspend mask must remain active until AST builds the handler frame"
+    );
+    assert_eq!(
+        payload
+            .take_sigsuspend_restore_mask()
+            .map(|mask| mask.raw_bits()),
+        Some(0),
+        "AST must receive the caller's pre-suspend mask for rt_sigreturn"
     );
     assert!(
         payload.pending().is_pending(Signum::SIGTERM),

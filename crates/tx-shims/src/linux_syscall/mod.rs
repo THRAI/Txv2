@@ -68,10 +68,10 @@ use tx_subsystems::signal::{
     KillProcessWithPostOp, SaFlags, SigActionEntry, SigDisposition, SigDispositionChange,
     SigactionOp, SignalMask, Signum,
 };
+use tx_subsystems::thread_runtime::adapter::step_engine::{MailboxEvent, TaskMailbox};
 use tx_subsystems::thread_runtime::execution::{
     step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange, SigprocmaskOp,
 };
-use tx_subsystems::thread_runtime::adapter::step_engine::{MailboxEvent, TaskMailbox};
 use tx_subsystems::thread_runtime::{
     step_thread_exit, step_thread_exit_with_posts, ThreadExitOp, ThreadIdentity,
     ThreadKillWithPostOp, ThreadPayload,
@@ -671,14 +671,17 @@ where
         return None;
     }
     let l0_span = emit_syscall_enter(req);
-    let result =
-        match step_thread_exit_with_posts(thread.clone(), req.args[0] as i32, signal_post, wake_post)
-        {
+    let result = match step_thread_exit_with_posts(
+        thread.clone(),
+        req.args[0] as i32,
+        signal_post,
+        wake_post,
+    ) {
         tx_subsystems::thread_runtime::ThreadExitOutcome::Completed => SyscallResult::NoReturn,
         tx_subsystems::thread_runtime::ThreadExitOutcome::Retry => {
             SyscallResult::Error(EAGAIN_VALUE)
         }
-        };
+    };
     emit_syscall_exit(l0_span, &result);
     Some(result)
 }
@@ -1255,9 +1258,14 @@ where
         nr if nr == NR_FSYNC => sys_fsync::<P>(req.args, ctx).await,
         nr if nr == NR_FDATASYNC => sys_fdatasync::<P>(req.args, ctx).await,
         nr if nr == NR_FLOCK => sys_flock::<P>(req.args, ctx).await,
-        nr if nr == NR_OPEN_TREE => sys_open_tree::<P>(req.args, ctx).await,
-        nr if nr == NR_FSOPEN => sys_fsopen::<P>(req.args, ctx).await,
-        nr if nr == NR_FSPICK => sys_fspick::<P>(req.args, ctx).await,
+        // The new mount API is not exposed until its complete fd lifecycle
+        // (`fsconfig` -> `fsmount` -> `move_mount`) is implemented. Returning
+        // ENOSYS consistently lets util-linux fall back to legacy mount(2)
+        // instead of retaining a half-backed MountApi fd that can reach
+        // ordinary VFS-only rnode dispatch.
+        nr if nr == NR_OPEN_TREE || nr == NR_FSOPEN || nr == NR_FSPICK => {
+            SyscallResult::Error(ENOSYS_VALUE)
+        }
         nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
         nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
         nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,

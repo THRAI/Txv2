@@ -66,6 +66,51 @@ fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
 }
 
 impl<P: TxPlatform> CoreInit<P> {
+    /// Run an exec preparation that may fault file pages through the async
+    /// page/block I/O graph before the userspace reactor loop starts.
+    ///
+    /// `ExecError::Deferred` is a pre-point-of-no-return result: the caller
+    /// must service the reactor and restart exec preparation from phase 1.
+    /// The page cache keeps completed reads resident, so each restart advances
+    /// the executable/interpreter population until the transaction can commit.
+    fn bootstrap_exec_with_file_io(
+        process: &Cap<tx_subsystems::process::ProcessIdentity>,
+        thread: &Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
+        path: &[u8],
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        cred: &tx_subsystems::vfs::Credential,
+    ) -> Result<(), tx_scripts::process::exec::ExecError> {
+        use tx_scripts::process::exec::ExecError;
+
+        const MAX_BOOTSTRAP_EXEC_RESTARTS: usize = 16 * 1024;
+        for _ in 0..MAX_BOOTSTRAP_EXEC_RESTARTS {
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                process, thread, path, argv, envp, cred,
+            ));
+            match outcome {
+                Err(ExecError::Deferred(shape)) => {
+                    let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+                    crate::trap::service_pending_maintenance::<P>();
+                    let _ = step_engine::service_local_drain_request(
+                        crate::trap::MAINTENANCE_DRAIN_BUDGET,
+                    );
+                    if Self::boot_reactor_once(cpu).is_none() {
+                        return Err(ExecError::Deferred(shape));
+                    }
+                }
+                Err(ExecError::Retry) => {
+                    let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+                    if Self::boot_reactor_once(cpu).is_none() {
+                        return Err(ExecError::Retry);
+                    }
+                }
+                result => return result,
+            }
+        }
+        Err(ExecError::Retry)
+    }
+
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
     /// any per-entry failure. A corrupt or missing initramfs leaves
@@ -328,14 +373,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 default_envp
             };
             let argv: &[&[u8]] = &[b"bash", b"-c", FINAL_TESTCODE];
-            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                &init,
-                &thread,
-                b"/bin/bash",
-                argv,
-                envp,
-                &cred,
-            ));
+            let outcome =
+                Self::bootstrap_exec_with_file_io(&init, &thread, b"/bin/bash", argv, envp, &cred);
             Self::write_board_sentinel_prefix();
             match outcome {
                 Ok(()) => {

@@ -318,6 +318,27 @@ impl AddressSpace {
                         continue;
                     }
                     Err(VmFaultError::StaleRecipe) => continue 'resolve,
+                    // Resident-root publication is deliberately fallible
+                    // under transient writer/retire-credit contention. The
+                    // PageContainer reports that condition as EAGAIN; it is
+                    // not a backing I/O failure and must not become SIGSEGV.
+                    // Drop the materialization guard at the call boundary,
+                    // service EBR once, and yield so the competing publisher
+                    // or file-I/O task can make progress before retrying the
+                    // same resolved recipe.
+                    Err(VmFaultError::PageCache(crate::page_backed::PageCacheError::Backend(
+                        crate::execution::Errno::EAGAIN,
+                    ))) => {
+                        let _ = tx_substrate::epoch::drain_with_budget(64);
+                        tx_reactor::yield_now().await;
+                        continue;
+                    }
+                    // A private-page CAS loser also asks the fault script to
+                    // restart after yielding; the recipe may have changed.
+                    Err(VmFaultError::WouldBlock) => {
+                        tx_reactor::yield_now().await;
+                        continue 'resolve;
+                    }
                     Err(error) => return Err(error),
                 }
             }

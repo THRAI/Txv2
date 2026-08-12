@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex, MutexGuard,
 };
 
 use tx_ext4::journal::{
@@ -23,9 +23,15 @@ use tx_subsystems::io_manager::page::{
 };
 use tx_subsystems::mount::MountTransactionFrontier;
 
-fn setup() {
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn setup() -> MutexGuard<'static, ()> {
+    let serial = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     tx_test_support::init_host();
     tx_subsystems::zones::register_all().expect("kernel zones");
+    serial
 }
 
 fn ring() -> Arc<JournalRing> {
@@ -105,7 +111,7 @@ struct DeferredFreeSettlementSpy {
 }
 
 impl JournalSettlementObserver for DeferredFreeSettlementSpy {
-    fn settle_after_checkpoint(&self) {
+    fn settle_after_checkpoint(&self, _object: Option<u64>) {
         let source = self.source.upgrade().expect("source remains mounted");
         assert_eq!(
             source.try_reuse_for_test(self.physical_block),
@@ -124,7 +130,7 @@ impl SettlementSpy {
 }
 
 impl JournalSettlementObserver for SettlementSpy {
-    fn settle_after_checkpoint(&self) {
+    fn settle_after_checkpoint(&self, _object: Option<u64>) {
         assert_eq!(self.ring.reserve(1), Err(JournalRingError::Busy));
         self.calls.fetch_add(1, Ordering::AcqRel);
     }
@@ -132,7 +138,7 @@ impl JournalSettlementObserver for SettlementSpy {
 
 #[test]
 fn data_failure_releases_the_handle_owned_journal_extent() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(JournalFsyncSource::new());
     let ring = ring();
     let runtime = JournalMutationRuntime::with_ring(
@@ -171,7 +177,7 @@ fn data_failure_releases_the_handle_owned_journal_extent() {
 
 #[test]
 fn runtime_snapshot_frontier_tracks_active_journal_sequence() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(JournalFsyncSource::new());
     let ring = ring();
     let runtime = JournalMutationRuntime::with_ring(
@@ -206,7 +212,7 @@ fn runtime_snapshot_frontier_tracks_active_journal_sequence() {
 
 #[test]
 fn unknown_commit_retains_the_extent_and_blocks_new_mutations() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(JournalFsyncSource::new());
     let ring = ring();
     let runtime = JournalMutationRuntime::with_ring(
@@ -263,7 +269,7 @@ fn unknown_commit_retains_the_extent_and_blocks_new_mutations() {
 
 #[test]
 fn known_commit_failure_rolls_back_and_releases_the_extent() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(JournalFsyncSource::new());
     let ring = ring();
     let runtime = JournalMutationRuntime::with_ring(
@@ -314,7 +320,7 @@ fn known_commit_failure_rolls_back_and_releases_the_extent() {
 
 #[test]
 fn checkpoint_failure_records_an_error_and_retains_the_retry_owner() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(JournalFsyncSource::new());
     let ring = ring();
     let runtime = JournalMutationRuntime::with_ring(
@@ -373,7 +379,7 @@ fn checkpoint_failure_records_an_error_and_retains_the_retry_owner() {
 
 #[test]
 fn successful_checkpoint_notifies_the_mount_cache_settlement_observer() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(JournalFsyncSource::new());
     let ring = ring();
     let observer = Arc::new(SettlementSpy::new(Arc::clone(&ring)));
@@ -427,7 +433,7 @@ fn successful_checkpoint_notifies_the_mount_cache_settlement_observer() {
 
 #[test]
 fn allocator_cannot_reuse_before_tail_reclaim() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(JournalFsyncSource::new());
     let ring = ring();
     let observer = Arc::new(DeferredFreeSettlementSpy {

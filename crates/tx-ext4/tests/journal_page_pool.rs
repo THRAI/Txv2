@@ -25,4 +25,14 @@ fn journal_page_pool_retains_encoded_bytes_and_exports_their_ppn() {
         pool.stage(&[0; 4096], &guard),
         Err(JournalPagePoolError::Capacity)
     ));
+    let ppn = record.ppn();
+    drop(record);
+
+    // A settled transaction can reuse its private journal page immediately,
+    // even while the caller remains in the same epoch.
+    let second = pool.stage(&[0x22; 4096], &guard).unwrap();
+    assert_eq!(second.ppn(), ppn);
+    let address = tx_substrate::page_allocator::frame_kernel_addr(second.ppn()).unwrap();
+    let observed = unsafe { core::slice::from_raw_parts(address, 4096) };
+    assert_eq!(observed, &[0x22; 4096]);
 }

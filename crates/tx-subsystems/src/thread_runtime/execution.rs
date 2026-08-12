@@ -466,7 +466,14 @@ pub(crate) fn step_thread_exit_after_lane_check_for_test<H>(
 where
     H: FnOnce(),
 {
-    step_thread_exit_inner(thread, status, after_lane_check, || {}, |_, _| {}, |_, _| true)
+    step_thread_exit_inner(
+        thread,
+        status,
+        after_lane_check,
+        || {},
+        |_, _| {},
+        |_, _| true,
+    )
 }
 
 #[cfg(test)]

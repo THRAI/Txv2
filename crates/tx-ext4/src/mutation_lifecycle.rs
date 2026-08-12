@@ -74,7 +74,7 @@ pub(crate) enum MutationTerminal {
 /// The source stores only a weak observer so the planner's strong source
 /// reference cannot keep a mounted backend alive after unmount.
 pub trait JournalSettlementObserver: Send + Sync {
-    fn settle_after_checkpoint(&self);
+    fn settle_after_checkpoint(&self, object: Option<u64>);
 }
 
 /// Ext4 mount-owned bridge from L4/L6 callbacks to one `MutationHandle`.
@@ -216,10 +216,11 @@ impl JournalFsyncSource {
             return Err(JournalTransactionStateError::NotCommitted);
         };
         mutation.complete_checkpoint(Ok(()))?;
+        let settled_object = mutation.transaction.object();
         let observer = state.settlement_observer.as_ref().and_then(Weak::upgrade);
         drop(state);
         if let Some(observer) = observer {
-            observer.settle_after_checkpoint();
+            observer.settle_after_checkpoint(settled_object);
         }
         let mut state = self.state.lock();
         let Some(mutation) = state.mutation.as_mut() else {

@@ -201,6 +201,10 @@ impl Jbd2Superblock {
     const INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
     const CHECKSUM_TYPE_OFFSET: usize = 0x50;
     const CHECKSUM_OFFSET: usize = 0xFC;
+    /// `journal_superblock_s` has a fixed 1024-byte checksum domain even
+    /// when the journal's block size is 4096 bytes.  Bytes after this struct
+    /// belong to block padding and are not covered by `s_checksum`.
+    const CHECKSUM_COVERED_LEN: usize = 1024;
     const CRC32C_CHECKSUM_TYPE: u8 = 4;
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -241,7 +245,7 @@ impl Jbd2Superblock {
         if incompat & (Self::INCOMPAT_CSUM_V2 | Self::INCOMPAT_CSUM_V3) == 0 {
             return Ok(());
         }
-        require_len(bytes, JBD2_BLOCK_SIZE)?;
+        require_len(bytes, Self::CHECKSUM_COVERED_LEN)?;
         if bytes[Self::CHECKSUM_TYPE_OFFSET] != Self::CRC32C_CHECKSUM_TYPE {
             return Err(Ext4FormatError::Unsupported);
         }
@@ -252,7 +256,7 @@ impl Jbd2Superblock {
                 crc32c_append(0xFFFF_FFFF, &bytes[..Self::CHECKSUM_OFFSET]),
                 &zero,
             ),
-            &bytes[Self::CHECKSUM_OFFSET + 4..JBD2_BLOCK_SIZE],
+            &bytes[Self::CHECKSUM_OFFSET + 4..Self::CHECKSUM_COVERED_LEN],
         );
         if checksum != expected {
             return Err(Ext4FormatError::Corrupt);
@@ -294,7 +298,7 @@ impl Jbd2Superblock {
                 return Err(Ext4FormatError::Unsupported);
             }
             page[Self::CHECKSUM_OFFSET..Self::CHECKSUM_OFFSET + 4].fill(0);
-            let checksum = crc32c_append(0xFFFF_FFFF, page);
+            let checksum = crc32c_append(0xFFFF_FFFF, &page[..Self::CHECKSUM_COVERED_LEN]);
             write_u32(page, Self::CHECKSUM_OFFSET, checksum)?;
         }
         Ok(())

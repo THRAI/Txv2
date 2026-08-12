@@ -180,6 +180,13 @@ pub struct ThreadPayload {
     /// Signal mask active before the most recent handler delivery.
     /// Restored together with `saved_signal_context` by `rt_sigreturn`.
     pub(crate) saved_signal_mask: SpinMutex<Option<SignalMask>>,
+    /// Mask to restore after a handler which interrupted `rt_sigsuspend`.
+    ///
+    /// `rt_sigsuspend` temporarily replaces the caller's mask while sleeping.
+    /// The handler must run under that temporary mask, but `rt_sigreturn` must
+    /// restore the mask from before `rt_sigsuspend`. This slot carries that
+    /// second mask across syscall completion into the AST signal-frame builder.
+    pub(crate) sigsuspend_restore_mask: SpinMutex<Option<SignalMask>>,
     /// Result of the last completed syscall, drained by the
     /// userspace-entry checkpoint and written into the (then-fresh)
     /// trap frame via `set_syscall_return` / `set_syscall_error`
@@ -271,6 +278,7 @@ impl ThreadPayload {
             saved_user_context: SpinMutex::new(None),
             saved_signal_context: SpinMutex::new(None),
             saved_signal_mask: SpinMutex::new(None),
+            sigsuspend_restore_mask: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
             mailbox: SpinMutex::new(None),
             stopped: core::sync::atomic::AtomicBool::new(false),
@@ -378,6 +386,16 @@ impl ThreadPayload {
     /// Take the signal mask saved for the active signal frame.
     pub fn take_saved_signal_mask(&self) -> Option<SignalMask> {
         self.saved_signal_mask.lock().take()
+    }
+
+    /// Publish the pre-`rt_sigsuspend` mask for the next handler frame.
+    pub fn store_sigsuspend_restore_mask(&self, mask: Option<SignalMask>) {
+        *self.sigsuspend_restore_mask.lock() = mask;
+    }
+
+    /// Consume the pre-`rt_sigsuspend` mask while building that handler frame.
+    pub fn take_sigsuspend_restore_mask(&self) -> Option<SignalMask> {
+        self.sigsuspend_restore_mask.lock().take()
     }
 
     /// Push a pending syscall return into the per-thread slot. The

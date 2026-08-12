@@ -1225,12 +1225,7 @@ pub(crate) fn step_process_exit_with_posts<F, G>(
     F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
     G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
 {
-    step_process_exit_inner(
-        process,
-        status,
-        &mut signal_post,
-        &mut wake_post,
-    );
+    step_process_exit_inner(process, status, &mut signal_post, &mut wake_post);
 }
 
 fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {

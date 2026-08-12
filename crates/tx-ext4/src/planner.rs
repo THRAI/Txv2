@@ -201,6 +201,15 @@ impl Ext4MappingTable {
         *self.state.lock() = Ext4MappingTableState::default();
     }
 
+    /// Invalidate every derived extent view owned by one inode while leaving
+    /// unrelated live file mappings intact.
+    pub fn remove_object(&self, object: u64) {
+        let mut state = self.state.lock();
+        state.rows.retain(|(found, _), _| *found != object);
+        state.roots.remove(&object);
+        state.nodes.retain(|(found, _), _| *found != object);
+    }
+
     fn resume_token(object: u64, page: u64) -> PagerResumeToken {
         PagerResumeToken::new(object.rotate_left(17) ^ page.rotate_left(31))
     }

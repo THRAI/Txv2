@@ -428,6 +428,11 @@ where
         Ok(mask) => mask,
         Err(result) => return result,
     };
+    let Some(thread_payload) = ctx.thread.payload_cap() else {
+        let _ = set_thread_signal_mask(ctx, old_mask);
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    thread_payload.store_sigsuspend_restore_mask(Some(old_mask));
 
     // Return EINTR for an interrupting signal WITHOUT restoring the pre-suspend
     // mask first. POSIX sigsuspend runs the signal's handler *while the suspend
@@ -440,27 +445,35 @@ where
     // undeliverable: the signal stayed pending, every re-`sigsuspend` saw it
     // again, and the caller span forever (the flaky fs_bind* hang, root-caused
     // by gdb to a busy rt_sigsuspend loop). The pre-suspend mask is re-applied
-    // by the delivered handler's `sigreturn` frame / the caller's own SETMASK
-    // after its wait loop.
-    let restore_and_eintr = |ctx: &SyscallCtx<'_>, old_mask: SignalMask| {
-        let _ = set_thread_signal_mask(ctx, old_mask);
-        SyscallResult::Error(EINTR_VALUE)
-    };
+    // by the delivered handler's `sigreturn` frame. The thread payload carries
+    // `old_mask` separately so the handler itself still runs under the
+    // temporary suspend mask.
+    let return_eintr = || SyscallResult::Error(EINTR_VALUE);
 
     const CHUNK_NS: u64 = 5_000_000;
     loop {
         let timer_registrar = ctx.timer_registrar.as_ref().cloned();
         let timer_mailbox = ctx.mailbox.as_ref().map(alloc::sync::Arc::downgrade);
-        let itimer_deadline_ns = poll_due_itimers_with_post::<P, _>(
+        let registrar = timer_registrar
+            .as_ref()
+            .map(|registrar| registrar as &dyn DeadlineRegistrar);
+        let posix_deadline = poll_due_posix_timers_with_post::<P, _>(
             &ctx.process,
-            timer_registrar
-                .as_ref()
-                .map(|registrar| registrar as &dyn DeadlineRegistrar),
-            timer_mailbox,
-            |mailbox, event| {
-                ctx.post_mailbox_event(mailbox, event);
-            },
+            registrar,
+            timer_mailbox.clone(),
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
         );
+        let itimer_deadline = poll_due_itimers_with_post::<P, _>(
+            &ctx.process,
+            registrar,
+            timer_mailbox,
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+        );
+        let timer_deadline = match (posix_deadline, itimer_deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
         // Interrupt only on a signal that POSIX says should break a blocking
         // syscall — NOT on benign pending signals such as SIGCHLD (default
         // action Ignore), which the shell accrues while reaping the children
@@ -471,15 +484,15 @@ where
         // fs_bind* hang. This is the rt_sigsuspend counterpart of the
         // ppoll/pselect/recv/send/wait4 fix that already switched to
         // `thread_pending_signal_interrupts` (it broke netperf identically).
-        if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
-            return restore_and_eintr(ctx, old_mask);
+        if tx_subsystems::signal::thread_pending_signal_ends_sigsuspend(&ctx.thread) {
+            return return_eintr();
         }
 
         use crate::adapter::step_engine::DriveMode;
         use tx_scripts::drive;
         let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
         let chunk_deadline_ns = now_ns.saturating_add(CHUNK_NS);
-        let park_deadline_ns = itimer_deadline_ns
+        let park_deadline_ns = timer_deadline
             .map(|deadline_ns| deadline_ns.min(chunk_deadline_ns))
             .unwrap_or(chunk_deadline_ns);
         let mut script_ctx = build_subject_script_ctx(ctx);
@@ -504,9 +517,12 @@ where
             Err(v3errno) => {
                 let errno: Errno = v3errno.into();
                 if errno == Errno::EINTR {
-                    return restore_and_eintr(ctx, old_mask);
+                    if tx_subsystems::signal::thread_pending_signal_ends_sigsuspend(&ctx.thread) {
+                        return return_eintr();
+                    }
                 }
                 let _ = set_thread_signal_mask(ctx, old_mask);
+                thread_payload.store_sigsuspend_restore_mask(None);
                 return SyscallResult::error_from(errno);
             }
         }

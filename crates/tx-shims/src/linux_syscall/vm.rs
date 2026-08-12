@@ -9,7 +9,7 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, Errno as V3Errno, StepOutcome};
 use tx_hal::UserPtr;
 use tx_scripts::drive;
-use tx_services::time::{ClockRead, TimekeeperClock, TimekeeperIf, timekeeper, timekeeper_clock};
+use tx_services::time::{timekeeper, timekeeper_clock, ClockRead, TimekeeperClock, TimekeeperIf};
 use tx_substrate::step::DriveMode;
 use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::vm::step_ops::{
@@ -1271,7 +1271,7 @@ where
             use tx_scripts::drive;
             use tx_substrate::step::Deadline;
             use tx_substrate::step::DriveMode;
-            use tx_subsystems::futex::{FUTEX_WAKE_MASK, FutexWaitOp};
+            use tx_subsystems::futex::{FutexWaitOp, FUTEX_WAKE_MASK};
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);

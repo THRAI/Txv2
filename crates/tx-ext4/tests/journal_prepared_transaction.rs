@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tx_ext4::journal::{
     Ext4MutationPlanSource, JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource,
     JournalPagePool, JournalRecordLayout, JournalRing, JournalRingError, MutationJournalImage,
@@ -16,14 +16,20 @@ use tx_ext4_format::pager::JournalGeometry;
 use tx_subsystems::fs_iface::{IoDataLeaseId, IoDataSource, PageFrameRef};
 use tx_subsystems::io_manager::block::{BioVec, BlockOp, DeviceKey, LbaRange};
 
-fn setup() {
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn setup() -> MutexGuard<'static, ()> {
+    let serial = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     tx_test_support::init_host();
     tx_subsystems::zones::register_all().expect("kernel zones");
+    serial
 }
 
 #[test]
 fn journal_page_pool_reuses_record_page_after_lease_drop() {
-    setup();
+    let _serial = setup();
     let pool = JournalPagePool::new(1).unwrap();
     let guard = tx_substrate::epoch::guard();
     let first = pool.stage(&[0; JBD2_BLOCK_SIZE], &guard).unwrap();
@@ -47,7 +53,7 @@ impl Ext4MutationPlanSource for FixedMutationPlan {
 
 #[test]
 fn prepared_transaction_keeps_all_commit_record_leases() {
-    setup();
+    let _serial = setup();
     let image = Jbd2TransactionImage::encode_legacy(
         7,
         [1; 16],
@@ -77,7 +83,7 @@ fn prepared_transaction_keeps_all_commit_record_leases() {
 
 #[test]
 fn prepared_transaction_keeps_every_revoke_page_until_checkpoint_completion() {
-    setup();
+    let _serial = setup();
     let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
     mutation
         .push_metadata(MetadataBlock {
@@ -162,7 +168,7 @@ fn prepared_transaction_keeps_every_revoke_page_until_checkpoint_completion() {
 
 #[test]
 fn prepared_transaction_stages_mutation_data_journal_and_checkpoint_leases() {
-    setup();
+    let _serial = setup();
     let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
     mutation.data.push(SealedDataWrite {
         logical_page: 3,
@@ -221,7 +227,7 @@ fn prepared_transaction_stages_mutation_data_journal_and_checkpoint_leases() {
 
 #[test]
 fn mutation_runtime_stages_plan_into_its_fsync_source() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let runtime = JournalMutationRuntime::new(
         Arc::clone(&source),
@@ -261,7 +267,7 @@ fn mutation_runtime_stages_plan_into_its_fsync_source() {
 
 #[test]
 fn prepared_transaction_uses_l4_owned_data_source_without_copying_it() {
-    setup();
+    let _serial = setup();
     let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
     mutation.data.push(SealedDataWrite {
         logical_page: 0,
@@ -315,7 +321,7 @@ fn prepared_transaction_uses_l4_owned_data_source_without_copying_it() {
 
 #[test]
 fn mutation_runtime_accepts_l4_owned_data_source() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let runtime = JournalMutationRuntime::new(
         Arc::clone(&source),
@@ -363,7 +369,7 @@ fn mutation_runtime_accepts_l4_owned_data_source() {
 
 #[test]
 fn journal_source_commits_only_after_data_graph_completion() {
-    setup();
+    let _serial = setup();
     let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let ring = Arc::new(
         JournalRing::new(
@@ -483,7 +489,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
 
 #[test]
 fn mutation_write_source_stages_l4_data_during_guarded_admission() {
-    setup();
+    let _serial = setup();
     let fsync = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let runtime = Arc::new(JournalMutationRuntime::new(
         Arc::clone(&fsync),
@@ -568,7 +574,7 @@ fn mutation_write_source_stages_l4_data_during_guarded_admission() {
 
 #[test]
 fn mutation_write_source_splits_multi_page_direct_sources_per_data_write() {
-    setup();
+    let _serial = setup();
     let fsync = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let runtime = Arc::new(JournalMutationRuntime::new(
         Arc::clone(&fsync),

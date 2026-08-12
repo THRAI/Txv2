@@ -695,11 +695,7 @@ impl ProcessIdentity {
             .and_then(|payload| payload.install_new_fd_at_least(min, file, cloexec))
     }
 
-    pub fn install_new_fd(
-        &self,
-        file: Cap<crate::vfs::OpenFile>,
-        cloexec: bool,
-    ) -> Option<u32> {
+    pub fn install_new_fd(&self, file: Cap<crate::vfs::OpenFile>, cloexec: bool) -> Option<u32> {
         self.install_new_fd_at_least(0, file, cloexec)
     }
 

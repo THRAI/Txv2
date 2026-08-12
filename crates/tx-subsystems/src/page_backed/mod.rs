@@ -2724,6 +2724,38 @@ impl PageContainer {
         self.page_submission.file_request_data(request.id)
     }
 
+    /// Resolve a completed buffered read back to the target retained by its
+    /// L4 owner.
+    ///
+    /// The block queue may merge adjacent BIOs from different page requests.
+    /// In that case the completed BIO contains several vectors, so selecting
+    /// `plan.vecs.first()` would install the first request's frame for every
+    /// merged page.  The admitted request remains the authoritative mapping
+    /// from page request to destination frame until terminal completion.
+    pub(crate) fn file_io_read_target_for_completion(
+        &self,
+        completion: &BlockPageCompletion,
+    ) -> Option<PageFrameRef> {
+        if completion.block_completion().result.is_err()
+            || !matches!(completion.request().op, PageIoOp::Read | PageIoOp::Readahead)
+        {
+            return None;
+        }
+        match self
+            .page_submission
+            .file_request_data(completion.request().id)
+            .1
+        {
+            IoDataTarget::PageCache {
+                frame,
+                offset: 0,
+                len,
+                ..
+            } if len != 0 => Some(frame),
+            _ => None,
+        }
+    }
+
     fn fail_unsubmitted_file_io_request(&self, request: &PageIoRequest, errno: Errno) {
         self.finish_owned_file_io_request(request, FileIoTerminalResult::SubmitFailure);
         if request.op != PageIoOp::Fsync {
@@ -3860,6 +3892,35 @@ impl PageContainer {
                 page_cache_error_to_errno(PageCacheError::UnsupportedKind).into(),
             );
         }
+        // Persistent anonymous pages are used as private staging storage by
+        // the ext4 journal pool.  Once resident, their binding remains valid
+        // independently of the transient PageSlot state left by the previous
+        // journal I/O.  Re-entering `materialize_page(Read)` here could turn a
+        // perfectly reusable resident frame into EAGAIN while that slot is
+        // completing.  The caller's epoch guard keeps the published binding
+        // alive until the additional cache pin has been acquired.
+        if matches!(
+            self.kind(),
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Persistent
+            }
+        ) {
+            if let Some(hit) = self.lookup_resident_with_guard(guard, page) {
+                let ppn = hit.ppn();
+                let cache_pin = match page_allocator::acquire_cache_pin(ppn) {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        return StepOutcome::Err(
+                            page_cache_error_to_errno(PageCacheError::Alloc(error)).into(),
+                        );
+                    }
+                };
+                return StepOutcome::Done(PageLease {
+                    ppn,
+                    cache_pin: PageCachePin::Allocated(cache_pin),
+                });
+            }
+        }
         match self.materialize_page(page, MaterializeAccess::Read, guard) {
             StepOutcome::Done(materialized) => {
                 let cache_pin = match page_allocator::acquire_cache_pin(materialized.ppn) {
@@ -4853,6 +4914,26 @@ pub fn reserve_frame_with_reclaim(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Allocate one frame and retain it as a transferable page-cache lease.
+///
+/// This is the non-indexed counterpart of installing a frame into a
+/// `PageContainer`: private staging pools that do not need lookup, dirty, or
+/// writeback state can own the returned lease directly and call `retain()` for
+/// each in-flight I/O user.  Avoiding a synthetic PageContainer also avoids an
+/// RCU-root publication for every private staging frame.
+pub fn reserve_page_lease_with_reclaim(policy: ZeroPolicy) -> Result<PageLease, PageCacheError> {
+    let owned = reserve_frame_with_reclaim(policy)
+        .map_err(PageCacheError::Alloc)?
+        .commit();
+    let ppn = owned.ppn();
+    let cache_pin = owned.try_cache_pin().map_err(PageCacheError::Alloc)?;
+    drop(owned);
+    Ok(PageLease {
+        ppn,
+        cache_pin: PageCachePin::Allocated(cache_pin),
+    })
 }
 
 pub fn reclaim_clean_file_pages_if_low() -> usize {

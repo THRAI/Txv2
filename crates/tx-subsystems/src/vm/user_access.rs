@@ -247,8 +247,8 @@ impl AddressSpace {
                 StepOutcome::Err(error) => return Err(error.into()),
                 StepOutcome::Continue { .. } => continue,
                 StepOutcome::Yield { shape, .. } => {
-                    let token = crate::vm::notification::wait_token_from_shape(&shape)
-                        .ok_or(Errno::EIO)?;
+                    let token =
+                        crate::vm::notification::wait_token_from_shape(&shape).ok_or(Errno::EIO)?;
                     if let Some(wait) = crate::wait_source::wait_on_registered_source_id(
                         token.source_id(),
                         token.interest(),

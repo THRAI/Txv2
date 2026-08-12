@@ -163,6 +163,7 @@ where
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
+        let _mutation_guard = self.lock_metadata_mutation_without_flushing();
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
         if let Err(err) = read_frame_bytes(frame, &mut page) {
@@ -220,6 +221,10 @@ where
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let current = match self.inode_meta_cached(inode) {
             Ok(meta) => meta,
             Err(err) => return StepOutcome::err(err.into()),
@@ -246,7 +251,7 @@ where
         fs_object_id: FsObjectId,
         offset: u64,
         len: usize,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if len == 0 {
             return StepOutcome::done(());
@@ -266,6 +271,14 @@ where
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        // A pending extending write owns allocation after-images that have
+        // not reached the pager snapshot yet.  Consume that claim before
+        // planning another page instead of returning the internal EBUSY to a
+        // concurrent userspace write.
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let current = match self.inode_meta_cached(inode) {

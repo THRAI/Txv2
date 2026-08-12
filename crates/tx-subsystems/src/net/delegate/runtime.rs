@@ -132,9 +132,10 @@ where
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
         let wait_token = net_delegate_wait_token();
-        let Some(wait) =
-            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
-        else {
+        let Some(wait) = wait_source::wait_on_registered_source_id(
+            wait_token.source_id(),
+            wait_token.interest(),
+        ) else {
             report.waits_failed += 1;
             break;
         };
@@ -166,9 +167,10 @@ pub async fn net_delegate_task_loop_with_deadline_hook(
         .is_none_or(|max_ready_steps| report.ready_steps < max_ready_steps)
     {
         let wait_token = net_delegate_wait_token();
-        let Some(wait) =
-            wait_source::wait_on_registered_source_id(wait_token.source_id(), wait_token.interest())
-        else {
+        let Some(wait) = wait_source::wait_on_registered_source_id(
+            wait_token.source_id(),
+            wait_token.interest(),
+        ) else {
             report.waits_failed += 1;
             break;
         };

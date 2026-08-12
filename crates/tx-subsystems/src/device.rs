@@ -698,7 +698,7 @@ where
     container.drive_file_block_io_service_once(
         budget,
         &mut adapter,
-        page_frame_ref_for_block_completion,
+        |completion| container.file_io_read_target_for_completion(completion),
         kick,
     )
 }

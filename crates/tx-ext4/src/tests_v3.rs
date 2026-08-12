@@ -50,12 +50,9 @@ use tx_subsystems::io_manager::page::{
     PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
 };
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, MountPayloadPin,
-    SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::page_backed::{
-    step_write, Frame, FsPageBacking, PageContainer, PageContainerKind, PageIndex,
-};
+use tx_subsystems::page_backed::{step_write, Frame, FsPageBacking, PageContainer, PageIndex};
 use tx_subsystems::vfs::structure::{
     DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
     RNode, RNodeBacking,
@@ -1034,7 +1031,7 @@ fn mounted_counting_truncate_free_fs(
     Arc<AtomicUsize>,
 ) {
     let writes = Arc::new(AtomicUsize::new(0));
-    let runtime = mutation_runtime_for_test_with_metadata(sequence, 4, true);
+    let runtime = mutation_runtime_for_test_with_ring(sequence, 4, true);
     let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
         CountingImage {
             image: build_tier1_mount_image(),
@@ -1410,8 +1407,8 @@ fn page_container_for_mounted_file<I>(
     mounted: &crate::mount::MountedExt4<I>,
     fs_object_id: FsObjectId,
     size_bytes: u64,
-    page_count: u64,
-) -> PageContainer
+    _page_count: u64,
+) -> epoch::Cap<PageContainer>
 where
     I: BlockImage + Send + 'static,
 {
@@ -1425,15 +1422,24 @@ where
         SourceLabel::Static("ext4"),
     )
     .expect("ext4 mount payload");
-    let pc = PageContainer::new(
-        PageContainerKind::File {
-            mount: MountPayloadPin::acquire(&epoch::PayloadCap::from_cap(mount)),
-            fs_object_id,
-        },
-        page_count,
-    );
-    pc.set_size_bytes(size_bytes);
-    pc
+    mounted.bind_mount_payload(&mount);
+    let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
+    let mut meta = match mounted.fs_ops().load_inode_meta(fs_object_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load mounted file metadata: {other:?}"),
+    };
+    meta.size = size_bytes;
+    let rnode = match mounted
+        .fs_ops()
+        .materialise_rnode(fs_object_id, meta, &mount, &guard)
+    {
+        V3::Done(rnode) => rnode,
+        other => panic!("materialise mounted file rnode: {other:?}"),
+    };
+    match rnode.backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        other => panic!("mounted regular file has non-page backing: {other:?}"),
+    }
 }
 
 fn open_file_for_page_container(pc: &PageContainer) -> OpenFile {
@@ -2098,7 +2104,7 @@ fn ext4_buffered_extending_write_reserves_before_dirty_and_flushes_without_home_
 }
 
 #[test]
-fn ext4_close_visibility_flush_clears_buffered_write_reservation_for_next_write() {
+fn ext4_next_extending_write_consumes_prior_buffered_reservation() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let guard = epoch::guard();
@@ -2113,23 +2119,24 @@ fn ext4_close_visibility_flush_clears_buffered_write_reservation_for_next_write(
     of.set_offset(5 * BLOCK_SIZE as u64);
     assert_eq!(
         step_write(&pc, &of, 32, &guard),
-        V3::err(V3Errno::EBUSY),
-        "a second extending buffered write reproduces the stale reservation blocker"
+        V3::done(32),
+        "a second extending write must consume, not expose, the prior allocation claim"
     );
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
 
     assert_eq!(
         pc.flush_dirty_pages_for_close_visibility(&guard),
         V3::<(), PageProgress>::done(())
     );
     assert_eq!(mounted.buffered_write_reservation_count_for_test(), 0);
-    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert!(writes.load(Ordering::Acquire) > 0);
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
         tx_subsystems::mount::MountTransactionFrontier::new(25)
     );
 
     assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
-    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 1);
+    assert_eq!(mounted.buffered_write_reservation_count_for_test(), 0);
 }
 
 #[test]
@@ -2878,6 +2885,59 @@ fn checkpoint_settlement_clears_mount_mapping_and_namespace_caches() {
 
     assert_eq!(binding.mapping().len(), 0);
     assert_eq!(fs.cache_entry_counts(), (0, 0, 0));
+}
+
+#[test]
+fn checkpoint_settlement_reseeds_extent_roots_for_live_page_containers() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let (fs, binding) = open_fs_with_io_manager_binding();
+    let payload = MountPayload::new_cap_with_backend_planner(
+        fs.clone().fs_ops_arc(),
+        fs.clone().fs_page_backing_arc(),
+        None,
+        DevId::new(91),
+        MountOptions::default(),
+        "ext4",
+        SourceLabel::Static("settlement-live-page-container"),
+        Some(binding.planner()),
+    )
+    .expect("ext4 mount payload");
+    fs.bind_mount_payload(&payload);
+    let guard = epoch::guard();
+    let file_id = FsObjectId::new(12);
+    let fs_ops = fs.clone().fs_ops_arc();
+    let meta = match fs_ops.load_inode_meta(file_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load inode meta: {other:?}"),
+    };
+    let rnode = match fs_ops.materialise_rnode(file_id, meta, &payload, &guard) {
+        V3::Done(rnode) => rnode,
+        other => panic!("materialise live file: {other:?}"),
+    };
+    assert!(matches!(rnode.backing(), RNodeBacking::PageBacked { .. }));
+
+    fs.settle_metadata_caches();
+
+    let request = BackendPageRequest::new_with_source_and_target(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(42),
+        PageIoRange::new(0, 1),
+        PageIoOp::Read,
+        PageIoFlags::DEMAND,
+        Some(PageGeneration::new(1)),
+        IoDataSource::None,
+        IoDataTarget::page_cache(
+            IoDataLeaseId::new(2),
+            PageFrameRef::new(tx_hal::Ppn(0x43)),
+            0,
+            BLOCK_SIZE as u32,
+        ),
+    );
+    let BackendPlan::SubmitBios(bios) = binding.planner().plan_page_io(request) else {
+        panic!("settlement must preserve planning for a live file page container");
+    };
+    assert_eq!(bios.as_slice()[0].lba.start_lba(), 20 * 8);
 }
 
 #[test]

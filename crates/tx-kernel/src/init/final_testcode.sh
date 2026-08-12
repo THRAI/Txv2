@@ -54,20 +54,16 @@ run_cagent_diag() {
     cd "$TEST_BASE" || return 1
     echo "TX_FINAL_INIT cagent-diag=start base=$TEST_BASE script=$TEST_SCRIPT"
 
-    # Keep the official workload and timing unchanged.  The diagnostic copy
-    # only exposes output which the official script normally deletes after a
-    # rejected case.
+    # Keep the official cases, commands and timing unchanged, but retain the
+    # rejected command output long enough to diagnose it.  Put only this tiny
+    # script copy on tmpfs so creating the diagnostic itself does not exercise
+    # the ext4 path under investigation; case output still uses official /tmp.
+    cagent_diag_script=/dev/shm/cagent_testcode_diag.sh
     /bin/sed \
-        -e 's@^[[:space:]]*timeout ${timeout}s@    echo "===== CAGENT_DIAG_CASE_START name=$test_name shell_pid=$BASHPID timeout_s=$timeout ====="; timeout ${timeout}s@' \
-        -e 's@^[[:space:]]*local exit_code=$?@    local exit_code=$?; echo "===== CAGENT_DIAG_CASE_RETURN name=$test_name exit=$exit_code ====="@' \
-        -e 's@^[[:space:]]*rm -f "$output_file"$@    if [ "$success" -ne 1 ]; then echo "===== CAGENT_DIAG_FAIL name=$test_name exit=$exit_code duration_ms=$duration ====="; cat "$output_file"; echo "===== CAGENT_DIAG_FAIL_END name=$test_name ====="; fi; rm -f "$output_file"@' \
-        "$TEST_SCRIPT" > /tmp/cagent_testcode_diag.sh
-    if ! /bin/grep -q CAGENT_DIAG_FAIL /tmp/cagent_testcode_diag.sh; then
-        echo "TX_FINAL_INIT cagent-diag=instrumentation-failed"
-        return 126
-    fi
-
-    /bin/bash /tmp/cagent_testcode_diag.sh &
+        -e 's@    local exit_code=$?@    local exit_code=$?; echo "===== CAGENT_DIAG_CASE name=${test_name} exit=${exit_code} ====="@' \
+        -e 's@    rm -f "$output_file"@    if [ "$success" -ne 1 ]; then echo "===== CAGENT_DIAG_FAIL_BEGIN name=${test_name} ====="; /bin/cat "$output_file"; echo "===== CAGENT_DIAG_FAIL_END name=${test_name} ====="; fi; rm -f "$output_file"@' \
+        "$TEST_SCRIPT" > "$cagent_diag_script" || return 1
+    /bin/bash "$cagent_diag_script" &
     cagent_suite_pid=$!
 
     # The official cases have 20-35 second timeouts.  Do not start ps/tail/cat

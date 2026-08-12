@@ -15,8 +15,8 @@ use tx_ext4_format::journal::{
 use tx_ext4_format::mutation::Ext4MutationPlan;
 use tx_ext4_format::pager::{JournalGeometry, Page4K};
 use tx_ext4_format::Ext4FormatError;
-use tx_substrate::zone::Cap;
-use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_substrate::page_allocator::ZeroPolicy;
+use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::fs_iface::{
     BackendBioDependency, BackendBioGraph, BackendBioGraphError, BackendBioNode, BackendBioNodeId,
     BackendPageCompletion, BackendPageRequest, BackendPlan, IoDataLeaseId, IoDataSource,
@@ -26,8 +26,7 @@ use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, Dev
 use tx_subsystems::io_manager::page::PageIoOp;
 use tx_subsystems::mount::MountTransactionFrontier;
 use tx_subsystems::page_backed::{
-    AnonSwapPolicy, MaterializeAccess, PageCacheError, PageContainer, PageContainerKind, PageIndex,
-    PageLease,
+    reserve_page_lease_with_reclaim, PageCacheError, PageIndex, PageLease,
 };
 
 pub use crate::mutation_lifecycle::{JournalFsyncSource, JournalSettlementObserver};
@@ -433,11 +432,13 @@ impl JournalRecordLease {
 
 /// Private persistent metadata pages used for journal descriptor/data/commit records.
 ///
-/// A pool page is allocated once and remains owned by the PageContainer. Each
-/// staged record additionally carries a `PageLease`; callers retain that lease
-/// through graph completion before allowing the record to be recycled.
+/// The pool owns one base `PageLease` per frame. Each staged record retains a
+/// second lease through graph completion before allowing the index to be
+/// recycled. These frames need no page-cache lookup or dirty-state semantics,
+/// so keeping them out of a synthetic PageContainer also avoids one RCU-root
+/// publication per journal page.
 pub struct JournalPagePool {
-    pages: Cap<PageContainer>,
+    pages: Vec<PageLease>,
     next_page: AtomicU64,
     free: Arc<SpinMutex<Vec<PageIndex>>>,
 }
@@ -471,13 +472,18 @@ impl JournalPagePool {
         if tx_subsystems::vm::USER_PAGE_SIZE != JBD2_BLOCK_SIZE {
             return Err(JournalPagePoolError::UnsupportedPageSize);
         }
-        let pages = PageContainer::new_cap(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Persistent,
-            },
-            page_capacity,
-        )
-        .map_err(|_| JournalPagePoolError::Zone)?;
+        let capacity =
+            usize::try_from(page_capacity).map_err(|_| JournalPagePoolError::Capacity)?;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(capacity)
+            .map_err(|_| JournalPagePoolError::Capacity)?;
+        for _ in 0..capacity {
+            pages.push(
+                reserve_page_lease_with_reclaim(ZeroPolicy::Zeroed)
+                    .map_err(JournalPagePoolError::Page)?,
+            );
+        }
         Ok(Self {
             pages,
             next_page: AtomicU64::new(0),
@@ -487,10 +493,8 @@ impl JournalPagePool {
 
     fn ensure_capacity(&self, required: u64) -> Result<(), JournalPagePoolError> {
         let free = self.free.lock().len() as u64;
-        let fresh = self
-            .pages
-            .page_count()
-            .saturating_sub(self.next_page.load(Ordering::Acquire));
+        let fresh =
+            (self.pages.len() as u64).saturating_sub(self.next_page.load(Ordering::Acquire));
         if free.saturating_add(fresh) < required {
             return Err(JournalPagePoolError::Capacity);
         }
@@ -500,47 +504,38 @@ impl JournalPagePool {
     pub fn stage(
         &self,
         bytes: &[u8; JBD2_BLOCK_SIZE],
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> Result<JournalRecordLease, JournalPagePoolError> {
         let page = self
             .free
             .lock()
             .pop()
             .unwrap_or_else(|| PageIndex::new(self.next_page.fetch_add(1, Ordering::AcqRel)));
-        if page.as_u64() >= self.pages.page_count() {
+        let Some(base_lease) = self.pages.get(page.as_u64() as usize) else {
             return Err(JournalPagePoolError::Capacity);
-        }
-
-        let materialized = self
-            .pages
-            .materialize_anon(page, MaterializeAccess::Write)
-            .map_err(JournalPagePoolError::Page)?;
-        let address = tx_substrate::page_allocator::frame_kernel_addr(materialized.ppn)
-            .map_err(|_| JournalPagePoolError::FrameAddress)?;
-        // `materialized.map_pin` keeps this page live and mapped until the copy
-        // finishes. The PC's cache pin owns the frame afterwards.
+        };
+        let lease = match base_lease.retain() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.free.lock().push(page);
+                return Err(JournalPagePoolError::Page(error));
+            }
+        };
+        let address = match tx_substrate::page_allocator::frame_kernel_addr(lease.ppn()) {
+            Ok(address) => address,
+            Err(_) => {
+                self.free.lock().push(page);
+                return Err(JournalPagePoolError::FrameAddress);
+            }
+        };
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), address, JBD2_BLOCK_SIZE);
         }
-        drop(materialized);
-
-        match self.pages.export_page_lease(page, guard) {
-            StepOutcome::Done(lease) => Ok(JournalRecordLease {
-                page,
-                lease,
-                free: Arc::clone(&self.free),
-            }),
-            StepOutcome::Err(errno) => {
-                self.free.lock().push(page);
-                Err(JournalPagePoolError::Page(PageCacheError::Backend(
-                    errno.into(),
-                )))
-            }
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                self.free.lock().push(page);
-                Err(JournalPagePoolError::WouldBlock)
-            }
-        }
+        Ok(JournalRecordLease {
+            page,
+            lease,
+            free: Arc::clone(&self.free),
+        })
     }
 }
 
@@ -861,6 +856,7 @@ pub struct MutationBlockWrite {
 /// the owned bytes in page leases through durable commit completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationJournalImage {
+    pub object: u64,
     pub layout: MutationJournalLayout,
     pub image: Jbd2TransactionImage,
     pub data_writes: Vec<MutationBlockWrite>,
@@ -927,6 +923,7 @@ impl MutationJournalImage {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            object: mutation.object,
             image: Jbd2TransactionImage::encode_legacy_with_revokes(
                 layout.sequence,
                 layout.journal_uuid,
@@ -948,6 +945,7 @@ pub enum PreparedJournalTransactionError {
 }
 
 pub struct PreparedJournalTransaction {
+    object: Option<u64>,
     plan: JournalTransactionPlan,
     records: Vec<JournalRecordLease>,
 }
@@ -1058,6 +1056,10 @@ impl<T> Default for JournalTransactionState<T> {
 }
 
 impl PreparedJournalTransaction {
+    pub fn object(&self) -> Option<u64> {
+        self.object
+    }
+
     pub fn sequence(&self) -> u32 {
         self.plan.sequence()
     }
@@ -1072,6 +1074,7 @@ impl PreparedJournalTransaction {
         data_sources: Vec<IoDataSource>,
         guard: &Guard<'_>,
     ) -> Result<Self, PreparedJournalTransactionError> {
+        let object = mutation.object;
         if mutation.data_writes.len() != data_sources.len()
             || mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len()
             || mutation.layout.records.revokes.len() != mutation.image.revokes.len()
@@ -1162,7 +1165,11 @@ impl PreparedJournalTransaction {
         if let Some((activation, clean)) = superblock_state {
             plan = plan.with_superblock_state(activation, clean);
         }
-        Ok(Self { plan, records })
+        Ok(Self {
+            object: Some(object),
+            plan,
+            records,
+        })
     }
 
     /// Stage a complete immutable ext4 mutation into owned pool pages.
@@ -1175,6 +1182,7 @@ impl PreparedJournalTransaction {
         mutation: MutationJournalImage,
         guard: &Guard<'_>,
     ) -> Result<Self, PreparedJournalTransactionError> {
+        let object = mutation.object;
         if mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len()
             || mutation.layout.records.revokes.len() != mutation.image.revokes.len()
         {
@@ -1273,7 +1281,11 @@ impl PreparedJournalTransaction {
         if let Some((activation, clean)) = superblock_state {
             plan = plan.with_superblock_state(activation, clean);
         }
-        Ok(Self { plan, records })
+        Ok(Self {
+            object: Some(object),
+            plan,
+            records,
+        })
     }
 
     pub fn stage(
@@ -1333,7 +1345,11 @@ impl PreparedJournalTransaction {
             checkpoint_writes,
         )
         .map_err(PreparedJournalTransactionError::Plan)?;
-        Ok(Self { plan, records })
+        Ok(Self {
+            object: None,
+            plan,
+            records,
+        })
     }
 
     pub fn plan(&self) -> &JournalTransactionPlan {
@@ -1420,6 +1436,22 @@ pub trait Ext4MutationPlanSource: Send + Sync + 'static {
         &self,
         request: &BackendPageRequest,
     ) -> Result<Ext4MutationPlan, Errno>;
+
+    /// Keep the default for format-only providers.  Mount-backed providers
+    /// override this to make pager planning, journal admission, and pager
+    /// after-image publication one serialised operation.
+    fn admit_writeback_mutation(
+        &self,
+        request: &BackendPageRequest,
+        data_sources: Vec<IoDataSource>,
+        runtime: &JournalMutationRuntime,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        let mutation = self.plan_writeback_mutation(request)?;
+        runtime
+            .begin_mutation_with_data_sources(&mutation, data_sources, guard)
+            .map_err(journal_mutation_runtime_errno)
+    }
 }
 
 /// Bridges a pure ext4 mutation planner to the mount-local JBD2 runtime.
@@ -1447,12 +1479,10 @@ impl<P: Ext4MutationPlanSource> Ext4WritePlanSource for JournalMutationWriteSour
         if request.op != PageIoOp::Writeback || matches!(request.source, IoDataSource::None) {
             return Err(Errno::EINVAL);
         }
-        let mutation = self.planner.plan_writeback_mutation(request)?;
         let data_sources =
             split_writeback_data_sources(&request.source, request.range.page_count())?;
-        self.runtime
-            .begin_mutation_with_data_sources(&mutation, data_sources, guard)
-            .map_err(journal_mutation_runtime_errno)
+        self.planner
+            .admit_writeback_mutation(request, data_sources, &self.runtime, guard)
     }
 
     fn plan_writeback(

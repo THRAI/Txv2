@@ -619,9 +619,12 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     };
     let siginfo_record = process.siginfo_take(sig);
 
-    let old_mask = payload.signal_mask();
-    payload.store_saved_signal_mask(Some(old_mask));
-    let mut new_mask = old_mask.union(action.sa_mask);
+    let handler_base_mask = payload.signal_mask();
+    let return_mask = payload
+        .take_sigsuspend_restore_mask()
+        .unwrap_or(handler_base_mask);
+    payload.store_saved_signal_mask(Some(return_mask));
+    let mut new_mask = handler_base_mask.union(action.sa_mask);
     if !action
         .flags
         .contains(tx_subsystems::signal::SaFlags::NODEFER)
@@ -651,7 +654,7 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
         sig_no: sig.raw() as u32,
         siginfo,
         old_mask: tx_hal::UserSignalMaskAbi {
-            bits: old_mask.raw_bits(),
+            bits: return_mask.raw_bits(),
         },
         flags: tx_hal::UserSaFlagsAbi {
             bits: action.flags.bits(),
@@ -1310,7 +1313,28 @@ fn vm_fault_error_label(error: tx_subsystems::vm::VmFaultError) -> &'static str 
         tx_subsystems::vm::VmFaultError::BackingMismatch => "backing-mismatch",
         tx_subsystems::vm::VmFaultError::BackingOffsetOverflow => "backing-offset-overflow",
         tx_subsystems::vm::VmFaultError::PageBeyondSize => "page-beyond-size",
-        tx_subsystems::vm::VmFaultError::PageCache(_) => "page-cache",
+        tx_subsystems::vm::VmFaultError::PageCache(error) => match error {
+            tx_subsystems::page_backed::PageCacheError::Backend(
+                crate::adapter::step_engine::Errno::EAGAIN,
+            ) => "page-cache-eagain",
+            tx_subsystems::page_backed::PageCacheError::Backend(
+                crate::adapter::step_engine::Errno::EIO,
+            ) => "page-cache-eio",
+            tx_subsystems::page_backed::PageCacheError::Backend(
+                crate::adapter::step_engine::Errno::ENOSYS,
+            ) => "page-cache-enosys",
+            tx_subsystems::page_backed::PageCacheError::Backend(_) => "page-cache-backend",
+            tx_subsystems::page_backed::PageCacheError::Alloc(_) => "page-cache-alloc",
+            tx_subsystems::page_backed::PageCacheError::OutOfBounds => "page-cache-bounds",
+            tx_subsystems::page_backed::PageCacheError::UnsupportedKind => "page-cache-unsupported",
+            tx_subsystems::page_backed::PageCacheError::AlreadyPresent { .. } => {
+                "page-cache-present"
+            }
+            tx_subsystems::page_backed::PageCacheError::MissingPage => "page-cache-missing",
+            tx_subsystems::page_backed::PageCacheError::MismatchedFrame { .. } => {
+                "page-cache-mismatch"
+            }
+        },
         tx_subsystems::vm::VmFaultError::StaleRecipe => "stale-recipe",
         tx_subsystems::vm::VmFaultError::SpecialUnavailable => "special-unavailable",
         tx_subsystems::vm::VmFaultError::Pmap(error) => match error {

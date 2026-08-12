@@ -263,10 +263,11 @@ fn checksummed_journal_superblock_accepts_a_valid_checksum() {
     let mut page = geometry_with_superblock_page().superblock_page.unwrap();
     page[40..44].copy_from_slice(&0x0000_0008u32.to_be_bytes());
     page[0x50] = 4;
+    page[1024..].fill(0xA5);
     page[0xFC..0x100].fill(0);
     let checksum = crc32c_append(
         crc32c_append(crc32c_append(0xFFFF_FFFF, &page[..0xFC]), &[0; 4]),
-        &page[0x100..],
+        &page[0x100..1024],
     );
     page[0xFC..0x100].copy_from_slice(&checksum.to_be_bytes());
 

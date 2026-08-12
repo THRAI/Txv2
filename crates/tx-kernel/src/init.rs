@@ -1080,7 +1080,8 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         use tx_fs::tx_ext4::{
-            mount_ext4_read_only, mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
+            discovered_mount_stage, mount_ext4_read_only,
+            mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
             Ext4FileIoRuntimeBinder, JournalPagePool,
         };
         use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
@@ -1145,18 +1146,21 @@ impl<P: TxPlatform> CoreInit<P> {
                 return false;
             }
         };
-        let mount_output = match mount_ext4_read_write_with_discovered_journal(
-            image, geometry, device, pool,
-        ) {
-            Ok(out) => out,
-            Err(_) => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
-                tx_hal::console_write_str::<P>(dev_name);
-                tx_hal::console_write_str::<P>(":err\n");
-                return false;
-            }
-        };
+        let mount_output =
+            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
+                Ok(out) => out,
+                Err(error) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                    tx_hal::console_write_str::<P>(dev_name);
+                    tx_hal::console_write_str::<P>(":err:stage=");
+                    Self::write_decimal_unsigned(discovered_mount_stage() as usize);
+                    tx_hal::console_write_str::<P>(":errno=");
+                    Self::write_decimal_unsigned(error.linux_i32() as usize);
+                    tx_hal::console_write_str::<P>("\n");
+                    return false;
+                }
+            };
         mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
             Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
         )));
@@ -1398,40 +1402,42 @@ impl<P: TxPlatform> CoreInit<P> {
             .payload_cap()
             .expect("rootfs payload alive during boot")
             .into_cap();
-        let (dev_object_id, dev_meta) = match root_payload
-            .fs_ops
-            .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
-        {
-            V3::Done(out) => out,
-            V3::Err(step_engine::Errno::EEXIST) => {
-                let dev_object_id =
-                    match root_payload.fs_ops.lookup(root_fs_object_id, b"dev", &guard) {
-                        V3::Done(id) => id,
-                        other => {
-                            panic!("mount_devfs_at_dev: lookup(/dev) after EEXIST: {other:?}")
-                        }
+        let (dev_object_id, dev_meta) =
+            match root_payload
+                .fs_ops
+                .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
+            {
+                V3::Done(out) => out,
+                V3::Err(step_engine::Errno::EEXIST) => {
+                    let dev_object_id =
+                        match root_payload
+                            .fs_ops
+                            .lookup(root_fs_object_id, b"dev", &guard)
+                        {
+                            V3::Done(id) => id,
+                            other => {
+                                panic!("mount_devfs_at_dev: lookup(/dev) after EEXIST: {other:?}")
+                            }
+                        };
+                    let dev_meta = match root_payload.fs_ops.load_inode_meta(dev_object_id, &guard)
+                    {
+                        V3::Done(meta) => meta,
+                        other => panic!(
+                            "mount_devfs_at_dev: load_inode_meta(/dev) after EEXIST: {other:?}"
+                        ),
                     };
-                let dev_meta = match root_payload
-                    .fs_ops
-                    .load_inode_meta(dev_object_id, &guard)
-                {
-                    V3::Done(meta) => meta,
-                    other => panic!(
-                        "mount_devfs_at_dev: load_inode_meta(/dev) after EEXIST: {other:?}"
-                    ),
-                };
-                assert_eq!(
-                    dev_meta.kind(),
-                    tx_subsystems::vfs::InodeKind::Directory,
-                    "mount_devfs_at_dev: existing /dev is not a directory"
-                );
-                (dev_object_id, dev_meta)
-            }
-            V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
-                (root_fs_object_id, root_mount.root().meta())
-            }
-            other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
-        };
+                    assert_eq!(
+                        dev_meta.kind(),
+                        tx_subsystems::vfs::InodeKind::Directory,
+                        "mount_devfs_at_dev: existing /dev is not a directory"
+                    );
+                    (dev_object_id, dev_meta)
+                }
+                V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                    (root_fs_object_id, root_mount.root().meta())
+                }
+                other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
+            };
         drop(guard);
 
         // Build the `/dev` mountpoint DEntry on the rootfs.

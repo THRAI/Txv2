@@ -3,7 +3,9 @@ use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak as ZoneWeak};
+use crate::adapter::step_engine::{
+    self as step_engine, Cap, Guard, PayloadCap, SpinMutex, Weak as ZoneWeak,
+};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec;
@@ -14,10 +16,11 @@ use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, BLOCK_SIZE,
 };
 use tx_ext4_format::Ext4FormatError;
+use tx_substrate::SpinMutexGuard;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner, IoDataSource};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
-use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
+use tx_subsystems::page_backed::{PageContainer, PageContainerKind, PageIndex};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -111,6 +114,28 @@ where
             )
         })
     }
+
+    fn admit_writeback_mutation(
+        &self,
+        request: &BackendPageRequest,
+        data_sources: Vec<IoDataSource>,
+        runtime: &JournalMutationRuntime,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        let backend = self
+            .backend
+            .lock()
+            .as_ref()
+            .and_then(ArcWeak::upgrade)
+            .ok_or(Errno::EIO)?;
+        // This request is itself consuming a buffered-write claim, so it must
+        // not recursively flush reservations while acquiring the plan gate.
+        let _mutation_guard = backend.lock_metadata_mutation_without_flushing();
+        let mutation = self.plan_writeback_mutation(request)?;
+        backend
+            .begin_metadata_mutation_with_data_sources(runtime, &mutation, data_sources, guard)
+            .map_err(crate::namespace::journal_mutation_runtime_errno)
+    }
 }
 
 fn validate_multi_page_write_source(source: &IoDataSource, page_count: u64) -> Result<(), Errno> {
@@ -150,6 +175,12 @@ pub(crate) struct Ext4FsInstance<I> {
     file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
     file_page_containers: SpinMutex<BTreeMap<FsObjectId, ZoneWeak<PageContainer>>>,
     metadata_mutation_runtime: SpinMutex<Option<Arc<JournalMutationRuntime>>>,
+    /// Serialises the authoritative pager snapshot used to plan a mutation
+    /// with admission of that plan into the journal runtime.  Locking only
+    /// the pager while planning is insufficient: another hart could otherwise
+    /// plan from the same allocation bitmap before the first plan's
+    /// after-images have been staged.
+    metadata_mutation_gate: SpinMutex<()>,
     buffered_write_reservations: SpinMutex<BTreeMap<(u32, u64), Ext4MutationPlan>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
@@ -195,6 +226,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             file_page_container_binder: SpinMutex::new(None),
             file_page_containers: SpinMutex::new(BTreeMap::new()),
             metadata_mutation_runtime: SpinMutex::new(None),
+            metadata_mutation_gate: SpinMutex::new(()),
             buffered_write_reservations: SpinMutex::new(BTreeMap::new()),
             read_only: AtomicBool::new(read_only),
             legacy_writeback_enabled: AtomicBool::new(true),
@@ -281,6 +313,147 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         self.metadata_mutation_runtime.lock().clone()
     }
 
+    /// Flush every pre-admitted extending write before a namespace mutation
+    /// takes its pager snapshot.  A reservation contains allocation
+    /// after-images which have deliberately not yet been staged; planning a
+    /// create/unlink beside it could otherwise reuse the same free blocks.
+    fn flush_buffered_write_reservations(&self, guard: &Guard<'_>) -> Result<(), Errno>
+    where
+        I: Send + 'static,
+    {
+        #[allow(unused_labels)]
+        'drain: loop {
+            let reservations = self
+                .buffered_write_reservations
+                .lock()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            if reservations.is_empty() {
+                return Ok(());
+            }
+
+            let containers = {
+                let mut index = self.file_page_containers.lock();
+                let mut containers = Vec::new();
+                index.retain(|fs_object_id, weak| {
+                    let Some(container) = weak.upgrade(guard) else {
+                        return false;
+                    };
+                    containers.push((*fs_object_id, container));
+                    true
+                });
+                containers
+            };
+
+            let before = reservations.len();
+            for (inode, file_page_index) in reservations {
+                let object = FsObjectId::new(inode as u64);
+                let Some((_, container)) = containers
+                    .iter()
+                    .find(|(fs_object_id, _)| *fs_object_id == object)
+                else {
+                    // A few unit fixtures construct a raw PageContainer
+                    // instead of materialising it through this backend, so no
+                    // weak entry exists to drive.  Production PageContainers
+                    // are always registered by `materialise_rnode`.
+                    #[cfg(test)]
+                    {
+                        self.clear_buffered_write_reservation(InodeNo::new(inode), file_page_index);
+                        continue;
+                    }
+                    #[cfg(not(test))]
+                    {
+                        // A production file write is issued through a
+                        // materialised RNode.  A missing weak upgrade can only
+                        // be the short hand-off in which that RNode is still
+                        // being published by another hart; do not surface the
+                        // internal allocation claim as userspace EBUSY.
+                        core::hint::spin_loop();
+                        continue 'drain;
+                    }
+                };
+                let Some(_ppn) = container.lookup(PageIndex::new(file_page_index)) else {
+                    // `prepare_write_range` publishes the reservation before
+                    // PageBacked marks the page dirty.  Let that tiny window
+                    // finish instead of planning against an unstaged claim.
+                    #[cfg(test)]
+                    {
+                        self.clear_buffered_write_reservation(InodeNo::new(inode), file_page_index);
+                        continue;
+                    }
+                    #[cfg(not(test))]
+                    {
+                        // `prepare_write_range` publishes the claim just
+                        // before PageBacked installs the resident page.  The
+                        // owner runs on another hart, so wait for that bounded
+                        // publication window and then consume the claim.  An
+                        // allocation-serialization detail must never leak to
+                        // write(2) as EBUSY.
+                        core::hint::spin_loop();
+                        continue 'drain;
+                    }
+                };
+                let page = PageIndex::new(file_page_index);
+                if !container.page_marks(page).is_some_and(|marks| marks.dirty) {
+                    // Installation precedes the copy-and-dirty publication in
+                    // PageBacked. Flushing the newly installed zero frame in
+                    // that window would clear the allocation claim but leave
+                    // the subsequent user bytes dirty and cause a duplicate
+                    // writeback. Wait until the complete write is visible.
+                    #[cfg(test)]
+                    {
+                        self.clear_buffered_write_reservation(InodeNo::new(inode), file_page_index);
+                        continue;
+                    }
+                    #[cfg(not(test))]
+                    {
+                        core::hint::spin_loop();
+                        continue 'drain;
+                    }
+                }
+                match container.flush_dirty_pages_for_close_visibility(guard) {
+                    step_engine::StepOutcome::Done(()) => {}
+                    step_engine::StepOutcome::Err(errno) => return Err(errno.into()),
+                    step_engine::StepOutcome::Continue { .. }
+                    | step_engine::StepOutcome::Yield { .. } => return Err(Errno::EBUSY),
+                }
+            }
+
+            let after = self.buffered_write_reservations.lock().len();
+            if after == 0 {
+                return Ok(());
+            }
+            if after >= before {
+                return Err(Errno::EBUSY);
+            }
+        }
+    }
+
+    /// Acquire the plan/admission gate only after all buffered allocation
+    /// claims have become journal-owned.  The reservation check is repeated
+    /// while holding the gate to close the race with `prepare_write_range`.
+    pub(crate) fn lock_metadata_mutation<'a>(
+        &'a self,
+        guard: &Guard<'_>,
+    ) -> Result<SpinMutexGuard<'a, ()>, Errno>
+    where
+        I: Send + 'static,
+    {
+        loop {
+            self.flush_buffered_write_reservations(guard)?;
+            let mutation_guard = self.metadata_mutation_gate.lock();
+            if self.buffered_write_reservations.lock().is_empty() {
+                return Ok(mutation_guard);
+            }
+            drop(mutation_guard);
+        }
+    }
+
+    pub(crate) fn lock_metadata_mutation_without_flushing(&self) -> SpinMutexGuard<'_, ()> {
+        self.metadata_mutation_gate.lock()
+    }
+
     pub(crate) fn begin_metadata_mutation(
         &self,
         runtime: &JournalMutationRuntime,
@@ -307,6 +480,33 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             self.settle_metadata_mutation(runtime)
                 .map_err(JournalMutationRuntimeError::Settlement)?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn begin_metadata_mutation_with_data_sources(
+        &self,
+        runtime: &JournalMutationRuntime,
+        mutation: &Ext4MutationPlan,
+        data_sources: Vec<IoDataSource>,
+        guard: &Guard<'_>,
+    ) -> Result<(), JournalMutationRuntimeError>
+    where
+        I: Send + 'static,
+    {
+        match runtime.begin_mutation_with_data_sources(mutation, data_sources.clone(), guard) {
+            Ok(()) => {}
+            Err(JournalMutationRuntimeError::Busy(_)) => {
+                self.settle_metadata_mutation(runtime)
+                    .map_err(JournalMutationRuntimeError::Settlement)?;
+                runtime.begin_mutation_with_data_sources(mutation, data_sources, guard)?;
+            }
+            Err(error) => return Err(error),
+        }
+        self.with_pager(|pager| {
+            pager.stage_mutation_after_images(mutation);
+            Ok(())
+        })
+        .map_err(JournalMutationRuntimeError::Settlement)?;
         Ok(())
     }
 
@@ -441,6 +641,22 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(meta)
     }
 
+    /// Seed the L5 extent mapper for an inode whose RNode may remain live
+    /// without another `load_inode_meta` call.  This is especially important
+    /// for newly-created files: their create transaction settles before VFS
+    /// materialises the RNode, so checkpoint-time refresh cannot see them yet.
+    pub(crate) fn refresh_extent_mapping(&self, inode: InodeNo) -> Result<(), Errno> {
+        let Some(mapping) = self.extent_mapping.as_ref() else {
+            return Ok(());
+        };
+        let (meta, extent_root) =
+            self.with_pager(|pager| pager.inode_meta_and_extent_root(inode))?;
+        if meta.mode & 0xF000 == 0x8000 {
+            mapping.insert_extent_root(inode.get() as u64, &extent_root)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_dir_entries_cached(
         &self,
         inode: InodeNo,
@@ -492,17 +708,53 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     /// remaining mapping and namespace caches are only accelerators and must
     /// not survive a checkpoint that can change inode, directory, or extent
     /// metadata.
-    pub(crate) fn settle_metadata_caches(&self) {
+    fn settle_metadata_caches_for(&self, object: Option<FsObjectId>) {
         let _ = self.with_pager(|pager| {
             pager.settle_image_cache();
             Ok(())
         });
         if let Some(mapping) = self.extent_mapping.as_ref() {
-            mapping.clear();
+            match object {
+                Some(object) => mapping.remove_object(object.as_u64()),
+                None => mapping.clear(),
+            }
+
+            // Checkpoint settlement invalidates the affected extent views, but
+            // live RNodes keep their PageContainers across that boundary. A
+            // later fault on one of those containers does not rematerialise
+            // the inode and therefore cannot rely on load_inode_meta() to seed
+            // its inline extent root again. Refresh only the affected live
+            // containers before publishing the settled state.
+            let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+            let live_files = {
+                let mut index = self.file_page_containers.lock();
+                let mut live = Vec::new();
+                index.retain(|fs_object_id, weak| {
+                    if object.is_some_and(|object| object != *fs_object_id) {
+                        return true;
+                    }
+                    let Some(container) = weak.upgrade(&guard) else {
+                        return false;
+                    };
+                    live.push((*fs_object_id, container));
+                    true
+                });
+                live
+            };
+            for (fs_object_id, _container) in live_files {
+                let Ok(inode) = inode_no(fs_object_id) else {
+                    continue;
+                };
+                let _ = self.refresh_extent_mapping(inode);
+            }
         }
         *self.lookup_cache.lock() = LookupCache::empty();
         *self.dir_cache.lock() = DirCache::empty();
         *self.inode_meta_cache.lock() = InodeMetaCache::empty();
+    }
+
+    pub(crate) fn settle_metadata_caches(&self) {
+        self.settle_metadata_caches_for(None);
     }
 
     #[cfg(test)]
@@ -531,8 +783,8 @@ impl<I: BlockImage> Ext4FsInstance<I> {
 }
 
 impl<I: BlockImage + Send + 'static> JournalSettlementObserver for Ext4FsInstance<I> {
-    fn settle_after_checkpoint(&self) {
-        self.settle_metadata_caches();
+    fn settle_after_checkpoint(&self, object: Option<u64>) {
+        self.settle_metadata_caches_for(object.map(FsObjectId::new));
     }
 }
 

@@ -2,6 +2,7 @@ use core::marker::Send;
 
 use crate::adapter::step_engine::Cap;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU8, Ordering};
 use tx_ext4_format::pager::BlockImage;
 use tx_ext4_format::pager::Ext4Pager;
 use tx_ext4_format::{
@@ -29,6 +30,15 @@ pub struct MountedExt4<I> {
     backend: Arc<Ext4FsInstance<I>>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
+}
+
+static DISCOVERED_MOUNT_STAGE: AtomicU8 = AtomicU8::new(0);
+
+/// Last completed stage of the discovered-journal mount path.  This remains a
+/// compact boot diagnostic because all format-layer failures intentionally
+/// collapse to `EIO` at the public mount boundary.
+pub fn discovered_mount_stage() -> u8 {
+    DISCOVERED_MOUNT_STAGE.load(Ordering::Acquire)
 }
 
 impl<I> MountedExt4<I>
@@ -206,18 +216,26 @@ pub fn mount_ext4_read_write_with_discovered_journal<I>(
 where
     I: BlockImage + Send + 'static,
 {
+    DISCOVERED_MOUNT_STAGE.store(1, Ordering::Release);
     validate_tier1_rw_profile(&image)?;
+    DISCOVERED_MOUNT_STAGE.store(2, Ordering::Release);
     let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
     let superblock = pager.superblock();
+    DISCOVERED_MOUNT_STAGE.store(3, Ordering::Release);
     let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
     let mut image = pager.into_inner();
+    DISCOVERED_MOUNT_STAGE.store(4, Ordering::Release);
     let _recovery =
         recover_if_required(&mut image, &superblock, &journal_geometry).map_err(|_| Errno::EIO)?;
+    DISCOVERED_MOUNT_STAGE.store(5, Ordering::Release);
     let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    DISCOVERED_MOUNT_STAGE.store(6, Ordering::Release);
     let _orphan_recovery = pager
         .recover_classic_orphan_chain()
         .map_err(|_| Errno::EIO)?;
+    DISCOVERED_MOUNT_STAGE.store(7, Ordering::Release);
     pager.mark_recovery_required().map_err(|_| Errno::EIO)?;
+    DISCOVERED_MOUNT_STAGE.store(8, Ordering::Release);
     let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
     let next_sequence = journal_geometry.superblock.sequence;
     let image = pager.into_inner();
@@ -233,7 +251,11 @@ where
         )
         .map_err(|_| Errno::EIO)?,
     );
-    mount_ext4_read_write_with_mutation_journal_io_manager_planner(image, geometry, runtime)
+    DISCOVERED_MOUNT_STAGE.store(9, Ordering::Release);
+    let mounted =
+        mount_ext4_read_write_with_mutation_journal_io_manager_planner(image, geometry, runtime)?;
+    DISCOVERED_MOUNT_STAGE.store(10, Ordering::Release);
+    Ok(mounted)
 }
 
 fn open_ext4_with_backend_planner<I>(

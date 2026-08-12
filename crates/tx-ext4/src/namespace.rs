@@ -202,6 +202,10 @@ where
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
@@ -238,6 +242,10 @@ where
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
@@ -271,6 +279,10 @@ where
         }
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
@@ -313,6 +325,10 @@ where
         }
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
@@ -367,6 +383,10 @@ where
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -416,6 +436,10 @@ where
         if old_parent == new_parent && old_name == new_name {
             return StepOutcome::done(());
         }
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let old_parent_ino = match inode_no(old_parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -509,6 +533,10 @@ where
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -562,6 +590,10 @@ where
         }
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
@@ -621,6 +653,10 @@ where
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -666,6 +702,10 @@ where
         }
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
@@ -763,6 +803,10 @@ where
         let Some(runtime) = self.metadata_mutation_runtime() else {
             return StepOutcome::err(Errno::EOPNOTSUPP.into());
         };
+        let _mutation_guard = match self.lock_metadata_mutation(guard) {
+            Ok(mutation_guard) => mutation_guard,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
@@ -823,6 +867,16 @@ where
             Some(p) => p,
             None => return StepOutcome::err(Errno::ENOSYS.into()),
         };
+
+        if meta.mode & 0xF000 == Inode::S_IFREG {
+            let inode = match inode_no(fs_object_id) {
+                Ok(inode) => inode,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+            if let Err(err) = self.refresh_extent_mapping(inode) {
+                return StepOutcome::err(err.into());
+            }
+        }
 
         const PAGE_SIZE: u64 = 4096;
         // Always allocate a writable growth window for regular files.
