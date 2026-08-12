@@ -1394,14 +1394,39 @@ impl<P: TxPlatform> CoreInit<P> {
         let cred = Credential::root();
         use StepOutcome as V3;
         let root_fs_object_id = root_mount.root().fs_object_id();
-        let (dev_object_id, dev_meta) = match root_mount
+        let root_payload = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap()
+            .into_cap();
+        let (dev_object_id, dev_meta) = match root_payload
             .fs_ops
             .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
         {
             V3::Done(out) => out,
+            V3::Err(step_engine::Errno::EEXIST) => {
+                let dev_object_id =
+                    match root_payload.fs_ops.lookup(root_fs_object_id, b"dev", &guard) {
+                        V3::Done(id) => id,
+                        other => {
+                            panic!("mount_devfs_at_dev: lookup(/dev) after EEXIST: {other:?}")
+                        }
+                    };
+                let dev_meta = match root_payload
+                    .fs_ops
+                    .load_inode_meta(dev_object_id, &guard)
+                {
+                    V3::Done(meta) => meta,
+                    other => panic!(
+                        "mount_devfs_at_dev: load_inode_meta(/dev) after EEXIST: {other:?}"
+                    ),
+                };
+                assert_eq!(
+                    dev_meta.kind(),
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    "mount_devfs_at_dev: existing /dev is not a directory"
+                );
+                (dev_object_id, dev_meta)
+            }
             V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
                 (root_fs_object_id, root_mount.root().meta())
             }
