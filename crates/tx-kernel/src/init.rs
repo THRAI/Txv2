@@ -2,7 +2,7 @@ use core::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
@@ -318,6 +318,17 @@ impl Future for OwnerWakeSmpPark {
 static ROOT_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.root_mount");
 
+/// True when boot media is mounted directly as `/`.
+static ROOTFS_FROM_BOOT_MEDIA: AtomicBool = AtomicBool::new(false);
+
+/// True when the default QEMU boot disk was recognised as an OSComp
+/// preliminary-stage image.  The preliminary image keeps the compatibility
+/// layout: tmpfs at `/`, with the image mounted later at `/musl`.
+static PRELIMINARY_OSCOMP_MEDIA: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn preliminary_oscomp_media_detected() -> bool {
+    PRELIMINARY_OSCOMP_MEDIA.load(Ordering::Acquire)
+}
 /// Pin slot for the rootfs's root `DEntry` identity. Populated by
 /// `bind_init_cwd_and_root` with a clone of the same `Cap<DEntry>`
 /// it hands to `step_chdir(init, …)`. Each `DEntry` produced by the
@@ -532,6 +543,8 @@ pub fn reset_boot_state_for_test() {
     *PROC_MOUNT.lock() = None;
     *SYS_MOUNT.lock() = None;
     *MUSL_MOUNT.lock() = None;
+    ROOTFS_FROM_BOOT_MEDIA.store(false, Ordering::Release);
+    PRELIMINARY_OSCOMP_MEDIA.store(false, Ordering::Release);
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
 }
@@ -657,13 +670,13 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_subsystems::time_hooks::ensure_hooks_installed();
             Self::install_kernel_trap_vector();
             Self::init_boot_reactor();
-            let boot_plan = BootPlan::read::<P>();
+            let early_boot_plan = BootPlan::read::<P>();
             Self::boot_secondary_cpus();
             Self::run_smp_shootdown_smoke();
             Self::run_smp_ipi_smoke();
             Self::run_reactor_dispatcher_smoke();
             if matches!(
-                boot_plan.first_userspace,
+                early_boot_plan.first_userspace,
                 FirstUserspace::OscompSdcard { .. }
             ) {
                 Self::write_board_sentinel_prefix();
@@ -722,6 +735,9 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_procfs_at_proc();
             Self::mount_sysfs_at_sys();
             Self::mount_bdevfs_at_dev_block();
+            // Rootfs selection may have recognised a preliminary-stage image,
+            // so derive the userspace policy only after media detection.
+            let boot_plan = BootPlan::read::<P>();
             if boot_plan.args.mount_sdcard {
                 Self::mount_sdcard_at_musl();
             }
@@ -1025,14 +1041,25 @@ impl<P: TxPlatform> CoreInit<P> {
         );
     }
 
-    /// Mount tmpfs as the boot rootfs.
+    /// Select and mount the boot rootfs.
     ///
-    /// Keep LA64 aligned with RV64: `/` is a writable tmpfs used for
-    /// devfs, initramfs overlays, and bootstrap fixtures; block-backed
-    /// ext4 media is mounted later under `/musl` by
-    /// `mount_sdcard_at_musl`.
+    /// With the official QEMU command line, the kernel identifies the image
+    /// layout from the first ext4 disk: preliminary-stage images keep the
+    /// writable tmpfs root and are mounted later under `/musl`, while
+    /// final-stage images are mounted directly as `/`. Explicit developer
+    /// boot selectors continue to override this automatic choice.
+    ///
+    /// When `root_device_name` selects a root block device, mount its ext4 image
+    /// directly as `/` so Alpine's natural `/bin`, `/usr`, `/lib`, and `/etc`
+    /// paths are visible without compatibility symlinks. QEMU passes
+    /// `tx.root=sdcard`/`tx.profile=onsite` (→ `vda`); the board passes
+    /// `tx.root=mmcblk0` (the SD card).  A QEMU boot with neither an initrd nor
+    /// an explicit compatibility profile also defaults to `vda`, matching the
+    /// contest platform's kernel-plus-sdcard invocation without `-append`.
     pub(crate) fn mount_rootfs_from_boot_media() {
-        Self::mount_rootfs_tmpfs();
+        if !Self::mount_sdcard_as_root_if_requested() {
+            Self::mount_rootfs_tmpfs();
+        }
         // Initialise the vDSO image and high-res clock parameters.
         // Must run after the substrate page allocator is ready.
         if let Err(e) = crate::vdso::init::<P>() {
@@ -1045,6 +1072,188 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
+    }
+
+    fn mount_sdcard_as_root_if_requested() -> bool {
+        let Some(dev_name) = Self::root_device_name() else {
+            return false;
+        };
+
+        use tx_fs::tx_ext4::{
+            mount_ext4_read_write, BlockDeviceImage, Ext4FileIoRuntimeBinder,
+        };
+        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+
+        let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+            tx_hal::console_write_str::<P>(dev_name);
+            tx_hal::console_write_str::<P>(":missing\n");
+            return false;
+        };
+
+        let image = BlockDeviceImage::new(reg.ops);
+        let mount_output = match mount_ext4_read_write(image) {
+            Ok(out) => out,
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                tx_hal::console_write_str::<P>(dev_name);
+                tx_hal::console_write_str::<P>(":err\n");
+                return false;
+            }
+        };
+        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+        )));
+
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        if dev_name == "vda"
+            && Self::should_autodetect_boot_media_layout(
+                boot_info.cmdline.unwrap_or(""),
+                boot_info.initrd.is_some(),
+            )
+        {
+            let fs_ops = mount_output.fs_ops();
+            if Self::mounted_media_is_preliminary_suite(
+                fs_ops.as_ref(),
+                mount_output.root_fs_object_id,
+            ) {
+                PRELIMINARY_OSCOMP_MEDIA.store(true, Ordering::Release);
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":boot-media:layout:preliminary\n");
+                // Reuse the established preliminary-stage path. The caller
+                // creates the tmpfs root, and `mount_sdcard_at_musl` attaches
+                // this device at `/musl` later in the normal boot sequence.
+                return false;
+            }
+
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":boot-media:layout:final\n");
+        }
+
+        let ext4_payload = MountPayload::new_cap(
+            mount_output.fs_ops().clone(),
+            mount_output.fs_page_backing().clone(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "ext4",
+            SourceLabel::Static(dev_name),
+        )
+        .expect("mount_sdcard_as_root_if_requested: payload reservation");
+
+        mount_output.bind_mount_payload(&ext4_payload);
+
+        let ext4_root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&ext4_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_sdcard_as_root_if_requested: root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            None,
+            ext4_root_rnode,
+            None,
+            ext4_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_sdcard_as_root_if_requested: mount identity reservation");
+
+        let mnt_ns = MountNamespace::new_cap(mount.clone())
+            .expect("mount_sdcard_as_root_if_requested: mount namespace reservation");
+        if let Some(init) = tx_subsystems::process::init_process() {
+            tx_subsystems::process::step_set_mount_namespace(&init, mnt_ns)
+                .expect("mount_sdcard_as_root_if_requested: publish init mount namespace");
+        }
+
+        *ROOT_MOUNT.lock() = Some(mount);
+        ROOTFS_FROM_BOOT_MEDIA.store(true, Ordering::Release);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+        tx_hal::console_write_str::<P>(dev_name);
+        tx_hal::console_write_str::<P>(":ok\n");
+        true
+    }
+
+    fn should_autodetect_boot_media_layout(cmdline: &str, has_initrd: bool) -> bool {
+        !has_initrd
+            && !cmdline.split_ascii_whitespace().any(|token| {
+                token.starts_with("tx.root=")
+                    || token.starts_with("tx.profile=")
+                    || token.starts_with("tx.runsh=")
+                    || token.starts_with("init=")
+            })
+    }
+
+    fn mounted_media_is_preliminary_suite(
+        fs_ops: &dyn tx_subsystems::vfs::FsOps,
+        root_fs_object_id: tx_subsystems::vfs::FsObjectId,
+    ) -> bool {
+        use step_engine::StepOutcome as V3;
+
+        let guard = step_engine::guard();
+        for suite_dir in [b"musl".as_slice(), b"glibc".as_slice()] {
+            let suite_id = match fs_ops.lookup(root_fs_object_id, suite_dir, &guard) {
+                V3::Done(id) => id,
+                _ => continue,
+            };
+            let has_busybox = matches!(fs_ops.lookup(suite_id, b"busybox", &guard), V3::Done(_));
+            let has_basic_script = matches!(
+                fs_ops.lookup(suite_id, b"basic_testcode.sh", &guard),
+                V3::Done(_)
+            );
+            if has_busybox && has_basic_script {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Resolve the root block device to mount from the boot cmdline, the way
+    /// Linux's `root=` parameter works. `tx.root=<name>` names the block
+    /// device directly (`vda` for the QEMU virtio disk, `mmcblk0` for the
+    /// SD card on the board, …). The legacy `tx.root=sdcard` alias resolves to
+    /// `vda`.  Explicit `tx.root=` always wins.  Initramfs/busybox and
+    /// `tx.profile=pretest` boots retain the tmpfs-root compatibility layout;
+    /// otherwise QEMU defaults to `vda` so a judge does not need a custom
+    /// kernel command line. Returns `None` for a tmpfs-root boot.
+    fn root_device_name() -> Option<&'static str> {
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        Self::root_device_name_from_boot(
+            boot_info.cmdline.unwrap_or(""),
+            boot_info.initrd.is_some(),
+        )
+    }
+
+    fn root_device_name_from_boot(cmdline: &'static str, has_initrd: bool) -> Option<&'static str> {
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(val) = token.strip_prefix("tx.root=") {
+                return match val {
+                    "tmpfs" => None,
+                    "sdcard" => Some("vda"),
+                    _ => Some(val),
+                };
+            }
+        }
+
+        if has_initrd
+            || cmdline
+                .split_ascii_whitespace()
+                .any(|token| token == "tx.profile=busybox" || token == "tx.profile=pretest")
+        {
+            return None;
+        }
+
+        Some("vda")
     }
 
     /// Mount tmpfs as the rootfs.
@@ -1677,6 +1886,9 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
+        if ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+            return;
+        }
         use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage, Ext4FileIoRuntimeBinder};
         use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
 

@@ -1182,14 +1182,14 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 
 fn oscomp_bench_observe_enabled_from_cmdline(cmdline: Option<&str>) -> bool {
     let Some(cmdline) = cmdline else {
-        return true;
+        return false;
     };
     for token in cmdline.split_ascii_whitespace() {
         if let Some(value) = token.strip_prefix("tx.oscomp.observe=") {
             return !matches!(value, "0" | "false" | "off" | "no");
         }
     }
-    true
+    false
 }
 
 fn oscomp_bench_observe_threshold_from_cmdline(cmdline: Option<&str>) -> Option<u64> {
@@ -2210,9 +2210,9 @@ mod tests {
     }
 
     #[test]
-    fn oscomp_bench_observe_cmdline_flag_defaults_on_and_accepts_off_values() {
-        assert!(oscomp_bench_observe_enabled_from_cmdline(None));
-        assert!(oscomp_bench_observe_enabled_from_cmdline(Some(
+    fn oscomp_bench_observe_cmdline_flag_defaults_off_and_accepts_explicit_on() {
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(None));
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
             "tx.oscomp.groups=libcbench-musl"
         )));
         assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(

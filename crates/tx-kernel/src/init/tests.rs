@@ -532,6 +532,26 @@ fn initial_userspace_sched_meta_ignores_other_online_cpus() {
 }
 
 #[test]
+fn automatic_media_layout_only_applies_without_an_explicit_boot_selector() {
+    assert!(CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", false));
+    assert!(
+        CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(
+            "console=ttyS0 tx.oscomp.groups=basic-musl",
+            false
+        )
+    );
+    for cmdline in [
+        "tx.root=vda",
+        "tx.profile=onsite",
+        "tx.runsh=/root/test.sh",
+        "init=/sbin/init",
+    ] {
+        assert!(!CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(cmdline, false));
+    }
+    assert!(!CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", true));
+}
+
+#[test]
 fn demo_boot_banner_is_ascii_and_names_txkernel() {
     let banner = crate::init::TX_KERNEL_DEMO_BANNER;
 
