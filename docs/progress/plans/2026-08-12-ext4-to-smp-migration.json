@@ -1,0 +1,304 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-12-ext4-to-smp-migration",
+  "title": "Finish ext4 worktree migration on the current SMP architecture",
+  "status": "proposed",
+  "created": "2026-08-12",
+  "updated": "2026-08-12",
+  "owner": "codex/root",
+  "summary": "Treat the landed ext4 reconciliation work as the baseline, retain the remaining dirty worktrees only as behavioral or test oracles, and close the missing multi-page data lease, writable-mapping freeze, L4/L6 custody, and SMP acceptance boundaries without importing legacy runtimes.",
+  "scope": {
+    "in": [
+      "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md",
+      "crates/tx-subsystems/src/page_backed/",
+      "crates/tx-subsystems/src/fs_iface/",
+      "crates/tx-subsystems/src/io_manager/",
+      "crates/tx-subsystems/src/vm/",
+      "crates/tx-ext4-format/",
+      "crates/tx-ext4/",
+      "xtask/src/ext4/",
+      "tools/ext4/",
+      "tools/ext4/tier1/",
+      "tools/shell-tests/ext4-*"
+    ],
+    "out": [
+      "merge/whole-worktree",
+      "merge/broad-cherry-pick-ranges",
+      "ext4/already-landed-reconciliation",
+      "legacy/mount-bdevfs-pagebacked-jbd2-runtime",
+      "legacy/syscall-exec-reactor-runtime",
+      "legacy/direct-home-write",
+      "rcu/page-slot-dma-range-lock-pte-map-pin-shootdown-jbd2-phase",
+      "scheduler/pelt",
+      "network/",
+      "vm/rcu-on-vm-recipe-arena-range-txn",
+      "jbd2/multiple-outstanding-cross-transaction-replay",
+      "claims/pre-linux-crash-smp-performance-or-tier2"
+    ],
+    "write_sets": [
+      {
+        "owner": "codex/root",
+        "paths": [
+          "docs/progress/plans/2026-08-12-ext4-to-smp-migration.json",
+          "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md"
+        ],
+        "notes": "This planning pass claims only its own records. Each implementation phase must claim a fresh disjoint write set in a clean candidate worktree so it cannot overlap the existing dirty ext4, VM, or I/O plans."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md",
+      "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/Txv3/10_SCHED_SMP_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md",
+      "docs/progress/research/2026-08-08-ext4-worktree-reconciliation.md",
+      "docs/progress/research/2026-08-09-ext4-rustc-contract-disposition.md",
+      "docs/progress/plans/2026-08-11-rcu-on-vm-to-smp-migration.json",
+      "docs/progress/research/2026-08-12-rcu-on-vm-smp-migration-closeout.md",
+      "docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json"
+    ],
+    "external_refs": [
+      "clean source /Users/3y/.config/superpowers/worktrees/Tx/ext4-worktree-reconciliation on codex/ext4-worktree-reconciliation",
+      "oracle source /Users/3y/.config/superpowers/worktrees/Tx/ext4-jbd2-revoke on codex/ext4-jbd2-revoke",
+      "oracle source /Users/3y/.config/superpowers/worktrees/Tx/ext4-journal-settlement on codex/ext4-journal-settlement",
+      "oracle source /Users/3y/.config/superpowers/worktrees/Tx/ext4-rustc-performance on codex/ext4-rustc-performance",
+      "oracle source /Users/3y/.config/superpowers/worktrees/Tx/rsext4-migration-p0 on codex/rsext4-migration-p0",
+      "heap source /Users/3y/.config/superpowers/worktrees/Tx/rcu-on-vm on codex/rcu-on-vm",
+      "target /Users/3y/Downloads/Tx on codex/test-remote-network",
+      "Linux ext4, e2fsprogs, debugfs, and the pinned xfstests selection remain compatibility authorities",
+      "worktree identity is recorded by path, branch, status, and timestamp; no commit SHA is used"
+    ]
+  },
+  "steps": [
+    {
+      "id": "e0-freeze-current-baseline",
+      "title": "Freeze the current SMP and ext4 baseline",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md"
+      ],
+      "verification": [
+        "record every source path, branch, tracked/untracked status count, and directory timestamp",
+        "confirm the current branch history contains the ext4 reconciliation integration subjects without using SHA identity",
+        "preserve the target's pre-existing dirty and untracked files"
+      ],
+      "notes": "The clean reconciliation worktree is already integrated and is not a migration source anymore."
+    },
+    {
+      "id": "e1-classify-worktree-content",
+      "title": "Classify historical changes as landed, oracle-only, rejected, or current candidate",
+      "status": "complete",
+      "depends_on": [
+        "e0-freeze-current-baseline"
+      ],
+      "paths": [
+        "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md"
+      ],
+      "verification": [
+        "current source inspection for extent checksums, multi-page revoke, recursive truncate/destroy, role images, resolver tooling, PageDataLease, L4, L6, and MutationHandle",
+        "git status --short in every named worktree"
+      ],
+      "notes": "Landed algorithms and tooling are retained; old runtimes are rejected; only missing ownership protocols become implementation candidates."
+    },
+    {
+      "id": "e2-refresh-current-oracles",
+      "title": "Refresh current acceptance oracles without replacing xtask APIs",
+      "status": "pending",
+      "depends_on": [
+        "e1-classify-worktree-content"
+      ],
+      "paths": [
+        "xtask/src/ext4/",
+        "tools/ext4/",
+        "tools/ext4/tier1/",
+        "tools/shell-tests/ext4-*"
+      ],
+      "verification": [
+        "cargo test -p xtask ext4 -- --test-threads=1",
+        "cargo xtask ext4 tier1 --dry-run",
+        "cargo xtask ext4 tier1 --preflight-live --preflight-report target/ext4/tier1/preflight/ext4-smp-candidate.json",
+        "focused Python tests for only the adapted oracle inputs"
+      ],
+      "notes": "Import missing fixtures, selected cases, or receipt checks only when current APIs lack them. Do not copy historical monolithic xtask or placeholder evidence schemas."
+    },
+    {
+      "id": "e3-multi-page-data-lease",
+      "title": "Generalize PageDataLease and DMA custody to a real multi-page request",
+      "status": "pending",
+      "depends_on": [
+        "e1-classify-worktree-content"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/",
+        "crates/tx-subsystems/src/fs_iface/",
+        "crates/tx-subsystems/src/io_manager/"
+      ],
+      "verification": [
+        "multi-page writeback and fetch admission retain every page generation and frame until one terminal L4 return",
+        "redirty, stale completion, cancellation, submit failure, and partial-node failure release each bundle exactly once",
+        "lease projection preserves opaque segment keys and ranges through graph split, coalesce, and L6 completion",
+        "normal aligned buffered I/O reports zero extra payload copies and zero bounce bytes",
+        "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1"
+      ],
+      "notes": "The current private PageDataLease stores Box<[PageLease]> but constructs and projects only pages[0]. Extend that owner in place; do not add a parallel lease type or let L6 release it."
+    },
+    {
+      "id": "e4-writable-pte-freeze-lease",
+      "title": "Design and implement a VM-owned writable-PTE freeze lease",
+      "status": "pending",
+      "depends_on": [
+        "e1-classify-worktree-content"
+      ],
+      "paths": [
+        "docs/design/03_memory-vm/VM_v1_2.md",
+        "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+        "crates/tx-subsystems/src/vm/",
+        "crates/tx-subsystems/src/page_backed/"
+      ],
+      "verification": [
+        "active design update names the VM owner, lease state machine, generation checks, and terminal unwind",
+        "RangeLock and epoch Guard are released before every Yield while an owned freeze token survives",
+        "writable PTE removal or write-protection, TLB shootdown acknowledgement, PageSlot generation freeze, I/O terminal return, and PTE restoration follow one checked order",
+        "mmap write versus writeback, truncate, munmap, mprotect, fork/COW, stale completion, and shootdown-timeout races",
+        "cargo test -p tx-subsystems --lib vm -- --test-threads=1"
+      ],
+      "notes": "This is a new current-architecture design, not a direct import. RangeLock, MapPin, PTE state, and shootdown acknowledgement remain VM-owned and are never RCU-retired."
+    },
+    {
+      "id": "e5-current-l4-l6-jbd2-convergence",
+      "title": "Converge the leases through current L4, L6, and MutationHandle ownership",
+      "status": "pending",
+      "depends_on": [
+        "e2-refresh-current-oracles",
+        "e3-multi-page-data-lease",
+        "e4-writable-pte-freeze-lease"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/",
+        "crates/tx-subsystems/src/io_manager/",
+        "crates/tx-ext4/src/mutation_lifecycle.rs",
+        "crates/tx-ext4/src/journal.rs",
+        "crates/tx-ext4/src/pager.rs"
+      ],
+      "verification": [
+        "one fsync frontier can admit every selected page generation without a one-page Busy dead end",
+        "MutationHandle retains only child request IDs and journal/deferred-free tokens while L4 owns page/DMA bundles",
+        "L6 returns value-only node completions and cannot mutate PageSlot or release PageDataLease",
+        "checkpoint completion precedes deferred-free reuse, cache settlement, and writable mapping restoration",
+        "cargo xtask lint invariants ext4-no-direct-home-write",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Extend the existing current owners. Do not restore historical JournalFsyncSource, caller-managed discard, synchronous settlement, or direct home writes."
+    },
+    {
+      "id": "e6-smp-ext4-acceptance",
+      "title": "Run host, SMP1/SMP2, Linux, crash, and non-LTP OSComp acceptance",
+      "status": "pending",
+      "depends_on": [
+        "e5-current-l4-l6-jbd2-convergence"
+      ],
+      "paths": [
+        "target/ext4/",
+        "target/qemu-rv64-qemu-*.serial.log",
+        "docs/progress/research/"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask progress validate",
+        "cargo xtask lint invariants ext4-no-direct-home-write",
+        "cargo xtask full-build --target rv64-qemu",
+        "cargo xtask qemu --target rv64-qemu --profile smoke --smp 1 --expect-sentinel --timeout-ms 90000",
+        "cargo xtask qemu --target rv64-qemu --profile smoke --smp 2 --expect-sentinel --timeout-ms 90000",
+        "full OSComp run excluding LTP and network-focused interpretation, using multiple harts",
+        "fresh SMP2 ext4 role matrix plus offline e2fsck -fn",
+        "fresh deterministic crash campaign and pinned Linux/Docker xfstests receipt",
+        "cargo xtask ext4 tier1 --verify-receipt PATH"
+      ],
+      "notes": "The runtime matrix is bounded to one-hart and two-hart verification. Long commands are polled with sleep and are not abandoned because an intermediate module fails."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-substrate --test slab -- --test-threads=1",
+      "status": "passed",
+      "notes": "Companion RCU-on-VM heap migration: 8 passed, including fragmentation, half-size reserve retry, and absolute-PPN alignment."
+    },
+    {
+      "command": "cargo test -p tx-substrate --lib",
+      "status": "passed",
+      "notes": "Companion substrate regression gate: 51 passed."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Validated 49 progress records after adding this plan."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "skipped",
+      "notes": "The pre-existing untracked .io-submission-patch duplicate tree produced 2116 duplicate-tag and broken-link findings; no finding was attributed to this plan or research note."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Passed for the planning and heap diff before final catch-up."
+    },
+    {
+      "command": "cargo fmt -p tx-substrate -- --check",
+      "status": "passed",
+      "notes": "Task-scoped format gate passed; whole-workspace cargo fmt --check remains blocked by unrelated pre-existing files."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "tx-shims 663, tx-kernel 119, tx-ext4 73 with 2 ignored, and tx-scripts 168 passed."
+    },
+    {
+      "command": "cargo xtask lint invariants ext4-no-direct-home-write",
+      "status": "passed",
+      "notes": "Zero production tx-ext4 direct home writes outside explicit owners."
+    },
+    {
+      "command": "cargo xtask full-build --target rv64-qemu",
+      "status": "passed",
+      "notes": "Doctor, RV64 kernel build, and initramfs image completed; only the documented optional host-tool and unrelated warning set remained."
+    },
+    {
+      "command": "cargo xtask qemu --target rv64-qemu --profile smoke --smp 1 --expect-sentinel --timeout-ms 90000",
+      "status": "passed",
+      "notes": "Boot sentinel observed with the migrated LargeArena."
+    },
+    {
+      "command": "cargo xtask qemu --target rv64-qemu --profile smoke --smp 2 --expect-sentinel --timeout-ms 90000",
+      "status": "passed",
+      "notes": "Boot sentinel observed with the migrated LargeArena on two harts."
+    }
+  ],
+  "risks": [
+    "A broad import from any dirty source can overwrite newer SMP scheduler, ResidentRoot, PageBacked, L4/L6, ext4 lifecycle, or tooling behavior.",
+    "A multi-page projection without one retained owner bundle can release a DMA-visible frame or clean a redirtied generation.",
+    "Holding RangeLock, Guard, or borrowed PTE state across Yield can deadlock or observe a migrated hart with stale exclusion.",
+    "Restoring writable PTEs before I/O and checkpoint terminal settlement can race mmap writers with persisted data and metadata.",
+    "Host tests and SMP smoke do not replace Linux image exchange, e2fsck, xfstests, and crash evidence."
+  ],
+  "blockers": [
+    "The current target has pre-existing dirty and untracked work; implementation needs a clean candidate worktree and disjoint phase claims.",
+    "The current PageDataLease is structurally multi-page but operationally single-page.",
+    "No active design currently defines the writable-PTE freeze lease required for mmap/writeback/truncate convergence.",
+    "A fresh full ext4 crash/xfstests receipt for the future SMP candidate does not exist.",
+    "Whole-tree docs lint may be blocked by the pre-existing untracked .io-submission-patch duplicate-doc tree."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}
