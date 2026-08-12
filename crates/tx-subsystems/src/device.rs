@@ -939,7 +939,11 @@ pub fn submit_pending_file_io_service_runtimes() -> usize {
     let Some(spawner) = FILE_IO_SERVICE_RUNTIME_SPAWNER.lock().clone() else {
         return 0;
     };
-    let guard = step_engine::guard();
+    // Registration may be triggered while a VFS/exec operation already owns
+    // the current CPU's epoch guard. Reuse that guard instead of nesting a
+    // second one; cold boot/runtime calls without an active guard still pin a
+    // fresh epoch as before.
+    let guard = tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
     let pending = {
         let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
         let mut pending = Vec::new();
