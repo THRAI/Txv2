@@ -13,16 +13,22 @@
     "crates/tx-subsystems/src/page_backed",
     "crates/tx-subsystems/src/fs_iface",
     "crates/tx-subsystems/src/io_manager/page",
+    "crates/tx-subsystems/src/io_manager/backend/plan.rs",
+    "crates/tx-subsystems/src/vfs/execution.rs",
     "crates/tx-ext4/src/planner.rs",
+    "crates/tx-ext4/src/read_backend.rs",
+    "crates/tx-ext4/src/journal.rs",
+    "docs/progress/STATUS.md",
     "docs/progress/worktrees/2026-08-12-ext4-smp-migration.json",
     "docs/progress/research/2026-08-12-ext4-e3-multi-page-data-lease-readiness.md"
   ],
   "verification": [
     "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1",
+    "cargo test -p tx-ext4 --lib -- --test-threads=1",
     "cargo -q xtask unit",
     "cargo xtask progress validate",
     "cargo fmt --check",
     "git diff --check"
   ],
-  "notes": "Clean candidate worktree for E3 only. Identity is path, branch, clean starting status, and date; no commit SHA is used. PELT, network, writable-PTE freeze, RCU expansion, and JBD2 convergence remain out of scope."
+  "notes": "Candidate worktree for the completed E3 bounded multi-page writeback slice and the host-tested E5 fsync batching and partial L6 admission sub-boundaries. Identity is path, branch, clean starting status, and date; no commit SHA is used. Multi-page fetch/readahead, PELT, network, writable-PTE freeze, RCU expansion, JBD2 aggregation, and production cutover remain out of scope."
 }

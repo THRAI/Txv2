@@ -97,6 +97,280 @@ fn cached_frame_for_test() -> CachedFrame {
     allocate_cached_frame().expect("cached frame")
 }
 
+fn seed_dirty_file_page(pc: &PageContainer, page: PageIndex) -> (tx_hal::Ppn, PageGeneration) {
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let mut state = pc.state.lock();
+    state
+        .install_resident_if_absent(page, frame)
+        .expect("seed cached page");
+    let slot = state.page_slots.entry(page).or_default();
+    let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+        panic!("test must own fetch generation");
+    };
+    slot.complete_fetch(generation, Ok(ppn))
+        .expect("make page resident");
+    let dirty = slot.mark_dirty().expect("mark page dirty");
+    (ppn, dirty.generation)
+}
+
+fn admitted_writeback_request(pc: &PageContainer, range: PageIoRange) -> PageIoRequest {
+    pc.page_submission
+        .find_submission(pc.io_manager_key(), range, PageIoOp::Writeback)
+        .expect("admitted writeback request")
+}
+
+#[test]
+fn two_page_writeback_admits_one_range_and_retains_both_frames() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = file_page_container(Arc::new(LifecycleFs::new()), FsObjectId::new(0x80));
+    let first = PageIndex::new(0);
+    let second = PageIndex::new(1);
+    let (first_ppn, _) = seed_dirty_file_page(&pc, first);
+    let (second_ppn, _) = seed_dirty_file_page(&pc, second);
+
+    assert_eq!(pc.queue_dirty_file_writeback(), 2);
+    assert_eq!(pc.file_io_request_count_for_test(), 1);
+    assert_eq!(pc.file_io_owner_count_for_test(), 1);
+    let request = admitted_writeback_request(&pc, PageIoRange::new(0, 2));
+    let (source, target) = pc.prepare_owned_file_io_request(&request);
+    let IoDataSource::PageCacheSegments { segments, .. } = source else {
+        panic!("two-page writeback must project page-cache segments");
+    };
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].frame.ppn(), first_ppn);
+    assert_eq!(segments[1].frame.ppn(), second_ppn);
+    assert_eq!(target, IoDataTarget::None);
+}
+
+#[test]
+fn two_page_writeback_pre_admission_failure_rolls_back_first_page() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = file_page_container(Arc::new(LifecycleFs::new()), FsObjectId::new(0x81));
+    let first = PageIndex::new(0);
+    let missing = PageIndex::new(1);
+    let (first_ppn, _) = seed_dirty_file_page(&pc, first);
+
+    assert_eq!(pc.queue_file_writeback_batch(&[first, missing]), None);
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(first)
+            .expect("first slot")
+            .state,
+        PageSlotState::Dirty { ppn: first_ppn }
+    );
+}
+
+#[test]
+fn two_page_writeback_submit_failure_rolls_back_both_pages_once() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = file_page_container(Arc::new(LifecycleFs::new()), FsObjectId::new(0x82));
+    let first = PageIndex::new(0);
+    let second = PageIndex::new(1);
+    let (first_ppn, _) = seed_dirty_file_page(&pc, first);
+    let (second_ppn, _) = seed_dirty_file_page(&pc, second);
+    assert_eq!(pc.queue_dirty_file_writeback(), 2);
+    let request = admitted_writeback_request(&pc, PageIoRange::new(0, 2));
+
+    assert!(pc
+        .finish_owned_file_io_request(&request, FileIoTerminalResult::SubmitFailure)
+        .is_some());
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(pc.file_io_lease_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(first).expect("first").state,
+        PageSlotState::Dirty { ppn: first_ppn }
+    );
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(second)
+            .expect("second")
+            .state,
+        PageSlotState::Dirty { ppn: second_ppn }
+    );
+    assert_eq!(
+        pc.finish_owned_file_io_request(&request, FileIoTerminalResult::SubmitFailure),
+        None
+    );
+}
+
+#[test]
+fn two_page_writeback_success_preserves_redirtied_sibling() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = file_page_container(Arc::new(LifecycleFs::new()), FsObjectId::new(0x83));
+    let first = PageIndex::new(0);
+    let second = PageIndex::new(1);
+    let (first_ppn, first_generation) = seed_dirty_file_page(&pc, first);
+    let (second_ppn, _) = seed_dirty_file_page(&pc, second);
+    assert_eq!(pc.queue_dirty_file_writeback(), 2);
+    let request = admitted_writeback_request(&pc, PageIoRange::new(0, 2));
+    pc.state
+        .lock()
+        .page_slots
+        .get(&second)
+        .expect("second slot")
+        .mark_dirty()
+        .expect("redirty second page");
+    let completion = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Done,
+            first_generation,
+            PageIoCompletionKind::WritebackFinished,
+        ),
+        frame: None,
+        waiters: alloc::vec![],
+    };
+
+    assert!(pc.apply_file_io_completion_route(&completion).is_some());
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(first).expect("first").state,
+        PageSlotState::Resident { ppn: first_ppn }
+    );
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(second)
+            .expect("second")
+            .state,
+        PageSlotState::Dirty { ppn: second_ppn }
+    );
+    assert_eq!(pc.apply_file_io_completion_route(&completion), None);
+}
+
+#[test]
+fn two_page_writeback_settles_successful_sibling_when_other_slot_is_stale() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = file_page_container(Arc::new(LifecycleFs::new()), FsObjectId::new(0x84));
+    let first = PageIndex::new(0);
+    let second = PageIndex::new(1);
+    let (first_ppn, first_generation) = seed_dirty_file_page(&pc, first);
+    seed_dirty_file_page(&pc, second);
+    assert_eq!(pc.queue_dirty_file_writeback(), 2);
+    let request = admitted_writeback_request(&pc, PageIoRange::new(0, 2));
+    pc.state
+        .lock()
+        .page_slots
+        .get(&second)
+        .expect("second slot")
+        .invalidate();
+    let completion = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Done,
+            first_generation,
+            PageIoCompletionKind::WritebackFinished,
+        ),
+        frame: None,
+        waiters: alloc::vec![],
+    };
+
+    assert!(matches!(
+        pc.apply_file_io_completion_route(&completion),
+        Some(Err(PageSlotCompletionError::NotFetching { .. }))
+    ));
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(first).expect("first").state,
+        PageSlotState::Resident { ppn: first_ppn }
+    );
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(second)
+            .expect("second")
+            .state,
+        PageSlotState::Empty
+    );
+}
+
+#[test]
+fn two_page_writeback_device_error_settles_both_pages() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = file_page_container(Arc::new(LifecycleFs::new()), FsObjectId::new(0x85));
+    let first = PageIndex::new(0);
+    let second = PageIndex::new(1);
+    let (_, first_generation) = seed_dirty_file_page(&pc, first);
+    seed_dirty_file_page(&pc, second);
+    assert_eq!(pc.queue_dirty_file_writeback(), 2);
+    let request = admitted_writeback_request(&pc, PageIoRange::new(0, 2));
+    let completion = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Err(Errno::EIO),
+            first_generation,
+            PageIoCompletionKind::WritebackFinished,
+        ),
+        frame: None,
+        waiters: alloc::vec![],
+    };
+
+    assert!(pc.apply_file_io_completion_route(&completion).is_some());
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(first).expect("first").state,
+        PageSlotState::Error { errno: Errno::EIO }
+    );
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(second)
+            .expect("second")
+            .state,
+        PageSlotState::Error { errno: Errno::EIO }
+    );
+}
+
+#[test]
+fn writeback_completion_with_read_kind_rolls_back_before_consuming_owner() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let pc = file_page_container(Arc::new(LifecycleFs::new()), FsObjectId::new(0x86));
+    let page = PageIndex::new(0);
+    let (ppn, generation) = seed_dirty_file_page(&pc, page);
+    let request_id = pc.queue_file_page_writeback(page).expect("admit writeback");
+    let request = admitted_writeback_request(&pc, PageIoRange::new(0, 1));
+    assert_eq!(request.id, request_id);
+    let wrong_kind = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::ReadInstalled,
+        ),
+        frame: None,
+        waiters: alloc::vec![],
+    };
+
+    assert!(pc.apply_file_io_completion_route(&wrong_kind).is_some());
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(page)
+            .expect("writeback slot")
+            .state,
+        PageSlotState::Dirty { ppn }
+    );
+}
+
 #[test]
 fn owned_request_submit_failure_restores_writeback_and_releases_owner() {
     let _lock = EPOCH_TEST_LOCK

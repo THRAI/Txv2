@@ -7,8 +7,8 @@ use alloc::vec;
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::fs_iface::{
     BackendBioGraph, BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner,
-    BioPlanList, IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef,
-    PagerResumeToken,
+    BioPlanList, IoDataLeaseId, IoDataSource, IoDataTarget, PageCacheSegment, PageCompletion,
+    PageCompletionList, PageFrameRef, PagerResumeToken,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
 
@@ -77,6 +77,13 @@ pub trait Ext4FsyncPlanSource: Send + Sync + 'static {
 /// may atomically stage bitmap/inode/extent metadata for holes without giving
 /// the generic planner access to live pager state.
 pub trait Ext4WritePlanSource: Send + Sync + 'static {
+    /// Whether this source delegates mapped page-cache segments to the generic
+    /// contiguous-range SG lowering below. Journal-owned sources return false
+    /// so their private data graph remains authoritative.
+    fn uses_generic_segment_mapping(&self) -> bool {
+        false
+    }
+
     /// Stage backend-private writeback state while L4 still owns the source
     /// lease and its epoch guard. Implementations must not retain `guard`.
     fn prepare_writeback(
@@ -101,6 +108,10 @@ pub trait Ext4WritePlanSource: Send + Sync + 'static {
 pub struct MappedExt4WritePlan;
 
 impl Ext4WritePlanSource for MappedExt4WritePlan {
+    fn uses_generic_segment_mapping(&self) -> bool {
+        true
+    }
+
     fn plan_writeback(
         &self,
         geometry: Ext4BlockGeometry,
@@ -395,14 +406,39 @@ impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource, W: Ext4WritePlanSource> B
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
         match request.op {
             tx_subsystems::io_manager::page::PageIoOp::Read
-            | tx_subsystems::io_manager::page::PageIoOp::Readahead => {
-                plan_read_request(self.geometry, &request, self.mapping.map_page(&request))
+            | tx_subsystems::io_manager::page::PageIoOp::Readahead => match &request.target {
+                IoDataTarget::PageCacheSegments { lease, segments } => plan_page_cache_segments(
+                    self.geometry,
+                    &request,
+                    *lease,
+                    segments,
+                    BlockOp::Read,
+                    |page_request| self.mapping.map_page(page_request),
+                ),
+                _ => plan_read_request(self.geometry, &request, self.mapping.map_page(&request)),
+            },
+            tx_subsystems::io_manager::page::PageIoOp::Writeback => {
+                match (
+                    &request.source,
+                    self.writeback.uses_generic_segment_mapping(),
+                ) {
+                    (IoDataSource::PageCacheSegments { lease, segments }, true) => {
+                        plan_page_cache_segments(
+                            self.geometry,
+                            &request,
+                            *lease,
+                            segments,
+                            BlockOp::Write,
+                            |page_request| self.mapping.map_page(page_request),
+                        )
+                    }
+                    _ => self.writeback.plan_writeback(
+                        self.geometry,
+                        &request,
+                        self.mapping.map_page(&request),
+                    ),
+                }
             }
-            tx_subsystems::io_manager::page::PageIoOp::Writeback => self.writeback.plan_writeback(
-                self.geometry,
-                &request,
-                self.mapping.map_page(&request),
-            ),
             tx_subsystems::io_manager::page::PageIoOp::Fsync => self.fsync.plan_fsync(&request),
             tx_subsystems::io_manager::page::PageIoOp::Checkpoint => {
                 BackendPlan::Err(Errno::ENOSYS)
@@ -455,6 +491,114 @@ impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource, W: Ext4WritePlanSource> B
     }
 }
 
+/// Lower a bounded page-cache range only when every page maps to one valid,
+/// physically contiguous ext4 block. L4 retains the lease; this adapter emits
+/// a single SG BIO containing the ordered frame slices.
+fn plan_page_cache_segments<M>(
+    geometry: Ext4BlockGeometry,
+    request: &BackendPageRequest,
+    lease: IoDataLeaseId,
+    segments: &[PageCacheSegment],
+    op: BlockOp,
+    mut map_page: M,
+) -> BackendPlan
+where
+    M: FnMut(&BackendPageRequest) -> Ext4ReadMapping,
+{
+    if segments.is_empty() || request.range.page_count() != segments.len() as u64 {
+        return BackendPlan::Err(Errno::EINVAL);
+    }
+    if segments
+        .iter()
+        .any(|segment| segment.offset != 0 || segment.len != BLOCK_SIZE as u32)
+    {
+        return BackendPlan::Err(Errno::EINVAL);
+    }
+
+    let mut combined: Option<BioPlan> = None;
+    for (offset, segment) in segments.iter().copied().enumerate() {
+        let Some(page) = request.range.start_page().checked_add(offset as u64) else {
+            return BackendPlan::Err(Errno::EINVAL);
+        };
+        let page_request = page_request_for_segment(request, page, lease, segment, op);
+        let physical_block = match map_page(&page_request) {
+            Ext4ReadMapping::Data { physical_block } => physical_block,
+            Ext4ReadMapping::Hole | Ext4ReadMapping::MetadataFirst { .. } => {
+                return BackendPlan::Err(Errno::ENOSYS);
+            }
+            Ext4ReadMapping::Err(errno) => return BackendPlan::Err(errno),
+        };
+        let page_bio = match op {
+            BlockOp::Read => geometry.plan_read(physical_block, &page_request.target),
+            BlockOp::Write => geometry.plan_write(physical_block, &page_request.source),
+            BlockOp::Flush | BlockOp::Barrier => Err(Errno::EINVAL),
+        };
+        let page_bio = match page_bio {
+            Ok(bio) => bio,
+            Err(errno) => return BackendPlan::Err(errno),
+        };
+
+        if let Some(previous) = combined.as_mut() {
+            if previous.device != page_bio.device
+                || previous.op != page_bio.op
+                || previous.flags != page_bio.flags
+                || previous.lba.end_lba() != Some(page_bio.lba.start_lba())
+            {
+                return BackendPlan::Err(Errno::EINVAL);
+            }
+            let Some(block_count) = previous
+                .lba
+                .block_count()
+                .checked_add(page_bio.lba.block_count())
+            else {
+                return BackendPlan::Err(Errno::EINVAL);
+            };
+            previous.lba = LbaRange::new(previous.lba.start_lba(), block_count);
+            previous.vecs.extend(page_bio.vecs);
+        } else {
+            combined = Some(page_bio);
+        }
+    }
+
+    let Some(bio) = combined else {
+        return BackendPlan::Err(Errno::EINVAL);
+    };
+    BackendPlan::SubmitBios(BioPlanList::from_vec(vec![bio]))
+}
+
+fn page_request_for_segment(
+    request: &BackendPageRequest,
+    page: u64,
+    lease: IoDataLeaseId,
+    segment: PageCacheSegment,
+    op: BlockOp,
+) -> BackendPageRequest {
+    let range = tx_subsystems::io_manager::page::PageIoRange::new(page, 1);
+    match op {
+        BlockOp::Read => BackendPageRequest::new_with_source_and_target(
+            request.object,
+            request.id,
+            range,
+            request.op,
+            request.flags,
+            request.generation_hint,
+            request.source.clone(),
+            IoDataTarget::page_cache(lease, segment.frame, segment.offset, segment.len),
+        ),
+        BlockOp::Write => BackendPageRequest::new_with_source_and_target(
+            request.object,
+            request.id,
+            range,
+            request.op,
+            request.flags,
+            request.generation_hint,
+            IoDataSource::page_cache(lease, segment.frame, segment.offset, segment.len),
+            request.target.clone(),
+        ),
+        BlockOp::Flush | BlockOp::Barrier => request.clone(),
+    }
+}
+
 /// Translate an ext4 mapping result into the neutral L4/L6 plan IR.
 pub fn plan_read_request(
     geometry: Ext4BlockGeometry,
@@ -476,6 +620,7 @@ pub fn plan_read_request(
                 )
                 .with_frame_ref(frame)]))
             }
+            IoDataTarget::PageCacheSegments { .. } => BackendPlan::Err(Errno::EINVAL),
             IoDataTarget::Direct { .. } => BackendPlan::Err(Errno::ENOSYS),
             IoDataTarget::None => BackendPlan::Err(Errno::EINVAL),
         },
@@ -539,12 +684,13 @@ impl Ext4BlockGeometry {
             IoDataTarget::PageCache {
                 frame, offset, len, ..
             } => {
-                if *len != BLOCK_SIZE as u32 {
+                if *offset != 0 || *len != BLOCK_SIZE as u32 {
                     return Err(Errno::EINVAL);
                 }
                 vec![bio_vec(*frame, *offset, *len)]
             }
             IoDataTarget::Direct { vecs, .. } => direct_bio_vecs(vecs)?,
+            IoDataTarget::PageCacheSegments { .. } => return Err(Errno::EINVAL),
             IoDataTarget::None => return Err(Errno::EINVAL),
         };
         if self.sectors_per_block == 0 {
@@ -568,12 +714,13 @@ impl Ext4BlockGeometry {
             IoDataSource::PageCache {
                 frame, offset, len, ..
             } => {
-                if *len != BLOCK_SIZE as u32 {
+                if *offset != 0 || *len != BLOCK_SIZE as u32 {
                     return Err(Errno::EINVAL);
                 }
                 vec![bio_vec(*frame, *offset, *len)]
             }
             IoDataSource::Direct { vecs, .. } => direct_bio_vecs(vecs)?,
+            IoDataSource::PageCacheSegments { .. } => return Err(Errno::EINVAL),
             IoDataSource::None => return Err(Errno::EINVAL),
         };
         if self.sectors_per_block == 0 {
@@ -618,7 +765,6 @@ mod tests {
     use super::*;
     use tx_ext4_format::ondisk::{Extent, ExtentIdx, ExtentNode};
     use tx_hal::Ppn;
-    use tx_subsystems::fs_iface::IoDataLeaseId;
 
     fn request(target: IoDataTarget) -> BackendPageRequest {
         BackendPageRequest::new_with_source_and_target(
@@ -631,6 +777,53 @@ mod tests {
             tx_subsystems::fs_iface::IoDataSource::None,
             target,
         )
+    }
+
+    fn page_cache_segments(frames: &[usize]) -> alloc::boxed::Box<[PageCacheSegment]> {
+        frames
+            .iter()
+            .map(|frame| {
+                PageCacheSegment::new(PageFrameRef::new(Ppn(*frame)), 0, BLOCK_SIZE as u32)
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn segmented_request(op: tx_subsystems::io_manager::page::PageIoOp) -> BackendPageRequest {
+        let segments = page_cache_segments(&[41, 42]);
+        let (source, target) = match op {
+            tx_subsystems::io_manager::page::PageIoOp::Read
+            | tx_subsystems::io_manager::page::PageIoOp::Readahead => (
+                IoDataSource::None,
+                IoDataTarget::page_cache_segments(IoDataLeaseId::new(17), segments),
+            ),
+            tx_subsystems::io_manager::page::PageIoOp::Writeback => (
+                IoDataSource::page_cache_segments(IoDataLeaseId::new(17), segments),
+                IoDataTarget::None,
+            ),
+            tx_subsystems::io_manager::page::PageIoOp::Fsync
+            | tx_subsystems::io_manager::page::PageIoOp::Checkpoint => unreachable!(),
+        };
+        BackendPageRequest::new_with_source_and_target(
+            tx_subsystems::fs_iface::FsObjectKey::new(3),
+            tx_subsystems::io_manager::page::PageIoRequestId::new(4),
+            tx_subsystems::io_manager::page::PageIoRange::new(5, 2),
+            op,
+            tx_subsystems::io_manager::page::PageIoFlags::DEMAND,
+            Some(tx_subsystems::io_manager::page::PageGeneration::new(6)),
+            source,
+            target,
+        )
+    }
+
+    fn planner_with_mappings(
+        mappings: &[(u64, Ext4ReadMapping)],
+    ) -> Ext4ReadPlanner<Ext4MappingTable> {
+        let table = Ext4MappingTable::new();
+        for (page, mapping) in mappings {
+            table.insert(3, *page, *mapping);
+        }
+        Ext4ReadPlanner::with_mapping_table(Ext4BlockGeometry::new(DeviceKey::new(7), 8), table)
     }
 
     fn indexed_root(child: u64) -> [u8; 60] {
@@ -691,6 +884,113 @@ mod tests {
             let target = IoDataTarget::direct(IoDataLeaseId::new(12), vecs);
             assert_eq!(geometry.plan_read(11, &target), Err(Errno::EINVAL));
         }
+    }
+
+    #[test]
+    fn page_cache_segments_read_maps_each_page_into_one_sg_bio() {
+        let planner = planner_with_mappings(&[
+            (5, Ext4ReadMapping::Data { physical_block: 11 }),
+            (6, Ext4ReadMapping::Data { physical_block: 12 }),
+        ]);
+
+        let BackendPlan::SubmitBios(bios) = planner.plan_page_io(segmented_request(
+            tx_subsystems::io_manager::page::PageIoOp::Read,
+        )) else {
+            panic!("contiguous page-cache segments must produce one BIO");
+        };
+        assert_eq!(bios.as_slice().len(), 1);
+        assert_eq!(bios.as_slice()[0].lba, LbaRange::new(88, 16));
+        assert_eq!(
+            bios.as_slice()[0].vecs,
+            vec![BioVec::new(41, 0, 4096), BioVec::new(42, 0, 4096)]
+        );
+    }
+
+    #[test]
+    fn page_cache_segments_write_maps_each_page_into_one_sg_bio() {
+        let planner = planner_with_mappings(&[
+            (5, Ext4ReadMapping::Data { physical_block: 21 }),
+            (6, Ext4ReadMapping::Data { physical_block: 22 }),
+        ]);
+
+        let BackendPlan::SubmitBios(bios) = planner.plan_page_io(segmented_request(
+            tx_subsystems::io_manager::page::PageIoOp::Writeback,
+        )) else {
+            panic!("contiguous page-cache segments must produce one BIO");
+        };
+        assert_eq!(bios.as_slice().len(), 1);
+        assert_eq!(bios.as_slice()[0].op, BlockOp::Write);
+        assert_eq!(bios.as_slice()[0].lba, LbaRange::new(168, 16));
+        assert_eq!(
+            bios.as_slice()[0].vecs,
+            vec![BioVec::new(41, 0, 4096), BioVec::new(42, 0, 4096)]
+        );
+    }
+
+    #[test]
+    fn page_cache_segments_fail_closed_for_holes_and_noncontiguous_blocks() {
+        let request = segmented_request(tx_subsystems::io_manager::page::PageIoOp::Read);
+        for (second, expected) in [
+            (Ext4ReadMapping::Hole, Errno::ENOSYS),
+            (Ext4ReadMapping::Data { physical_block: 20 }, Errno::EINVAL),
+        ] {
+            let planner = planner_with_mappings(&[
+                (5, Ext4ReadMapping::Data { physical_block: 11 }),
+                (6, second),
+            ]);
+            assert_eq!(
+                planner.plan_page_io(request.clone()),
+                BackendPlan::Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn page_cache_segments_fail_closed_for_invalid_segment_shape() {
+        let planner = planner_with_mappings(&[
+            (5, Ext4ReadMapping::Data { physical_block: 11 }),
+            (6, Ext4ReadMapping::Data { physical_block: 12 }),
+        ]);
+        let mut short = segmented_request(tx_subsystems::io_manager::page::PageIoOp::Read);
+        let IoDataTarget::PageCacheSegments { segments, .. } = &mut short.target else {
+            unreachable!();
+        };
+        segments[1].len -= 1;
+        assert_eq!(planner.plan_page_io(short), BackendPlan::Err(Errno::EINVAL));
+
+        let mut short = segmented_request(tx_subsystems::io_manager::page::PageIoOp::Writeback);
+        let IoDataSource::PageCacheSegments { segments, .. } = &mut short.source else {
+            unreachable!();
+        };
+        segments[1].len -= 1;
+        assert_eq!(planner.plan_page_io(short), BackendPlan::Err(Errno::EINVAL));
+
+        let mut offset = segmented_request(tx_subsystems::io_manager::page::PageIoOp::Read);
+        let IoDataTarget::PageCacheSegments { segments, .. } = &mut offset.target else {
+            unreachable!();
+        };
+        segments[1].offset = 1;
+        assert_eq!(
+            planner.plan_page_io(offset),
+            BackendPlan::Err(Errno::EINVAL)
+        );
+
+        let mut offset = segmented_request(tx_subsystems::io_manager::page::PageIoOp::Writeback);
+        let IoDataSource::PageCacheSegments { segments, .. } = &mut offset.source else {
+            unreachable!();
+        };
+        segments[1].offset = 1;
+        assert_eq!(
+            planner.plan_page_io(offset),
+            BackendPlan::Err(Errno::EINVAL)
+        );
+
+        let mut mismatch = segmented_request(tx_subsystems::io_manager::page::PageIoOp::Read);
+        mismatch.range = tx_subsystems::io_manager::page::PageIoRange::new(5, 3);
+        assert_eq!(
+            planner.plan_page_io(mismatch),
+            BackendPlan::Err(Errno::EINVAL)
+        );
     }
 
     #[test]
@@ -885,6 +1185,25 @@ mod tests {
             IoDataTarget::None,
         );
         assert_eq!(planner.plan_page_io(request), BackendPlan::Err(Errno::EIO));
+    }
+
+    #[test]
+    fn segmented_writeback_keeps_mount_owned_write_source_authoritative() {
+        let planner = Ext4ReadPlanner::with_plan_sources(
+            Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+            FixedMapping {
+                mapping: Ext4ReadMapping::Data { physical_block: 11 },
+            },
+            UnsupportedExt4FsyncPlan,
+            RejectingWriteSource,
+        );
+
+        assert_eq!(
+            planner.plan_page_io(segmented_request(
+                tx_subsystems::io_manager::page::PageIoOp::Writeback,
+            )),
+            BackendPlan::Err(Errno::EIO)
+        );
     }
 
     #[test]

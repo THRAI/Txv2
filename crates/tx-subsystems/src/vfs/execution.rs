@@ -1995,10 +1995,14 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
-        if let Some(container) = &self.page_container {
-            let PageContainerKind::File { mount, .. } = container.kind() else {
-                return V3::Err(crate::execution::Errno::EINVAL.into());
-            };
+        if let Some((container, mount)) =
+            self.page_container
+                .as_ref()
+                .and_then(|container| match container.kind() {
+                    PageContainerKind::File { mount, .. } => Some((container, mount)),
+                    PageContainerKind::Anon { .. } | PageContainerKind::Device { .. } => None,
+                })
+        {
             if self.raw_block_device && mount.payload().backend_planner().is_none() {
                 let guard = step_engine::guard();
                 return match crate::page_backed::step_raw_block_fsync(container, &guard) {

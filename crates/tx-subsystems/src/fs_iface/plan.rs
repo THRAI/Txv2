@@ -55,6 +55,19 @@ pub struct PageFrameRef {
     ppn: Ppn,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageCacheSegment {
+    pub frame: PageFrameRef,
+    pub offset: u32,
+    pub len: u32,
+}
+
+impl PageCacheSegment {
+    pub const fn new(frame: PageFrameRef, offset: u32, len: u32) -> Self {
+        Self { frame, offset, len }
+    }
+}
+
 impl PageFrameRef {
     pub const fn new(ppn: Ppn) -> Self {
         Self { ppn }
@@ -89,6 +102,10 @@ pub enum IoDataSource {
         offset: u32,
         len: u32,
     },
+    PageCacheSegments {
+        lease: IoDataLeaseId,
+        segments: Box<[PageCacheSegment]>,
+    },
     Direct {
         lease: IoDataLeaseId,
         vecs: Vec<BioVec>,
@@ -114,10 +131,16 @@ impl IoDataSource {
         Self::Direct { lease, vecs }
     }
 
+    pub fn page_cache_segments(lease: IoDataLeaseId, segments: Box<[PageCacheSegment]>) -> Self {
+        Self::PageCacheSegments { lease, segments }
+    }
+
     pub const fn lease(&self) -> Option<IoDataLeaseId> {
         match self {
             Self::None => None,
-            Self::PageCache { lease, .. } | Self::Direct { lease, .. } => Some(*lease),
+            Self::PageCache { lease, .. }
+            | Self::PageCacheSegments { lease, .. }
+            | Self::Direct { lease, .. } => Some(*lease),
         }
     }
 }
@@ -146,17 +169,21 @@ mod page_data_lease_projection_tests {
 
     #[test]
     fn projection_transfers_only_neutral_sources() {
-        let projection =
-            PageDataLeaseProjection::new(alloc::boxed::Box::new([IoDataSource::page_cache(
+        let projection = PageDataLeaseProjection::new(alloc::boxed::Box::new([
+            IoDataSource::page_cache_segments(
                 IoDataLeaseId::new(7),
-                PageFrameRef::new(Ppn(0x42)),
-                0,
-                4096,
-            )]));
+                alloc::boxed::Box::new([PageCacheSegment::new(
+                    PageFrameRef::new(Ppn(0x42)),
+                    0,
+                    4096,
+                )]),
+            ),
+        ]));
 
         assert!(matches!(
             projection.into_sources().as_ref(),
-            [IoDataSource::PageCache { lease, .. }] if *lease == IoDataLeaseId::new(7)
+            [IoDataSource::PageCacheSegments { lease, segments }]
+                if *lease == IoDataLeaseId::new(7) && segments.len() == 1
         ));
     }
 }
@@ -174,6 +201,10 @@ pub enum IoDataTarget {
         frame: PageFrameRef,
         offset: u32,
         len: u32,
+    },
+    PageCacheSegments {
+        lease: IoDataLeaseId,
+        segments: Box<[PageCacheSegment]>,
     },
     Direct {
         lease: IoDataLeaseId,
@@ -200,10 +231,16 @@ impl IoDataTarget {
         Self::Direct { lease, vecs }
     }
 
+    pub fn page_cache_segments(lease: IoDataLeaseId, segments: Box<[PageCacheSegment]>) -> Self {
+        Self::PageCacheSegments { lease, segments }
+    }
+
     pub const fn lease(&self) -> Option<IoDataLeaseId> {
         match self {
             Self::None => None,
-            Self::PageCache { lease, .. } | Self::Direct { lease, .. } => Some(*lease),
+            Self::PageCache { lease, .. }
+            | Self::PageCacheSegments { lease, .. }
+            | Self::Direct { lease, .. } => Some(*lease),
         }
     }
 }

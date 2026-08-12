@@ -1,5 +1,5 @@
 use super::*;
-use crate::fs_iface::PageDataLeaseProjection;
+use crate::fs_iface::{PageCacheSegment, PageDataLeaseProjection};
 use crate::page_backed::adapter::step_engine::{
     self as step_engine, PageProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
@@ -93,6 +93,11 @@ impl PageDataLease {
         self.pages.len()
     }
 
+    pub(super) fn with_id(mut self, id: IoDataLeaseId) -> Self {
+        self.id = id;
+        self
+    }
+
     pub(super) fn generations(&self) -> impl Iterator<Item = (PageIndex, PageGeneration)> + '_ {
         self.pages
             .iter()
@@ -114,8 +119,7 @@ impl PageDataLease {
             .pages
             .iter()
             .map(|segment| {
-                IoDataSource::page_cache(
-                    self.id,
+                PageCacheSegment::new(
                     PageFrameRef::new(segment.lease.ppn()),
                     0,
                     crate::vm::USER_PAGE_SIZE as u32,
@@ -123,7 +127,28 @@ impl PageDataLease {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        PageDataLeaseProjection::new(segments)
+        PageDataLeaseProjection::new(alloc::boxed::Box::new([IoDataSource::page_cache_segments(
+            self.id, segments,
+        )]))
+    }
+
+    pub(super) fn source_for_request(&self) -> IoDataSource {
+        if self.pages.len() == 1 {
+            return self.source();
+        }
+        let segments = self
+            .pages
+            .iter()
+            .map(|segment| {
+                PageCacheSegment::new(
+                    PageFrameRef::new(segment.lease.ppn()),
+                    0,
+                    crate::vm::USER_PAGE_SIZE as u32,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        IoDataSource::page_cache_segments(self.id, segments)
     }
 }
 
@@ -182,7 +207,7 @@ impl OwnedFileIoRequest {
 
     pub(crate) fn source(&self) -> IoDataSource {
         match &self.payload {
-            FileIoPayload::Writeback { lease } => lease.source(),
+            FileIoPayload::Writeback { lease } => lease.source_for_request(),
             FileIoPayload::Read { .. } | FileIoPayload::Control => IoDataSource::None,
         }
     }

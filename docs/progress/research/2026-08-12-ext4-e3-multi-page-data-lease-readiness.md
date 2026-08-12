@@ -34,49 +34,61 @@ E3 remains one vertical ownership change:
 | Freeze writable PTEs across writeback | No active design defines the owned VM lease and restore protocol | needs design update; defer to E4 |
 | Apply RCU to PageSlot contents, DMA pins, RangeLock, PTEs, shootdown, or JBD2 phase | Explicitly rejected by the current migration audit and memory/I/O ownership contract | do not implement |
 
-## Current readiness
+## E3 writeback slice complete
 
-| Boundary | Current state | E3 action |
-|---|---|---|
-| Lease storage | `Box<[PageLease]>`, but only `single()` and `pages[0]` projection | add checked multi-segment construction/projection |
-| Read target | one retained `CachedFrame` | retain a bounded target bundle before multi-page fetch admission |
-| L4 admission | service submission and owner insertion are separate | migrate atomic request-plus-owner publication first |
-| Planner payload | one `IoDataSource` and one `IoDataTarget`; an unused multi-source projection exists | add an opaque segment-preserving representation without aliasing `Direct` user DMA |
-| Terminal route | one completion generation/frame and `page_count == 1` checks | aggregate one request's per-page facts before consuming its owner |
-| L6 | already value-only and SG-capable | no ownership redesign |
-
-The first implementation slice is the atomic L4 publication helper and its
-writeback/fetch call sites, followed by the checked multi-segment lease types.
-The plan stays in progress until real two-page admission, partial failure,
-stale/redirty settlement, and exactly-once release tests pass.
-
-## E3 slice landed
-
-The first implementation slice is now present in the candidate worktree:
+The candidate now implements the bounded multi-page writeback custody path:
 
 - L4 publishes a `PageService` request and its `OwnedFileIoRequest` under one
-  manager lock; writeback and planner-backed fetch use this path.
-- `PageDataLease` retains `(PageIndex, PageGeneration, PageLease)` segments,
-  validates a caller-supplied bound and contiguous order, and emits a neutral
-  multi-source projection while the single-page source remains compatible.
-- Focused tests cover atomic owner visibility, two-segment generation/frame
-  order, projection shape, and empty/hole rejection.
+  manager lock. Writeback and planner-backed single-page fetch both use the
+  atomic request-plus-owner path.
+- `PageDataLease` retains checked, contiguous
+  `(PageIndex, PageGeneration, PageLease)` segments. One lease supports up to
+  64 dirty pages while preserving the single-page compatibility entry point.
+- `queue_dirty_file_writeback()` groups adjacent frontier pages. One batch
+  creates one `PageIoRange`, one request, and one retained owner; any failed
+  pre-admission step rolls back every PageSlot transition and cache pin.
+- Terminal handling consumes the owner once and settles each PageSlot using
+  the generation stored in the lease. Submit failure, device error, redirty,
+  one stale sibling, and duplicate terminal paths are covered.
+- `PageCacheSegments` carries opaque frame segments through the filesystem
+  interface. The ext4 mapped planner emits one SG BIO only when every segment
+  maps to consecutive physical blocks; holes, metadata-first mapping,
+  noncontiguous blocks, and malformed lengths/counts fail closed.
+- A custom ext4/JBD2 write planner remains authoritative. Its journal bridge
+  splits a valid multi-page source into ordered per-page sources with the same
+  lease identity before mutation staging.
+- Explicit fsync scans the frozen frontier, groups adjacent dirty pages into
+  bounded requests, and falls back page-by-page only when a batch cannot be
+  admitted.
+- Partial L6 admission retains every non-empty accepted prefix and emits one
+  sticky admission error only after the prefix reaches terminal completion.
+  A zero-accepted ordinary BIO, metadata-first batch, or graph root fails
+  synchronously, leaving no DMA route or continuation that could outlive its
+  PageBacked owner.
 
-This is intentionally not a complete multi-page runtime: fetch targets still
-arrive one page at a time, ext4 lowering still consumes one `PageCache` source
-or target, and terminal completion still rejects `page_count != 1`. Batch
-admission, graph/range fanout, stale/redirty sibling settlement, and
-exactly-once bundle release remain the next E3 gate.
+Full regression exposed and fixed two earlier branch inconsistencies:
 
-Verification for this slice:
+- synchronous demand-read planning now attributes terminal planner errors to
+  the exact request and returns its errno instead of falling through to the
+  compatibility pager as `EAGAIN`;
+- `FileFsyncOp` sends only file-backed containers through the L4 frontier;
+  anon/device containers use the existing `FsPageBacking` fallback instead of
+  returning `EINVAL`.
 
+Multi-page fetch/readahead and writable-PTE freeze are explicitly out of this
+migration scope. JBD2 transaction aggregation, production cutover, and live
+crash/xfstests evidence are later gates and are not claimed by E3.
+
+Verification for the completed writeback slice:
+
+- `cargo check -p tx-subsystems -p tx-ext4`: passed.
+- `cargo test -p tx-subsystems --lib page_backed -- --test-threads=1`:
+  191 passed.
+- `cargo test -p tx-ext4 --lib -- --test-threads=1`: 80 passed, 2 ignored.
+- `cargo test -p tx-ext4 --lib split_writeback_page_cache_segments -- --test-threads=1`:
+  2 passed.
 - `cargo -q xtask unit`: passed (`tx-shims` 663, `tx-kernel` 119,
-  `tx-ext4` 73 with 2 ignored, `tx-scripts` 168).
-- `cargo test -p tx-subsystems --lib page_data_lease -- --test-threads=1`:
-  3 passed.
-- `cargo test -p tx-subsystems --lib file_io_owner_is_admitted_before_request_becomes_service_visible -- --test-threads=1`:
-  1 passed.
-- targeted `rustfmt --edition 2021 --check` and `git diff --check`: passed.
+  `tx-ext4` 80 with 2 ignored, `tx-scripts` 168).
 
 ## Verification baseline
 
@@ -90,6 +102,7 @@ Verification for this slice:
 
 ## Next gate
 
-Land and test atomic L4 publication, then implement the multi-segment owner and
-terminal fanout without widening into writable mappings or JBD2 transaction
-aggregation.
+Refresh the current ext4 acceptance oracles, then converge the completed
+writeback lease through the current `MutationHandle` and JBD2 ownership path.
+Do not add multi-page fetch/readahead, writable-PTE freeze, PELT, or network
+work to that phase.

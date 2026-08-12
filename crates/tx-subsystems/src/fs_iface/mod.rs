@@ -9,6 +9,6 @@ pub use plan::{
     BackendBioCompletion, BackendBioDependency, BackendBioGraph, BackendBioGraphError,
     BackendBioNode, BackendBioNodeId, BackendPageCompletion, BackendPageRequest, BackendPlan,
     BackendPlanResume, BackendPlanner, BioPlanList, FsObjectKey, IoDataLeaseId, IoDataSource,
-    IoDataTarget, PageCompletion, PageCompletionList, PageDataLeaseProjection, PageFrameRef,
-    PagerResumeToken, WaitSourceId,
+    IoDataTarget, PageCacheSegment, PageCompletion, PageCompletionList, PageDataLeaseProjection,
+    PageFrameRef, PagerResumeToken, WaitSourceId,
 };

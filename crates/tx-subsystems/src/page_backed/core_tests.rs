@@ -13,8 +13,8 @@ use crate::device::{
 use crate::execution::Errno;
 use crate::fs_iface::{
     BackendBioDependency, BackendBioGraph, BackendBioNode, BackendBioNodeId, BackendPageRequest,
-    BackendPlan, BackendPlanner, BioPlanList, IoDataLeaseId, IoDataSource, PageCompletion,
-    PageCompletionList, PageFrameRef, PagerResumeToken,
+    BackendPlan, BackendPlanner, BioPlanList, IoDataLeaseId, IoDataSource, PageCacheSegment,
+    PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken,
 };
 use crate::io_manager::backend::BlockPageRequestTracker;
 use crate::io_manager::block::{
@@ -1808,6 +1808,46 @@ fn file_fsync_session_waits_for_its_captured_writeback_without_duplicate_submiss
 }
 
 #[test]
+fn file_fsync_session_batches_adjacent_frontier_pages_into_one_request() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(0x88), 4);
+    for raw in [1, 2] {
+        let page = PageIndex::new(raw);
+        let frame = cached_frame_for_test();
+        let ppn = frame.ppn;
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+
+    let session = pc.begin_file_fsync_session().expect("file fsync session");
+    assert_eq!(
+        session.advance(),
+        FileFsyncFrontierAdvance::Submitted { pages: 2 }
+    );
+    assert_eq!(pc.file_io_request_count_for_test(), 1);
+    assert_eq!(pc.file_io_owner_count_for_test(), 1);
+    assert!(pc
+        .page_submission
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(1, 2),
+            PageIoOp::Writeback,
+        )
+        .is_some());
+}
+
+#[test]
 fn file_fsync_session_resubmits_a_redirty_after_its_earlier_writeback_finishes() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -2546,11 +2586,15 @@ fn page_data_lease_preserves_bounded_generation_order_in_projection() {
             (PageIndex::new(5), PageGeneration::new(12)),
         ]
     );
+    let sources = lease.source_projection().into_sources();
+    let [IoDataSource::PageCacheSegments { segments, .. }] = sources.as_ref() else {
+        panic!("expected one opaque page-cache segment projection");
+    };
     assert!(matches!(
-        lease.source_projection().into_sources().as_ref(),
+        segments.as_ref(),
         [
-            IoDataSource::PageCache { frame: first, .. },
-            IoDataSource::PageCache { frame: second, .. }
+            PageCacheSegment { frame: first, .. },
+            PageCacheSegment { frame: second, .. }
         ] if first.ppn() == first_ppn && second.ppn() == second_ppn
     ));
 }
@@ -2808,6 +2852,40 @@ fn file_page_planner_terminal_error_does_not_fallback_to_compat_fetch() {
         "planner terminal errors should not retry through the compatibility pager"
     );
     assert!(!pc.file_page_fetch_in_flight_for_test(PageIndex::new(1)));
+}
+
+#[test]
+fn file_service_terminal_error_is_attributed_to_its_request() {
+    let request = |id| {
+        PageIoRequest::new(
+            PageIoRequestId::new(id),
+            PageContainerKey::new(7),
+            PageIoRange::new(id, 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(id)),
+        )
+    };
+    let work = [
+        PageServiceDrivenWork::BackendSubmission(PageServiceBackendSubmitOutcome::Err {
+            request: request(11),
+            errno: Errno::EIO,
+        }),
+        PageServiceDrivenWork::BackendSubmission(PageServiceBackendSubmitOutcome::Err {
+            request: request(12),
+            errno: Errno::ESTALE,
+        }),
+    ];
+
+    assert_eq!(
+        file_service_terminal_error_for_request(&work, Some(PageIoRequestId::new(12))),
+        Some(Errno::ESTALE)
+    );
+    assert_eq!(
+        file_service_terminal_error_for_request(&work, Some(PageIoRequestId::new(13))),
+        None
+    );
 }
 
 #[test]
@@ -3942,6 +4020,49 @@ fn file_page_owned_l6_runtime_routes_bio_completion_into_page_slot() {
 }
 
 #[test]
+fn read_completion_with_writeback_kind_rolls_back_fetch_before_consuming_owner() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(0x87),
+        2,
+        Arc::new(RecordingPlanner),
+    );
+    let page = PageIndex::new(0);
+    let FilePageFetchStart::Owner(_) = pc.begin_file_page_fetch(page, MaterializeAccess::Read)
+    else {
+        panic!("test fetch should own a newly admitted request");
+    };
+    let request = pc
+        .file_io_pending_request_for_test(page)
+        .expect("staged file service submission");
+    let generation = request.generation_hint.expect("fetch generation");
+    let wrong_kind = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ),
+        frame: None,
+        waiters: alloc::vec![],
+    };
+
+    assert_eq!(pc.apply_file_io_completion_route(&wrong_kind), None);
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(page)
+            .expect("fetch slot")
+            .state,
+        PageSlotState::Empty
+    );
+}
+
+#[test]
 fn file_checkpoint_completion_notifies_background_graph_owner_only() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -4077,6 +4198,72 @@ fn file_background_admission_failure_notifies_planner_after_releasing_state_lock
         !planner.called_under_state_lock.load(Ordering::Acquire),
         "background completion callback must run after releasing PageContainer state lock"
     );
+}
+
+#[test]
+fn file_background_zero_l6_admission_reports_queue_errno_synchronously() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct QueueFailurePlanner {
+        completions: SpinMutex<Vec<Result<(), Errno>>>,
+    }
+
+    impl BackendPlanner for QueueFailurePlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Err(Errno::ENOSYS)
+        }
+
+        fn complete_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+            result: Result<(), Errno>,
+        ) {
+            self.completions.lock().push(result);
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(QueueFailurePlanner {
+        completions: SpinMutex::new(Vec::new()),
+    });
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(114), 2, planner.clone());
+    for lba in 0..1024 {
+        pc.block_submission
+            .submit_untracked_for_test(BioPlan::new(
+                DeviceKey::new(99),
+                BlockOp::Read,
+                LbaRange::new(20_000 + lba * 2, 1),
+                alloc::vec![BioVec::new(0x400 + lba, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("fill owned L6 queue");
+    }
+    let graph = BackendBioGraph::new(
+        alloc::vec![BackendBioNode::new(
+            BackendBioNodeId::new(94),
+            BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Write,
+                LbaRange::new(112, 1),
+                alloc::vec![BioVec::new(0x500, 0, 512)],
+                BlockFlags::EMPTY,
+            ),
+            IoDataSource::None,
+        )],
+        alloc::vec![],
+    )
+    .expect("valid checkpoint graph");
+
+    pc.queue_file_background_graph(
+        planner.as_ref(),
+        crate::fs_iface::FsObjectKey::new(114),
+        graph,
+    );
+
+    assert_eq!(*planner.completions.lock(), alloc::vec![Err(Errno::EAGAIN)]);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
 }
 
 #[test]

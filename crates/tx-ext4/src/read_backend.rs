@@ -114,17 +114,27 @@ where
 }
 
 fn validate_multi_page_write_source(source: &IoDataSource, page_count: u64) -> Result<(), Errno> {
-    let IoDataSource::Direct { vecs, .. } = source else {
-        return Err(Errno::EINVAL);
-    };
-    if vecs.len() != usize::try_from(page_count).map_err(|_| Errno::EINVAL)? {
-        return Err(Errno::EINVAL);
-    }
-    if vecs
-        .iter()
-        .any(|vec| vec.offset != 0 || vec.len != BLOCK_SIZE as u32)
-    {
-        return Err(Errno::EINVAL);
+    let count = usize::try_from(page_count).map_err(|_| Errno::EINVAL)?;
+    match source {
+        IoDataSource::PageCacheSegments { segments, .. } => {
+            if segments.len() != count
+                || segments
+                    .iter()
+                    .any(|segment| segment.offset != 0 || segment.len != BLOCK_SIZE as u32)
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        IoDataSource::Direct { vecs, .. } => {
+            if vecs.len() != count
+                || vecs
+                    .iter()
+                    .any(|vec| vec.offset != 0 || vec.len != BLOCK_SIZE as u32)
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        IoDataSource::None | IoDataSource::PageCache { .. } => return Err(Errno::EINVAL),
     }
     Ok(())
 }

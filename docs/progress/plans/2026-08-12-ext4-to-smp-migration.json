@@ -6,7 +6,7 @@
   "created": "2026-08-12",
   "updated": "2026-08-12",
   "owner": "codex/root",
-  "summary": "Treat the landed ext4 reconciliation work as the baseline, retain the remaining dirty worktrees only as behavioral or test oracles, and close the missing multi-page data lease, writable-mapping freeze, L4/L6 custody, and SMP acceptance boundaries without importing legacy runtimes.",
+  "summary": "Treat the landed ext4 reconciliation work as the baseline, retain the remaining dirty worktrees only as behavioral or test oracles, and close bounded multi-page writeback custody, current L4/L6/JBD2 ownership, and SMP acceptance boundaries without importing legacy runtimes.",
   "scope": {
     "in": [
       "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md",
@@ -32,6 +32,8 @@
       "scheduler/pelt",
       "network/",
       "vm/rcu-on-vm-recipe-arena-range-txn",
+      "vm/writable-pte-freeze",
+      "pagebacked/multi-page-fetch-readahead",
       "jbd2/multiple-outstanding-cross-transaction-replay",
       "claims/pre-linux-crash-smp-performance-or-tier2"
     ],
@@ -42,7 +44,7 @@
           "docs/progress/plans/2026-08-12-ext4-to-smp-migration.json",
           "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md"
         ],
-        "notes": "This planning pass claims only its own records. Each implementation phase must claim a fresh disjoint write set in a clean candidate worktree so it cannot overlap the existing dirty ext4, VM, or I/O plans."
+        "notes": "The plan owns only its planning records. The clean candidate worktree record owns the completed E3 code and catch-up files; future phases must refresh both records before editing."
       }
     ]
   },
@@ -59,6 +61,8 @@
     ],
     "progress_refs": [
       "docs/progress/research/2026-08-12-ext4-worktree-smp-migration-audit.md",
+      "docs/progress/research/2026-08-12-ext4-e3-multi-page-data-lease-readiness.md",
+      "docs/progress/worktrees/2026-08-12-ext4-smp-migration.json",
       "docs/progress/research/2026-08-08-ext4-worktree-reconciliation.md",
       "docs/progress/research/2026-08-09-ext4-rustc-contract-disposition.md",
       "docs/progress/plans/2026-08-11-rcu-on-vm-to-smp-migration.json",
@@ -132,8 +136,8 @@
     },
     {
       "id": "e3-multi-page-data-lease",
-      "title": "Generalize PageDataLease and DMA custody to a real multi-page request",
-      "status": "in-progress",
+      "title": "Generalize PageDataLease and DMA custody for bounded multi-page writeback",
+      "status": "complete",
       "depends_on": [
         "e1-classify-worktree-content"
       ],
@@ -143,18 +147,18 @@
         "crates/tx-subsystems/src/io_manager/"
       ],
       "verification": [
-        "multi-page writeback and fetch admission retain every page generation and frame until one terminal L4 return",
-        "redirty, stale completion, cancellation, submit failure, and partial-node failure release each bundle exactly once",
-        "lease projection preserves opaque segment keys and ranges through graph split, coalesce, and L6 completion",
-        "normal aligned buffered I/O reports zero extra payload copies and zero bounce bytes",
+        "bounded contiguous multi-page writeback admission retains every selected page generation and frame until one terminal L4 return",
+        "redirty, stale sibling, submit failure, device error, duplicate terminal, and pre-admission rollback settle or release each bundle exactly once",
+        "lease projection preserves opaque page-cache segments through ext4 SG lowering and JBD2 per-page source splitting",
+        "custom JBD2 write planning remains authoritative while unsupported hole, metadata-first, noncontiguous, and malformed shapes fail closed",
         "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1"
       ],
-      "notes": "Active in /Users/3y/.config/superpowers/worktrees/Tx/ext4-smp-migration on codex/ext4-smp-migration. Start by migrating atomic L4 request-plus-owner publication, then extend the existing owner through checked multi-segment projection and one consuming per-page settlement; do not add a parallel lease type or let L6 release it."
+      "notes": "Completed in /Users/3y/.config/superpowers/worktrees/Tx/ext4-smp-migration on codex/ext4-smp-migration. One request and owner bundle cover up to 64 contiguous dirty pages; L4 consumes the owner once and PageBacked settles captured generations per page. Multi-page fetch/readahead was explicitly removed from scope."
     },
     {
       "id": "e4-writable-pte-freeze-lease",
       "title": "Design and implement a VM-owned writable-PTE freeze lease",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": [
         "e1-classify-worktree-content"
       ],
@@ -171,7 +175,7 @@
         "mmap write versus writeback, truncate, munmap, mprotect, fork/COW, stale completion, and shootdown-timeout races",
         "cargo test -p tx-subsystems --lib vm -- --test-threads=1"
       ],
-      "notes": "This is a new current-architecture design, not a direct import. RangeLock, MapPin, PTE state, and shootdown acknowledgement remain VM-owned and are never RCU-retired."
+      "notes": "Canceled by current scope. The migration does not implement writable-PTE freeze; RangeLock, MapPin, PTE state, and shootdown acknowledgement remain VM-owned and are never RCU-retired."
     },
     {
       "id": "e5-current-l4-l6-jbd2-convergence",
@@ -179,8 +183,7 @@
       "status": "pending",
       "depends_on": [
         "e2-refresh-current-oracles",
-        "e3-multi-page-data-lease",
-        "e4-writable-pte-freeze-lease"
+        "e3-multi-page-data-lease"
       ],
       "paths": [
         "crates/tx-subsystems/src/page_backed/",
@@ -193,11 +196,11 @@
         "one fsync frontier can admit every selected page generation without a one-page Busy dead end",
         "MutationHandle retains only child request IDs and journal/deferred-free tokens while L4 owns page/DMA bundles",
         "L6 returns value-only node completions and cannot mutate PageSlot or release PageDataLease",
-        "checkpoint completion precedes deferred-free reuse, cache settlement, and writable mapping restoration",
+        "checkpoint completion precedes deferred-free reuse and cache settlement",
         "cargo xtask lint invariants ext4-no-direct-home-write",
         "cargo -q xtask unit"
       ],
-      "notes": "Extend the existing current owners. Do not restore historical JournalFsyncSource, caller-managed discard, synchronous settlement, or direct home writes."
+      "notes": "Explicit fsync contiguous-page batching and partial L6 accepted-prefix custody are implemented and host-tested. The step remains pending on e2 plus MutationHandle/JBD2 aggregation and production cutover. Do not restore historical JournalFsyncSource, caller-managed discard, synchronous settlement, or direct home writes."
     },
     {
       "id": "e6-smp-ext4-acceptance",
@@ -239,18 +242,18 @@
     },
     {
       "command": "cargo xtask progress validate",
-      "status": "passed",
-      "notes": "Validated 49 progress records after adding this plan."
+      "status": "failed",
+      "notes": "The current catch-up is valid JSON, but repository-wide validation is blocked by the unrelated missing docs/progress/research/2026-08-04-smp-scheduler-readiness-audit.md reference in the excluded PELT plan."
     },
     {
       "command": "cargo xtask lint docs",
-      "status": "skipped",
-      "notes": "The pre-existing untracked .io-submission-patch duplicate tree produced 2116 duplicate-tag and broken-link findings; no finding was attributed to this plan or research note."
+      "status": "passed",
+      "notes": "Passed after the final catch-up; seven stale-vocabulary mentions in active docs remain warning-only because they discuss retired terms."
     },
     {
       "command": "git diff --check",
       "status": "passed",
-      "notes": "Passed for the planning and heap diff before final catch-up."
+      "notes": "Passed for the full ext4 E3 and partial E5 migration diff after final catch-up."
     },
     {
       "command": "cargo fmt -p tx-substrate -- --check",
@@ -258,9 +261,24 @@
       "notes": "Task-scoped format gate passed; whole-workspace cargo fmt --check remains blocked by unrelated pre-existing files."
     },
     {
+      "command": "rustfmt --edition 2021 --check <all 13 touched Rust files>",
+      "status": "passed",
+      "notes": "Task-scoped format gate passed without formatting unrelated tx-subsystems modules."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1",
+      "status": "passed",
+      "notes": "191 passed, including zero-accepted and partial-prefix L6 admission, explicit fsync batching, completion-kind mismatch, and multi-page lease settlement regressions."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib -- --test-threads=1",
+      "status": "passed",
+      "notes": "80 passed and 2 ignored, including mapped SG lowering and JBD2 per-page source splitting."
+    },
+    {
       "command": "cargo -q xtask unit",
       "status": "passed",
-      "notes": "tx-shims 663, tx-kernel 119, tx-ext4 73 with 2 ignored, and tx-scripts 168 passed."
+      "notes": "tx-shims 663, tx-kernel 119, tx-ext4 80 with 2 ignored, and tx-scripts 168 passed after the partial L6 admission repair."
     },
     {
       "command": "cargo xtask lint invariants ext4-no-direct-home-write",
@@ -291,9 +309,7 @@
     "Host tests and SMP smoke do not replace Linux image exchange, e2fsck, xfstests, and crash evidence."
   ],
   "blockers": [
-    "The current target has pre-existing dirty and untracked work; implementation needs a clean candidate worktree and disjoint phase claims.",
-    "The current PageDataLease is structurally multi-page but operationally single-page.",
-    "No active design currently defines the writable-PTE freeze lease required for mmap/writeback/truncate convergence.",
+    "JBD2 transaction aggregation and production cutover remain outside the completed E3 writeback slice.",
     "A fresh full ext4 crash/xfstests receipt for the future SMP candidate does not exist.",
     "Whole-tree docs lint may be blocked by the pre-existing untracked .io-submission-patch duplicate-doc tree."
   ],

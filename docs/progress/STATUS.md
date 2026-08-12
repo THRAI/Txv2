@@ -32737,13 +32737,26 @@
 
 ### 2026-08-12 Ext4 E3 multi-page lease migration
 
-- The clean `codex/ext4-smp-migration` candidate now has atomic L4
-  request-plus-owner publication, and `PageDataLease` retains checked
-  `(page, generation, PageLease)` segments with a neutral multi-source
-  projection. Focused lease/visibility tests and full `cargo -q xtask unit`
-  passed. This is a preparation slice only: real multi-page target admission,
-  ext4 segment lowering, terminal fanout, stale/redirty handling, and
-  exactly-once bundle settlement remain open.
+- The clean `codex/ext4-smp-migration` candidate completed bounded contiguous
+  multi-page writeback custody: one request/owner retains up to 64 page
+  generations and cache pins, ext4 lowers valid mapped segments into one SG
+  BIO, JBD2 splits ordered per-page sources without losing lease identity, and
+  terminal handling consumes the owner once before per-page settlement.
+  Rollback, submit failure, device error, redirty, stale sibling, malformed
+  segment, noncontiguous mapping, and duplicate-terminal cases are covered.
+- Explicit fsync now batches adjacent dirty frontier pages into the same
+  bounded range request. Partial L6 admission retains a non-empty accepted
+  prefix until its terminal completion and reports the sticky admission errno
+  once; a zero-accepted BIO, metadata-first, or graph receipt fails
+  synchronously so PageBacked releases the owner in the same service turn.
+- Full regression also restored request-attributed planner errno propagation
+  for synchronous demand reads and non-file VFS fsync fallback. Verification
+  passed `cargo test -p tx-subsystems --lib page_backed -- --test-threads=1`
+  (191/191), `cargo test -p tx-ext4 --lib -- --test-threads=1` (80 passed,
+  2 ignored), and `cargo -q xtask unit` (`663/119/80+2 ignored/168`).
+- Multi-page fetch/readahead and writable-PTE freeze are canceled for this
+  migration scope. JBD2 aggregation, production cutover, and fresh SMP ext4
+  crash/xfstests evidence remain later work.
 - `cargo xtask progress validate` remains blocked by the unrelated missing
   `docs/progress/research/2026-08-04-smp-scheduler-readiness-audit.md` reference.
   Details: `docs/progress/research/2026-08-12-ext4-e3-multi-page-data-lease-readiness.md`.

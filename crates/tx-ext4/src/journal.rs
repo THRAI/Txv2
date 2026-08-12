@@ -1495,6 +1495,24 @@ fn split_writeback_data_sources(
                 *lease, *frame, *offset, *len,
             )])
         }
+        IoDataSource::PageCacheSegments { lease, segments } => {
+            if segments.len() != usize::try_from(page_count).map_err(|_| Errno::EINVAL)? {
+                return Err(Errno::EINVAL);
+            }
+            let mut out = Vec::new();
+            for segment in segments {
+                if segment.offset != 0 || segment.len != JBD2_BLOCK_SIZE as u32 {
+                    return Err(Errno::EINVAL);
+                }
+                out.push(IoDataSource::page_cache(
+                    *lease,
+                    segment.frame,
+                    segment.offset,
+                    segment.len,
+                ));
+            }
+            Ok(out)
+        }
         IoDataSource::Direct { lease, vecs } => {
             if vecs.len() != usize::try_from(page_count).map_err(|_| Errno::EINVAL)? {
                 return Err(Errno::EINVAL);
@@ -1719,6 +1737,54 @@ mod tests {
         Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
     };
     use tx_ext4_format::pager::JournalGeometry;
+    use tx_hal::Ppn;
+    use tx_subsystems::fs_iface::PageCacheSegment;
+
+    #[test]
+    fn split_writeback_page_cache_segments_preserves_order_frames_and_lease() {
+        let lease = IoDataLeaseId::new(17);
+        let first = PageCacheSegment::new(PageFrameRef::new(Ppn(0x41)), 0, 4096);
+        let second = PageCacheSegment::new(PageFrameRef::new(Ppn(0x42)), 0, 4096);
+        let source = IoDataSource::page_cache_segments(lease, [first, second].into());
+
+        assert_eq!(
+            split_writeback_data_sources(&source, 2),
+            Ok(vec![
+                IoDataSource::page_cache(lease, first.frame, first.offset, first.len),
+                IoDataSource::page_cache(lease, second.frame, second.offset, second.len),
+            ])
+        );
+    }
+
+    #[test]
+    fn split_writeback_page_cache_segments_rejects_invalid_shapes() {
+        let lease = IoDataLeaseId::new(18);
+        let valid = PageCacheSegment::new(PageFrameRef::new(Ppn(0x51)), 0, 4096);
+        let cases = [
+            (2, IoDataSource::page_cache_segments(lease, [valid].into())),
+            (
+                1,
+                IoDataSource::page_cache_segments(
+                    lease,
+                    [PageCacheSegment::new(valid.frame, 1, 4096)].into(),
+                ),
+            ),
+            (
+                1,
+                IoDataSource::page_cache_segments(
+                    lease,
+                    [PageCacheSegment::new(valid.frame, 0, 4095)].into(),
+                ),
+            ),
+        ];
+
+        for (page_count, source) in cases {
+            assert_eq!(
+                split_writeback_data_sources(&source, page_count),
+                Err(Errno::EINVAL)
+            );
+        }
+    }
 
     #[test]
     fn journal_pool_sizing_counts_owned_data_metadata_checkpoint_and_state_pages() {

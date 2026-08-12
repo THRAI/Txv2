@@ -105,6 +105,7 @@ static FILE_PAGE_CONTAINER_IDENTITIES: SpinMutex<alloc::vec::Vec<FilePageContain
 
 const PAGE_CACHE_RECLAIM_BATCH: usize = 256;
 const PAGE_CACHE_RECLAIM_LOW_WATERMARK: usize = 1024;
+const MAX_FILE_WRITEBACK_BATCH_PAGES: usize = 64;
 const RESIDENT_ROOT_RETIRE_MAINTENANCE_BUDGET: usize = 64;
 const RESIDENT_ROOT_RETIRE_MAINTENANCE_ATTEMPTS: usize = 4;
 
@@ -1923,52 +1924,90 @@ impl PageContainer {
     /// submission and completion. A failed admission restores the slot to
     /// `Dirty`, so no request is left falsely in flight.
     pub fn queue_file_page_writeback(&self, page: PageIndex) -> Option<PageIoRequestId> {
+        self.queue_file_writeback_batch(core::slice::from_ref(&page))
+    }
+
+    /// Atomically admit one bounded contiguous dirty-page range to L4.
+    ///
+    /// Every PageSlot transition and cache pin is acquired before the request
+    /// becomes visible. Any failure restores all generations that this attempt
+    /// moved into writeback and drops every acquired pin.
+    fn queue_file_writeback_batch(&self, pages: &[PageIndex]) -> Option<PageIoRequestId> {
         if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return None;
+        }
+        if pages.is_empty() || pages.len() > MAX_FILE_WRITEBACK_BATCH_PAGES {
+            return None;
+        }
+        if pages
+            .windows(2)
+            .any(|pair| pair[0].as_u64().checked_add(1) != Some(pair[1].as_u64()))
+        {
             return None;
         }
 
         let state = self.state.lock();
-        let writeback = state.page_slots.get(&page)?.begin_writeback().ok()?;
-        let Some(ppn) = state.pages.load(page).map(PageCacheEntry::ppn) else {
-            if let Some(slot) = state.page_slots.get(&page) {
-                let _ = slot.abort_writeback(writeback.generation);
+        let mut segments = Vec::with_capacity(pages.len());
+        let mut generations = Vec::with_capacity(pages.len());
+        for &page in pages {
+            let Some(slot) = state.page_slots.get(&page) else {
+                rollback_file_writeback_slots(&state, &generations);
+                return None;
+            };
+            let Ok(writeback) = slot.begin_writeback() else {
+                rollback_file_writeback_slots(&state, &generations);
+                return None;
+            };
+            generations.push((page, writeback.generation));
+            let Some(ppn) = state.pages.load(page).map(PageCacheEntry::ppn) else {
+                rollback_file_writeback_slots(&state, &generations);
+                return None;
+            };
+            let Ok(cache_pin) = page_allocator::acquire_cache_pin(ppn) else {
+                rollback_file_writeback_slots(&state, &generations);
+                return None;
+            };
+            segments.push((
+                page,
+                writeback.generation,
+                PageLease {
+                    ppn,
+                    cache_pin: PageCachePin::Allocated(cache_pin),
+                },
+            ));
+        }
+        drop(state);
+
+        let first = pages[0];
+        let first_generation = generations[0].1;
+        let lease = match PageDataLease::from_segments(
+            IoDataLeaseId::new(0),
+            MAX_FILE_WRITEBACK_BATCH_PAGES,
+            segments.into_boxed_slice(),
+        ) {
+            Ok(lease) => lease,
+            Err(_) => {
+                let state = self.state.lock();
+                rollback_file_writeback_slots(&state, &generations);
+                return None;
             }
-            return None;
-        };
-        let Ok(cache_pin) = page_allocator::acquire_cache_pin(ppn) else {
-            if let Some(slot) = state.page_slots.get(&page) {
-                let _ = slot.abort_writeback(writeback.generation);
-            }
-            return None;
         };
         match self.page_submission.submit_owned_file_request(
             self.io_manager_key(),
-            PageIoRange::new(page.as_u64(), 1),
+            PageIoRange::new(first.as_u64(), pages.len() as u64),
             PageIoOp::Writeback,
             PageIoPriority::BackgroundWriteback,
             PageIoFlags::WRITEBACK,
-            Some(writeback.generation),
-            |request| {
+            Some(first_generation),
+            move |request| {
                 let lease_id = IoDataLeaseId::new(request.id.raw());
-                OwnedFileIoRequest::writeback(
-                    request,
-                    PageDataLease::single(
-                        lease_id,
-                        page,
-                        writeback.generation,
-                        PageLease {
-                            ppn,
-                            cache_pin: PageCachePin::Allocated(cache_pin),
-                        },
-                    ),
-                )
+                OwnedFileIoRequest::writeback(request, lease.with_id(lease_id))
             },
         ) {
             Some(id) => Some(id),
             None => {
-                if let Some(slot) = state.page_slots.get(&page) {
-                    let _ = slot.abort_writeback(writeback.generation);
-                }
+                let state = self.state.lock();
+                rollback_file_writeback_slots(&state, &generations);
                 None
             }
         }
@@ -1984,11 +2023,41 @@ impl PageContainer {
             return 0;
         };
 
+        let candidates = {
+            let state = self.state.lock();
+            frontier
+                .pages()
+                .iter()
+                .filter_map(|&(page, _)| {
+                    state
+                        .page_slots
+                        .get(&page)
+                        .filter(|slot| matches!(slot.snapshot().state, PageSlotState::Dirty { .. }))
+                        .map(|_| page)
+                })
+                .collect::<Vec<_>>()
+        };
         let mut admitted = 0usize;
-        for &(page, _) in frontier.pages() {
-            if self.queue_file_page_writeback(page).is_some() {
-                admitted = admitted.saturating_add(1);
+        let mut start = 0usize;
+        while start < candidates.len() {
+            let mut end = start + 1;
+            while end < candidates.len()
+                && end - start < MAX_FILE_WRITEBACK_BATCH_PAGES
+                && candidates[end].as_u64() == candidates[end - 1].as_u64().saturating_add(1)
+            {
+                end += 1;
             }
+            let batch = &candidates[start..end];
+            if self.queue_file_writeback_batch(batch).is_some() {
+                admitted = admitted.saturating_add(batch.len());
+            } else {
+                for &page in batch {
+                    admitted = admitted.saturating_add(usize::from(
+                        self.queue_file_page_writeback(page).is_some(),
+                    ));
+                }
+            }
+            start = end;
         }
         if admitted != 0 {
             self.kick_file_io_service(IoServiceKind::Page);
@@ -2026,6 +2095,7 @@ impl PageContainer {
     ) -> FileFsyncFrontierAdvance {
         let mut submitted = 0u32;
         let mut waiting = false;
+        let mut candidates = Vec::new();
         for &(page, generation) in frontier.pages() {
             let status = self
                 .state
@@ -2035,11 +2105,7 @@ impl PageContainer {
                 .map(|slot| slot.fsync_status(generation));
             match status {
                 Some(PageSlotFsyncStatus::NeedsWriteback { .. }) => {
-                    if self.queue_file_page_writeback(page).is_some() {
-                        submitted = submitted.saturating_add(1);
-                    } else {
-                        waiting = true;
-                    }
+                    candidates.push(page);
                 }
                 Some(
                     PageSlotFsyncStatus::WaitingForWriteback { .. }
@@ -2050,6 +2116,29 @@ impl PageContainer {
                 }
                 Some(PageSlotFsyncStatus::Clean) | None => {}
             }
+        }
+        let mut start = 0usize;
+        while start < candidates.len() {
+            let mut end = start + 1;
+            while end < candidates.len()
+                && end - start < MAX_FILE_WRITEBACK_BATCH_PAGES
+                && candidates[end].as_u64() == candidates[end - 1].as_u64().saturating_add(1)
+            {
+                end += 1;
+            }
+            let batch = &candidates[start..end];
+            if self.queue_file_writeback_batch(batch).is_some() {
+                submitted = submitted.saturating_add(batch.len() as u32);
+            } else {
+                for &page in batch {
+                    if self.queue_file_page_writeback(page).is_some() {
+                        submitted = submitted.saturating_add(1);
+                    } else {
+                        waiting = true;
+                    }
+                }
+            }
+            start = end;
         }
         if submitted != 0 {
             FileFsyncFrontierAdvance::Submitted { pages: submitted }
@@ -2168,7 +2257,10 @@ impl PageContainer {
                                 // this PageContainer's private graph registry.
                                 let queued = match outcome {
                                     PageServiceBackendOutcome::BlockGraph(_) => {
-                                        Ok(PageServiceBackendSubmitOutcome::Err(Errno::ENOSYS))
+                                        Ok(PageServiceBackendSubmitOutcome::Err {
+                                            request: request.clone(),
+                                            errno: Errno::ENOSYS,
+                                        })
                                     }
                                     outcome => self.page_submission.with_service(|service| {
                                         service.queue_backend_outcome(
@@ -2188,7 +2280,7 @@ impl PageContainer {
                             }
                         };
                         match queued {
-                            Ok(outcome @ PageServiceBackendSubmitOutcome::Err(_)) => {
+                            Ok(outcome @ PageServiceBackendSubmitOutcome::Err { .. }) => {
                                 self.finish_owned_file_io_request(
                                     &rollback_request,
                                     FileIoTerminalResult::SubmitFailure,
@@ -2232,7 +2324,10 @@ impl PageContainer {
                                 // this PageContainer's private graph registry.
                                 let queued = match outcome {
                                     PageServiceBackendOutcome::BlockGraph(_) => {
-                                        Ok(PageServiceBackendSubmitOutcome::Err(Errno::ENOSYS))
+                                        Ok(PageServiceBackendSubmitOutcome::Err {
+                                            request: page_request.clone(),
+                                            errno: Errno::ENOSYS,
+                                        })
                                     }
                                     outcome => self.page_submission.with_service(|service| {
                                         service.queue_backend_outcome(
@@ -2251,7 +2346,7 @@ impl PageContainer {
                                 .submit_owned_file_backend_outcome(outcome, page_request.clone()),
                         };
                         match queued {
-                            Ok(outcome @ PageServiceBackendSubmitOutcome::Err(_)) => {
+                            Ok(outcome @ PageServiceBackendSubmitOutcome::Err { .. }) => {
                                 self.finish_owned_file_io_request(
                                     &page_request,
                                     FileIoTerminalResult::SubmitFailure,
@@ -2335,9 +2430,6 @@ impl PageContainer {
                     prepared.outcome.queued += queued;
                     prepared.outcome.wake = prepared.outcome.wake.or(wake);
                 }
-                if applied.failure.is_some() {
-                    return Err(PageServiceTaggedBlockCompletionError::ExternalCompletion);
-                }
             }
             let outcome = prepared.outcome;
             let direct_completions = receipt.direct;
@@ -2392,9 +2484,6 @@ impl PageContainer {
             }
             return None;
         }
-        if route.completion.range.page_count() != 1 {
-            return None;
-        }
         if !matches!(
             route.completion.kind,
             PageIoCompletionKind::WritebackFinished | PageIoCompletionKind::ReadInstalled
@@ -2402,6 +2491,27 @@ impl PageContainer {
             return None;
         }
         let request = self.page_submission.file_request(route.completion.id)?;
+        if route.completion.range != request.range
+            || (request.op == PageIoOp::Read && request.range.page_count() != 1)
+        {
+            return self
+                .finish_owned_file_io_request(&request, FileIoTerminalResult::SubmitFailure);
+        }
+        let kind_matches = matches!(
+            (request.op, route.completion.kind),
+            (
+                PageIoOp::Read | PageIoOp::Readahead,
+                PageIoCompletionKind::ReadInstalled
+            ) | (PageIoOp::Writeback, PageIoCompletionKind::WritebackFinished)
+                | (
+                    PageIoOp::Fsync | PageIoOp::Checkpoint,
+                    PageIoCompletionKind::Noop
+                )
+        );
+        if !kind_matches {
+            return self
+                .finish_owned_file_io_request(&request, FileIoTerminalResult::SubmitFailure);
+        }
         self.finish_owned_file_io_request(
             &request,
             FileIoTerminalResult::Completion {
@@ -2432,6 +2542,7 @@ impl PageContainer {
                     PageServiceBackendOutcome::BlockGraph(graph),
                     request.clone(),
                 ) {
+                    Ok(PageServiceBackendSubmitOutcome::Err { errno, .. }) => Err(errno),
                     Ok(_) => {
                         self.page_submission.mark_background_graph(request.id);
                         Ok(())
@@ -2463,10 +2574,7 @@ impl PageContainer {
                 let receipt = self.block_submission.submit_page_action(action);
                 let applied = self.page_submission.apply_l6_receipt(receipt)?;
                 self.block_submission.record_page_outcome(&applied.outcome);
-                match applied.failure {
-                    Some(failure) => Err(PageServiceBackendSubmitError::BlockQueue(failure.error)),
-                    None => Ok(applied.outcome),
-                }
+                Ok(applied.outcome)
             }
             Err(error) => Err(error),
         }
@@ -2529,16 +2637,34 @@ impl PageContainer {
 
         match request.op {
             PageIoOp::Writeback => {
-                let page = PageIndex::new(request.range.start_page());
+                let lease = owner.and_then(|owner| match owner.take_payload() {
+                    FileIoPayload::Writeback { lease } => Some(lease),
+                    FileIoPayload::Read { .. } | FileIoPayload::Control => None,
+                })?;
                 let state = self.state.lock();
-                let result = match terminal {
+                let first_result = match terminal {
                     FileIoTerminalResult::SubmitFailure => {
-                        if let (Some(slot), Some(generation)) =
-                            (state.page_slots.get(&page), request.generation_hint)
-                        {
-                            let _ = slot.abort_writeback(generation);
+                        let mut first_snapshot = None;
+                        let mut first_error = None;
+                        for (page, generation) in lease.generations() {
+                            let result = state.page_slots.get(&page).map_or_else(
+                                || {
+                                    Err(PageSlotCompletionError::NotFetching {
+                                        state: PageSlotState::Empty,
+                                        generation: PageGeneration::new(0),
+                                    })
+                                },
+                                |slot| slot.abort_writeback(generation),
+                            );
+                            match result {
+                                Ok(snapshot) if first_snapshot.is_none() => {
+                                    first_snapshot = Some(snapshot)
+                                }
+                                Err(error) if first_error.is_none() => first_error = Some(error),
+                                Ok(_) | Err(_) => {}
+                            }
                         }
-                        None
+                        first_error.map(Err).or_else(|| first_snapshot.map(Ok))
                     }
                     FileIoTerminalResult::Completion {
                         result,
@@ -2546,20 +2672,51 @@ impl PageContainer {
                         generation,
                         ..
                     } => {
-                        let slot = state.page_slots.get(&page)?;
-                        let result = slot.complete_writeback(
-                            generation,
-                            match result {
+                        if Some(generation) != request.generation_hint {
+                            let current = lease
+                                .generations()
+                                .next()
+                                .and_then(|(page, _)| state.page_slots.get(&page))
+                                .map(|slot| slot.generation())
+                                .unwrap_or(PageGeneration::new(0));
+                            Some(Err(PageSlotCompletionError::GenerationMismatch {
+                                current,
+                                completed: generation,
+                            }))
+                        } else {
+                            let io_result = match result {
                                 PageIoResult::Done => Ok(()),
                                 PageIoResult::Err(errno) => Err(errno),
-                            },
-                        );
-                        Some(result)
+                            };
+                            let mut first_snapshot = None;
+                            let mut first_error = None;
+                            for (page, generation) in lease.generations() {
+                                let result = state.page_slots.get(&page).map_or_else(
+                                    || {
+                                        Err(PageSlotCompletionError::NotFetching {
+                                            state: PageSlotState::Empty,
+                                            generation: PageGeneration::new(0),
+                                        })
+                                    },
+                                    |slot| slot.complete_writeback(generation, io_result),
+                                );
+                                match result {
+                                    Ok(snapshot) if first_snapshot.is_none() => {
+                                        first_snapshot = Some(snapshot)
+                                    }
+                                    Err(error) if first_error.is_none() => {
+                                        first_error = Some(error)
+                                    }
+                                    Ok(_) | Err(_) => {}
+                                }
+                            }
+                            first_error.map(Err).or_else(|| first_snapshot.map(Ok))
+                        }
                     }
                     FileIoTerminalResult::Completion { .. } => None,
                 };
-                drop(owner);
-                result
+                drop(lease);
+                first_result
             }
             PageIoOp::Read => match terminal {
                 FileIoTerminalResult::SubmitFailure => {
@@ -3741,7 +3898,16 @@ impl PageContainer {
             return None;
         }
 
+        let request_id = self
+            .state
+            .lock()
+            .in_flight_file_pages
+            .get(&page)
+            .and_then(|fetch| fetch.request_id);
         let first = self.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)?;
+        if let Some(errno) = file_service_terminal_error_for_request(&first.work, request_id) {
+            return Some(StepOutcome::Err(errno.into()));
+        }
         let mut waits_for_async_completion =
             file_service_work_waits_for_async_completion(first.work.as_slice());
 
@@ -3749,6 +3915,11 @@ impl PageContainer {
             if let Some(second) =
                 self.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
             {
+                if let Some(errno) =
+                    file_service_terminal_error_for_request(&second.work, request_id)
+                {
+                    return Some(StepOutcome::Err(errno.into()));
+                }
                 waits_for_async_completion |=
                     file_service_work_waits_for_async_completion(second.work.as_slice());
             }
@@ -4691,6 +4862,17 @@ const fn direct_queue_errno(error: QueueError) -> Errno {
     }
 }
 
+fn rollback_file_writeback_slots(
+    state: &PageContainerState,
+    generations: &[(PageIndex, PageGeneration)],
+) {
+    for &(page, generation) in generations {
+        if let Some(slot) = state.page_slots.get(&page) {
+            let _ = slot.abort_writeback(generation);
+        }
+    }
+}
+
 fn record_file_service_block_submissions(
     tracker: &mut BlockPageRequestTracker,
     outcome: &PageServiceBackendSubmitOutcome,
@@ -4703,7 +4885,7 @@ fn record_file_service_block_submissions(
         | PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. } => {}
         PageServiceBackendSubmitOutcome::QueuedPageCompletions { .. }
         | PageServiceBackendSubmitOutcome::Yield(_)
-        | PageServiceBackendSubmitOutcome::Err(_) => {}
+        | PageServiceBackendSubmitOutcome::Err { .. } => {}
     }
 }
 
@@ -4717,6 +4899,19 @@ fn file_service_work_waits_for_async_completion(work: &[PageServiceDrivenWork]) 
                     | PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. }
             )
         )
+    })
+}
+
+fn file_service_terminal_error_for_request(
+    work: &[PageServiceDrivenWork],
+    request_id: Option<PageIoRequestId>,
+) -> Option<Errno> {
+    work.iter().find_map(|item| match item {
+        PageServiceDrivenWork::BackendSubmission(PageServiceBackendSubmitOutcome::Err {
+            request,
+            errno,
+        }) if Some(request.id) == request_id => Some(*errno),
+        _ => None,
     })
 }
 

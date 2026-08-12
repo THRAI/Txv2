@@ -307,7 +307,7 @@ fn page_action_submit_outcomes(outcome: &PageServiceBackendSubmitOutcome) -> &[S
         | PageServiceBackendSubmitOutcome::BlockGraphQueued { submitted, .. } => submitted,
         PageServiceBackendSubmitOutcome::QueuedPageCompletions { .. }
         | PageServiceBackendSubmitOutcome::Yield(_)
-        | PageServiceBackendSubmitOutcome::Err(_) => &[],
+        | PageServiceBackendSubmitOutcome::Err { .. } => &[],
     }
 }
 
