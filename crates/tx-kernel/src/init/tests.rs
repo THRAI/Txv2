@@ -364,6 +364,29 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
 }
 
 #[test]
+fn automatic_media_layout_only_applies_without_an_explicit_boot_selector() {
+    assert!(CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", false));
+    assert!(
+        CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(
+            "console=ttyS0 tx.oscomp.groups=basic-musl",
+            false
+        )
+    );
+    for cmdline in [
+        "tx.root=vda",
+        "tx.profile=onsite",
+        "tx.runsh=/root/test.sh",
+        "init=/sbin/init",
+    ] {
+        assert!(
+            !CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(cmdline, false),
+            "explicit selector must win: {cmdline}"
+        );
+    }
+    assert!(!CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", true));
+}
+
+#[test]
 fn userspace_sched_meta_exposes_online_harts_without_initial_migration() {
     let _serial = setup();
     TEST_CURRENT_CPU.store(3, Ordering::Release);

@@ -700,6 +700,30 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         };
 
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        if dev_name == "vda"
+            && Self::should_autodetect_boot_media_layout(
+                boot_info.cmdline.unwrap_or(""),
+                boot_info.initrd.is_some(),
+            )
+        {
+            let fs_ops = mount_output.fs_ops();
+            if Self::mounted_media_is_preliminary_suite(
+                fs_ops.as_ref(),
+                mount_output.root_fs_object_id,
+            ) {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":boot-media:layout:preliminary\n");
+                // Keep the established preliminary-stage layout: the caller
+                // creates a tmpfs root, then `mount_sdcard_at_musl` reopens
+                // this image and attaches it at `/musl`.
+                return false;
+            }
+
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":boot-media:layout:final\n");
+        }
+
         let ext4_payload = MountPayload::new_cap(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
@@ -751,6 +775,40 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(dev_name);
         tx_hal::console_write_str::<P>(":ok\n");
         true
+    }
+
+    fn should_autodetect_boot_media_layout(cmdline: &str, has_initrd: bool) -> bool {
+        !has_initrd
+            && !cmdline.split_ascii_whitespace().any(|token| {
+                token.starts_with("tx.root=")
+                    || token.starts_with("tx.profile=")
+                    || token.starts_with("tx.runsh=")
+                    || token.starts_with("init=")
+            })
+    }
+
+    fn mounted_media_is_preliminary_suite(
+        fs_ops: &dyn tx_subsystems::vfs::FsOps,
+        root_fs_object_id: tx_subsystems::vfs::FsObjectId,
+    ) -> bool {
+        use step_engine::StepOutcome as V3;
+
+        let guard = step_engine::guard();
+        for suite_dir in [b"musl".as_slice(), b"glibc".as_slice()] {
+            let suite_id = match fs_ops.lookup(root_fs_object_id, suite_dir, &guard) {
+                V3::Done(id) => id,
+                _ => continue,
+            };
+            let has_busybox = matches!(fs_ops.lookup(suite_id, b"busybox", &guard), V3::Done(_));
+            let has_basic_script = matches!(
+                fs_ops.lookup(suite_id, b"basic_testcode.sh", &guard),
+                V3::Done(_)
+            );
+            if has_busybox && has_basic_script {
+                return true;
+            }
+        }
+        false
     }
 
     /// Resolve the root block device to mount from the boot cmdline, the way
