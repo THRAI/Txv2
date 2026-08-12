@@ -1,4 +1,5 @@
 use super::*;
+use crate::fs_iface::PageDataLeaseProjection;
 use crate::page_backed::adapter::step_engine::{
     self as step_engine, PageProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
@@ -9,25 +10,120 @@ use alloc::vec::Vec;
 #[derive(Debug)]
 pub(super) struct PageDataLease {
     id: IoDataLeaseId,
-    pages: alloc::boxed::Box<[PageLease]>,
+    pages: alloc::boxed::Box<[PageDataLeaseSegment]>,
+}
+
+#[derive(Debug)]
+struct PageDataLeaseSegment {
+    page: PageIndex,
+    generation: PageGeneration,
+    lease: PageLease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PageDataLeaseError {
+    Empty,
+    TooMany {
+        count: usize,
+    },
+    NonContiguous {
+        previous: PageIndex,
+        next: PageIndex,
+    },
 }
 
 impl PageDataLease {
-    pub(super) fn single(id: IoDataLeaseId, page: PageLease) -> Self {
+    pub(super) fn single(
+        id: IoDataLeaseId,
+        page: PageIndex,
+        generation: PageGeneration,
+        lease: PageLease,
+    ) -> Self {
         Self {
             id,
-            pages: alloc::boxed::Box::new([page]),
+            pages: alloc::boxed::Box::new([PageDataLeaseSegment {
+                page,
+                generation,
+                lease,
+            }]),
         }
     }
 
+    pub(super) fn from_segments(
+        id: IoDataLeaseId,
+        max_pages: usize,
+        segments: alloc::boxed::Box<[(PageIndex, PageGeneration, PageLease)]>,
+    ) -> Result<Self, PageDataLeaseError> {
+        if segments.is_empty() {
+            return Err(PageDataLeaseError::Empty);
+        }
+        if segments.len() > max_pages {
+            return Err(PageDataLeaseError::TooMany {
+                count: segments.len(),
+            });
+        }
+
+        let mut previous: Option<PageIndex> = None;
+        let pages = segments
+            .into_vec()
+            .into_iter()
+            .map(|(page, generation, lease)| {
+                if let Some(previous) = previous {
+                    if page.as_u64() != previous.as_u64().saturating_add(1) {
+                        return Err(PageDataLeaseError::NonContiguous {
+                            previous,
+                            next: page,
+                        });
+                    }
+                }
+                previous = Some(page);
+                Ok(PageDataLeaseSegment {
+                    page,
+                    generation,
+                    lease,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
+
+        Ok(Self { id, pages })
+    }
+
+    pub(super) fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub(super) fn generations(&self) -> impl Iterator<Item = (PageIndex, PageGeneration)> + '_ {
+        self.pages
+            .iter()
+            .map(|segment| (segment.page, segment.generation))
+    }
+
     pub(super) fn source(&self) -> IoDataSource {
-        let page = &self.pages[0];
+        let page = &self.pages[0].lease;
         IoDataSource::page_cache(
             self.id,
             PageFrameRef::new(page.ppn()),
             0,
             crate::vm::USER_PAGE_SIZE as u32,
         )
+    }
+
+    pub(super) fn source_projection(&self) -> PageDataLeaseProjection {
+        let segments = self
+            .pages
+            .iter()
+            .map(|segment| {
+                IoDataSource::page_cache(
+                    self.id,
+                    PageFrameRef::new(segment.lease.ppn()),
+                    0,
+                    crate::vm::USER_PAGE_SIZE as u32,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        PageDataLeaseProjection::new(segments)
     }
 }
 

@@ -32734,3 +32734,16 @@
   cleanup production claim is made yet. The RCU/PageBacked closure is now an
   isolated commit. Next: run the paired 1-hart/2-hart acceptance or record the
   QEMU environment blocker.
+
+### 2026-08-12 Ext4 E3 multi-page lease migration
+
+- The clean `codex/ext4-smp-migration` candidate now has atomic L4
+  request-plus-owner publication, and `PageDataLease` retains checked
+  `(page, generation, PageLease)` segments with a neutral multi-source
+  projection. Focused lease/visibility tests and full `cargo -q xtask unit`
+  passed. This is a preparation slice only: real multi-page target admission,
+  ext4 segment lowering, terminal fanout, stale/redirty handling, and
+  exactly-once bundle settlement remain open.
+- `cargo xtask progress validate` remains blocked by the unrelated missing
+  `docs/progress/research/2026-08-04-smp-scheduler-readiness-audit.md` reference.
+  Details: `docs/progress/research/2026-08-12-ext4-e3-multi-page-data-lease-readiness.md`.

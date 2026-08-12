@@ -2,7 +2,7 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-08-12-ext4-to-smp-migration",
   "title": "Finish ext4 worktree migration on the current SMP architecture",
-  "status": "proposed",
+  "status": "active",
   "created": "2026-08-12",
   "updated": "2026-08-12",
   "owner": "codex/root",
@@ -133,7 +133,7 @@
     {
       "id": "e3-multi-page-data-lease",
       "title": "Generalize PageDataLease and DMA custody to a real multi-page request",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": [
         "e1-classify-worktree-content"
       ],
@@ -149,7 +149,7 @@
         "normal aligned buffered I/O reports zero extra payload copies and zero bounce bytes",
         "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1"
       ],
-      "notes": "The current private PageDataLease stores Box<[PageLease]> but constructs and projects only pages[0]. Extend that owner in place; do not add a parallel lease type or let L6 release it."
+      "notes": "Active in /Users/3y/.config/superpowers/worktrees/Tx/ext4-smp-migration on codex/ext4-smp-migration. Start by migrating atomic L4 request-plus-owner publication, then extend the existing owner through checked multi-segment projection and one consuming per-page settlement; do not add a parallel lease type or let L6 release it."
     },
     {
       "id": "e4-writable-pte-freeze-lease",

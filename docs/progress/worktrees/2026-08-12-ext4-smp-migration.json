@@ -1,0 +1,28 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-08-12-ext4-smp-migration",
+  "created": "2026-08-12",
+  "updated": "2026-08-12",
+  "status": "active",
+  "branch": "codex/ext4-smp-migration",
+  "path": "/Users/3y/.config/superpowers/worktrees/Tx/ext4-smp-migration",
+  "base": "codex/test-remote-network",
+  "plan": "docs/progress/plans/2026-08-12-ext4-to-smp-migration.json",
+  "owner": "codex/root",
+  "write_scope": [
+    "crates/tx-subsystems/src/page_backed",
+    "crates/tx-subsystems/src/fs_iface",
+    "crates/tx-subsystems/src/io_manager/page",
+    "crates/tx-ext4/src/planner.rs",
+    "docs/progress/worktrees/2026-08-12-ext4-smp-migration.json",
+    "docs/progress/research/2026-08-12-ext4-e3-multi-page-data-lease-readiness.md"
+  ],
+  "verification": [
+    "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1",
+    "cargo -q xtask unit",
+    "cargo xtask progress validate",
+    "cargo fmt --check",
+    "git diff --check"
+  ],
+  "notes": "Clean candidate worktree for E3 only. Identity is path, branch, clean starting status, and date; no commit SHA is used. PELT, network, writable-PTE freeze, RCU expansion, and JBD2 convergence remain out of scope."
+}

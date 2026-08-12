@@ -4,6 +4,7 @@
 //! including their `FsOps` + `FsPageBacking` impls needed because
 //! `MountPayload` carries `fs_ops` / `fs_page_backing` fields.
 
+use super::lifecycle::PageDataLeaseError;
 use super::*;
 use crate::device::{
     BlockDevice, BlockDeviceHandle, BlockDeviceOps, BlockDeviceRegistration, DevT,
@@ -39,6 +40,7 @@ use crate::vfs::{
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use core::future::Future;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -2465,6 +2467,132 @@ fn file_page_planner_reads_into_l4_leased_target_and_releases_it_on_install() {
 
     assert_eq!(materialized.ppn, frame.ppn());
     assert_eq!(pc.file_io_read_target_count_for_test(), 0);
+}
+
+#[test]
+fn file_io_owner_is_admitted_before_request_becomes_service_visible() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let submission = PageIoSubmissionHandle::new(4);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let id = submission
+        .submit_owned_file_request(
+            PageContainerKey::new(71),
+            PageIoRange::new(3, 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(9)),
+            |request| OwnedFileIoRequest::read(request, frame),
+        )
+        .expect("atomic read admission");
+
+    let (_, target) = submission.file_request_data(id);
+    assert!(matches!(
+        target,
+        crate::fs_iface::IoDataTarget::PageCache { frame, .. } if frame.ppn() == ppn
+    ));
+    assert!(matches!(
+        submission.with_service(|service| service.drain_turn(ServiceBudget::new(1))),
+        crate::io_manager::page::service::PageServiceTurn::Work(_)
+    ));
+    let (_, target) = submission.file_request_data(id);
+    assert!(matches!(
+        target,
+        crate::fs_iface::IoDataTarget::PageCache { frame, .. } if frame.ppn() == ppn
+    ));
+}
+
+#[test]
+fn page_data_lease_preserves_bounded_generation_order_in_projection() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let first = cached_frame_for_test();
+    let second = cached_frame_for_test();
+    let first_ppn = first.ppn;
+    let second_ppn = second.ppn;
+    let first_pin = page_allocator::acquire_cache_pin(first_ppn).expect("first cache pin");
+    let second_pin = page_allocator::acquire_cache_pin(second_ppn).expect("second cache pin");
+    let lease = PageDataLease::from_segments(
+        IoDataLeaseId::new(90),
+        2,
+        alloc::boxed::Box::new([
+            (
+                PageIndex::new(4),
+                PageGeneration::new(11),
+                PageLease {
+                    ppn: first_ppn,
+                    cache_pin: PageCachePin::Allocated(first_pin),
+                },
+            ),
+            (
+                PageIndex::new(5),
+                PageGeneration::new(12),
+                PageLease {
+                    ppn: second_ppn,
+                    cache_pin: PageCachePin::Allocated(second_pin),
+                },
+            ),
+        ]),
+    )
+    .expect("contiguous multi-page lease");
+
+    assert_eq!(lease.page_count(), 2);
+    assert_eq!(
+        lease.generations().collect::<Vec<_>>(),
+        vec![
+            (PageIndex::new(4), PageGeneration::new(11)),
+            (PageIndex::new(5), PageGeneration::new(12)),
+        ]
+    );
+    assert!(matches!(
+        lease.source_projection().into_sources().as_ref(),
+        [
+            IoDataSource::PageCache { frame: first, .. },
+            IoDataSource::PageCache { frame: second, .. }
+        ] if first.ppn() == first_ppn && second.ppn() == second_ppn
+    ));
+}
+
+#[test]
+fn page_data_lease_rejects_holes_and_empty_batches() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let frame = cached_frame_for_test();
+    let pin = page_allocator::acquire_cache_pin(frame.ppn).expect("cache pin");
+    let empty = PageDataLease::from_segments(IoDataLeaseId::new(91), 2, alloc::boxed::Box::new([]));
+    assert!(matches!(empty, Err(PageDataLeaseError::Empty)));
+
+    let hole = PageDataLease::from_segments(
+        IoDataLeaseId::new(92),
+        2,
+        alloc::boxed::Box::new([
+            (
+                PageIndex::new(1),
+                PageGeneration::new(1),
+                PageLease {
+                    ppn: frame.ppn,
+                    cache_pin: PageCachePin::Allocated(pin),
+                },
+            ),
+            (
+                PageIndex::new(3),
+                PageGeneration::new(2),
+                PageLease {
+                    ppn: frame.ppn,
+                    cache_pin: PageCachePin::Allocated(
+                        page_allocator::acquire_cache_pin(frame.ppn).expect("second cache pin"),
+                    ),
+                },
+            ),
+        ]),
+    );
+    assert!(matches!(
+        hole,
+        Err(PageDataLeaseError::NonContiguous { previous, next })
+            if previous == PageIndex::new(1) && next == PageIndex::new(3)
+    ));
 }
 
 #[test]

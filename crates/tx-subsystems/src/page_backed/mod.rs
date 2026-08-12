@@ -1927,7 +1927,7 @@ impl PageContainer {
             return None;
         }
 
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let writeback = state.page_slots.get(&page)?.begin_writeback().ok()?;
         let Some(ppn) = state.pages.load(page).map(PageCacheEntry::ppn) else {
             if let Some(slot) = state.page_slots.get(&page) {
@@ -1941,43 +1941,31 @@ impl PageContainer {
             }
             return None;
         };
-        match self.page_submission.with_service(|service| {
-            service.submit(
-                self.io_manager_key(),
-                PageIoRange::new(page.as_u64(), 1),
-                PageIoOp::Writeback,
-                PageIoPriority::BackgroundWriteback,
-                PageIoFlags::WRITEBACK,
-                Some(writeback.generation),
-            )
-        }) {
-            Ok(id) => {
-                let request = PageIoRequest::new(
-                    id,
-                    self.io_manager_key(),
-                    PageIoRange::new(page.as_u64(), 1),
-                    PageIoOp::Writeback,
-                    PageIoPriority::BackgroundWriteback,
-                    PageIoFlags::WRITEBACK,
-                    Some(writeback.generation),
-                );
-                let owner = OwnedFileIoRequest::writeback(
+        match self.page_submission.submit_owned_file_request(
+            self.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+            PageIoPriority::BackgroundWriteback,
+            PageIoFlags::WRITEBACK,
+            Some(writeback.generation),
+            |request| {
+                let lease_id = IoDataLeaseId::new(request.id.raw());
+                OwnedFileIoRequest::writeback(
                     request,
                     PageDataLease::single(
-                        IoDataLeaseId::new(id.raw()),
+                        lease_id,
+                        page,
+                        writeback.generation,
                         PageLease {
                             ppn,
                             cache_pin: PageCachePin::Allocated(cache_pin),
                         },
                     ),
-                );
-                debug_assert!(
-                    self.page_submission.admit_file_request(owner),
-                    "L4 request identifiers are unique"
-                );
-                Some(id)
-            }
-            Err(_) => {
+                )
+            },
+        ) {
+            Some(id) => Some(id),
+            None => {
                 if let Some(slot) = state.page_slots.get(&page) {
                     let _ = slot.abort_writeback(writeback.generation);
                 }
@@ -3939,7 +3927,19 @@ impl PageContainer {
                 | PageSlotFetch::Resident { generation, .. }
                 | PageSlotFetch::Blocked { generation, .. } => generation,
             };
-            let submit = || {
+            let request_id = if planner_present {
+                planned_target.take().and_then(|target| {
+                    self.page_submission.submit_owned_file_request(
+                        self.io_manager_key(),
+                        PageIoRange::new(page.as_u64(), 1),
+                        PageIoOp::Read,
+                        PageIoPriority::Demand,
+                        PageIoFlags::DEMAND,
+                        Some(generation),
+                        |request| OwnedFileIoRequest::read(request, target),
+                    )
+                })
+            } else {
                 self.page_submission.with_service(|service| {
                     service
                         .submit(
@@ -3953,30 +3953,10 @@ impl PageContainer {
                         .ok()
                 })
             };
-            let request_id = if planner_present {
-                planned_target.as_ref().and_then(|_| submit())
-            } else {
-                submit()
-            };
             if request_id.is_none() {
                 if let Some(slot) = state.page_slots.get(&page) {
                     let _ = slot.invalidate_if_generation(generation);
                 }
-            } else if let (Some(request_id), Some(target)) = (request_id, planned_target.take()) {
-                let request = PageIoRequest::new(
-                    request_id,
-                    self.io_manager_key(),
-                    PageIoRange::new(page.as_u64(), 1),
-                    PageIoOp::Read,
-                    PageIoPriority::Demand,
-                    PageIoFlags::DEMAND,
-                    Some(generation),
-                );
-                debug_assert!(
-                    self.page_submission
-                        .admit_file_request(OwnedFileIoRequest::read(request, target)),
-                    "L4 request identifiers are unique"
-                );
             }
             state.in_flight_file_pages.insert(
                 page,

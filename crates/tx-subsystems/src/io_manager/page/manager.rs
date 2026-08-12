@@ -28,12 +28,12 @@ use super::service::{
     PageServiceBackendSubmitError, PageServiceBlockCompletionPrepared, PageServiceL6Applied,
     PageServiceTaggedBlockCompletionError,
 };
-#[cfg(test)]
 use super::{
-    PageContainerKey, PageGeneration, PageIoCompletion, PageIoFlags, PageIoOp, PageIoPriority,
-    PageIoRange, PageQueueError,
+    PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
+    PageIoRequest, PageIoRequestId, PageL6Receipt,
 };
-use super::{PageIoRequest, PageIoRequestId, PageL6Receipt};
+#[cfg(test)]
+use super::{PageIoCompletion, PageQueueError};
 #[cfg(test)]
 use crate::io_manager::backend::PageCompletion;
 
@@ -100,6 +100,35 @@ impl PageIoSubmissionHandle {
 
     pub(crate) fn with_service<R>(&self, f: impl FnOnce(&mut PageService) -> R) -> R {
         f(&mut self.0.lock_state().service)
+    }
+
+    /// Publish a queued L4 request and its retained data owner together.
+    ///
+    /// The service can become runnable as soon as `PageService::submit`
+    /// returns. Keeping both mutations under the manager lock prevents a
+    /// concurrent service turn from observing a request before its source or
+    /// target lease has been installed.
+    pub(crate) fn submit_owned_file_request(
+        &self,
+        pc: PageContainerKey,
+        range: PageIoRange,
+        op: PageIoOp,
+        priority: PageIoPriority,
+        flags: PageIoFlags,
+        generation_hint: Option<PageGeneration>,
+        make_owner: impl FnOnce(PageIoRequest) -> OwnedFileIoRequest,
+    ) -> Option<PageIoRequestId> {
+        let mut state = self.0.lock_state();
+        let id = state
+            .service
+            .submit(pc, range, op, priority, flags, generation_hint)
+            .ok()?;
+        let request = PageIoRequest::new(id, pc, range, op, priority, flags, generation_hint);
+        let replaced = state
+            .admitted_file_requests
+            .insert(id, AdmittedFileRequest(make_owner(request)));
+        debug_assert!(replaced.is_none(), "L4 request identifiers are unique");
+        Some(id)
     }
 
     /// L4 retains the page-cache source/target bundle from admission until its
