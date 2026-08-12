@@ -809,6 +809,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
             }
             Ok(FileFsyncFrontierAdvance::Error(errno)) => V3::err(errno.into()),
             Ok(FileFsyncFrontierAdvance::Complete) => {
+                if self.state.backend_finished() {
+                    return V3::done(());
+                }
                 let guard = step_engine::guard();
                 match mount.payload().fs_page_backing.fsync_file(
                     match self.pc.kind() {
@@ -832,6 +835,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
                             carrier,
                             interests,
                         )
+                    }
+                    V3::Err(errno) if errno == step_engine::Errno::ENOSYS => {
+                        drop(guard);
+                        if let Err(errno) = self.state.submit_backend_fsync(self.pc) {
+                            return V3::err(errno.into());
+                        }
+                        V3::continue_with(PageProgress::EMPTY)
                     }
                     V3::Err(errno) => V3::err(errno),
                 }

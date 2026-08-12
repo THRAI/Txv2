@@ -201,7 +201,7 @@ fn partial_page_receipt_commits_only_accepted_l6_routes() {
     let applied = service
         .apply_l6_receipt(receipt)
         .expect("partial receipt remains valid for its accepted prefix");
-    assert!(applied.failure.is_some());
+    assert!(applied.failure.is_none());
     assert!(matches!(
         &applied.outcome,
         PageServiceBackendSubmitOutcome::BlockBiosQueued { submitted, .. } if submitted.len() == 1

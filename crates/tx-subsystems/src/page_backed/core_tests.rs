@@ -80,6 +80,83 @@ struct SourceRecordingPlanner {
     target: SpinMutex<Option<crate::fs_iface::IoDataTarget>>,
 }
 
+struct FsyncCompletionPlanner {
+    result: Result<(), Errno>,
+    plans: AtomicUsize,
+    completions: SpinMutex<Vec<crate::fs_iface::BackendPageCompletion>>,
+}
+
+struct GraphFsyncCompletionPlanner {
+    completions: SpinMutex<Vec<crate::fs_iface::BackendPageCompletion>>,
+}
+
+impl GraphFsyncCompletionPlanner {
+    const fn new() -> Self {
+        Self {
+            completions: SpinMutex::new(Vec::new()),
+        }
+    }
+}
+
+impl BackendPlanner for GraphFsyncCompletionPlanner {
+    fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+        BackendPlan::SubmitGraph(
+            BackendBioGraph::new(
+                alloc::vec![BackendBioNode::new(
+                    BackendBioNodeId::new(1),
+                    BioPlan::new(
+                        DeviceKey::new(8),
+                        BlockOp::Write,
+                        LbaRange::new(64, 1),
+                        alloc::vec![BioVec::new(0x800, 0, 512)],
+                        BlockFlags::BARRIER,
+                    ),
+                    IoDataSource::None,
+                )],
+                alloc::vec![],
+            )
+            .expect("valid fsync graph"),
+        )
+    }
+
+    fn complete_page_io(&self, completion: crate::fs_iface::BackendPageCompletion) {
+        self.completions.lock().push(completion);
+    }
+}
+
+impl FsyncCompletionPlanner {
+    const fn new(result: Result<(), Errno>) -> Self {
+        Self {
+            result,
+            plans: AtomicUsize::new(0),
+            completions: SpinMutex::new(Vec::new()),
+        }
+    }
+}
+
+impl BackendPlanner for FsyncCompletionPlanner {
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        self.plans.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(request.op, PageIoOp::Fsync);
+        if let Err(errno) = self.result {
+            return BackendPlan::Err(errno);
+        }
+        BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+            PageCompletion::new(
+                request.id,
+                request.range,
+                PageIoResult::Done,
+                request.generation_hint.unwrap_or(PageGeneration::new(0)),
+                PageIoCompletionKind::Noop,
+            )
+        ]))
+    }
+
+    fn complete_page_io(&self, completion: crate::fs_iface::BackendPageCompletion) {
+        self.completions.lock().push(completion);
+    }
+}
+
 impl SourceRecordingPlanner {
     const fn new() -> Self {
         Self {
@@ -401,15 +478,25 @@ fn user_page_gift_for_test() -> (crate::vm::UserPageGift, Ppn) {
 struct RecordingFs {
     fetches: AtomicUsize,
     fsyncs: AtomicUsize,
+    fsync_returns_enosys: AtomicBool,
     last_object: AtomicU64,
     last_offset: AtomicU64,
 }
 
 impl RecordingFs {
     fn new() -> Self {
+        Self::with_fsync_enosys(false)
+    }
+
+    fn fsync_fallback() -> Self {
+        Self::with_fsync_enosys(true)
+    }
+
+    fn with_fsync_enosys(fsync_returns_enosys: bool) -> Self {
         Self {
             fetches: AtomicUsize::new(0),
             fsyncs: AtomicUsize::new(0),
+            fsync_returns_enosys: AtomicBool::new(fsync_returns_enosys),
             last_object: AtomicU64::new(0),
             last_offset: AtomicU64::new(0),
         }
@@ -574,6 +661,9 @@ impl FsPageBacking for RecordingFs {
 
     fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
         self.fsyncs.fetch_add(1, Ordering::AcqRel);
+        if self.fsync_returns_enosys.load(Ordering::Acquire) {
+            return V3Out::err(V3Errno::ENOSYS);
+        }
         V3Out::done(())
     }
 }
@@ -4285,6 +4375,139 @@ fn fsync_op_calls_backing_after_an_empty_frontier_without_l4_fsync() {
         .file_io_service
         .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
         .is_none());
+}
+
+#[test]
+fn fsync_op_backend_complete_notifies_planner_once() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::fsync_fallback());
+    let planner = Arc::new(FsyncCompletionPlanner::new(Ok(())));
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(108),
+        2,
+        planner.clone(),
+    );
+    let mut op = crate::page_backed::FsyncOp::new(&pc);
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("plan backend fsync");
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("route backend fsync completion");
+    assert_eq!(op.step(&mut ctx), V3Out::Done(()));
+    assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+    assert_eq!(planner.plans.load(Ordering::Acquire), 1);
+    let completions = planner.completions.lock();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].op, PageIoOp::Fsync);
+    assert_eq!(completions[0].result, PageIoResult::Done);
+}
+
+#[test]
+fn fsync_op_backend_error_completes_and_wakes_with_errno_once() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::fsync_fallback());
+    let planner = Arc::new(FsyncCompletionPlanner::new(Err(Errno::EIO)));
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(109),
+        2,
+        planner.clone(),
+    );
+    let mut op = crate::page_backed::FsyncOp::new(&pc);
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("plan backend fsync");
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("route backend fsync error");
+    assert_eq!(op.step(&mut ctx), V3Out::Err(V3Errno::EIO));
+    assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+    assert_eq!(planner.plans.load(Ordering::Acquire), 1);
+    let completions = planner.completions.lock();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].op, PageIoOp::Fsync);
+    assert_eq!(completions[0].result, PageIoResult::Err(Errno::EIO));
+}
+
+#[test]
+fn fsync_op_zero_l6_admission_completes_with_queue_errno_once() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::fsync_fallback());
+    let planner = Arc::new(GraphFsyncCompletionPlanner::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(110),
+        2,
+        planner.clone(),
+    );
+    for lba in 0..1024 {
+        pc.block_submission
+            .submit_untracked_for_test(BioPlan::new(
+                DeviceKey::new(99),
+                BlockOp::Read,
+                LbaRange::new(20_000 + lba * 2, 1),
+                alloc::vec![BioVec::new(0x900 + lba, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("fill owned L6 queue");
+    }
+    let mut op = crate::page_backed::FsyncOp::new(&pc);
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("attempt backend fsync admission");
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("route zero-admission error");
+    assert_eq!(op.step(&mut ctx), V3Out::Err(V3Errno::EAGAIN));
+    let completions = planner.completions.lock();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].result, PageIoResult::Err(Errno::EAGAIN));
+}
+
+#[test]
+fn vfs_fsync_op_uses_backend_fallback_to_terminal_success() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::fsync_fallback());
+    let planner = Arc::new(FsyncCompletionPlanner::new(Ok(())));
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(111),
+        2,
+        planner.clone(),
+    );
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs.clone(),
+        fs_object_id: FsObjectId::new(111),
+        page_container: Some(pc.clone()),
+        raw_block_device: false,
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("plan backend fsync");
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("route backend fsync completion");
+    assert_eq!(op.step(&mut ctx), V3Out::Done(()));
+    assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+    assert_eq!(planner.completions.lock().len(), 1);
 }
 
 #[test]

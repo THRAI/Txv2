@@ -2029,9 +2029,24 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                     V3::Err(errno.into())
                 }
                 Ok(crate::page_backed::FileFsyncFrontierAdvance::Complete) => {
+                    if self.state.backend_finished() {
+                        return V3::Done(());
+                    }
                     let guard = step_engine::guard();
                     match self.page_backing.fsync_file(self.fs_object_id, &guard) {
                         V3::Done(()) => V3::Done(()),
+                        V3::Err(e)
+                            if e == step_engine::Errno::ENOSYS
+                                && mount.payload().backend_planner().is_some() =>
+                        {
+                            drop(guard);
+                            match self.state.submit_backend_fsync(container) {
+                                Ok(()) => V3::Continue {
+                                    progress: NoProgress,
+                                },
+                                Err(errno) => V3::Err(errno.into()),
+                            }
+                        }
                         V3::Err(e) => V3::Err(e),
                         V3::Continue { .. } => V3::Continue {
                             progress: NoProgress,
