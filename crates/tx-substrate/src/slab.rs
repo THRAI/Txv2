@@ -2,8 +2,8 @@
 //!
 //! The slab heap is the allocation layer that becomes legal after
 //! `tx_substrate::init::<P>()` has installed the page allocator. Small
-//! allocations use per-size-class pages; page-sized and larger allocations
-//! reserve contiguous physical page runs directly.
+//! allocations use per-size-class pages; larger allocations use a reserved
+//! contiguous arena first and fall back to direct physical runs when needed.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -21,6 +21,8 @@ const CLASS_SIZES: [usize; CLASS_COUNT] = [8, 16, 32, 64, 128, 256, 512, 1024, 2
 const CLASS_REFILL_PAGES: [usize; CLASS_COUNT] = [1, 1, 1, 4, 8, 4, 2, 1, 1];
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const RETAIN_EMPTY_SLAB_PAGES_PER_CLASS: usize = 1;
+const LARGE_ARENA_MAX_PAGES: usize = 4096;
+const LARGE_ARENA_BITMAP_WORDS: usize = LARGE_ARENA_MAX_PAGES / u64::BITS as usize;
 
 /// Slab allocation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +75,12 @@ pub unsafe trait SlabPageProvider: Copy {
 
     /// Convert a direct-map page pointer back to a PPN.
     fn ppn_from_direct_map_ptr(&self, ptr: *mut u8) -> Option<Ppn>;
+
+    /// Preferred number of pages for the early large-allocation arena.
+    /// Providers that cannot dedicate a stable arena may return zero.
+    fn preferred_large_arena_pages(&self) -> usize {
+        0
+    }
 }
 
 /// Reusable slab heap over a page provider.
@@ -80,6 +88,7 @@ pub struct SlabHeap<P: SlabPageProvider> {
     provider: P,
     initialized: AtomicBool,
     classes: [SlabClass; CLASS_COUNT],
+    large_arena: LargeArena,
 }
 
 unsafe impl<P: SlabPageProvider + Sync> Sync for SlabHeap<P> {}
@@ -91,6 +100,7 @@ impl<P: SlabPageProvider> SlabHeap<P> {
             provider,
             initialized: AtomicBool::new(false),
             classes: [const { SlabClass::new() }; CLASS_COUNT],
+            large_arena: LargeArena::new(),
         }
     }
 
@@ -101,10 +111,15 @@ impl<P: SlabPageProvider> SlabHeap<P> {
             return Err(SlabError::InvalidLayout);
         }
 
-        self.initialized
+        let result = self
+            .initialized
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
-            .map_err(|_| SlabError::AlreadyInitialized)
+            .map_err(|_| SlabError::AlreadyInitialized);
+        if result.is_ok() {
+            self.init_large_arena();
+        }
+        result
     }
 
     /// Allocate a block for `layout`.
@@ -217,9 +232,22 @@ impl<P: SlabPageProvider> SlabHeap<P> {
         } else {
             layout.align() / page_size
         };
+        if let Some(ppn) = self.large_arena.try_alloc(count, align) {
+            let ptr = unsafe { self.provider.direct_map_ptr(ppn) };
+            if let Some(ptr) = NonNull::new(ptr) {
+                return Ok(ptr);
+            }
+            unsafe { self.large_arena.dealloc(ppn, count) };
+        }
         let ppn = self.provider.reserve_run(count, align)?;
         let ptr = unsafe { self.provider.direct_map_ptr(ppn) };
-        NonNull::new(ptr).ok_or(SlabError::InvalidLayout)
+        match NonNull::new(ptr) {
+            Some(ptr) => Ok(ptr),
+            None => {
+                unsafe { self.provider.release_run(ppn, count) };
+                Err(SlabError::InvalidLayout)
+            }
+        }
     }
 
     unsafe fn dealloc_large(&self, ptr: *mut u8, layout: Layout) {
@@ -230,8 +258,28 @@ impl<P: SlabPageProvider> SlabHeap<P> {
         let Some(count) = div_ceil(layout.size(), page_size) else {
             return;
         };
+        if self.large_arena.contains(ppn, count) {
+            unsafe { self.large_arena.dealloc(ppn, count) };
+            return;
+        }
         unsafe {
             self.provider.release_run(ppn, count);
+        }
+    }
+
+    fn init_large_arena(&self) {
+        let mut pages = self
+            .provider
+            .preferred_large_arena_pages()
+            .min(LARGE_ARENA_MAX_PAGES);
+        while pages != 0 {
+            if let Ok(ppn) = self.provider.reserve_run(pages, 1) {
+                self.large_arena.initialize(ppn, pages);
+                return;
+            }
+            // Boot-time fragmentation may reject the preferred size even
+            // though a smaller stable pool is available.
+            pages /= 2;
         }
     }
 
@@ -295,6 +343,118 @@ impl<P: SlabPageProvider> SlabHeap<P> {
         }
 
         Ok(())
+    }
+}
+
+/// Stable direct-map storage for large kernel allocations.
+///
+/// The arena is reserved while the frame allocator is still mostly
+/// unfragmented. Allocations then use a page bitmap, so a later large object
+/// does not need a fresh physically contiguous run from the global allocator.
+struct LargeArena {
+    lock: SpinLock,
+    base: AtomicUsize,
+    pages: AtomicUsize,
+    used: UnsafeCell<[u64; LARGE_ARENA_BITMAP_WORDS]>,
+}
+
+unsafe impl Sync for LargeArena {}
+
+impl LargeArena {
+    const fn new() -> Self {
+        Self {
+            lock: SpinLock::new(),
+            base: AtomicUsize::new(0),
+            pages: AtomicUsize::new(0),
+            used: UnsafeCell::new([0; LARGE_ARENA_BITMAP_WORDS]),
+        }
+    }
+
+    fn initialize(&self, base: Ppn, pages: usize) {
+        let _guard = self.lock.lock();
+        unsafe {
+            (*self.used.get()).fill(0);
+        }
+        self.base.store(base.0, Ordering::Release);
+        self.pages.store(pages, Ordering::Release);
+    }
+
+    fn try_alloc(&self, pages: usize, align_pages: usize) -> Option<Ppn> {
+        let arena_pages = self.pages.load(Ordering::Acquire);
+        let base = self.base.load(Ordering::Acquire);
+        if arena_pages == 0 || pages == 0 || pages > arena_pages || align_pages == 0 {
+            return None;
+        }
+
+        let _guard = self.lock.lock();
+        let mut start = 0usize;
+        while start
+            .checked_add(pages)
+            .is_some_and(|end| end <= arena_pages)
+        {
+            let absolute = base.checked_add(start)?;
+            let aligned = align_up(absolute, align_pages)?.checked_sub(base)?;
+            if aligned
+                .checked_add(pages)
+                .is_none_or(|end| end > arena_pages)
+            {
+                return None;
+            }
+            let mut free = true;
+            for page in aligned..aligned + pages {
+                if self.is_used(page) {
+                    start = page.saturating_add(1);
+                    free = false;
+                    break;
+                }
+            }
+            if !free {
+                continue;
+            }
+            for page in aligned..aligned + pages {
+                self.set_used(page, true);
+            }
+            return Some(Ppn(base + aligned));
+        }
+        None
+    }
+
+    fn contains(&self, base: Ppn, pages: usize) -> bool {
+        let arena_base = self.base.load(Ordering::Acquire);
+        let arena_pages = self.pages.load(Ordering::Acquire);
+        base.0 >= arena_base
+            && base
+                .0
+                .checked_add(pages)
+                .is_some_and(|end| end <= arena_base.saturating_add(arena_pages))
+    }
+
+    unsafe fn dealloc(&self, base: Ppn, pages: usize) {
+        let arena_base = self.base.load(Ordering::Acquire);
+        let _guard = self.lock.lock();
+        let start = base.0.saturating_sub(arena_base);
+        for page in start..start.saturating_add(pages) {
+            self.set_used(page, false);
+        }
+    }
+
+    fn is_used(&self, page: usize) -> bool {
+        unsafe {
+            let word = (*self.used.get())[page / u64::BITS as usize];
+            word & (1u64 << (page % u64::BITS as usize)) != 0
+        }
+    }
+
+    fn set_used(&self, page: usize, used: bool) {
+        unsafe {
+            let word = &mut (*self.used.get())[page / u64::BITS as usize];
+            let bit = 1u64 << (page % u64::BITS as usize);
+            if used {
+                *word |= bit;
+            } else {
+                *word &= !bit;
+            }
+        }
     }
 }
 
@@ -366,7 +526,7 @@ struct FreeObject {
 }
 
 fn class_index(layout: Layout) -> Result<Option<usize>, SlabError> {
-    if layout.align() > DEFAULT_PAGE_SIZE || !layout.align().is_power_of_two() {
+    if !layout.align().is_power_of_two() {
         return Err(SlabError::InvalidLayout);
     }
 
@@ -514,6 +674,22 @@ unsafe impl SlabPageProvider for GlobalPageProvider {
             Some(Ppn(offset / page_size))
         } else {
             None
+        }
+    }
+
+    fn preferred_large_arena_pages(&self) -> usize {
+        let Ok(allocator) = installed_bitmap_allocator() else {
+            return 0;
+        };
+        let total = allocator.total_count();
+        if total >= 128 * 1024 {
+            4096
+        } else if total >= 64 * 1024 {
+            2048
+        } else if total >= 16 * 1024 {
+            512
+        } else {
+            0
         }
     }
 }
