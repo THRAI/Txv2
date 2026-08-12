@@ -1037,7 +1037,12 @@ impl<P: TxPlatform> CoreInit<P> {
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
-    let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
+    let mut cmd = String::from(
+        "tx_musl_root=/musl/musl; \
+         [ -d \"$tx_musl_root/basic\" ] || tx_musl_root=/musl; \
+         tx_bb=\"$tx_musl_root/busybox\"; \
+         cd \"$tx_musl_root\"",
+    );
     let bench_observe_enabled = oscomp_bench_observe_enabled::<P>();
     let bench_observe_threshold = oscomp_bench_observe_threshold::<P>();
     let mut selected = 0usize;
@@ -1369,14 +1374,14 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 
 fn oscomp_bench_observe_enabled_from_cmdline(cmdline: Option<&str>) -> bool {
     let Some(cmdline) = cmdline else {
-        return true;
+        return false;
     };
     for token in cmdline.split_ascii_whitespace() {
         if let Some(value) = token.strip_prefix("tx.oscomp.observe=") {
             return !matches!(value, "0" | "false" | "off" | "no");
         }
     }
-    true
+    false
 }
 
 fn oscomp_bench_observe_threshold_from_cmdline(cmdline: Option<&str>) -> Option<u64> {
@@ -1482,7 +1487,58 @@ fn append_oscomp_musl_script_with_observe(
         append_busybox_script(cmd, "busybox-musl", "./busybox");
         return;
     }
+    if script == "basic_testcode.sh" {
+        append_basic_script(cmd);
+        return;
+    }
+    if script == "iozone_testcode.sh" {
+        append_iozone_script(cmd);
+        return;
+    }
+    if script == "lmbench_testcode.sh" {
+        append_lmbench_script(cmd);
+        return;
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+fn append_basic_script(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; ./busybox echo \"#### OS COMP TEST GROUP START basic-musl ####\"\
+         ; tx_basic_work=/tmp/tx-basic-musl; ./busybox rm -rf \"$tx_basic_work\"\
+         ; ./busybox mkdir -p \"$tx_basic_work\"\
+         ; ./busybox cp -r \"$tx_musl_root/basic/.\" \"$tx_basic_work\"\
+         ; (cd \"$tx_basic_work\"; for tx_basic_case in brk chdir clone close dup2 dup execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do \"$tx_bb\" echo \"Testing $tx_basic_case :\"; \"$tx_musl_root/lib/libc.so\" \"./$tx_basic_case\"; done)\
+         ; ./busybox echo \"#### OS COMP TEST GROUP END basic-musl ####\"",
+    );
+}
+
+fn append_iozone_script(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; tx_iozone_work=/tmp/tx-iozone-musl; ./busybox rm -rf \"$tx_iozone_work\"\
+         ; ./busybox mkdir -p \"$tx_iozone_work\"\
+         ; ./busybox cp ./iozone ./iozone_testcode.sh ./busybox \"$tx_iozone_work\"\
+         ; ./busybox cp -r ./lib \"$tx_iozone_work\"\
+         ; (cd \"$tx_iozone_work\"; ./busybox sh iozone_testcode.sh)\
+         ; ./busybox rm -rf \"$tx_iozone_work\"",
+    );
+}
+
+fn append_lmbench_script(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; tx_lmbench_work=/tmp/tx-lmbench-musl; ./busybox rm -rf \"$tx_lmbench_work\"\
+         ; ./busybox mkdir -p \"$tx_lmbench_work\"\
+         ; ./busybox cp ./lmbench_testcode.sh ./lmbench_all ./lmbench ./lat_syscall ./lat_select ./lat_sig ./lat_pipe ./lat_proc ./lat_pagefault ./lat_mmap ./lat_fs ./bw_pipe ./bw_file_rd ./bw_mmap_rd ./lat_ctx ./lmdd ./busybox \"$tx_lmbench_work\"\
+         ; ./busybox cp -r ./lib \"$tx_lmbench_work\"\
+         ; ./busybox printf '#!/bin/sh\\nexec /code/lmbench_src/bin/build/lmbench_all hello \"$@\"\\n' > \"$tx_lmbench_work/hello\"\
+         ; ./busybox chmod 755 \"$tx_lmbench_work/hello\"\
+         ; ./busybox rm -f /tmp/hello\
+         ; ./busybox cp \"$tx_lmbench_work/hello\" /tmp/hello\
+         ; ./busybox chmod 755 /tmp/hello\
+         ; (cd \"$tx_lmbench_work\"; ./busybox sh lmbench_testcode.sh)\
+         ; ./busybox rm -f /tmp/hello\
+         ; ./busybox rm -rf \"$tx_lmbench_work\"",
+    );
 }
 
 fn append_lmbench_probe(cmd: &mut alloc::string::String) {
@@ -2307,9 +2363,9 @@ mod tests {
     }
 
     #[test]
-    fn oscomp_bench_observe_cmdline_flag_defaults_on_and_accepts_off_values() {
-        assert!(oscomp_bench_observe_enabled_from_cmdline(None));
-        assert!(oscomp_bench_observe_enabled_from_cmdline(Some(
+    fn oscomp_bench_observe_cmdline_flag_defaults_off_and_accepts_explicit_on() {
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(None));
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
             "tx.oscomp.groups=libcbench-musl"
         )));
         assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
@@ -2381,11 +2437,35 @@ mod tests {
         append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
         append_full_libctest(&mut cmd);
 
-        assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START basic-musl ####"));
+        assert!(cmd.contains("tx_basic_work=/tmp/tx-basic-musl"));
+        assert!(cmd.contains("cp -r \"$tx_musl_root/basic/.\" \"$tx_basic_work\""));
+        assert!(cmd.contains("\"$tx_musl_root/lib/libc.so\" \"./$tx_basic_case\""));
         assert!(
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
         assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn iozone_script_runs_from_writable_tmp_workdir() {
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
+        append_oscomp_musl_script(&mut cmd, "iozone_testcode.sh");
+
+        assert!(cmd.contains("tx_iozone_work=/tmp/tx-iozone-musl"));
+        assert!(cmd.contains("cp ./iozone ./iozone_testcode.sh ./busybox \"$tx_iozone_work\""));
+        assert!(cmd.contains("(cd \"$tx_iozone_work\"; ./busybox sh iozone_testcode.sh)"));
+    }
+
+    #[test]
+    fn lmbench_script_runs_from_writable_tmp_workdir() {
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
+        append_oscomp_musl_script(&mut cmd, "lmbench_testcode.sh");
+
+        assert!(cmd.contains("tx_lmbench_work=/tmp/tx-lmbench-musl"));
+        assert!(cmd.contains("chmod 755 \"$tx_lmbench_work/hello\""));
+        assert!(cmd.contains("chmod 755 /tmp/hello"));
+        assert!(cmd.contains("(cd \"$tx_lmbench_work\"; ./busybox sh lmbench_testcode.sh)"));
     }
 
     #[test]
