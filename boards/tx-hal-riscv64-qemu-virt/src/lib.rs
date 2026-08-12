@@ -60,7 +60,7 @@ fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
 
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
-const MAX_BOOT_CPUS: usize = 4;
+const MAX_BOOT_CPUS: usize = 8;
 #[cfg(target_arch = "riscv64")]
 const PLIC_PHYS_BASE: usize = 0x0c00_0000;
 #[cfg(target_arch = "riscv64")]
@@ -150,6 +150,10 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
     Rv64PerCpuArea::new(1),
     Rv64PerCpuArea::new(2),
     Rv64PerCpuArea::new(3),
+    Rv64PerCpuArea::new(4),
+    Rv64PerCpuArea::new(5),
+    Rv64PerCpuArea::new(6),
+    Rv64PerCpuArea::new(7),
 ];
 
 /// Per-hart save area for the reschedule longjmp (slice 2 of the
@@ -230,6 +234,30 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
         tp: 0,
         s: [0; 12],
     }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        tp: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        tp: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        tp: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        tp: 0,
+        s: [0; 12],
+    }),
 ];
 
 /// Per-CPU trap-handler stack. Sized 64 KiB; the trap vector
@@ -245,13 +273,17 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
 /// `KERNEL_RO`); plain `static [u8; N]` lands in `.rodata` and
 /// the trap-vector's first store would fault.
 ///
-/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 256 KiB`.
+/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 512 KiB`.
 const RV64_TRAP_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
 pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);
 
 static RV64_TRAP_STACKS: [PerHartCell<Rv64TrapStack>; MAX_BOOT_CPUS] = [
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
