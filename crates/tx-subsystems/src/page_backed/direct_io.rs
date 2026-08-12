@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::execution::Errno;
 use crate::io_manager::block::BioVec;
 use crate::vm::{AccessMode, AddressSpace, UserAccessKind, UserRange, USER_PAGE_SIZE};
 use tx_hal::UserPtr;
@@ -147,6 +148,12 @@ pub(crate) enum DirectIoInFlightState {
     Admitted,
     Planning,
     Queued,
+    /// The device completion arrived, but resident-root retirement was
+    /// temporarily backpressured. Keep the reservation and DMA buffer until
+    /// the coherency withdrawal can commit.
+    CompletionPending {
+        result: Result<(), Errno>,
+    },
 }
 
 #[derive(Debug)]
@@ -192,32 +199,26 @@ impl DirectIoBuffer {
         access: UserAccessKind,
     ) -> Result<Self, DirectIoBufferError> {
         let (range, first_offset) = user_range(user, len)?;
-        let snapshots = aspace.pmap().walk_range(range);
-        if snapshots.len() != range.page_count() {
-            return Err(DirectIoBufferError::NotMaterialized);
-        }
         let required = match access {
             UserAccessKind::Read => AccessMode::Read,
             UserAccessKind::Write => AccessMode::Write,
         };
-        if snapshots
-            .iter()
-            .any(|(_, snapshot)| !snapshot.prot.permits(required))
-        {
-            return Err(DirectIoBufferError::PermissionDenied);
-        }
-
-        let mut pins = Vec::with_capacity(snapshots.len());
-        for (_, snapshot) in &snapshots {
+        let page_count = range.page_count();
+        let mut pins = Vec::with_capacity(page_count);
+        let mut vecs = Vec::with_capacity(page_count);
+        let mut remaining = len;
+        let first_page = range.start().containing_page();
+        for (index, (page, snapshot)) in aspace.pmap().walk_range(range).into_iter().enumerate() {
+            if page.0 != first_page.0 + index {
+                return Err(DirectIoBufferError::NotMaterialized);
+            }
+            if !snapshot.prot.permits(required) {
+                return Err(DirectIoBufferError::PermissionDenied);
+            }
             match page_allocator::acquire_dma_pin(snapshot.ppn) {
                 Ok(pin) => pins.push(pin),
                 Err(error) => return Err(DirectIoBufferError::DmaPin(error)),
             }
-        }
-
-        let mut vecs = Vec::with_capacity(snapshots.len());
-        let mut remaining = len;
-        for (index, (_, snapshot)) in snapshots.iter().enumerate() {
             let offset = if index == 0 { first_offset } else { 0 };
             let available = USER_PAGE_SIZE - offset;
             let segment_len = core::cmp::min(remaining, available);
@@ -227,6 +228,9 @@ impl DirectIoBuffer {
                 segment_len as u32,
             ));
             remaining -= segment_len;
+        }
+        if pins.len() != page_count {
+            return Err(DirectIoBufferError::NotMaterialized);
         }
         debug_assert_eq!(remaining, 0);
 

@@ -50,6 +50,18 @@ fn pagebacked_install_shared_page_attaches_existing_frame_to_new_pc() {
 
     assert_eq!(dest.lookup(PageIndex::new(0)), Some(source_ppn));
     assert_eq!(
+        dest.page_slot_snapshot_for_test(PageIndex::new(0))
+            .expect("shared page slot")
+            .state,
+        PageSlotState::Resident { ppn: source_ppn }
+    );
+    reset_page_container_lock_service_observations_for_test();
+    let hit = dest
+        .materialize_page_now(PageIndex::new(0), MaterializeAccess::Read, &guard)
+        .expect("guarded shared-page read hit");
+    assert_eq!(hit.ppn, source_ppn);
+    assert_eq!(page_container_state_lock_acquisitions_for_test(), 0);
+    assert_eq!(
         read_frame_bytes(source_ppn, crate::vm::USER_PAGE_SIZE),
         pattern
     );
@@ -133,6 +145,18 @@ fn pagebacked_cow_replace_into_private_swaps_to_fresh_frame_with_matching_bytes(
 
     assert_ne!(new_ppn, source_ppn);
     assert_eq!(dest.lookup(PageIndex::new(0)), Some(new_ppn));
+    assert_eq!(
+        dest.page_slot_snapshot_for_test(PageIndex::new(0))
+            .expect("private replacement slot")
+            .state,
+        PageSlotState::Resident { ppn: new_ppn }
+    );
+    reset_page_container_lock_service_observations_for_test();
+    let hit = dest
+        .materialize_page_now(PageIndex::new(0), MaterializeAccess::Read, &guard)
+        .expect("guarded CoW replacement read hit");
+    assert_eq!(hit.ppn, new_ppn);
+    assert_eq!(page_container_state_lock_acquisitions_for_test(), 0);
     assert_eq!(source.lookup(PageIndex::new(0)), Some(source_ppn));
     assert_eq!(
         read_frame_bytes(new_ppn, crate::vm::USER_PAGE_SIZE),

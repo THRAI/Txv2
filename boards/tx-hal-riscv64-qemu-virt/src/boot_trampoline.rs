@@ -25,10 +25,8 @@ core::arch::global_asm!(
     // before satp turns on; an under-mapped kernel page-faults into a trap-vector loop.
     .equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 16
     .equ TX_RV64_PAGE_SIZE, 4096
-    // Must equal `lib.rs::MAX_BOOT_CPUS`. The official final-phase lane uses
-    // `-smp 8`, and OpenSBI may choose any of harts 0..7 as the boot hart.
-    .equ TX_RV64_MAX_BOOT_CPUS, 8
-    .equ TX_RV64_BOOT_STACK_STRIDE, 524288
+    .equ TX_RV64_MAX_BOOT_CPUS, 4
+    .equ TX_RV64_BOOT_STACK_STRIDE, 131072
     .equ TX_RV64_SATP_SV39, 0x8000000000000000
     .equ TX_RV64_PTE_V, 0x001
     .equ TX_RV64_PTE_R, 0x002
@@ -48,7 +46,7 @@ _start:
     la sp, __tx_boot_stack_top_load
     li t0, TX_RV64_MAX_BOOT_CPUS
     bgeu s0, t0, .Ltx_bsp_stack_ready
-    slli t1, s0, 19
+    slli t1, s0, 17
     sub sp, sp, t1
 .Ltx_bsp_stack_ready:
 
@@ -78,6 +76,28 @@ _start:
     slli t2, t2, 3
     add t3, s2, t2
     sd t1, 0(t3)
+
+    // QEMU may place the FDT at the top of RAM. Preserve the one direct-map
+    // leaf containing the firmware pointer so Rust can parse BootInfo before
+    // substrate extends the contiguous RAM mapping.
+    li t0, TX_RV64_QEMU_RAM_BASE
+    bltu s1, t0, .Ltx_fdt_direct_done
+    sub t1, s1, t0
+    srli t1, t1, 30
+    li t2, 128
+    bgeu t1, t2, .Ltx_fdt_direct_done
+    li t2, TX_RV64_DIRECT_MAP_ROOT_SLOT
+    add t2, t2, t1
+    slli t2, t2, 3
+    add t3, s2, t2
+    slli t1, t1, 30
+    li t2, TX_RV64_QEMU_RAM_BASE
+    add t1, t1, t2
+    srli t1, t1, 12
+    slli t1, t1, 10
+    ori t1, t1, TX_RV64_PTE_DIRECT
+    sd t1, 0(t3)
+.Ltx_fdt_direct_done:
 
     la s3, __kernel_alias_l1_load
     srli t1, s3, 12
@@ -140,7 +160,7 @@ _start:
     la sp, __tx_boot_stack_top_load
     li t1, TX_RV64_MAX_BOOT_CPUS
     bgeu s0, t1, .Ltx_bsp_high_stack_ready
-    slli t2, s0, 19
+    slli t2, s0, 17
     sub sp, sp, t2
 .Ltx_bsp_high_stack_ready:
     add sp, sp, t0
@@ -165,7 +185,7 @@ tx_rv64_qemu_secondary_start:
     bgeu s0, t0, 9f
 
     la sp, __tx_boot_stack_top_load
-    slli t1, s0, 19
+    slli t1, s0, 17
     sub sp, sp, t1
     li t0, TX_RV64_KERNEL_VIRT_OFFSET
     add sp, sp, t0

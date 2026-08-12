@@ -65,13 +65,11 @@ pub(super) fn sys_tx_observe_trace_off() -> SyscallResult {
 /// (`GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE`) but ignored — the
 /// in-tree default impl is deterministic + non-blocking.
 ///
-/// User-VA writeback flows through the wait-capable user-copy lane.  Under
-/// SMP, another hart can temporarily own the destination page's VM range;
-/// that is a scheduling condition, not an I/O error.
-///
-/// Null `buf` with non-zero `buflen` returns `-EFAULT`; `buflen == 0` is a
-/// successful no-op (`Return(0)`).
-pub(super) async fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+/// User-VA writeback flows through `bootstrap_copy_to_user`
+/// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
+/// for test scaffolding). Null `buf` with non-zero `buflen` returns
+/// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
+pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     let buf_len = args[1] as usize;
     let flags = args[2] as u32;
@@ -92,9 +90,7 @@ pub(super) async fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // canonical user-VA lane.
     let mut tmp = alloc::vec![0u8; buf_len];
     tx_services::random::fill_bytes(&mut tmp);
-    if let Err(errno) =
-        super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, buf_uaddr, &tmp).await
-    {
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &tmp) {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(buf_len as i64)

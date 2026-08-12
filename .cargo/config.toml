@@ -4,6 +4,13 @@ xtask = "run --package xtask --"
 [build]
 target-dir = "target"
 
+[env]
+# Host tests model the kernel's per-hart ambient polling context. Multiple
+# independent virtual reactors must not concurrently claim the same HartId.
+# CI and `cargo xtask unit` already serialize these tests; make direct
+# `cargo test` use the same virtual-hart setup.
+RUST_TEST_THREADS = "1"
+
 [target.riscv64gc-unknown-none-elf]
 linker = "rust-lld"
 

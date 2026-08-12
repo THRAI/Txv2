@@ -493,9 +493,7 @@ impl ExecError {
     fn from_vdso_map_error(error: VmMapError) -> Self {
         match error {
             VmMapError::WouldBlock => Self::Retry,
-            VmMapError::NoFreeRange
-            | VmMapError::Private(_)
-            | VmMapError::PageAlloc(_) => Self::OutOfMemory,
+            VmMapError::NoFreeRange | VmMapError::Private(_) => Self::OutOfMemory,
             VmMapError::Pmap(_) => Self::IoError,
             VmMapError::AlreadyMapped
             | VmMapError::InvalidRange
@@ -703,8 +701,12 @@ pub struct ExecScriptOp<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> {
     argv: &'a [&'a [u8]],
     envp: &'a [&'a [u8]],
     cred: &'a Credential,
+    oom_pressure_retries: usize,
     _platform: core::marker::PhantomData<fn() -> P>,
 }
+
+const EXEC_OOM_PRESSURE_RETRY_LIMIT: usize = 16;
+const EXEC_OOM_PRESSURE_SPIN_ROUNDS: usize = 65536;
 
 impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> ExecScriptOp<'a, P> {
     pub const fn new(
@@ -722,6 +724,7 @@ impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> ExecScriptOp<'a, P> {
             argv,
             envp,
             cred,
+            oom_pressure_retries: 0,
             _platform: core::marker::PhantomData,
         }
     }
@@ -740,12 +743,24 @@ impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> StepOp<ProcessIdentity> for Exe
             self.envp,
             self.cred,
         );
-        exec_result_to_step_outcome(poll_ready_synchronously(future))
+        exec_result_to_step_outcome_with_pressure_retry(
+            poll_ready_synchronously(future),
+            &mut self.oom_pressure_retries,
+        )
     }
 }
 
+#[cfg(test)]
 pub(crate) fn exec_result_to_step_outcome(
     result: Option<Result<(), ExecError>>,
+) -> StepOutcome<(), NoProgress> {
+    let mut oom_pressure_retries = EXEC_OOM_PRESSURE_RETRY_LIMIT;
+    exec_result_to_step_outcome_with_pressure_retry(result, &mut oom_pressure_retries)
+}
+
+fn exec_result_to_step_outcome_with_pressure_retry(
+    result: Option<Result<(), ExecError>>,
+    oom_pressure_retries: &mut usize,
 ) -> StepOutcome<(), NoProgress> {
     match result {
         Some(Ok(())) => StepOutcome::done(()),
@@ -753,6 +768,18 @@ pub(crate) fn exec_result_to_step_outcome(
             progress: NoProgress,
             shape,
         },
+        Some(Err(ExecError::OutOfMemory))
+            if *oom_pressure_retries < EXEC_OOM_PRESSURE_RETRY_LIMIT =>
+        {
+            *oom_pressure_retries += 1;
+            tx_subsystems::zones::try_memory_pressure_maintenance_tick();
+            for _ in 0..EXEC_OOM_PRESSURE_SPIN_ROUNDS {
+                core::hint::spin_loop();
+            }
+            StepOutcome::Continue {
+                progress: NoProgress,
+            }
+        }
         Some(Err(ExecError::Retry)) | None => StepOutcome::Continue {
             progress: NoProgress,
         },
@@ -1447,10 +1474,6 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     }
     let _cred_outcome = commit_prepared_exec_cred(prepared_exec_cred)
         .expect("checked address-space swap preserves the authoritative exec binding");
-    // vfork completion: if the parent is waiting on CLONE_VFORK,
-    // unblock it now that exec has completed.
-    process.fire_exit_source_with_post(1, |mailbox, event| mailbox.post(event));
-
     // ===== Phase 8 — userspace re-entry ==============================
     //
     // The script does not directly re-enter userspace. The next
@@ -1736,37 +1759,14 @@ fn open_executable_candidate(
             return Err(ExecError::from_walker_errno(Errno::from(err)));
         }
     };
+    drop(guard);
 
     if opened.mount.flags().contains(MountFlags::NOEXEC) {
         return Err(ExecError::PermissionDenied);
     }
     let file = opened.open_file;
 
-    // RNode metadata is a materialisation-time snapshot.  In particular,
-    // linkers commonly create an output with 0666 (subject to umask), then
-    // fchmod it executable while an earlier path lookup still keeps the
-    // dentry/RNode alive.  Permission and credential transitions must use
-    // the filesystem's current inode metadata, just like Linux consults the
-    // canonical live inode, rather than the stale RNode snapshot.
-    //
-    // Keeping the load on the mount selected by the namespace walk also
-    // matters for bind mounts: ascending an arbitrary dentry parent chain can
-    // select the wrong filesystem after a concurrent namespace operation.
-    let mount_payload = opened
-        .mount
-        .payload_cap()
-        .map_err(|_| ExecError::Retry)?;
-    let meta = match mount_payload
-        .fs_ops()
-        .load_inode_meta(file.rnode().fs_object_id(), &guard)
-    {
-        V3::Done(meta) => meta,
-        V3::Continue { .. } => return Err(ExecError::Retry),
-        V3::Yield { shape, .. } => return Err(ExecError::Deferred(shape)),
-        V3::Err(err) => return Err(ExecError::from_walker_errno(Errno::from(err))),
-    };
-    drop(guard);
-
+    let meta = file.rnode().meta();
     check_exec_perm(&meta, cred)?;
     if meta.kind() == InodeKind::Directory {
         return Err(ExecError::PermissionDenied);
@@ -1843,31 +1843,18 @@ fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 
 /// Build argv for a shebang re-exec.
 ///
-/// OSComp Lua uses helper scripts with `#!/bin/busybox sh`. Txv2
-/// publishes `/bin/sh` consistently across boot modes, while
-/// `/bin/busybox` is not guaranteed to exist. When normalising that
-/// exact shebang to `/bin/sh`, the original busybox applet selector
-/// (`sh`) must be consumed; otherwise busybox receives
-/// `/bin/sh sh script ...` and tries to open a script literally named
-/// `sh`.
+/// The busybox profile runs shell commands reliably through the explicit
+/// multi-call shape `/bin/busybox sh ...`; launching the shell through the
+/// `/bin/sh` applet symlink can stall before the first post-exec syscall on
+/// the current initramfs. Preserve explicit busybox shebangs in that shape
+/// while keeping normal Linux binfmt_script ordering.
 fn shebang_exec_argv(
     interp: &[u8],
     opt_arg: Option<&[u8]>,
     script_path: &[u8],
     original_argv: &[&[u8]],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), ExecError> {
-    let normalized_interp = if interp == b"/bin/busybox" {
-        b"/bin/sh".as_slice()
-    } else {
-        interp
-    };
-    let interp_path = try_copy_exec_bytes(normalized_interp)?;
-    let mut opt_arg = opt_arg;
-    if interp == b"/bin/busybox" {
-        if matches!(opt_arg, Some(b"sh" | b"ash")) {
-            opt_arg = None;
-        }
-    }
+    let interp_path = try_copy_exec_bytes(interp)?;
 
     // Linux binfmt_script shape: [interp, opt_arg?, script_path,
     // original argv[1..]...].

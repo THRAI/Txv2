@@ -3,9 +3,10 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
-    self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome,
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome,
 };
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cred::CapabilitySet;
@@ -20,17 +21,17 @@ use tx_subsystems::vfs::structure::{
     Credential, DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::{DirEntry, FsOps};
 use tx_subsystems::vm::{
     MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
     USER_PAGE_SIZE,
 };
 
 use crate::linux_syscall::{
-    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_MOUNT,
-    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT,
-    NR_UTIMENSAT, NR_WRITE, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET,
-    UTIME_NOW,
+    AT_FDCWD, AT_REMOVEDIR, NR_CLOSE, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT,
+    NR_MOUNT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT,
+    NR_UTIMENSAT, NR_WRITEV, O_CREAT, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE,
+    SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -44,7 +45,6 @@ const E_PERM: i32 = 1;
 const E_ACCES: i32 = 13;
 const E_NOSYS: i32 = 38;
 const STAT_BYTES: usize = 128;
-const STAT_SIZE_OFF: usize = 48;
 const STAT_ATIME_SEC_OFF: usize = 72;
 const STAT_MTIME_SEC_OFF: usize = 88;
 
@@ -119,6 +119,225 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     (root_dentry, tmpfs)
 }
 
+struct DestroyCountingFs {
+    inner: Arc<Tmpfs>,
+    destroy_calls: Arc<AtomicUsize>,
+}
+
+impl DestroyCountingFs {
+    fn new(inner: Arc<Tmpfs>) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let destroy_calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                inner,
+                destroy_calls: Arc::clone(&destroy_calls),
+            }),
+            destroy_calls,
+        )
+    }
+}
+
+impl FsOps for DestroyCountingFs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<FsObjectId, step_engine::NoProgress> {
+        self.inner.lookup(parent, name, guard)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<InodeMeta, step_engine::NoProgress> {
+        self.inner.load_inode_meta(fs_object_id, guard)
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.serialize_inode_meta(fs_object_id, meta, guard)
+    }
+
+    fn create_inode(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        self.inner.create_inode(parent, name, mode, cred, guard)
+    }
+
+    fn unlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.unlink(parent, name, target, guard)
+    }
+
+    fn rename(
+        &self,
+        old_parent: FsObjectId,
+        old_name: &[u8],
+        new_parent: FsObjectId,
+        new_name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner
+            .rename(old_parent, old_name, new_parent, new_name, guard)
+    }
+
+    fn link(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.link(parent, name, target, guard)
+    }
+
+    fn mkdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        self.inner.mkdir(parent, name, mode, cred, guard)
+    }
+
+    fn rmdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.rmdir(parent, name, target, guard)
+    }
+
+    fn symlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        self.inner.symlink(parent, name, link_target, cred, guard)
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, step_engine::NoProgress> {
+        self.inner.readdir(fs_object_id, cursor, guard)
+    }
+
+    fn destroy_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.destroy_calls.fetch_add(1, Ordering::AcqRel);
+        self.inner.destroy_inode(fs_object_id, guard)
+    }
+
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, step_engine::NoProgress> {
+        self.inner.read_link(fs_object_id, guard)
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, step_engine::NoProgress> {
+        self.inner
+            .materialise_rnode(fs_object_id, meta, mount, guard)
+    }
+
+    fn chmod_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner.chmod_inode(fs_object_id, new_mode, cred, guard)
+    }
+
+    fn chown_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.inner
+            .chown_inode(fs_object_id, new_uid, new_gid, cred, guard)
+    }
+}
+
+fn build_destroy_counting_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Arc<AtomicUsize>) {
+    let tmpfs = Arc::new(Tmpfs::new());
+    let (counting_fs, destroy_calls) = DestroyCountingFs::new(Arc::clone(&tmpfs));
+    let payload = MountPayload::new_cap(
+        counting_fs as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        DevId::new(412),
+        MountOptions::default(),
+        "tmpfs-destroy-counting-file-mutation",
+        SourceLabel::Static("tmpfs-destroy-counting-file-mutation"),
+    )
+    .expect("mount payload");
+
+    let root_rnode = {
+        let raw = RNode::new(
+            TMPFS_ROOT_OBJECT_ID,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
+    };
+
+    let _mount = MountIdentity::new_cap(
+        MountId::new(42),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("mount identity");
+
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    (root_dentry, tmpfs, destroy_calls)
+}
+
 fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     let aspace = fresh_aspace();
     let process = bootstrap_init_process(aspace).expect("bootstrap init");
@@ -140,25 +359,23 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
 }
 
 fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) -> u64 {
-    assert!(bytes.len() <= USER_PAGE_SIZE);
     let range = UserRange::new_aligned(UserVirtAddr(uaddr), USER_PAGE_SIZE)
-        .expect("aligned file-mutation user range");
-    ctx.aspace
-        .try_mmap(VmMapRequest::fixed(
-            range,
-            MapPlacement::FixedReplace,
-            Prot::READ_WRITE,
-            VmEntryFlags::PRIVATE,
-            VmBacking::PrivateAnon,
-        ))
-        .expect("map file-mutation user buffer");
+        .expect("aligned user test range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(request).expect("map user bytes");
     if !bytes.is_empty() {
         let guard = guard();
-        assert_eq!(
-            ctx.aspace
-                .copy_to_user(tx_hal::UserPtr::<u8>::new(uaddr), bytes, &guard),
-            StepOutcome::Done(bytes.len())
-        );
+        let copied = ctx
+            .aspace
+            .copy_to_user(tx_hal::UserPtr::<u8>::new(uaddr), bytes, &guard);
+        drop(guard);
+        assert_eq!(copied, StepOutcome::Done(bytes.len()));
     }
     uaddr as u64
 }
@@ -407,12 +624,6 @@ fn dispatch_mount_move_preserves_identity_and_rekeys_global_and_namespace_indexe
 
 /// `mkdirat(AT_FDCWD, "/d", 0o755)` mints a new directory inode in
 /// tmpfs.
-// -----------------------------------------------------------------
-// mkdirat
-// -----------------------------------------------------------------
-
-/// `mkdirat(AT_FDCWD, "/d", 0o755)` mints a new directory inode in
-/// tmpfs.
 #[test]
 fn dispatch_mkdirat_creates_directory() {
     let _setup = fm_setup();
@@ -428,6 +639,30 @@ fn dispatch_mkdirat_creates_directory() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert!(lookup_exists(&tmpfs, b"d"), "/d should exist after mkdirat");
+    drop(path);
+}
+
+/// BusyBox `mkdir -p /usr/bin` may first issue `mkdirat("/usr/", ...)`.
+/// Linux treats that as creating `/usr`; keep that compatibility so
+/// test-init can build writable OSComp helper directories on the tmpfs root.
+#[test]
+fn dispatch_mkdirat_trailing_slash_creates_directory() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/usr/");
+    let req = SyscallRequest::new(
+        NR_MKDIRAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0o755, 0, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        lookup_exists(&tmpfs, b"usr"),
+        "/usr should exist after mkdirat with trailing slash"
+    );
     drop(path);
 }
 
@@ -450,7 +685,7 @@ fn dispatch_mkdirat_existing_returns_neg_eexist() {
     drop(path);
 }
 
-/// Linux ignores dirfd when the supplied path is absolute.
+/// `mkdirat` with an absolute path ignores a non-cwd dirfd.
 #[test]
 fn dispatch_mkdirat_absolute_path_ignores_non_cwd_dirfd() {
     let _setup = fm_setup();
@@ -486,6 +721,254 @@ fn dispatch_unlinkat_removes_regular_file() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert!(!lookup_exists(&tmpfs, b"f"), "/f should be removed");
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_closed_regular_file_destroys_inode_immediately() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"closed");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/closed");
+    let req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"closed"),
+        "/closed should be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "unlinkat of a closed zero-link file must run backend destroy"
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_closed_cached_regular_file_destroys_inode_immediately() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"cached");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry.clone());
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/cached");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /cached: {other:?}"),
+    };
+    assert!(
+        root_dentry
+            .cached_child(InlineName::new(b"cached").expect("inline"))
+            .is_some(),
+        "openat should publish the child into the parent dentry cache"
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_CLOSE, [fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"cached"),
+        "/cached should be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "a stale weak dentry cache entry must not keep a closed zero-link file inode alive"
+    );
+    assert!(
+        root_dentry
+            .cached_child(InlineName::new(b"cached").expect("inline"))
+            .is_none(),
+        "unlinkat should evict the removed name from the parent dentry cache"
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_open_regular_file_defers_destroy() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"open");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/open");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /open: {other:?}"),
+    };
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"open"),
+        "/open name must be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "unlinkat must not destroy storage while an fd still owns the rnode"
+    );
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_FSTAT, [fd, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0],),
+            &ctx
+        )),
+        SyscallResult::Return(0)
+    );
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_open_regular_file_defers_destroy_without_cached_dentry() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"open-fd");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry.clone());
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/open-fd");
+    let open_req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open_req, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /open-fd: {other:?}"),
+    };
+    root_dentry.remove_cached_child_by_name(b"open-fd");
+
+    let unlink_req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(unlink_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(
+        !lookup_exists(&tmpfs, b"open-fd"),
+        "/open-fd name must be removed"
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "open fd must defer zero-link storage destroy even without cached dentry"
+    );
+    assert!(proc_cap.fd(fd as u32).is_some(), "fd remains open");
+    drop(path);
+}
+
+#[test]
+fn dispatch_close_last_unlinked_regular_file_destroys_inode() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"gone");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/gone");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                O_RDWR as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /gone: {other:?}"),
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_UNLINKAT,
+                [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+            ),
+            &ctx
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(destroy_calls.load(Ordering::Acquire), 0);
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_CLOSE, [fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "last close of a zero-link file must run backend destroy"
+    );
     drop(path);
 }
 
@@ -534,6 +1017,39 @@ fn dispatch_unlinkat_at_removedir_removes_empty_directory() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert!(!lookup_exists(&tmpfs, b"d"), "/d should be removed");
+    drop(path);
+}
+
+#[test]
+fn dispatch_unlinkat_at_removedir_closed_empty_directory_destroys_inode_immediately() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    make_dir(&tmpfs, b"d");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/d");
+    let req = SyscallRequest::new(
+        NR_UNLINKAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            AT_REMOVEDIR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(!lookup_exists(&tmpfs, b"d"), "/d should be removed");
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        1,
+        "rmdir of a closed zero-link directory must run backend destroy"
+    );
     drop(path);
 }
 
@@ -825,6 +1341,59 @@ fn dispatch_truncate_pagebacked_returns_zero() {
 }
 
 #[test]
+fn writev_pagebacked_oneshot_publishes_live_size() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/wv");
+    let open = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_CREAT | O_RDWR) as u64,
+            0o755,
+            0,
+            0,
+        ],
+    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(open, &ctx)) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat(O_CREAT): {other:?}"),
+    };
+
+    let first = b"#!/bin/sh\n";
+    let second = b"echo tier1-exec-ok\n";
+    let first_ptr = map_user_bytes(&ctx, 0x5300_0000, first);
+    let second_ptr = map_user_bytes(&ctx, 0x5300_1000, second);
+    let mut iov = [0u8; 32];
+    iov[0..8].copy_from_slice(&first_ptr.to_le_bytes());
+    iov[8..16].copy_from_slice(&(first.len() as u64).to_le_bytes());
+    iov[16..24].copy_from_slice(&second_ptr.to_le_bytes());
+    iov[24..32].copy_from_slice(&(second.len() as u64).to_le_bytes());
+    let iov_ptr = map_user_bytes(&ctx, 0x5300_2000, &iov);
+    let writev = SyscallRequest::new(NR_WRITEV, [fd, iov_ptr, 2, 0, 0, 0]);
+    assert_eq!(
+        crate::linux_syscall::dispatch_writev_pagebacked_oneshot(&writev, &ctx),
+        Some(SyscallResult::Return((first.len() + second.len()) as i64))
+    );
+
+    let guard = guard();
+    let file_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"wv", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup /wv: {other:?}"),
+    };
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load_inode_meta /wv: {other:?}"),
+    };
+    assert_eq!(meta.size, (first.len() + second.len()) as u64);
+    drop(path);
+}
+
+#[test]
 fn dispatch_truncate_without_file_write_returns_neg_eacces() {
     use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
 
@@ -1079,23 +1648,15 @@ fn dispatch_renameat2_same_directory_succeeds() {
     drop(newpath);
 }
 
-/// Rename-over at the syscall layer must complete the VFS lifetime
-/// protocol by destroying the displaced inode after tmpfs drops its
-/// last link. Otherwise repeated temp-file replacement keeps old
-/// PageContainers resident until the whole tmpfs mount is torn down.
+/// Rename-over replaces the destination namespace entry. Backend
+/// storage reclamation is deferred until VFS can prove no fd/RNode
+/// payload remains live.
 #[test]
-fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
+fn dispatch_renameat2_over_existing_replaces_destination_name() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs) = build_tmpfs_root();
     create_regular(&tmpfs, b"source");
     create_regular(&tmpfs, b"target");
-
-    let first_guard = guard();
-    let displaced_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &first_guard) {
-        StepOutcome::Done(id) => id,
-        other => panic!("lookup target before rename: {other:?}"),
-    };
-    drop(first_guard);
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
@@ -1118,11 +1679,81 @@ fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
     );
 
     let guard = guard();
-    assert_eq!(
-        tmpfs.load_inode_meta(displaced_id, &guard),
-        StepOutcome::Err(step_engine::Errno::ENOENT),
-        "rename-over should destroy the displaced zero-link inode"
+    assert!(matches!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"source", &guard),
+        StepOutcome::Err(step_engine::Errno::ENOENT)
+    ));
+    assert!(matches!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &guard),
+        StepOutcome::Done(_)
+    ));
+    drop(oldpath);
+    drop(newpath);
+}
+
+#[test]
+fn dispatch_renameat2_over_open_target_defers_displaced_destroy() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    create_regular(&tmpfs, b"source");
+    create_regular(&tmpfs, b"target");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let target_path = nul_terminate(b"/target");
+    let target_fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                target_path.as_ptr() as u64,
+                O_RDWR as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat /target: {other:?}"),
+    };
+
+    let oldpath = nul_terminate(b"/source");
+    let newpath = nul_terminate(b"/target");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
     );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "rename-over must not destroy a displaced inode while its fd is open"
+    );
+
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_FSTAT,
+                [target_fd, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0],
+            ),
+            &ctx
+        )),
+        SyscallResult::Return(0)
+    );
+    drop(target_path);
     drop(oldpath);
     drop(newpath);
 }
@@ -1511,6 +2142,47 @@ fn dispatch_openat_o_tmpfile_returns_unlinked_regular_file() {
 }
 
 #[test]
+fn dispatch_openat_o_tmpfile_defers_destroy_while_fd_is_live() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs, destroy_calls) = build_destroy_counting_tmpfs_root();
+    make_dir(&tmpfs, b"tmp");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/tmp");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (O_TMPFILE | O_RDWR) as u64,
+                0o600,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat O_TMPFILE /tmp: {other:?}"),
+    };
+
+    assert_eq!(
+        destroy_calls.load(Ordering::Acquire),
+        0,
+        "O_TMPFILE must keep backend storage while returning a live fd"
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_LSEEK, [fd, 0, SEEK_SET as u64, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
 fn dispatch_futimens_preserves_large_explicit_time_in_fstat() {
     let _setup = fm_setup();
     let (root_dentry, tmpfs) = build_tmpfs_root();
@@ -1561,94 +2233,4 @@ fn dispatch_futimens_preserves_large_explicit_time_in_fstat() {
     assert_eq!(read_i64_at(&statbuf, STAT_ATIME_SEC_OFF), large);
     assert_eq!(read_i64_at(&statbuf, STAT_MTIME_SEC_OFF), large);
     drop(path);
-}
-
-#[test]
-fn dispatch_futimens_does_not_hide_later_page_container_size() {
-    let _setup = fm_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
-    create_regular(&tmpfs, b"f");
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let path = nul_terminate(b"/f");
-    let fd = match block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(
-            NR_OPENAT,
-            [
-                AT_FDCWD as i64 as u64,
-                path.as_ptr() as u64,
-                O_RDWR as u64,
-                0,
-                0,
-                0,
-            ],
-        ),
-        &ctx,
-    )) {
-        SyscallResult::Return(fd) => fd as u64,
-        other => panic!("openat /f: {other:?}"),
-    };
-
-    let times = [
-        TestTimespec {
-            tv_sec: 123,
-            tv_nsec: 0,
-        },
-        TestTimespec {
-            tv_sec: 456,
-            tv_nsec: 0,
-        },
-    ];
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(NR_UTIMENSAT, [fd, 0, times.as_ptr() as u64, 0, 0, 0]),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-
-    let payload = b"page-container-size";
-    let payload_uaddr = map_user_bytes(&ctx, 0x5300_0000, payload);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(NR_WRITE, [fd, payload_uaddr, payload.len() as u64, 0, 0, 0],),
-            &ctx,
-        )),
-        SyscallResult::Return(payload.len() as i64)
-    );
-
-    let mut fstatbuf = vec![0u8; STAT_BYTES];
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(NR_FSTAT, [fd, fstatbuf.as_mut_ptr() as u64, 0, 0, 0, 0],),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-    assert_eq!(read_i64_at(&fstatbuf, STAT_SIZE_OFF), payload.len() as i64);
-    assert_eq!(read_i64_at(&fstatbuf, STAT_ATIME_SEC_OFF), 123);
-    assert_eq!(read_i64_at(&fstatbuf, STAT_MTIME_SEC_OFF), 456);
-
-    let mut statbuf = vec![0u8; STAT_BYTES];
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_NEWFSTATAT,
-                [
-                    AT_FDCWD as i64 as u64,
-                    path.as_ptr() as u64,
-                    statbuf.as_mut_ptr() as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-    assert_eq!(read_i64_at(&statbuf, STAT_SIZE_OFF), payload.len() as i64);
-    assert_eq!(read_i64_at(&statbuf, STAT_ATIME_SEC_OFF), 123);
-    assert_eq!(read_i64_at(&statbuf, STAT_MTIME_SEC_OFF), 456);
 }

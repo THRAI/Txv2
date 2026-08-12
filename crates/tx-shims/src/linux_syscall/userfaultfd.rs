@@ -45,8 +45,8 @@ use super::numbers::{
     UFFDIO_REGISTER_MODE_WP, UFFDIO_REGISTER_REPLY_IOCTLS, UFFD_API,
 };
 use super::{
-    bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx, SyscallResult,
-    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, EMFILE_VALUE, ENOMEM_VALUE,
+    bootstrap_read_user, bootstrap_write_user, errno_to_i32, next_stdio_fd_below_nofile,
+    SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{
     self as step_engine, DelegateReply, TransitionOutcome, UfdReply,
@@ -170,9 +170,14 @@ pub(super) fn sys_userfaultfd<'a>(flags: u32, ctx: &SyscallCtx<'a>) -> SyscallRe
     };
 
     // Install at the lowest free fd.
-    let Some(fd) = ctx.process.install_new_fd(open_cap, cloexec) else {
-        return SyscallResult::Error(EMFILE_VALUE);
+    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(result) => return result,
     };
+    let _ = ctx.process.install_fd(fd, open_cap);
+    if cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
 
     SyscallResult::Return(fd as i64)
 }

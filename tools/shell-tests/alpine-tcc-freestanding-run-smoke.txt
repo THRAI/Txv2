@@ -1,0 +1,33 @@
+# alpine-tcc-freestanding-run-smoke.txt - link and run a tiny TCC binary.
+#
+# This deliberately avoids libc/crt objects so the test can run from the
+# lightweight TCC rootfs:
+#   TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-tcc-qemu \
+#   TX_ALPINE_PACKAGES="busybox openrc tcc" \
+#     tools/images/fetch-alpine-rv64.sh
+#   TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-tcc-qemu \
+#     cargo xtask image cpio --profile alpine --target rv64-qemu
+
+wait ":bootstrap-exec:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "echo tcc-freestanding-start\n"
+expect "tcc-freestanding-start" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat > /tmp/exit42.c <<'EOF'\nvoid _start(void) { __asm__(\"li a0, 42\\nli a7, 93\\necall\"); for (;;) {} }\nEOF\n"
+expect "/ # " within 20000
+
+sleep 500
+send "/usr/bin/tcc -nostdlib /tmp/exit42.c -o /tmp/exit42\n"
+expect "/ # " within 30000
+
+sleep 500
+send "/tmp/exit42; echo tcc-run-status:$?\n"
+expect "tcc-run-status:42" within 20000
+expect "/ # " within 20000
+
+sleep 500
+quit

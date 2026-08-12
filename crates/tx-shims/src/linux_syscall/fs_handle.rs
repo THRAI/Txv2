@@ -336,12 +336,17 @@ pub(super) fn sys_open_by_handle_at(
         }
     };
 
-    let open_file = match OpenFile::new_cap(rnode, open_flags) {
+    let open_file = match OpenFile::new_cap_with_mount_payload(rnode, open_flags, &mount_payload) {
         Ok(file) => file,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
-    let Some(fd) = ctx.process.install_new_fd(open_file, open_flags.cloexec) else {
-        return SyscallResult::Error(EMFILE_VALUE);
+    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(err) => return err,
     };
+    let _ = ctx.process.set_fd(fd, Some(open_file));
+    if open_flags.cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
     SyscallResult::Return(fd as i64)
 }

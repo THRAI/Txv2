@@ -633,10 +633,12 @@ fn devfs_rtc_event_with_post_uses_injected_mailbox_ref_post() {
             mailbox.poll(),
             Some(tx_substrate::wake::MailboxEvent::SourceFired {
                 generation: fired,
+                source,
                 ..
             }) if fired == generation
+                && source == tx_substrate::step::WaitSourceId::new(rtc_event_source_id())
         ),
-        "RTC event publication must wake RTC waiters"
+        "RTC event publication must wake RTC waiters with the registered source id"
     );
 
     subscriber.unsubscribe();

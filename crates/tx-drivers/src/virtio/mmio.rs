@@ -8,7 +8,9 @@ use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
 use step_engine::page_allocator;
 use step_engine::SpinMutex;
 use tx_hal::{MmioRegion, PlatformInfoIf, TxPlatform};
-use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
+use tx_subsystems::device::{
+    BlockDevice, BlockDeviceOps, BlockDurabilityCapabilities, PhysicalBlockNumber,
+};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::Frame;
 use virtio_drivers::device::blk::VirtIOBlk;
@@ -27,37 +29,16 @@ pub enum VirtioMmioError {
     Device,
 }
 
-/// Source of a virtio-mmio register window. Static boards can retain the
-/// name-based path, while firmware-discovered devices carry the exact region.
+/// Source of a virtio-mmio register window. Static QEMU layouts use the
+/// name-based form; firmware-discovered devices can retain the exact region.
 #[derive(Clone, Copy)]
 pub(crate) enum RegionSource {
     Name(&'static str),
     Region(MmioRegion),
 }
 
-const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x08;
-
-pub(crate) fn peek_device_type(
-    region: MmioRegion,
-) -> Option<virtio_drivers::transport::DeviceType> {
-    let base = region.virt.start.0 as *const u8;
-    if base.is_null() {
-        return None;
-    }
-    // SAFETY: the caller passes a platform-published MMIO region and these
-    // two words are the immutable virtio-mmio identification registers.
-    let magic = unsafe { core::ptr::read_volatile(base.cast::<u32>()) };
-    if magic != VIRTIO_MMIO_MAGIC {
-        return None;
-    }
-    let device_id =
-        unsafe { core::ptr::read_volatile(base.add(VIRTIO_MMIO_DEVICE_ID_OFFSET).cast::<u32>()) };
-    virtio_drivers::transport::DeviceType::try_from(device_id).ok()
-}
-
 pub struct VirtioMmioBlock<P: TxPlatform> {
-    region_source: RegionSource,
+    mmio_region_name: &'static str,
     inner: SpinMutex<Option<VirtIOBlk<TxVirtioHal<P>, MmioTransport<'static>>>>,
     initialized: AtomicBool,
     total_blocks: AtomicU64,
@@ -75,16 +56,8 @@ unsafe impl<P: TxPlatform> Sync for VirtioMmioBlock<P> {}
 
 impl<P: TxPlatform> VirtioMmioBlock<P> {
     pub const fn new(mmio_region_name: &'static str) -> Self {
-        Self::with_source(RegionSource::Name(mmio_region_name))
-    }
-
-    pub const fn from_region(region: MmioRegion) -> Self {
-        Self::with_source(RegionSource::Region(region))
-    }
-
-    const fn with_source(region_source: RegionSource) -> Self {
         Self {
-            region_source,
+            mmio_region_name,
             inner: SpinMutex::new(None),
             initialized: AtomicBool::new(false),
             total_blocks: AtomicU64::new(0),
@@ -98,13 +71,7 @@ impl<P: TxPlatform> VirtioMmioBlock<P> {
             return Ok(());
         }
 
-        let region = match self.region_source {
-            RegionSource::Name(name) => mmio_region::<P>(name)?,
-            RegionSource::Region(region) => region,
-        };
-        if peek_device_type(region) != Some(virtio_drivers::transport::DeviceType::Block) {
-            return Err(VirtioMmioError::Device);
-        }
+        let region = mmio_region::<P>(self.mmio_region_name)?;
         let header = NonNull::new(region.virt.start.0 as *mut VirtIOHeader)
             .ok_or(VirtioMmioError::NullHeader)?;
 
@@ -155,17 +122,6 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             return StepOutcome::Err(Errno::EINVAL.into());
         }
 
-        if let Some(buf) = contiguous_frame_slice_mut(target) {
-            let Ok(lba) = usize::try_from(block_id.as_u64()) else {
-                return StepOutcome::Err(Errno::EINVAL.into());
-            };
-            return if blk.read_blocks(lba, buf).is_ok() {
-                StepOutcome::Done(())
-            } else {
-                StepOutcome::Err(Errno::EIO.into())
-            };
-        }
-
         for (idx, frame) in target.iter_mut().enumerate() {
             let Some(lba) = block_id
                 .as_u64()
@@ -198,17 +154,6 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             return StepOutcome::Err(Errno::EINVAL.into());
         }
 
-        if let Some(buf) = contiguous_frame_slice(source) {
-            let Ok(lba) = usize::try_from(block_id.as_u64()) else {
-                return StepOutcome::Err(Errno::EINVAL.into());
-            };
-            return if blk.write_blocks(lba, buf).is_ok() {
-                StepOutcome::Done(())
-            } else {
-                StepOutcome::Err(Errno::EIO.into())
-            };
-        }
-
         for (idx, frame) in source.iter().enumerate() {
             let Some(lba) = block_id
                 .as_u64()
@@ -235,6 +180,14 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             return StepOutcome::Err(Errno::EIO.into());
         }
         StepOutcome::Done(())
+    }
+
+    fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+        // virtio-drivers exposes a durable flush but no FUA write option.
+        BlockDurabilityCapabilities {
+            fua: false,
+            flush: true,
+        }
     }
 }
 
@@ -263,35 +216,4 @@ fn frame_slice_mut(frame: Frame) -> Option<&'static mut [u8]> {
 fn frame_slice(frame: Frame) -> Option<&'static [u8]> {
     let ptr = page_allocator::frame_kernel_addr(frame.ppn()).ok()?;
     Some(unsafe { core::slice::from_raw_parts(ptr, PAGE_SIZE) })
-}
-
-fn contiguous_frame_slice_mut(frames: &mut [Frame]) -> Option<&'static mut [u8]> {
-    let first = *frames.first()?;
-    let base = first.ppn().0;
-    for (index, frame) in frames.iter().enumerate() {
-        if frame.ppn().0 != base.checked_add(index)? {
-            return None;
-        }
-    }
-    let len = frames.len().checked_mul(PAGE_SIZE)?;
-    let ptr = page_allocator::frame_kernel_addr(first.ppn()).ok()?;
-    // SAFETY: the caller supplies exclusive DMA targets.  The verified PPN
-    // sequence is contiguous and the kernel direct map preserves physical
-    // adjacency, so the run is one writable byte slice.
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
-}
-
-fn contiguous_frame_slice(frames: &[Frame]) -> Option<&'static [u8]> {
-    let first = *frames.first()?;
-    let base = first.ppn().0;
-    for (index, frame) in frames.iter().enumerate() {
-        if frame.ppn().0 != base.checked_add(index)? {
-            return None;
-        }
-    }
-    let len = frames.len().checked_mul(PAGE_SIZE)?;
-    let ptr = page_allocator::frame_kernel_addr(first.ppn()).ok()?;
-    // SAFETY: the verified PPN sequence is contiguous in the kernel direct
-    // map and the device only reads from this immutable source range.
-    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }

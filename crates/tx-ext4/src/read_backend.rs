@@ -1,37 +1,42 @@
 use core::cell::UnsafeCell;
+use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak};
+use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak as ZoneWeak};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak as ArcWeak};
+use alloc::vec;
 use alloc::vec::Vec;
+use tx_ext4_format::capability::CapabilityProfileHash;
 use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
 use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, BLOCK_SIZE,
 };
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
-use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner};
+use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner, IoDataSource};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
-use crate::journal::Ext4MutationPlanSource;
+use crate::journal::{
+    Ext4MutationPlanSource, JournalMutationRuntime, JournalMutationRuntimeError,
+    JournalSettlementObserver,
+};
 use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
 pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
-const DIR_VERSION_SHARDS: usize = 256;
 
 pub trait FilePageContainerBinder: Send + Sync {
     fn bind_file_page_container(&self, container: Cap<PageContainer>);
 }
 
 /// Mount-local adapter from a backend request to the pure format mutation
-/// planner. Page data remains owned by L4 and is attached by the journal
-/// runtime during admission.
+/// planner. It intentionally has no access to page-cache frames; L4 supplies
+/// those separately to `JournalMutationRuntime` during admission.
 pub(crate) struct Ext4PagerMutationPlanSource<I> {
     backend: Arc<SpinMutex<Option<ArcWeak<Ext4FsInstance<I>>>>>,
 }
@@ -64,7 +69,7 @@ where
         &self,
         request: &BackendPageRequest,
     ) -> Result<Ext4MutationPlan, Errno> {
-        if request.range.page_count() != 1 {
+        if request.range.is_empty() {
             return Err(Errno::EINVAL);
         }
         let generation = request.generation_hint.ok_or(Errno::EINVAL)?;
@@ -74,24 +79,64 @@ where
             .as_ref()
             .and_then(ArcWeak::upgrade)
             .ok_or(Errno::EIO)?;
-        let object = FsObjectId::new(request.object.raw());
-        let (inode, _) = backend.resolve_object(object)?;
+        let inode = inode_no(FsObjectId::new(request.object.raw()))?;
+        if backend.is_read_only() {
+            return Err(Errno::EROFS);
+        }
+        if backend.metadata_mutation_runtime().is_none() {
+            return Err(Errno::EOPNOTSUPP);
+        }
 
+        // The runtime replaces this placeholder with the L4-owned source.
+        // The format plan therefore remains metadata-only from L5's view.
+        if request.range.page_count() == 1 {
+            return backend.with_pager(|pager| {
+                pager.plan_write_page(
+                    inode,
+                    request.range.start_page(),
+                    &[0; BLOCK_SIZE],
+                    FsyncStamp::new(generation.raw()),
+                )
+            });
+        }
+        validate_multi_page_write_source(&request.source, request.range.page_count())?;
+        let page_count = usize::try_from(request.range.page_count()).map_err(|_| Errno::EINVAL)?;
+        let pages = vec![[0; BLOCK_SIZE]; page_count];
         backend.with_pager(|pager| {
-            pager.plan_write_page(
+            pager.plan_write_pages(
                 inode,
                 request.range.start_page(),
-                &[0; BLOCK_SIZE],
+                &pages,
                 FsyncStamp::new(generation.raw()),
             )
         })
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum OrphanState {
-    Pending,
-    Reclaiming,
+fn validate_multi_page_write_source(source: &IoDataSource, page_count: u64) -> Result<(), Errno> {
+    let count = usize::try_from(page_count).map_err(|_| Errno::EINVAL)?;
+    match source {
+        IoDataSource::PageCacheSegments { segments, .. } => {
+            if segments.len() != count
+                || segments
+                    .iter()
+                    .any(|segment| segment.offset != 0 || segment.len != BLOCK_SIZE as u32)
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        IoDataSource::Direct { vecs, .. } => {
+            if vecs.len() != count
+                || vecs
+                    .iter()
+                    .any(|vec| vec.offset != 0 || vec.len != BLOCK_SIZE as u32)
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        IoDataSource::None | IoDataSource::PageCache { .. } => return Err(Errno::EINVAL),
+    }
+    Ok(())
 }
 
 pub(crate) struct Ext4FsInstance<I> {
@@ -100,27 +145,12 @@ pub(crate) struct Ext4FsInstance<I> {
     extent_mapping: Option<Arc<Ext4MappingTable>>,
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
-    /// Lock-free namespace generations used to validate lookup/readdir cache
-    /// fills against concurrent directory mutations.
-    ///
-    /// The pager serializes on-disk operations, but cache insertion happens
-    /// after that pager guard is released. Without a generation, a reader can
-    /// read an old directory, a writer can commit and invalidate, and then the
-    /// reader can publish its old snapshot after the invalidation. Hashed
-    /// shards avoid a global namespace lock; collisions only cause harmless
-    /// extra cache misses.
-    dir_versions: [AtomicU64; DIR_VERSION_SHARDS],
-    /// Per-inode page-cache coherence index. Every hard-link alias of a
-    /// regular inode must materialise the same PageContainer while it is
-    /// alive; separate containers would permit stale reads and writeback
-    /// through one name to overwrite data written through another.
-    page_containers: SpinMutex<BTreeMap<FsObjectId, Weak<PageContainer>>>,
-    /// Inodes whose namespace link count reached zero. Entries remain here
-    /// while an RNode/OpenFile/mmap/PageContainer can still reach the payload;
-    /// the last-payload callback retries `destroy_inode`.
-    orphaned_inodes: SpinMutex<BTreeMap<FsObjectId, OrphanState>>,
+    inode_meta_cache: SpinMutex<InodeMetaCache>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
+    file_page_containers: SpinMutex<BTreeMap<FsObjectId, ZoneWeak<PageContainer>>>,
+    metadata_mutation_runtime: SpinMutex<Option<Arc<JournalMutationRuntime>>>,
+    buffered_write_reservations: SpinMutex<BTreeMap<(u32, u64), Ext4MutationPlan>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
     /// every page-cache writeback rejects with `EROFS`. The flag is
@@ -128,15 +158,24 @@ pub(crate) struct Ext4FsInstance<I> {
     /// `mount_ext4_read_write` entry point clears it. Matches
     /// Linux's `MS_RDONLY` semantics.
     read_only: AtomicBool,
-    /// Journal-backed mounts must not bypass their ordered mutation runtime
-    /// through the legacy direct-pager writeback path.
+    /// Mutation-journal mounts must submit writeback through their bound L5
+    /// planner. The compatibility pager would otherwise update home blocks
+    /// before the ordered transaction is committed.
     legacy_writeback_enabled: AtomicBool,
+    capability_profile_hash: SpinMutex<Option<CapabilityProfileHash>>,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
-    #[cfg(test)]
     pub(crate) fn open(image: I, read_only: bool) -> Result<Arc<Self>, Errno> {
-        Self::open_with_backend_planner_and_mapping(image, read_only, None, None)
+        Self::open_with_backend_planner(image, read_only, None)
+    }
+
+    pub(crate) fn open_with_backend_planner(
+        image: I,
+        read_only: bool,
+        backend_planner: Option<Arc<dyn BackendPlanner>>,
+    ) -> Result<Arc<Self>, Errno> {
+        Self::open_with_backend_planner_and_mapping(image, read_only, backend_planner, None)
     }
 
     pub(crate) fn open_with_backend_planner_and_mapping(
@@ -151,13 +190,15 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             extent_mapping,
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
-            dir_versions: core::array::from_fn(|_| AtomicU64::new(0)),
-            page_containers: SpinMutex::new(BTreeMap::new()),
-            orphaned_inodes: SpinMutex::new(BTreeMap::new()),
+            inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
             mount_pin: SpinMutex::new(None),
             file_page_container_binder: SpinMutex::new(None),
+            file_page_containers: SpinMutex::new(BTreeMap::new()),
+            metadata_mutation_runtime: SpinMutex::new(None),
+            buffered_write_reservations: SpinMutex::new(BTreeMap::new()),
             read_only: AtomicBool::new(read_only),
             legacy_writeback_enabled: AtomicBool::new(true),
+            capability_profile_hash: SpinMutex::new(None),
         }))
     }
 
@@ -177,10 +218,148 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         *self.file_page_container_binder.lock() = binder;
     }
 
-    fn bind_file_page_container(&self, container: Cap<PageContainer>) {
+    pub(crate) fn bind_file_page_container(&self, container: Cap<PageContainer>) {
         if let Some(binder) = self.file_page_container_binder.lock().clone() {
             binder.bind_file_page_container(container);
         }
+    }
+
+    pub(crate) fn file_page_container_for_materialized_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        page_count: u64,
+        size_bytes: u64,
+        mount: MountPayloadPin,
+        guard: &Guard<'_>,
+    ) -> Result<Cap<PageContainer>, Errno> {
+        {
+            let mut index = self.file_page_containers.lock();
+            if let Some(weak) = index.get(&fs_object_id) {
+                if let Some(container) = weak.upgrade(guard) {
+                    if container.size_bytes() < size_bytes {
+                        container.set_size_bytes(size_bytes);
+                    }
+                    return Ok(container);
+                }
+                index.remove(&fs_object_id);
+            }
+        }
+
+        let container = PageContainer::new_cap(
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            },
+            page_count,
+        )
+        .map_err(|_| Errno::ENOMEM)?;
+        container.set_size_bytes(size_bytes);
+
+        {
+            let mut index = self.file_page_containers.lock();
+            if let Some(weak) = index.get(&fs_object_id) {
+                if let Some(existing) = weak.upgrade(guard) {
+                    if existing.size_bytes() < size_bytes {
+                        existing.set_size_bytes(size_bytes);
+                    }
+                    return Ok(existing);
+                }
+                index.remove(&fs_object_id);
+            }
+            index.insert(fs_object_id, container.downgrade());
+        }
+
+        self.bind_file_page_container(container.clone());
+        Ok(container)
+    }
+
+    pub(crate) fn bind_metadata_mutation_runtime(&self, runtime: Arc<JournalMutationRuntime>) {
+        *self.metadata_mutation_runtime.lock() = Some(runtime);
+    }
+
+    pub(crate) fn metadata_mutation_runtime(&self) -> Option<Arc<JournalMutationRuntime>> {
+        self.metadata_mutation_runtime.lock().clone()
+    }
+
+    pub(crate) fn begin_metadata_mutation(
+        &self,
+        runtime: &JournalMutationRuntime,
+        mutation: &Ext4MutationPlan,
+        guard: &Guard<'_>,
+    ) -> Result<(), JournalMutationRuntimeError>
+    where
+        I: Send + 'static,
+    {
+        match runtime.begin_mutation(mutation, guard) {
+            Ok(()) => {}
+            Err(JournalMutationRuntimeError::Busy(_)) => {
+                self.settle_metadata_mutation(runtime)
+                    .map_err(JournalMutationRuntimeError::Settlement)?;
+                runtime.begin_mutation(mutation, guard)?;
+            }
+            Err(error) => return Err(error),
+        }
+        let _ = self.with_pager(|pager| {
+            pager.stage_mutation_after_images(mutation);
+            Ok(())
+        });
+        if mutation.data.is_empty() {
+            self.settle_metadata_mutation(runtime)
+                .map_err(JournalMutationRuntimeError::Settlement)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_buffered_write(
+        &self,
+        inode: InodeNo,
+        file_page_index: u64,
+        mutation: Ext4MutationPlan,
+    ) -> Result<(), Errno> {
+        let key = (inode.get(), file_page_index);
+        let mut reservations = self.buffered_write_reservations.lock();
+        if reservations.contains_key(&key) {
+            return Ok(());
+        }
+        if !reservations.is_empty() {
+            return Err(Errno::EBUSY);
+        }
+        reservations.insert(key, mutation);
+        Ok(())
+    }
+
+    pub(crate) fn buffered_write_reservation(
+        &self,
+        inode: InodeNo,
+        file_page_index: u64,
+    ) -> Option<Ext4MutationPlan> {
+        self.buffered_write_reservations
+            .lock()
+            .get(&(inode.get(), file_page_index))
+            .cloned()
+    }
+
+    pub(crate) fn clear_buffered_write_reservation(&self, inode: InodeNo, file_page_index: u64) {
+        self.buffered_write_reservations
+            .lock()
+            .remove(&(inode.get(), file_page_index));
+    }
+
+    pub(crate) fn clear_buffered_write_reservations_from(
+        &self,
+        inode: InodeNo,
+        first_removed_page: u64,
+    ) {
+        self.buffered_write_reservations
+            .lock()
+            .retain(|(reserved_inode, file_page_index), _| {
+                *reserved_inode != inode.get() || *file_page_index < first_removed_page
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_write_reservation_count_for_test(&self) -> usize {
+        self.buffered_write_reservations.lock().len()
     }
 
     /// Returns `true` when this mount was opened with `MS_RDONLY`
@@ -199,121 +378,51 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         self.legacy_writeback_enabled.load(Ordering::Acquire)
     }
 
+    pub(crate) fn set_capability_profile_hash(&self, profile_hash: CapabilityProfileHash) {
+        *self.capability_profile_hash.lock() = Some(profile_hash);
+    }
+
+    pub(crate) fn capability_profile_hash(&self) -> Option<CapabilityProfileHash> {
+        *self.capability_profile_hash.lock()
+    }
+
     pub(crate) fn with_pager<T>(
         &self,
         f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,
     ) -> Result<T, Errno> {
-        self.with_pager_raw(f).map_err(map_format_error)
-    }
-
-    pub(crate) fn with_pager_raw<T>(
-        &self,
-        f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,
-    ) -> tx_ext4_format::Result<T> {
         let mut pager = self.pager.lock();
-        f(&mut pager)
-    }
-
-    pub(crate) fn with_pager_namespace_mutation<T>(
-        &self,
-        parents: &[FsObjectId],
-        f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,
-    ) -> Result<T, Errno> {
-        self.with_pager(|pager| {
-            let value = f(pager)?;
-            for parent in parents {
-                self.bump_dir_version(*parent);
-            }
-            Ok(value)
-        })
-    }
-
-    fn dir_version(&self, object: FsObjectId) -> u64 {
-        self.dir_versions[dir_version_shard(object)].load(Ordering::Acquire)
-    }
-
-    fn bump_dir_version(&self, object: FsObjectId) {
-        self.dir_versions[dir_version_shard(object)].fetch_add(1, Ordering::AcqRel);
+        f(&mut pager).map_err(map_format_error)
     }
 
     pub(crate) fn lookup_cached(
         &self,
-        parent: FsObjectId,
-        parent_inode: InodeNo,
+        parent: InodeNo,
         name: &[u8],
     ) -> Result<Option<InodeNo>, Errno> {
-        let version = self.dir_version(parent);
-        let lookup_cached = {
-            let mut cache = self.lookup_cache.lock();
-            cache.get(parent, name, version)
-        };
-        if let Some(cached) = lookup_cached {
+        if let Some(cached) = self.lookup_cache.lock().get(parent, name) {
             return Ok(cached);
         }
-
-        // Never nest dir_cache and lookup_cache. In Rust 2021 an `if let`
-        // scrutinee temporary can live through the body, so spelling this as
-        // `if let Some(..) = self.dir_cache.lock().lookup(..)` and then taking
-        // lookup_cache in the body creates the reverse of the invalidation
-        // order (lookup_cache -> dir_cache). Concurrent readdir + namespace
-        // mutation can then deadlock both CPUs. Copy the result out under one
-        // lock and release it before touching the other cache.
-        let dir_cached = {
-            let mut cache = self.dir_cache.lock();
-            cache.lookup(parent, name, version)
-        };
-        if let Some(cached) = dir_cached {
-            self.lookup_cache.lock().insert(
-                parent,
-                name,
-                cached.unwrap_or(InodeNo::new(0)),
-                version,
-            );
+        if let Some(cached) = self.dir_cache.lock().lookup(parent, name) {
+            self.lookup_cache
+                .lock()
+                .insert(parent, name, cached.unwrap_or(InodeNo::new(0)));
             return Ok(cached);
         }
-        let (found, version) = self.with_pager(|pager| {
-            let found = pager.lookup(parent_inode, name)?;
-            Ok((found, self.dir_version(parent)))
-        })?;
+        let found = self.with_pager(|pager| pager.lookup(parent, name))?;
         // Cache negatives too (inode 0 sentinel): every shell command's PATH
         // search stats mostly-nonexistent names against testcases/bin
         // (~2800 entries); an uncached miss is a full linear directory scan
         // (~48 ms under TCG, measured) repeated for every command.
         self.lookup_cache
             .lock()
-            .insert(parent, name, found.unwrap_or(InodeNo::new(0)), version);
+            .insert(parent, name, found.unwrap_or(InodeNo::new(0)));
         Ok(found)
     }
 
-    /// Resolve and validate a persistent object incarnation.
-    ///
-    /// An inode bitmap slot can be reused immediately after reclamation.
-    /// Every backend entry point therefore validates both the low inode
-    /// number and the on-disk generation before touching data or metadata.
-    pub(crate) fn resolve_object(
-        &self,
-        fs_object_id: FsObjectId,
-    ) -> Result<(InodeNo, InodeMetaLite), Errno> {
-        let inode = inode_no(fs_object_id)?;
-        let meta = self.inode_meta_with_mapping(inode)?;
-        if meta.mode == 0 {
-            return Err(Errno::ENOENT);
+    pub(crate) fn inode_meta_cached(&self, inode: InodeNo) -> Result<InodeMetaLite, Errno> {
+        if let Some(meta) = self.inode_meta_cache.lock().get(inode) {
+            return Ok(meta);
         }
-        if meta.generation != fs_object_id.inode_generation() {
-            return Err(Errno::ESTALE);
-        }
-        Ok((inode, meta))
-    }
-
-    pub(crate) fn object_id_for_inode(&self, inode: InodeNo) -> Result<FsObjectId, Errno> {
-        let meta = self.inode_meta_with_mapping(inode)?;
-        if meta.mode == 0 {
-            return Err(Errno::ENOENT);
-        }
-        Ok(fs_object_id(inode, meta.generation))
-    }
-
-    fn inode_meta_with_mapping(&self, inode: InodeNo) -> Result<InodeMetaLite, Errno> {
         let (meta, extent_root) = match self.extent_mapping.as_ref() {
             Some(_) => self.with_pager(|pager| pager.inode_meta_and_extent_root(inode))?,
             None => (
@@ -326,49 +435,44 @@ impl<I: BlockImage> Ext4FsInstance<I> {
                 mapping.insert_extent_root(inode.get() as u64, &extent_root)?;
             }
         }
+        if inode_meta_is_dir(meta) {
+            self.inode_meta_cache.lock().insert(inode, meta);
+        }
         Ok(meta)
     }
 
     pub(crate) fn read_dir_entries_cached(
         &self,
-        fs_object_id: FsObjectId,
         inode: InodeNo,
         start_offset: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Result<usize, Errno> {
-        let version = self.dir_version(fs_object_id);
-        if let Some(count) =
-            self.dir_cache
-                .lock()
-                .get(fs_object_id, start_offset, version, out, next_offsets)
+        if let Some(count) = self
+            .dir_cache
+            .lock()
+            .get(inode, start_offset, out, next_offsets)
         {
             return Ok(count);
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
         let mut cached_next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
-        let (count, version) = self.with_pager(|pager| {
-            let count = pager.read_dir_entries_from_offset(
+        let count = self.with_pager(|pager| {
+            pager.read_dir_entries_from_offset(
                 inode,
                 start_offset,
                 &mut entries,
                 &mut cached_next_offsets,
-            )?;
-            Ok((count, self.dir_version(fs_object_id)))
+            )
         })?;
-        self.dir_cache.lock().insert(
-            fs_object_id,
-            start_offset,
-            version,
-            &entries,
-            &cached_next_offsets,
-            count,
-        );
+        self.dir_cache
+            .lock()
+            .insert(inode, start_offset, &entries, &cached_next_offsets, count);
         {
             let mut lookup_cache = self.lookup_cache.lock();
             for entry in entries.iter().take(count) {
-                lookup_cache.insert(fs_object_id, entry.name(), entry.inode, version);
+                lookup_cache.insert(inode, entry.name(), entry.inode);
             }
         }
         out[..count].copy_from_slice(&entries[..count]);
@@ -376,160 +480,64 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(count)
     }
 
-    pub(crate) fn invalidate_lookup_cache_for(&self, parent: FsObjectId) {
+    pub(crate) fn invalidate_lookup_cache_for(&self, parent: InodeNo) {
         self.lookup_cache.lock().invalidate_parent(parent);
         self.dir_cache.lock().invalidate(parent);
+        self.inode_meta_cache.lock().invalidate(parent);
     }
 
-    /// Resolve or create the one coherent page cache for `inode`.
+    /// Rebuild every mount-local derived view after durable journal settlement.
     ///
-    /// The coherence lock is held while the on-disk inode is revalidated and
-    /// the new container is published. `destroy_orphaned_inode` takes the
-    /// same lock before freeing/reusing the inode number, closing the race
-    /// between lookup metadata and materialisation on another CPU.
-    pub(crate) fn get_or_create_page_container(
-        &self,
-        fs_object_id: FsObjectId,
-        mount: MountPayloadPin,
-        minimum_page_count: u64,
-        guard: &Guard<'_>,
-    ) -> Result<(Cap<PageContainer>, InodeMetaLite), Errno> {
-        {
-            let mut index = self.page_containers.lock();
-            if let Some(weak) = index.get(&fs_object_id).copied() {
-                if let Some(container) = weak.upgrade(guard) {
-                    drop(index);
-                    let (_, meta) = self.resolve_object(fs_object_id)?;
-                    return Ok((container, meta));
-                }
-                index.remove(&fs_object_id);
-            }
+    /// The pager and BlockImage have already made the home writes durable. The
+    /// remaining mapping and namespace caches are only accelerators and must
+    /// not survive a checkpoint that can change inode, directory, or extent
+    /// metadata.
+    pub(crate) fn settle_metadata_caches(&self) {
+        let _ = self.with_pager(|pager| {
+            pager.settle_image_cache();
+            Ok(())
+        });
+        if let Some(mapping) = self.extent_mapping.as_ref() {
+            mapping.clear();
         }
+        *self.lookup_cache.lock() = LookupCache::empty();
+        *self.dir_cache.lock() = DirCache::empty();
+        *self.inode_meta_cache.lock() = InodeMetaCache::empty();
+    }
 
-        let (_, meta) = self.resolve_object(fs_object_id)?;
-        if meta.nlinks == 0 {
-            return Err(Errno::ENOENT);
-        }
-        let page_count = meta
-            .size
-            .div_ceil(tx_subsystems::vm::USER_PAGE_SIZE as u64)
-            .max(minimum_page_count);
-        let container = PageContainer::new_cap(
-            PageContainerKind::File {
-                mount,
-                fs_object_id,
-            },
-            page_count,
+    #[cfg(test)]
+    pub(crate) fn cache_entry_counts(&self) -> (usize, usize, usize) {
+        (
+            self.lookup_cache
+                .lock()
+                .entries
+                .iter()
+                .filter(|entry| entry.valid)
+                .count(),
+            self.dir_cache
+                .lock()
+                .entries
+                .iter()
+                .filter(|entry| entry.valid)
+                .count(),
+            self.inode_meta_cache
+                .lock()
+                .entries
+                .iter()
+                .filter(|entry| entry.valid)
+                .count(),
         )
-        .map_err(|_| Errno::ENOMEM)?;
-        container.set_size_bytes_persisted(meta.size);
-
-        // Publish under the coherence lock, but allocate the candidate before
-        // taking it: zone allocation can drain EBR and run a PageContainer
-        // finalizer, which may re-enter this instance.
-        let orphaned = self.orphaned_inodes.lock();
-        if orphaned.contains_key(&fs_object_id) {
-            drop(orphaned);
-            drop(container);
-            return Err(Errno::ENOENT);
-        }
-        let mut index = self.page_containers.lock();
-        if let Some(weak) = index.get(&fs_object_id).copied() {
-            if let Some(existing) = weak.upgrade(guard) {
-                drop(index);
-                drop(orphaned);
-                drop(container);
-                let (_, latest) = self.resolve_object(fs_object_id)?;
-                return Ok((existing, latest));
-            }
-            index.remove(&fs_object_id);
-        }
-        let (_, latest) = self.resolve_object(fs_object_id)?;
-        if latest.nlinks == 0 {
-            drop(index);
-            drop(orphaned);
-            drop(container);
-            return Err(Errno::ENOENT);
-        }
-        container.set_size_bytes_persisted(latest.size);
-        index.insert(fs_object_id, container.downgrade());
-        drop(index);
-        drop(orphaned);
-        self.bind_file_page_container(container.clone());
-        Ok((container, latest))
-    }
-
-    pub(crate) fn mark_inode_orphaned(&self, fs_object_id: FsObjectId) {
-        self.orphaned_inodes
-            .lock()
-            .insert(fs_object_id, OrphanState::Pending);
-    }
-
-    /// Reclaim a zero-link inode only after its coherent PageContainer no
-    /// longer has a strong reference. ext4 materialises every inode kind
-    /// through this indexed file container, so directories and symlinks use
-    /// the same final-payload gate as regular files.
-    pub(crate) fn destroy_orphaned_inode(
-        &self,
-        fs_object_id: FsObjectId,
-        guard: &Guard<'_>,
-    ) -> Result<(), Errno> {
-        let inode = inode_no(fs_object_id)?;
-        {
-            let mut orphaned = self.orphaned_inodes.lock();
-            if orphaned.get(&fs_object_id) != Some(&OrphanState::Pending) {
-                return Ok(());
-            }
-            orphaned.insert(fs_object_id, OrphanState::Reclaiming);
-        }
-
-        let current = self.with_pager(|pager| pager.inode_meta(inode));
-        match current {
-            Ok(meta) if meta.mode != 0 && meta.generation == fs_object_id.inode_generation() => {}
-            Ok(_) | Err(Errno::ENOENT) => {
-                self.orphaned_inodes.lock().remove(&fs_object_id);
-                return Ok(());
-            }
-            Err(error) => {
-                self.orphaned_inodes
-                    .lock()
-                    .insert(fs_object_id, OrphanState::Pending);
-                return Err(error);
-            }
-        }
-
-        let mut containers = self.page_containers.lock();
-        if let Some(weak) = containers.get(&fs_object_id).copied() {
-            if let Some(live) = weak.upgrade(guard) {
-                drop(containers);
-                self.orphaned_inodes
-                    .lock()
-                    .insert(fs_object_id, OrphanState::Pending);
-                // Dropping this temporary reference outside every lock may
-                // itself be the last release and re-enter the callback.
-                drop(live);
-                return Ok(());
-            }
-            containers.remove(&fs_object_id);
-        }
-        drop(containers);
-
-        // Extent collection allocates and block I/O can trigger unrelated
-        // completion/finalizer work. Never hold orphan/coherence locks here.
-        let result = self.with_pager(|pager| pager.destroy_inode(inode));
-        let mut orphaned = self.orphaned_inodes.lock();
-        if result.is_ok() {
-            orphaned.remove(&fs_object_id);
-        } else {
-            orphaned.insert(fs_object_id, OrphanState::Pending);
-        }
-        result
     }
 }
 
-fn dir_version_shard(object: FsObjectId) -> usize {
-    let raw = object.as_u64();
-    (raw ^ (raw >> 32)) as usize % DIR_VERSION_SHARDS
+impl<I: BlockImage + Send + 'static> JournalSettlementObserver for Ext4FsInstance<I> {
+    fn settle_after_checkpoint(&self) {
+        self.settle_metadata_caches();
+    }
+}
+
+fn inode_meta_is_dir(meta: InodeMetaLite) -> bool {
+    meta.mode & 0xF000 == 0x4000
 }
 
 const DIR_CACHE_ENTRIES: usize = 32;
@@ -549,15 +557,14 @@ impl DirCache {
 
     fn get(
         &mut self,
-        object: FsObjectId,
+        inode: InodeNo,
         start_offset: u64,
-        version: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Option<usize> {
         let (index, window_index) =
             self.entries.iter().enumerate().find_map(|(index, entry)| {
-                if !entry.valid || entry.object != object || entry.version != version {
+                if !entry.valid || entry.inode != inode {
                     return None;
                 }
                 if entry.start_offset == start_offset {
@@ -579,11 +586,11 @@ impl DirCache {
         Some(count)
     }
 
-    fn lookup(&mut self, object: FsObjectId, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
+    fn lookup(&mut self, inode: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
         let mut complete_first_window = None;
         let mut found_index = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            if !entry.valid || entry.object != object || entry.version != version {
+            if !entry.valid || entry.inode != inode {
                 continue;
             }
             if entry.start_offset == 0 && entry.count < READDIR_WINDOW_ENTRIES {
@@ -621,9 +628,8 @@ impl DirCache {
 
     fn insert(
         &mut self,
-        object: FsObjectId,
+        inode: InodeNo,
         start_offset: u64,
-        version: u64,
         entries: &[DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &[u64; READDIR_WINDOW_ENTRIES],
         count: usize,
@@ -633,7 +639,7 @@ impl DirCache {
             .entries
             .iter()
             .position(|entry| {
-                !entry.valid || (entry.object == object && entry.start_offset == start_offset)
+                !entry.valid || (entry.inode == inode && entry.start_offset == start_offset)
             })
             .unwrap_or_else(|| {
                 if self.entries.len() < DIR_CACHE_ENTRIES {
@@ -650,9 +656,8 @@ impl DirCache {
             });
         let entry = &mut self.entries[victim];
         entry.valid = true;
-        entry.object = object;
+        entry.inode = inode;
         entry.start_offset = start_offset;
-        entry.version = version;
         entry.count = count.min(READDIR_WINDOW_ENTRIES);
         entry.last_used = self.clock;
         entry.entries.clear();
@@ -663,9 +668,9 @@ impl DirCache {
             .extend_from_slice(&next_offsets[..entry.count]);
     }
 
-    fn invalidate(&mut self, object: FsObjectId) {
+    fn invalidate(&mut self, inode: InodeNo) {
         for entry in &mut self.entries {
-            if entry.valid && entry.object == object {
+            if entry.valid && entry.inode == inode {
                 entry.valid = false;
             }
         }
@@ -674,9 +679,8 @@ impl DirCache {
 
 struct DirCacheEntry {
     valid: bool,
-    object: FsObjectId,
+    inode: InodeNo,
     start_offset: u64,
-    version: u64,
     count: usize,
     entries: Vec<DirEntryLite>,
     next_offsets: Vec<u64>,
@@ -687,12 +691,97 @@ impl DirCacheEntry {
     fn empty() -> Self {
         Self {
             valid: false,
-            object: FsObjectId::new(0),
+            inode: InodeNo::new(0),
             start_offset: 0,
-            version: 0,
             count: 0,
             entries: Vec::new(),
             next_offsets: Vec::new(),
+            last_used: 0,
+        }
+    }
+}
+
+const INODE_META_CACHE_ENTRIES: usize = 64;
+
+struct InodeMetaCache {
+    clock: u64,
+    entries: [InodeMetaCacheEntry; INODE_META_CACHE_ENTRIES],
+}
+
+impl InodeMetaCache {
+    const fn empty() -> Self {
+        Self {
+            clock: 0,
+            entries: [InodeMetaCacheEntry::empty(); INODE_META_CACHE_ENTRIES],
+        }
+    }
+
+    fn get(&mut self, inode: InodeNo) -> Option<InodeMetaLite> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.valid && entry.inode == inode)?;
+        self.clock = self.clock.wrapping_add(1);
+        self.entries[index].last_used = self.clock;
+        Some(self.entries[index].meta)
+    }
+
+    fn insert(&mut self, inode: InodeNo, meta: InodeMetaLite) {
+        self.clock = self.clock.wrapping_add(1);
+        let victim = self
+            .entries
+            .iter()
+            .position(|entry| !entry.valid || entry.inode == inode)
+            .unwrap_or_else(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(index, _)| index)
+                    .unwrap_or(0)
+            });
+        self.entries[victim] = InodeMetaCacheEntry {
+            valid: true,
+            inode,
+            meta,
+            last_used: self.clock,
+        };
+    }
+
+    fn invalidate(&mut self, inode: InodeNo) {
+        for entry in &mut self.entries {
+            if entry.valid && entry.inode == inode {
+                entry.valid = false;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InodeMetaCacheEntry {
+    valid: bool,
+    inode: InodeNo,
+    meta: InodeMetaLite,
+    last_used: u64,
+}
+
+impl InodeMetaCacheEntry {
+    const fn empty() -> Self {
+        Self {
+            valid: false,
+            inode: InodeNo::new(0),
+            meta: InodeMetaLite {
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                nlinks: 0,
+                blocks_512: 0,
+                flags: 0,
+                atime: 0,
+                ctime: 0,
+                mtime: 0,
+            },
             last_used: 0,
         }
     }
@@ -721,11 +810,11 @@ impl LookupCache {
     /// `Some(Some(ino))` = cached hit. Negative entries reuse `inode == 0`
     /// (ext4 inode numbers start at 1) and are invalidated by the same
     /// `invalidate_parent` calls that cover create/unlink/rename.
-    fn get(&mut self, parent: FsObjectId, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
+    fn get(&mut self, parent: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
         let index = self
             .entries
             .iter()
-            .position(|entry| entry.matches(parent, name, version))?;
+            .position(|entry| entry.matches(parent, name))?;
         self.clock = self.clock.wrapping_add(1);
         self.entries[index].last_used = self.clock;
         let inode = self.entries[index].inode;
@@ -736,7 +825,7 @@ impl LookupCache {
         }
     }
 
-    fn insert(&mut self, parent: FsObjectId, name: &[u8], inode: InodeNo, version: u64) {
+    fn insert(&mut self, parent: InodeNo, name: &[u8], inode: InodeNo) {
         if name.len() > LOOKUP_CACHE_NAME_BYTES {
             return;
         }
@@ -753,10 +842,10 @@ impl LookupCache {
                     .map(|(index, _)| index)
                     .unwrap_or(0)
             });
-        self.entries[victim] = LookupCacheEntry::new(parent, name, inode, version, self.clock);
+        self.entries[victim] = LookupCacheEntry::new(parent, name, inode, self.clock);
     }
 
-    fn invalidate_parent(&mut self, parent: FsObjectId) {
+    fn invalidate_parent(&mut self, parent: InodeNo) {
         for entry in &mut self.entries {
             if entry.valid && entry.parent == parent {
                 entry.valid = false;
@@ -768,9 +857,8 @@ impl LookupCache {
 #[derive(Clone, Copy)]
 struct LookupCacheEntry {
     valid: bool,
-    parent: FsObjectId,
+    parent: InodeNo,
     inode: InodeNo,
-    version: u64,
     name_len: u8,
     name: [u8; LOOKUP_CACHE_NAME_BYTES],
     last_used: u64,
@@ -780,31 +868,28 @@ impl LookupCacheEntry {
     const fn empty() -> Self {
         Self {
             valid: false,
-            parent: FsObjectId::new(0),
+            parent: InodeNo::new(0),
             inode: InodeNo::new(0),
-            version: 0,
             name_len: 0,
             name: [0; LOOKUP_CACHE_NAME_BYTES],
             last_used: 0,
         }
     }
 
-    fn new(parent: FsObjectId, name: &[u8], inode: InodeNo, version: u64, last_used: u64) -> Self {
+    fn new(parent: InodeNo, name: &[u8], inode: InodeNo, last_used: u64) -> Self {
         let mut entry = Self::empty();
         entry.valid = true;
         entry.parent = parent;
         entry.inode = inode;
-        entry.version = version;
         entry.name_len = name.len() as u8;
         entry.name[..name.len()].copy_from_slice(name);
         entry.last_used = last_used;
         entry
     }
 
-    fn matches(&self, parent: FsObjectId, name: &[u8], version: u64) -> bool {
+    fn matches(&self, parent: InodeNo, name: &[u8]) -> bool {
         self.valid
             && self.parent == parent
-            && self.version == version
             && self.name_len as usize == name.len()
             && &self.name[..name.len()] == name
     }
@@ -862,15 +947,15 @@ impl<I> Drop for Ext4PagerGuard<'_, I> {
 }
 
 pub(crate) fn inode_no(fs_object_id: FsObjectId) -> Result<InodeNo, Errno> {
-    let raw = fs_object_id.inode_number();
+    let raw = u32::try_from(fs_object_id.as_u64()).map_err(|_| Errno::ENOENT)?;
     if raw == 0 {
         return Err(Errno::ENOENT);
     }
     Ok(InodeNo::new(raw))
 }
 
-pub(crate) fn fs_object_id(inode: InodeNo, generation: u32) -> FsObjectId {
-    FsObjectId::from_inode_generation(inode.get(), generation)
+pub(crate) fn fs_object_id(inode: InodeNo) -> FsObjectId {
+    FsObjectId::new(inode.get() as u64)
 }
 
 pub(crate) fn map_inode_meta(meta: InodeMetaLite) -> InodeMeta {
@@ -910,12 +995,7 @@ pub(crate) fn map_format_error(err: Ext4FormatError) -> Errno {
         }
         Ext4FormatError::OutOfBounds => Errno::ENOENT,
         Ext4FormatError::Unsupported => Errno::ENOSYS,
-        Ext4FormatError::ExtentTreeFull { .. } => Errno::EFBIG,
         Ext4FormatError::WouldBlock => Errno::EAGAIN,
-        Ext4FormatError::NotEmpty => Errno::ENOTEMPTY,
-        Ext4FormatError::IsDirectory => Errno::EISDIR,
-        Ext4FormatError::NotDirectory => Errno::ENOTDIR,
-        Ext4FormatError::InvalidInput => Errno::EINVAL,
     }
 }
 

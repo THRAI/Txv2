@@ -30,7 +30,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     #[cfg(not(tx_lock_metrics_vm))]
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::{self as epoch_mod, borrow_current_guard, guard, Guard};
+    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
     pub use tx_substrate::page_allocator::{
         self, BitmapPageAllocator, CachePin, GiftPin, ZeroPolicy,
     };

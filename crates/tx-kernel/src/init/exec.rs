@@ -22,53 +22,6 @@ use crate::adapter::step_engine::{self as step_engine};
 #[cfg(test)]
 use crate::adapter::step_engine::{page_allocator, StepOutcome};
 
-/// Finals first-stage PID 1 policy. The script is executed by the Bash from
-/// the official root filesystem, so the kernel does not overwrite `/init`.
-const FINAL_TESTCODE: &[u8] = include_bytes!("final_testcode.sh");
-
-fn buildstorm_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
-    <P as tx_hal::BootInfoIf>::boot_info()
-        .cmdline
-        .is_some_and(|cmdline| {
-            cmdline
-                .split_ascii_whitespace()
-                .any(|token| token == "tx.profile=buildstorm")
-        })
-}
-
-fn cagent_diag_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
-    <P as tx_hal::BootInfoIf>::boot_info()
-        .cmdline
-        .is_some_and(|cmdline| {
-            cmdline
-                .split_ascii_whitespace()
-                .any(|token| token == "tx.profile=cagentdiag")
-        })
-}
-
-/// The judge boots a block-backed root without selecting an explicit init
-/// lane. Explicit developer profiles keep using the BootPlan path below.
-fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
-    if !ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
-        return false;
-    }
-    let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
-        return true;
-    };
-    !cmdline.split_ascii_whitespace().any(|token| {
-        token.starts_with("init=")
-            || token.starts_with("tx.runsh=")
-            || matches!(
-                token,
-                "tx.profile=onsite" | "tx.profile=busybox" | "tx.profile=pretest"
-            )
-    })
-}
-
-/// `tx.runsh` exec restarts allowed before reporting failure. Each restart
-/// re-runs reversible Phase-1 preparation after driving the boot reactor once.
-const RUNSH_EXEC_POLL_BUDGET: usize = 1 << 16;
-
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
@@ -301,237 +254,6 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
 
-        // Finals default: keep the official block-backed ext4 image mounted
-        // at `/` and run the embedded policy through the image's Bash. This
-        // precedes the legacy OSComp sdcard lane only when no explicit
-        // developer init/profile selected another BootPlan.
-        if final_testcode_autorun_enabled::<P>() {
-            let default_envp: &[&[u8]] = &[
-                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                b"HOME=/root",
-                b"TMPDIR=/tmp",
-                b"TERM=linux",
-            ];
-            let buildstorm_envp: &[&[u8]] = &[
-                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                b"HOME=/root",
-                b"TMPDIR=/tmp",
-                b"TERM=linux",
-                b"TX_FINAL_MODE=buildstorm-only",
-            ];
-            let cagent_diag_envp: &[&[u8]] = &[
-                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                b"HOME=/root",
-                b"TMPDIR=/tmp",
-                b"TERM=linux",
-                b"TX_FINAL_MODE=cagent-diag",
-            ];
-            let envp = if cagent_diag_profile_enabled::<P>() {
-                cagent_diag_envp
-            } else if buildstorm_profile_enabled::<P>() {
-                buildstorm_envp
-            } else {
-                default_envp
-            };
-            let argv: &[&[u8]] = &[b"bash", b"-c", FINAL_TESTCODE];
-            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                &init,
-                &thread,
-                b"/bin/bash",
-                argv,
-                envp,
-                &cred,
-            ));
-            Self::write_board_sentinel_prefix();
-            match outcome {
-                Ok(()) => {
-                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:ok\n");
-                    return;
-                }
-                Err(e) => {
-                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:fail:");
-                    tx_hal::console_write_str::<P>(exec_error_tag(&e));
-                    tx_hal::console_write_str::<P>("\n");
-                    panic!("bootstrap exec for finals /bin/bash failed: {e:?}");
-                }
-            }
-        }
-
-        // tx.runsh=<path>: bring-up lane for the on-site-finals git task. Run an
-        // arbitrary shell script from the mounted Alpine ext4 (/musl) under the
-        // Alpine userland env, so real dynamic musl binaries (git and its
-        // helpers) resolve their interpreter, shared libraries (/musl/usr/lib),
-        // and git-core helpers. Flag-gated; default boot path unchanged.
-        // (Ported from net-git ca0ae657 + e7992ef8 — git Task2.)
-        if let Some(script) = cmdline_value::<P>("tx.runsh") {
-            if super::MUSL_MOUNT.lock().is_some() {
-                // The Alpine ext4 is mounted at /musl, but its binaries and
-                // their absolute symlinks (/bin/sh -> /bin/busybox, default lib
-                // search /lib:/usr/lib, git's hardcoded /bin/sh for spawning
-                // index-pack/upload-pack) assume a real root layout. Bind-mount
-                // the image's /usr,/lib,/bin,/sbin subtrees over the empty rootfs
-                // skeleton so the image behaves as the root fs. Gated to this lane.
-                Self::overlay_image_dirs_for_runsh();
-                let envp: &[&[u8]] = &[
-                    b"PATH=/musl/usr/bin:/musl/bin:/musl/usr/sbin:/musl/sbin:/usr/bin:/bin",
-                    b"LD_LIBRARY_PATH=/musl/usr/lib:/musl/lib",
-                    b"GIT_EXEC_PATH=/musl/usr/libexec/git-core",
-                    // Skip git-init's optional sample-hook template copy: now that
-                    // /usr is overlaid git *finds* /usr/share/git-core/templates
-                    // and tries to copy them into every new repo's .git/hooks,
-                    // which currently fails fatally. An empty template dir makes
-                    // git warn-and-continue (clone still produces a full repo).
-                    b"GIT_TEMPLATE_DIR=",
-                    b"HOME=/musl/root",
-                    b"TERM=linux",
-                ];
-                let argv: &[&[u8]] = &[b"sh", script.as_bytes()];
-                // `/musl/bin/busybox` is DYNAMIC (Alpine), unlike the static
-                // ET_EXEC the sdcard lane runs. main's exec rewrite made image
-                // reads restartable: a page that is not resident yet aborts
-                // reversible preparation with `Deferred(shape)` (park and
-                // restart from Phase 1) or `Retry`. Neither is a failure, and
-                // `bootstrap_block_on` cannot see them — they are `Err` values,
-                // not `Poll::Pending`. Drive the boot reactor between attempts
-                // so the block I/O behind the interpreter/library reads can
-                // land, then restart. Bounded so a genuinely stuck read still
-                // reports instead of hanging boot.
-                let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-                // A per-task mailbox is REQUIRED here. Without one,
-                // `drive`'s `resolve_on_wait_source` takes its no-mailbox
-                // branch and returns `ResumeOutcome::Retry` *without
-                // awaiting*, so `drive` spins inside a single `poll()` —
-                // the caller never sees `Pending` and never gets a chance
-                // to run the reactor that would complete the page fetch.
-                // `sys_execve` always has one via its `SyscallCtx`.
-                let mailbox = alloc::sync::Arc::new(
-                    tx_subsystems::signal::adapter::step_engine::TaskMailbox::new(),
-                );
-                let mut script_ctx = tx_shims::KernelScriptCtx::new()
-                    .with_mailbox(alloc::sync::Arc::clone(&mailbox));
-                let op = tx_scripts::process::exec::ExecScriptOp::<P>::new(
-                    &init,
-                    &thread,
-                    b"/musl/bin/busybox",
-                    argv,
-                    envp,
-                    &cred,
-                );
-
-                let outcome = {
-                    use core::pin::Pin;
-                    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-                    unsafe fn clone_raw(_d: *const ()) -> RawWaker {
-                        RawWaker::new(core::ptr::null(), &VT)
-                    }
-                    unsafe fn noop_raw(_d: *const ()) {}
-                    static VT: RawWakerVTable =
-                        RawWakerVTable::new(clone_raw, noop_raw, noop_raw, noop_raw);
-                    let raw = RawWaker::new(core::ptr::null(), &VT);
-                    // SAFETY: no-op vtable never dereferences `data`.
-                    let waker = unsafe { Waker::from_raw(raw) };
-                    let mut cx = Context::from_waker(&waker);
-                    let mut fut = tx_scripts::drive(
-                        op,
-                        &mut script_ctx,
-                        tx_substrate::step::DriveMode::Waiting,
-                        Some(&mailbox),
-                        None,
-                        None,
-                    );
-                    // SAFETY: `fut` is a local never moved after this point.
-                    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-                    let mut result = None;
-                    for i in 0..RUNSH_EXEC_POLL_BUDGET {
-                        if i == 0 {}
-                        let polled = pinned.as_mut().poll(&mut cx);
-                        if i == 0 {
-                            Self::write_board_sentinel_prefix();
-                            tx_hal::console_write_str::<P>(":runsh:probe:after-poll0:");
-                            tx_hal::console_write_str::<P>(match polled {
-                                Poll::Ready(_) => "ready",
-                                Poll::Pending => "pending",
-                            });
-                            tx_hal::console_write_str::<P>("\n");
-                        }
-                        match polled {
-                            Poll::Ready(v) => {
-                                Self::write_board_sentinel_prefix();
-                                tx_hal::console_write_str::<P>(":runsh:probe:polls=");
-                                Self::write_decimal_unsigned(i + 1);
-                                tx_hal::console_write_str::<P>("\n");
-                                result = Some(v);
-                                break;
-                            }
-                            Poll::Pending => {
-                                if i == 0 || (i + 1) % 16384 == 0 {
-                                    let n =
-                                        tx_subsystems::device::page_container_file_io_service_runtimes_snapshot()
-                                            .len();
-                                    let newly =
-                                        tx_subsystems::device::submit_pending_file_io_service_runtimes();
-                                    Self::write_board_sentinel_prefix();
-                                    tx_hal::console_write_str::<P>(":runsh:probe:i=");
-                                    Self::write_decimal_unsigned(i);
-                                    tx_hal::console_write_str::<P>(":fileio-runtimes=");
-                                    Self::write_decimal_unsigned(n);
-                                    tx_hal::console_write_str::<P>(":newly=");
-                                    Self::write_decimal_unsigned(newly);
-                                    tx_hal::console_write_str::<P>(":irq-enabled=");
-                                    tx_hal::console_write_str::<P>(
-                                        if <P as tx_hal::IrqIf>::interrupts_enabled() {
-                                            "y"
-                                        } else {
-                                            "n"
-                                        },
-                                    );
-                                    tx_hal::console_write_str::<P>("\n");
-                                }
-                                if (i + 1) % 262144 == 0 {
-                                    Self::write_board_sentinel_prefix();
-                                    tx_hal::console_write_str::<P>(":runsh:probe:hb=");
-                                    Self::write_decimal_unsigned(i + 1);
-                                    tx_hal::console_write_str::<P>("\n");
-                                }
-                                if i == 0 {}
-                                let _ = Self::boot_reactor_once(cpu);
-                                if i == 0 {}
-                            }
-                        }
-                    }
-                    result
-                };
-                Self::write_board_sentinel_prefix();
-                match outcome {
-                    Some(Ok(())) => tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:ok\n"),
-                    Some(Err(errno)) => {
-                        tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:fail:errno=");
-                        Self::write_decimal_unsigned(errno as usize);
-                        tx_hal::console_write_str::<P>("\n");
-                        // Same diagnostic the selected-init lane emits: which
-                        // component of the walk failed, and with what errno.
-                        let last_open_errno =
-                            tx_scripts::process::exec::script::EXEC_LAST_OPEN_ERRNO
-                                .load(core::sync::atomic::Ordering::Relaxed);
-                        let vfs_ctx = tx_subsystems::vfs::resolution::last_ctx();
-                        let mut rendered = [0u8; 256];
-                        let rendered_len =
-                            tx_subsystems::vfs::resolution::render_ctx(&vfs_ctx, &mut rendered);
-                        Self::write_board_sentinel_prefix();
-                        tx_hal::console_write_str::<P>(":runsh:diag:last-open-errno=");
-                        Self::write_decimal_unsigned(last_open_errno.max(0) as usize);
-                        tx_hal::console_write_str::<P>(":vfs:");
-                        tx_hal::console_write_bytes::<P>(&rendered[..rendered_len]);
-                        tx_hal::console_write_str::<P>("\n");
-                    }
-                    None => {
-                        tx_hal::console_write_str::<P>(":bootstrap-exec:runsh:fail:poll-budget\n")
-                    }
-                }
-                return;
-            }
-        }
-
         let sdcard_test_init = match boot_plan.first_userspace {
             FirstUserspace::OscompSdcard { test_init } => Some(test_init),
             FirstUserspace::CmdlineInit => None,
@@ -727,18 +449,6 @@ impl<P: TxPlatform> CoreInit<P> {
         crate::irq::drain_uart_rx_pending::<P>()
     }
 
-    /// Run lock-taking device IRQ bottom halves in normal reactor context.
-    ///
-    /// UART consumes bytes buffered by its top half. Virtio-net clears the
-    /// level-triggered device source and completes its deferred controller
-    /// claim. Keeping both calls here makes the IRQ/task-context boundary
-    /// explicit at each reactor-loop call site.
-    pub(crate) fn drain_device_irq_bottom_halves() -> bool {
-        let drained_uart = Self::drain_pending_uart_rx_into_tty() != 0;
-        let drained_net = crate::irq::drain_net_rx_irq::<P>();
-        drained_uart || drained_net
-    }
-
     pub(super) fn drain_sbi_console_into_tty() -> usize {
         // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
         // command lines in a single SBI poll. The 64-byte cap left the
@@ -789,8 +499,13 @@ impl<P: TxPlatform> CoreInit<P> {
         let submit_thread = thread.clone();
         let current_hart = boot_runtime::HartId(current_cpu.0);
         let mut signal = super::SmpRescheduleSignal::<P>::new();
+        // Initial userspace can be published to a remote hart (CPU0-safe entry
+        // when the boot hart is nonzero). Enable the poll-lease path before
+        // publishing so a reschedule IPI cannot wake the target AP into the
+        // legacy lock-held poll path.
+        super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
         let submitted = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task_with_meta_from_hart(
+            reactor.submit_task_publish_ack(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
                     thread.clone(),
                     wrapper_payload,
@@ -801,19 +516,24 @@ impl<P: TxPlatform> CoreInit<P> {
                 &mut signal,
             )
         });
-        let Some((task_key, _report)) = submitted else {
+        let Some(report) = submitted else {
             // Boot reactor not initialised; nothing to drive.
             return;
         };
+        let task_key = report.task;
         Self::register_thread_reactor_task(thread.tid.0, task_key);
+        Self::emit_smp_witness_initial_submit(
+            current_hart,
+            report.publish.hart,
+            report.dispatch.placements,
+            report.dispatch.remote_ipis,
+            report.dispatch.local_reschedules,
+        );
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
         Self::deadline_timer().enable_timer_wakeups();
-
-        // Enable concurrent poll on all harts (Phase 1a poll lease).
-        Self::reset_smp_stall_diagnostic();
-        super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
+        let mut smp_witness_drive_logs = 0usize;
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -822,20 +542,18 @@ impl<P: TxPlatform> CoreInit<P> {
         // userspace trap (which is the only event that resolves the
         // thread future's pending wait).
         loop {
-            // LA64's supervisor IPI is maskable and syscall/fault paths may
-            // keep interrupts disabled. Poll the mailbox at reactor
-            // boundaries so shootdown progress never depends only on IRQ
-            // delivery. This is a no-op on platforms that do not need it.
-            P::service_pending_tlb_shootdown();
-            // Complete any outstanding controller transaction even if init
-            // became a zombie in the preceding reactor poll.
-            let drained_device_before_poll = Self::drain_device_irq_bottom_halves();
             if init.is_zombie() {
                 break;
             }
 
+            // UART IRQ handlers cannot touch TTY state directly
+            // because epoch guards are forbidden in IRQ context.
+            // They queue bytes in an IRQ-safe buffer and request a
+            // reactor wake; consume that buffer here in normal
+            // context before deciding whether there is runnable work.
+            let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
-            if drained_device_before_poll || had_sbi {
+            if had_uart || had_sbi {
                 continue;
             }
 
@@ -856,16 +574,21 @@ impl<P: TxPlatform> CoreInit<P> {
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
             let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            crate::trap::service_pending_maintenance::<P>();
+            let _ = step_engine::service_local_drain_request(crate::trap::MAINTENANCE_DRAIN_BUDGET);
             let step = match Self::boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
-                None => break,
+                None => {
+                    if smp_witness_drive_logs < 8 {
+                        Self::emit_smp_witness_drive_none(smp_witness_drive_logs, loop_cpu);
+                    }
+                    break;
+                }
             };
-            P::service_pending_tlb_shootdown();
-            // A device IRQ may interrupt the future that was just polled.
-            // The bounded reactor step has now committed that future and
-            // cleared task-local state, so this is the earliest safe
-            // task-context boundary for same-hart deferred completion.
-            let drained_device_after_poll = Self::drain_device_irq_bottom_halves();
+            if smp_witness_drive_logs < 8 {
+                Self::emit_smp_witness_drive_step(smp_witness_drive_logs, loop_cpu, step);
+                smp_witness_drive_logs += 1;
+            }
             let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
             let submitted_child_after_poll = Self::drain_pending_child_submits();
 
@@ -892,20 +615,17 @@ impl<P: TxPlatform> CoreInit<P> {
             } else {
                 Default::default()
             };
+            crate::zones::try_bounded_maintenance_tick();
             // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
             // may have called wake_by_ref() on parked tasks, which is
             // invisible to step.should_idle() computed before the drain) or
             // if there are items still pending reclamation (need more epoch
             // advances before they can be reclaimed).
-            let vm_recipe_reclaims = if step.should_idle() {
-                tx_subsystems::vm::drain_deferred_recipe_reclaims(64)
-            } else {
-                0
-            };
-            let ebr_active =
-                drain_stats.reclaimed > 0 || drain_stats.remaining > 0 || vm_recipe_reclaims > 0;
+            let ebr_active = drain_stats.bag_reclaimed > 0
+                || drain_stats.bag_remaining > 0
+                || drain_stats.publication_dropped > 0
+                || drain_stats.publication_remaining > 0;
             if step.should_idle()
-                && !drained_device_after_poll
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
                 && !drained_terminal_before_poll
@@ -934,25 +654,16 @@ impl<P: TxPlatform> CoreInit<P> {
                 if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
                     continue;
                 }
-                P::service_pending_tlb_shootdown();
-                Self::note_reactor_hart_idle(loop_cpu);
-                let wait_state = P::prepare_interrupt_wait();
-                if Self::boot_reactor_has_runnable_work(boot_runtime::HartId(loop_cpu.0)) {
-                    Self::note_reactor_hart_active(loop_cpu);
-                    P::cancel_interrupt_wait(wait_state);
-                    continue;
-                }
-                P::wait_for_interrupt_prepared(wait_state);
-                P::service_pending_tlb_shootdown();
-                Self::note_reactor_hart_active(loop_cpu);
+                P::wait_for_interrupt_once();
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
-                // Run device bottom halves immediately after wake. Net IRQ
-                // completion must happen on the claimant hart; UART ingestion
-                // likewise requires task context because it may create an
-                // epoch guard.
-                let _ = Self::drain_device_irq_bottom_halves();
+                // Drain UART RX bytes buffered by `uart_rx_irq_handler`
+                // during the preceding WFI sleep. The IRQ handler cannot
+                // call `epoch::guard()` (irq_depth > 0), so it stores raw
+                // bytes in `UART_RX_PENDING`; `drain_uart_rx_pending` runs
+                // here with irq_depth == 0 and feeds them to `step_ingest`.
+                let _ = crate::irq::drain_uart_rx_pending::<P>();
                 // Also poll the SBI debug-console as a fallback for
                 // platforms where the UART IRQ is claimed by firmware
                 // (e.g. OpenSBI M-mode UART handling). Harmless when the
@@ -972,20 +683,6 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        if cmdline_bool::<P>("tx.net.irq_report") {
-            let stats = crate::irq::net_irq_stats();
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":irq:net:claims:");
-            Self::write_u64(stats.claims);
-            tx_hal::console_write_str::<P>(":completions:");
-            Self::write_u64(stats.completions);
-            tx_hal::console_write_str::<P>(":wrong-hart:");
-            Self::write_u64(stats.wrong_hart_drains);
-            tx_hal::console_write_str::<P>(":missing-device:");
-            Self::write_u64(stats.missing_device_drains);
-            tx_hal::console_write_str::<P>("\n");
-        }
-
         // init zombified — emit the exit sentinel.
         let status_word = init
             .exit_status()
@@ -994,6 +691,75 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:exited:");
         Self::write_signed_decimal(status_word);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    fn emit_smp_witness_initial_submit(
+        current_hart: boot_runtime::HartId,
+        publish_hart: boot_runtime::HartId,
+        placements: usize,
+        remote_ipis: usize,
+        local_reschedules: usize,
+    ) {
+        if !cfg!(tx_smp_scheduler_witness) {
+            let _ = (
+                current_hart,
+                publish_hart,
+                placements,
+                remote_ipis,
+                local_reschedules,
+            );
+            return;
+        }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sched-witness:init-submit:current=");
+        Self::write_signed_decimal(current_hart.0 as i32);
+        tx_hal::console_write_str::<P>(":publish=");
+        Self::write_signed_decimal(publish_hart.0 as i32);
+        tx_hal::console_write_str::<P>(":placements=");
+        Self::write_signed_decimal(placements as i32);
+        tx_hal::console_write_str::<P>(":remote-ipis=");
+        Self::write_signed_decimal(remote_ipis as i32);
+        tx_hal::console_write_str::<P>(":local-reschedules=");
+        Self::write_signed_decimal(local_reschedules as i32);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    fn emit_smp_witness_drive_none(index: usize, loop_cpu: tx_hal::CpuId) {
+        if !cfg!(tx_smp_scheduler_witness) {
+            let _ = (index, loop_cpu);
+            return;
+        }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sched-witness:drive-none:index=");
+        Self::write_decimal_unsigned(index);
+        tx_hal::console_write_str::<P>(":hart=");
+        Self::write_signed_decimal(loop_cpu.0 as i32);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    pub(super) fn emit_smp_witness_drive_step(
+        index: usize,
+        loop_cpu: tx_hal::CpuId,
+        step: boot_runtime::hart_loop::HartLoopStep,
+    ) {
+        if !cfg!(tx_smp_scheduler_witness) {
+            let _ = (index, loop_cpu, step);
+            return;
+        }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sched-witness:drive-step:index=");
+        Self::write_decimal_unsigned(index);
+        tx_hal::console_write_str::<P>(":hart=");
+        Self::write_signed_decimal(loop_cpu.0 as i32);
+        tx_hal::console_write_str::<P>(":polled=");
+        Self::write_decimal_unsigned(step.stats.polled);
+        tx_hal::console_write_str::<P>(":idle=");
+        Self::write_decimal_unsigned(step.should_idle() as usize);
+        tx_hal::console_write_str::<P>(":resched=");
+        Self::write_decimal_unsigned(step.consumed_reschedule_marker() as usize);
+        tx_hal::console_write_str::<P>(":placements=");
+        Self::write_decimal_unsigned(step.wake_dispatch.placements);
         tx_hal::console_write_str::<P>("\n");
     }
 
@@ -1131,8 +897,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             // glibc lane (re-homed; the main rebase dropped it with the
-            // network groups): the sdcard's /musl/glibc dir mirrors
-            // /musl/musl with
+            // network groups): the sdcard's /glibc dir mirrors /musl with
             // glibc-linked binaries, and its testcode scripts emit
             // `-glibc`-suffixed GROUP markers for the judge.
             if let Some(script) = oscomp_glibc_script_for_group(group) {
@@ -1257,7 +1022,9 @@ fn append_filtered_musl_libctest_case(cmd: &mut alloc::string::String, entry: &s
     } else if libctest_case_missing_from_sdcard(entry, case) {
         append_synthetic_libctest_pass(cmd, entry, case);
     } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
-        append_dynamic_libctest_cwd_dso_case(cmd, case);
+        append_musl_dynamic_libctest_cwd_dso_case(cmd, case);
+    } else if entry == "entry-dynamic.exe" {
+        append_musl_dynamic_libctest_direct_case(cmd, case);
     } else {
         let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
     }
@@ -1288,6 +1055,12 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
     );
 }
 
+fn append_musl_dynamic_libctest_direct_case(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; ./runtest.exe -w entry-dynamic.exe {case}");
+}
+
 fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
     use core::fmt::Write as _;
 
@@ -1295,7 +1068,10 @@ fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &
         cmd,
         "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
     );
-    let _ = write!(cmd, "; (cd lib && ../entry-dynamic.exe {case})");
+    let _ = write!(
+        cmd,
+        "; (cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe {case})"
+    );
     let _ = write!(
         cmd,
         "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
@@ -1304,6 +1080,38 @@ fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &
         cmd,
         "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
     );
+}
+
+fn append_musl_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    append_musl_dynamic_libctest_workdir(cmd, case);
+    let _ = write!(
+        cmd,
+        "; ./busybox cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work/lib\""
+    );
+    let _ = write!(
+        cmd,
+        "; (cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe {case})"
+    );
+    append_musl_dynamic_libctest_workdir_cleanup(cmd);
+}
+
+fn append_musl_dynamic_libctest_workdir(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; tx_libctest_dyn_work=/tmp/tx-libctest-dyn-{case}");
+    let _ = write!(cmd, "; ./busybox rm -rf \"$tx_libctest_dyn_work\"");
+    let _ = write!(cmd, "; ./busybox mkdir -p \"$tx_libctest_dyn_work\"");
+    let _ = write!(
+        cmd,
+        "; ./busybox cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work\""
+    );
+    let _ = write!(cmd, "; ./busybox cp -r ./lib \"$tx_libctest_dyn_work\"");
+}
+
+fn append_musl_dynamic_libctest_workdir_cleanup(cmd: &mut alloc::string::String) {
+    cmd.push_str("; ./busybox rm -rf \"$tx_libctest_dyn_work\"");
 }
 
 fn append_musl_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
@@ -1374,14 +1182,14 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 
 fn oscomp_bench_observe_enabled_from_cmdline(cmdline: Option<&str>) -> bool {
     let Some(cmdline) = cmdline else {
-        return false;
+        return true;
     };
     for token in cmdline.split_ascii_whitespace() {
         if let Some(value) = token.strip_prefix("tx.oscomp.observe=") {
             return !matches!(value, "0" | "false" | "off" | "no");
         }
     }
-    false
+    true
 }
 
 fn oscomp_bench_observe_threshold_from_cmdline(cmdline: Option<&str>) -> Option<u64> {
@@ -1550,11 +1358,19 @@ fn append_lmbench_probe(cmd: &mut alloc::string::String) {
          ; ./busybox rm -f /tmp/hello\
          ; ./busybox cp hello /tmp/hello\
          ; ./busybox echo lmbench-probe:cp-status:$?\
+         ; ./busybox chmod 755 /tmp/hello\
          ; ./busybox ls -l hello /tmp/hello\
+         ; ./busybox ls -l /lib/ld-musl-riscv64.so.1 ./lib/libc.so\
+         ; ./busybox readlink /lib/ld-musl-riscv64.so.1\
+         ; ./busybox echo lmbench-probe:loader-readlink-status:$?\
          ; ./busybox readlink hello\
          ; ./busybox echo lmbench-probe:readlink-status:$?\
          ; ./busybox cat hello\
          ; ./busybox echo\
+         ; ./lib/libc.so /tmp/hello\
+         ; ./busybox echo lmbench-probe:local-loader-tmp-status:$?\
+         ; ./lib/libc.so hello\
+         ; ./busybox echo lmbench-probe:local-loader-src-status:$?\
          ; ./busybox ls -l /code /code/lmbench_src/bin/build/lmbench_all\
          ; ./busybox sh /tmp/hello\
          ; ./busybox echo lmbench-probe:sh-status:$?\
@@ -1592,7 +1408,7 @@ const DEFAULT_OSCOMP_GLIBC_SCRIPTS: &[(&str, &str)] = &[
     ("iperf-glibc", "iperf_testcode.sh"),
 ];
 
-/// Map a `<suite>-glibc` group to its testcode script under `/musl/glibc`.
+/// Map a `<suite>-glibc` group to its testcode script under `/glibc`.
 /// Same script names as the musl lane; the directory selects the libc.
 fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
     let canonical = group.strip_suffix("-glibc")?;
@@ -1612,12 +1428,28 @@ fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
     }
 }
 
-/// Run one glibc testcode script from `/musl/glibc`, then restore the
+/// Run one glibc testcode script from `/glibc`, then restore the
 /// musl CWD. `;` separators (not `&&`) so a failing script never skips
 /// the groups queued after it.
 fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
 
+    if script == "basic_testcode.sh" {
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\
+             ; tx_basic_work=/tmp/tx-basic-glibc; ./busybox rm -rf \"$tx_basic_work\"\
+             ; ./busybox mkdir -p \"$tx_basic_work\"\
+             ; tx_glibc_root=/musl/glibc; [ -d \"$tx_glibc_root/basic\" ] || tx_glibc_root=/glibc\
+             ; tx_glibc_lib=/lib/ld-linux-riscv64-lp64d.so.1\
+             ; ./busybox cp \"$tx_glibc_root/busybox\" \"$tx_basic_work\"\
+             ; ./busybox cp -r \"$tx_glibc_root/basic/.\" \"$tx_basic_work\"\
+             ; (cd \"$tx_basic_work\"; for tx_basic_case in brk chdir clone close dup2 dup execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do ./busybox echo \"Testing $tx_basic_case :\"; \"$tx_glibc_lib\" \"./$tx_basic_case\"; done)\
+             ; ./busybox echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\
+             ; ./busybox rm -rf \"$tx_basic_work\""
+        );
+        return;
+    }
     if script == "ltp_testcode.sh" {
         // Same env contract as the musl walk, rooted at the glibc tree;
         // run in a subshell so the glibc LTPROOT/PATH don't leak into
@@ -1626,19 +1458,19 @@ fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
         append_ltp_walk_env(&mut env, "/musl/glibc");
         let _ = write!(
             cmd,
-            "; cd /musl/glibc; (true{env}; /musl/musl/busybox sh {script}); cd /musl/musl"
+            "; cd /musl/glibc; (true{env}; \"$tx_bb\" sh {script}); cd \"$tx_musl_root\""
         );
         return;
     }
     if script == "busybox_testcode.sh" {
         let _ = write!(cmd, "; cd /musl/glibc");
-        append_busybox_script(cmd, "busybox-glibc", "/musl/musl/busybox");
-        let _ = write!(cmd, "; cd /musl/musl");
+        append_busybox_script(cmd, "busybox-glibc", "\"$tx_bb\"");
+        let _ = write!(cmd, "; cd \"$tx_musl_root\"");
         return;
     }
     let _ = write!(
         cmd,
-        "; cd /musl/glibc; {} /musl/musl/busybox sh {script}; cd /musl/musl",
+        "; cd /musl/glibc; {} \"$tx_bb\" sh {script}; cd \"$tx_musl_root\"",
         glibc_non_ltp_prelude()
     );
 }
@@ -1658,13 +1490,20 @@ fn append_busybox_script(cmd: &mut alloc::string::String, group: &str, sh: &str)
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"\
+         ; tx_busybox_work=/tmp/tx-{group}; ./busybox rm -rf \"$tx_busybox_work\"\
+         ; ./busybox mkdir -p \"$tx_busybox_work\"\
+         ; ./busybox cp ./busybox busybox_cmd.txt busybox_testcode.sh \"$tx_busybox_work\"\
+         ; (cd \"$tx_busybox_work\"\
+         ; ./busybox --install -s . 2>/dev/null\
+         ; ./busybox rm -f test\
+         ; export PATH=.:$PATH\
          ; {}\
-         ; ./busybox sh -c 'sleep 5' & tx_kill_pid=$!; ./busybox kill $tx_kill_pid\
+         ; ./busybox sh -c './busybox sleep 5' & tx_kill_pid=$!; ./busybox kill $tx_kill_pid\
          ; tx_kill_rc=$?; if [ $tx_kill_rc -eq 0 ]; then \
          ./busybox echo 'testcase busybox kill 10 success'; else \
          ./busybox echo 'testcase busybox kill 10 fail'; fi\
          ; ./busybox sed '/OS COMP TEST GROUP /d' busybox_testcode.sh > /tmp/tx-busybox-body.sh\
-         ; {sh} sh /tmp/tx-busybox-body.sh\
+         ; {sh} sh /tmp/tx-busybox-body.sh)\
          ; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\"",
         busybox_case_name_prelude()
     );
@@ -1880,7 +1719,7 @@ fn ltp_args_from_cmdline<P: tx_hal::TxPlatform>() -> LtpArgs<'static> {
     args
 }
 
-pub(super) fn cmdline_value<P: tx_hal::TxPlatform>(key: &str) -> Option<&'static str> {
+fn cmdline_value<P: tx_hal::TxPlatform>(key: &str) -> Option<&'static str> {
     let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
     for token in cmdline.split_ascii_whitespace() {
         let Some((token_key, value)) = token.split_once('=') else {
@@ -2304,9 +2143,14 @@ mod tests {
 
         assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
         assert!(cmd.contains("SKIP entry-static.exe dlopen"));
-        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
+        assert!(cmd.contains("tx_libctest_dyn_work=/tmp/tx-libctest-dyn-dlopen"));
+        assert!(cmd
+            .contains("cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work\""));
         assert!(cmd.contains(
-            "(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"
+            "cp ./entry-dynamic.exe ./runtest.exe ./busybox \"$tx_libctest_dyn_work/lib\""
+        ));
+        assert!(cmd.contains(
+            "(cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe dlopen)"
         ));
     }
 
@@ -2338,15 +2182,17 @@ mod tests {
         let mut cmd = String::new();
         append_full_libctest(&mut cmd);
 
-        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
+        assert!(cmd.contains("tx_libctest_dyn_work=/tmp/tx-libctest-dyn-dlopen"));
         assert!(cmd.contains(
-            "(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"
+            "(cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe dlopen)"
         ));
         assert!(
-            cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe tls_get_new_dtv)")
+            cmd.contains(
+                "(cd \"$tx_libctest_dyn_work/lib\" && ./runtest.exe -w entry-dynamic.exe tls_get_new_dtv)"
+            )
         );
-        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe dlopen"));
-        assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe tls_get_new_dtv"));
+        assert!(!cmd.contains("LD_LIBRARY_PATH=. ../entry-dynamic.exe dlopen"));
+        assert!(!cmd.contains("LD_LIBRARY_PATH=. ../entry-dynamic.exe tls_get_new_dtv"));
     }
 
     #[test]
@@ -2359,13 +2205,14 @@ mod tests {
         assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
+        assert!(!cmd.contains("tx_libctest_dyn_work=/tmp/tx-libctest-dyn-pthread_cancel_points"));
         assert!(!cmd.contains("skipped known hang"));
     }
 
     #[test]
-    fn oscomp_bench_observe_cmdline_flag_defaults_off_and_accepts_explicit_on() {
-        assert!(!oscomp_bench_observe_enabled_from_cmdline(None));
-        assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
+    fn oscomp_bench_observe_cmdline_flag_defaults_on_and_accepts_off_values() {
+        assert!(oscomp_bench_observe_enabled_from_cmdline(None));
+        assert!(oscomp_bench_observe_enabled_from_cmdline(Some(
             "tx.oscomp.groups=libcbench-musl"
         )));
         assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
@@ -2427,6 +2274,8 @@ mod tests {
         append_lmbench_probe(&mut cmd);
         assert!(cmd.contains("lmbench-probe:cp-status"));
         assert!(cmd.contains("lmbench-probe:cmp-status"));
+        assert!(cmd.contains("lmbench-probe:loader-readlink-status"));
+        assert!(cmd.contains("lmbench-probe:local-loader-tmp-status"));
         assert!(cmd.contains("/tmp/hello"));
         assert!(!cmd.contains("lmbench_testcode.sh"));
     }
@@ -2454,6 +2303,7 @@ mod tests {
 
         assert!(cmd.contains("tx_iozone_work=/tmp/tx-iozone-musl"));
         assert!(cmd.contains("cp ./iozone ./iozone_testcode.sh ./busybox \"$tx_iozone_work\""));
+        assert!(cmd.contains("cp -r ./lib \"$tx_iozone_work\""));
         assert!(cmd.contains("(cd \"$tx_iozone_work\"; ./busybox sh iozone_testcode.sh)"));
     }
 
@@ -2463,9 +2313,16 @@ mod tests {
         append_oscomp_musl_script(&mut cmd, "lmbench_testcode.sh");
 
         assert!(cmd.contains("tx_lmbench_work=/tmp/tx-lmbench-musl"));
+        assert!(cmd.contains("cp ./lmbench_testcode.sh ./lmbench_all"));
+        assert!(cmd.contains("cp -r ./lib \"$tx_lmbench_work\""));
+        assert!(cmd.contains(
+            "printf '#!/bin/sh\\nexec /code/lmbench_src/bin/build/lmbench_all hello \"$@\"\\n'"
+        ));
         assert!(cmd.contains("chmod 755 \"$tx_lmbench_work/hello\""));
+        assert!(cmd.contains("cp \"$tx_lmbench_work/hello\" /tmp/hello"));
         assert!(cmd.contains("chmod 755 /tmp/hello"));
         assert!(cmd.contains("(cd \"$tx_lmbench_work\"; ./busybox sh lmbench_testcode.sh)"));
+        assert!(cmd.contains("rm -f /tmp/hello"));
     }
 
     #[test]
@@ -2489,7 +2346,7 @@ mod tests {
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
         assert!(cmd.contains("; cd /musl/glibc; "));
-        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("\"$tx_bb\" sh netperf_testcode.sh; cd \"$tx_musl_root\""));
     }
 
     #[test]
@@ -2499,7 +2356,23 @@ mod tests {
 
         assert!(cmd.contains("[ -e lib/libc.so.6 ] || ./busybox cp lib/libc.so lib/libc.so.6"));
         assert!(cmd.contains("[ -e lib/libm.so.6 ] || ./busybox cp lib/libm.so lib/libm.so.6"));
-        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh"));
+        assert!(cmd.contains("\"$tx_bb\" sh netperf_testcode.sh"));
+    }
+
+    #[test]
+    fn glibc_basic_script_runs_from_writable_tmp_workdir() {
+        let mut cmd = alloc::string::String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut cmd, "basic_testcode.sh");
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START basic-glibc ####"));
+        assert!(cmd.contains("tx_basic_work=/tmp/tx-basic-glibc"));
+        assert!(cmd.contains("tx_glibc_root=/musl/glibc"));
+        assert!(cmd.contains("tx_glibc_lib=/lib/ld-linux-riscv64-lp64d.so.1"));
+        assert!(cmd.contains("cp \"$tx_glibc_root/busybox\" \"$tx_basic_work\""));
+        assert!(cmd.contains("cp -r \"$tx_glibc_root/basic/.\" \"$tx_basic_work\""));
+        assert!(cmd.contains("\"$tx_glibc_lib\" \"./$tx_basic_case\""));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END basic-glibc ####"));
+        assert!(cmd.contains("rm -rf \"$tx_basic_work\""));
     }
 
     #[test]
@@ -2515,7 +2388,7 @@ mod tests {
         let mut glibc_cmd = alloc::string::String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut glibc_cmd, "busybox_testcode.sh");
         assert!(glibc_cmd.contains("sed -i"));
-        assert!(glibc_cmd.contains("/musl/musl/busybox sh /tmp/tx-busybox-body.sh"));
+        assert!(glibc_cmd.contains("\"$tx_bb\" sh /tmp/tx-busybox-body.sh"));
     }
 
     #[test]
@@ -2569,21 +2442,21 @@ mod tests {
         append_oscomp_glibc_script(&mut glibc_cmd, "ltp_testcode.sh");
         assert!(glibc_cmd.contains("if [ -d /musl/glibc/ltp ]; then LROOT=/musl/glibc;"));
         assert!(glibc_cmd.contains("export LTPROOT=$LROOT/ltp"));
-        assert!(glibc_cmd.contains("/musl/musl/busybox sh ltp_testcode.sh)"));
-        assert!(glibc_cmd.ends_with("cd /musl/musl"));
+        assert!(glibc_cmd.contains("\"$tx_bb\" sh ltp_testcode.sh)"));
+        assert!(glibc_cmd.ends_with("cd \"$tx_musl_root\""));
 
         // Non-LTP scripts stay bare — no env leak, no subshell.
         let mut bench = String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut bench, "netperf_testcode.sh");
         assert!(bench.contains("; cd /musl/glibc; "));
-        assert!(bench.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(bench.contains("\"$tx_bb\" sh netperf_testcode.sh; cd \"$tx_musl_root\""));
     }
 
     #[test]
     fn default_scripts_include_glibc_bench_groups() {
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_default_oscomp_scripts(&mut cmd, false, None);
-        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
-        assert!(cmd.contains("/musl/musl/busybox sh iperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("\"$tx_bb\" sh netperf_testcode.sh; cd \"$tx_musl_root\""));
+        assert!(cmd.contains("\"$tx_bb\" sh iperf_testcode.sh; cd \"$tx_musl_root\""));
     }
 }

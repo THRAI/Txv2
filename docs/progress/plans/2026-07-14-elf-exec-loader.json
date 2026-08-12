@@ -4,26 +4,75 @@
   "title": "Replaceable elf 0.8 exec loader",
   "status": "active",
   "created": "2026-07-14",
-  "updated": "2026-07-21",
+  "updated": "2026-07-17",
   "owner": "codex",
-  "summary": "Replace production goblin parsing with a tx-owned ElfFileParser backed by elf 0.8.0, staged metadata reads, platform policy, and validated dynamic interpreter layout. Non-goals are dynamic tag/symbol/hash/relocation processing, vDSO implementation owned by the vDSO plan, and uncoordinated PageBacked executable-lease edits.",
+  "summary": "Replace production goblin parsing with a tx-owned ElfFileParser backed by elf 0.8.0, staged metadata reads, platform policy, and validated dynamic interpreter layout.",
   "scope": {
     "in": [
+      "Cargo.lock",
+      "crates/tx-scripts/Cargo.toml",
       "crates/tx-scripts/src/process/exec/loader.rs",
       "crates/tx-scripts/src/process/exec/loader",
-      "crates/tx-scripts/Cargo.toml",
-      "Cargo.lock"
+      "crates/tx-scripts/src/process/exec/image_reader.rs",
+      "crates/tx-scripts/src/process/exec/mod.rs",
+      "crates/tx-scripts/src/process/exec/script.rs",
+      "crates/tx-scripts/src/process/exec/script/tests.rs",
+      "crates/tx-scripts/src/process/exec/script/tests/v3.rs",
+      "crates/tx-scripts/src/process/exec/stack.rs",
+      "crates/tx-subsystems/src/vm/scripts.rs",
+      "crates/tx-subsystems/src/vfs/mod.rs",
+      "crates/tx-subsystems/src/vfs/structure.rs",
+      "crates/tx-subsystems/src/vfs/walker.rs",
+      "crates/tx-subsystems/src/vfs/walker/tests.rs",
+      "crates/tx-subsystems/src/mount/mod.rs",
+      "crates/tx-subsystems/src/cred/adapter.rs",
+      "crates/tx-subsystems/src/cred/mod.rs",
+      "crates/tx-subsystems/src/cred/tests.rs",
+      "crates/tx-subsystems/src/process/exec_prep.rs",
+      "crates/tx-subsystems/src/process/execution.rs",
+      "crates/tx-subsystems/src/process/structure.rs",
+      "crates/tx-subsystems/src/process/tests.rs",
+      "crates/tx-subsystems/src/process/tests/step_clone_thread.rs",
+      "crates/tx-subsystems/src/thread_runtime/execution.rs",
+      "crates/tx-subsystems/src/thread_runtime/tests.rs",
+      "crates/tx-subsystems/src/signal/mod.rs",
+      "crates/tx-subsystems/src/signal/tests/delivery.rs",
+      "crates/tx-subsystems/src/signal/tests/kill_permission.rs",
+      "crates/tx-kernel/src/init.rs",
+      "crates/tx-kernel/src/init/tests.rs",
+      "crates/tx-kernel/src/thread_future.rs",
+      "crates/tx-kernel/src/thread_future/tests.rs",
+      "crates/tx-substrate/src/step/mod.rs",
+      "crates/tx-substrate/tests/errno_linux_values.rs",
+      "crates/tx-shims/src/linux_syscall/exec_op.rs",
+      "crates/tx-shims/src/linux_syscall/cred.rs",
+      "crates/tx-shims/src/linux_syscall/mod.rs",
+      "crates/tx-shims/src/linux_syscall/proc.rs",
+      "crates/tx-shims/src/linux_syscall/signal.rs",
+      "crates/tx-shims/src/linux_syscall/tests.rs",
+      "crates/tx-shims/src/linux_syscall/tests/execve.rs",
+      "crates/tx-shims/src/linux_syscall/tests/fcntl_misc.rs",
+      "crates/tx-shims/src/linux_syscall/tests/fork_clone_wait4_wave2.rs",
+      "docs/design/02_execution/EXEC_v1.md",
+      "docs/design/04_process-signals/PROCESS_v1.md",
+      "docs/progress/STATUS.md",
+      "docs/progress/research/2026-07-14-elf-parser-library-audit.md",
+      "docs/progress/plans/2026-07-14-elf-exec-loader.json"
     ],
-    "out": [],
+    "out": [
+      "crates/tx-scripts/src/process/exec/dynamic_linker.rs",
+      "crates/tx-vdso",
+      "crates/tx-subsystems/src/page_backed"
+    ],
     "write_sets": [
       {
-        "owner": "elf-loader-core",
+        "owner": "elf-exec-progress",
         "paths": [
-          "crates/tx-scripts/src/process/exec/loader.rs",
-          "crates/tx-scripts/src/process/exec/loader",
-          "crates/tx-scripts/Cargo.toml"
+          "docs/design/02_execution/EXEC_v1.md",
+          "docs/progress/research/2026-07-14-elf-parser-library-audit.md",
+          "docs/progress/plans/2026-07-14-elf-exec-loader.json"
         ],
-        "notes": "Parser trait, elf 0.8 backend, tx-owned facts, policy and loader tests. Staged exec integration is coordinated separately with the active vDSO plan."
+        "notes": "Owns the active exec contract and ELF migration record. STATUS.md is updated during catch-up but is not claimed because another active coordinator owns that shared index."
       }
     ]
   },
@@ -34,7 +83,8 @@
       "docs/design/03_memory-vm/VM_v1_2.md"
     ],
     "progress_refs": [
-      "docs/progress/STATUS.md"
+      "docs/progress/research/2026-07-14-elf-parser-library-audit.md",
+      "docs/progress/plans/2026-07-14-vdso-migration.json"
     ],
     "external_refs": [
       "https://docs.rs/elf/0.8.0/elf/"
@@ -44,7 +94,7 @@
     {
       "id": "parser-contract",
       "title": "Add tx-owned ELF values and replaceable parser trait",
-      "status": "in-progress",
+      "status": "complete",
       "depends_on": [],
       "paths": [
         "crates/tx-scripts/src/process/exec/loader.rs",
@@ -59,7 +109,7 @@
     {
       "id": "elf08-backend",
       "title": "Implement elf 0.8 syntax decoder",
-      "status": "pending",
+      "status": "complete",
       "depends_on": ["parser-contract"],
       "paths": [
         "crates/tx-scripts/src/process/exec/loader/elf08.rs",
@@ -75,7 +125,7 @@
     {
       "id": "platform-policy",
       "title": "Build image plans from parser-independent platform policy",
-      "status": "pending",
+      "status": "complete",
       "depends_on": ["elf08-backend"],
       "paths": [
         "crates/tx-scripts/src/process/exec/loader/policy.rs",
@@ -89,7 +139,7 @@
     {
       "id": "runtime-metadata",
       "title": "Retain TLS, dynamic, RELRO and GNU stack facts",
-      "status": "pending",
+      "status": "complete",
       "depends_on": ["platform-policy"],
       "paths": [
         "crates/tx-scripts/src/process/exec/loader/model.rs",
@@ -103,7 +153,7 @@
     {
       "id": "staged-reader",
       "title": "Integrate bounded header, phdr and interpreter reads",
-      "status": "pending",
+      "status": "complete",
       "depends_on": ["runtime-metadata"],
       "paths": [
         "crates/tx-scripts/src/process/exec/image_reader.rs",
@@ -111,14 +161,16 @@
       ],
       "verification": [
         "cargo test -p tx-scripts staged_elf_read_ --lib",
+        "cargo test -p tx-scripts --lib real_page_container_eagain_makes_exec_script_op_continue_but_eio_stays_eio",
+        "cargo test -p tx-scripts --lib bss_tail_page_read_preserves_eagain_and_eio",
         "cargo test -p tx-scripts process::exec --lib"
       ],
-      "notes": "Coordinate line ownership with vdso-migration before editing script.rs."
+      "notes": "Bounded header/phdr/interpreter reads are integrated. The 2026-07-17 final review required PageBacked EAGAIN to remain a typed Retry at every exec read boundary: the Phase-2 probe, staged image reader, and main/interpreter BSS tail reads now preserve EAGAIN while EIO remains EIO. Real file-backed PageContainer regressions cover the initial probe and a later BSS-tail page fault. Fresh Cargo verification is currently blocked in unrelated tx-reactor sources before tx-scripts compiles."
     },
     {
       "id": "layout-and-auxv",
       "title": "Validate combined main/interpreter layout and auxv",
-      "status": "pending",
+      "status": "complete",
       "depends_on": ["staged-reader"],
       "paths": [
         "crates/tx-scripts/src/process/exec/script.rs",
@@ -129,12 +181,12 @@
         "cargo test -p tx-scripts dynamic_exec_layout_ --lib",
         "cargo check -p tx-subsystems --lib --no-default-features"
       ],
-      "notes": "Preserve any vDSO mappings and AT_SYSINFO_EHDR work that lands first."
+      "notes": "Combined layout and auxv are closed: checked stack construction materializes NUL-terminated AT_PLATFORM from P::ARCH and original-path AT_EXECFN, preserves both across shebang/interpreter rewrites, enforces USER_TOP and 16-byte SP alignment, and retains vDSO AT_SYSINFO_EHDR."
     },
     {
       "id": "goblin-retirement",
-      "title": "Remove goblin and close core guest verification",
-      "status": "pending",
+      "title": "Remove goblin and close core host verification",
+      "status": "complete",
       "depends_on": ["layout-and-auxv"],
       "paths": [
         "crates/tx-scripts/Cargo.toml",
@@ -143,30 +195,296 @@
         "docs/progress"
       ],
       "verification": [
-        "cargo -q xtask unit",
+        "cargo tree -p tx-scripts -e normal",
+        "cargo check -p tx-scripts --lib",
         "cargo xtask lint docs",
         "cargo xtask progress validate",
-        "RV64 and LA64 static, PIE, musl and glibc exec witnesses"
+        "git diff --check -- scoped files"
       ],
-      "notes": "Complete-program status remains open for executable lease, yielding StepOp, and vDSO GNU-stack closure."
+      "notes": "elf 0.8.0 is the sole parser dependency; the migration-only goblin 0.10.5 backend, test, dev-dependency, and lockfile entries were removed after the differential check passed. Guest closure remains a separate pending step."
+    },
+    {
+      "id": "exec-mount-witness-auth",
+      "title": "Authorize exec against the resolved mount witness",
+      "status": "complete",
+      "depends_on": ["goblin-retirement"],
+      "paths": [
+        "crates/tx-subsystems/src/vfs",
+        "crates/tx-subsystems/src/mount",
+        "crates/tx-scripts/src/process/exec/script.rs"
+      ],
+      "verification": [
+        "focused main and interpreter MS_NOEXEC and NOSUID authorization tests"
+      ],
+      "notes": "Main and interpreter share execute-bit plus regular PageBacked candidate validation, retain the final namespace-resolved Mount, reject MS_NOEXEC after symlink/mount crossing, and apply NOSUID from the final alias mount."
+    },
+    {
+      "id": "exec-credential-reservation",
+      "title": "Make exec credential preparation transactional",
+      "status": "complete",
+      "depends_on": ["exec-mount-witness-auth"],
+      "paths": [
+        "crates/tx-subsystems/src/cred",
+        "crates/tx-subsystems/src/process/exec_prep.rs",
+        "crates/tx-subsystems/src/process/structure.rs",
+        "crates/tx-subsystems/src/process/execution.rs",
+        "crates/tx-subsystems/src/thread_runtime/execution.rs",
+        "crates/tx-subsystems/src/signal/mod.rs",
+        "crates/tx-scripts/src/process/exec/script.rs",
+        "crates/tx-shims/src/linux_syscall/cred.rs",
+        "crates/tx-shims/src/linux_syscall/proc.rs",
+        "crates/tx-shims/src/linux_syscall/signal.rs",
+        "crates/tx-kernel/src/thread_future.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems cred::tests --lib",
+        "cargo test -p tx-subsystems --lib process::tests::step_clone_thread::",
+        "cargo test -p tx-subsystems --lib thread_exit_",
+        "cargo test -p tx-scripts process::exec --lib",
+        "cargo test -p tx-shims reserved_credential_mutation_maps_to_eagain --lib",
+        "cargo test -p tx-kernel --lib run_thread_page_fault_retry_yields_before_reentering_userspace",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Exec now owns a ProcessExecPrep bound to the authoritative ProcessIdentity payload key and lifecycle generation through Phase 7. Exec, exit, ordinary/last-thread exit, fatal teardown, and CLONE_THREAD share ProcessPayload.group_exit; per-TID linear permits and ExecAborting handoff prevent duplicate detach/count updates and release an abandoned collapse after the last in-flight permit. All production set*id and capset writers return EAGAIN while reserved. Checked AS replacement and credential commit validate the authoritative binding before mutation; stale payloads cannot mutate credentials or address space. NOSUID reserves without signing or replacing. Fatal AST/page-fault retries yield cooperatively, clone contention maps to EAGAIN, and timeout-bounded race tests cover both exec/exit orderings, clone admission, duplicate exit, and abort handoff."
+    },
+    {
+      "id": "ponr-cloexec-plan",
+      "title": "Prepare CLOEXEC closure before PoNR",
+      "status": "pending",
+      "depends_on": ["exec-credential-reservation"],
+      "paths": [
+        "crates/tx-subsystems/src/process/exec_prep.rs",
+        "crates/tx-subsystems/src/process/structure.rs",
+        "crates/tx-subsystems/src/process/tests/fd_table.rs",
+        "crates/tx-scripts/src/process/exec/script.rs",
+        "crates/tx-scripts/src/process/exec/script/tests.rs",
+        "docs/design/02_execution/EXEC_v1.md"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib prepared_cloexec_",
+        "cargo test -p tx-subsystems --lib stale_cloexec_plan_",
+        "cargo test -p tx-scripts --lib cloexec_plan_oom_",
+        "cargo test -p tx-scripts --lib exec_script_closes_cloexec_"
+      ],
+      "notes": "Implementation now fallibly allocates and retains the complete exact-identity close plan plus the caller thread payload before sibling collapse. Final commit holds the authoritative payload plus fds/cloexec locks and rejects drift before the AS store. OOM, fd reuse rollback, success, and post-prepare allocation-fault tests are present. The step remains pending for two independent reasons: Cargo cannot reach the focused tests because of the unrelated tx-reactor timer/deadline split, and a last pipe/socketpair endpoint decrement or vfork/exit-source publication can still enter allocation-backed WaitSource/mailbox delivery after the AS store. Closure requires a prepared, bounded, non-expanding notification path in substrate/reactor."
+    },
+    {
+      "id": "executable-lease",
+      "title": "Add a generation-stable executable lease",
+      "status": "pending",
+      "depends_on": ["goblin-retirement"],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed",
+        "crates/tx-scripts/src/process/exec"
+      ],
+      "verification": [
+        "focused executable-write exclusion and ETXTBSY tests"
+      ],
+      "notes": "Requires PageBacked ownership coordination; do not edit through the parser lane."
+    },
+    {
+      "id": "yielding-exec-stepop",
+      "title": "Replace the one-shot EBUSY bridge with a yielding exec StepOp",
+      "status": "pending",
+      "depends_on": ["goblin-retirement"],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/script.rs",
+        "crates/tx-shims/src/linux_syscall/proc.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-scripts exec_step_preserves_wait_source_yield_instead_of_returning_ebusy --lib",
+        "cargo test -p tx-scripts --lib real_page_container_eagain_makes_exec_script_op_continue_but_eio_stays_eio",
+        "cargo test -p tx-scripts --lib bss_tail_page_read_preserves_eagain_and_eio",
+        "cargo test -p tx-scripts process::exec --lib",
+        "cargo test -p tx-shims linux_syscall::tests::execve --lib"
+      ],
+      "notes": "The code shape preserves PageBacked/VFS YieldShape values and sys_execve calls the central Waiting driver. Phase-2 probe, staged reader, and BSS-tail read errors now preserve EAGAIN as Continue and EIO as EIO, with real PageContainer regressions present. Final closure remains pending until those regressions and shim integration rerun successfully; current verification is blocked before tx-scripts by the unrelated tx-reactor timer/deadline API split."
+    },
+    {
+      "id": "nx-gnu-stack",
+      "title": "Close GNU-stack NX enforcement with the vDSO layout",
+      "status": "complete",
+      "depends_on": ["goblin-retirement"],
+      "paths": [
+        "crates/tx-scripts/src/process/exec/script.rs",
+        "crates/tx-subsystems/src/vm",
+        "crates/tx-vdso"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems initial_stack_protection_follows_gnu_stack_and_vdso_restorer_matrix --lib",
+        "cargo test -p tx-scripts process::exec --lib"
+      ],
+      "notes": "The VM builder now selects final stack protection once: explicit PT_GNU_STACK PF_X is RWX, mapped-vDSO plus no PF_X is RW, and no-vDSO targets retain RWX for the signal-frame trampoline fallback. Exec no longer overwrites PF_X with a post-map mprotect."
+    },
+    {
+      "id": "guest-witnesses",
+      "title": "Close RV64 and LA64 static, PIE, musl, and glibc witnesses",
+      "status": "pending",
+      "depends_on": [
+        "executable-lease",
+        "yielding-exec-stepop",
+        "nx-gnu-stack"
+      ],
+      "paths": [
+        "docs/progress",
+        "xtask"
+      ],
+      "verification": [
+        "RV64 static ET_EXEC shell witness",
+        "RV64 dynamic PIE plus PT_INTERP and static-PIE musl loader witness",
+        "LA64 static and dynamic exec witnesses",
+        "focused musl and glibc LTP execve01/execve06 witnesses"
+      ],
+      "notes": "2026-07-16 partial guest evidence: RV64 static ET_EXEC passed tools/shell-tests/busybox-prompt.txt (target/elf-witness/rv64-busybox-prompt-60s.log), and Alpine dynamic PIE with PT_INTERP plus the static-PIE musl loader passed tools/shell-tests/alpine-vi-open-smoke.txt (target/elf-witness/rv64-alpine-vi-dynamic-musl-30s.log); target/elf-witness/elf-artifact-types.log records the exact ELF types. The LA64 singular/plural signal-exit API drift is fixed and cargo check -p tx-shims --lib --target loongarch64-unknown-none passes; full guest build still lacks the vendored LA64 BusyBox. Musl LTP execve01/execve06 reached QEMU but tx-test-init could not create /usr, /var, /lib, or /tx-ltp, emitted no RUN LTP CASE marker, and judged 0/0; the fallback runtest path spent its bounded window copying the 4 GiB image; glibc LTP is blocked by an unavailable Docker/Colima daemon. None of those blocked or 0/0 runs count as a passing witness."
     }
   ],
   "verification": [
     {
+      "command": "cargo test -p tx-scripts process::exec --lib",
+      "status": "passed",
+      "notes": "2026-07-17 final compatibility refresh: 163 passed, 0 failed; adds Linux 256-byte shebang truncation semantics, full optional-argument preservation, four-success/fifth-ELOOP redirects, argv/envp embedded-NUL rejection, Linux-compatible AT_PHDR derivation including the high-e_phoff USER_TOP boundary, and the existing RV64/LA64/shebang auxv, parser, staged-read, layout, mount, wait, and stack coverage."
+    },
+    {
       "command": "cargo test -p tx-scripts process::exec::loader::tests --lib",
       "status": "passed",
-      "notes": "Baseline before implementation: 23 passed, 0 failed."
+      "notes": "2026-07-17 compatibility refresh: 73 permanent tests passed, 0 failed, including AT_PHDR derivation from the first PT_LOAD covering e_phoff, acceptance when only the table start is file-backed by that LOAD, ignored inconsistent PT_PHDR declarations, a high-e_phoff phdr-table-end USER_TOP rejection, and the deterministic no-panic corpus over 2048 mutated-fixture and random bounded inputs."
+    },
+    {
+      "command": "cargo test -p tx-scripts migration_only_elf08_matches_goblin_syntax_fixtures --lib",
+      "status": "passed",
+      "notes": "2026-07-15 migration-only evidence: Elf08Parser matched exact goblin 0.10.5 across three fixtures for every mapped ELF header and program-header field. The differential test, goblin backend, and temporary dev-dependency were then deleted."
+    },
+    {
+      "command": "cargo test -p tx-scripts staged_elf_read_ --lib",
+      "status": "passed",
+      "notes": "2026-07-15: 6 passed, 0 failed."
+    },
+    {
+      "command": "cargo test -p tx-scripts dynamic_exec_layout_ --lib",
+      "status": "passed",
+      "notes": "2026-07-15: 9 passed, 0 failed."
+    },
+    {
+      "command": "cargo test -p tx-subsystems cred::tests --lib",
+      "status": "passed",
+      "notes": "2026-07-16 lifecycle refresh: 75 passed, 0 failed; includes all seven production credential writers blocked by exec reservation, abort/commit release, NOSUID no-replacement, stale token rejection, and authoritative stale-binding no-mutation coverage."
+    },
+    {
+      "command": "cargo test -p tx-scripts process::exec::script::tests --lib",
+      "status": "passed",
+      "notes": "2026-07-17 compatibility refresh: 63 passed, 0 failed; production exec integration covers the 256-byte shebang boundary, complete optional text such as -S python -O, truncated optional-text acceptance with byte 255 reserved as NUL, four redirects plus fifth ELOOP, argv/envp NUL rejection, RV64/LA64 stack strings, original execve pathname retention, non-ELF ENOEXEC, mount namespace, PT_INTERP policy, and transactional credentials."
+    },
+    {
+      "command": "cargo test -p tx-shims reserved_credential_mutation_maps_to_eagain --lib",
+      "status": "passed",
+      "notes": "2026-07-16 lifecycle refresh: 1 passed, 0 failed; credential reservation contention maps to Linux EAGAIN (11)."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib process::tests::step_clone_thread:: && cargo test -p tx-subsystems --lib thread_exit_",
+      "status": "passed",
+      "notes": "2026-07-16 lifecycle refresh: 20 clone/exec lifecycle tests and 15 thread-exit tests passed. Timeout-bounded races cover exec-first, exit-first, clone admission, per-TID claim, post-zombie idempotence, and ExecAborting cleanup."
+    },
+    {
+      "command": "cargo test -p tx-kernel --lib run_thread_fatal_retry_yields_before_rechecking_ast && cargo test -p tx-kernel --lib run_thread_page_fault_retry_yields_before_reentering_userspace",
+      "status": "passed",
+      "notes": "2026-07-16 lifecycle refresh: both production-future regressions passed; fatal AST and page-fault Retry clear the pending request and cooperatively yield before rechecking or re-entering userspace."
+    },
+    {
+      "command": "cargo check -p tx-subsystems -p tx-scripts -p tx-shims -p tx-kernel",
+      "status": "passed",
+      "notes": "2026-07-16 lifecycle refresh: passed; only pre-existing workspace warnings and shared incremental-cache cleanup warnings were emitted."
+    },
+    {
+      "command": "cargo check -p tx-shims --lib --target loongarch64-unknown-none",
+      "status": "passed",
+      "notes": "2026-07-16 lifecycle refresh: passed; LA64 tkill/tgkill SIGCANCEL paths use the authorized plural exit helper and preserve Retry to EAGAIN."
+    },
+    {
+      "command": "cargo test -p tx-shims linux_syscall::tests::execve --lib",
+      "status": "passed",
+      "notes": "2026-07-17 final compatibility refresh: 23 passed, 0 failed; adds empty-path ENOENT, fallible string/outer/reference-vector ENOMEM injection, unwind-safe fault-hook reset, invalid argv/envp array and element EFAULT, impossible usize::MAX slot-count E2BIG, and retains Waiting-mode exec plus non-shebang ENOEXEC coverage."
+    },
+    {
+      "command": "cargo test -p tx-subsystems initial_stack_protection_follows_gnu_stack_and_vdso_restorer_matrix --lib",
+      "status": "passed",
+      "notes": "2026-07-16 TDD: first failed because the matrix helper did not exist, then all PF_X/vDSO combinations passed after final stack protection moved into VM construction."
+    },
+    {
+      "command": "cargo test -p tx-scripts exec_step_preserves_wait_source_yield_instead_of_returning_ebusy --lib",
+      "status": "passed",
+      "notes": "2026-07-16 TDD: first failed because exec had no Deferred/Retry outcome, then passed with exact wait-source YieldShape preservation and retry mapping."
+    },
+    {
+      "command": "cargo check -p tx-scripts -p tx-shims",
+      "status": "passed",
+      "notes": "2026-07-17 compatibility refresh: passed; only pre-existing workspace and shared incremental-cache warnings remain, and the former stack unused-assignment warning is absent."
+    },
+    {
+      "command": "cargo check",
+      "status": "passed",
+      "notes": "2026-07-16: workspace check passed; only pre-existing warnings in tx-subsystems, tx-ext4, tx-fs, and tx-kernel were emitted."
+    },
+    {
+      "command": "cargo tree -p tx-scripts -e normal",
+      "status": "passed",
+      "notes": "2026-07-15: contains elf v0.8.0 and no goblin dependency."
+    },
+    {
+      "command": "cargo test -p tx-kernel --lib <three bootstrap exec tests> -- --test-threads=1",
+      "status": "passed",
+      "notes": "2026-07-16 TDD: all three tests first reproduced NotExecutable with the inherited USER_TOP=0, then passed after TestPlatform declared FULL_USER_V1_TOP. The bootstrap context assertion now checks that the ASLR-selected saved SP is mapped in the replacement AddressSpace and remains 16-byte aligned."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Historical 2026-07-17 compatibility refresh passed with tx-shims 636/636, tx-kernel 113/113, tx-ext4 31/31, and tx-scripts 163/163. The fresh final-review rerun on 2026-07-17 now stops in unrelated tx-reactor sources with 9 missing timer/deadline/mailbox/generation/wake APIs before any target crate builds."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "2026-07-17 final-review rerun: progress records ok (34 files)."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "2026-07-17 final-review rerun: passed with 7 existing stale-vocabulary warnings."
+    },
+    {
+      "command": "rustfmt --check --edition 2021 <scoped ELF quality-review Rust files>",
+      "status": "passed",
+      "notes": "2026-07-17 final-review rerun: scoped image-reader, loader, exec script/tests, ProcessExecPrep, fd-table test, and VFS files are formatted."
+    },
+    {
+      "command": "git diff --check -- scoped files",
+      "status": "passed",
+      "notes": "2026-07-17 final-review rerun: no whitespace errors in the scoped exec code, design, and progress files."
+    },
+    {
+      "command": "cargo test -p tx-scripts --lib bss_tail_page_read_preserves_eagain_and_eio",
+      "status": "failed",
+      "notes": "2026-07-17: target test did not compile or run; Cargo stopped first in unrelated tx-reactor sources with the same 9 timer/deadline/mailbox/generation/wake API errors."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib prepared_cloexec_commit_closes_only_the_prevalidated_file",
+      "status": "failed",
+      "notes": "2026-07-17: target test did not compile or run; Cargo stopped first in unrelated tx-reactor sources with the same 9 timer/deadline/mailbox/generation/wake API errors."
+    },
+    {
+      "command": "cargo xtask check",
+      "status": "failed",
+      "notes": "2026-07-17: stopped at cargo fmt --check because unrelated dirty ext4 journal/planner, PageBacked/I/O, process/signal, vDSO, and xtask files need formatting. Scoped ELF ABI rustfmt and all requested compile/test/docs/progress gates passed."
     }
   ],
   "risks": [
     "Current exec files contain unrelated uncommitted StepOp migration changes that must be preserved.",
-    "The active vDSO plan owns overlapping future exec and VM paths.",
     "Changing strict alignment/WX behavior can invalidate hand-built fixtures while improving Linux compatibility.",
-    "Production parser replacement does not by itself provide ETXTBSY generation stability or a yielding exec continuation."
+    "Production parser replacement does not by itself provide ETXTBSY generation stability.",
+    "Current WaitSource/mailbox and vfork/exit-source publication can allocate after the exec AS store when live subscribers exist."
   ],
   "blockers": [
-    "Final NX GNU-stack enforcement depends on vDSO migration phase 6.",
-    "Progress validation is currently blocked by the pre-existing vdso-migration status value 'in_progress'."
+    "Executable lease ownership requires coordinated PageBacked and VFS changes.",
+    "Full EXEC-PONR closure requires a preallocated bounded notification path for CLOEXEC endpoint close and vfork/exit-source publication; current substrate/reactor delivery may allocate after the AS store.",
+    "Focused exec/CLOEXEC Cargo tests are blocked before the target crates by the unrelated tx-reactor timer/deadline API split."
   ],
   "handoff": {
     "needed": true,

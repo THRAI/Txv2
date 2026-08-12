@@ -270,6 +270,66 @@ fn should_skip_file(rel: &str) -> bool {
         || rel.ends_with("_test.rs")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{lint_channel_retirement_text, RetirementFinding};
+
+    #[test]
+    fn channel_retirement_flags_channel_and_registry_terms() {
+        let findings = lint_channel_retirement_text(
+            "crates/tx-subsystems/src/pipe/notification.rs",
+            r#"
+use crate::adapter::wait_routing::{Channel, WaitFuture};
+fn install(channel: Channel) {
+    crate::wait_source::register_wait_channel_with_id(7, channel.clone());
+    wait_routing::fire_legacy_channel(&channel, 1);
+}
+"#,
+        );
+
+        assert!(has_term(&findings, "Channel"));
+        assert!(has_term(&findings, "WaitFuture"));
+        assert!(has_term(&findings, "register_wait_channel_with_id"));
+        assert!(has_term(&findings, "fire_legacy_channel"));
+    }
+
+    #[test]
+    fn channel_retirement_ignores_comments() {
+        let findings = lint_channel_retirement_text(
+            "crates/tx-subsystems/src/pipe/mod.rs",
+            r#"
+// Channel should not count in comments.
+/// WaitFuture should not count in docs.
+fn endpoint() {}
+"#,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn fd_ready_facade_inventory_flags_io_poll_readiness_terms() {
+        let findings = super::lint_fd_ready_facade_text(
+            "crates/tx-shims/src/linux_syscall/io.rs",
+            r#"
+fn scan() {
+    let _ = socket_poll_mask_from_file(&file, &guard);
+    let _ = socket_poll_wait_token_from_file(&file, mask, &guard);
+    let _ = timerfd_readable_level::<P>(tfd);
+}
+"#,
+        );
+
+        assert!(has_term(&findings, "socket_poll_mask_from_file"));
+        assert!(has_term(&findings, "socket_poll_wait_token_from_file"));
+        assert!(has_term(&findings, "timerfd_readable_level"));
+    }
+
+    fn has_term(findings: &[RetirementFinding], term: &str) -> bool {
+        findings.iter().any(|finding| finding.term == term)
+    }
+}
+
 fn code_before_comment(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     if trimmed.is_empty()

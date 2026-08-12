@@ -1,0 +1,20 @@
+{
+  "schema": "tx.ext4.workload.v1",
+  "name": "rustc-kernel-build",
+  "contract_status": "fixture-non-evidence",
+  "tx_source_commit": "0000000000000000000000000000000000000000",
+  "cargo_lock_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "vendor_tree_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "target_triple": "riscv64gc-unknown-none-elf",
+  "native_rv64_toolchain": {
+    "source_commit": "0000000000000000000000000000000000000000",
+    "config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "rustc_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "cargo_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "rustc -vV": "fixture-only; measure before acceptance",
+    "linker": "fixture-only; measure before acceptance"
+  },
+  "build": {"command": ["cargo", "build", "--release", "-p", "tx-kernel-riscv64-qemu-virt", "--target", "riscv64gc-unknown-none-elf", "--offline", "--frozen"], "environment": {}},
+  "role_images": {"test_seed": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "offline_source_tree": true}, "scratch_seed": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "raw_roofline_only": true}, "workload": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "read_only": true}},
+  "measurement_geometry": {"smp": 1, "memory_mib": 4096, "swap": "disabled", "qemu_cache": "identical-linux-tx"}
+}

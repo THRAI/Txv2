@@ -16,7 +16,6 @@ mod gift;
 mod lock_metrics;
 pub mod notification;
 mod pmap;
-pub mod probe;
 pub mod project;
 pub mod scripts;
 pub mod step_ops;
@@ -50,13 +49,12 @@ pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
     MapPlacement, PendingWriter, PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot,
     PrivateFrameState, PrivatePageError, PrivatePageSet, Prot, RangeGuard, RangeGuardPair,
-    RangeLock, RangeLockDiagnosticSnapshot, UfdRegistration, UserPage, UserPageIter, UserRange,
-    UserRangeError, UserVirtAddr, VmBacking, VmCap, VmEntry, VmEntryBacking, VmEntryError,
-    VmEntryFlags, VmEntryProtectRewrite, VmEntryRewrite, VmFault, VmFaultError,
-    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultMaterializationStep,
-    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmPageOff,
-    VmRemapOutcome, VmRemapPlacement, VmRemapRequest, VmSpecialBacking, WouldBlock,
-    FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
+    RangeLock, UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr,
+    VmBacking, VmCap, VmEntry, VmEntryBacking, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
+    VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
+    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
+    VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
+    VmSpecialBacking, WouldBlock, FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
 };
 pub use user_access::UserAccessKind;
 pub use vdso::{
@@ -67,11 +65,6 @@ pub fn reset_debug_phase_totals() {
     structure::reset_private_page_debug_totals();
     structure::reset_recipe_debug_totals();
     pmap::reset_pmap_debug_totals();
-}
-
-/// Drop recipe roots that EBR has already proven unreachable.
-pub fn drain_deferred_recipe_reclaims(limit: usize) -> usize {
-    structure::drain_deferred_recipe_reclaims(limit)
 }
 
 pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
@@ -117,28 +110,6 @@ pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
             ("node_alloc_max", recipe.op_node_alloc_max),
             ("node_alloc_count", recipe.node_alloc_count),
             ("chunk_alloc_count", recipe.chunk_alloc_count),
-        ],
-    );
-    let recipe_reclaim_avg_ns = if recipe.reclaim_count == 0 {
-        0
-    } else {
-        recipe.reclaim_total_ns / recipe.reclaim_count
-    };
-    write_debug_line::<P>(
-        ":vm:phase-total:recipe.reclaim_tree",
-        &[
-            ("count", recipe.reclaim_count),
-            ("total_ns", recipe.reclaim_total_ns),
-            ("avg_ns", recipe_reclaim_avg_ns),
-            ("max_ns", recipe.reclaim_max_ns),
-            ("node_total", recipe.reclaim_node_total),
-            ("node_max", recipe.reclaim_node_max),
-            ("deferred_enqueued", recipe.deferred_reclaim_enqueued),
-            ("deferred_drained", recipe.deferred_reclaim_drained),
-            (
-                "deferred_inline_fallback",
-                recipe.deferred_reclaim_inline_fallback,
-            ),
         ],
     );
     let pmap = pmap::pmap_debug_totals();

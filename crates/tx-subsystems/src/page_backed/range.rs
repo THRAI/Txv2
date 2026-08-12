@@ -74,6 +74,10 @@ pub enum RangeReservationKind {
     Fallocate,
     DirectRead,
     DirectWrite,
+    /// A clean-cache eviction. This claims the page while a resident-root
+    /// withdrawal is prepared and published, so it cannot race direct I/O or
+    /// truncate on the same range.
+    Reclaim,
     Writeback,
 }
 

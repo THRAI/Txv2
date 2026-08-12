@@ -28,8 +28,12 @@ pub fn install_shared_page(
         ppn: source_ppn,
         pin: PageCachePin::Allocated(cache_pin),
     };
-    let mut state = pc.state.lock();
-    state.pages.install_if_absent(page, frame)
+    if !pc.install_resident_if_absent_published(page, frame)? {
+        return Err(PageCacheError::AlreadyPresent {
+            current: pc.lookup(page).ok_or(PageCacheError::MissingPage)?,
+        });
+    }
+    Ok(())
 }
 
 /// Replace `pc`'s currently cached frame at `page` with a fresh private
@@ -58,12 +62,16 @@ pub fn cow_replace_into_private(
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
         return Err(PageCacheError::UnsupportedKind);
     }
-    let existing_ppn = {
-        let state = pc.state.lock();
-        state
+    let (existing_ppn, generation) = {
+        let mut state = pc.state.lock();
+        let existing_ppn = state
             .pages
             .lookup(page)
-            .ok_or(PageCacheError::MissingPage)?
+            .ok_or(PageCacheError::MissingPage)?;
+        let snapshot = state
+            .ensure_resident_page_slot(page, existing_ppn)
+            .map_err(page_slot_completion_error_to_page_cache_error)?;
+        (existing_ppn, snapshot.generation)
     };
 
     let reservation =
@@ -78,9 +86,5 @@ pub fn cow_replace_into_private(
         ppn: new_ppn,
         pin: PageCachePin::Allocated(new_cache_pin),
     };
-    let mut state = pc.state.lock();
-    state
-        .pages
-        .install_if_match(page, existing_ppn, Some(replacement))?;
-    Ok(new_ppn)
+    pc.replace_resident_if_match_published(page, existing_ppn, generation, replacement)
 }

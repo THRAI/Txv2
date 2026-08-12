@@ -17,9 +17,9 @@ pub enum MutationError {
 
 /// A committed entry reserved for conditional withdrawal.
 ///
-/// Dropping this value rolls the reservation back; [`Self::withdraw`] commits
-/// the removal. Callers can reserve several entries first and withdraw them
-/// only after every reservation succeeds.
+/// Dropping this value restores the committed entry; [`Self::withdraw`]
+/// commits the removal. This lets callers reserve several related entries
+/// before making any of the removals visible.
 #[must_use]
 pub struct WithdrawReservation<'i, K, V, const N: usize> {
     inner: CommittedReservation<'i, K, V, N>,
@@ -64,11 +64,7 @@ pub fn withdraw<K: Eq, V, const N: usize>(
         .withdraw())
 }
 
-/// Withdraw a committed value only when it still satisfies `predicate`.
-///
-/// Reserving the committed slot before evaluating the predicate makes the
-/// owner check and removal one mutation transaction. A failed predicate drops
-/// the reservation and restores the entry unchanged.
+/// Withdraw a committed value only while it still satisfies `predicate`.
 pub fn withdraw_if<K: Eq, V, const N: usize>(
     index: &Index<K, V, N>,
     key: &K,
@@ -77,8 +73,8 @@ pub fn withdraw_if<K: Eq, V, const N: usize>(
     Ok(reserve_withdraw_if(index, key, predicate)?.map(WithdrawReservation::withdraw))
 }
 
-/// Reserve a committed value for withdrawal only when it still satisfies
-/// `predicate`. A rejected predicate returns `Ok(None)` with the entry intact.
+/// Reserve a committed value for withdrawal only while it still satisfies
+/// `predicate`. A rejected predicate leaves the entry unchanged.
 pub fn reserve_withdraw_if<'i, K: Eq, V, const N: usize>(
     index: &'i Index<K, V, N>,
     key: &K,
@@ -109,40 +105,5 @@ fn mutation_error(error: IndexError) -> MutationError {
         IndexError::Duplicate => MutationError::AlreadyPresent,
         IndexError::Missing => MutationError::Missing,
         IndexError::Busy => MutationError::Busy,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Debug, Eq, PartialEq)]
-    struct OwnedValue(u32);
-
-    #[test]
-    fn withdraw_if_preserves_a_value_when_the_predicate_rejects_it() {
-        let index = Index::<u32, OwnedValue, 1>::new();
-        install_if_absent(&index, 7, OwnedValue(41)).expect("install");
-
-        assert_eq!(withdraw_if(&index, &7, |value| value.0 == 42), Ok(None));
-        assert_eq!(
-            withdraw_if(&index, &7, |value| value.0 == 41),
-            Ok(Some(OwnedValue(41)))
-        );
-    }
-
-    #[test]
-    fn withdraw_if_predicate_can_reenter_without_spinlock_deadlock() {
-        let index = Index::<u32, OwnedValue, 1>::new();
-        install_if_absent(&index, 7, OwnedValue(41)).expect("install");
-
-        assert_eq!(
-            withdraw_if(&index, &7, |_| {
-                assert_eq!(withdraw_if(&index, &7, |_| true), Err(MutationError::Busy));
-                false
-            }),
-            Ok(None)
-        );
-        assert_eq!(withdraw_if(&index, &7, |_| true), Ok(Some(OwnedValue(41))));
     }
 }

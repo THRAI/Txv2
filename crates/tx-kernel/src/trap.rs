@@ -8,6 +8,14 @@ use tx_shims::linux_syscall::SyscallResult;
 
 use crate::{adapter::boot_runtime, trap_handoff};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static MAINTENANCE_SERVICE_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Bound normal-context EBR work per maintenance turn so an IPI cannot
+/// convert into an unbounded reactor tail latency spike.
+pub(crate) const MAINTENANCE_DRAIN_BUDGET: usize = 64;
+
 pub struct KernelTrapDispatcher;
 
 impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
@@ -65,71 +73,23 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Resume
     }
 
-    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId) -> TrapAction {
         let irq = P::claim();
         if irq == 0 {
             return TrapAction::Resume;
         }
 
         let handled = P::dispatch_irq(irq);
-        // Most handlers finish their controller transaction in the trap.
-        // A deferred handler keeps the claim outstanding so a task-context
-        // bottom half can clear a level-triggered device source first. That
-        // bottom half owns the one matching same-context completion.
-        if !matches!(handled, IrqHandled::DeferredWake) {
-            P::complete(irq);
-        }
+        P::complete(irq);
 
         match handled {
-            IrqHandled::Wake | IrqHandled::DeferredWake => {
-                // A from-user reschedule longjmps out of the board trap shell.
-                // Preserve the interrupted userspace run in its hart slot
-                // before requesting that jump, exactly as the timer path does.
-                if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
-                    let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
-                    if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
-                        crate::init::mark_boot_reactor_userspace_preempt(cpu);
-                    }
-                    return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
-                }
-                TrapAction::Reschedule
-            }
+            IrqHandled::Wake => TrapAction::Reschedule,
             IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
         }
     }
 
-    fn on_ipi(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
-        let maintenance = P::pending_ipi(IpiKind::Maintenance);
-        let reschedule = P::pending_ipi(IpiKind::Reschedule);
-        if maintenance {
-            P::ack_ipi(IpiKind::Maintenance);
-        }
-        if P::pending_ipi(IpiKind::Membarrier) {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            P::ack_ipi(IpiKind::Membarrier);
-        }
-        if reschedule {
-            P::ack_ipi(IpiKind::Reschedule);
-        }
-        if P::pending_ipi(IpiKind::TlbShootdown) {
-            P::ack_ipi(IpiKind::TlbShootdown);
-        }
-
-        if (maintenance || reschedule)
-            && view.view().previous_mode == tx_hal::TrapPreviousMode::User
-        {
-            let outcome = trap_handoff::hand_off_timer_preempt(cpu.0, &view);
-            if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
-                crate::init::mark_boot_reactor_userspace_preempt(cpu);
-            }
-            return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
-        }
-
-        if maintenance {
-            TrapAction::Reschedule
-        } else {
-            TrapAction::Resume
-        }
+    fn on_ipi(_cpu: CpuId) -> TrapAction {
+        dispatch_pending_ipis::<P>()
     }
 
     fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
@@ -161,6 +121,10 @@ fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
     let mut action = TrapAction::Resume;
     if P::pending_ipi(IpiKind::Maintenance) {
         P::ack_ipi(IpiKind::Maintenance);
+        let cpu = P::current_cpu_id().0;
+        if cpu < u64::BITS as usize {
+            MAINTENANCE_SERVICE_PENDING.fetch_or(1u64 << cpu, Ordering::AcqRel);
+        }
         action = TrapAction::Reschedule;
     }
     if P::pending_ipi(IpiKind::Membarrier) {
@@ -174,6 +138,29 @@ fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
         P::ack_ipi(IpiKind::TlbShootdown);
     }
     action
+}
+
+/// Service a maintenance IPI after the trap shell has returned to normal
+/// kernel context.
+///
+/// The IPI handler itself runs with IRQ admission disabled, so it must not
+/// enter the epoch/zone retirement path. It only records the current hart in
+/// `MAINTENANCE_SERVICE_PENDING`; the BSP/AP reactor loop calls this helper
+/// before polling userspace work and performs the actual local drain and zone
+/// bucket flush there.
+pub(crate) fn service_pending_maintenance<P: TxPlatform>() -> bool {
+    let cpu = <P as PercpuIf>::current_cpu_id().0;
+    if cpu >= u64::BITS as usize {
+        return false;
+    }
+    let bit = 1u64 << cpu;
+    if MAINTENANCE_SERVICE_PENDING.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
+        return false;
+    }
+
+    let _ = crate::adapter::step_engine::service_local_drain_request(MAINTENANCE_DRAIN_BUDGET);
+    crate::zones::try_bounded_maintenance_tick();
+    true
 }
 
 #[cfg(test)]
@@ -204,12 +191,15 @@ mod ipi_tests {
     fn maintenance_ipi_only_acknowledges_and_reschedules() {
         MAINTENANCE_ACKED.store(false, Ordering::Release);
         MAINTENANCE_PENDING.store(true, Ordering::Release);
+        MAINTENANCE_SERVICE_PENDING.store(0, Ordering::Release);
 
         let action = dispatch_pending_ipis::<TestSmp>();
 
         assert_eq!(action, TrapAction::Reschedule);
         assert!(MAINTENANCE_ACKED.load(Ordering::Acquire));
         assert!(!MAINTENANCE_PENDING.load(Ordering::Acquire));
+        assert_ne!(MAINTENANCE_SERVICE_PENDING.load(Ordering::Acquire), 0);
+        MAINTENANCE_SERVICE_PENDING.store(0, Ordering::Release);
     }
 }
 
@@ -244,11 +234,8 @@ fn try_direct_trap_syscall<P: TxPlatform>(
 
     let context_start = direct_sigprocmask_detail_now(req.nr);
     let thread_lookup_start = direct_sigprocmask_detail_now(req.nr);
-    // The trap runs inside `PerHartSlotted::poll`, which keeps the current
-    // thread identity installed until the userspace round-trip longjmps back
-    // and the wrapped poll returns.  Use that poll-scoped authority instead of
-    // maintaining a second userspace identity cache with a wider lifetime.
-    let Some(thread) = tx_subsystems::thread_runtime::current_thread_identity(hart) else {
+    let Some(thread) = tx_subsystems::thread_runtime::current_userspace_thread_identity(hart)
+    else {
         emit_direct_sigprocmask_detail_value(req.nr, b"debug.trap.direct_sigprocmask.no_thread", 1);
         return None;
     };

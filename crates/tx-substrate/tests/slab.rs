@@ -12,10 +12,16 @@ struct TestPage {
     _bytes: [u8; PAGE_SIZE],
 }
 
+#[repr(align(16384))]
+struct AlignedTestPages {
+    _pages: [TestPage; 32],
+}
+
 #[derive(Clone, Copy)]
 struct TestProvider<'a> {
     allocator: &'a BitmapPageAllocator<'a>,
     base: usize,
+    arena_pages: usize,
 }
 
 unsafe impl SlabPageProvider for TestProvider<'_> {
@@ -56,6 +62,10 @@ unsafe impl SlabPageProvider for TestProvider<'_> {
             None
         }
     }
+
+    fn preferred_large_arena_pages(&self) -> usize {
+        self.arena_pages
+    }
 }
 
 fn test_allocator<'a>(
@@ -81,6 +91,7 @@ fn slab_rejects_allocation_before_init() {
     let provider = TestProvider {
         allocator: &allocator,
         base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 0,
     };
     let heap = SlabHeap::new(provider);
     let layout = Layout::from_size_align(32, 8).expect("valid layout");
@@ -104,6 +115,7 @@ fn slab_reuses_small_objects_and_retains_one_empty_page() {
     let provider = TestProvider {
         allocator: &allocator,
         base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 0,
     };
     let heap = SlabHeap::new(provider);
     heap.init().expect("heap init");
@@ -144,6 +156,7 @@ fn slab_returns_surplus_empty_pages_beyond_retained_page() {
     let provider = TestProvider {
         allocator: &allocator,
         base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 0,
     };
     let heap = SlabHeap::new(provider);
     heap.init().expect("heap init");
@@ -201,6 +214,7 @@ fn slab_refills_medium_classes_in_page_batches() {
     let provider = TestProvider {
         allocator: &allocator,
         base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 0,
     };
     let heap = SlabHeap::new(provider);
     heap.init().expect("heap init");
@@ -251,6 +265,7 @@ fn large_allocation_uses_page_run_and_frees_all_pages() {
     let provider = TestProvider {
         allocator: &allocator,
         base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 0,
     };
     let heap = SlabHeap::new(provider);
     heap.init().expect("heap init");
@@ -266,4 +281,141 @@ fn large_allocation_uses_page_run_and_frees_all_pages() {
     }
 
     assert_eq!(allocator.free_count(), 4);
+}
+
+#[test]
+fn large_arena_survives_fragmented_page_allocator() {
+    static mut PAGES: [TestPage; 32] = [TestPage {
+        _bytes: [0; PAGE_SIZE],
+    }; 32];
+    let metas = [const { FrameMeta::new() }; 32];
+    let bitmap = [const { AtomicU64::new(0) }; 1];
+    let allocator = test_allocator(&metas, &bitmap, 32);
+    let provider = TestProvider {
+        allocator: &allocator,
+        base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 8,
+    };
+    let heap = SlabHeap::new(provider);
+    heap.init().expect("heap init");
+
+    let mut occupied = Vec::new();
+    for _ in 0..12 {
+        let run = allocator
+            .reserve_run(1, 2, ZeroPolicy::UninitFullOverwrite)
+            .expect("aligned single page reservation")
+            .commit();
+        occupied.push(run.base());
+        core::mem::forget(run);
+    }
+    assert_eq!(
+        allocator.backend_diagnostics().max_contiguous_free_run,
+        1,
+        "the ordinary page allocator must be fragmented before the probe"
+    );
+
+    let layout = Layout::from_size_align(6000, PAGE_SIZE).expect("valid layout");
+    let free_before = allocator.free_count();
+    let ptr = heap
+        .try_alloc(layout)
+        .expect("arena should satisfy a multi-page allocation");
+    assert_eq!(allocator.free_count(), free_before);
+
+    unsafe {
+        heap.dealloc(ptr.as_ptr(), layout);
+    }
+    for ppn in occupied {
+        allocator.release_owned(ppn);
+    }
+    assert_eq!(allocator.free_count(), 24);
+}
+
+#[test]
+fn large_arena_retries_with_smaller_boot_pool() {
+    static mut PAGES: [TestPage; 32] = [TestPage {
+        _bytes: [0; PAGE_SIZE],
+    }; 32];
+    let metas = [const { FrameMeta::new() }; 32];
+    let bitmap = [const { AtomicU64::new(0) }; 1];
+    let allocator = test_allocator(&metas, &bitmap, 32);
+    let provider = TestProvider {
+        allocator: &allocator,
+        base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 8,
+    };
+
+    let mut occupied = Vec::new();
+    for _ in 0..8 {
+        let run = allocator
+            .reserve_run(1, 4, ZeroPolicy::UninitFullOverwrite)
+            .expect("aligned fragmentation reservation")
+            .commit();
+        occupied.push(run.base());
+        core::mem::forget(run);
+    }
+    assert!(allocator.backend_diagnostics().max_contiguous_free_run < 4);
+
+    let heap = SlabHeap::new(provider);
+    heap.init()
+        .expect("heap init should retain a smaller arena");
+    assert_eq!(allocator.free_count(), 22, "two pages should be reserved");
+
+    let layout = Layout::from_size_align(6000, PAGE_SIZE).expect("valid layout");
+    let free_before = allocator.free_count();
+    let ptr = heap
+        .try_alloc(layout)
+        .expect("smaller arena should be usable");
+    assert_eq!(allocator.free_count(), free_before);
+
+    unsafe {
+        heap.dealloc(ptr.as_ptr(), layout);
+    }
+    for ppn in occupied {
+        allocator.release_owned(ppn);
+    }
+    assert_eq!(
+        allocator.free_count(),
+        30,
+        "the smaller arena remains reserved for later large objects"
+    );
+}
+
+#[test]
+fn large_arena_respects_alignment_from_an_unaligned_base() {
+    static mut PAGES: AlignedTestPages = AlignedTestPages {
+        _pages: [TestPage {
+            _bytes: [0; PAGE_SIZE],
+        }; 32],
+    };
+    let metas = [const { FrameMeta::new() }; 32];
+    let bitmap = [const { AtomicU64::new(0) }; 1];
+    let allocator = test_allocator(&metas, &bitmap, 32);
+    let provider = TestProvider {
+        allocator: &allocator,
+        base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 8,
+    };
+
+    let prefix = allocator
+        .reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)
+        .expect("unaligning prefix")
+        .commit();
+    let prefix_base = prefix.base();
+    core::mem::forget(prefix);
+
+    let heap = SlabHeap::new(provider);
+    heap.init().expect("heap init");
+    let layout = Layout::from_size_align(6000, 4 * PAGE_SIZE).expect("valid layout");
+    let ptr = heap.try_alloc(layout).expect("aligned arena allocation");
+    let ppn = provider
+        .ppn_from_direct_map_ptr(ptr.as_ptr())
+        .expect("arena pointer must be direct mapped");
+    assert_eq!(ptr.as_ptr() as usize % (4 * PAGE_SIZE), 0);
+    assert_eq!(ppn.0 % 4, 0);
+
+    unsafe {
+        heap.dealloc(ptr.as_ptr(), layout);
+    }
+    allocator.release_owned(prefix_base);
+    assert_eq!(allocator.free_count(), 24);
 }

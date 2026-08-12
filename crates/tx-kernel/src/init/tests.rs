@@ -458,7 +458,7 @@ fn boot_init_submits_registered_file_io_service_runtimes() {
     )
     .expect("file io runtime test page container");
     tx_subsystems::device::register_page_container_file_io_service(
-        pc,
+        pc.clone(),
         tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
     );
 
@@ -478,9 +478,12 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
         1,
     )
     .expect("file io runtime test page container");
-    let runtime = tx_subsystems::device::register_page_container_file_io_service(
+    let runtime = tx_subsystems::device::FileIoManagerRuntimeClaim::detached_for_test(
         pc,
         tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
+        alloc::sync::Arc::new(tx_subsystems::io_manager::runtime::ServiceWakeSource::new(
+            0x72ff,
+        )),
     );
     let mut submitted = 0;
 
@@ -495,7 +498,7 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
 }
 
 #[test]
-fn userspace_sched_meta_exposes_online_harts_without_initial_migration() {
+fn initial_userspace_sched_meta_stays_on_current_boot_hart() {
     let _serial = setup();
     TEST_CURRENT_CPU.store(3, Ordering::Release);
     TEST_ONLINE_CPUS.store(0b1111, Ordering::Release);
@@ -503,74 +506,29 @@ fn userspace_sched_meta_exposes_online_harts_without_initial_migration() {
     let meta = CoreInit::<TestPlatform>::userspace_thread_sched_meta();
 
     assert_eq!(
-        meta.affinity, 0b1111,
-        "the Linux affinity ABI exposes every online hart",
+        meta.affinity,
+        CpuMask::single(CpuId(3)).bits(),
+        "initial userspace stays on the BSP hart so the local userspace reactor loop can drive it",
     );
     assert!(meta.userspace_thread);
     assert!(!meta.spread_on_submit);
-    assert_eq!(meta.migration, tx_reactor::MigrationPolicy::Pinned);
-
-    let child = CoreInit::<TestPlatform>::userspace_child_thread_sched_meta_for(CpuId(3));
-    assert_eq!(child.affinity, 0b1111);
-    assert!(child.userspace_thread);
-    assert!(child.spread_on_submit);
-    assert_eq!(child.migration, tx_reactor::MigrationPolicy::Pinned);
 }
 
 #[test]
-fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roots() {
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("", false),
-        Some("vda")
-    );
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=onsite", false),
-        Some("vda")
-    );
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=mmcblk0", false),
-        Some("mmcblk0")
-    );
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sdcard", false),
-        Some("vda")
-    );
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=pretest", false),
-        None
-    );
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=busybox", false),
-        None
-    );
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("", true),
-        None
-    );
-    assert_eq!(
-        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=vda", true),
-        Some("vda")
-    );
-}
+fn initial_userspace_sched_meta_ignores_other_online_cpus() {
+    let _serial = setup();
+    TEST_CURRENT_CPU.store(3, Ordering::Release);
+    TEST_ONLINE_CPUS.store(0b1000, Ordering::Release);
 
-#[test]
-fn automatic_media_layout_only_applies_without_an_explicit_boot_selector() {
-    assert!(CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", false));
-    assert!(
-        CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(
-            "console=ttyS0 tx.oscomp.groups=basic-musl",
-            false
-        )
+    let meta = CoreInit::<TestPlatform>::userspace_thread_sched_meta();
+
+    assert_eq!(
+        meta.affinity,
+        CpuMask::single(CpuId(3)).bits(),
+        "initial userspace stays on the current boot hart even when other CPUs are online",
     );
-    for cmdline in [
-        "tx.root=vda",
-        "tx.profile=onsite",
-        "tx.runsh=/root/test.sh",
-        "init=/sbin/init",
-    ] {
-        assert!(!CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(cmdline, false));
-    }
-    assert!(!CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", true));
+    assert!(meta.userspace_thread);
+    assert!(!meta.spread_on_submit);
 }
 
 #[test]

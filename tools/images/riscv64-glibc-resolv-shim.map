@@ -1,0 +1,2 @@
+GLIBC_2.27 { global: __res_init; };
+GLIBC_2.28 { global: fcntl64; } GLIBC_2.27;

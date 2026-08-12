@@ -711,7 +711,6 @@ dependencies = [
  "tx-observe",
  "tx-observe-types",
  "tx-platform-adapter",
- "tx-reactor",
  "tx-services",
  "tx-substrate",
  "tx-subsystems",
@@ -844,12 +843,12 @@ dependencies = [
  "gimli",
  "object",
  "proc-macro2",
- "quote",
  "rustc-demangle",
  "serde",
  "serde_json",
  "syn",
  "toml",
+ "tx-ext4-format",
 ]
 
 [[package]]

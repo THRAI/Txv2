@@ -333,24 +333,11 @@ This does not starve faults: once a writer completes and releases, faults unbloc
 
 **A reservation protects only the synchronous publication or rewrite phase of an operation. It must not be held across unbounded asynchronous waits.**
 
-If a step yields while preparing publication (e.g., the fault handler blocking on `materialize_page` for a disk read), it **must drop the reservation** before yielding. Upon resume, it **must reacquire** the reservation and **must re-observe all authoritative state** from the beginning of the step.
+If a step yields while preparing publication (e.g., the fault handler blocking on `materialize_page` for a disk read), it **must drop the reservation** before yielding. Upon resume, it **must reacquire** the reservation. A waitable fault script may then continue materialization with its owned `VmFaultOutcome`; publication performs the stamped-generation fast check and falls back to the full target-field comparison. Only a stale target requires restarting recipe resolution; a wake from the page-I/O source does not force a redundant recipe lookup.
 
 Rationale. Holding a RangeLock reservation across disk I/O would serialize an entire range against every concurrent operation for the duration of the I/O — potentially tens of milliseconds. The reservation is for synchronous coordination of binding-and-materialization consistency, not for blocking other threads while waiting on hardware.
 
-Application. The fault handler (§5.1) acquires a page-sized Materializer, re-observes recipes, and keeps the reservation through synchronous materialization and PTE publication. If `materialize_page` returns `Blocked`, the handler drops the reservation and its guards, yields, and on wake retries from the top.
-
-The same rule applies to syscall-side user-buffer prefault. An overlapping
-Materializer is ordinary SMP contention: the async syscall entry consumes the
-RangeLock wait token, waits without retaining a guard, and retries the whole
-range. It must never translate this internal `Yield` into userspace `EIO`.
-
-After acquiring the final page transaction, a fault rechecks the resident PTE
-before allocating. If another hart has already installed a mapping that
-permits the faulting access, the waiter converges on that mapping and only
-refreshes its translation. Every invalid-to-valid PTE commit performs the
-ASID-scoped local translation barrier before releasing the page transaction;
-a remote hart that had already trapped performs its own local refresh when it
-converges. Publishing software bookkeeping alone is not completion.
+Application. The fault handler (§5.1) acquires a Materializer reservation, observes recipes, and calls `materialize_page`. If `materialize_page` returns `Blocked`, the handler drops the reservation and its guards, yields on the token's exact source, and on wake continues the materialize/publish lane with the owned outcome. Reacquisition and publication validation still reject a changed recipe; only that stale result restarts the outer recipe-resolution loop.
 
 ### 3.7 WaitToken abstraction
 <!-- txdoc:VM-3-7-WAITTOKEN-ABSTRACTION -->

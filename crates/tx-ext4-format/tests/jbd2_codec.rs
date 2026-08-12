@@ -133,6 +133,8 @@ fn superblock_state_update_preserves_unknown_bytes_and_recomputes_crc32c() {
     bytes[48..64].copy_from_slice(&[0x5a; 16]);
     bytes[80] = 4;
     bytes[84..252].fill(0xC3);
+    let initial_checksum = crc32c_append(0xFFFF_FFFF, &bytes);
+    bytes[252..256].copy_from_slice(&initial_checksum.to_be_bytes());
 
     let superblock = Jbd2Superblock::parse(&bytes).unwrap();
     superblock.write_state(&mut bytes, 19, 0).unwrap();

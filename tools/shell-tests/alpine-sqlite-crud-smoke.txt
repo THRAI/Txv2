@@ -1,0 +1,18 @@
+# alpine-sqlite-crud-smoke.txt - file-backed sqlite3 create/table CRUD smoke.
+wait "/ # " within 60000
+sleep 500
+send "rm -f /tmp/sqlite-crud-demo.db /tmp/sqlite-crud-demo.db-journal /tmp/sqlite-crud-demo.db-wal /tmp/sqlite-crud-demo.db-shm\n"
+expect "/ # " within 10000
+sleep 500
+send "/usr/bin/sqlite3 -batch -noheader /tmp/sqlite-crud-demo.db \"PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0; CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT); INSERT INTO kv VALUES('a','one'),('b','two'); SELECT 'after-insert:' || count(*) FROM kv; UPDATE kv SET v='three' WHERE k='b'; SELECT 'after-update:' || v FROM kv WHERE k='b'; DELETE FROM kv WHERE k='a'; SELECT 'after-delete:' || count(*) FROM kv;\"; echo sqlite-crud-status-$?\n"
+expect "delete" within 20000
+expect "after-insert:2" within 20000
+expect "after-update:three" within 20000
+expect "after-delete:1" within 20000
+expect "sqlite-crud-status-0" within 20000
+sleep 500
+send "/usr/bin/sqlite3 -batch -noheader /tmp/sqlite-crud-demo.db \"SELECT 'final:' || k || '=' || v FROM kv;\"; echo sqlite-reopen-status-$?\n"
+expect "final:b=three" within 20000
+expect "sqlite-reopen-status-0" within 20000
+sleep 500
+quit

@@ -12,7 +12,8 @@
 - `PageContainerKind` — the three variants (Anon, File, Device).
 - `RNodeBacking` — the three-variant classification of what content an RNode has.
 - The uniform step functions for page-backed RNodes (read, write, mmap, truncate, fsync).
-- The narrow `FsPageBacking` trait for the File variant's dispatch into filesystem code.
+- The current `FsPageBacking` compatibility bridge and its migration to pure
+  `FileLayoutPlanner` plus the Tx filesystem adapter.
 - Cross-variant operations (splice, copy_file_range, sendfile).
 - Reflink and sharing semantics.
 
@@ -30,7 +31,10 @@ This document does *not* cover:
 **Key commitments** (established in prior rounds):
 
 1. **No shadow objects.** COW is expressed via PTE manipulation, not via stacked PageContainers. A MAP_PRIVATE mapping that writes generates a fresh private Frame that is installed in the VmEntry's private-frame tracking, not in the source PageContainer.
-2. **No Pager trait.** Per-variant logic is handled by match-on-kind. The only genuine polymorphism is `FsPageBacking` for filesystem-specific page fetch, which is a narrow trait used only by `PageContainerKind::File`.
+2. **No generic PageContainer Pager trait.** Per-variant content dispatch is
+   match-on-kind. The target filesystem-specific I/O polymorphism is the pure
+   `FileLayoutPlanner` behind a Tx adapter; `FsPageBacking` remains only the
+   current compatibility bridge for `PageContainerKind::File`.
 3. **Eager prefault is preserved.** Syscall scripts prefault user buffers during the observe phase. Step functions do not take kernel-mode page faults on user buffers; they either have the pages materialized and memcpy, or return `Blocked` waiting for materialization.
 4. **No swap.** Anonymous pages are pinned until explicit teardown. The Anon variant has no flush-to-disk path; its `evict` does nothing (the CachePin drop + map_count transitions handle reclamation naturally).
 5. **Stackless coroutines.** Every step function returns `StepOutcome<T>`. Page fetches that need I/O return `Blocked(carrier, mask)`; the script composes a wait; the step retries after wake.
@@ -49,7 +53,9 @@ This document does *not* cover:
 - [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — step outcome algebra, five-phase discipline.
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, BIF-*.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §7 (FS instances).
-- [`IO_MANAGER_v1.md`](../05_filesystem/IO_MANAGER_v1.md) — target I/O control plane that keeps `PageContainer` as the only long-lived ordinary file-data cache while moving miss/writeback submission, readahead, completion, and block scheduling into service futures.
+- [`OBJECT_API_LANES_v1.md`](../00_meta-framework/OBJECT_API_LANES_v1.md) — owner-private publication, single-binding slots, and the rule that manager/state-machine ownership stays outside published roots.
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md) — canonical cross-layer authority for `PageDataLease`, PageSlot dirty state, zero-copy file payload, reclaim providers, and memory-pressure coordination.
+- [`IO_MANAGER_v1.md`](../05_filesystem/IO_MANAGER_v1.md) — target file-I/O execution plane that keeps `PageContainer` as the only long-lived ordinary file-data cache while moving admitted request/graph execution, readahead mechanics, completion routing, and block scheduling into service futures.
 
 ### Zone-derived type policy
 <!-- txdoc:PAGE-BACKED-ZONE-DERIVED-TYPE-POLICY -->
@@ -256,13 +262,8 @@ The zone-allocated entity that owns an offset-keyed collection of Frames.
 
 ```rust
 pub struct PageContainer {
-    /// Zone slot metadata (refcount, generation, SENTINEL_DEAD).
-    meta: SlotMeta,
-
-    /// Offset → Frame. Offsets are byte offsets (aligned to page size).
-    ///   - For File and Anon variants: offset is content offset.
-    ///   - For Device variant: offset is into the MMIO region, starting from 0.
-    pages: PageCacheIndex<PageIndex, Cap<Frame>>,
+    /// Guard-observed authoritative PageIndex -> ResidentPage bindings.
+    resident: Published<ResidentRoot>,
 
     /// Valid byte range; reads and writes beyond this return SIGBUS on mmap
     /// access or EOF/0-len on read. Updated by truncate, fallocate, and
@@ -282,14 +283,60 @@ pub struct PageContainer {
 
     /// Variant-specific data.
     kind: PageContainerKind,
+
+    /// Coherency for truncate, direct I/O, hole punch, and fsync.
+    ranges: RangeReservationTable,
+
+    /// Ownership-transfer boundary into the L4 page-submission manager.
+    io: PageIoSubmissionHandle,
+}
+
+struct ResidentRoot {
+    pages: PersistentSparseIndex<PageIndex, ResidentRef>,
+}
+
+struct ResidentPage {
+    /// Stable after installation.
+    ppn: Ppn,
+    cache_pin: PageCachePin,
+
+    /// Resident/withdrawn/generation/referenced observation.
+    hot_state: AtomicResidentState,
+
+    /// Dirty/writeback/redirty/fetch-completion state machine.
+    transition: PageSlot,
 }
 ```
 
 **Zone and SlotMeta.** Each PC occupies one slot in a `BitmapZone<PageContainer>`. Retention via `Cap<PageContainer>`; SENTINEL_DEAD on the final Cap drop. No Identity/Payload split — PC is co-located (no "degraded-but-addressable" state; PC is either fully alive or fully gone).
 
-**Pages index.** `PageCacheIndex<PageIndex, Cap<Frame>>` is the one place in v1 where an XArray-like sparse index is intentional. It is VM/PageContainer-local: sparse ordered lookup by page index, install-if-absent / install-if-match publication, withdrawal, iteration for reclaim/writeback, and optional non-authoritative marks such as dirty, writeback, referenced, or no-reclaim. Offsets are page-aligned byte offsets shifted right by PAGE_SHIFT (12), then keyed by page index. The index is the single linearization point for "is there a materialized Frame at this offset?"
+**Resident index.** `ResidentRoot` is the one place in v1 where an XArray-like
+persistent sparse index is intentional. It is PageContainer-local: sparse
+ordered lookup by page index, install-if-absent / install-if-match publication,
+withdrawal, and iteration for reclaim/writeback. Offsets are page-aligned byte
+offsets shifted right by `PAGE_SHIFT`, then keyed by page index. Root
+publication is the linearization point for "is there a resident binding at
+this offset?"
 
-Each entry in the page index is a Frame reference. The Frame's cache_ref is incremented when inserted, decremented on removal. The PC holds CachePins on every Frame in its page index.
+The resident index stores private stable `ResidentRef` values. `ResidentPage`
+and radix/tree nodes are observer/state storage, not semantic entities: they do
+not receive public `Cap<Node>`, `Weak<Node>`, lane, or endpoint APIs. They may
+use private observer-node zones when bounded node reservation is useful. The
+resident cell holds the frame cache pin; materialization acquires owned map
+evidence before the caller's epoch guard ends.
+
+**Marks and page state.** Referenced/no-reclaim hints may use atomic bits on the
+stable cell. Dirty, writeback, redirty, fetching, completion generation, and
+error transitions remain in `PageSlot` or an equivalent per-entry state cell.
+Updating these states does not publish a new resident root.
+
+**I/O manager boundary.** The L4 page-submission manager and L6 block-submission
+manager are not part of `ResidentRoot` and do not share its reader critical
+section. `PageIoSubmissionHandle` transfers an immutable request to L4. L4 owns
+request queues, completion/continuation graphs, batching, readahead, and waiter
+routing; L6 owns block queues, tags, depth, merge, fences, and completion
+tracking. PageContainer retains ordinary file-data ownership and applies
+generation-checked completion through typed install/transition operations.
 
 **Conservative XArray scope.** The XArray-like substrate is not a general
 kernel object directory and not the implementation contract for pid namespaces,
@@ -298,9 +345,22 @@ reservation/index structures. The PC page index gets this richer shape because
 file and device page caches need sparse offset lookup, ordered reclaim walks,
 and per-entry marks.
 
+**Publication ordering.** Install validates the completion generation and
+reserves the stable resident cell, sparse path nodes, and retire capacity before
+release-publishing the new root. Only then may it wake waiters. Invalidate first
+marks the old cell withdrawn so an old snapshot cannot acquire new map evidence,
+then publishes a root without the binding and retires the old path through EBR.
+Removal publication completes before a direct-I/O or truncate reservation is
+released. Existing map pins finish under their normal lifetime rules. RCU
+delays physical destruction; it does not authorize stale materialization after
+truncate, hole punch, reclaim, or explicit invalidation.
+
 **Size.** Governs the legal offset range for this PC. Truncate-down invalidates pages beyond the new size; truncate-up extends the valid range (pages are not pre-materialized). Atomic reads let concurrent readers observe size without a lock.
 
-**Flags.** Coarse-grained hints for writeback and reclaim schedulers. Not authoritative state; per-page dirty/io-locked flags on FrameMeta are the ground truth.
+**Flags.** Coarse-grained replacement hints such as referenced, no-reclaim,
+age, and queue membership. They are not authoritative state. `PageSlot` is the
+sole authority for fetching, dirty, writeback, redirty, error, and completion
+generation; `FrameMeta` retains only physical-lifecycle and role evidence.
 
 ### 3.2 PageContainerKind
 <!-- txdoc:PAGE-BACKED-3-2-PAGECONTAINERKIND -->
@@ -319,8 +379,9 @@ pub enum PageContainerKind {
         swap_policy: AnonSwapPolicy,
     },
 
-    /// File-backed: pages fetched from and (if dirty) written back to a
-    /// filesystem's backing store via FsPageBacking.
+    /// File-backed: PageBacked owns pages and their generations. Filesystem
+    /// layout is planned through FileLayoutPlanner and lowered by the Tx
+    /// adapter; FsPageBacking is the current compatibility bridge.
     /// 
     /// Holds the filesystem-instance reference (to dispatch fs-specific
     /// calls) and the fs-internal identifier (e.g., inode number for ext4,
@@ -362,7 +423,14 @@ pub enum AnonSwapPolicy {
 
 **tmpfs.** `PageContainerKind::Anon { swap_policy: Persistent }`. Same as anonymous mmap except the PC is attached to an RNode with a path-namespace presence. File operations (read, write, mmap) work uniformly.
 
-**Persistent filesystem (ext4).** `PageContainerKind::File { fs, fs_object_id }`. Pages fetched via `FsPageBacking::fetch_page()`. Dirty pages tracked; writeback issued periodically or on fsync.
+**Persistent filesystem (ext4).** `PageContainerKind::File { fs,
+fs_object_id }`. PageBacked admits concrete PageSlot generations and signs a
+`PageDataLease`; the Tx filesystem adapter invokes pure `FileLayoutPlanner`,
+binds opaque payload keys back to retained segments, and lowers
+`FileIoPlan<K>` into the existing `BackendBioGraph`. `FsPageBacking` and
+`PageIoPlan` remain compatibility staging vocabulary. `PageSlot` owns dirty
+state; the global memory-pressure coordinator owns background dirty budgets,
+while fsync captures a target generation frontier.
 
 **Device framebuffer, DRI.** `PageContainerKind::Device { device, base_ppn, page_count }`. No allocation; the Frames in the PC page index wrap pre-existing device-owned PPNs.
 
@@ -387,20 +455,23 @@ Spec decision: **/dev/zero is Projected, not PageBacked.** Documented here for c
 ### 4.1 Creation
 <!-- txdoc:PAGE-BACKED-4-1-CREATION -->
 
-`PageContainer::new(kind, initial_size)` constructs a new PC in a zone slot:
+`PageContainer::new(kind, initial_size, io)` constructs a new PC in a zone
+slot:
 
 ```rust
 pub fn new_page_container(
     kind: PageContainerKind,
     initial_size: u64,
+    io: PageIoSubmissionHandle,
 ) -> Result<Cap<PageContainer>, Errno> {
     let slot = zone::reserve::<PageContainer>()?;
     let pc = PageContainer {
-        meta: SlotMeta::new(),
-        pages: PageCacheIndex::new(),
+        resident: Published::new(ResidentRoot::empty()),
         size: AtomicU64::new(initial_size),
         flags: AtomicU32::new(0),
         kind,
+        ranges: RangeReservationTable::new(),
+        io,
     };
     let cap = zone::sign(slot, pc);
     Ok(cap)
@@ -530,48 +601,47 @@ pub fn step_read(
 }
 ```
 
-The key call is `materialize_page(pc, offset, guard) -> StepOutcome<Frame>`. This is where the per-variant logic lives:
+The key call is `materialize_page(pc, offset, guard) ->
+StepOutcome<MaterializedPagePin>`. This is where guarded resident observation,
+owned map-evidence acquisition, and per-variant miss submission meet:
 
 ```rust
 fn materialize_page<'g>(
     pc: &Cap<PageContainer>,
     offset: u64,
     guard: &'g Guard,
-) -> StepOutcome<IdentRef<'g, Frame>> {
+) -> StepOutcome<MaterializedPagePin> {
     let page_index = (offset >> PAGE_SHIFT) as u64;
-    
-    // Fast path: already in the PC page index.
-    if let Some(frame) = pc.pages.lookup(page_index, guard) {
-        return Done(frame);
+
+    // Fast path: one guarded root read, sparse lookup, state validation,
+    // and owned MapPin acquisition. No PC-wide or manager lock.
+    if let Some(resident) = pc.observe_resident(page_index, guard) {
+        if let Some(materialized) = resident.try_materialize() {
+            return Done(materialized);
+        }
+        // Withdrawn or generation changed: retry as a miss.
     }
-    
+
     // Miss. Dispatch by kind.
     match &pc.kind {
         PageContainerKind::Anon { .. } => {
-            // Allocate zeroed frame, install.
-            match install_new_frame(pc, page_index, /* zero = */ true, guard) {
-                Ok(frame) => Done(frame),
+            match pc.reserve_anon_install(page_index, guard) {
+                Ok(reservation) => reservation.initialize_zero_and_commit(),
                 Err(e) => Err(e),
             }
         }
-        PageContainerKind::File { fs, fs_object_id } => {
-            // Dispatch to filesystem's page fetcher.
-            match fs.upgrade(guard)?.page_backing().fetch_page(*fs_object_id, offset, guard) {
-                Done(frame_ready) => {
-                    install_prefilled_frame(pc, page_index, frame_ready, guard)
-                }
-                Blocked(c, m) => Blocked(c, m),
-                Err(e) => Err(e),
-            }
+        PageContainerKind::File { fs_object_id, .. } => {
+            pc.io.submit_materialize(PageIoRequest::demand(
+                pc.key(), page_index, *fs_object_id
+            ))
         }
-        PageContainerKind::Device { device, base_ppn, page_count } => {
-            // Device region: wrap the appropriate PPN directly.
+        PageContainerKind::Device { base_ppn, page_count, .. } => {
             if page_index >= *page_count as u64 {
                 return Err(Errno::EINVAL);
             }
             let ppn = PPN(base_ppn.0 + page_index as u32);
-            match install_device_frame(pc, page_index, ppn, guard) {
-                Ok(frame) => Done(frame),
+            match pc.reserve_device_install(page_index, ppn, guard) {
+                Ok(reservation) => reservation.commit(),
                 Err(e) => Err(e),
             }
         }
@@ -581,10 +651,14 @@ fn materialize_page<'g>(
 
 Three dispatch arms:
 - **Anon**: allocate a frame from the frame allocator, zero it, install in the PC page index. Synchronous; the only failure is allocation failure (ENOMEM).
-- **File**: call into the filesystem's `FsPageBacking::fetch_page`, which may return `Blocked` on disk I/O. If it returns a ready frame, install it. The frame was allocated by the fs or by this code; the fs-returned frame is already populated with disk content.
+- **File**: commit a page request to the L4 manager and yield when the page is
+  not already resident. L5 plans filesystem mapping and L6 owns block
+  submission; generation-checked completion returns to the PC install path.
 - **Device**: compute the device PPN, construct a Frame wrapping it (no allocation), install in the PC page index.
 
-Installation is via `install_if_match` on the PC page-index slot: if another thread installed first, we drop our candidate frame and re-observe.
+Installation is through a PC-owned reservation that covers the stable resident
+cell, sparse path update, and retire capacity. If another writer installed or
+withdrew the page first, the reservation rolls back and the caller re-observes.
 
 ### 5.2 Write
 <!-- txdoc:PAGE-BACKED-5-2-WRITE -->
@@ -592,7 +666,9 @@ Installation is via `install_if_match` on the PC page-index slot: if another thr
 Write is symmetric to read, with three additions:
 
 1. **Extending size.** If offset + len exceeds PC.size, size is bumped via CAS. For Device variant, writes beyond size return EINVAL.
-2. **Dirty tracking.** Written pages have FrameMeta.flags.dirty set. For File variant, this marks the page for writeback. For Anon variant, dirty has no meaning (no writeback target).
+2. **Dirty tracking.** A File write advances the authoritative `PageSlot`
+   generation and transitions it to Dirty. Redirty during writeback remains a
+   PageSlot transition. Anonymous content has no backing writeback state.
 3. **Copy-on-write for shared pages.** If the target offset currently holds a Frame that is shared (cache_ref > 1, indicating reflink), the write must allocate a new Frame, copy the shared content, install the new Frame. This is reflink-induced CoW; see §7.
 
 Other than that, step_write mirrors step_read in shape.
@@ -600,7 +676,7 @@ Other than that, step_write mirrors step_read in shape.
 ### 5.3 Truncate
 <!-- txdoc:PAGE-BACKED-5-3-TRUNCATE -->
 
-Truncate adjusts PC.size and drops pages beyond the new size.
+Truncate adjusts `PC.size` and withdraws resident bindings beyond the new size.
 
 ```rust
 pub fn step_truncate(
@@ -608,52 +684,55 @@ pub fn step_truncate(
     new_size: u64,
     ctx: &ThreadContext,
 ) -> StepOutcome<()> {
+    // A manager-owned truncate intent blocks conflicting admissions while an
+    // asynchronous filesystem metadata phase is in flight. It is operation
+    // state, not an epoch guard or substrate reservation carried across yield.
+    let intent = match pc.io().drive_truncate(pc.key(), new_size, ctx) {
+        Done(intent) => intent,
+        Blocked(c, m) => return Blocked(c, m),
+        Err(e) => return Err(e),
+    };
+
+    // The final commit step is bounded and non-yielding.
     let guard = epoch::guard();
     let pc = pc.upgrade(&guard)?;
-    
-    // For File variant, ask fs first — some filesystems limit truncate
-    // (e.g., read-only mounts return EROFS; some fs check quotas).
-    match &pc.kind {
-        PageContainerKind::File { fs, fs_object_id } => {
-            fs.upgrade(&guard)?
-              .page_backing()
-              .truncate(*fs_object_id, new_size, &guard)?;
-        }
-        PageContainerKind::Device { .. } => {
-            return Err(Errno::EINVAL);  // can't truncate MMIO regions
-        }
-        _ => {}
-    }
-    
-    let old_size = pc.size.swap(new_size, Ordering::AcqRel);
-    pc.flags.fetch_or(FLAG_TRUNCATE_IN_PROGRESS, Ordering::AcqRel);
-    
-    if new_size < old_size {
-        // Drop pages beyond new_size.
-        let first_drop_index = (new_size + PAGE_SIZE as u64 - 1) >> PAGE_SHIFT;
-        let last_drop_index = (old_size - 1) >> PAGE_SHIFT;
-        
-        for page_index in first_drop_index..=last_drop_index {
-            if let Some(frame) = pc.pages.remove(page_index, &guard) {
-                // Drop of `frame` releases this PC's CachePin on the Frame.
-                // If that was the last cache_ref and no map_count or refcount
-                // holds the Frame, FrameMeta.state reaches zero and
-                // free_frame is called.
-                drop(frame);
-            }
-        }
-    }
-    
-    pc.flags.fetch_and(!FLAG_TRUNCATE_IN_PROGRESS, Ordering::AcqRel);
+    let range = pc.ranges.reserve_truncate(intent.affected_range())?;
+    let withdrawal = pc.prepare_resident_withdrawal(&intent, &range, &guard)?;
+
+    // Old guarded roots may still exist. Marking cells withdrawn prevents
+    // them from granting new map evidence before the binding root is replaced.
+    withdrawal.mark_withdrawn();
+    pc.size.store(new_size, Ordering::Release);
+    let removed = withdrawal.commit();
+
+    // Root removal is visible before the semantic reservation is released or
+    // waiters are notified. Retired roots release cache pins after grace.
+    drop(range);
+    removed.notify_waiters();
     Done(())
 }
 ```
 
-For File variant, the filesystem must also update its on-disk metadata (file size, block allocation). That happens inside `FsPageBacking::truncate` before the in-memory PC shrinks.
+For File variant, the filesystem must also update its on-disk metadata (file
+size and block allocation). The L4/L5 truncate operation owns that asynchronous
+phase. A manager-owned truncate intent blocks conflicting admission while it
+is in flight; the epoch guard and final `RangeReservation` exist only in the
+bounded commit step and never cross a yield.
 
-**Concurrent readers during truncate.** A reader observing size before the truncate sees the old size; after the truncate, the new size. Pages in the truncated range may still be in the reader's hand (epoch-protected), but the reader's offset check against size catches it: if the reader's offset is now beyond size, it returns short. No page materialization is attempted for offsets ≥ size.
+**Concurrent readers during truncate.** A reader observing size before the
+truncate sees the old size; after the truncate, the new size. A reader that
+already acquired owned map evidence may finish its current bounded access.
+An old guarded root cannot acquire new evidence after the resident cell is
+marked withdrawn. New read/materialization attempts re-check size and return a
+short read, EOF, or SIGBUS according to the caller contract.
 
-**Concurrent mmaped writers during truncate.** Pages mapped into address spaces (map_count > 0) have MapPins independent of the PC's CachePin. Removing the page from the PC page index decrements cache_ref but the MapPin keeps the Frame alive. The mmap holders continue to access the Frame through their PTEs until they unmap or get SIGBUS on next fault beyond the new size. (POSIX permits but does not require SIGBUS on access to truncated-away mappings; implementations vary. We implement SIGBUS-on-fault-beyond-size via the fault handler checking PC.size.)
+**Concurrent mmaped writers during truncate.** Pages mapped into address
+spaces have `MapPin`s independent of the PC's cache pin. The truncate receipt
+identifies the withdrawn range for VM teardown/shootdown before the operation
+is reported complete. Existing pins retain the frame until that teardown
+finishes; later access faults, re-checks `PC.size`, and receives SIGBUS beyond
+the new end. Root retirement alone neither revokes a PTE nor waits for a
+shootdown.
 
 ### 5.4 Fsync
 <!-- txdoc:PAGE-BACKED-5-4-FSYNC -->
@@ -669,18 +748,21 @@ pub fn step_fsync(
     let pc = pc.upgrade(&guard)?;
     
     match &pc.kind {
-        PageContainerKind::File { fs, fs_object_id } => {
-            fs.upgrade(&guard)?
-              .page_backing()
-              .fsync(*fs_object_id, &guard)
-        }
+        PageContainerKind::File { fs_object_id, .. } =>
+            pc.io.submit_fsync(PageIoRequest::fsync(
+                pc.key(),
+                *fs_object_id,
+            )),
         PageContainerKind::Anon { .. } => Done(()),  // no backing
         PageContainerKind::Device { .. } => Done(()),  // device handles its own sync
     }
 }
 ```
 
-The filesystem's `fsync` implementation walks the PC's pages (passed implicitly via `fs_object_id`), issues writeback for any dirty ones, and (for File) flushes any on-disk metadata. Returns `Blocked` while disk I/O is in flight.
+L4 walks the PC's dirty-state projection through PageContainer-owned APIs,
+deduplicates and routes writeback, and asks L5 to flush filesystem metadata.
+The filesystem does not walk a private resident root by `fs_object_id`.
+`step_fsync` returns `Blocked` while the manager-owned request is in flight.
 
 ### 5.5 Fallocate
 <!-- txdoc:PAGE-BACKED-5-5-FALLOCATE -->
@@ -698,63 +780,85 @@ For Device: returns EINVAL.
 ## 6. FsPageBacking
 <!-- txdoc:PAGE-BACKED-6-FSPAGEBACKING -->
 
-The narrow trait for filesystem-specific page fetch and writeback. This is the only polymorphism needed for the File variant.
+The current live compatibility trait for filesystem-specific page I/O. It
+remains the File variant's per-page step bridge while callers migrate. It is
+not the target pure planner contract: the target is `FileLayoutPlanner` over
+`FileLayoutRequest<K>` / `FileIoPlan<K>`, with a Tx adapter holding resources
+before admission and lowering into the existing `BackendBioGraph`. L4 owns the
+admitted request/resource bundle, waiter and graph-execution state; L6 owns
+ready block submission.
 
 ```rust
 pub trait FsPageBacking {
-    /// Fetch the page at `offset` into a freshly-allocated Frame.
-    /// Returns Done(frame) if content is available (from cache or
-    /// synchronous fetch); Blocked if disk I/O is needed.
-    fn fetch_page<'g>(
+    fn fetch_page(
         &self,
-        fs_object_id: u64,
+        fs_object_id: FsObjectId,
         offset: u64,
-        guard: &'g Guard,
-    ) -> StepOutcome<Frame>;
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Frame, NoProgress>;
 
-    /// Write a dirty page back to backing storage.
-    fn flush_page<'g>(
+    fn flush_page(
         &self,
-        fs_object_id: u64,
+        fs_object_id: FsObjectId,
         offset: u64,
         frame: &Frame,
-        guard: &'g Guard,
-    ) -> StepOutcome<()>;
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
 
-    /// Truncate the backing file to `new_size`. May fail (EROFS, EDQUOT, etc.)
-    /// before any page-level state is touched.
-    fn truncate<'g>(
+    fn truncate(
         &self,
-        fs_object_id: u64,
+        fs_object_id: FsObjectId,
         new_size: u64,
-        guard: &'g Guard,
-    ) -> StepOutcome<()>;
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
 
-    /// Flush all dirty pages for this object to backing storage and
-    /// commit any outstanding metadata (for ordered / metadata-journal
-    /// filesystems).
-    fn fsync<'g>(
+    fn fsync_file(
         &self,
-        fs_object_id: u64,
-        guard: &'g Guard,
-    ) -> StepOutcome<()>;
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
 
-    /// Capability query: does this fs support reflink across to `other`?
-    /// Default: no.
+    fn sync_filesystem(
+        &self,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
+
+    fn fallocate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
+
     fn supports_reflink(&self, other: &PageContainer) -> bool {
         false
     }
 }
 ```
 
-Implementations:
+The signatures above summarize the live surface; the source of truth remains
+`page_backed/fs_page_backing.rs`. Current compatibility paths are:
 
-- **rsext4::PageBacking:** connects to ext4 on-disk format. `fetch_page` issues a block read via the block device; `flush_page` writes back. `reflink` is false (ext4 doesn't support reflink).
-- **Future tmpfs-as-fs:** not needed — tmpfs uses Anon variant, not File, so it doesn't participate in this trait.
+- **`FsPageBacking`:** ext4, bdev-fs, tmpfs, and several synthetic filesystems
+  still implement per-page `fetch_page` / `flush_page` and lifecycle methods.
+  Some paths call filesystem/block-device work directly.
+- **`BackendPlanner`:** planner-backed ext4 requests may already use
+  `prepare_page_io` / `plan_page_io` / resume/completion hooks and produce
+  `BackendPlan` or the existing `BackendBioGraph` for L4/L6 execution.
 
-Most filesystems we care about for Linux 2.6 parity are local block-backed. Network filesystems (nfs, cifs, fuse) would add their own impls when we get to them.
+These are two staging paths in the current checkout, not two target interface
+families. They converge by moving format-only decisions into
+`FileLayoutPlanner`, resource/transaction binding into the Tx adapter, and all
+block execution into the existing graph.
 
-**The trait is narrow.** Four step-returning methods plus one capability predicate. No vtable for read, write, lseek, ioctl — those go through the uniform page_backed step functions and only dispatch into fs at fetch/flush/truncate/fsync points.
+The target planner result is owned and contains no guard, witness, backend lock,
+`WaitSourceId`, device queue handle, or completion callback. Read, write, lseek,
+and ioctl remain PageBacked/VFS operations rather than filesystem vtable
+methods.
+
+No new caller may treat `PageIoPlan`, `BackendPlan`, or `BioPlan` as a second
+target IR. New planning work uses opaque keys and `FileIoPlan<K>`; new
+execution work extends the existing `BackendBioGraph`.
 
 ---
 
@@ -782,7 +886,9 @@ A write into a VmEntry backed by a shared Frame (cache_ref > 1, or PTE is read-o
 1. Identifies the target page via VmEntry + offset -> PC -> page in the PC page index.
 2. Checks the Frame's cache_ref. If > 1 (shared), allocate a new Frame.
 3. Copy source Frame content to new Frame.
-4. Install new Frame in the PC page index at the same offset (via `install_if_match`; concurrent CoW from another writer on another PC is resolved by the page index's linearization).
+4. Install the new Frame through a PC-owned install-if-match reservation;
+   concurrent CoW is resolved by resident-root publication and generation
+   revalidation.
 5. Install writable PTE pointing at new Frame in the faulting VmEntry's pmap.
 6. The old shared Frame's cache_ref decrements (we removed our entry).
 
@@ -803,7 +909,10 @@ There is no `PageContainer::reflink_into(other_pc, src_range, dst_range)` primit
 ## 8. Reclaim under memory pressure
 <!-- txdoc:PAGE-BACKED-8-RECLAIM-UNDER-MEMORY-PRESSURE -->
 
-Under no-swap, reclaim options are limited. This section describes what's available; the actual reclaim policy (when to reclaim, which PC's pages to pick) is a separate concern deferred to a future doc.
+Under no-swap, reclaim options are limited. This section describes PageBacked's
+owner-side eligibility and withdrawal mechanics. Global trigger, provider
+arbitration, algorithm selection, writeback pressure, and allocation retry are
+defined by [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md).
 
 ### 8.1 What can be reclaimed
 <!-- txdoc:PAGE-BACKED-8-1-WHAT-CAN-BE-RECLAIMED -->
@@ -813,7 +922,7 @@ Under no-swap, reclaim options are limited. This section describes what's availa
 | Anon (Reclaimable) | Only if map_count and cache_ref both reach zero | Explicit teardown (munmap, PC drop) |
 | Anon (Persistent, tmpfs) | Only via truncate or PC drop | Explicit |
 | File, clean page | Yes | Drop from PC page index; CachePin decrements; Frame freed if unmapped |
-| File, dirty page | After writeback | Flush via FsPageBacking, then same as clean |
+| File, dirty page | After generation-checked writeback | Admit a bounded PageDataLease batch, plan/lower it into BackendBioGraph, then reclaim only after PageSlot accepts terminal completion |
 | Device | No | Frames are device-owned; not allocator-managed |
 
 Under memory pressure, the reclaim target is almost exclusively **clean file pages**. Dirty file pages require a writeback step first. Anonymous pages cannot be reclaimed (in v1, under no-swap).
@@ -821,35 +930,33 @@ Under memory pressure, the reclaim target is almost exclusively **clean file pag
 ### 8.2 Reclaim trigger
 <!-- txdoc:PAGE-BACKED-8-2-RECLAIM-TRIGGER -->
 
-Reclaim is synchronous: an `alloc_frame` failure triggers the allocation path to request reclaim.
+PageBacked implements a `ReclaimProvider` adapter. It exports bounded snapshots
+and stable candidate IDs, then revalidates a selected candidate through
+`try_claim`. A clean file page may be claimed only if its binding generation,
+PageSlot classification, mapping/pin facts, and no-reclaim state still permit
+withdrawal. Dirty pages are routed through a separate writeback episode; the
+allocation slow path never recursively performs synchronous filesystem I/O.
 
-```rust
-fn alloc_frame_with_reclaim() -> Option<PPN> {
-    if let Some(ppn) = alloc_frame() { return Some(ppn); }
-    
-    // Try to reclaim clean file pages.
-    reclaim::reclaim_clean_file_pages(CLEAN_RECLAIM_BUDGET);
-    
-    if let Some(ppn) = alloc_frame() { return Some(ppn); }
-    
-    // Try harder: writeback-then-reclaim dirty pages.
-    reclaim::writeback_and_reclaim(DIRTY_RECLAIM_BUDGET);
-    
-    alloc_frame()  // final attempt; None if still out
-}
-```
-
-The reclaimer walks a global list of PC-owned pages (LRU-like, approximated by a per-PC dirty list and global age counters), picks candidates, invalidates their page-index entries, potentially issues writeback.
+The first policy uses persistent second-chance cursors and clean-only reclaim.
+Later ghost/refault or generational policy consumes the same provider contract.
+PageBacked reports separately: candidates scanned, bindings withdrawn, role
+pins released, and physical frames actually returned to the allocator.
 
 ### 8.3 Reclaim vs concurrent access
 <!-- txdoc:PAGE-BACKED-8-3-RECLAIM-VS-CONCURRENT-ACCESS -->
 
-Reclaiming a page removes it from the PC page index. A concurrent reader observing the same offset may:
+Reclaiming a page marks its stable resident cell withdrawn and publishes a root
+without that binding. A concurrent reader observing the same offset may:
 
-- Find the page (observed before reclaim's remove linearization) and continue.
+- Find the old binding but fail resident-state validation, then retry as a
+  miss.
+- Acquire owned map evidence before withdrawal and finish that bounded access.
 - Find an empty slot (observed after remove) and trigger re-materialization via `materialize_page`. For File variant, this refetches from disk; for Anon, this would reallocate and zero — but anonymous reclaim doesn't happen in v1, so this path is unreachable. For Device, the device PPN is stable; reclaim doesn't remove Device entries.
 
-This is architecturally fine: the PC page index is the linearization point. Any state visible through it is safe to use; anything missing triggers re-fetch.
+Root publication is the binding visibility point, while the stable cell's
+withdrawn/generation state prevents an old root from granting new evidence.
+Visibility alone is therefore insufficient; every hit validates the cell
+before acquiring its owned pin.
 
 ---
 
@@ -1018,7 +1125,7 @@ The private Frame is tracked per-VmEntry (see the VM subsystem's own data struct
 - **FileOps vtable on Inode.** The per-instance read/write/lseek/mmap/ioctl function pointer table. Now: match on RNodeBacking.
 - **InodeOps vtable on Inode.** The per-fs lookup/create/unlink function pointer table. Now: FsOps on the fs instance (MODULE_MAP §7), not per-Inode.
 - **FileOps injection at open time.** Used by devices to swap FileOps per open. Now: backing variant is fixed at RNode creation; device nodes are Device-variant PageBacked or CharDevice StructBacked from the start.
-- **`address_space_operations` analog.** Linux's per-Inode page-cache operations table. Now: FsPageBacking on the fs instance.
+- **`address_space_operations` analog.** Linux's per-Inode page-cache operations table. Target: PageBacked owner operations plus pure `FileLayoutPlanner` and the Tx adapter; `FsPageBacking` is only the compatibility bridge.
 - **Fake Inodes for anonymous memory.** SYSV shm, POSIX shm, memfd all synthesized Inodes to plug into the FileOps machinery. Now: direct RNode with PageBacked(Anon) backing, no filesystem involved.
 - **Separation between file mmap and anonymous mmap code paths.** Linux has distinct code paths for file-backed vs anonymous mmap, converging late. Now: one step_mmap, one fault handler, two cases (fresh PC for anon, shared PC for file).
 
@@ -1034,7 +1141,12 @@ The private Frame is tracked per-VmEntry (see the VM subsystem's own data struct
 ### 11.3 Net change
 <!-- txdoc:PAGE-BACKED-11-3-NET-CHANGE -->
 
-Lines of code: significantly less. Linux's address_space_operations has ~20 methods per filesystem; FsPageBacking has 4. Per-instance FileOps per Inode (1 KB+): eliminated. The machinery for "what does read do on this file?" collapses from "look up FileOps, maybe injected, vtable-call read" to "match on RNodeBacking, call uniform or subsystem-specific step_read."
+Lines of code: significantly less. Linux's `address_space_operations` has
+roughly 20 methods per filesystem; the compatibility `FsPageBacking` surface is
+narrow, and the target splits pure layout planning from Tx execution adaptation.
+Per-instance FileOps per Inode (1 KB+): eliminated. The machinery for "what
+does read do on this file?" collapses from injected vtables to matching
+`RNodeBacking` and calling uniform or subsystem-specific step functions.
 
 ---
 
@@ -1054,7 +1166,11 @@ When are dirty file pages flushed to disk? Options: on fsync only (simple, but r
 ### 12.3 Truncate race against reclaim
 <!-- txdoc:PAGE-BACKED-12-3-TRUNCATE-RACE-AGAINST-RECLAIM -->
 
-Truncate removes pages from the PC page index. Reclaim also removes pages. Concurrent truncate and reclaim on the same page: first-wins via page-index linearization; the loser observes an already-empty slot and proceeds. Safe by construction, but worth a test.
+Truncate and reclaim both withdraw resident bindings. Their owner reservations
+serialize the stable-cell transition and root update; the loser observes a
+withdrawn generation or absent binding and proceeds without a second cache-pin
+release. The test must cover both old-root observation and concurrent
+withdrawal.
 
 ### 12.4 Reflink under concurrent truncate
 <!-- txdoc:PAGE-BACKED-12-4-REFLINK-UNDER-CONCURRENT-TRUNCATE -->
@@ -1087,7 +1203,11 @@ The minimal per-char-device vtable. What's the minimum interface? Probably: step
 - **StructBacked** — subsystem-specific payload, per-subsystem step functions.
 - **Projected** — no stored content, view via projection schema.
 
-**PageContainer** is the zone entity for offset-keyed page storage. Three kinds: Anon, File, Device. No Pager trait; dispatch on kind is a match. The only polymorphism is FsPageBacking, a narrow 4-method trait for filesystem-specific fetch/flush.
+**PageContainer** is the zone entity for offset-keyed page storage. Three kinds:
+Anon, File, Device. Content dispatch on kind is a match. For persistent-file
+I/O, the target polymorphic boundary is pure `FileLayoutPlanner` plus a Tx
+adapter that lowers into the existing `BackendBioGraph`; `FsPageBacking` is a
+temporary compatibility bridge.
 
 **Uniform step functions** handle read, write, lseek, mmap, truncate, fsync, fallocate for all PageBacked content. Per-variant behavior is a match inside the uniform code. Struct-backed content routes to subsystem-specific implementations. Projected content invokes projection schemas.
 
@@ -1108,4 +1228,5 @@ The model unifies file-like things at the substrate level without forcing pipes,
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, BIF-*.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §6.1 (vfs subsystem), §7 (FS instances), §8 (scripts).
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module layout; PageContainer and RNodeBacking structural content lives in vm and vfs subsystems' structure/ modules.
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md) — umbrella ownership, data/control planes, `PageDataLease`, PageSlot authority, and reclaim-provider contract.
 - Linux kernel source for reference: `include/linux/fs.h` (file_operations, inode_operations, address_space_operations — the things this spec replaces).

@@ -11,10 +11,8 @@
 //! - The script DSL is intentionally tiny so test failures are
 //!   debuggable without learning a new language.
 //! - Explicit `sleep` directives force timing diversity into tests
-//!   to surface heisenbugs (e.g. "sending input the instant the
-//!   prompt appears, before the read syscall registers"). The
-//!   script author owns the pause discipline; the driver does NOT
-//!   silently coalesce input into a sustained burst.
+//!   to surface heisenbugs. The driver also waits briefly before
+//!   each send so prompt echoes do not race the guest's next read.
 //!
 //! ## Script DSL
 //!
@@ -54,6 +52,8 @@
 //! parses the script and prints group names without spawning QEMU.
 //! `--keep-going` runs every selected group even if an earlier one
 //! fails, and reports a per-group summary at the end.
+//! `--serial-log PATH` writes the captured QEMU console output to PATH
+//! after a sequential run, including failing or stop-after-needle runs.
 //!
 //! ## Parallel mode
 //!
@@ -88,6 +88,20 @@ use crate::Result;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONTROL_KEY_DELAY: Duration = Duration::from_millis(25);
 const ESC_KEY_DELAY: Duration = Duration::from_millis(500);
+const SEND_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Ext4BlockImages {
+    test: Option<PathBuf>,
+    scratch: Option<PathBuf>,
+    workload: Option<PathBuf>,
+}
+
+impl Ext4BlockImages {
+    fn any(&self) -> bool {
+        self.test.is_some() || self.scratch.is_some() || self.workload.is_some()
+    }
+}
 
 pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
@@ -107,8 +121,14 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let list_groups = args.iter().any(|a| a == "--list-groups");
     let keep_going = args.iter().any(|a| a == "--keep-going");
     let parallel = args.iter().any(|a| a == "--parallel");
-    let extra_rv64_ext4 = optional_option_value(&args, "--extra-rv64-ext4")
-        .map(|path| resolve_path(root, PathBuf::from(path)));
+    let stop_after_needle = optional_option_value(&args, "--stop-after-needle");
+    let serial_log =
+        optional_option_value(&args, "--serial-log").map(|path| resolve_path(root, path.into()));
+    let extra_rv64_ext4: Vec<PathBuf> = option_values(&args, "--extra-rv64-ext4")?
+        .into_iter()
+        .map(|path| resolve_path(root, PathBuf::from(path)))
+        .collect();
+    let ext4_block_images = ext4_block_images(root, &args, &extra_rv64_ext4)?;
     let boot_mode = optional_option_value(&args, "--boot-mode")
         .map(|value| validate_boot_mode_value(&value).map(|()| value))
         .transpose()?;
@@ -127,6 +147,19 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         })
         .transpose()?
         .unwrap_or(1);
+    let memory_mib = optional_option_value(&args, "--memory-mib")
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|err| format!("invalid --memory-mib value '{s}': {err}"))
+                .and_then(|value| {
+                    if value == 0 {
+                        Err("--memory-mib must be greater than zero".into())
+                    } else {
+                        Ok(value)
+                    }
+                })
+        })
+        .transpose()?;
     let jobs: usize = optional_option_value(&args, "--jobs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4)
@@ -150,6 +183,13 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    if stop_after_needle.is_some() && parallel {
+        return Err("--stop-after-needle is only supported in sequential mode".into());
+    }
+    if serial_log.is_some() && parallel {
+        return Err("--serial-log is only supported in sequential mode".into());
     }
 
     // Validate that every name passed to --group exists in the script.
@@ -218,8 +258,10 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let next = Arc::clone(&next_idx);
                 let root = root.to_path_buf();
                 let extra_rv64_ext4 = extra_rv64_ext4.clone();
+                let ext4_block_images = ext4_block_images.clone();
                 let boot_mode = boot_mode.clone();
                 let append_cmdline = append_cmdline.clone();
+                let memory_mib = memory_mib;
                 thread::spawn(move || loop {
                     let idx = next.fetch_add(1, Ordering::Relaxed);
                     if idx >= groups.len() {
@@ -231,7 +273,9 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                         target,
                         profile,
                         smp,
-                        extra_rv64_ext4: extra_rv64_ext4.as_deref(),
+                        memory_mib,
+                        extra_rv64_ext4: &extra_rv64_ext4,
+                        ext4_block_images: &ext4_block_images,
                         boot_mode: boot_mode.as_deref(),
                         append_cmdline: append_cmdline.as_deref(),
                         setup: &setup,
@@ -290,15 +334,17 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     }
 
     // ── Sequential mode (default) ───────────────────────────────────────────
-    let qemu_cmd = build_qemu_command(
+    let mut qemu_cmd = build_qemu_command(
         root,
         target,
         profile,
         smp,
-        extra_rv64_ext4.as_deref(),
+        &extra_rv64_ext4,
         append_cmdline.as_deref(),
         boot_mode.as_deref(),
+        memory_mib,
     )?;
+    append_ext4_role_images(&mut qemu_cmd, target, &ext4_block_images)?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
 
     let Some((program, rest)) = qemu_cmd.split_first() else {
@@ -314,12 +360,13 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         .map_err(|err| format!("failed to spawn {program}: {err}"))?;
 
     let buffer = Arc::new(Mutex::new(String::new()));
-    let _ = spawn_reader(&mut child, "stdout", Arc::clone(&buffer), true);
-    let _ = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), true);
+    let h_out = spawn_reader(&mut child, "stdout", Arc::clone(&buffer), true);
+    let h_err = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), true);
 
     let mut anchor = 0usize;
     let mut group_results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
     let mut quit_seen = false;
+    let mut stop_triggered = false;
 
     let outer = (|| -> Result<()> {
         // Setup always runs. A failure here is fatal regardless of
@@ -331,8 +378,13 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             &script.setup,
             &mut anchor,
             true,
+            stop_after_needle.as_deref(),
+            &mut stop_triggered,
         )? {
             return Err(format!("setup: {err}"));
+        }
+        if stop_triggered {
+            return Ok(());
         }
         if directives_quit(&script.setup) {
             quit_seen = true;
@@ -349,7 +401,12 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 &group.directives,
                 &mut anchor,
                 true,
+                stop_after_needle.as_deref(),
+                &mut stop_triggered,
             )?;
+            if stop_triggered {
+                quit_seen = true;
+            }
             match outcome {
                 None => group_results.push((group.name.clone(), Ok(()))),
                 Some(err) => {
@@ -362,6 +419,9 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             if directives_quit(&group.directives) {
                 quit_seen = true;
             }
+            if stop_triggered {
+                break;
+            }
         }
         Ok(())
     })();
@@ -371,6 +431,14 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     // QEMU doesn't linger past the test.
     let _ = child.kill();
     let _ = child.wait();
+    // Drain both pipes before writing the optional serial log. This keeps
+    // late QEMU diagnostics from racing the snapshot after process exit.
+    let _ = h_out.join();
+    let _ = h_err.join();
+
+    if let Some(path) = &serial_log {
+        write_serial_log(path, &buffer)?;
+    }
 
     let captured_bytes = buffer.lock().unwrap().len();
     let dump_captured = || {
@@ -381,6 +449,14 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
 
     match outer {
         Ok(()) => {
+            if stop_triggered {
+                println!(
+                    "shell-test: stop needle observed: {}",
+                    stop_after_needle.as_deref().unwrap_or_default()
+                );
+                println!("shell-test: ok");
+                return Ok(());
+            }
             let failed: Vec<&(String, std::result::Result<(), String>)> =
                 group_results.iter().filter(|(_, r)| r.is_err()).collect();
             if !group_results.is_empty() {
@@ -412,6 +488,15 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     }
 }
 
+fn write_serial_log(path: &Path, buffer: &Arc<Mutex<String>>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let captured = buffer.lock().unwrap().clone();
+    fs::write(path, captured).map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
 fn directives_quit(d: &[Directive]) -> bool {
     matches!(d.last(), Some(Directive::Quit))
 }
@@ -432,6 +517,8 @@ fn run_block(
     directives: &[Directive],
     script_anchor: &mut usize,
     verbose: bool,
+    stop_after_needle: Option<&str>,
+    stop_triggered: &mut bool,
 ) -> Result<Option<String>> {
     if directives.is_empty() {
         return Ok(None);
@@ -450,7 +537,7 @@ fn run_block(
                 unreachable!("Directive::Group should not survive parse_script");
             }
             Directive::Wait { needle, timeout } => {
-                if let Err(err) = wait_for(buffer, 0, needle, *timeout) {
+                if let Err(err) = wait_for(child, buffer, 0, needle, *timeout) {
                     return Ok(Some(err));
                 }
             }
@@ -458,6 +545,7 @@ fn run_block(
                 thread::sleep(Duration::from_millis(*ms));
             }
             Directive::Send(text) => {
+                thread::sleep(SEND_SETTLE_DELAY);
                 let stdin = child
                     .stdin
                     .as_mut()
@@ -469,7 +557,7 @@ fn run_block(
                 send_interactive_bytes(stdin, text.as_bytes())?;
             }
             Directive::Expect { needle, timeout } => {
-                if let Err(err) = wait_for(buffer, *script_anchor, needle, *timeout) {
+                if let Err(err) = wait_for(child, buffer, *script_anchor, needle, *timeout) {
                     return Ok(Some(err));
                 }
             }
@@ -490,11 +578,23 @@ fn run_block(
                 return Ok(None);
             }
         }
+        if let Some(needle) = stop_after_needle {
+            if buffer.lock().unwrap().contains(needle) {
+                if let Some(stdin) = child.stdin.take() {
+                    drop(stdin);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                *stop_triggered = true;
+                return Ok(None);
+            }
+        }
     }
     Ok(None)
 }
 
 fn wait_for(
+    child: &mut Child,
     buffer: &Arc<Mutex<String>>,
     start_offset: usize,
     needle: &str,
@@ -509,6 +609,17 @@ fn wait_for(
                     return Ok(());
                 }
             }
+        }
+        if let Some(status) = child.try_wait().map_err(|err| {
+            format!(
+                "failed to poll QEMU status while waiting for {:?}: {err}",
+                needle
+            )
+        })? {
+            return Err(format!(
+                "QEMU exited with {status} while waiting for {:?}",
+                needle
+            ));
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -814,7 +925,9 @@ struct IsolatedGroupRun<'a> {
     target: TxTarget,
     profile: Profile,
     smp: usize,
-    extra_rv64_ext4: Option<&'a Path>,
+    memory_mib: Option<usize>,
+    extra_rv64_ext4: &'a [PathBuf],
+    ext4_block_images: &'a Ext4BlockImages,
     boot_mode: Option<&'a str>,
     append_cmdline: Option<&'a str>,
     setup: &'a [Directive],
@@ -842,7 +955,7 @@ fn run_group_isolated_inner(
     run: &IsolatedGroupRun<'_>,
     buffer: Arc<Mutex<String>>,
 ) -> Option<String> {
-    let qemu_cmd = match build_qemu_command(
+    let mut qemu_cmd = match build_qemu_command(
         run.root,
         run.target,
         run.profile,
@@ -850,10 +963,14 @@ fn run_group_isolated_inner(
         run.extra_rv64_ext4,
         run.append_cmdline,
         run.boot_mode,
+        run.memory_mib,
     ) {
         Ok(c) => c,
         Err(e) => return Some(format!("qemu command: {e}")),
     };
+    if let Err(e) = append_ext4_role_images(&mut qemu_cmd, run.target, run.ext4_block_images) {
+        return Some(format!("qemu command: {e}"));
+    }
     let Some((program, rest)) = qemu_cmd.split_first() else {
         return Some("empty qemu command".into());
     };
@@ -873,9 +990,19 @@ fn run_group_isolated_inner(
     let h_err = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), false);
 
     let mut anchor = 0usize;
+    let mut stop_triggered = false;
 
     let result = (|| -> Option<String> {
-        match run_block(&mut child, &buffer, "setup", run.setup, &mut anchor, false) {
+        match run_block(
+            &mut child,
+            &buffer,
+            "setup",
+            run.setup,
+            &mut anchor,
+            false,
+            None,
+            &mut stop_triggered,
+        ) {
             Err(e) => return Some(format!("setup (harness): {e}")),
             Ok(Some(e)) => return Some(format!("setup: {e}")),
             Ok(None) => {}
@@ -887,6 +1014,8 @@ fn run_group_isolated_inner(
             &run.group.directives,
             &mut anchor,
             false,
+            None,
+            &mut stop_triggered,
         ) {
             Err(e) => Some(format!("group harness: {e}")),
             Ok(v) => v,
@@ -907,9 +1036,10 @@ fn build_qemu_command(
     target: TxTarget,
     profile: Profile,
     smp: usize,
-    extra_rv64_ext4: Option<&Path>,
+    extra_rv64_ext4: &[PathBuf],
     append_cmdline: Option<&str>,
     boot_mode: Option<&str>,
+    memory_mib: Option<usize>,
 ) -> Result<Vec<String>> {
     // Reuse the existing qemu_command builder by constructing an
     // args list and invoking the same dispatcher path. We can't call
@@ -930,12 +1060,16 @@ fn build_qemu_command(
         "-machine".into(),
         target.qemu_machine().to_string(),
         "-m".into(),
-        match (target, profile) {
-            (TxTarget::La64Qemu, _) => "1152M",
-            (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
-            (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
-        }
-        .into(),
+        memory_mib
+            .map(|value| format!("{value}M"))
+            .unwrap_or_else(|| {
+                match (target, profile) {
+                    (TxTarget::La64Qemu, _) => "1152M",
+                    (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
+                    (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
+                }
+                .to_string()
+            }),
         "-smp".into(),
         smp.to_string(),
         "-accel".into(),
@@ -959,7 +1093,9 @@ fn build_qemu_command(
     let cmdline_base = match profile {
         Profile::Busybox => format!("tx.profile=busybox tx.boot.mode={boot_mode} console=ttyS0"),
         Profile::Alpine => {
-            format!("tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0")
+            format!(
+                "tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0"
+            )
         }
         Profile::Smoke => unreachable!("rejected above"),
     };
@@ -968,24 +1104,149 @@ fn build_qemu_command(
         _ => cmdline_base,
     };
     args.push(append_tty_winsize_cmdline(&cmdline));
-    if let Some(path) = extra_rv64_ext4 {
-        if target != TxTarget::Rv64Qemu {
-            return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
-        }
+    if !extra_rv64_ext4.is_empty() && target != TxTarget::Rv64Qemu {
+        return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
+    }
+    if extra_rv64_ext4.len() > 3 {
+        return Err("--extra-rv64-ext4 supports at most three RV64 virtio-mmio drives".into());
+    }
+    for (idx, path) in extra_rv64_ext4.iter().enumerate() {
         args.push("-drive".into());
         args.push(format!(
-            "file={},format=raw,if=none,id=txblk0",
-            path.display()
+            "file={},format=raw,if=none,id=txblk{idx}",
+            path.display(),
         ));
         args.push("-device".into());
-        args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
+        args.push(format!(
+            "virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
+        ));
     }
     Ok(args)
+}
+
+fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        if args[idx] == name {
+            let Some(value) = args.get(idx + 1) else {
+                return Err(format!("option {name} needs a value"));
+            };
+            values.push(value.clone());
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    Ok(values)
+}
+
+fn ext4_block_images(root: &Path, args: &[String], legacy: &[PathBuf]) -> Result<Ext4BlockImages> {
+    let test = single_role_image(root, args, "--ext4-test-image")?;
+    let scratch = single_role_image(root, args, "--ext4-scratch-image")?;
+    let workload = single_role_image(root, args, "--ext4-workload-image")?;
+    if !legacy.is_empty() && (test.is_some() || scratch.is_some() || workload.is_some()) {
+        return Err("--extra-rv64-ext4 cannot be combined with ext4 role image flags".into());
+    }
+
+    let images = Ext4BlockImages {
+        test,
+        scratch,
+        workload,
+    };
+    reject_duplicate_ext4_role_paths(&images)?;
+    Ok(images)
+}
+
+fn single_role_image(root: &Path, args: &[String], name: &str) -> Result<Option<PathBuf>> {
+    let values = option_values(args, name)?;
+    if values.len() > 1 {
+        return Err(format!("{name} may be specified only once"));
+    }
+    Ok(values
+        .into_iter()
+        .next()
+        .map(|path| resolve_path(root, PathBuf::from(path))))
+}
+
+fn reject_duplicate_ext4_role_paths(images: &Ext4BlockImages) -> Result<()> {
+    let roles = [
+        ("TEST", images.test.as_ref()),
+        ("SCRATCH", images.scratch.as_ref()),
+        ("WORKLOAD", images.workload.as_ref()),
+    ];
+    for left in 0..roles.len() {
+        let Some(left_path) = roles[left].1 else {
+            continue;
+        };
+        for right in (left + 1)..roles.len() {
+            let Some(right_path) = roles[right].1 else {
+                continue;
+            };
+            if left_path == right_path {
+                return Err(format!(
+                    "ext4 block roles {} and {} must use different image paths",
+                    roles[left].0, roles[right].0
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_ext4_role_images(
+    args: &mut Vec<String>,
+    target: TxTarget,
+    images: &Ext4BlockImages,
+) -> Result<()> {
+    if !images.any() {
+        return Ok(());
+    }
+    if target != TxTarget::Rv64Qemu {
+        return Err("ext4 role images are only supported for rv64-qemu".into());
+    }
+
+    let Some(cmdline_index) = args.windows(2).position(|pair| pair[0] == "-append") else {
+        return Err("shell-test QEMU command has no kernel cmdline".into());
+    };
+    let cmdline = &mut args[cmdline_index + 1];
+    for (token, present) in [
+        ("tx.ext4.test=vda", images.test.is_some()),
+        ("tx.ext4.scratch=vdb", images.scratch.is_some()),
+        ("tx.ext4.workload=vdc", images.workload.is_some()),
+    ] {
+        if present {
+            cmdline.push(' ');
+            cmdline.push_str(token);
+        }
+    }
+
+    for (id, bus, path, read_only) in [
+        ("tx-test", 0, images.test.as_ref(), false),
+        ("tx-scratch", 1, images.scratch.as_ref(), false),
+        ("tx-workload", 2, images.workload.as_ref(), true),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let read_only_suffix = if read_only { ",read-only=on" } else { "" };
+        args.push("-drive".into());
+        args.push(format!(
+            "file={},format=raw,if=none,id={id}{read_only_suffix}",
+            path.display(),
+        ));
+        args.push("-device".into());
+        args.push(format!(
+            "virtio-blk-device,drive={id},bus=virtio-mmio-bus.{bus}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn alpine_profile_uses_alpine_initramfs_and_cmdline() {
@@ -995,6 +1256,7 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
+            &[],
             None,
             None,
             None,
@@ -1021,6 +1283,7 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             4,
+            &[],
             None,
             None,
             None,
@@ -1030,15 +1293,32 @@ mod tests {
     }
 
     #[test]
+    fn shell_test_qemu_command_honors_explicit_memory_override() {
+        let command = build_qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            &[],
+            None,
+            None,
+            Some(4096),
+        )
+        .expect("build qemu command");
+        assert!(command.join(" ").contains("-m 4096M"));
+    }
+
+    #[test]
     fn shell_test_can_attach_rv64_ext4_drive_on_bus0() {
         let root = Path::new("/tmp/tx");
-        let image = Path::new("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
+        let image = PathBuf::from("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
         let command = build_qemu_command(
             root,
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
-            Some(image),
+            &[image],
+            None,
             None,
             None,
         )
@@ -1050,6 +1330,125 @@ mod tests {
     }
 
     #[test]
+    fn shell_test_can_attach_three_rv64_ext4_drives_on_stable_buses() {
+        let root = Path::new("/tmp/tx");
+        let images = vec![
+            PathBuf::from("/tmp/tx/test.img"),
+            PathBuf::from("/tmp/tx/scratch.img"),
+            PathBuf::from("/tmp/tx/workload.img"),
+        ];
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            &images,
+            None,
+            None,
+            None,
+        )
+        .expect("build qemu command");
+        let rendered = command.join(" ");
+
+        for (idx, name) in ["test", "scratch", "workload"].iter().enumerate() {
+            assert!(rendered.contains(&format!(
+                "-drive file=/tmp/tx/{name}.img,format=raw,if=none,id=txblk{idx}"
+            )));
+            assert!(rendered.contains(&format!(
+                "-device virtio-blk-device,drive=txblk{idx},bus=virtio-mmio-bus.{idx}"
+            )));
+        }
+    }
+
+    #[test]
+    fn shell_test_can_attach_named_ext4_roles() {
+        let root = Path::new("/tmp/tx");
+        let mut command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("build qemu command");
+        let images = Ext4BlockImages {
+            test: Some(PathBuf::from("/tmp/tx/test.img")),
+            scratch: Some(PathBuf::from("/tmp/tx/scratch.img")),
+            workload: Some(PathBuf::from("/tmp/tx/workload.img")),
+        };
+
+        append_ext4_role_images(&mut command, TxTarget::Rv64Qemu, &images)
+            .expect("append ext4 role images");
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("-drive file=/tmp/tx/test.img,format=raw,if=none,id=tx-test"));
+        assert!(
+            rendered.contains("-drive file=/tmp/tx/scratch.img,format=raw,if=none,id=tx-scratch")
+        );
+        assert!(rendered.contains(
+            "-drive file=/tmp/tx/workload.img,format=raw,if=none,id=tx-workload,read-only=on"
+        ));
+        assert!(rendered.contains("tx.ext4.test=vda"));
+        assert!(rendered.contains("tx.ext4.scratch=vdb"));
+        assert!(rendered.contains("tx.ext4.workload=vdc"));
+    }
+
+    #[test]
+    fn shell_test_rejects_duplicate_named_ext4_role_paths() {
+        let err = ext4_block_images(
+            Path::new("/tmp/tx"),
+            &[
+                "--ext4-test-image".into(),
+                "same.img".into(),
+                "--ext4-workload-image".into(),
+                "same.img".into(),
+            ],
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(err.contains("TEST and WORKLOAD"));
+    }
+
+    #[test]
+    fn shell_test_rejects_serial_log_parallel_mode() {
+        let root = temp_root("serial-log-parallel");
+        let script = root.join("script.scn");
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            &script,
+            r#"
+group one
+wait "never" within 1
+group two
+wait "never" within 1
+"#,
+        )
+        .expect("write script");
+
+        let error = shell_test(
+            &root,
+            vec![
+                "--target".into(),
+                "rv64-qemu".into(),
+                "--profile".into(),
+                "alpine".into(),
+                "--script".into(),
+                script.display().to_string(),
+                "--parallel".into(),
+                "--serial-log".into(),
+                root.join("serial.log").display().to_string(),
+            ],
+        )
+        .expect_err("parallel serial log must be rejected before qemu");
+
+        assert!(error.contains("--serial-log is only supported in sequential mode"));
+    }
+
+    #[test]
     fn shell_test_can_append_kernel_cmdline_tokens() {
         let root = Path::new("/tmp/tx");
         let command = build_qemu_command(
@@ -1057,8 +1456,9 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
-            None,
+            &[],
             Some("tx.mount.sdcard=0"),
+            None,
             None,
         )
         .expect("build qemu command");
@@ -1077,9 +1477,10 @@ mod tests {
             TxTarget::Rv64Qemu,
             Profile::Alpine,
             1,
-            None,
+            &[],
             None,
             Some("contest"),
+            None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1113,5 +1514,16 @@ mod tests {
 
         assert_eq!(out, b"\x1b:wq\n");
         assert!(start.elapsed() >= ESC_KEY_DELAY);
+    }
+
+    fn temp_root(suffix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tx-shell-test-{suffix}-{}-{unique}",
+            std::process::id()
+        ))
     }
 }

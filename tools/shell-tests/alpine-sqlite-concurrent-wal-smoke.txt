@@ -1,0 +1,18 @@
+# alpine-sqlite-concurrent-wal-smoke.txt - concurrent sqlite3 WAL writers.
+wait "/ # " within 60000
+sleep 500
+send "cat > /tmp/sqlite-concurrent.sh <<'EOF'\nDB=/tmp/sqlite-concurrent-demo.db\nrm -f \"$DB\" \"$DB-journal\" \"$DB-wal\" \"$DB-shm\"\n/usr/bin/sqlite3 -batch -noheader \"$DB\" \"PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; CREATE TABLE log(worker TEXT, n INTEGER, PRIMARY KEY(worker,n));\"\nworker() {\n  w=\"$1\"\n  i=1\n  while [ \"$i\" -le 25 ]; do\n    /usr/bin/sqlite3 -batch -noheader \"$DB\" \"PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; INSERT INTO log(worker,n) VALUES('$w',$i);\" || { echo \"worker-$w-fail-$i\"; exit 1; }\n    i=$((i + 1))\n  done\n  echo \"worker-$w-done\"\n}\nworker a &\npa=$!\nworker b &\npb=$!\nwait \"$pa\"\nsa=$?\nwait \"$pb\"\nsb=$?\necho \"worker-status:$sa:$sb\"\n/usr/bin/sqlite3 -batch -noheader \"$DB\" \"SELECT 'concurrent-count:' || count(*) FROM log; SELECT 'concurrent-a:' || count(*) FROM log WHERE worker='a'; SELECT 'concurrent-b:' || count(*) FROM log WHERE worker='b'; PRAGMA integrity_check;\"\necho sqlite-concurrent-status-$?\nEOF\n"
+expect "/ # " within 10000
+sleep 500
+send "sh /tmp/sqlite-concurrent.sh\n"
+expect "wal" within 20000
+expect "worker-a-done" within 60000
+expect "worker-b-done" within 60000
+expect "worker-status:0:0" within 10000
+expect "concurrent-count:50" within 20000
+expect "concurrent-a:25" within 20000
+expect "concurrent-b:25" within 20000
+expect "ok" within 20000
+expect "sqlite-concurrent-status-0" within 20000
+sleep 500
+quit

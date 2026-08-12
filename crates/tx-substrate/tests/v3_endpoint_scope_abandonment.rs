@@ -81,6 +81,7 @@ fn endpoint_process_exit_aborts_single_in_flight_token_with_agent_died() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
     assert_eq!(registry.state(id), Some(DelegateState::Pending));
@@ -132,6 +133,7 @@ fn endpoint_death_walks_all_in_flight_tokens_for_that_endpoint() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_1),
+        None,
     );
     let g2 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -139,6 +141,7 @@ fn endpoint_death_walks_all_in_flight_tokens_for_that_endpoint() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_2),
+        None,
     );
     let g3 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -146,6 +149,7 @@ fn endpoint_death_walks_all_in_flight_tokens_for_that_endpoint() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_3),
+        None,
     );
     let g4 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -153,6 +157,7 @@ fn endpoint_death_walks_all_in_flight_tokens_for_that_endpoint() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_4),
+        None,
     );
 
     let transitioned =
@@ -208,6 +213,7 @@ fn mark_replied_wins_then_endpoint_death_is_late_no_op() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
 
@@ -258,6 +264,7 @@ fn endpoint_death_wins_then_late_mark_replied_is_late_no_op() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
 
@@ -313,6 +320,7 @@ fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_replied),
+        None,
     );
     let g_canceled = registry.install_request(
         DelegateRequest::Placeholder,
@@ -320,6 +328,7 @@ fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_canceled),
+        None,
     );
     let g_live = registry.install_request(
         DelegateRequest::Placeholder,
@@ -327,6 +336,7 @@ fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_live),
+        None,
     );
 
     // Pre-terminate two tokens.
@@ -409,6 +419,7 @@ fn late_mark_replied_for_dead_endpoint_is_late_no_op_and_no_state_change() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
 
@@ -475,6 +486,7 @@ fn agent_token_guard_drop_after_endpoint_died_is_late_no_op() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::CancelOnDrop,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
 
@@ -543,6 +555,7 @@ fn endpoint_death_is_scoped_to_matching_endpoint_marker_only() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_dying),
+        None,
     );
     let g_sib_a = registry.install_request(
         DelegateRequest::Placeholder,
@@ -550,6 +563,7 @@ fn endpoint_death_is_scoped_to_matching_endpoint_marker_only() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_sib_a),
+        None,
     );
     // A second sibling-A token to verify routing handles multiple
     // matching markers on the unaffected side too.
@@ -560,6 +574,7 @@ fn endpoint_death_is_scoped_to_matching_endpoint_marker_only() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_sib_a2),
+        None,
     );
     let g_sib_b = registry.install_request(
         DelegateRequest::Placeholder,
@@ -567,6 +582,7 @@ fn endpoint_death_is_scoped_to_matching_endpoint_marker_only() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_sib_b),
+        None,
     );
 
     // The dying endpoint dies.

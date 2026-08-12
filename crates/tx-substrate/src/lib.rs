@@ -25,6 +25,7 @@ pub mod pmap {
 }
 
 pub mod page_allocator;
+mod publication;
 pub mod slab;
 pub mod slot;
 pub mod step;
@@ -33,8 +34,14 @@ pub mod verbs;
 pub mod wake;
 pub mod zone;
 
+pub use publication::{
+    DetachedNodeAllocation, DetachedPublication, DetachedPublicationParts, DetachedPublicationSlot,
+    PublishCommitRetry, PublishError, PublishReservation, PublishRetryReason, Published,
+    ReservedCommitInvariant,
+};
 pub use slot::AtomicSlot;
 pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard};
+pub use zone::{BindingToken, PublishedBinding};
 
 #[doc(hidden)]
 pub mod testing {
@@ -75,6 +82,10 @@ pub mod testing {
         )
         .expect("test zone runtime init");
         STATE.store(INITIALIZED, Ordering::Release);
+    }
+
+    pub fn fail_next_publication_allocations(count: usize) {
+        crate::publication::fail_next_allocations_for_test(count);
     }
 }
 
@@ -120,6 +131,10 @@ pub mod shootdown {
         Asid, PhysAddr, PmapIf, PmapInvalidation, PmapReserveKind, PmapUnmapResult, Ppn, VirtAddr,
     };
 
+    use tx_hal::pmap::{
+        InvalidationRunGather, InvalidationRunGatherError, InvalidationRunGatherErrorKind,
+    };
+
     use crate::page_allocator::{MapPin, MapPinRun, PageAllocator};
 
     const PAGE_SIZE_4K: usize = 4096;
@@ -129,6 +144,8 @@ pub mod shootdown {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum ShootdownError {
         Full,
+        InvalidCursor,
+        AddressOverflow,
         UnsupportedMapping,
         MismatchedFrame,
     }
@@ -136,6 +153,7 @@ pub mod shootdown {
     pub struct ShootdownPushError<'a, A: PageAllocator> {
         reason: ShootdownError,
         map_pin: MapPin<'a, A>,
+        next_cursor: VirtAddr,
     }
 
     impl<'a, A: PageAllocator> ShootdownPushError<'a, A> {
@@ -145,6 +163,22 @@ pub mod shootdown {
 
         pub fn into_map_pin(self) -> MapPin<'a, A> {
             self.map_pin
+        }
+
+        pub fn next_cursor(&self) -> VirtAddr {
+            self.next_cursor
+        }
+
+        /// Complete a rejected-but-already-mutated mapping with a caller-
+        /// supplied safe invalidation before releasing its map pin.
+        pub fn issue_and_release_with(
+            self,
+            asid: Asid,
+            invalidation: PmapInvalidation,
+            shootdown_mappings: fn(Asid, &[PmapInvalidation]),
+        ) {
+            shootdown_mappings(asid, &[invalidation]);
+            drop(self.map_pin);
         }
     }
 
@@ -160,6 +194,7 @@ pub mod shootdown {
     pub struct ShootdownRunPushError<'a, A: PageAllocator> {
         reason: ShootdownError,
         map_pin_run: MapPinRun<'a, A>,
+        next_cursor: VirtAddr,
     }
 
     impl<'a, A: PageAllocator> ShootdownRunPushError<'a, A> {
@@ -169,6 +204,20 @@ pub mod shootdown {
 
         pub fn into_map_pin_run(self) -> MapPinRun<'a, A> {
             self.map_pin_run
+        }
+
+        pub fn next_cursor(&self) -> VirtAddr {
+            self.next_cursor
+        }
+
+        pub fn issue_and_release_with(
+            self,
+            asid: Asid,
+            invalidation: PmapInvalidation,
+            shootdown_mappings: fn(Asid, &[PmapInvalidation]),
+        ) {
+            shootdown_mappings(asid, &[invalidation]);
+            drop(self.map_pin_run);
         }
     }
 
@@ -181,12 +230,12 @@ pub mod shootdown {
         }
     }
 
-    enum PendingMapReleaseToken<'a, A: PageAllocator> {
+    pub enum AcknowledgedMapReleaseToken<'a, A: PageAllocator> {
         Page(MapPin<'a, A>),
         Run(MapPinRun<'a, A>),
     }
 
-    impl<A: PageAllocator> PendingMapReleaseToken<'_, A> {
+    impl<A: PageAllocator> AcknowledgedMapReleaseToken<'_, A> {
         fn release(self) {
             match self {
                 Self::Page(map_pin) => drop(map_pin),
@@ -197,7 +246,7 @@ pub mod shootdown {
 
     struct PendingMapRelease<'a, A: PageAllocator> {
         result: PmapUnmapResult,
-        token: PendingMapReleaseToken<'a, A>,
+        token: AcknowledgedMapReleaseToken<'a, A>,
     }
 
     pub struct KernelShootdownBatch<'a, A: PageAllocator, const N: usize> {
@@ -234,6 +283,7 @@ pub mod shootdown {
                 return Err(ShootdownPushError {
                     reason: ShootdownError::UnsupportedMapping,
                     map_pin,
+                    next_cursor: VirtAddr(0),
                 });
             }
 
@@ -241,6 +291,7 @@ pub mod shootdown {
                 return Err(ShootdownPushError {
                     reason: ShootdownError::MismatchedFrame,
                     map_pin,
+                    next_cursor: VirtAddr(0),
                 });
             }
 
@@ -248,12 +299,13 @@ pub mod shootdown {
                 return Err(ShootdownPushError {
                     reason: ShootdownError::Full,
                     map_pin,
+                    next_cursor: VirtAddr(0),
                 });
             }
 
             self.entries[self.len].write(PendingMapRelease {
                 result,
-                token: PendingMapReleaseToken::Page(map_pin),
+                token: AcknowledgedMapReleaseToken::Page(map_pin),
             });
             self.len += 1;
             Ok(())
@@ -269,6 +321,7 @@ pub mod shootdown {
                 return Err(ShootdownRunPushError {
                     reason: ShootdownError::MismatchedFrame,
                     map_pin_run,
+                    next_cursor: VirtAddr(0),
                 });
             }
 
@@ -276,12 +329,13 @@ pub mod shootdown {
                 return Err(ShootdownRunPushError {
                     reason: ShootdownError::Full,
                     map_pin_run,
+                    next_cursor: VirtAddr(0),
                 });
             }
 
             self.entries[self.len].write(PendingMapRelease {
                 result,
-                token: PendingMapReleaseToken::Run(map_pin_run),
+                token: AcknowledgedMapReleaseToken::Run(map_pin_run),
             });
             self.len += 1;
             Ok(())
@@ -322,17 +376,69 @@ pub mod shootdown {
         }
     }
 
-    pub struct AddressSpaceShootdownBatch<'a, A: PageAllocator, const N: usize> {
+    pub struct PendingMapReleaseGather<'a, A: PageAllocator, const N: usize> {
         asid: Asid,
-        entries: [MaybeUninit<PendingMapRelease<'a, A>>; N],
+        invalidations: InvalidationRunGather<N>,
+        entries: [MaybeUninit<AcknowledgedMapReleaseToken<'a, A>>; N],
         len: usize,
         _not_send: PhantomData<*const ()>,
     }
 
-    impl<'a, A: PageAllocator, const N: usize> AddressSpaceShootdownBatch<'a, A, N> {
+    #[must_use = "acknowledged map releases must be consumed explicitly"]
+    pub struct AcknowledgedMapReleaseBatch<'a, A: PageAllocator, const N: usize> {
+        invalidations: InvalidationRunGather<N>,
+        entries: [MaybeUninit<AcknowledgedMapReleaseToken<'a, A>>; N],
+        len: usize,
+        _not_send: PhantomData<*const ()>,
+    }
+
+    impl<'a, A: PageAllocator, const N: usize> AcknowledgedMapReleaseBatch<'a, A, N> {
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0 && self.invalidations.is_empty()
+        }
+
+        pub fn next_cursor(&self) -> VirtAddr {
+            self.invalidations.next_cursor()
+        }
+
+        pub fn drain_into(mut self, sink: &mut impl FnMut(AcknowledgedMapReleaseToken<'a, A>)) {
+            let len = self.len;
+            self.len = 0;
+            let next_cursor = self.invalidations.next_cursor();
+            self.invalidations.clear(next_cursor);
+            for index in 0..len {
+                let token = unsafe { self.entries[index].assume_init_read() };
+                sink(token);
+            }
+        }
+
+        pub fn release(self) {
+            self.drain_into(&mut |token| token.release());
+        }
+    }
+
+    impl<A: PageAllocator, const N: usize> Drop for AcknowledgedMapReleaseBatch<'_, A, N> {
+        fn drop(&mut self) {
+            debug_assert!(
+                self.len == 0 && self.invalidations.is_empty(),
+                "acknowledged map releases must be consumed explicitly"
+            );
+        }
+    }
+
+    impl<'a, A: PageAllocator, const N: usize> PendingMapReleaseGather<'a, A, N> {
         pub fn new(asid: Asid) -> Self {
+            Self::new_at(asid, VirtAddr(0))
+        }
+
+        pub fn new_at(asid: Asid, next_cursor: VirtAddr) -> Self {
             Self {
                 asid,
+                invalidations: InvalidationRunGather::new(next_cursor),
                 entries: [const { MaybeUninit::uninit() }; N],
                 len: 0,
                 _not_send: PhantomData,
@@ -348,7 +454,23 @@ pub mod shootdown {
         }
 
         pub fn is_empty(&self) -> bool {
-            self.len == 0
+            self.invalidations.is_empty()
+        }
+
+        pub fn next_cursor(&self) -> VirtAddr {
+            self.invalidations.next_cursor()
+        }
+
+        pub fn invalidation_len(&self) -> usize {
+            self.invalidations.len()
+        }
+
+        pub fn push_invalidation(
+            &mut self,
+            invalidation: PmapInvalidation,
+            next_cursor: VirtAddr,
+        ) -> Result<(), InvalidationRunGatherError> {
+            self.invalidations.push(invalidation, next_cursor)
         }
 
         pub fn push_page_unmap_result(
@@ -362,13 +484,28 @@ pub mod shootdown {
                 return Err(ShootdownPushError {
                     reason: ShootdownError::UnsupportedMapping,
                     map_pin,
+                    next_cursor: self.next_cursor(),
                 });
             }
+
+            let Some(next_cursor) = result
+                .virt()
+                .0
+                .checked_add(result.invalidation().size())
+                .map(VirtAddr)
+            else {
+                return Err(ShootdownPushError {
+                    reason: ShootdownError::AddressOverflow,
+                    map_pin,
+                    next_cursor: self.next_cursor(),
+                });
+            };
 
             if result_ppn(result.phys()) != map_pin.ppn() {
                 return Err(ShootdownPushError {
                     reason: ShootdownError::MismatchedFrame,
                     map_pin,
+                    next_cursor: self.next_cursor(),
                 });
             }
 
@@ -376,13 +513,18 @@ pub mod shootdown {
                 return Err(ShootdownPushError {
                     reason: ShootdownError::Full,
                     map_pin,
+                    next_cursor: self.next_cursor(),
                 });
             }
 
-            self.entries[self.len].write(PendingMapRelease {
-                result,
-                token: PendingMapReleaseToken::Page(map_pin),
-            });
+            if let Err(error) = self.invalidations.push(result.invalidation(), next_cursor) {
+                return Err(ShootdownPushError {
+                    reason: shootdown_error_for_gather(error),
+                    map_pin,
+                    next_cursor: self.next_cursor(),
+                });
+            }
+            self.entries[self.len].write(AcknowledgedMapReleaseToken::Page(map_pin));
             self.len += 1;
             Ok(())
         }
@@ -397,41 +539,75 @@ pub mod shootdown {
                 return Err(ShootdownRunPushError {
                     reason: ShootdownError::MismatchedFrame,
                     map_pin_run,
+                    next_cursor: self.next_cursor(),
                 });
             }
+
+            let Some(next_cursor) = result
+                .virt()
+                .0
+                .checked_add(result.invalidation().size())
+                .map(VirtAddr)
+            else {
+                return Err(ShootdownRunPushError {
+                    reason: ShootdownError::AddressOverflow,
+                    map_pin_run,
+                    next_cursor: self.next_cursor(),
+                });
+            };
 
             if self.len == N {
                 return Err(ShootdownRunPushError {
                     reason: ShootdownError::Full,
                     map_pin_run,
+                    next_cursor: self.next_cursor(),
                 });
             }
 
-            self.entries[self.len].write(PendingMapRelease {
-                result,
-                token: PendingMapReleaseToken::Run(map_pin_run),
-            });
+            if let Err(error) = self.invalidations.push(result.invalidation(), next_cursor) {
+                return Err(ShootdownRunPushError {
+                    reason: shootdown_error_for_gather(error),
+                    map_pin_run,
+                    next_cursor: self.next_cursor(),
+                });
+            }
+            self.entries[self.len].write(AcknowledgedMapReleaseToken::Run(map_pin_run));
             self.len += 1;
             Ok(())
         }
 
-        pub fn issue_and_release_with(mut self, shootdown_mappings: fn(Asid, &[PmapInvalidation])) {
+        #[must_use = "acknowledged map releases must be consumed explicitly"]
+        pub fn issue_and_wait_with(
+            mut self,
+            shootdown_mappings: fn(Asid, &[PmapInvalidation]),
+        ) -> AcknowledgedMapReleaseBatch<'a, A, N> {
+            shootdown_mappings(self.asid, self.invalidations.as_slice());
+
             let len = self.len;
-
-            let mut invalidations = [PmapInvalidation::new(VirtAddr(0), 0); N];
-            for (index, slot) in invalidations.iter_mut().enumerate().take(len) {
-                let entry = unsafe { self.entries[index].assume_init_ref() };
-                *slot = entry.result.invalidation();
-            }
-
-            shootdown_mappings(self.asid, &invalidations[..len]);
-
+            let entries =
+                core::mem::replace(&mut self.entries, [const { MaybeUninit::uninit() }; N]);
             self.len = 0;
+            let next_cursor = self.invalidations.next_cursor();
+            let invalidations = core::mem::replace(
+                &mut self.invalidations,
+                InvalidationRunGather::new(next_cursor),
+            );
 
-            for index in 0..len {
-                let entry = unsafe { self.entries[index].assume_init_read() };
-                entry.token.release();
+            AcknowledgedMapReleaseBatch {
+                invalidations,
+                entries,
+                len,
+                _not_send: PhantomData,
             }
+        }
+
+        #[must_use = "acknowledged map releases must be consumed explicitly"]
+        pub fn issue_and_wait<P: PmapIf>(self) -> AcknowledgedMapReleaseBatch<'a, A, N> {
+            self.issue_and_wait_with(P::shootdown_mappings)
+        }
+
+        pub fn issue_and_release_with(self, shootdown_mappings: fn(Asid, &[PmapInvalidation])) {
+            self.issue_and_wait_with(shootdown_mappings).release();
         }
 
         pub fn issue_and_release<P: PmapIf>(self) {
@@ -439,17 +615,28 @@ pub mod shootdown {
         }
     }
 
-    impl<A: PageAllocator, const N: usize> Drop for AddressSpaceShootdownBatch<'_, A, N> {
+    impl<A: PageAllocator, const N: usize> Drop for PendingMapReleaseGather<'_, A, N> {
         fn drop(&mut self) {
             debug_assert!(
-                self.len == 0,
+                self.len == 0 && self.invalidations.is_empty(),
                 "AddressSpaceShootdownBatch must be issued before pending map pins release"
             );
         }
     }
 
+    /// Compatibility name for the pre-R3 address-space batch API.
+    pub type AddressSpaceShootdownBatch<'a, A, const N: usize> = PendingMapReleaseGather<'a, A, N>;
+
     fn result_ppn(phys: PhysAddr) -> Ppn {
         Ppn(phys.0 / PAGE_SIZE_4K)
+    }
+
+    fn shootdown_error_for_gather(error: InvalidationRunGatherError) -> ShootdownError {
+        match error.kind() {
+            InvalidationRunGatherErrorKind::Capacity => ShootdownError::Full,
+            InvalidationRunGatherErrorKind::InvalidCursor => ShootdownError::InvalidCursor,
+            InvalidationRunGatherErrorKind::AddressOverflow => ShootdownError::AddressOverflow,
+        }
     }
 }
 
@@ -523,23 +710,7 @@ fn emit_phase_span_begin(
     hart_id: u8,
 ) -> tx_observe::SpanId {
     if let Some(em) = tx_observe::current() {
-        use tx_observe::encode::{encode_phase_transition, phase_transition_tag};
-        use tx_observe::{EventNameId, TxTraceLevel};
-        use tx_observe_types::PayloadPhaseTransition;
-
-        let p = PayloadPhaseTransition {
-            phase_kind: phase_kind as u8,
-            hart_id,
-            _pad: [0u8; 14],
-        };
-        let (payload_bytes, _) = encode_phase_transition(&p);
-        em.span_begin(
-            TxTraceLevel::Phase,
-            EventNameId::from_raw(phase_kind as u32),
-            tx_observe::SpanId::NONE,
-            phase_transition_tag(),
-            &payload_bytes,
-        )
+        em.phase_begin(phase_kind as u8, hart_id)
     } else {
         tx_observe::SpanId::NONE
     }
@@ -553,7 +724,6 @@ fn emit_phase_span_end(span: tx_observe::SpanId) {
         return;
     }
     if let Some(em) = tx_observe::current() {
-        use tx_observe_types::TxPayloadTag;
-        em.span_end(span, TxPayloadTag::None, &[]);
+        em.phase_end(span);
     }
 }

@@ -140,16 +140,32 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "step-discipline" => crate::lint_invariants_step::lint_invariants_step_discipline(root),
         "step-v4-vocabulary" => crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary(root),
         "step-no-await" => crate::lint_invariants_step_v3::lint_invariants_step_no_await(root),
-        "step-sync-signature" => crate::lint_invariants_step_v3::lint_invariants_step_sync_signature(root),
-        "step-interface" => crate::lint_invariants_step_interface::lint_invariants_step_interface(root),
+        "step-sync-signature" => {
+            crate::lint_invariants_step_v3::lint_invariants_step_sync_signature(root)
+        }
+        "step-interface" => {
+            crate::lint_invariants_step_interface::lint_invariants_step_interface(root)
+        }
         "step" => {
             // Convenience: run all four step-related lints
             type LintRule = fn(&Path) -> Result<()>;
             let rules: &[(&str, LintRule)] = &[
-                ("step-discipline", crate::lint_invariants_step::lint_invariants_step_discipline),
-                ("step-v4-vocabulary", crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary),
-                ("step-no-await", crate::lint_invariants_step_v3::lint_invariants_step_no_await),
-                ("step-sync-signature", crate::lint_invariants_step_v3::lint_invariants_step_sync_signature),
+                (
+                    "step-discipline",
+                    crate::lint_invariants_step::lint_invariants_step_discipline,
+                ),
+                (
+                    "step-v4-vocabulary",
+                    crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary,
+                ),
+                (
+                    "step-no-await",
+                    crate::lint_invariants_step_v3::lint_invariants_step_no_await,
+                ),
+                (
+                    "step-sync-signature",
+                    crate::lint_invariants_step_v3::lint_invariants_step_sync_signature,
+                ),
             ];
             let mut errors: Vec<String> = Vec::new();
             for (name, rule) in rules {
@@ -158,53 +174,167 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                     errors.push(format!("{name}: {e}"));
                 }
             }
-            if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("\n"))
+            }
         }
         "subject-context" => crate::lint_invariants_subj::lint_invariants_subject_context(root),
+        "ext4-lifecycle-ownership" => {
+            crate::lint_invariants_ext4::lint_invariants_ext4_lifecycle_ownership(root)
+        }
+        "ext4-no-direct-home-write" => {
+            crate::lint_invariants_ext4::lint_invariants_ext4_no_direct_home_write(root)
+        }
+        "ext4-durability-flags" => {
+            crate::lint_invariants_ext4::lint_invariants_ext4_durability_flags(root)
+        }
         "witness-scope" => crate::lint_invariants_witness::lint_invariants_witness_scope(root),
         "signal-publish" => crate::lint_invariants_signal::lint_invariants_signal_publish(root),
         "script-boundary" => crate::lint_invariants_script::lint_invariants_script_boundary(root),
         "checks-purity" => crate::lint_invariants_checks::lint_invariants_checks_purity(root),
         "cred-check" => crate::lint_invariants_cred_check::lint_invariants_cred_check(root),
-        "legacy-wait-channel" => crate::lint_invariants_wait::lint_invariants_legacy_wait_channel(root),
+        "legacy-wait-channel" => {
+            crate::lint_invariants_wait::lint_invariants_legacy_wait_channel(root)
+        }
         "zone-interface" => crate::lint_invariants_zone::lint_invariants_zone_interface(root),
         "api-language" => crate::lint_invariants_api_language::lint_invariants_api_language(root),
-        "notification-boundary" => crate::lint_invariants_notification::lint_invariants_notification_boundary(root),
-        "observe-producer-boundary" => crate::lint_invariants_observe::lint_invariants_observe_producer_boundary(root),
-        "time-layering" => crate::lint_invariants_time_layering::lint_invariants_time_layering(root),
-        "time-wake-retired" => crate::lint_invariants_time_wake::lint_invariants_time_wake_retired(root),
+        "notification-boundary" => {
+            crate::lint_invariants_notification::lint_invariants_notification_boundary(root)
+        }
+        "observe-producer-boundary" => {
+            crate::lint_invariants_observe::lint_invariants_observe_producer_boundary(root)
+        }
+        "time-layering" => {
+            crate::lint_invariants_time_layering::lint_invariants_time_layering(root)
+        }
+        "time-wake-retired" => {
+            crate::lint_invariants_time_wake::lint_invariants_time_wake_retired(root)
+        }
         "boot-setup" => lint_invariants_boot_setup(root),
         "step-guard" => crate::lint_step_guard::lint_invariants_step_guard(root),
         "no-adhoc-drive" => crate::lint_invariants_drive::lint_invariants_no_adhoc_drive(root),
-        "syscall-adhoc-loop" => crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root),
-        "syscall-no-await" => crate::lint_invariants_syscall::lint_invariants_syscall_no_await(root),
-        "syscall-ctx-bridge" => crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge(root),
+        "syscall-adhoc-loop" => {
+            crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root)
+        }
+        "syscall-no-await" => {
+            crate::lint_invariants_syscall::lint_invariants_syscall_no_await(root)
+        }
+        "syscall-ctx-bridge" => {
+            crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge(root)
+        }
+        "pagecontainer-resident-rcu" => {
+            crate::lint_pagecontainer_resident_rcu::lint_pagecontainer_resident_rcu(root)
+        }
         "all" => {
             type LintRule = fn(&Path) -> Result<()>;
             let rules: &[(&str, LintRule)] = &[
-                ("step-discipline", crate::lint_invariants_step::lint_invariants_step_discipline),
-                ("step-v4-vocabulary", crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary),
-                ("step-no-await", crate::lint_invariants_step_v3::lint_invariants_step_no_await),
-                ("step-sync-signature", crate::lint_invariants_step_v3::lint_invariants_step_sync_signature),
-                ("subject-context", crate::lint_invariants_subj::lint_invariants_subject_context),
-                ("witness-scope", crate::lint_invariants_witness::lint_invariants_witness_scope),
-                ("signal-publish", crate::lint_invariants_signal::lint_invariants_signal_publish),
-                ("script-boundary", crate::lint_invariants_script::lint_invariants_script_boundary),
-                ("checks-purity", crate::lint_invariants_checks::lint_invariants_checks_purity),
-                ("cred-check", crate::lint_invariants_cred_check::lint_invariants_cred_check),
-                ("step-guard", crate::lint_step_guard::lint_invariants_step_guard),
-                ("legacy-wait-channel", crate::lint_invariants_wait::lint_invariants_legacy_wait_channel),
-                ("zone-interface", crate::lint_invariants_zone::lint_invariants_zone_interface),
-                ("api-language", crate::lint_invariants_api_language::lint_invariants_api_language),
-                ("notification-boundary", crate::lint_invariants_notification::lint_invariants_notification_boundary),
-                ("observe-producer-boundary", crate::lint_invariants_observe::lint_invariants_observe_producer_boundary),
-                ("time-layering", crate::lint_invariants_time_layering::lint_invariants_time_layering),
-                ("time-wake-retired", crate::lint_invariants_time_wake::lint_invariants_time_wake_retired),
+                (
+                    "step-discipline",
+                    crate::lint_invariants_step::lint_invariants_step_discipline,
+                ),
+                (
+                    "step-v4-vocabulary",
+                    crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary,
+                ),
+                (
+                    "step-no-await",
+                    crate::lint_invariants_step_v3::lint_invariants_step_no_await,
+                ),
+                (
+                    "step-sync-signature",
+                    crate::lint_invariants_step_v3::lint_invariants_step_sync_signature,
+                ),
+                (
+                    "subject-context",
+                    crate::lint_invariants_subj::lint_invariants_subject_context,
+                ),
+                (
+                    "ext4-lifecycle-ownership",
+                    crate::lint_invariants_ext4::lint_invariants_ext4_lifecycle_ownership,
+                ),
+                (
+                    "ext4-no-direct-home-write",
+                    crate::lint_invariants_ext4::lint_invariants_ext4_no_direct_home_write,
+                ),
+                (
+                    "ext4-durability-flags",
+                    crate::lint_invariants_ext4::lint_invariants_ext4_durability_flags,
+                ),
+                (
+                    "witness-scope",
+                    crate::lint_invariants_witness::lint_invariants_witness_scope,
+                ),
+                (
+                    "signal-publish",
+                    crate::lint_invariants_signal::lint_invariants_signal_publish,
+                ),
+                (
+                    "script-boundary",
+                    crate::lint_invariants_script::lint_invariants_script_boundary,
+                ),
+                (
+                    "checks-purity",
+                    crate::lint_invariants_checks::lint_invariants_checks_purity,
+                ),
+                (
+                    "cred-check",
+                    crate::lint_invariants_cred_check::lint_invariants_cred_check,
+                ),
+                (
+                    "step-guard",
+                    crate::lint_step_guard::lint_invariants_step_guard,
+                ),
+                (
+                    "legacy-wait-channel",
+                    crate::lint_invariants_wait::lint_invariants_legacy_wait_channel,
+                ),
+                (
+                    "zone-interface",
+                    crate::lint_invariants_zone::lint_invariants_zone_interface,
+                ),
+                (
+                    "api-language",
+                    crate::lint_invariants_api_language::lint_invariants_api_language,
+                ),
+                (
+                    "notification-boundary",
+                    crate::lint_invariants_notification::lint_invariants_notification_boundary,
+                ),
+                (
+                    "observe-producer-boundary",
+                    crate::lint_invariants_observe::lint_invariants_observe_producer_boundary,
+                ),
+                (
+                    "time-layering",
+                    crate::lint_invariants_time_layering::lint_invariants_time_layering,
+                ),
+                (
+                    "time-wake-retired",
+                    crate::lint_invariants_time_wake::lint_invariants_time_wake_retired,
+                ),
                 ("boot-setup", lint_invariants_boot_setup),
-                ("no-adhoc-drive", crate::lint_invariants_drive::lint_invariants_no_adhoc_drive),
-                ("syscall-adhoc-loop", crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop),
-                ("syscall-no-await", crate::lint_invariants_syscall::lint_invariants_syscall_no_await),
-                ("syscall-ctx-bridge", crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge),
+                (
+                    "no-adhoc-drive",
+                    crate::lint_invariants_drive::lint_invariants_no_adhoc_drive,
+                ),
+                (
+                    "syscall-adhoc-loop",
+                    crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop,
+                ),
+                (
+                    "syscall-no-await",
+                    crate::lint_invariants_syscall::lint_invariants_syscall_no_await,
+                ),
+                (
+                    "syscall-ctx-bridge",
+                    crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge,
+                ),
+                (
+                    "pagecontainer-resident-rcu",
+                    crate::lint_pagecontainer_resident_rcu::lint_pagecontainer_resident_rcu,
+                ),
             ];
             let mut errors: Vec<String> = Vec::new();
             for (name, rule) in rules {
@@ -220,7 +350,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         other => Err(format!(
-            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step-interface, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, zone-interface, api-language, notification-boundary, observe-producer-boundary, time-layering, time-wake-retired, boot-setup, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step-interface, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, zone-interface, api-language, notification-boundary, observe-producer-boundary, time-layering, time-wake-retired, boot-setup, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, pagecontainer-resident-rcu, all"
         )),
     }
 }
@@ -325,7 +455,9 @@ pub(crate) fn lint_docs(root: &Path) -> Result<()> {
     }
 
     if stale_warnings > 0 {
-        println!("docs lint: {stale_warnings} stale-vocabulary mention(s) found in active docs; treated as warnings because current docs discuss retired terms");
+        println!(
+            "docs lint: {stale_warnings} stale-vocabulary mention(s) found in active docs; treated as warnings because current docs discuss retired terms"
+        );
     }
 
     // Harvest TXV3 tag references from Rust sources under crates/, boards/,

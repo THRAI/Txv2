@@ -1,0 +1,89 @@
+# ext4 Tier 1 shell scenario.
+#
+# Run with `cargo xtask ext4 tier1 --dry-run` to inspect the pinned
+# authority hashes and with the live tier1 runner to drive the guest
+# matrix against the mounted TEST/SCRATCH/WORKLOAD ext4 images.
+
+wait ":mount:sdcard:ext4:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "if [ -x /musl/musl/busybox ] || [ -x /musl/busybox ]; then echo tier1-test-role-status:0; else echo tier1-test-role-status:1; fi\n"
+expect "tier1-test-role-status:0" within 10000
+expect "/ # " within 10000
+sleep 500
+send "/bin/busybox sync; /bin/busybox umount -l /musl; echo tier1-test-detach:$?\n"
+expect "tier1-test-detach:0" within 30000
+expect "/ # " within 30000
+sleep 500
+send "/bin/busybox mkdir -p /musl; /bin/busybox mount -o ro -t ext4 /dev/block/vdc /musl; echo tier1-workload-ro-mount:$?\n"
+expect "tier1-workload-ro-mount:0" within 30000
+expect "/ # " within 30000
+sleep 500
+send "if printf blocked > /musl/tx-tier1-ro-probe; then echo tier1-workload-ro-write:bad; else echo tier1-workload-ro-write:ok; fi\n"
+expect "tier1-workload-ro-write:ok" within 10000
+expect "/ # " within 10000
+sleep 500
+send "/bin/busybox umount -l /musl; /bin/busybox mkdir -p /musl; /bin/busybox mount -t ext4 /dev/block/vdb /musl; echo tier1-scratch-mount:$?\n"
+expect "tier1-scratch-mount:0" within 30000
+expect "/ # " within 30000
+
+group data
+sleep 500
+send "/bin/busybox mkdir -p /musl/tier1-data; echo tier1-data-mkdir:$?\n"
+expect "tier1-data-mkdir:0" within 10000
+expect "/ # " within 10000
+sleep 500
+send "printf 'alpha\\n' > /musl/tier1-data/file; echo tier1-data-write:$?\n"
+expect "tier1-data-write:0" within 10000
+expect "/ # " within 10000
+sleep 500
+send "/bin/busybox cat /musl/tier1-data/file; echo tier1-data-read:$?\n"
+expect "alpha" within 10000
+expect "tier1-data-read:0" within 10000
+expect "/ # " within 10000
+
+group setattr
+sleep 500
+send "/bin/busybox chmod 755 /musl/tier1-data/file; /bin/busybox test -x /musl/tier1-data/file; echo tier1-setattr-status:$?\n"
+expect "tier1-setattr-status:0" within 10000
+expect "/ # " within 10000
+
+group namespace
+sleep 500
+send "/bin/busybox mkdir -p /musl/tier1-ns; printf ns > /musl/tier1-ns/a; /bin/busybox ln /musl/tier1-ns/a /musl/tier1-ns/b; /bin/busybox ln -s a /musl/tier1-ns/c; /bin/busybox mv /musl/tier1-ns/a /musl/tier1-ns/d; /bin/busybox rm /musl/tier1-ns/b /musl/tier1-ns/c /musl/tier1-ns/d; /bin/busybox rmdir /musl/tier1-ns; echo tier1-namespace-status:$?\n"
+expect "tier1-namespace-status:0" within 10000
+expect "/ # " within 10000
+
+group orphan
+sleep 500
+send "/bin/busybox mkdir -p /musl/tier1-orphan; printf orphan > /musl/tier1-orphan/live; exec 3</musl/tier1-orphan/live; /bin/busybox rm /musl/tier1-orphan/live; /bin/busybox cat <&3; status=$?; exec 3<&-; echo tier1-orphan-status:$status\n"
+expect "orphan" within 10000
+expect "tier1-orphan-status:0" within 10000
+expect "/ # " within 10000
+
+group durability
+sleep 500
+send "/bin/busybox sync; echo tier1-durability-status:$?\n"
+expect "tier1-durability-status:0" within 10000
+expect "/ # " within 10000
+
+group remount
+sleep 500
+send "/bin/busybox umount -l /musl; /bin/busybox mkdir -p /musl; /bin/busybox mount -t ext4 /dev/block/vdb /musl; echo tier1-remount-status:$?\n"
+expect "tier1-remount-status:0" within 30000
+expect "/ # " within 30000
+
+group execute-from-scratch
+sleep 500
+send "printf '#!/bin/busybox sh\\necho tier1-exec-ok\\n' > /musl/tier1-exec.sh; /bin/busybox chmod +x /musl/tier1-exec.sh; /musl/tier1-exec.sh; echo tier1-exec-status:$?\n"
+expect "tier1-exec-ok" within 10000
+expect "tier1-exec-status:0" within 10000
+expect "/ # " within 10000
+
+group detach
+sleep 500
+send "/bin/busybox sync; /bin/busybox umount -l /musl; echo tier1-detach-status:$?\n"
+expect "tier1-detach-status:0" within 30000
+
+quit

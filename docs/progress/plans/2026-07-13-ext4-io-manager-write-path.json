@@ -2,7 +2,7 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-07-13-ext4-io-manager-write-path",
   "title": "Ext4 I/O-manager write-path migration",
-  "status": "active",
+  "status": "canceled",
   "created": "2026-07-13",
   "updated": "2026-07-30",
   "owner": "codex",
@@ -42,7 +42,7 @@
       "docs/superpowers/specs/2026-07-13-ext4-io-manager-write-design.md"
     ],
     "progress_refs": [
-      "docs/progress/STATUS.md"
+      "docs/progress/plans/2026-07-11-io-manager-phase0-landing.json"
     ],
     "external_refs": [
       "Linux iomap and blk-mq layering",
@@ -80,12 +80,12 @@
         "cargo test -p tx-subsystems --lib page_backed",
         "cargo test -p tx-subsystems --lib io_manager"
       ],
-      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. PageContainer now admits dirty pages to L4 writeback, retains PageCache leases through planning/execution, routes terminal WritebackFinished completion into the generation-checked slot FSM, and rolls back leases/marks/slots on unplanned or queue-rejected submission. FileFsyncSession captures the page-generation frontier once, submits only the captured generations, waits without duplicate admission, resubmits a captured redirty after its earlier writeback, and surfaces terminal backend errors. The 2026-07-30 Git repair added per-operation weak wait registration, service admission kicks, terminal wake publication, generation-aware synchronous fallback, and an immediate retry wake when every captured writeback admission is initially blocked. Compatibility FsPageBacking::flush_page remains until 6G hot-path cutover; this slice makes no durable fsync claim before 6E ordered JBD2 fencing."
+      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. PageContainer now admits dirty pages to L4 writeback, retains PageCache leases through planning/execution, routes terminal WritebackFinished completion into the generation-checked slot FSM, and rolls back leases/marks/slots on unplanned or queue-rejected submission. FileFsyncSession captures the page-generation frontier once, submits only the captured generations, waits without duplicate admission, resubmits a captured redirty after its earlier writeback, and surfaces terminal backend errors. Compatibility FsPageBacking::flush_page remains until 6G hot-path cutover; this slice makes no durable fsync claim before 6E ordered JBD2 fencing."
     },
     {
       "id": "6c-ext4-read-planner",
       "title": "Implement ext4 read planner parity",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": [
         "6a-neutral-write-ir"
       ],
@@ -101,7 +101,7 @@
     {
       "id": "6d-ext4-buffered-writeback",
       "title": "Plan buffered ext4 writeback from PC frame sources",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": [
         "6b-page-slot-writeback",
         "6c-ext4-read-planner"
@@ -119,7 +119,7 @@
     {
       "id": "6e-jbd2-durability",
       "title": "Add ordered JBD2 transaction graph, replay, and fsync fence",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": [
         "6d-ext4-buffered-writeback"
       ],
@@ -133,12 +133,12 @@
         "e2fsck -n",
         "Linux ext4 interoperability witness"
       ],
-      "notes": "Data precedes journal commit; commit record is durable before fsync completes; checkpoint remains asynchronous. The first 6E sub-slice added a standalone BackendGraphScheduler that admits only dependency-ready bios, releases joins only after all predecessors complete, and suppresses dependent admission after an error. The second sub-slice wires it through PageService and the owned PageContainer block runtime: a terminal tag advances every graph sharing its merged L6 request ID, queues generation-preserving terminal page completion, and kicks L6 when successors become ready. The 2026-07-30 Git repair ensures successful writeback completion reaches the backend planner before fsync progress is published and turns a direct BackendPlan::Err into a terminal L4 completion. Planner Yield, partial Bio/graph admission failure, and compatibility-graph terminalization remain explicit follow-ups. No ext4 allocation or JBD2 transaction graph is emitted yet, so this remains pending and makes no durable fsync claim."
+      "notes": "Data precedes journal commit; commit record is durable before fsync completes; checkpoint remains asynchronous. The first 6E sub-slice added a standalone BackendGraphScheduler that admits only dependency-ready bios, releases joins only after all predecessors complete, and suppresses dependent admission after an error. The second sub-slice wires it through PageService and the owned PageContainer block runtime: a terminal tag advances every graph sharing its merged L6 request ID, queues generation-preserving terminal page completion, and kicks L6 when successors become ready. No ext4 allocation or JBD2 transaction graph is emitted yet, so this remains pending and makes no durable fsync claim."
     },
     {
       "id": "6f-direct-io-coherency",
       "title": "Add direct-I/O, msync, and syncfs coherence",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": [
         "6e-jbd2-durability"
       ],
@@ -158,7 +158,7 @@
     {
       "id": "6g-hot-path-cutover",
       "title": "Cut over hot paths callsite by callsite",
-      "status": "pending",
+      "status": "canceled",
       "depends_on": [
         "6f-direct-io-coherency"
       ],
@@ -180,7 +180,7 @@
     {
       "command": "cargo xtask progress validate",
       "status": "passed",
-      "notes": "Passed for all 34 progress records after repairing the stale progress reference and restoring the active IO_MANAGER_v1.md contract."
+      "notes": "Passed after narrowing this plan to its unclaimed documentation write set."
     },
     {
       "command": "cargo xtask lint docs",
@@ -256,24 +256,13 @@
       "command": "cargo test -p tx-subsystems --lib fs_iface::plan::tests --no-default-features -- --nocapture --test-threads=1; cargo check -p tx-ext4 --lib --no-default-features",
       "status": "passed",
       "notes": "The neutral direct-read target contract and ext4's explicit hole-read ENOSYS guard passed; existing net unused-guard and Ext4FsInstance dead-code warnings remain."
-    },
-    {
-      "command": "cargo test -p tx-subsystems --lib fsync -- --test-threads=1",
-      "status": "passed",
-      "notes": "Passed 22 fsync tests after the per-operation wait/service-wake repair, no-planner synchronous fallback, planner completion/error terminalization, and generation-aware slot handling."
-    },
-    {
-      "command": "timeout --signal=TERM --kill-after=10s 180s env TXKERNEL=/home/msp/learning/Txv2/target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt bash tools/verify-git-net.sh",
-      "status": "passed",
-      "notes": "Clean RV64 QEMU Git witness passed 8/8: local commit/content, HTTP and HTTPS clone, push, pull, and DNS. Serial: msp/debug-logs/2026-07-30-git-net-8-of-8-clean.serial.log."
     }
   ],
   "risks": [
     "Treating a completed data bio as durable fsync before ordered JBD2 exists would violate the power-loss contract.",
     "A writeback completion that clears a page redirtied after submission loses data.",
     "A plan that holds PC, inode, journal, or range locks across I/O will preserve the current serialization bottleneck.",
-    "Direct I/O without reservation and invalidation creates stale PC data.",
-    "Planner Yield, partial Bio or graph admission failure, and the compatibility graph path still need an exactly-once terminalization contract."
+    "Direct I/O without reservation and invalidation creates stale PC data."
   ],
   "blockers": [
     "Active I/O-manager and ext4 design files are already modified in the current worktree; reconcile this plan into those files in their owning change rather than overwriting them."

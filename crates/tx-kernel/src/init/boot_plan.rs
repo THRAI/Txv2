@@ -4,7 +4,7 @@
 //! the kernel should do with it: which rootfs setup path is legal and whether
 //! the OSComp sdcard command-chain entry is selected.
 
-use super::boot_args::{BootArgs, BootMode};
+use super::boot_args::BootArgs;
 use tx_hal::TxPlatform;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,11 +39,7 @@ pub(super) struct BootPlan {
 
 impl BootPlan {
     pub(super) fn read<P: TxPlatform>() -> Self {
-        let mut args = BootArgs::read::<P>();
-        if super::preliminary_oscomp_media_detected() {
-            args.mode = BootMode::Oscomp;
-        }
-        Self::from_args(args)
+        Self::from_args(BootArgs::read::<P>())
     }
 
     fn from_args(args: BootArgs) -> Self {

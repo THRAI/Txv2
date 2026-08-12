@@ -27,9 +27,9 @@ use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
-use crate::mount::{FsObjectPin, MountApiFile, MountIdentity, MountPayload};
+use crate::mount::{MountApiFile, MountIdentity, MountPayload};
 use crate::net::{NetNamespacePayload, SocketIdentity};
-use crate::page_backed::PageContainer;
+use crate::page_backed::{ErrorCursor, PageContainer};
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
 use crate::timerfd::TimerFd;
@@ -97,27 +97,8 @@ impl FsObjectId {
         Self(value)
     }
 
-    /// Construct a persistent-filesystem object identity from its allocation
-    /// slot and incarnation generation.
-    ///
-    /// The low 32 bits remain the on-disk inode number for backends such as
-    /// ext4.  The high 32 bits distinguish successive occupants of the same
-    /// inode bitmap slot, preventing a reclaimed inode from inheriting an old
-    /// RNode, page cache, orphan record, or advisory lock.
-    pub const fn from_inode_generation(inode: u32, generation: u32) -> Self {
-        Self(((generation as u64) << 32) | inode as u64)
-    }
-
     pub const fn as_u64(self) -> u64 {
         self.0
-    }
-
-    pub const fn inode_number(self) -> u32 {
-        self.0 as u32
-    }
-
-    pub const fn inode_generation(self) -> u32 {
-        (self.0 >> 32) as u32
     }
 }
 
@@ -593,9 +574,6 @@ pub struct RNode {
     meta: InodeMeta,
     backing: RNodeBacking,
     containing_mount: Option<Weak<MountPayload>>,
-    /// Shared persistent-object lifetime.  All RNodes and file
-    /// PageContainers for the same `(mount, FsObjectId)` hold the same pin.
-    object_pin: Option<FsObjectPin>,
     /// Optional per-inode readiness endpoints. Most RNodes in the current
     /// tree never expose VFS-level blocking readiness (pipes, tty, sockets,
     /// timerfd, eventfd, etc. own their wait sources on the backing object),
@@ -612,7 +590,6 @@ impl RNode {
             meta,
             backing,
             containing_mount: None,
-            object_pin: None,
             wait_points: SpinMutex::new(None),
         }
     }
@@ -726,9 +703,6 @@ impl RNode {
     }
 
     pub fn with_containing_mount(mut self, mount: &Cap<MountPayload>) -> Self {
-        if self.object_pin.is_none() {
-            self.object_pin = Some(FsObjectPin::acquire(mount, self.fs_object_id));
-        }
         self.containing_mount = Some(mount.downgrade());
         self
     }
@@ -864,7 +838,6 @@ impl core::fmt::Debug for RNode {
             .field("meta", &self.meta)
             .field("backing", &self.backing)
             .field("containing_mount", &self.containing_mount)
-            .field("object_pin", &self.object_pin)
             .field("wait_points_allocated", &self.wait_points.lock().is_some())
             .finish()
     }
@@ -980,49 +953,13 @@ impl DEntry {
 /// - Output bytes are not validated as UTF-8 — POSIX paths are
 ///   byte sequences with `/` and `\0` reserved.
 pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
-    render_dentry_path_in_namespace(dentry, None)
-}
-
-/// Namespace-aware variant of [`render_dentry_path`]: when the parent-hint
-/// chain tops out at a mounted filesystem's root dentry, hop to that mount's
-/// mountpoint dentry and keep walking toward the namespace root.
-///
-/// Without the hop, a cwd inside a mount renders with the mountpoint
-/// component silently dropped — `cd /musl/root/t1` then `getcwd()` returned
-/// `/root/t1`, and every caller that round-trips the result through an
-/// absolute-path walk (git stores `getcwd()` output and re-opens
-/// `<cwd>/.git`) landed in a directory that does not exist. `None` keeps the
-/// plain chain rendering for callers with no namespace in scope.
-pub fn render_dentry_path_in_namespace(
-    dentry: &Cap<DEntry>,
-    namespace: Option<&Cap<crate::mount::MountNamespace>>,
-) -> Option<alloc::vec::Vec<u8>> {
     let mut components: alloc::vec::Vec<InlineName> = alloc::vec::Vec::new();
-    let mut cursor: Cap<DEntry> = dentry.clone();
-    // Mount hops are bounded so a mis-registered mountpoint chain (a cycle)
-    // degrades to a truncated path instead of a hang.
-    let mut hops = 0usize;
-    loop {
-        components.push(cursor.name());
-        if let Some(parent) = cursor.parent_hint() {
-            cursor = parent;
-            continue;
-        }
-        // Chain top. If it is the root of a mounted fs, continue from the
-        // dentry the mount is attached to (e.g. `/musl`).
-        let Some(ns) = namespace else { break };
-        let Some(mount) = ns.mount_containing_dentry(&cursor) else {
-            break;
-        };
-        let Some(mountpoint) = mount.mountpoint() else {
-            // The namespace root mount: rendering is complete.
-            break;
-        };
-        if mountpoint.key() == cursor.key() || hops >= 8 {
-            break;
-        }
-        hops += 1;
-        cursor = mountpoint;
+    components.push(dentry.name());
+
+    let mut current = dentry.parent_hint();
+    while let Some(parent_cap) = current {
+        components.push(parent_cap.name());
+        current = parent_cap.parent_hint();
     }
 
     // components collected leaf → root; reverse for root → leaf rendering.
@@ -1203,9 +1140,27 @@ pub struct BpfMapFile {
 /// happens to be a `userfaultfd(2)` (a state no VFS-aware caller can
 /// reach today).
 #[derive(Debug)]
+struct OpenFileErrorCursors {
+    mount: ErrorCursor,
+    payload: ErrorCursor,
+}
+
+impl OpenFileErrorCursors {
+    fn new(mount_payload: Option<&MountPayload>) -> Self {
+        let cursor =
+            mount_payload.map_or_else(ErrorCursor::new, MountPayload::snapshot_error_cursor);
+        Self {
+            mount: cursor,
+            payload: cursor,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct OpenFile {
     pub(crate) backing: OpenFileBacking,
     offset: AtomicU64,
+    error_cursors: SpinMutex<OpenFileErrorCursors>,
     /// Per-fd readdir cursor. Slice 6 of the shell-prompt roadmap
     /// added this so `getdents64(2)` can resume across calls without
     /// rewinding the directory each time.
@@ -1230,9 +1185,18 @@ pub struct OpenFile {
 
 impl OpenFile {
     pub fn new(rnode: Cap<RNode>, flags: OpenFileFlags) -> Self {
+        Self::new_with_optional_mount_payload(rnode, flags, None)
+    }
+
+    fn new_with_optional_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        mount_payload: Option<&MountPayload>,
+    ) -> Self {
         Self {
             backing: OpenFileBacking::Rnode { rnode },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(mount_payload)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1241,8 +1205,24 @@ impl OpenFile {
         }
     }
 
+    pub fn new_with_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        mount_payload: &MountPayload,
+    ) -> Self {
+        Self::new_with_optional_mount_payload(rnode, flags, Some(mount_payload))
+    }
+
     pub fn new_cap(rnode: Cap<RNode>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
         step_engine::sign(Self::new(rnode, flags))
+    }
+
+    pub fn new_cap_with_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        mount_payload: &MountPayload,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_with_mount_payload(rnode, flags, mount_payload))
     }
 
     /// Like [`Self::new_cap`] but also records the DEntry that
@@ -1257,6 +1237,17 @@ impl OpenFile {
         step_engine::sign(file)
     }
 
+    pub fn new_cap_with_dentry_and_mount_payload(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        dentry: Cap<DEntry>,
+        mount_payload: &MountPayload,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let mut file = Self::new_with_mount_payload(rnode, flags, mount_payload);
+        file.opendir_dentry = Some(dentry);
+        step_engine::sign(file)
+    }
+
     /// Construct a userfaultfd-backed `OpenFile` (PR-10 phase 0). The
     /// resulting value carries `OpenFileBacking::Ufd { ufd }` and no
     /// `Cap<RNode>` — userfaultfd is a non-VFS fd kind (see D7 §3.7).
@@ -1267,6 +1258,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Ufd { ufd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1297,6 +1289,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::AioContext { ctx },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1323,6 +1316,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::SignalFd { sfd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1346,6 +1340,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Epoll { ep },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1366,6 +1361,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Eventfd { efd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1389,6 +1385,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Timerfd { tfd },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1410,6 +1407,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::PosixMq { mq },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1431,6 +1429,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::Pidfd { process },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1452,6 +1451,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::KernelObject { object },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1473,6 +1473,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::MountApi { file },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1498,6 +1499,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::SocketPair { rx, tx },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1525,6 +1527,7 @@ impl OpenFile {
         Self {
             backing: OpenFileBacking::IoUring { ring },
             offset: AtomicU64::new(0),
+            error_cursors: SpinMutex::new(OpenFileErrorCursors::new(None)),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
@@ -1584,16 +1587,6 @@ impl OpenFile {
     /// Exec's post-PoNR CLOEXEC commit uses the decrement form, so this method
     /// must remain allocation-free and infallible.
     pub(crate) fn adjust_process_fd_reference(&self, increment: bool) {
-        // final-smp tracks descriptor ownership explicitly for network
-        // sockets. Cap clones are lifetime pins and cannot be used to decide
-        // when close(2) must publish FIN/EOF.
-        if let Some(socket) = self.socket_identity() {
-            if increment {
-                socket.incr_fd_ref();
-            } else {
-                socket.decr_fd_ref();
-            }
-        }
         match &self.backing {
             OpenFileBacking::Rnode { rnode } => {
                 let RNodeBacking::StructBacked {
@@ -1622,13 +1615,6 @@ impl OpenFile {
         }
     }
 
-    /// P3-S2/S5 (D13): byte and lifecycle operations supplied by a rich
-    /// file kind. Readiness remains fd-neutral through `query_fd_ready`.
-    pub fn file_ops(&self) -> Option<&dyn crate::device::FileOps> {
-        self.socket_identity()
-            .map(|identity| identity as &dyn crate::device::FileOps)
-    }
-
     /// Socket identity backing this open file, if it is a network socket.
     /// Restored alongside the net subsystem re-home; used by
     /// `/proc/net/{tcp,udp,...}` enumeration to walk a process's open sockets.
@@ -1642,6 +1628,12 @@ impl OpenFile {
             },
             _ => None,
         }
+    }
+
+    /// Byte and lifecycle operations supplied by a structured file kind.
+    pub fn file_ops(&self) -> Option<&dyn crate::device::FileOps> {
+        self.socket_identity()
+            .map(|identity| identity as &dyn crate::device::FileOps)
     }
 
     /// VFS-shaped accessor — returns the inner `Cap<RNode>` for an
@@ -1706,6 +1698,16 @@ impl OpenFile {
                  dispatch via OpenFile::backing() / OpenFile::socketpair_endpoint() first",
             ),
         }
+    }
+
+    pub fn observe_mount_error(&self, mount_payload: &MountPayload) -> Option<Errno> {
+        let mut cursors = self.error_cursors.lock();
+        mount_payload.observe_mount_error_with_cursor(&mut cursors.mount)
+    }
+
+    pub fn observe_payload_error(&self, mount_payload: &MountPayload) -> Option<Errno> {
+        let mut cursors = self.error_cursors.lock();
+        mount_payload.observe_payload_error_with_cursor(&mut cursors.payload)
     }
 
     /// Return the DEntry hint set by step_open.  Used by fchdir.

@@ -417,13 +417,14 @@ fn open_resolved_dentry<'g>(
     };
 
     let rnode = dentry.rnode().clone();
-    match OpenFile::new_cap_with_dentry(rnode, flags, dentry) {
+    let open = match mount_payload_for(&dentry, guard) {
+        Some(payload) => {
+            OpenFile::new_cap_with_dentry_and_mount_payload(rnode, flags, dentry, &payload)
+        }
+        None => OpenFile::new_cap_with_dentry(rnode, flags, dentry),
+    };
+    match open {
         Ok(open) => V3::done(open),
-        // Preserve resource exhaustion as ENOMEM.  Collapsing every
-        // zone failure to EIO made concurrent exec failures look like
-        // storage corruption even when only the OpenFile zone could
-        // not grow.
-        Err(tx_substrate::zone::ZoneError::AllocationFailed) => V3::err(step_engine::Errno::ENOMEM),
         Err(_) => V3::err(step_engine::Errno::EIO),
     }
 }
@@ -579,32 +580,10 @@ pub(crate) fn dentry_for_mount_root(
 
 /// Walk `from`'s parent-hint chain to find the namespace's root
 /// dentry. Returns `from` itself when no parent hint is installed.
-///
-/// Mount-boundary aware: when the chain tops out at a mounted
-/// filesystem's root, hop to that mount's mountpoint (global table)
-/// and keep climbing. Without the hop, a namespace-less walk rooted
-/// inside a mount (cwd = /musl/root/t1 on the sdcard ext4) treats the
-/// ext4 root as "/" — every absolute path then resolves against the
-/// image tree: `stat /musl/...` dies with ENOENT while namespace-aware
-/// syscalls (openat, chdir) resolve the same path fine, and `/tmp`
-/// splits into two different directories depending on the syscall.
 pub(crate) fn mount_root_dentry(from: &Cap<DEntry>) -> Cap<DEntry> {
     let mut cursor: Cap<DEntry> = from.clone();
-    // Bounded so a mis-registered mountpoint cycle degrades to a
-    // truncated climb instead of a hang.
-    let mut hops = 0usize;
-    loop {
-        while let Some(parent_cap) = cursor.parent_hint() {
-            cursor = parent_cap;
-        }
-        let Some(mountpoint) = crate::mount::mountpoint_for_mount_root(&cursor) else {
-            break;
-        };
-        if mountpoint.key() == cursor.key() || hops >= 8 {
-            break;
-        }
-        hops += 1;
-        cursor = mountpoint;
+    while let Some(parent_cap) = cursor.parent_hint() {
+        cursor = parent_cap;
     }
     cursor
 }

@@ -9,7 +9,7 @@ use tx_hal::UserPtr;
 pub mod adapter;
 mod read;
 
-pub use read::{procfs_register_boot_cmdline, procfs_register_uptime_clock, procfs_set_mounts};
+pub use read::{procfs_register_boot_cmdline, procfs_register_uptime_clock};
 
 use adapter::step_engine::{Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
@@ -160,7 +160,7 @@ fn ipv6_conf_dir_id(name: &[u8]) -> FsObjectId {
 /// 0 = directory, 1 = disable_ipv6, 2 = accept_dad, or `None` if not a conf id.
 fn ipv6_conf_kind(id: FsObjectId) -> Option<u8> {
     let r = id.as_u64();
-    if (PROCFS_IPV6_CONF_BASE..PROCFS_IPV6_CONF_BASE + PROCFS_IPV6_CONF_SPAN * 4).contains(&r) {
+    if r >= PROCFS_IPV6_CONF_BASE && r < PROCFS_IPV6_CONF_BASE + PROCFS_IPV6_CONF_SPAN * 4 {
         Some((r & 3) as u8)
     } else {
         None
@@ -175,7 +175,7 @@ fn ipv4_conf_dir_id(name: &[u8]) -> FsObjectId {
 /// 0 = directory, 1 = force_igmp_version, or `None` if not an ipv4 conf id.
 fn ipv4_conf_kind(id: FsObjectId) -> Option<u8> {
     let r = id.as_u64();
-    if (PROCFS_IPV4_CONF_BASE..PROCFS_IPV4_CONF_BASE + PROCFS_IPV6_CONF_SPAN * 4).contains(&r) {
+    if r >= PROCFS_IPV4_CONF_BASE && r < PROCFS_IPV4_CONF_BASE + PROCFS_IPV6_CONF_SPAN * 4 {
         Some((r & 3) as u8)
     } else {
         None
@@ -348,13 +348,13 @@ fn write_userns_projection(
     };
 
     let Some(proc) = process::process_by_pid(pid) else {
-        return Some(StepOutcome::err(Errno::ESRCH));
+        return Some(StepOutcome::err(Errno::ESRCH.into()));
     };
     let Some(nsproxy) = proc.nsproxy_cap() else {
-        return Some(StepOutcome::err(Errno::ESRCH));
+        return Some(StepOutcome::err(Errno::ESRCH.into()));
     };
     let Some(writer_cred) = proc.cred() else {
-        return Some(StepOutcome::err(Errno::ESRCH));
+        return Some(StepOutcome::err(Errno::ESRCH.into()));
     };
     let user_ns = nsproxy.user_ns.clone();
 
@@ -382,7 +382,7 @@ fn write_userns_projection(
 
     Some(match result {
         Ok(()) => StepOutcome::done(bytes.len() as u64),
-        Err(errno) => StepOutcome::err(errno),
+        Err(errno) => StepOutcome::err(errno.into()),
     })
 }
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
@@ -424,7 +424,7 @@ const fn pid_fdinfo_id(pid: Pid, fd: u32) -> FsObjectId {
 }
 pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if (PROCFS_MEM_BASE..PROCFS_MEM_BASE + PROCFS_PID_FILE_SPAN).contains(&r) {
+    if r >= PROCFS_MEM_BASE && r < PROCFS_MEM_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_MEM_BASE) as u32))
     } else {
         None
@@ -432,7 +432,7 @@ pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_smaps_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if (PROCFS_SMAPS_BASE..PROCFS_SMAPS_BASE + PROCFS_PID_FILE_SPAN).contains(&r) {
+    if r >= PROCFS_SMAPS_BASE && r < PROCFS_SMAPS_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_SMAPS_BASE) as u32))
     } else {
         None
@@ -440,7 +440,7 @@ pub fn pid_from_smaps_id(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if (PROCFS_MAPS_BASE..PROCFS_MAPS_BASE + PROCFS_PID_FILE_SPAN).contains(&r) {
+    if r >= PROCFS_MAPS_BASE && r < PROCFS_MAPS_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_MAPS_BASE) as u32))
     } else {
         None
@@ -448,7 +448,7 @@ pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if (PROCFS_EXE_BASE..PROCFS_EXE_BASE + PROCFS_PID_FILE_SPAN).contains(&r) {
+    if r >= PROCFS_EXE_BASE && r < PROCFS_EXE_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_EXE_BASE) as u32))
     } else {
         None
@@ -456,7 +456,7 @@ pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_mounts_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if (PROCFS_PID_MOUNTS_BASE..PROCFS_PID_MOUNTS_BASE + PROCFS_PID_FILE_SPAN).contains(&r) {
+    if r >= PROCFS_PID_MOUNTS_BASE && r < PROCFS_PID_MOUNTS_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_PID_MOUNTS_BASE) as u32))
     } else {
         None
@@ -515,7 +515,7 @@ pub fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_stat_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if (PROCFS_STAT_BASE..PROCFS_STAT_BASE + PROCFS_PID_FILE_SPAN).contains(&r) {
+    if r >= PROCFS_STAT_BASE && r < PROCFS_STAT_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_STAT_BASE) as u32))
     } else {
         None
@@ -523,7 +523,7 @@ pub fn pid_from_stat_id(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_cmdline_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if (PROCFS_CMDLINE_BASE..PROCFS_CMDLINE_BASE + PROCFS_PID_FILE_SPAN).contains(&r) {
+    if r >= PROCFS_CMDLINE_BASE && r < PROCFS_CMDLINE_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_CMDLINE_BASE) as u32))
     } else {
         None
@@ -609,7 +609,7 @@ impl FsOps for Procfs {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
                 }
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYSVIPC_ID {
             if name == b"msg" {
@@ -621,7 +621,7 @@ impl FsOps for Procfs {
             if name == b"shm" {
                 return StepOutcome::done(PROCFS_SYSVIPC_SHM_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_ID {
             if name == b"kernel" {
@@ -633,7 +633,7 @@ impl FsOps for Procfs {
             if name == b"fs" {
                 return StepOutcome::done(PROCFS_SYS_FS_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_FS_ID {
             if name == b"pipe-max-size" {
@@ -648,7 +648,7 @@ impl FsOps for Procfs {
             if name == b"protected_symlinks" {
                 return StepOutcome::done(PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_NET_ID {
             if name == b"tcp" {
@@ -687,7 +687,7 @@ impl FsOps for Procfs {
             if name == b"arp" {
                 return StepOutcome::done(PROCFS_NET_ARP_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_ID {
             if name == b"ipv6" {
@@ -696,13 +696,13 @@ impl FsOps for Procfs {
             if name == b"ipv4" {
                 return StepOutcome::done(PROCFS_SYS_NET_IPV4_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_IPV6_ID {
             if name == b"conf" {
                 return StepOutcome::done(PROCFS_SYS_NET_IPV6_CONF_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_IPV4_ID {
             if name == b"conf" {
@@ -717,7 +717,7 @@ impl FsOps for Procfs {
             if name == b"ip_forward" {
                 return StepOutcome::done(PROCFS_SYS_NET_IPV4_IP_FORWARD_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_IPV6_CONF_ID {
             // `all`, `default`, or any per-interface name (`lo`, `eth0`, veth…),
@@ -725,7 +725,7 @@ impl FsOps for Procfs {
             if !name.is_empty() {
                 return StepOutcome::done(ipv6_conf_dir_id(name));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_IPV4_CONF_ID {
             // Reject dotted names: busybox sysctl probes dot→slash splits
@@ -735,7 +735,7 @@ impl FsOps for Procfs {
             if !name.is_empty() && !name.contains(&b'.') {
                 return StepOutcome::done(ipv4_conf_dir_id(name));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if ipv6_conf_kind(parent) == Some(0) {
             if name == b"disable_ipv6" {
@@ -744,13 +744,13 @@ impl FsOps for Procfs {
             if name == b"accept_dad" {
                 return StepOutcome::done(FsObjectId::new(parent.as_u64() + 2));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if ipv4_conf_kind(parent) == Some(0) {
             if name == b"force_igmp_version" {
                 return StepOutcome::done(FsObjectId::new(parent.as_u64() + 1));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_KERNEL_ID {
             if name == b"tainted" {
@@ -759,7 +759,7 @@ impl FsOps for Procfs {
             if name == b"pid_max" {
                 return StepOutcome::done(PROCFS_SYS_KERNEL_PID_MAX_ID);
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_dir(parent) {
             if name == b"stat" && process::process_by_pid(pid).is_some() {
@@ -804,7 +804,7 @@ impl FsOps for Procfs {
             if name == b"ns" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_ns_dir_id(pid));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_ns_dir(parent) {
             if name == b"net" && process::process_by_pid(pid).is_some() {
@@ -813,11 +813,11 @@ impl FsOps for Procfs {
             if name == b"mnt" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_mntns_id(pid));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_fd_dir(parent) {
             let Ok(fd) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             if process::process_by_pid(pid)
                 .and_then(|proc| proc.fd(fd))
@@ -825,11 +825,11 @@ impl FsOps for Procfs {
             {
                 return StepOutcome::done(pid_fd_id(pid, fd));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_fdinfo_dir(parent) {
             let Ok(fd) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             if process::process_by_pid(pid)
                 .and_then(|proc| proc.fd(fd))
@@ -837,9 +837,9 @@ impl FsOps for Procfs {
             {
                 return StepOutcome::done(pid_fdinfo_id(pid, fd));
             }
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
-        StepOutcome::err(Errno::ENOENT)
+        StepOutcome::err(Errno::ENOENT.into())
     }
 
     fn load_inode_meta(
@@ -979,7 +979,7 @@ impl FsOps for Procfs {
             id if pid_from_fdinfo_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
-            _ => StepOutcome::err(Errno::ENOENT),
+            _ => StepOutcome::err(Errno::ENOENT.into()),
         }
     }
 
@@ -1062,7 +1062,7 @@ impl FsOps for Procfs {
                 let fi = idx.saturating_sub(2);
                 if fi < fds.len() {
                     let fd = fds[fi];
-                    let name = alloc::format!("{fd}");
+                    let name = alloc::format!("{}", fd);
                     return StepOutcome::done(Some((
                         dir_entry(pid_fdinfo_id(pid, fd), InodeKind::Regular, name.as_bytes()),
                         procfs_entry_cursor(fi),
@@ -1375,10 +1375,10 @@ impl FsOps for Procfs {
         } else if let Some((pid, fd_num)) = pid_from_fd_id(id) {
             // /proc/<pid>/fd/N — symlink target is the path of the open file.
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             let Some(open_file) = proc.fd(fd_num) else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             if let tx_subsystems::vfs::structure::OpenFileBacking::Rnode { rnode } =
                 open_file.backing()
@@ -1393,21 +1393,21 @@ impl FsOps for Procfs {
                 }
             }
             // v1: render as "fd:N" since we don't have reverse-path from OpenFile.
-            let target = alloc::format!("anon_inode:[{fd_num}]");
+            let target = alloc::format!("anon_inode:[{}]", fd_num);
             StepOutcome::done(target.into_bytes().into_boxed_slice())
         } else if let Some(pid) = pid_from_exe_id(id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             let Some(exe_dentry) = proc.exe_file() else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             match render_dentry_path(&exe_dentry) {
                 Some(path) => StepOutcome::done(path.into_boxed_slice()),
-                None => StepOutcome::err(Errno::ENOENT),
+                None => StepOutcome::err(Errno::ENOENT.into()),
             }
         } else {
-            StepOutcome::err(Errno::ENOENT)
+            StepOutcome::err(Errno::ENOENT.into())
         }
     }
 
@@ -1419,7 +1419,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn mkdir(
         &self,
@@ -1429,7 +1429,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn unlink(
         &self,
@@ -1438,7 +1438,7 @@ impl FsOps for Procfs {
         _: FsObjectId,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn rmdir(
         &self,
@@ -1447,7 +1447,7 @@ impl FsOps for Procfs {
         _: FsObjectId,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn symlink(
         &self,
@@ -1457,7 +1457,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn rename(
         &self,
@@ -1467,7 +1467,7 @@ impl FsOps for Procfs {
         _: &[u8],
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn link(
         &self,
@@ -1476,7 +1476,7 @@ impl FsOps for Procfs {
         _: FsObjectId,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn destroy_inode(&self, _: FsObjectId, _: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
@@ -1501,10 +1501,10 @@ impl FsOps for Procfs {
         // `setns(2)` (and the rtnetlink fd resolvers) can resolve.
         if let Some(pid) = pid_from_netns_id(id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             let Some(payload) = proc.net_namespace() else {
-                return StepOutcome::err(Errno::ESRCH);
+                return StepOutcome::err(Errno::ESRCH.into());
             };
             return match RNode::new_cap_in_mount(
                 id,
@@ -1515,7 +1515,7 @@ impl FsOps for Procfs {
                 mount,
             ) {
                 Ok(cap) => StepOutcome::done(cap),
-                Err(_) => StepOutcome::err(Errno::ENOMEM),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
             };
         }
         // `/proc/<pid>/ns/mnt` — back with the target's mount namespace so
@@ -1523,10 +1523,10 @@ impl FsOps for Procfs {
         // the shared mnt ns for now, but tst_ns_exec requires the node to open).
         if let Some(pid) = pid_from_mntns_id(id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             };
             let Some(payload) = proc.mount_namespace_cap() else {
-                return StepOutcome::err(Errno::ESRCH);
+                return StepOutcome::err(Errno::ESRCH.into());
             };
             return match RNode::new_cap_in_mount(
                 id,
@@ -1537,7 +1537,7 @@ impl FsOps for Procfs {
                 mount,
             ) {
                 Ok(cap) => StepOutcome::done(cap),
-                Err(_) => StepOutcome::err(Errno::ENOMEM),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
             };
         }
         match RNode::new_cap_in_mount(
@@ -1550,7 +1550,7 @@ impl FsOps for Procfs {
             mount,
         ) {
             Ok(cap) => StepOutcome::done(cap),
-            Err(_) => StepOutcome::err(Errno::ENOMEM),
+            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
     }
 
@@ -1565,22 +1565,22 @@ impl FsOps for Procfs {
         // `offset` is the virtual address to read from.
         if let Some(pid) = pid_from_mem_id(fs_object_id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ESRCH);
+                return StepOutcome::err(Errno::ESRCH.into());
             };
             let Some(aspace) = proc.aspace_cap() else {
-                return StepOutcome::err(Errno::ESRCH);
+                return StepOutcome::err(Errno::ESRCH.into());
             };
             let src = UserPtr::<u8>::new(offset as usize);
             match aspace.copy_from_user(buf, src, guard) {
                 StepOutcome::Done(n) => StepOutcome::done(n as u64),
                 StepOutcome::Err(e) => StepOutcome::err(e),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    StepOutcome::err(Errno::EIO)
+                    StepOutcome::err(Errno::EIO.into())
                 }
             }
         } else {
             // Other projected files: render content via read::render.
-            let content: Vec<u8> = read::render(fs_object_id).into_bytes();
+            let content: Vec<u8> = read::render(fs_object_id, guard).into_bytes();
             let bytes = content.as_slice();
             let off = offset as usize;
             if off >= bytes.len() {
@@ -1604,7 +1604,8 @@ impl FsOps for Procfs {
         if pid_from_mem_id(fs_object_id).is_some() {
             return self.read_projected(fs_object_id, offset, buf, guard);
         }
-        let content: Vec<u8> = read::render_with_netns(fs_object_id, caller_netns).into_bytes();
+        let content: Vec<u8> =
+            read::render_with_netns(fs_object_id, caller_netns, guard).into_bytes();
         let bytes = content.as_slice();
         let off = offset as usize;
         if off >= bytes.len() {
@@ -1641,11 +1642,11 @@ impl FsOps for Procfs {
         {
             let text = core::str::from_utf8(bytes).unwrap_or("").trim();
             let Ok(value) = text.parse::<u32>() else {
-                return StepOutcome::err(Errno::EINVAL);
+                return StepOutcome::err(Errno::EINVAL.into());
             };
             if fs_object_id == PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
                 if value > 1 {
-                    return StepOutcome::err(Errno::EINVAL);
+                    return StepOutcome::err(Errno::EINVAL.into());
                 }
                 let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
                 netns.set_ipv4_forwarding_for_test_or_bootstrap(value != 0);
@@ -1665,7 +1666,7 @@ impl FsOps for Procfs {
             let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
             return match tx_subsystems::net::apply_netfilter_control_command(&netns, bytes) {
                 Ok(()) => StepOutcome::done(bytes.len() as u64),
-                Err(errno) => StepOutcome::err(errno),
+                Err(errno) => StepOutcome::err(errno.into()),
             };
         }
         // `ip neigh del` writes "<addr> <dev>" here to drop a neighbor entry.
@@ -1673,7 +1674,7 @@ impl FsOps for Procfs {
             let _ = tx_subsystems::net::namespace::delete_neighbor_ctl(bytes);
             return StepOutcome::done(bytes.len() as u64);
         }
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn write_projected_with_netns(
@@ -1693,22 +1694,22 @@ impl FsOps for Procfs {
             return self.write_projected(fs_object_id, offset, bytes, guard);
         };
         if offset != 0 {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
         if fs_object_id == PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
             let text = core::str::from_utf8(bytes).unwrap_or("").trim();
             let Ok(value) = text.parse::<u32>() else {
-                return StepOutcome::err(Errno::EINVAL);
+                return StepOutcome::err(Errno::EINVAL.into());
             };
             if value > 1 {
-                return StepOutcome::err(Errno::EINVAL);
+                return StepOutcome::err(Errno::EINVAL.into());
             }
             netns.set_ipv4_forwarding_for_test_or_bootstrap(value != 0);
             return StepOutcome::done(bytes.len() as u64);
         }
         match tx_subsystems::net::apply_netfilter_control_command(netns, bytes) {
             Ok(()) => StepOutcome::done(bytes.len() as u64),
-            Err(errno) => StepOutcome::err(errno),
+            Err(errno) => StepOutcome::err(errno.into()),
         }
     }
 
@@ -1719,7 +1720,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
     fn chown_inode(
         &self,
@@ -1729,7 +1730,7 @@ impl FsOps for Procfs {
         _: &Credential,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 }
 
@@ -1774,7 +1775,7 @@ fn procfs_entry_cursor(entry_index: usize) -> DirCursor {
 
 impl FsPageBacking for Procfs {
     fn fetch_page(&self, _: FsObjectId, _: u64, _: &Guard<'_>) -> StepOutcome<Frame, NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
     fn flush_page(
         &self,
@@ -1783,7 +1784,7 @@ impl FsPageBacking for Procfs {
         _: &Frame,
         _: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
     fn truncate(
         &self,
@@ -1794,10 +1795,10 @@ impl FsPageBacking for Procfs {
         if len == 0 && is_writable_procfs_projection(fs_object_id) {
             return StepOutcome::done(());
         }
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
     fn fsync_file(&self, _: FsObjectId, _: &Guard<'_>) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 }
 
@@ -1817,6 +1818,7 @@ fn is_writable_procfs_projection(fs_object_id: FsObjectId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
     use std::collections::BTreeMap;
     use std::sync::{LazyLock, Mutex};
     use tx_hal::{
@@ -1955,6 +1957,19 @@ mod tests {
         names
     }
 
+    fn render_for_test(id: FsObjectId) -> String {
+        let guard = adapter::step_engine::guard();
+        read::render(id, &guard)
+    }
+
+    fn render_with_netns_for_test(
+        id: FsObjectId,
+        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+    ) -> String {
+        let guard = adapter::step_engine::guard();
+        read::render_with_netns(id, caller_netns, &guard)
+    }
+
     #[test]
     fn procfs_root_readdir_advances_from_dots_to_static_entries() {
         let _setup = setup();
@@ -1985,8 +2000,8 @@ mod tests {
         assert!(names.iter().any(|name| name == b"udp"));
         assert!(names.iter().any(|name| name == b"snmp"));
         assert!(names.iter().any(|name| name == b"netlink"));
-        assert!(read::render(lookup(&fs, net_id, b"tcp")).contains("local_address"));
-        let snmp = read::render(lookup(&fs, net_id, b"snmp"));
+        assert!(render_for_test(lookup(&fs, net_id, b"tcp")).contains("local_address"));
+        let snmp = render_for_test(lookup(&fs, net_id, b"snmp"));
         assert!(snmp.contains("Ip:"), "{snmp}");
         assert!(snmp.contains("Tcp:"), "{snmp}");
         assert!(snmp.contains("Udp:"), "{snmp}");
@@ -2007,13 +2022,13 @@ mod tests {
         assert!(names.iter().any(|name| name == b"route"));
         assert!(names.iter().any(|name| name == b"nf_conntrack"));
         assert!(names.iter().any(|name| name == b"tx_nf_rules"));
-        assert!(read::render(lookup(&fs, net_id, b"dev")).contains("lo:"));
-        assert!(read::render(lookup(&fs, net_id, b"route")).contains("Iface"));
-        assert_eq!(read::render(lookup(&fs, net_id, b"nf_conntrack")), "");
+        assert!(render_for_test(lookup(&fs, net_id, b"dev")).contains("lo:"));
+        assert!(render_for_test(lookup(&fs, net_id, b"route")).contains("Iface"));
+        assert_eq!(render_for_test(lookup(&fs, net_id, b"nf_conntrack")), "");
 
         let ip_forward_id = lookup(&fs, sys_net_ipv4_id, b"ip_forward");
         let tx_nf_rules_id = lookup(&fs, net_id, b"tx_nf_rules");
-        assert_eq!(read::render(ip_forward_id), "0\n");
+        assert_eq!(render_for_test(ip_forward_id), "0\n");
         {
             let guard = adapter::step_engine::guard();
             assert!(matches!(
@@ -2029,7 +2044,7 @@ mod tests {
                 StepOutcome::Done(2)
             ));
         }
-        assert_eq!(read::render(ip_forward_id), "1\n");
+        assert_eq!(render_for_test(ip_forward_id), "1\n");
 
         let target_netns_identity =
             tx_subsystems::net::create_isolated_net_namespace_for_test("procfs-target-netns")
@@ -2050,9 +2065,9 @@ mod tests {
                 StepOutcome::Done(2)
             ));
         }
-        assert_eq!(read::render_with_netns(ip_forward_id, None), "1\n");
+        assert_eq!(render_with_netns_for_test(ip_forward_id, None), "1\n");
         assert_eq!(
-            read::render_with_netns(ip_forward_id, Some(&target_netns)),
+            render_with_netns_for_test(ip_forward_id, Some(&target_netns)),
             "0\n"
         );
 
@@ -2077,8 +2092,8 @@ mod tests {
                 StepOutcome::Done(22)
             ));
         }
-        let host_rules = read::render_with_netns(tx_nf_rules_id, None);
-        let target_rules = read::render_with_netns(tx_nf_rules_id, Some(&target_netns));
+        let host_rules = render_with_netns_for_test(tx_nf_rules_id, None);
+        let target_rules = render_with_netns_for_test(tx_nf_rules_id, Some(&target_netns));
         assert!(host_rules.contains("DROP"), "{host_rules}");
         assert!(!host_rules.contains("ACCEPT"), "{host_rules}");
         assert!(target_rules.contains("ACCEPT"), "{target_rules}");
@@ -2105,29 +2120,55 @@ mod tests {
                 core::str::from_utf8(expected).unwrap_or("<non-utf8>")
             );
         }
-        let filesystems = read::render(lookup(&fs, PROCFS_ROOT_ID, b"filesystems"));
+        let filesystems = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"filesystems"));
         assert!(filesystems.contains("tmpfs"), "{filesystems}");
         assert!(filesystems.contains("proc"), "{filesystems}");
         assert!(filesystems.contains("sysfs"), "{filesystems}");
-        assert_eq!(read::render(lookup(&fs, PROCFS_ROOT_ID, b"modules")), "");
-        let devices = read::render(lookup(&fs, PROCFS_ROOT_ID, b"devices"));
+        assert_eq!(render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"modules")), "");
+        let devices = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"devices"));
         assert!(devices.contains("Character devices:"), "{devices}");
         assert!(devices.contains("Block devices:"), "{devices}");
-        let cgroups = read::render(lookup(&fs, PROCFS_ROOT_ID, b"cgroups"));
+        let cgroups = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"cgroups"));
         assert!(cgroups.contains("#subsys_name"), "{cgroups}");
-        let mounts = read::render(lookup(&fs, PROCFS_ROOT_ID, b"mounts"));
+        let mounts = render_for_test(lookup(&fs, PROCFS_ROOT_ID, b"mounts"));
         assert!(mounts.contains(" /proc proc "), "{mounts}");
         assert!(mounts.contains(" /sys sysfs "), "{mounts}");
         bootstrap_procfs_test_init_process();
         let pid_dir = lookup(&fs, PROCFS_ROOT_ID, b"1");
         let pid_mounts_id = lookup(&fs, pid_dir, b"mounts");
-        let guard = adapter::step_engine::guard();
-        assert_eq!(
-            fs.load_inode_meta(pid_mounts_id, &guard),
-            StepOutcome::Done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
-        );
-        let pid_mounts = read::render(pid_mounts_id);
+        {
+            let guard = adapter::step_engine::guard();
+            assert_eq!(
+                fs.load_inode_meta(pid_mounts_id, &guard),
+                StepOutcome::Done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            );
+        }
+        let pid_mounts = render_for_test(pid_mounts_id);
         assert_eq!(pid_mounts, mounts);
+    }
+
+    #[test]
+    fn procfs_process_renderers_reuse_one_caller_guard() {
+        let _setup = setup();
+        let fs = Procfs::new();
+        bootstrap_procfs_test_init_process();
+
+        let pid_dir = lookup(&fs, PROCFS_ROOT_ID, b"1");
+        let stat_id = lookup(&fs, pid_dir, b"stat");
+        let status_id = lookup(&fs, pid_dir, b"status");
+        let maps_id = lookup(&fs, pid_dir, b"maps");
+        let smaps_id = lookup(&fs, pid_dir, b"smaps");
+
+        let guard = adapter::step_engine::guard();
+        let stat = read::render(stat_id, &guard);
+        let status = read::render(status_id, &guard);
+        let maps = read::render(maps_id, &guard);
+        let smaps = read::render(smaps_id, &guard);
+
+        assert!(stat.starts_with("1 "), "{stat}");
+        assert!(status.contains("Pid:\t1\n"), "{status}");
+        assert!(maps.is_empty(), "{maps}");
+        assert!(smaps.is_empty(), "{smaps}");
     }
 
     #[test]
@@ -2185,17 +2226,17 @@ mod tests {
         let sem_id = lookup(&fs, sysvipc_id, b"sem");
         let shm_id = lookup(&fs, sysvipc_id, b"shm");
 
-        let msg = read::render(msg_id);
+        let msg = render_for_test(msg_id);
         assert!(msg.contains("key"));
         assert!(msg.contains(&alloc::format!("{} {}", 0x4d534750, msqid)));
         assert!(msg.contains("5"), "{msg}");
 
-        let sem = read::render(sem_id);
+        let sem = render_for_test(sem_id);
         assert!(sem.contains("nsems"));
         assert!(sem.contains(&alloc::format!("{} {}", 0x53454d50, semid)));
         assert!(sem.contains("2"), "{sem}");
 
-        let shm = read::render(shm_id);
+        let shm = render_for_test(shm_id);
         assert!(shm.contains("bytes"));
         assert!(shm.contains(&alloc::format!("{} {}", 0x53484d50, shmid)));
         assert!(shm.contains("4096"), "{shm}");
@@ -2248,7 +2289,7 @@ mod tests {
         let proc_id = lookup(&fs, PROCFS_ROOT_ID, b"1");
         let fdinfo_dir = lookup(&fs, proc_id, b"fdinfo");
         let fdinfo_id = lookup(&fs, fdinfo_dir, b"7");
-        let fdinfo = read::render(fdinfo_id);
+        let fdinfo = render_for_test(fdinfo_id);
 
         assert!(fdinfo.contains("mq_maxmsg:\t4"), "{fdinfo}");
         assert!(fdinfo.contains("mq_msgsize:\t32"), "{fdinfo}");

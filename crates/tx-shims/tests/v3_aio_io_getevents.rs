@@ -122,7 +122,6 @@ impl PmapIf for StubPmap {
 
 impl EntropyIf for StubPmap {}
 impl tx_hal::AuxvIf for StubPmap {}
-impl tx_hal::CacheIf for StubPmap {}
 impl tx_hal::ConsoleIf for StubPmap {
     fn write_bytes(_bytes: &[u8]) {}
 }
@@ -325,7 +324,7 @@ fn submit_dispatch_completion_round_trip() {
     let mailbox = Arc::new(TaskMailbox::new());
     let generation = mailbox.next_generation();
     let _sub = aio
-        .events_available_endpoint()
+        .events_available_source()
         .prepare(
             Arc::downgrade(&mailbox),
             generation,

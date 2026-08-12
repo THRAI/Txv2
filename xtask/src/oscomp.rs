@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::image::ensure_test_initramfs;
 use crate::target::TxTarget;
@@ -13,10 +15,14 @@ use crate::Result;
 
 pub(crate) const OSCOMP_AUTOTEST: &str = "external/oscomp-autotest";
 const OSCOMP_DOCKER_IMAGE: &str = "zhouzhouyi/os-contest:20260104";
-const OSCOMP_SDCARD_RV_URL: &str =
-    "https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/sdcard-rv.img.xz";
-const OSCOMP_SDCARD_LA_URL: &str =
-    "https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/sdcard-la.img.xz";
+const OSCOMP_SDCARD_RV_URL: &str = "https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/sdcard-rv.img.xz";
+const OSCOMP_SDCARD_LA_URL: &str = "https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/sdcard-la.img.xz";
+
+#[derive(Debug)]
+struct QemuEvidenceWait {
+    marker: String,
+    timeout: Duration,
+}
 
 pub(crate) fn oscomp(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
@@ -207,7 +213,7 @@ fn oscomp_submit(root: &Path, args: &[String]) -> Result<()> {
         Some(other) => {
             return Err(format!(
                 "OSComp submit supports rv64-qemu, la64-qemu, or all, not {other}"
-            ))
+            ));
         }
     }
     println!("prepared OSComp submit dir at {}", submit.display());
@@ -268,6 +274,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
         .map(|path| resolve_path(root, path))
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let evidence_wait = oscomp_evidence_wait(args)?;
     let test_initramfs = ensure_test_initramfs(root, target)?;
     let (kernel, sdcard, out, mut qemu_args) = match target {
         TxTarget::Rv64Qemu => (
@@ -373,17 +380,78 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
     };
     fs::create_dir_all(out.parent().expect("output has parent")).map_err(|err| err.to_string())?;
     let output = fs::File::create(&out).map_err(|err| err.to_string())?;
-    let status = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(rest)
         .current_dir(root)
         .stdout(output.try_clone().map_err(|err| err.to_string())?)
-        .stderr(output)
-        .status()
+        .stderr(output);
+
+    let Some(wait) = evidence_wait else {
+        let status = command
+            .status()
+            .map_err(|err| format!("failed to run {program}: {err}"))?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!("OSComp qemu exited with {status}"))
+        };
+    };
+
+    let mut child = command
+        .spawn()
         .map_err(|err| format!("failed to run {program}: {err}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("OSComp qemu exited with {status}"))
+    let started = Instant::now();
+    loop {
+        let serial = fs::read_to_string(&out).unwrap_or_default();
+        if serial.contains(&wait.marker) {
+            let _ = child.kill();
+            let _ = child.wait();
+            println!("OSComp qemu observed evidence marker {:?}", wait.marker);
+            return Ok(());
+        }
+
+        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+            return Err(format!(
+                "OSComp qemu exited with {status} before evidence marker {:?}",
+                wait.marker
+            ));
+        }
+        if started.elapsed() >= wait.timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "OSComp qemu timed out after {} ms waiting for evidence marker {:?}",
+                wait.timeout.as_millis(),
+                wait.marker
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn oscomp_evidence_wait(args: &[String]) -> Result<Option<QemuEvidenceWait>> {
+    let marker = optional_option_value(args, "--expect-marker");
+    let timeout = optional_option_value(args, "--timeout-ms");
+    match (marker, timeout) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err("--expect-marker requires --timeout-ms".into()),
+        (None, Some(_)) => Err("--timeout-ms requires --expect-marker".into()),
+        (Some(marker), Some(_)) if marker.is_empty() => {
+            Err("--expect-marker requires a non-empty marker".into())
+        }
+        (Some(marker), Some(value)) => {
+            let millis = value
+                .parse::<u64>()
+                .map_err(|err| format!("invalid --timeout-ms value '{value}': {err}"))?;
+            if millis == 0 {
+                return Err("--timeout-ms must be greater than 0".into());
+            }
+            Ok(Some(QemuEvidenceWait {
+                marker,
+                timeout: Duration::from_millis(millis),
+            }))
+        }
     }
 }
 
@@ -395,7 +463,7 @@ fn oscomp_qemu_boot_cmdline(boot_suite: Option<&str>) -> Option<String> {
         );
     }
     Some(format!(
-        "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe_dump=0 tx.oscomp.groups={suite} console=ttyS0"
+        "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe=0 tx.oscomp.observe_dump=0 tx.oscomp.groups={suite} console=ttyS0"
     ))
 }
 
@@ -697,6 +765,51 @@ fn oscomp_release_profile(args: &[String]) -> bool {
         || env::var("TX_OSCOMP_KERNEL_PROFILE")
             .map(|value| value == "release")
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oscomp_qemu_boot_suite_uses_explicit_boot_mode_and_groups() {
+        assert_eq!(
+            oscomp_qemu_boot_cmdline(Some("libctest-musl")),
+            Some("tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe=0 tx.oscomp.observe_dump=0 tx.oscomp.groups=libctest-musl console=ttyS0".to_string())
+        );
+    }
+
+    #[test]
+    fn oscomp_qemu_without_suite_leaves_sdcard_default_but_marks_boot_mode() {
+        assert_eq!(
+            oscomp_qemu_boot_cmdline(None),
+            Some("tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 console=ttyS0".to_string())
+        );
+    }
+
+    #[test]
+    fn oscomp_qemu_evidence_wait_requires_a_marker_and_positive_timeout() {
+        let args = vec![
+            "--expect-marker".to_string(),
+            "case-end".to_string(),
+            "--timeout-ms".to_string(),
+            "60000".to_string(),
+        ];
+        let wait = oscomp_evidence_wait(&args)
+            .expect("marker wait should parse")
+            .expect("marker wait should be enabled");
+        assert_eq!(wait.marker, "case-end");
+        assert_eq!(wait.timeout, std::time::Duration::from_secs(60));
+
+        assert!(oscomp_evidence_wait(&["--timeout-ms".to_string(), "1".to_string()]).is_err());
+        assert!(oscomp_evidence_wait(&[
+            "--expect-marker".to_string(),
+            "case-end".to_string(),
+            "--timeout-ms".to_string(),
+            "0".to_string()
+        ])
+        .is_err());
+    }
 }
 
 fn copy_kernel_for_oscomp(root: &Path, target: TxTarget, dest: &Path, release: bool) -> Result<()> {

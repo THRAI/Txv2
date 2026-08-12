@@ -714,36 +714,6 @@ pub fn thread_pending_signal_interrupts(
     }
 }
 
-/// A caught/default-action signal ends `rt_sigsuspend` even when the handler
-/// has `SA_RESTART`.  Inspect all deliverable bits so an ignored lower-numbered
-/// signal cannot hide a caught higher-numbered one.
-pub fn thread_pending_signal_ends_sigsuspend(
-    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
-) -> bool {
-    let Ok(thread_payload) = thread.upgrade_operational() else {
-        return false;
-    };
-    let Some(process) = thread.upgrade_owner_proc() else {
-        return false;
-    };
-    let Ok(process_payload) = process.upgrade_operational() else {
-        return false;
-    };
-
-    let mask = thread_payload.signal_mask();
-    let mut pending = thread_payload.pending().deliverable_bits(mask)
-        | process_payload.group_pending().deliverable_bits(mask);
-    while let Some(sig) = lowest_signum_bit(pending) {
-        pending &= !sig.bit();
-        match process_payload.sig_actions().get(sig) {
-            SigDisposition::Ignore => {}
-            SigDisposition::Default if matches!(default_action(sig), DefaultAction::Ignore) => {}
-            SigDisposition::Default | SigDisposition::Handler(_) => return true,
-        }
-    }
-    false
-}
-
 fn refresh_deliverable_signal_summary_fast(
     thread: &Cap<crate::thread_runtime::ThreadIdentity>,
 ) -> bool {
@@ -1144,13 +1114,6 @@ where
     }
 }
 
-/// Direct-publication compatibility entry point.  The injected-post form is
-/// the canonical implementation; this wrapper preserves callers from
-/// final-smp while still using the main branch's mailbox publication rules.
-pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
-    deliver_posix_signal_with_post(target, sig, direct_task_mailbox_post)
-}
-
 /// Deliver `sig` to `process` only when it has a user handler installed.
 ///
 /// Returns `true` if a handler was present (signal posted; the AST runs it on
@@ -1220,10 +1183,6 @@ where
     }
 }
 
-pub fn deliver_signal_if_handler(process: &Cap<ProcessIdentity>, sig: Signum) -> bool {
-    deliver_signal_if_handler_with_post(process, sig, direct_task_mailbox_post)
-}
-
 /// Target for POSIX signal delivery.
 ///
 /// Per `SIGNAL_v1` §12, a signal can be addressed to a process
@@ -1279,14 +1238,6 @@ where
     step_kill_process_with_posts(target, sig, info, &mut post, |mailbox, event| {
         mailbox.post(event)
     })
-}
-
-pub fn step_kill_process(
-    target: &Cap<ProcessIdentity>,
-    sig: Signum,
-    info: Option<SigInfo>,
-) -> KillOutcome {
-    step_kill_process_with_post(target, sig, info, direct_task_mailbox_post)
 }
 
 pub fn step_kill_process_with_posts<P, R>(
@@ -1520,10 +1471,6 @@ where
     }
 }
 
-pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
-    route_gewalt_with_post(target, sig, direct_task_mailbox_post)
-}
-
 /// Deliver `sig` to every live process in `pgrp`. Catchable signals
 /// also get the bit set on each delivered member's `group_pending`
 /// queue so the (future) delivery step can distinguish thread-
@@ -1539,10 +1486,6 @@ where
 {
     let mut source_post = |mailbox: &TaskMailbox, event| mailbox.post(event);
     step_kill_pgrp_with_posts_dyn(pgrp, sig, &mut post, &mut source_post)
-}
-
-pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
-    step_kill_pgrp_with_post(pgrp, sig, direct_task_mailbox_post)
 }
 
 pub fn step_kill_pgrp_with_posts<P, R>(
@@ -1977,15 +1920,6 @@ where
     })
 }
 
-pub fn script_deliver_signal(
-    source: &Cap<ProcessIdentity>,
-    target: SignalTarget,
-    sig: Signum,
-    info: Option<SigInfo>,
-) -> Result<KillOutcome, Errno> {
-    script_deliver_signal_with_post(source, target, sig, info, direct_task_mailbox_post)
-}
-
 pub fn script_deliver_signal_with_posts<P, R>(
     source: &Cap<ProcessIdentity>,
     target: SignalTarget,
@@ -2161,24 +2095,6 @@ pub struct KillProcessWithPostOp<F> {
     pub post: F,
 }
 
-/// Direct-publication StepOp retained for final-smp syscall shims.
-pub struct KillProcessOp {
-    pub target: Cap<ProcessIdentity>,
-    pub sig: Signum,
-    pub info: Option<SigInfo>,
-}
-
-impl<I: SubjectIdentity> StepOp<I> for KillProcessOp {
-    type Output = KillOutcome;
-    type Progress = NoProgress;
-
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_kill_process(&self.target, self.sig, self.info))
-    }
-}
-
-impl<I: SubjectIdentity> OneShotStepOp<I> for KillProcessOp {}
-
 impl<I, F> StepOp<I> for KillProcessWithPostOp<F>
 where
     I: SubjectIdentity,
@@ -2211,22 +2127,6 @@ pub struct KillPgrpWithPostOp<F> {
     pub post: F,
 }
 
-pub struct KillPgrpOp {
-    pub pgrp: Cap<ProcessGroup>,
-    pub sig: Signum,
-}
-
-impl<I: SubjectIdentity> StepOp<I> for KillPgrpOp {
-    type Output = usize;
-    type Progress = NoProgress;
-
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_kill_pgrp(&self.pgrp, self.sig))
-    }
-}
-
-impl<I: SubjectIdentity> OneShotStepOp<I> for KillPgrpOp {}
-
 impl<I, F> StepOp<I> for KillPgrpWithPostOp<F>
 where
     I: SubjectIdentity,
@@ -2256,22 +2156,6 @@ pub struct DeliverSignalWithPostOp<F> {
     pub sig: Signum,
     pub post: F,
 }
-
-pub struct DeliverSignalOp {
-    pub target: SignalTarget,
-    pub sig: Signum,
-}
-
-impl<I: SubjectIdentity> StepOp<I> for DeliverSignalOp {
-    type Output = KillOutcome;
-    type Progress = NoProgress;
-
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(deliver_posix_signal(self.target.clone(), self.sig))
-    }
-}
-
-impl<I: SubjectIdentity> OneShotStepOp<I> for DeliverSignalOp {}
 
 impl<I, F> StepOp<I> for DeliverSignalWithPostOp<F>
 where

@@ -1,0 +1,37 @@
+# alpine-tcc-compile-smoke.txt - compile and run a tiny C program with TCC.
+#
+# Build a lightweight Alpine rootfs first, for example:
+#   TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-tcc-qemu \
+#   TX_ALPINE_PACKAGES="busybox openrc tcc" \
+#     tools/images/fetch-alpine-rv64.sh
+#   TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-tcc-qemu \
+#     cargo xtask image cpio --profile alpine --target rv64-qemu
+
+wait ":bootstrap-exec:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "echo tcc-guest-start\n"
+expect "tcc-guest-start" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/usr/bin/tcc -v\n"
+expect "tcc version" within 20000
+expect "/ # " within 20000
+
+sleep 500
+send "cat > /tmp/hello.c <<'EOF'\nint main(void) { return 42; }\nEOF\n"
+expect "/ # " within 20000
+
+sleep 500
+send "/usr/bin/tcc -c /tmp/hello.c -o /tmp/hello.o\n"
+expect "/ # " within 30000
+
+sleep 500
+send "test -s /tmp/hello.o; echo tcc-object-status:$?\n"
+expect "tcc-object-status:0" within 20000
+expect "/ # " within 20000
+
+sleep 500
+quit

@@ -726,7 +726,6 @@ impl Future for WaitFuture {
                     mailbox.poll_select(|event| source_wait_poll_action(active, event))
                 })
                 .is_some()
-                || mailbox.take_overflow()
             {
                 true
             } else {
@@ -789,7 +788,6 @@ where
                     mailbox.poll_select(|event| source_wait_poll_action(active, event))
                 })
                 .is_some()
-                || mailbox.take_overflow()
             {
                 true
             } else {
@@ -858,7 +856,6 @@ where
                     mailbox.poll_select(|event| source_wait_poll_action(active, event))
                 })
                 .is_some()
-                || mailbox.take_overflow()
             {
                 true
             } else {

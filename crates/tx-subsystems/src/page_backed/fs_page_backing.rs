@@ -20,22 +20,11 @@
 //! `supports_reflink` is a boolean predicate (not `StepOutcome`-
 //! returning).
 
-use crate::execution::{Errno, Guard};
+use crate::execution::Guard;
 use crate::vfs::FsObjectId;
 
 use super::{Frame, PageContainer};
 use crate::page_backed::adapter::step_engine::{NoProgress, StepOutcome};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FilesystemStats {
-    pub block_size: u64,
-    pub total_blocks: u64,
-    pub free_blocks: u64,
-    pub available_blocks: u64,
-    pub total_inodes: u64,
-    pub free_inodes: u64,
-    pub max_name_len: u64,
-}
 
 /// `FsPageBacking` trait emitting `step_v3` outcomes.
 ///
@@ -43,10 +32,6 @@ pub struct FilesystemStats {
 /// `StepOutcome<T, NoProgress>`. `fallocate`
 /// defaults to `Done(())` and `supports_reflink` defaults to `false`.
 pub trait FsPageBacking: Send + Sync + 'static {
-    fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
-    }
-
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
@@ -74,6 +59,20 @@ pub trait FsPageBacking: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
+
+    /// Pre-admit a buffered write before PageBacked publishes a dirty file
+    /// page. The default preserves filesystem backends that do not need
+    /// allocation claims; journaling backends may retain growth state before
+    /// PageSlot dirties.
+    fn prepare_write_range(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _len: usize,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
+    }
 
     /// Filesystem-wide flush, the storage backend for `syncfs(2)`.
     /// Default delegates to `fsync_file(ROOT)`; journaling filesystems

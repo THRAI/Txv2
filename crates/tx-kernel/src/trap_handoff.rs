@@ -194,7 +194,7 @@ pub fn current_payload_for_hart(hart: usize) -> Option<PayloadCap<ThreadPayload>
 /// 2. Snapshots `view.capture_user_context()` into the payload's
 ///    `saved_user_context` slot (Plan B writeback discipline).
 /// 3. Resolves the in-flight userspace-run wait by calling
-///    `slot.complete_interesting_trap(req, UserspaceTrapInfo::Syscall(req))`
+///    `slot.complete_running_trap(req, UserspaceTrapInfo::Syscall(req))`
 ///    on the payload's `userspace_slot`.
 ///
 /// Returns a [`HandoffOutcome`] so the caller (`KernelTrapDispatcher`)
@@ -232,7 +232,7 @@ pub fn hand_off_syscall(
     emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.store");
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
-    match slot.complete_interesting_trap(active, UserspaceTrapInfo::Syscall(req)) {
+    match slot.complete_running_trap(active, UserspaceTrapInfo::Syscall(req)) {
         Ok(_status) => {
             emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.complete");
             HandoffOutcome::Resolved
@@ -299,8 +299,7 @@ pub fn hand_off_user_pf(
     // `txdoc:VM-5-1-FAULT-HANDLER`. The trap shell hands off
     // raw fault info; downstream policy (SIGSEGV on Err, retry on
     // Ok) lives in the future, not here.
-    match slot.complete_interesting_trap(active, UserspaceTrapInfo::PageFault(info.into_reactor()))
-    {
+    match slot.complete_running_trap(active, UserspaceTrapInfo::PageFault(info.into_reactor())) {
         Ok(_status) => HandoffOutcome::Resolved,
         Err(err) => HandoffOutcome::SlotError(err),
     }
@@ -336,7 +335,7 @@ pub fn hand_off_user_fatal(
     payload.store_saved_user_context(Some(view.capture_user_context()));
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
-    match slot.complete_interesting_trap(
+    match slot.complete_running_trap(
         active,
         UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, value)),
     ) {

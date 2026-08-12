@@ -12,10 +12,10 @@ use tx_reactor::adapter::step_engine::{
 };
 use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{
-    current_deadline_registrar, current_task_mailbox, yield_now, HartId, HartPollBudget,
-    InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, Reactor, RescheduleSignal, RunStats,
-    SharedReactor, SignalRouting, SliceClock, SliceConfig, StopReason, TaskHandle, TaskId,
-    TaskStatus, WakeDispatchReport, WakeHint,
+    current_deadline_registrar, current_task_mailbox, yield_now, HartId, InitialSchedMeta,
+    Phase1QueueKind, Phase1Scheduler, Reactor, RescheduleSignal, RunStats, SharedReactor,
+    SignalRouting, SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus,
+    WakeDispatchReport, WakeHint,
 };
 use tx_services::time::{
     CurrentHartDeadlineTimer, DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle,
@@ -2407,17 +2407,6 @@ fn pending_task_wake_breaks_polling_idle_before_marker_drain() {
 }
 
 #[test]
-fn runnable_work_on_another_hart_does_not_keep_this_hart_spinning() {
-    let reactor = Reactor::new();
-    reactor.submit_task_with_meta(async {}, InitialSchedMeta::kernel().with_affinity(0b0100));
-
-    reactor.begin_polling_idle(HartId(0));
-    assert!(!reactor.should_leave_polling_idle(HartId(0)));
-    assert!(reactor.should_leave_polling_idle(HartId(2)));
-    reactor.end_polling_idle(HartId(0));
-}
-
-#[test]
 fn userspace_preempt_marker_does_not_alias_normal_reschedule() {
     let reactor = Reactor::new();
 
@@ -2462,72 +2451,6 @@ fn userspace_preempt_marker_requeues_pending_poll() {
     assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert!(signal.sent.is_empty());
-}
-
-#[test]
-fn concurrent_hart_loop_returns_at_poll_budget_boundary() {
-    let shared = SharedReactor::empty();
-    assert!(shared.init());
-    let stage = Arc::new(AtomicUsize::new(0));
-    let task = shared
-        .with(|reactor| {
-            let stage = Arc::clone(&stage);
-            reactor.submit_task_with_meta(
-                async move {
-                    stage.store(1, Ordering::SeqCst);
-                    yield_now().await;
-                    stage.store(2, Ordering::SeqCst);
-                },
-                InitialSchedMeta::kernel().with_affinity(0b0001),
-            )
-        })
-        .expect("initialized reactor");
-    let deadlines = Arc::new(Mutex::new(Vec::new()));
-    let mut clock = ScriptedSliceClock::new(vec![0; 8], deadlines);
-    let mut signal = RecordingRescheduleSignal::default();
-    let one_poll = HartPollBudget::up_to(1);
-
-    let first = shared
-        .run_hart_loop_concurrent_with_slice_clock_and_poll_budget(
-            HartId(0),
-            0,
-            &mut signal,
-            &mut clock,
-            one_poll,
-        )
-        .expect("initialized reactor");
-    assert_eq!(
-        first.stats,
-        RunStats {
-            polled: 1,
-            completed: 0
-        }
-    );
-    assert_eq!(stage.load(Ordering::SeqCst), 1);
-    shared
-        .with(|reactor| assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Runnable)))
-        .expect("initialized reactor");
-
-    let second = shared
-        .run_hart_loop_concurrent_with_slice_clock_and_poll_budget(
-            HartId(0),
-            0,
-            &mut signal,
-            &mut clock,
-            one_poll,
-        )
-        .expect("initialized reactor");
-    assert_eq!(
-        second.stats,
-        RunStats {
-            polled: 1,
-            completed: 1
-        }
-    );
-    assert_eq!(stage.load(Ordering::SeqCst), 2);
-    shared
-        .with(|reactor| assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed)))
-        .expect("initialized reactor");
 }
 
 #[test]
@@ -2911,15 +2834,15 @@ fn per_hart_runtime_context_is_visible_only_on_polling_hart() {
     let reactor = Reactor::new();
     let task = reactor.submit_task_with_meta(
         HartContextProbe {
-            hart: 11,
+            hart: 2,
             other_hart: 0,
             seen: Arc::clone(&seen),
         },
-        InitialSchedMeta::kernel().with_affinity(1 << 11),
+        InitialSchedMeta::kernel().with_affinity(0b0100),
     );
 
     assert_eq!(
-        reactor.run_until_idle_on_hart(HartId(11)),
+        reactor.run_until_idle_on_hart(HartId(2)),
         RunStats {
             polled: 1,
             completed: 1,
@@ -2930,9 +2853,9 @@ fn per_hart_runtime_context_is_visible_only_on_polling_hart() {
         seen.load(Ordering::SeqCst),
         SAW_MAILBOX | SAW_DEADLINE_REGISTRAR | SAW_DELEGATE_REGISTRY | SAW_OTHER_HART_CLEAR
     );
-    assert!(tx_reactor::current_task_mailbox(11).is_none());
-    assert!(tx_reactor::current_deadline_registrar(11).is_none());
-    assert!(tx_reactor::current_delegate_registry(11).is_none());
+    assert!(tx_reactor::current_task_mailbox(2).is_none());
+    assert!(tx_reactor::current_deadline_registrar(2).is_none());
+    assert!(tx_reactor::current_delegate_registry(2).is_none());
     assert!(tx_reactor::current_task_mailbox(usize::MAX).is_none());
 }
 

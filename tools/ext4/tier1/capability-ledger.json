@@ -1,0 +1,26 @@
+{
+  "schema": "tx.ext4.capability_ledger.v1",
+  "profile": {
+    "block_size": 4096,
+    "inode_sizes": [128, 256],
+    "feature_bits": {
+      "compat_allowed": 60,
+      "incompat_required": 64,
+      "incompat_allowed": 8902,
+      "ro_compat_allowed": 1131,
+      "metadata_csum_required": true,
+      "ordered_jbd2_required": true
+    },
+    "mutation_shapes": {
+      "extent": "depth_one",
+      "directory": ["linear", "htree_non_splitting"],
+      "orphan": "classic"
+    }
+  },
+  "unsupported": [
+    "extent_depth_growth",
+    "htree_split",
+    "orphan_file",
+    "direct_io"
+  ]
+}

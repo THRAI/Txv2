@@ -68,6 +68,10 @@ impl MountedNode {
         self.payload
     }
 
+    pub(super) fn payload(&self) -> Cap<MountPayload> {
+        self.payload.clone()
+    }
+
     pub(super) fn fs_ops(&self) -> Arc<dyn FsOps> {
         self.payload.fs_ops.clone()
     }

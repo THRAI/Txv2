@@ -3,19 +3,14 @@
 //! This module owns the mailbox and secondary-CPU bring-up helpers used by the
 //! platform's `SmpIf` implementation.
 
-#[cfg(target_arch = "loongarch64")]
-use super::la64_irq_trap::la64_timebase_frequency_hz;
 use super::la64_irq_trap::{read_la64_csr, write_la64_csr};
-use super::la64_percpu::la64_current_cpu_id;
-#[cfg(target_arch = "loongarch64")]
-use super::la64_percpu::la64_read_stable_counter;
+use super::la64_pmap::la64_current_cpu_id;
 use super::*;
 
 #[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_STATUS: usize = 0x1000;
+const LA64_BOOT_STACK_STRIDE: usize = 128 * 1024;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_IPI_ENABLE: usize = 0x1004;
-#[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_IPI_CLEAR: usize = 0x100c;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_IPI_SEND: usize = 0x1040;
@@ -26,7 +21,7 @@ const LA64_IOCSR_IPI_SEND_CPU_SHIFT: usize = 16;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
 #[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_VEC_BOOT: u32 = 0;
+const LA64_IOCSR_IPI_VEC_SCHED: u32 = 0;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_MBUF_SEND_CPU_SHIFT: usize = 16;
 #[cfg(target_arch = "loongarch64")]
@@ -40,12 +35,22 @@ const LA64_IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_AP_ENTRY_MAILBOX: usize = 0;
 #[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_AP_RUST_ENTRY_MAILBOX: usize = 1;
+const LA64_IOCSR_AP_STACK_MAILBOX: usize = 1;
+#[cfg(target_arch = "loongarch64")]
+const LA64_IOCSR_AP_LOGICAL_ID_MAILBOX: usize = 2;
+
 const LA64_IPI_KIND_COUNT: usize = 5;
-static LA64_IPI_PENDING: [AtomicU8; LA64_MAX_BOOT_CPUS] =
-    [const { AtomicU8::new(0) }; LA64_MAX_BOOT_CPUS];
-static LA64_IPI_ACKED: [AtomicU64; LA64_IPI_KIND_COUNT] =
+const LA64_IPI_CPU_SLOTS: usize = u64::BITS as usize;
+static LA64_IPI_STATE_LOCKS: [AtomicBool; LA64_IPI_CPU_SLOTS] =
+    [const { AtomicBool::new(false) }; LA64_IPI_CPU_SLOTS];
+static LA64_IPI_PENDING_CPUS: [AtomicU64; LA64_IPI_KIND_COUNT] =
     [const { AtomicU64::new(0) }; LA64_IPI_KIND_COUNT];
+static LA64_IPI_ACKED_CPUS: [AtomicU64; LA64_IPI_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; LA64_IPI_KIND_COUNT];
+#[cfg(test)]
+static TEST_IPI_TRANSPORT_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_LOCAL_MEMBARRIER_ACTIONS: AtomicUsize = AtomicUsize::new(0);
 
 const fn ipi_kind_index(kind: IpiKind) -> usize {
     match kind {
@@ -57,33 +62,9 @@ const fn ipi_kind_index(kind: IpiKind) -> usize {
     }
 }
 
-const fn ipi_kind_bit(kind: IpiKind) -> u8 {
-    1u8 << ipi_kind_index(kind)
-}
-
-/// IOCSR.IPI_SEND carries a vector index, while IOCSR.IPI_STATUS/CLEAR use
-/// the corresponding bit. Keep vector 0 for QEMU's secondary-CPU boot ROM and
-/// give every runtime IPI kind its own hardware action, matching Linux
-/// LoongArch's ACTION_* / BIT(ACTION_*) split.
-#[cfg(target_arch = "loongarch64")]
-const fn ipi_kind_vector(kind: IpiKind) -> u32 {
-    match kind {
-        IpiKind::Reschedule => 1,
-        IpiKind::TlbShootdown => 2,
-        IpiKind::Membarrier => 3,
-        IpiKind::Maintenance => 4,
-        IpiKind::Stop => 5,
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-const fn ipi_kind_action(kind: IpiKind) -> u32 {
-    1u32 << ipi_kind_vector(kind)
-}
-
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
-    fn tx_la64_secondary_start() -> !;
+    static __tx_boot_stack_top: u8;
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -108,16 +89,6 @@ fn la64_iocsr_write_u64(addr: usize, value: u64) {
 
 #[cfg(target_arch = "loongarch64")]
 #[inline]
-fn la64_iocsr_read_u32(addr: usize) -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("iocsrrd.w {value}, {addr}", value = out(reg) value, addr = in(reg) addr);
-    }
-    value
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
 pub(crate) fn send_mail_u64(target_cpu: CpuId, mailbox: usize, value: u64) {
     let hi_box = mailbox * 2 + 1;
     let lo_box = mailbox * 2;
@@ -136,20 +107,24 @@ pub(crate) fn send_mail_u64(target_cpu: CpuId, mailbox: usize, value: u64) {
 }
 
 #[cfg(target_arch = "loongarch64")]
+#[inline]
+pub(crate) fn boot_stack_top_for_cpu(cpu: CpuId) -> usize {
+    let top = core::ptr::addr_of!(__tx_boot_stack_top) as usize;
+    top.saturating_sub(cpu.0.saturating_mul(LA64_BOOT_STACK_STRIDE))
+}
+
+#[cfg(target_arch = "loongarch64")]
 pub(crate) fn start_secondary_cpu(cpu: CpuId, entry: SecondaryEntry) {
-    // QEMU's slave boot ROM only consumes mailbox 0 and jumps to it; it
-    // neither installs a stack nor passes the CPU id in a0. Enter our
-    // physical trampoline first. The trampoline configures DMW, derives the
-    // per-hart boot stack from CSR.CPUID, then loads the real Rust entry from
-    // mailbox 1 and calls it with a0 = CPUID.
-    let trampoline = tx_la64_secondary_start as *const () as usize as u64;
-    let rust_entry = entry as *const () as usize as u64;
-    send_mail_u64(cpu, LA64_IOCSR_AP_RUST_ENTRY_MAILBOX, rust_entry);
-    send_mail_u64(cpu, LA64_IOCSR_AP_ENTRY_MAILBOX, trampoline);
+    let entry = entry as *const () as usize as u64;
+    let stack_top = boot_stack_top_for_cpu(cpu) as u64;
+
+    send_mail_u64(cpu, LA64_IOCSR_AP_ENTRY_MAILBOX, entry);
+    send_mail_u64(cpu, LA64_IOCSR_AP_STACK_MAILBOX, stack_top);
+    send_mail_u64(cpu, LA64_IOCSR_AP_LOGICAL_ID_MAILBOX, cpu.0 as u64);
 
     let value = LA64_IOCSR_IPI_SEND_BLOCKING
         | ((cpu.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
-        | LA64_IOCSR_IPI_VEC_BOOT;
+        | LA64_IOCSR_IPI_VEC_SCHED;
     la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
 }
 
@@ -160,59 +135,34 @@ pub(crate) fn wait_for_online_secondaries(target: CpuMask) -> usize {
         return 0;
     }
 
-    // AP initialization includes per-hart substrate/reactor setup. A fixed
-    // iteration count is not a real timeout and expires far too early under
-    // multi-threaded TCG. Use the architectural stable counter so a 12-hart
-    // QEMU boot gets a deterministic five-second window even on a busy judge.
-    let frequency = la64_timebase_frequency_hz();
-    let start = la64_read_stable_counter();
-    let timeout_ticks = frequency.saturating_mul(5);
-    if timeout_ticks != 0 {
-        loop {
-            let online = LA64_ONLINE_CPUS.load(Ordering::Acquire) & target;
-            if online == target {
-                return online.count_ones() as usize;
-            }
-            if la64_read_stable_counter().wrapping_sub(start) >= timeout_ticks {
-                break;
-            }
-            core::hint::spin_loop();
+    for _ in 0..500_000 {
+        let online = LA64_ONLINE_CPUS.load(Ordering::Acquire) & target;
+        if online == target {
+            return online.count_ones() as usize;
         }
-    } else {
-        // Firmware without a usable timebase still receives a bounded
-        // best-effort wait.
-        for _ in 0..10_000_000 {
-            let online = LA64_ONLINE_CPUS.load(Ordering::Acquire) & target;
-            if online == target {
-                return online.count_ones() as usize;
-            }
-            core::hint::spin_loop();
-        }
+        core::hint::spin_loop();
     }
     (LA64_ONLINE_CPUS.load(Ordering::Acquire) & target).count_ones() as usize
 }
 
-pub(crate) fn boot_secondary_cpus(possible: CpuMask, entry: SecondaryEntry) -> usize {
+pub(crate) fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
-        // Wake set = SmpIf policy mask (firmware topology capped by
-        // tx.maxcpus) ∩ the raw discovered CPU count. Missing firmware
-        // topology is deliberately one CPU, so boards cannot accidentally
-        // wake nonexistent harts.
-        let discovered = CpuMask::first(
+        let possible = CpuMask::first(
             LA64_POSSIBLE_CPU_COUNT
                 .load(Ordering::Acquire)
                 .clamp(1, LA64_MAX_BOOT_CPUS),
         );
         let current = la64_current_cpu_id();
-        let target_mask = CpuMask::from_bits(
-            possible.bits() & discovered.bits() & !CpuMask::single(current).bits(),
-        );
+        let target_mask = CpuMask::from_bits(possible.bits() & !CpuMask::single(current).bits());
         if target_mask.is_empty() {
             return 0;
         }
 
-        for acked in &LA64_IPI_ACKED {
+        for pending in &LA64_IPI_PENDING_CPUS {
+            pending.store(0, Ordering::Release);
+        }
+        for acked in &LA64_IPI_ACKED_CPUS {
             acked.store(0, Ordering::Release);
         }
 
@@ -228,7 +178,7 @@ pub(crate) fn boot_secondary_cpus(possible: CpuMask, entry: SecondaryEntry) -> u
 
     #[cfg(not(target_arch = "loongarch64"))]
     {
-        let _ = (possible, entry);
+        let _ = entry;
         0
     }
 }
@@ -245,81 +195,231 @@ pub(crate) fn enable_ipi_wakeups() {
 }
 
 pub(crate) fn pending_ipi(kind: IpiKind) -> bool {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        la64_iocsr_read_u32(LA64_IOCSR_IPI_STATUS) & ipi_kind_action(kind) != 0
-    }
+    ipi_pending_on_cpu(la64_current_cpu_id(), kind)
+}
 
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        let cpu = la64_current_cpu_id();
-        cpu.0 < LA64_IPI_PENDING.len()
-            && LA64_IPI_PENDING[cpu.0].load(Ordering::Acquire) & ipi_kind_bit(kind) != 0
-    }
+fn ipi_pending_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    bit != 0 && LA64_IPI_PENDING_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire) & bit != 0
 }
 
 pub(crate) fn send_ipi(target: CpuId, kind: IpiKind) {
-    if target != la64_current_cpu_id() {
-        if target.0 >= LA64_IPI_PENDING.len() {
-            return;
-        }
-        #[cfg(not(target_arch = "loongarch64"))]
-        LA64_IPI_PENDING[target.0].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
-        raise_la64_ipi_interrupt(target, kind);
-    }
+    send_ipi_from(la64_current_cpu_id(), target, kind);
 }
 
-pub(crate) fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-    let mut bits = mask.bits();
-    while bits != 0 {
-        let cpu = bits.trailing_zeros() as usize;
-        send_ipi(CpuId(cpu), kind);
-        bits &= bits - 1;
+fn send_ipi_from(current: CpuId, target: CpuId, kind: IpiKind) {
+    if target == current {
+        return;
     }
-}
 
-fn raise_la64_ipi_interrupt(target: CpuId, kind: IpiKind) {
+    let locked = lock_ipi_targets(CpuMask::single(target));
+    publish_ipi_pending(CpuMask::single(target), kind);
     #[cfg(target_arch = "loongarch64")]
     {
         let value = LA64_IOCSR_IPI_SEND_BLOCKING
             | ((target.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
-            | ipi_kind_vector(kind);
+            | LA64_IOCSR_IPI_VEC_SCHED;
         la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
     }
     #[cfg(not(target_arch = "loongarch64"))]
-    let _ = (target, kind);
+    {
+        #[cfg(test)]
+        TEST_IPI_TRANSPORT_MASK.fetch_or(CpuMask::single(target).bits(), Ordering::AcqRel);
+        #[cfg(not(test))]
+        let _ = target;
+    }
+    unlock_ipi_targets(locked);
+}
+
+pub(crate) fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
+    broadcast_ipi_from(la64_current_cpu_id(), mask, kind);
+}
+
+fn broadcast_ipi_from(current: CpuId, mask: CpuMask, kind: IpiKind) {
+    let current_mask = CpuMask::single(current);
+    let mut remote_bits = mask.bits() & !current_mask.bits();
+    while remote_bits != 0 {
+        let cpu = CpuId(remote_bits.trailing_zeros() as usize);
+        send_ipi_from(current, cpu, kind);
+        remote_bits &= remote_bits - 1;
+    }
+    if mask.contains(current) {
+        process_local_ipi(current, kind);
+    }
+}
+
+fn process_local_ipi(cpu: CpuId, kind: IpiKind) {
+    let _irq_guard = <Platform as IrqIf>::exclude_local_execution();
+    let cpu_mask = CpuMask::single(cpu);
+    let locked = lock_ipi_targets(cpu_mask);
+    publish_ipi_pending(cpu_mask, kind);
+    execute_local_ipi_action(kind);
+    if acknowledge_ipi_on_cpu(cpu, kind) {
+        la64_iocsr_write_u32(LA64_IOCSR_IPI_CLEAR, u32::MAX);
+    }
+    unlock_ipi_targets(locked);
+}
+
+fn execute_local_ipi_action(kind: IpiKind) {
+    if kind == IpiKind::Membarrier {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        #[cfg(test)]
+        TEST_LOCAL_MEMBARRIER_ACTIONS.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) fn ack_ipi(kind: IpiKind) {
     let cpu = la64_current_cpu_id();
-    if cpu.0 >= LA64_IPI_PENDING.len() {
-        return;
+    let locked = lock_ipi_targets(CpuMask::single(cpu));
+    if acknowledge_ipi_on_cpu(cpu, kind) {
+        la64_iocsr_write_u32(LA64_IOCSR_IPI_CLEAR, u32::MAX);
     }
-
-    // Retire exactly the hardware action observed by the handler. A same-kind
-    // TLB request which races this clear is still covered by the requested /
-    // completed generation mailbox below; a later hardware action is therefore
-    // either serviced here or remains pending as a harmless redundant trap.
-    #[cfg(target_arch = "loongarch64")]
-    la64_iocsr_write_u32(LA64_IOCSR_IPI_CLEAR, ipi_kind_action(kind));
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    LA64_IPI_PENDING[cpu.0].fetch_and(!ipi_kind_bit(kind), Ordering::AcqRel);
-
-    if matches!(kind, IpiKind::TlbShootdown)
-        && !crate::la64_pmap::service_la64_pending_tlb_shootdown()
-    {
-        // Preserve the public SmpIf contract for a direct TLB IPI that did not
-        // originate from the generation mailbox (primarily host tests).
-        crate::la64_pmap::la64_invtlb_all();
-    }
-    LA64_IPI_ACKED[ipi_kind_index(kind)].fetch_or(CpuMask::single(cpu).bits(), Ordering::AcqRel);
+    unlock_ipi_targets(locked);
 }
 
 pub(crate) fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
-    LA64_IPI_ACKED[ipi_kind_index(kind)].fetch_and(!mask.bits(), Ordering::AcqRel);
+    LA64_IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_and(!mask.bits(), Ordering::AcqRel);
 }
 
 pub(crate) fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
-    CpuMask::from_bits(LA64_IPI_ACKED[ipi_kind_index(kind)].load(Ordering::Acquire))
+    CpuMask::from_bits(LA64_IPI_ACKED_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire))
+}
+
+fn lock_ipi_targets(mask: CpuMask) -> u64 {
+    let mut bits = mask.bits();
+    let mut locked = 0;
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        while LA64_IPI_STATE_LOCKS[cpu]
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let bit = 1u64 << cpu;
+        locked |= bit;
+        bits &= bits - 1;
+    }
+    locked
+}
+
+fn unlock_ipi_targets(mut bits: u64) {
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        LA64_IPI_STATE_LOCKS[cpu].store(false, Ordering::Release);
+        bits &= bits - 1;
+    }
+}
+
+fn publish_ipi_pending(mask: CpuMask, kind: IpiKind) {
+    LA64_IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_or(mask.bits(), Ordering::Release);
+}
+
+fn acknowledge_ipi_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    LA64_IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_and(!bit, Ordering::AcqRel);
+    LA64_IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_or(bit, Ordering::AcqRel);
+    !LA64_IPI_PENDING_CPUS
+        .iter()
+        .any(|pending| pending.load(Ordering::Acquire) & bit != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_self_and_remote_runs_local_membarrier_and_isolates_kind_state() {
+        let current = CpuId(3);
+        let remote = CpuId(63);
+        let targets =
+            CpuMask::from_bits(CpuMask::single(current).bits() | CpuMask::single(remote).bits());
+
+        for pending in &LA64_IPI_PENDING_CPUS {
+            pending.store(0, Ordering::Release);
+        }
+        for acked in &LA64_IPI_ACKED_CPUS {
+            acked.store(0, Ordering::Release);
+        }
+        TEST_IPI_TRANSPORT_MASK.store(0, Ordering::Release);
+        TEST_LOCAL_MEMBARRIER_ACTIONS.store(0, Ordering::Release);
+        broadcast_ipi_from(current, targets, IpiKind::Membarrier);
+
+        assert_eq!(
+            TEST_IPI_TRANSPORT_MASK.load(Ordering::Acquire),
+            CpuMask::single(remote).bits()
+        );
+        assert_eq!(TEST_LOCAL_MEMBARRIER_ACTIONS.load(Ordering::Acquire), 1);
+        assert_eq!(ipi_ack_cpus(IpiKind::Membarrier), CpuMask::single(current));
+        assert_eq!(ipi_ack_cpus(IpiKind::Maintenance), CpuMask::EMPTY);
+        assert!(!ipi_pending_on_cpu(current, IpiKind::Membarrier));
+        assert!(ipi_pending_on_cpu(remote, IpiKind::Membarrier));
+        assert!(!ipi_pending_on_cpu(remote, IpiKind::Maintenance));
+
+        let locked = lock_ipi_targets(CpuMask::single(remote));
+        assert!(acknowledge_ipi_on_cpu(remote, IpiKind::Membarrier));
+        unlock_ipi_targets(locked);
+        assert_eq!(ipi_ack_cpus(IpiKind::Membarrier), targets);
+
+        for pending in &LA64_IPI_PENDING_CPUS {
+            pending.store(0, Ordering::Release);
+        }
+        for acked in &LA64_IPI_ACKED_CPUS {
+            acked.store(0, Ordering::Release);
+        }
+        TEST_IPI_TRANSPORT_MASK.store(0, Ordering::Release);
+        TEST_LOCAL_MEMBARRIER_ACTIONS.store(0, Ordering::Release);
+        broadcast_ipi_from(current, targets, IpiKind::Maintenance);
+        assert_eq!(TEST_LOCAL_MEMBARRIER_ACTIONS.load(Ordering::Acquire), 0);
+        assert_eq!(ipi_ack_cpus(IpiKind::Maintenance), CpuMask::single(current));
+        assert_eq!(ipi_ack_cpus(IpiKind::Membarrier), CpuMask::EMPTY);
+        assert!(ipi_pending_on_cpu(remote, IpiKind::Maintenance));
+        assert!(!ipi_pending_on_cpu(remote, IpiKind::Membarrier));
+        let locked = lock_ipi_targets(CpuMask::single(remote));
+        assert!(acknowledge_ipi_on_cpu(remote, IpiKind::Maintenance));
+        unlock_ipi_targets(locked);
+        assert_eq!(ipi_ack_cpus(IpiKind::Maintenance), targets);
+
+        for pending in &LA64_IPI_PENDING_CPUS {
+            pending.store(0, Ordering::Release);
+        }
+        for acked in &LA64_IPI_ACKED_CPUS {
+            acked.store(0, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn ipi_pending_and_ack_state_are_isolated_by_cpu_and_kind() {
+        let sender = CpuId(0);
+        let target = CpuId(63);
+        let target_mask = CpuMask::single(target);
+
+        for pending in &LA64_IPI_PENDING_CPUS {
+            pending.fetch_and(!target_mask.bits(), Ordering::AcqRel);
+        }
+        for acked in &LA64_IPI_ACKED_CPUS {
+            acked.fetch_and(!target_mask.bits(), Ordering::AcqRel);
+        }
+
+        publish_ipi_pending(target_mask, IpiKind::Reschedule);
+        publish_ipi_pending(target_mask, IpiKind::Maintenance);
+        assert!(!ipi_pending_on_cpu(sender, IpiKind::Reschedule));
+        assert!(!ipi_pending_on_cpu(sender, IpiKind::Maintenance));
+        assert!(ipi_pending_on_cpu(target, IpiKind::Reschedule));
+        assert!(ipi_pending_on_cpu(target, IpiKind::Maintenance));
+        assert!(!ipi_pending_on_cpu(target, IpiKind::TlbShootdown));
+
+        assert!(!acknowledge_ipi_on_cpu(target, IpiKind::Reschedule));
+        assert!(!ipi_pending_on_cpu(target, IpiKind::Reschedule));
+        assert!(ipi_pending_on_cpu(target, IpiKind::Maintenance));
+        assert_eq!(ipi_ack_cpus(IpiKind::Reschedule), CpuMask::single(target));
+        assert_eq!(ipi_ack_cpus(IpiKind::Maintenance), CpuMask::EMPTY);
+
+        assert!(acknowledge_ipi_on_cpu(target, IpiKind::Maintenance));
+        assert!(!ipi_pending_on_cpu(target, IpiKind::Maintenance));
+        assert_eq!(ipi_ack_cpus(IpiKind::Maintenance), CpuMask::single(target));
+
+        clear_ipi_ack_cpus(IpiKind::Reschedule, target_mask);
+        clear_ipi_ack_cpus(IpiKind::Maintenance, target_mask);
+    }
 }

@@ -76,7 +76,7 @@ fn step_op_can_yield_with_progress_and_shape() {
                 YieldShape::OnEdge { .. } => panic!("expected OnWaitSource, got OnEdge"),
             }
         }
-        other => panic!("expected Yield, got {other:?}"),
+        other => panic!("expected Yield, got {:?}", other),
     }
 }
 
@@ -105,7 +105,7 @@ fn step_op_can_continue() {
         StepOutcome::Continue { progress } => {
             assert_eq!(progress, ByteProgress::new(8));
         }
-        other => panic!("expected Continue, got {other:?}"),
+        other => panic!("expected Continue, got {:?}", other),
     }
 }
 
@@ -184,7 +184,8 @@ fn apply_resume_default_rejects_aborted_variants() {
         assert_eq!(
             op.apply_resume(ResumeOutcome::Aborted(reason)),
             Err(Errno::EINVAL),
-            "default impl rejects Aborted({reason:?})"
+            "default impl rejects Aborted({:?})",
+            reason
         );
     }
 }

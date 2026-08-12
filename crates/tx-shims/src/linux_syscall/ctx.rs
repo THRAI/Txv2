@@ -36,13 +36,6 @@ impl SubjectScriptCtx {
         self.timer_registrar.as_ref()
     }
 
-    /// Compatibility view for final-smp syscall drivers that still use the
-    /// pre-time-service field name.  The returned capability is the unified
-    /// deadline registrar; no legacy timer wheel is reintroduced.
-    pub fn timer_wheel(&self) -> Option<&DeadlineRegistrarHandle> {
-        self.timer_registrar()
-    }
-
     pub fn with_deadline(mut self, deadline: tx_substrate::step::Deadline) -> Self {
         self.inner = self.inner.with_deadline(deadline);
         self

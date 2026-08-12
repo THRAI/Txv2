@@ -101,53 +101,6 @@ pub(crate) fn emulate_user_unaligned(frame: &mut La64TrapFrame) -> UnalignedOutc
     UnalignedOutcome::Emulated
 }
 
-/// Kernel-mode unaligned access emulation. The LA264 (LS2K1000) has
-/// no hardware unaligned access support — QEMU silently emulates it,
-/// so the first real-board boot died with ALE inside
-/// `claim_zero_frame` (2026-07-04 first flight). Kernel addresses sit
-/// in the DMW windows and are directly dereferenceable, so both the
-/// instruction fetch (era, always 4-byte aligned) and the data access
-/// (badv, byte-assembled — single-byte ops can never fault ALE) are
-/// plain volatile accesses; no fixup plumbing needed. Reuses the same
-/// decoder and register accessors as the user-mode path.
-pub(crate) fn emulate_kernel_unaligned(frame: &mut La64TrapFrame) -> UnalignedOutcome {
-    let inst = unsafe { core::ptr::read_volatile(frame.era as *const u32) };
-
-    let Some(decoded) = decode_unaligned_access(inst) else {
-        return UnalignedOutcome::Unsupported;
-    };
-
-    match decoded.kind {
-        AccessKind::Load => {
-            let mut raw: u64 = 0;
-            for offset in 0..decoded.width {
-                let byte = unsafe { core::ptr::read_volatile((frame.badv + offset) as *const u8) };
-                raw |= (byte as u64) << (8 * offset);
-            }
-            let value = if decoded.signed {
-                sign_extend(raw, decoded.width)
-            } else {
-                mask_width(raw, decoded.width)
-            };
-            write_register(frame, decoded, value);
-        }
-        AccessKind::Store => {
-            let value = read_register(frame, decoded);
-            for offset in 0..decoded.width {
-                unsafe {
-                    core::ptr::write_volatile(
-                        (frame.badv + offset) as *mut u8,
-                        (value >> (8 * offset)) as u8,
-                    );
-                }
-            }
-        }
-    }
-
-    frame.era = frame.era.saturating_add(4);
-    UnalignedOutcome::Emulated
-}
-
 fn decode_unaligned_access(inst: u32) -> Option<DecodedUnaligned> {
     let reg = (inst & 0x1f) as usize;
     let op_22 = inst >> 22;

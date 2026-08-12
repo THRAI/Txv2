@@ -113,17 +113,6 @@ pub trait SubjectIdentity: 'static {
         false
     }
 
-    /// Whether a currently deliverable signal should interrupt a blocked
-    /// syscall with `EINTR`.
-    ///
-    /// This is deliberately narrower than
-    /// [`Self::thread_deliverable_signal_pending`]: signals whose disposition
-    /// is ignore (including default-ignored `SIGCHLD`) and handlers installed
-    /// with `SA_RESTART` are wake hints, but must not abort the wait.
-    fn thread_signal_interrupts_wait(_thread: &Cap<Self::ThreadIdentity>) -> bool {
-        false
-    }
-
     /// Whether fatal termination is in force for `thread`.
     fn thread_termination_in_force(_thread: &Cap<Self::ThreadIdentity>) -> bool {
         false

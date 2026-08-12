@@ -46,12 +46,6 @@ impl<P> HalDeadlineTimer<P> {
     }
 }
 
-impl<P> Default for HalDeadlineTimer<P> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<P: DeadlineTimerIf> HalDeadlineTimer<P> {
     pub fn set_deadline_ns(&self, deadline_ns: u64) {
         P::set_deadline_ns(deadline_ns);
@@ -85,12 +79,6 @@ impl<P> HalRtcDevice<P> {
     }
 }
 
-impl<P> Default for HalRtcDevice<P> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<P: PersistentClockIf> RtcDeviceOps for HalRtcDevice<P> {
     fn read_time_ns(&self) -> Result<u64, TimeError> {
         P::read_realtime_ns().map_err(TimeError::from)
@@ -110,61 +98,5 @@ impl<P: PersistentClockIf> RtcDeviceOps for HalRtcDevice<P> {
 
     fn acknowledge_alarm_irq(&self) -> Result<(), TimeError> {
         P::acknowledge_wake_alarm_irq().map_err(TimeError::from)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core::mem::size_of_val;
-    use core::sync::atomic::{AtomicU64, Ordering};
-
-    use tx_hal::{DeadlineTimerIf, PersistentClockError, PersistentClockIf};
-
-    use super::{HalDeadlineTimer, HalRtcDevice, RtcDeviceOps};
-
-    struct StaticPlatform;
-
-    static DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
-    static RTC_NS: AtomicU64 = AtomicU64::new(0);
-
-    impl DeadlineTimerIf for StaticPlatform {
-        fn set_deadline_ns(deadline: u64) {
-            DEADLINE_NS.store(deadline, Ordering::Release);
-        }
-
-        fn cancel_deadline() {
-            DEADLINE_NS.store(0, Ordering::Release);
-        }
-    }
-
-    impl PersistentClockIf for StaticPlatform {
-        fn read_realtime_ns() -> Result<u64, PersistentClockError> {
-            Ok(RTC_NS.load(Ordering::Acquire))
-        }
-    }
-
-    #[test]
-    fn deadline_timer_default_matches_new_static_adapter() {
-        let default = HalDeadlineTimer::<StaticPlatform>::default();
-        let new = HalDeadlineTimer::<StaticPlatform>::new();
-
-        assert_eq!(size_of_val(&default), 0);
-        assert_eq!(size_of_val(&new), 0);
-        default.set_deadline_ns(11);
-        assert_eq!(DEADLINE_NS.load(Ordering::Acquire), 11);
-        new.cancel_deadline();
-        assert_eq!(DEADLINE_NS.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn rtc_device_default_matches_new_static_adapter() {
-        RTC_NS.store(23, Ordering::Release);
-        let default = HalRtcDevice::<StaticPlatform>::default();
-        let new = HalRtcDevice::<StaticPlatform>::new();
-
-        assert_eq!(size_of_val(&default), 0);
-        assert_eq!(size_of_val(&new), 0);
-        assert_eq!(default.read_time_ns(), Ok(23));
-        assert_eq!(new.read_time_ns(), Ok(23));
     }
 }

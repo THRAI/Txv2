@@ -19,12 +19,9 @@ impl<P: TxPlatform> SmpRescheduleSignal<P> {
 
 impl<P: TxPlatform> boot_runtime::RescheduleSignal for SmpRescheduleSignal<P> {
     fn send_reschedule_ipi(&mut self, target_hart: boot_runtime::HartId) -> bool {
-        // The runnable task is already published to the target queue when this
-        // method runs. Never suppress the remote interrupt from a lock-free
-        // observation of `polling_idle`: the target may leave its polling
-        // window after its final queue check and enter WFI, losing the wake.
-        // `WakeDispatchAction` calls this hook only for a remote target, so
-        // this does not reintroduce self-IPIs.
+        if crate::init::boot_reactor_hart_is_polling_idle(target_hart) {
+            return false;
+        }
         <P as tx_hal::SmpIf>::send_ipi(CpuId(target_hart.0), IpiKind::Reschedule);
         true
     }
@@ -87,16 +84,6 @@ pub(super) fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'
         E::OutOfMemory => "out-of-memory",
         E::Busy => "busy",
         E::IoError => "io-error",
-        // Variants main's exec rewrite added. Without these the merge's
-        // `tx.runsh` failure reported as the catch-all "other", which hides
-        // exactly the interesting cases (a dynamic binary whose interpreter
-        // cannot be resolved reports ELIBBAD, not ENOENT).
-        E::InterpreterMalformed => "interp-malformed",
-        E::InterpreterNested => "interp-nested",
-        E::Layout(_) => "layout",
-        E::Again => "again",
-        E::Retry => "retry",
-        E::Deferred(_) => "deferred",
         // Forward-compat: ExecError may grow new variants. Avoid a
         // build break if a future variant lands without a label here.
         #[allow(unreachable_patterns)]

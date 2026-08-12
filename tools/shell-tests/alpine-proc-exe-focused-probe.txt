@@ -1,0 +1,40 @@
+# alpine-proc-exe-focused-probe.txt - Alpine procfs executable symlink witness.
+#
+# Covers the older procfs discriminator where scalar pid files worked but
+# /proc/<pid>/exe readlink failed with ENOENT.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "m=N73F; echo ${m}_START\n"
+expect "N73F_START" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/1/status >/tmp/proc1.status && echo ${m}_PROC1_STATUS_OK\n"
+expect "N73F_PROC1_STATUS_OK" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "readlink /proc/1/exe; rc=$?; echo ${m}_PROC1_EXE_RC_${rc}\n"
+expect "N73F_PROC1_EXE_RC_0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "readlink /proc/self/exe; rc=$?; echo ${m}_SELF_EXE_RC_${rc}\n"
+expect "N73F_SELF_EXE_RC_0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "sh -c 'echo child=$$; readlink /proc/$$/exe; rc=$?; echo N73F_CHILD_EXE_RC_${rc}'\n"
+expect "N73F_CHILD_EXE_RC_0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "echo ${m}_PROC_EXE_SUCCESS\n"
+expect "N73F_PROC_EXE_SUCCESS" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

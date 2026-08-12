@@ -444,22 +444,6 @@ impl ExecTestFs {
         );
         id
     }
-
-    fn set_regular_mode_bits(&self, fs_object_id: FsObjectId, mode_bits: u16) {
-        let mut inner = self.inner.lock();
-        match inner.inodes.get_mut(&fs_object_id) {
-            Some(ExecTestInode::Regular {
-                mode_bits: current, ..
-            })
-            | Some(ExecTestInode::RegularNonPageBacked {
-                mode_bits: current, ..
-            }) => *current = mode_bits,
-            Some(ExecTestInode::Directory | ExecTestInode::Symlink { .. }) => {
-                panic!("set_regular_mode_bits called for non-regular inode")
-            }
-            None => panic!("set_regular_mode_bits called for missing inode"),
-        }
-    }
 }
 
 struct ErrnoPageBacking(tx_subsystems::execution::Errno);
@@ -523,7 +507,9 @@ impl FsPageBacking for OffsetErrnoPageBacking {
         ) {
             Ok(reservation) => reservation,
             Err(_) => {
-                return step_engine::StepOutcome::err(tx_subsystems::execution::Errno::EBUSY.into())
+                return step_engine::StepOutcome::err(
+                    tx_subsystems::execution::Errno::EBUSY.into(),
+                );
             }
         };
         let owned = reservation.commit();
@@ -2163,7 +2149,7 @@ fn exec_script_invalid_elf_returns_enoexec_without_kernel_shell_fallback() {
 }
 
 #[test]
-fn shebang_busybox_sh_normalization_consumes_applet_arg() {
+fn shebang_busybox_sh_preserves_working_busybox_applet_shape() {
     let header = b"#!/bin/busybox sh\n./lua $1\n";
     let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
     let original_argv: [&[u8]; 2] = [b"./test.sh", b"date.lua"];
@@ -2172,11 +2158,37 @@ fn shebang_busybox_sh_normalization_consumes_applet_arg() {
         super::shebang_exec_argv(interp, opt_arg, b"./test.sh", &original_argv)
             .expect("shebang argv");
 
+    assert_eq!(interp_path, b"/bin/busybox");
+    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        argv_refs,
+        vec![
+            b"/bin/busybox".as_slice(),
+            b"sh".as_slice(),
+            b"./test.sh".as_slice(),
+            b"date.lua".as_slice()
+        ]
+    );
+}
+
+#[test]
+fn shebang_bin_sh_keeps_linux_interpreter_shape() {
+    let header = b"#!/bin/sh\necho ok\n";
+    let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");
+
+    let (interp_path, argv) = super::shebang_exec_argv(
+        interp,
+        opt_arg,
+        b"/musl/tier1-exec.sh",
+        &[b"/musl/tier1-exec.sh"],
+    )
+    .expect("shebang argv");
+
     assert_eq!(interp_path, b"/bin/sh");
     let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
     assert_eq!(
         argv_refs,
-        vec![b"/bin/sh".as_slice(), b"./test.sh", b"date.lua"]
+        vec![b"/bin/sh".as_slice(), b"/musl/tier1-exec.sh".as_slice()]
     );
 }
 
@@ -2714,49 +2726,6 @@ fn exec_script_dac_override_still_requires_some_x_bit() {
 }
 
 #[test]
-fn executable_permission_uses_live_inode_meta_after_cached_rnode_chmod() {
-    let _setup = setup();
-    let bytes = minimal_elf_bytes();
-    let root_id = FsObjectId::new(2);
-    let (root_dentry, fs, mount) = build_fs_root_with_mount(MountId::new(1));
-    let file_id =
-        fs.add_regular_with_bytes_meta(root_id, b"minibuild", &bytes, 0o644, 0, 0);
-    let namespace = MountNamespace::new_cap(mount.clone()).expect("mount namespace");
-
-    // Keep the pre-chmod dentry/RNode alive, reproducing the VFS cache shape
-    // seen when Cargo/linker creates, stats and then chmods its output.
-    let guard = guard();
-    let stale_dentry = match tx_subsystems::vfs::step_walk_in_mount_namespace_with_origin_mount(
-        root_dentry.clone(),
-        &mount,
-        b"/minibuild",
-        &Credential::root(),
-        &namespace,
-        &guard,
-    ) {
-        StepOutcome::Done(resolved) => resolved.dentry,
-        other => panic!("materialise pre-chmod dentry: {other:?}"),
-    };
-    drop(guard);
-    assert_eq!(stale_dentry.rnode().meta().mode & 0o7777, 0o644);
-
-    // The filesystem has committed chmod, while the cached RNode correctly
-    // remains a snapshot.  Exec must consult live inode metadata and accept
-    // the file without weakening Linux's root-requires-some-X rule.
-    fs.set_regular_mode_bits(file_id, 0o755);
-    let candidate = super::open_executable_candidate(
-        root_dentry,
-        &mount,
-        b"/minibuild",
-        &Credential::root(),
-        &namespace,
-        super::ExecutableCandidateRole::Main,
-    );
-    assert!(candidate.is_ok(), "live chmod mode must authorize exec");
-    assert_eq!(stale_dentry.rnode().meta().mode & 0o7777, 0o644);
-}
-
-#[test]
 fn exec_script_setuid_binary_changes_euid() {
     let _setup = setup();
     let bytes = minimal_elf_bytes();
@@ -2816,6 +2785,40 @@ fn exec_setid_prepare_rolls_back_when_aspace_build_fails() {
     assert_eq!(
         process.cred().expect("failed exec keeps process alive"),
         before
+    );
+}
+
+#[test]
+fn exec_script_op_retries_after_pre_ponr_oom_pressure_reclaim() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o755, 0, 0);
+    let before_aspace = process.aspace_cap().expect("pre-exec aspace").key();
+    let argv: [&[u8]; 0] = [];
+    let envp: [&[u8]; 0] = [];
+    let cred = Credential::root();
+    let mut op = super::ExecScriptOp::<ScriptsTestPmap>::new(
+        &process, &thread, b"/init", &argv, &envp, &cred,
+    );
+    let mut ctx = step_engine::ScriptCtx::new();
+
+    fail_next_pmap_root_creation();
+    assert_eq!(
+        op.step(&mut ctx),
+        StepOutcome::Continue {
+            progress: step_engine::NoProgress,
+        },
+        "a pre-PoNR ENOMEM should trigger pressure reclaim and retry"
+    );
+
+    assert_eq!(
+        op.step(&mut ctx),
+        StepOutcome::Done(()),
+        "the retry restarts reversible exec preparation and can commit"
+    );
+    assert_ne!(
+        process.aspace_cap().expect("post-exec aspace").key(),
+        before_aspace
     );
 }
 

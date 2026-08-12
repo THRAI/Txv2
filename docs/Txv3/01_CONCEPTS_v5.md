@@ -150,8 +150,10 @@ storage: `BindingLane` for authoritative bindings, `ProjectionLane` for
 read-only views, and `ReadinessLane` for level state plus object-owned wait
 endpoints. Identity/evidence is the existing role-shaped type language;
 reservation is a binding-change phase; publication/RCU is an owner-private
-backend. Lanes therefore do not add a sixth primitive cell or expose a storage
-algorithm. The complete contract is `OBJECT_API_LANES_v1.md`.
+backend. The traits are owner implementation contracts; upper callers consume
+concern-specific domain facades rather than broad lane objects. Lanes therefore
+do not add a sixth primitive cell or expose a storage algorithm. The complete
+contract is `OBJECT_API_LANES_v1.md`.
 
 ## 3. Three planes (preserved from v4)
 

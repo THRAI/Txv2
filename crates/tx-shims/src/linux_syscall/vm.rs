@@ -9,7 +9,7 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, Errno as V3Errno, StepOutcome};
 use tx_hal::UserPtr;
 use tx_scripts::drive;
-use tx_services::time::{timekeeper, timekeeper_clock, ClockRead, TimekeeperClock, TimekeeperIf};
+use tx_services::time::{ClockRead, TimekeeperClock, TimekeeperIf, timekeeper, timekeeper_clock};
 use tx_substrate::step::DriveMode;
 use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::vm::step_ops::{
@@ -39,10 +39,7 @@ fn futex_trace_sample(counter: &AtomicU64) -> bool {
 
 fn emit_futex_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -84,6 +81,34 @@ fn brk_growth_exceeds_soft_limit(brk_base: u64, current_brk: u64, requested: u64
     requested > limit
 }
 
+fn normalize_truncated_brk_request(brk_base: u64, current_brk: u64, requested: u64) -> u64 {
+    const LOW32_MASK: u64 = 0xffff_ffff;
+    const SIGN_EXTENDED_I32_HIGH: u64 = 0xffff_ffff_0000_0000;
+
+    let low_requested = if requested <= LOW32_MASK {
+        requested
+    } else if (requested & !LOW32_MASK) == SIGN_EXTENDED_I32_HIGH {
+        requested & LOW32_MASK
+    } else {
+        return requested;
+    };
+    if low_requested == 0 || current_brk <= LOW32_MASK {
+        return requested;
+    }
+
+    // OSComp's historical brk.c truncates the printed heap pointer through a
+    // 32-bit path before issuing the next brk request. Recover only a small,
+    // forward move in the current high-address window.
+    let candidate = (current_brk & !LOW32_MASK) | low_requested;
+    if candidate < brk_base || candidate < current_brk {
+        return requested;
+    }
+    if brk_growth_exceeds_soft_limit(brk_base, current_brk, candidate) {
+        return requested;
+    }
+    candidate
+}
+
 fn emit_vm_recipe_summary(name: &[u8], ctx: &SyscallCtx<'_>) {
     let n = VM_RECIPE_TRACE_SAMPLE.fetch_add(1, Ordering::Relaxed) + 1;
     if n != 1 && n % 512 != 0 {
@@ -106,10 +131,9 @@ fn emit_vm_recipe_summary(name: &[u8], ctx: &SyscallCtx<'_>) {
 ///   userspace observes "the break didn't move" and is responsible
 ///   for noticing.
 pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let requested = args[0];
-
     let brk_base = ctx.process.brk_base();
     let current_brk = ctx.process.current_brk();
+    let requested = normalize_truncated_brk_request(brk_base, current_brk, args[0]);
 
     // Requested == 0 is the "report current" idiom; never call into
     // the script (which would treat zero as `requested < brk_base`
@@ -143,7 +167,7 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     match drive(
         op,
@@ -151,7 +175,7 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -166,6 +190,44 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
             // movement" by comparing against the prior break.
             SyscallResult::Return(current_brk as i64)
         }
+    }
+}
+
+#[cfg(test)]
+mod brk_compat_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_truncated_brk_request_recovers_same_window_growth() {
+        let brk_base = 0x0000_001e_ed46_a000;
+        let current_brk = brk_base;
+        let requested = 0xffff_ffff_ed46_a040;
+
+        let normalized = normalize_truncated_brk_request(brk_base, current_brk, requested);
+
+        assert_eq!(normalized, 0x0000_001e_ed46_a040);
+    }
+
+    #[test]
+    fn normalize_truncated_brk_request_recovers_zero_extended_oscomp_growth() {
+        let brk_base = 0x0000_0027_3e7f_e000;
+        let current_brk = brk_base;
+        let requested = 0x0000_0000_3e7f_e040;
+
+        let normalized = normalize_truncated_brk_request(brk_base, current_brk, requested);
+
+        assert_eq!(normalized, 0x0000_0027_3e7f_e040);
+    }
+
+    #[test]
+    fn normalize_truncated_brk_request_keeps_invalid_wrap() {
+        let brk_base = 0x0000_001e_ed46_a000;
+        let current_brk = brk_base;
+        let requested = 0xffff_ffff_ed46_9000;
+
+        let normalized = normalize_truncated_brk_request(brk_base, current_brk, requested);
+
+        assert_eq!(normalized, requested);
     }
 }
 
@@ -379,7 +441,7 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     match drive(
         op,
@@ -387,7 +449,7 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -533,7 +595,7 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     match drive(
         op,
@@ -541,7 +603,7 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -587,7 +649,7 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     match drive(
         op,
@@ -595,7 +657,7 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -632,7 +694,7 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     match drive(
         op,
@@ -640,7 +702,7 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -720,7 +782,7 @@ async fn drive_vm_lock(
 ) -> Result<tx_subsystems::vm::VmMapCommit, V3Errno> {
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     if locked {
         drive(
@@ -732,7 +794,7 @@ async fn drive_vm_lock(
             DriveMode::Waiting,
             mailbox_arc.as_ref(),
             delegate_registry_arc.as_deref(),
-            timer_wheel_arc.as_ref(),
+            timer_registrar_handle.as_ref(),
         )
         .await
     } else {
@@ -745,7 +807,7 @@ async fn drive_vm_lock(
             DriveMode::Waiting,
             mailbox_arc.as_ref(),
             delegate_registry_arc.as_deref(),
-            timer_wheel_arc.as_ref(),
+            timer_registrar_handle.as_ref(),
         )
         .await
     }
@@ -870,7 +932,7 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     match drive(
         op,
@@ -878,7 +940,7 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -986,7 +1048,7 @@ async fn drive_vm_remap(
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     drive(
         op,
@@ -994,7 +1056,7 @@ async fn drive_vm_remap(
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
 }
@@ -1080,7 +1142,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let _delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let op = VmMsyncOp {
         aspace: &ctx.aspace,
@@ -1092,7 +1154,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         None,
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -1157,7 +1219,6 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
         VmMapError::WouldBlock => EAGAIN_VALUE,
         VmMapError::BackingOffsetOverflow => EINVAL_VALUE,
         VmMapError::Pmap(_) => errno_to_i32(Errno::EIO),
-        VmMapError::PageAlloc(_) => errno_to_i32(Errno::ENOMEM),
         VmMapError::Private(_) => errno_to_i32(Errno::ENOMEM),
     }
 }
@@ -1204,14 +1265,13 @@ where
     let bitset = args[5] as u32;
 
     let op = op_full & FUTEX_CMD_MASK;
-    let private = (op_full & FUTEX_PRIVATE_FLAG) != 0;
 
     match op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             use tx_scripts::drive;
             use tx_substrate::step::Deadline;
             use tx_substrate::step::DriveMode;
-            use tx_subsystems::futex::{FutexWaitOp, FUTEX_WAKE_MASK};
+            use tx_subsystems::futex::{FUTEX_WAKE_MASK, FutexWaitOp};
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);
@@ -1325,7 +1385,6 @@ where
                 woken: false,
                 waiting: false,
                 registered_source_id: None,
-                private,
             };
             match drive(
                 op,
@@ -1373,7 +1432,6 @@ where
                 val,
                 wake_mask,
                 MailboxSchedulerHint::WakeHandoff,
-                private,
             );
             if trace_wake {
                 emit_futex_result(b"debug.futex.wake.result", &result);
@@ -1398,13 +1456,12 @@ where
             }
             let mut script_ctx = build_subject_script_ctx(ctx);
             let guard = step_engine::guard();
-            let outcome = tx_subsystems::futex::step_futex_requeue_scoped_in(
+            let outcome = tx_subsystems::futex::step_futex_requeue_in(
                 &ctx.aspace,
                 uaddr,
                 uaddr2,
                 val,
                 val2,
-                private,
                 &guard,
             );
             drop(guard);
@@ -1421,11 +1478,11 @@ where
             if uaddr2 == 0 {
                 return SyscallResult::Error(EINVAL_VALUE);
             }
-            let first = match futex_wake_count(ctx, uaddr, val, private) {
+            let first = match futex_wake_count(ctx, uaddr, val) {
                 Ok(woken) => woken,
                 Err(result) => return result,
             };
-            let second = match futex_wake_count(ctx, uaddr2, val2, private) {
+            let second = match futex_wake_count(ctx, uaddr2, val2) {
                 Ok(woken) => woken,
                 Err(result) => return result,
             };
@@ -1433,7 +1490,7 @@ where
         }
         FUTEX_LOCK_PI => futex_pi_lock(ctx, uaddr, false),
         FUTEX_TRYLOCK_PI => futex_pi_lock(ctx, uaddr, true),
-        FUTEX_UNLOCK_PI => futex_pi_unlock(ctx, uaddr, private),
+        FUTEX_UNLOCK_PI => futex_pi_unlock(ctx, uaddr),
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /
         // UNLOCK_PI / TRYLOCK_PI / WAIT_BITSET / WAKE_BITSET — out
         // of scope for v1. musl's libc init only emits FUTEX_WAIT
@@ -1456,7 +1513,6 @@ pub(super) fn sys_futex_oneshot_with_wake_hint(
     let val = args[2] as u32;
     let bitset = args[5] as u32;
     let op = op_full & FUTEX_CMD_MASK;
-    let private = (op_full & FUTEX_PRIVATE_FLAG) != 0;
 
     match op {
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
@@ -1472,7 +1528,7 @@ pub(super) fn sys_futex_oneshot_with_wake_hint(
             if trace_wake {
                 emit_futex_wake_entry(uaddr, val, op, wake_mask);
             }
-            let result = futex_wake_oneshot(ctx, uaddr, val, wake_mask, wake_hint, private);
+            let result = futex_wake_oneshot(ctx, uaddr, val, wake_mask, wake_hint);
             if trace_wake {
                 emit_futex_result(b"debug.futex.wake.result", &result);
             }
@@ -1488,27 +1544,15 @@ fn futex_wake_oneshot(
     n: u32,
     wake_mask: u64,
     wake_hint: MailboxSchedulerHint,
-    private: bool,
 ) -> SyscallResult {
-    match futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, wake_hint, private) {
+    match futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, wake_hint) {
         Ok(woken) => SyscallResult::Return(woken as i64),
         Err(result) => result,
     }
 }
 
-fn futex_wake_count(
-    ctx: &SyscallCtx<'_>,
-    uaddr: u64,
-    n: u32,
-    private: bool,
-) -> Result<u32, SyscallResult> {
-    futex_wake_count_masked(
-        ctx,
-        uaddr,
-        n,
-        tx_subsystems::futex::FUTEX_WAKE_MASK,
-        private,
-    )
+fn futex_wake_count(ctx: &SyscallCtx<'_>, uaddr: u64, n: u32) -> Result<u32, SyscallResult> {
+    futex_wake_count_masked(ctx, uaddr, n, tx_subsystems::futex::FUTEX_WAKE_MASK)
 }
 
 fn futex_wake_count_masked(
@@ -1516,16 +1560,8 @@ fn futex_wake_count_masked(
     uaddr: u64,
     n: u32,
     wake_mask: u64,
-    private: bool,
 ) -> Result<u32, SyscallResult> {
-    futex_wake_count_masked_with_hint(
-        ctx,
-        uaddr,
-        n,
-        wake_mask,
-        MailboxSchedulerHint::WakeHandoff,
-        private,
-    )
+    futex_wake_count_masked_with_hint(ctx, uaddr, n, wake_mask, MailboxSchedulerHint::WakeHandoff)
 }
 
 fn futex_wake_count_masked_with_hint(
@@ -1534,16 +1570,14 @@ fn futex_wake_count_masked_with_hint(
     n: u32,
     wake_mask: u64,
     wake_hint: MailboxSchedulerHint,
-    private: bool,
 ) -> Result<u32, SyscallResult> {
     let guard = step_engine::guard();
-    let outcome = tx_subsystems::futex::step_futex_wake_masked_with_hint_scoped_and_post_in(
+    let outcome = tx_subsystems::futex::step_futex_wake_masked_with_hint_and_post_in(
         &ctx.aspace,
         uaddr,
         n,
         wake_mask,
         wake_hint,
-        private,
         &guard,
         |mailbox, event, hint| ctx.post_mailbox_ref_event_with_hint(mailbox, event, hint),
     );
@@ -1579,16 +1613,10 @@ fn futex_pi_lock(ctx: &SyscallCtx<'_>, uaddr: u64, try_only: bool) -> SyscallRes
     }
 }
 
-fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64, private: bool) -> SyscallResult {
+fn futex_pi_unlock(ctx: &SyscallCtx<'_>, uaddr: u64) -> SyscallResult {
     let owner = futex_owner_tid(ctx);
     let guard = step_engine::guard();
-    let outcome = tx_subsystems::futex::step_futex_unlock_pi_scoped_in(
-        &ctx.aspace,
-        uaddr,
-        owner,
-        private,
-        &guard,
-    );
+    let outcome = tx_subsystems::futex::step_futex_unlock_pi_in(&ctx.aspace, uaddr, owner, &guard);
     drop(guard);
     match outcome {
         StepOutcome::Done(_) => SyscallResult::Return(0),

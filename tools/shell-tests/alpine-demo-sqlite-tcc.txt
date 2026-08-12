@@ -1,0 +1,38 @@
+# alpine-demo-sqlite-tcc.txt - one-shot witness for the demo TCC link step.
+#
+# Run with:
+#   cargo xtask shell-test --target rv64-qemu --profile alpine \
+#     --append-cmdline tx.mount.sdcard=0 \
+#     --extra-rv64-ext4 target/images/alpine-tcc-dev-root-rv64-qemu.ext4 \
+#     --script tools/shell-tests/alpine-demo-sqlite-tcc.txt
+
+wait ":mount:bdevfs:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "echo sqlite-tcc-demo-start\n"
+expect "sqlite-tcc-demo-start" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "sh /demo/sqlite-tcc/run-demo.sh; echo demo-run-status:$?\n"
+expect "setup-tcc: mounted /dev/block/vda at /mnt/tcc" within 30000
+expect "setup-tcc: tmp=/mnt/tmp" within 30000
+expect "tcc-link-status:0" within 30000
+expect "tcc-linked-bin:/tmp/sqlite_threads" within 30000
+expect "demo-run-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+send "grep -q 'main: creating pthread' /tmp/sqlite_threads.c; echo pthread-demo-source-status:$?\n"
+expect "pthread-demo-source-status:0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/usr/bin/sqlite3 -batch -noheader /mnt/tmp/demo.db \"CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT); INSERT OR REPLACE INTO kv VALUES('demo','ok'); SELECT 'mnt-tmp-sqlite:' || v FROM kv WHERE k='demo';\"; echo mnt-tmp-sqlite-status:$?\n"
+expect "mnt-tmp-sqlite:ok" within 30000
+expect "mnt-tmp-sqlite-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+quit

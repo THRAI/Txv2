@@ -2,24 +2,45 @@
 
 <!-- txdoc:05-FILESYSTEM-TX-EXT4-PLAN-V1-2 -->
 
-**Status.** v1.2 (2026-04-20). Draft plan for the ext4 filesystem backend for txKernel.
+**Status.** v1.2, Linux-compatibility profile revision (2026-07-25). Active
+plan for the ext4 filesystem backend for txKernel.
+
+**2026-07-25 direction.** The production design remains a Tx-native kernel
+filesystem instance. A userspace daemon or a separate in-kernel ext4 service is
+not the primary implementation path: neither removes the on-disk and durability
+work, and both add a request transport, page-transfer, failure and bootstrap
+protocol. Linux ext4, e2fsprogs and xfstests are the compatibility authorities;
+rsext4 is an algorithm source only. Delivery is split into a bounded Tier 1
+profile followed by Tier 2 mainstream-Linux compatibility.
 
 **Supersedes (v1.2 → v1.1).** Adds two design commitments to §1: (a) the stateless-per-inode rule — tx-ext4 holds no decoded per-inode state; POSIX-abstract metadata lives on VFS's RNode, ext4-specific fields are addressed as bytes in the inode-table PC and re-parsed on use; (b) a new §1.4 cache and reclaim policy that locks in v1 behavior (CLOCK reclaim for file pages phase 2, pinned metadata PCs, dentry-cache Tier 2 reclaim, periodic writeback phase 4, no swap), closing `PAGE_BACKED_v1.md §12.1` for v1 scope.
 
 **Supersedes (v1.1 → v1).** Adds §3 "Interfaces" explicitly specifying the traits tx-ext4 implements (`FsPageBacking`, `FsOps`), the trait it consumes (`BlockDevice`), the value types it handles (`InodeMeta`, `DirCursor`, `DirEntry`, `Credential`, `FsObjectId`), the mount handshake (`MountInitContext` + `MetadataPcFactory` + `MountOutput`), and an explicit import allowlist/denylist enforceable by grep-lint. Downstream sections renumbered (§4+). Content of final goals, phase breakdown, and test milestones unchanged.
 
-**Purpose.** Define the deliverables, phase structure, and test milestones for implementing an async, coroutine-compatible ext4 filesystem as the first persistent-FS backend behind VFS and PageContainer. rsext4 ([Starry-OS/rsext4](https://github.com/Starry-OS/rsext4)) is included as a git submodule and referenced during porting of on-disk format code; no rsext4 code is used at runtime.
+**Purpose.** Define the compatibility contract, ownership boundaries,
+deliverables, phase structure and executable acceptance gates for an async,
+coroutine-compatible ext4 filesystem behind VFS, PageBacked and the I/O
+manager. The implementation follows Linux-visible semantics and the ext4
+on-disk contract without copying Linux VFS, page-cache or locking internals.
+rsext4 ([Starry-OS/rsext4](https://github.com/Starry-OS/rsext4)) is included as
+a git submodule for algorithm study; no rsext4 code is used at runtime.
 
 **Audience.** Implementers working on tx-ext4, reviewers auditing the backend boundary, agents extending the filesystem in future phases.
 
 **Companion documents.**
 
+- [`EXT4_LIFECYCLE_v1.md`](EXT4_LIFECYCLE_v1.md) — canonical Tier 1 ownership and terminal-state contract for file-I/O requests, admitted mutations, fsync/sync/unmount settlement, production-path convergence, and crash/e2fsprogs acceptance. Where older phase prose implies caller-managed cleanup, commit-time journal release, multiple active Tier 1 transactions, accumulated uncheckpointed transactions, or concurrent checkpoint publication, this companion's serialized Tier 1 lifecycle wins. Phase-4 T4.5/T4.6 below use the revised serialized form.
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — canonical dual-plane file-I/O and global memory-pressure architecture; it supersedes this plan's older global `FrameMeta` CLOCK and dirty-authority prose.
 - [`VFS_CHECKS_V2.1.md`](VFS_CHECKS_V2.1.md) and [`MOUNT_v1.md`](MOUNT_v1.md) — VFS ownership boundary, `FsOps` and `FsPageBacking` consumer side.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — `FsPageBacking` trait, `PageContainer` model.
 - [`VM_v1_2.md`](../03_memory-vm/VM_v1_2.md) — fault handler and `FsPageBacking::fetch_page` integration.
 - [`IO_MANAGER_v1.md`](IO_MANAGER_v1.md) — target successor path for file-data I/O: ext4 remains the concrete mapping/journal backend and produces neutral page/block plans while the I/O manager owns batching, submission, completion, and block scheduling.
 - [`01_CONCEPTS_v5.md §3.5`](../../Txv3/01_CONCEPTS_v5.md) — factoring/topology axes used throughout this plan.
 - [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — `StepOutcome` contract; all async methods return step outcomes.
+- [Linux ext4 documentation](https://www.kernel.org/doc/html/latest/filesystems/ext4/index.html) — on-disk structures, feature flags, allocation, directories and JBD2 behavior.
+- [Linux `fs/ext4`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/ext4) — observable behavior and error-path oracle where prose is incomplete.
+- [e2fsprogs](https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git) — image construction, inspection and consistency authority (`mke2fs`, `debugfs`, `dumpe2fs`, `e2fsck`).
+- [xfstests](https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git) — Linux filesystem behavior and crash-regression oracle, filtered by declared feature support.
 
 ### Zone-derived type policy
 
@@ -52,7 +73,10 @@ resolved through VFS/PageBacked.
 
 - A tx-ext4 crate implementing `FsOps` and `FsPageBacking`.
 - An async block device trait that tx-ext4 consumes for all disk I/O.
-- ext4 on-disk format support sufficient for Linux-2.6-era userland: regular files, directories (linear and htree), symlinks, hard links, extent-based block mapping, inode/block bitmap allocation.
+- A declared Tier 1 ext4 profile for production bring-up and a Tier 2 profile
+  for mainstream Linux ext4 behavior, as specified in §1.5-§1.8.
+- Linux-visible regular-file, directory, symlink, hard-link, extent, allocation,
+  metadata, fsync and recovery semantics within the active tier.
 - JBD2 ordered-mode journaling with mount-time replay.
 - Filesystem-owned metadata kept in `MountPayload`-held `Cap<PageContainer>` handles (option A from the tx-ext4 plan discussion): **metadata PCs are not exposed as RNodes**; they are filesystem-private buffered block ranges.
 
@@ -67,13 +91,22 @@ resolved through VFS/PageBacked.
 - Block sizes other than 4 KiB.
 - Online resize.
 - Writeback mode or journal=data — only ordered mode.
-- POSIX ACLs (stick to mode bits).
+- Tier 3 features listed in §1.9. POSIX ACLs and common xattrs move to Tier 2;
+  they are no longer permanently excluded by this plan.
 
 ### 1.3 Non-negotiable design constraints
 
 <!-- txdoc:TX-EXT4-PLAN-NON-NEGOTIABLE-DESIGN-CONSTRAINTS-1 -->
 
 - **No runtime dependence on rsext4.** rsext4 is a reference and the on-disk format is ported from it; the runtime library is ours.
+- **No ext4 daemon or private ext4 service boundary in the production path.**
+  The mounted filesystem instance is the L5 mapping/journal planner consumed by
+  PageBacked and the I/O manager. Long-lived L4/L6 service futures remain
+  generic I/O-manager mechanism, not a second filesystem server.
+- **Linux is the behavioral oracle, not the internal template.** Error codes,
+  persistence rules, feature admission and filesystem-visible results follow
+  Linux. Tx retains its own VFS, PageBacked, StepOp, publication and scheduling
+  structure.
 - **No rsext4-style multi-level cache.** `PageContainer` is the cache.
 - **No synchronous blocking.** Every I/O call yields a `StepOutcome::Yield { shape: YieldShape::OnWaitSource { .. } }` and resumes when the block device completes. The block device trait is async.
 - **No `&mut self` threading.** Concurrent operations on the same `Ext4FsInstance` must be admissible. State mutation goes through PC-level publication discipline (ARCH-5) and substrate primitives.
@@ -84,7 +117,10 @@ resolved through VFS/PageBacked.
 
 <!-- txdoc:TX-EXT4-PLAN-CACHE-RECLAIM-POLICY-1 -->
 
-This section locks in the v1 reclaim policy for VFS- and filesystem-adjacent caches, closing the open question left in `PAGE_BACKED_v1.md §12.1` for v1 scope. Cache tiers are introduced phase-by-phase.
+This section classifies ext4/VFS caches and their owner-side reclaim
+eligibility. Global policy, watermarks, provider arbitration, allocation retry,
+and file-page replacement algorithms are owned by
+[`MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md).
 
 **Caches in scope.**
 
@@ -97,56 +133,159 @@ This section locks in the v1 reclaim policy for VFS- and filesystem-adjacent cac
 | RNode zone | Live-node slots | Dies when no edges and no payload-capable holders |
 | Coherence index | `fs_object_id → Weak<RNode>` per mount | Weak references; entries die with their RNodes |
 | Slab (kernel heap) | Kernel allocations backing Box/Vec/etc | Simple free-on-empty; no per-CPU cache in v1 |
-| Journal transactions | Pre-commit buffered metadata mutations | Bounded by journal size; commit releases |
+| Journal transactions | Admitted metadata after-images, revoke records, commit/checkpoint state | Bounded by journal size; checkpoint plus safe tail advancement releases the journal extent |
 
-**v1 policy by phase.**
+**Provider policy by phase.**
 
-- **Phase 1 (read-only mount).** No reclaim. ENOMEM on frame allocation fails cleanly up the stack. Clean file pages accumulate without eviction; acceptable because read-only workloads are bounded and bring-up doesn't need reclaim correctness.
-
-- **Phase 2 (writes, no journal).** Pressure-driven CLOCK reclaim for file pages only:
-  - Each `FrameMeta` gains a `used` bit (we have space in the existing packed layout).
-  - `step_read`/`step_write` / fault handler set `used` when touching a frame.
-  - On `alloc_frame` failure, the caller triggers a reclaim pass: CLOCK sweep over `FrameMeta` array; a candidate frame is `cache_ref == 1 ∧ map_count == 0 ∧ !flags.dirty ∧ !used`. Candidates are dropped from their PC page index and freed. If `used`, the bit is cleared and the sweep moves on.
-  - One pass is bounded; if it frees nothing, the caller returns ENOMEM.
-  - Anon PCs never produce candidates (cache_ref represents pinning, not caching).
-  - Metadata PCs never produce candidates (marked with a per-PC `no_reclaim` flag).
-  - Dirty pages never produce candidates (must be written first; writeback comes phase 4).
-
-  The CLOCK hand is a per-mount or per-NUMA-node cursor (v1: one global cursor; refine later).
-
-- **Phase 2 (dentry cache reclaim).** Dentries follow the same Tier-2 shape: each DEntry has a `used` bit set on walker traversal, cleared on reclaim sweep. Candidates are `cache_ref == 1 ∧ !used ∧ !negative_dentry_in_active_use`. Reclaim pass triggers when the dentry zone exceeds a high-water mark (configurable; default = 75% of zone capacity). Note that dentries pinned by active walkers (via witness IdentRefs under an epoch guard) are not candidates by construction — `cache_ref > 1` excludes them.
-
-- **Phase 4 (journal).** Periodic writeback for dirty file pages, implemented as a reactor-spawned task. Parameters:
-  - Timer-driven sweep every 5 seconds OR when dirty-byte count exceeds 10% of total memory, whichever first.
-  - Sweep is bounded (process at most N pages per pass; N configurable, default 1024) to avoid long latency tails.
-  - Dirty metadata pages are not flushed by this daemon — they go through journal commit.
-  - `fsync` short-circuits the timer: synchronous walk of the target PC's dirty frames + force-commit any in-flight transaction containing them.
+- **Phase 1.** File-page and ext4 metadata state may remain pinned while the
+  read-only bring-up profile is bounded. Allocation exhaustion fails cleanly.
+- **Phase 2.** PageBacked registers clean file pages through its global
+  `ReclaimProvider`; ext4 does not sweep `FrameMeta` or own the CLOCK hand. VFS
+  registers dentry/RNode caches through owner adapters.
+- **Phase 4.** Dirty ordinary file pages remain PageSlot-owned and enter the
+  global writeback control loop. ext4 supplies layout, immutable metadata
+  after-images, journal admission and ordering. Dirty metadata is never evicted
+  as an ordinary clean file page.
+- **Later measured stage.** ext4 may register bounded metadata caches only once
+  `FrozenMetadataLease`, transaction-safe claim rules, and refault/cost
+  accounting are executable.
 
 **Explicit non-policies (v1).**
 
 - **No swap.** Anon PCs are pinned until explicit teardown. This has been a standing commitment (`PAGE_SUBSTRATE_v1.md` §8).
-- **No metadata PC eviction.** Metadata is small (tens of MB for typical ext4 sizes); pinning it keeps tx-ext4 hot paths fast. Revisit if profiling shows pressure.
+- **No metadata PC eviction in the first control-plane stage.** Revisit only
+  through an ext4-owned provider after transaction-safe claim semantics land.
 - **No per-CPU slab caches.** Slab returns frames to the frame allocator when a slab is fully free; no high-water mark.
-- **No reverse-mapping machinery.** Reclaim is purely forward (start from FrameMeta, check PC membership); no walking from frame to mappers. This is what `map_count == 0` in the candidate predicate buys us — it tells us no mapper holds the frame without needing to find who.
-- **No per-mount reclaim priority.** All file-page PCs compete on equal terms for memory.
+- **No reverse-mapping machinery in v1.** Owners validate typed mapping/pin
+  facts at claim time; policy does not walk raw frames back into semantic
+  objects.
+- **No ext4-private global reclaim priority.** Provider arbitration belongs to
+  the memory-pressure coordinator.
 - **No dentry-cache periodic pruning.** Reclaim is on-demand at high-water only.
-
-**Soft targets (not blockers for v1).**
-
-- Reclaim sweep latency under 1ms for the CLOCK hand on a 64GB-frame system (bounded scan, cache-friendly access).
-- Writeback daemon pause under 10ms per sweep window.
-- No allocation failure under steady-state workloads within 80% of memory.
 
 **Cross-reference and closure.**
 
-This supersedes the "deferred to a reclaim-specific doc" language in `PAGE_BACKED_v1.md §12.1` *for v1 scope*. A future `RECLAIM.md` may refine this with per-CPU accounting, reverse-mapping, and NUMA-aware cursors. Scope creep is explicitly rejected for v1: we ship with CLOCK + timer-driven writeback + pinned metadata, and nothing more.
+The global contract now lives in `MEMORY_IO_ARCHITECTURE_v1.md`. This plan
+retains only ext4 cache classification and transaction-safe owner behavior.
 
 **What this buys us.**
 
 - Memory pressure produces graceful degradation instead of ENOMEM under any reasonable load.
-- No LRU list overhead (CLOCK needs one bit per frame, no linked-list maintenance).
-- Reclaim is fully synchronous under pressure (no background daemon required for correctness; writeback daemon in phase 4 is a latency optimization, not a correctness primitive).
+- Replacement algorithms can evolve without importing ext4 semantics into the
+  allocator or policy layer.
+- Background and direct work remain bounded, with actual allocator-free and
+  refault feedback.
 - Matches the no-swap discipline: memory pressure affects only reclaimable pages (clean file, evictable dentry), never anon.
+
+### 1.5 Compatibility authority
+
+<!-- txdoc:TX-EXT4-PLAN-COMPATIBILITY-AUTHORITY-1 -->
+
+There is no single complete ext4 specification. A claim is accepted only when
+it is consistent with the following authority stack, in this order:
+
+1. **On-disk authority:** current Linux ext4 format documentation plus the
+   structure encoders/validators in e2fsprogs.
+2. **Behavioral authority:** a current Linux ext4 mount for syscall results,
+   error cases, namespace semantics and mount-state transitions.
+3. **Consistency authority:** `e2fsck -fn` on an offline copy after every
+   mutation or recovery campaign. Tx self-checks do not override e2fsck.
+4. **Regression authority:** applicable generic/ext4 xfstests and focused Linux
+   differential fixtures.
+5. **Algorithm references:** rsext4 and other implementations may explain an
+   algorithm, but never define Tx ownership, cache, locking or durability.
+
+Every capability-ledger row names its active tier, feature bits, Linux or
+e2fsprogs witness, Tx owner, error mapping and crash gate. A passing unit test
+without an image-level witness proves only the local algorithm.
+
+### 1.6 Feature admission and mount policy
+
+<!-- txdoc:TX-EXT4-PLAN-FEATURE-ADMISSION-MOUNT-POLICY-1 -->
+
+Mount begins by producing an immutable `Ext4FeatureSet` and selecting
+`ReadOnly`, `Tier1ReadWrite`, or `Tier2ReadWrite`. Admission follows Linux's
+feature classes:
+
+- Unknown `incompat` bits reject both RO and RW mount. The format layer reports
+  unsupported; the initial Linux-compatible mount boundary returns `EINVAL`.
+- Unsupported `ro_compat` bits permit RO mount only when all structures needed
+  for safe reading are understood; an initial RW mount returns `EINVAL`, while
+  an attempted RO-to-RW remount returns `EROFS`, before any home-block write.
+- Unknown `compat` bits may be ignored only when Linux defines them as safe to
+  ignore. Their fields and bytes are preserved by round-trip encoders.
+- A bad required checksum, impossible geometry, out-of-bounds reference or
+  malformed tree returns `EUCLEAN` (or `EIO` when the failure is device I/O),
+  never a panic and never partial mount publication.
+- A runtime metadata or journal error aborts the current transaction and moves
+  the mount to an error state. Tier 1 implements deterministic remount-read-only
+  behavior; continuing RW after an integrity error is forbidden.
+
+The exact accepted masks live in one generated/tested table in
+`tx-ext4-format`; mount code must not duplicate ad hoc bit checks. Fixture
+generation records `mke2fs`, kernel and e2fsprogs versions plus `dumpe2fs -h`
+output so a distro default change cannot silently broaden the profile.
+
+### 1.7 Tier 1 - controlled production profile
+
+<!-- txdoc:TX-EXT4-PLAN-TIER1-CONTROLLED-PROFILE-1 -->
+
+Tier 1 is the first production and boot acceptance gate. Its image recipe is
+controlled and versioned; accepting an arbitrary distro-default ext4 image is
+not a Tier 1 claim.
+
+| Area | Tier 1 contract |
+|---|---|
+| Geometry | 4 KiB blocks; 128/256-byte inodes; extents required; 64-bit block numbers accepted; one external block device; no online resize |
+| Common features | journal, filetype dirents, extents, `64bit`, `flex_bg`, sparse-super/large-file/huge-file forms, `extra_isize`, `dir_nlink`, `metadata_csum` and `csum_seed` when emitted by the pinned recipe |
+| Mapping | inline extent root and the tested depth-1 indexed form; holes and sparse growth; larger/deeper shapes reject before mutation rather than corrupting |
+| Directories | linear directories plus htree lookup/readdir; insertion is supported while the current leaf has capacity; split/rebalance belongs to Tier 2 |
+| Objects | regular files, directories, fast/block symlinks and hard links; unlinked-open lifetime and classic-orphan recovery are journaled for supported shapes |
+| Mutation | create, mkdir, link, symlink, unlink, rmdir, same/cross-directory rename, chmod/chown/utimens, buffered write, truncate and fsync/fdatasync through immutable mutation admission |
+| Durability | JBD2 ordered mode, replay, revoke and classic-orphan recovery for supported free/truncate shapes, regular/directory fsync, fdatasync, syncfs, sync, checkpoint, clean unmount, serialized journal wrap/backpressure and recovery-only mount state on uncertain commit or settlement failure |
+| Integration | VFS/Mount/PageBacked ownership, L5 ext4 plans, L4/L6 I/O-manager execution, mmap/read/write and Alpine/OSComp guest workflows |
+
+Tier 1 may return `EOPNOTSUPP` before mutation for a shape outside the table,
+but it must not advertise RW admission for a feature whose ordinary operation
+can reach an unhandled shape. The controlled fixture bounds file fragmentation,
+directory fanout and extent depth accordingly.
+
+### 1.8 Tier 2 - mainstream Linux ext4 compatibility
+
+<!-- txdoc:TX-EXT4-PLAN-TIER2-MAINSTREAM-LINUX-1 -->
+
+Tier 2 removes the controlled-shape limits while preserving the same ownership
+and transaction protocol. It adds:
+
+- arbitrary legal extent-tree depth, multi-child split/merge, unwritten extent
+  conversion, fragmented files and files larger than 4 GiB;
+- complete htree collision, split and rebalance behavior for large directories;
+- `orphan_file` admission/recovery plus high-concurrency unlinked-open and
+  truncate recovery beyond the Tier 1 classic-orphan shapes;
+- common xattrs, `security.*`/`user.*` storage needed by Linux userland and
+  POSIX ACLs, after the VFS/credential authority seam is documented;
+- common `fallocate` operations (preallocate, punch-hole, zero-range),
+  `statfs`, `msync`, `O_DIRECT` coherency, `FIEMAP` and the common ext4
+  ioctl subset selected by actual Linux tests;
+- full mount error policy, remount-RO/RW transitions, forced-unmount semantics,
+  and sustained SMP mutation under journal pressure;
+- the applicable xfstests generic/ext4 groups, with every exclusion tied to a
+  named Tier 3 feature rather than a generic skip.
+
+Tier 2 is reached incrementally by vertical slices. Tier 1 remains a permanent
+fast gate and must stay green; Tier 2 work cannot weaken its feature rejection
+or durability guarantees.
+
+### 1.9 Tier 3 and explicit non-goals
+
+<!-- txdoc:TX-EXT4-PLAN-TIER3-NON-GOALS-1 -->
+
+The combined Tier 1+2 plan still excludes non-4-KiB block sizes, ext2/ext3
+indirect-block mode, `bigalloc`, inline data, encryption/fscrypt, verity,
+casefold, quotas/project quotas, DAX, MMP, online resize, reflink and
+`data=journal`/`data=writeback`. Encountering an incompatibility that requires
+one of these features extends the profile only through a design update and a
+new fixture/xfstests gate; it is not fixed by silently accepting the bit.
 
 ---
 
@@ -209,15 +348,14 @@ This section specifies the exact types tx-ext4 implements and consumes. These ar
 
 tx-ext4 may import from these crates only:
 
-| Crate | Types permitted |
+| Dependency surface | Types permitted |
 |---|---|
 | `tx-fnd::types` | `Errno`, `PageSize`, numeric newtypes |
 | `tx-fnd::step` | `StepOutcome<T>`, `Guard`, `Channel`, `Mask`, `Blocked`, `Done`, `Advanced` |
 | `tx-fnd::sync` | `AtomicU64`, `AtomicU32` (for superblock mirror counters) |
 | `tx-fnd::block` | `BlockDevice` trait, `PhysicalBlockNumber`, `BlockReadReq`, `BlockWriteReq` |
-| `tx-vm::frame` | `Frame`, `Cap<Frame>`, `FrameMeta` access for dirty/io-locked bits |
-| `tx-vm::page_container` | `Cap<PageContainer>`, `PageContainer` (as opaque), `step_read`, `step_write` against PCs |
-| `tx-vm::page_backed` | `FsPageBacking` trait (implemented by tx-ext4) |
+| PageBacked compatibility surface | `PageDataLease`/staged `PageLease`, opaque object/range keys, and current `FsPageBacking` bridge while migration is active; this may remain module-local before extraction |
+| `tx-pager-api` | range/layout values, `FileLayoutPlanner`, `FileIoPlan<K>`, and opaque payload keys only; this may remain module-local before crate extraction |
 | `tx-vfs::fs_ops` | `FsOps` trait (implemented by tx-ext4), `InodeMeta`, `DirEntry`, `DirCursor`, `Credential`, `FsObjectId` |
 | `tx-vfs::mount` | `MountId`, `MountInitContext` (for mount bringup handshake) |
 
@@ -229,13 +367,18 @@ tx-ext4 may import from these crates only:
 - `tx-vfs::walker` — no walker state types.
 - `tx-proc::*` — no process/thread entities.
 
-The asymmetry: tx-ext4 depends on VM (for PCs/Frames) but not on VFS live-node types. VFS depends on tx-ext4's trait implementations but constructs all RNode state itself.
+The asymmetry: the kernel-facing `tx-ext4` adapter may consume PageBacked
+capabilities, but the pure pager never imports PageBacked, PPN, `BioVec`,
+reactor, or VFS live-node types. VFS constructs all RNode state itself.
 
 ### 3.2 `FsPageBacking` — trait implemented by tx-ext4
 
 <!-- txdoc:TX-EXT4-PLAN-FSPAGEBACKING-TRAIT-IMPLEMENTED-TX-EXT4-1 -->
 
-Defined in `tx-vm::page_backed`; this is tx-ext4's byte-pager role. The trait was sketched in [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §6; the definitive async signatures tx-ext4 implements:
+Defined in `tx-vm::page_backed`; this is the current compatibility bridge. It
+remains valid during compatible migration, but the target splits pure
+`FileLayoutPlanner` planning from the Tx adapter that retains PageDataLease and
+lowers `FileIoPlan<K>` into the existing `BackendBioGraph`.
 
 ```rust
 pub trait FsPageBacking: Send + Sync + 'static {
@@ -557,17 +700,21 @@ tx-ext4 implements two traits (`FsPageBacking`, `FsOps`), consumes one trait (`B
 
 ---
 
-## 4. Final goals (v1 acceptance)
+## 4. Final goals and compatibility gates
 
 <!-- txdoc:TX-EXT4-PLAN-FINAL-GOALS-V1-ACCEPTANCE-1 -->
 
-### 4.1 Functional goals
+### 4.1 Tier 1 functional goals
 
 <!-- txdoc:TX-EXT4-PLAN-FUNCTIONAL-GOALS-1 -->
 
-1. **Mount.** Mount a pre-populated 4 KiB-block ext4 image with or without an unreplayed journal. Replay on mount if dirty. Reject filesystems with unsupported features (with clear errnos).
+1. **Mount admission.** Mount the pinned Tier 1 4-KiB profile with or
+   without an unreplayed journal. Select RO/RW from the feature table and reject
+   unsupported/corrupt images before publishing the mount.
 2. **Read path.** `read(2)` on any regular file in the filesystem returns correct data. Works through VFS walker → RNode PageBacked(File) PC → `FsPageBacking::fetch_page` → extent walk → block device read → frame installed. Yields on disk I/O.
-3. **Directory traversal.** `readdir(2)`, `getdents(2)` work over both linear and htree directories. `lookup` walks through htree.
+3. **Directory traversal.** `readdir(2)`, `getdents(2)` and lookup work over
+   linear and Tier 1 htree directories. A mutation that would require a Tier 2
+   htree split fails before admission.
 4. **Write path.** `write(2)`, `truncate(2)`, `ftruncate(2)` correctly mutate file data. Sizes grow through the extent allocator. `flush_page` produces correct on-disk content.
 
    File timestamps use the kernel's single `CLOCK_REALTIME` timebase. The
@@ -579,10 +726,16 @@ tx-ext4 implements two traits (`FsPageBacking`, `FsOps`), consumes one trait (`B
    an epoch-zero or stale modification time.
 5. **Namespace mutations.** `creat`, `open(O_CREAT)`, `unlink`, `rmdir`, `mkdir`, `rename`, `link`, `symlink` all work and leave the filesystem consistent. Unlinked-but-open holds correctly via `destroy_inode` triggered by payload-liveness loss.
 6. **fsync.** `fsync(2)` flushes data pages and commits any pending journal transaction containing the file's metadata.
-7. **Journal correctness.** Crash (simulated via hard-killing the emulator) at arbitrary points during active mutations, remount, run `e2fsck -n`: filesystem reported as clean, no corruption.
-8. **Boot-level scenarios.** Boot tx-kernel with an ext4 root, run busybox, run a C compiler on a source file to an ext4 output.
+7. **Journal correctness.** Crash (simulated via deterministic hard-kill cut
+   points) during every supported mutation, replay, and run `e2fsck -fn`: the
+   filesystem is clean, fsync-success data survives, and no uncommitted state is
+   published after recovery.
+8. **Orphan correctness.** Unlinking an open file and truncating a file across a
+   crash use the classic orphan mechanism for Tier 1 shapes; replay/recovery
+   finishes reclamation without an e2fsck repair.
+9. **Boot-level scenarios.** Boot tx-kernel with an ext4 root, run busybox, run a C compiler on a source file to an ext4 output.
 
-### 4.2 Integration goals
+### 4.2 Tier 1 integration goals
 
 <!-- txdoc:TX-EXT4-PLAN-INTEGRATION-GOALS-1 -->
 
@@ -590,6 +743,12 @@ tx-ext4 implements two traits (`FsPageBacking`, `FsOps`), consumes one trait (`B
 2. **Page fault handler consumes tx-ext4.** User-space page faults on file-backed mappings drive through `FsPageBacking::fetch_page` with correct `StepOutcome::Yield { shape: YieldShape::OnWaitSource { .. } }` yield behavior.
 3. **No tx-ext4 reference to `Cap<RNode>`.** Verified by `grep` — the tx-ext4 crate does not import `RNode` or hold it in any type.
 4. **No rsext4 code in runtime build.** Verified by `cargo tree` — rsext4 is not a compile-time or runtime dependency.
+5. **One production durability path.** Production RW mounts use discovered
+   journal geometry and the planner/runtime path. Direct pager home writes are
+   test or compatibility oracles and cannot be selected by production code.
+6. **No filesystem service transport.** ext4 produces L5 plans; generic L4/L6
+   service futures execute them. No private request/reply server sits between
+   VFS/PageBacked and the mounted instance.
 
 ### 4.3 Performance goals (soft targets, not blockers)
 
@@ -601,13 +760,44 @@ tx-ext4 implements two traits (`FsPageBacking`, `FsOps`), consumes one trait (`B
 
 Performance is explicitly secondary to correctness for v1.
 
+### 4.4 Tier 2 closure goals
+
+<!-- txdoc:TX-EXT4-PLAN-TIER2-CLOSURE-GOALS-1 -->
+
+Tier 2 is complete only when all §1.8 slices have Linux differential and crash
+evidence, the declared xfstests set has no unexplained failures, and image
+exchange works in both directions:
+
+1. Linux creates and mutates a supported Tier 2 image; Tx mounts and continues
+   using it without `e2fsck` repair.
+2. Tx performs each supported mutation and cleanly unmounts; Linux mounts it RW
+   and applicable xfstests continue to pass.
+3. Power-cut campaigns cover extent/htree splits, orphan recovery, xattr/ACL,
+   fallocate, direct-I/O overlap and journal wrap.
+4. Every skipped xfstest maps to a named Tier 3 feature or a separately tracked
+   non-filesystem kernel gap. Timeouts and harness failures are not skips.
+5. SMP stress shows no duplicate allocation, stale mapping publication,
+   deadlock or post-abort RW mutation.
+
 ---
 
 ## 5. Phase breakdown and test milestones
 
 <!-- txdoc:TX-EXT4-PLAN-PHASE-BREAKDOWN-TEST-MILESTONES-1 -->
 
-Each phase has a self-contained deliverable and explicit test milestones. Phases are sequenced but phase 0 runs in parallel with phase 1 dependencies maturing elsewhere.
+Each phase has a self-contained deliverable and explicit test milestones. Phase
+0-1 establish shared read/format foundations; phases 2-4 close Tier 1; phase 5
+is the ordered Tier 2 expansion. The current implementation may already contain
+parts of a later phase, but a phase closes only when its full gate passes.
+
+| Phase | Compatibility role | Promotion gate |
+|---|---|---|
+| 0 | Shared oracle and sans-I/O format | deterministic fixtures and byte-preserving codecs |
+| 1 | Shared RO integration | feature admission plus planner-driven read witnesses |
+| 2 | Tier 1 mutations | bounded-shape namespace/data operations through mutation admission |
+| 3 | Tier 1 async execution | all production file I/O through L4/L5/L6 |
+| 4 | Tier 1 durability and production cutover | replay/fsync/checkpoint/crash evidence and one RW path |
+| 5 | Tier 2 mainstream Linux closure | advanced shapes/features plus declared xfstests set |
 
 ### Phase 0 — Sans-IO format module
 
@@ -633,8 +823,9 @@ Each phase has a self-contained deliverable and explicit test milestones. Phases
 - Any I/O.
 - Any caching.
 - Any mutable state beyond what's needed to encode a struct.
-- Extent tree splits and merges (these require allocation context; phase 2).
-- Htree node splits (phase 2).
+- Extent tree splits and merges (Tier 1 bounded insertion is phase 2; arbitrary
+  depth is phase 5).
+- Htree node splits (phase 5).
 
 **Test milestones.**
 
@@ -663,7 +854,9 @@ Each phase has a self-contained deliverable and explicit test milestones. Phases
 
 - `Ext4FsInstance` struct. Holds: block device handle, parsed superblock, `Cap<PageContainer>` handles for metadata regions (GDT, inode table, block bitmap, inode bitmap — one or more PCs depending on filesystem size), a `dirty_state` flag (refuse to mount if dirty until phase 4 lands replay).
 - `MountPayload` wiring: when a mount is created, construct the `Ext4FsInstance`, build the metadata PCs, build the coherence index for RNodes (an `fs_object_id → Weak<RNode>` map per CONCEPTS §15.7).
-- Metadata PC population: the metadata PCs are synthetic (option A from the design discussion). Their `PageContainerKind` is a new variant `Metadata { region: MetaRegion }` OR — simpler — `Anon` with backing populated on-demand by an internal helper that does block-device reads. **Decision deferred to implementation start**; the observable surface is identical either way (PCs are `Cap<PageContainer>`).
+- Metadata PC population: filesystem-private mount-lifetime metadata PCs use
+  the existing PageBacked/I/O-manager seam. They are not RNodes, not generic
+  file-data cache entries and not an rsext4-style decoded metadata cache.
 - `impl FsOps` — read-side:
   - `lookup(parent_fs_object_id, name) → fs_object_id`: htree or linear walk against the directory's data PC.
   - `load_inode_meta(fs_object_id) → InodeMeta`: read the inode-table PC at the right offset, parse with format module, return decoded metadata.
@@ -697,40 +890,110 @@ Each phase has a self-contained deliverable and explicit test milestones. Phases
 
 ---
 
-### Phase 2 — Writes without journal
+### Mutation admission contract (all read-write phases)
+
+<!-- txdoc:TX-EXT4-MUTATION-ADMISSION-CONTRACT-1 -->
+
+Every persistent ext4 mutation, including `chmod`, `chown`, `utimens`, size
+changes, extent allocation, directory updates, bitmap updates and inode
+link-count changes, enters the same immutable admission protocol. A backend
+must not publish a decoded metadata change and must not call a direct home
+write as a substitute for this protocol.
+
+1. **Read set.** The operation reads the superblock/group descriptor state,
+   inode-table and directory/extent/bitmap blocks it will inspect. Each input
+   records `(block_no, observed_generation, observed_checksum)` (or the
+   equivalent immutable block identity supplied by the metadata PC). Missing
+   blocks and feature bits are also preconditions. The read set is frozen before
+   reservation; a later re-read is a conflict, not an implicit refresh.
+2. **After-image.** The format planner computes a complete immutable
+   `AfterImage { block_no, bytes }` for every changed block and an explicit
+   merge row for blocks touched by more than one logical field. The source
+   `BlockImage` and all caller-owned `InodeMeta` values remain unchanged. An
+   after-image may be admitted only if it preserves unknown ext4 fields and
+   passes the format/checksum validators.
+3. **Reservation.** Admission reserves journal descriptor, data and commit
+   space, plus any allocator claims, before publication. Reservation failure
+   returns `ENOSPC`/`EBUSY` without changing a PC, RNode, inode bitmap or
+   journal cursor. Reservations are mount-local and released on every error
+   path.
+4. **Prepare and commit.** `JournalMutationRuntime` validates the read set,
+   stages the after-images, writes ordered data before the commit record, and
+   makes the transaction durable only after the commit record is confirmed.
+   Conflicts retry from a fresh read set; they never merge mutable references
+   captured across an await.
+5. **Rollback.** Any failed prepare, I/O completion, checksum check or journal
+   abort releases reservations and discards staged after-images. The original
+   metadata PCs and VFS state are still authoritative. Recovery replays only
+   transactions with a valid commit record and matching checksums.
+6. **Publication.** The VFS `RNode`/`PageBacked` metadata projection is updated
+   only after terminal commit completion makes the admitted transaction
+   durable. Admission alone is not publication. The
+   publication carries the same mutation origin and object identity used by
+   the read set, so a rematerialized inode cannot observe an uncommitted mode,
+   size or link-count value. `fsync` waits for this transaction and its ordered
+   data dependencies; it does not flush an unadmitted dirty metadata page.
+
+The contract is implemented by Tx-owned planner/runtime types. rsext4's
+synchronous `&mut BlockDevice`, cache hierarchy, path/open-file APIs and
+in-place mutation helpers are reference material only and are not migration
+targets. `write_inode_meta_journaled` is a compatibility oracle for existing
+tests; it is not an extension point for new production mutations and is
+retired when the `SetAttr` vertical slice lands.
+
+**Admission exit criterion.** Host tests prove read-set conflicts, complete
+after-image coverage, reservation release, rollback without source mutation,
+and publication-after-commit. A static check rejects new production calls to
+`BlockImage::write_block` outside the journal runtime.
+
+---
+
+### Phase 2 — Writes using mutation admission
 
 <!-- txdoc:TX-EXT4-PLAN-PHASE-2-WRITES-WITHOUT-JOURNAL-1 -->
 
 **Scope.**
 
-- `FsPageBacking::flush_page` for Data PCs: extent walk, write to physical block.
-- `FsPageBacking::truncate`: shrink extent tree, free blocks (updates bitmap PCs), update inode size.
-- `FsPageBacking::fsync`: flush dirty data pages of the target PC; metadata flush is a no-op in this phase (no journal yet).
+- `FsPageBacking::flush_page` for Data PCs: extent walk, immutable data after-image and journal admission.
+- `FsPageBacking::truncate`: shrink extent tree, free blocks (updates bitmap PCs), update inode size through one mutation plan.
+- `FsPageBacking::fsync`: flush dirty data pages of the target PC and force-commit the admitted transaction containing their metadata.
 - `FsOps::create_inode`: bitmap scan, allocate inode, write inode record to inode-table PC (marking that PC dirty).
 - `FsOps::serialize_inode_meta`: write back updated `InodeMeta` to the inode-table PC.
 - `FsOps::destroy_inode`: free inode; free all extent-mapped blocks; clear the inode record.
 - `FsOps::unlink`: remove directory entry from parent directory's data PC; decrement `InodeMeta.nlinks` (via `serialize_inode_meta`); if `nlinks` reaches zero and no OpenFile pins exist, trigger `destroy_inode` via the VFS-side script (not from within tx-ext4).
 - `FsOps::mkdir`, `rmdir`, `rename`, `link`, `symlink`: equivalent; all go through directory-block mutation + inode bitmap/allocation + `serialize_inode_meta`.
-- Extent tree splits and merges (for writes that grow files past a leaf's capacity; for truncates that split an extent).
-- Htree splits (for directories that outgrow an htree leaf).
+- Tier 1 inline/depth-1 extent insertion, merge and supported-tail truncate.
+  A request requiring a second child or deeper root returns `EOPNOTSUPP` before
+  mutation and is a Tier 2 fixture.
+- Linear-directory mutation and htree insertion while the selected leaf has
+  capacity. Htree split/rebalance is Tier 2.
+- Classic orphan-chain admission and mount recovery for unlinked-open and
+  truncate-in-progress operations within Tier 1 shape bounds.
 
-**Crash behavior.** Crashes corrupt the filesystem. Acceptable for phase 2; remount requires `e2fsck` until phase 4 journal lands.
+**Crash behavior.** Every supported phase-2 mutation is journal-admitted. A
+crash may lose an operation without a durable commit, but replay must leave a
+consistent filesystem; `e2fsck -n` is required after each crash-cut fixture.
 
 **Test milestones.**
 
 - **T2.1 Create, write, read back.** `touch`, `echo hello > f`, `cat f` — roundtrip correct.
-- **T2.2 Large write.** Write a 500 MB file, read it back, `cmp`. Verify extent tree has multiple leaves.
+- **T2.2 Profile-bound write.** Write, read and `cmp` a fragmented file that
+  reaches the Tier 1 depth-1 extent form without requiring a second child.
 - **T2.3 Truncate down and up.** Create 10 MB file; `truncate -s 1000 f`; `truncate -s 10M f`; verify old content beyond 1000 is zero on re-read (sparse-file semantics).
 - **T2.4 Delete and reclaim.** Fill filesystem to 90%; delete half the files; `df` shows reclaimed space; new files succeed.
 - **T2.5 Concurrent writes.** Two processes writing to different files, different directories. No interference.
-- **T2.6 Rename across directories.** `mv a/foo b/bar` with both parents holding many entries (force htree). Verify namespace mutation correct in both.
+- **T2.6 Rename across directories.** `mv a/foo b/bar` in linear and
+  non-splitting htree fixtures. Verify one atomic namespace result in both.
 - **T2.7 Unlinked but open.** Process A opens /tmp/f, process B unlinks /tmp/f. Process A continues reading and writing; contents correct. Close A's fd; verify inode actually reclaimed (ext4 free-inode count increases).
 - **T2.8 Hard links.** `ln a b`; mutate through either; `stat` shows same inode; `unlink a` leaves b valid; `unlink b` actually frees.
 - **T2.9 Offline `e2fsck` after clean unmount.** After clean unmount, `e2fsck -n` reports no errors.
 
-**Phase-2 exit criterion.** All T2.* pass. Booting tx-kernel, compiling a small C program to ext4, rebooting (clean unmount), reading the binary back all work.
+**Phase-2 exit criterion.** All T2.* pass with immutable mutation plans and
+post-operation `e2fsck -n`. Booting tx-kernel, compiling a small C program to
+ext4, rebooting (clean unmount), reading the binary back all work.
 
-**Estimated effort.** 4–6 weeks. The extent-tree and htree split/merge paths are the hardest part.
+**Estimated effort.** 4–6 weeks. Arbitrary extent/htree split/merge is kept out
+of this bounded Tier 1 phase and scheduled in phase 5.
 
 **Dependencies.** Phase 1 complete.
 
@@ -762,18 +1025,25 @@ This phase may be absorbed into phases 1–2 depending on reactor maturity. List
 
 **Scope.**
 
-- `JournalState` inside `MountPayload`: current transaction, outstanding committed-but-uncheckpointed transactions, journal PC handles.
+- `JournalState` inside `MountPayload`: one Tier 1 transaction owner, its
+  admitted/committing/committed-needs-settlement phase, journal extent token,
+  and journal PC handles. Multiple simultaneously active or accumulated
+  uncheckpointed transactions are Tier 2 scheduling optimizations.
 - Mount-time replay: scan journal, identify committed transactions (those with valid commit records and matching checksums), replay their metadata writes directly. Use phase 0 JBD2 record parsing and phase 1 PC primitives. Replay is bounded work using only phases 0–2.
 - Transaction API inside tx-ext4: operations that mutate metadata start by attaching to the current transaction. Mutations buffer in the transaction, not directly in the metadata PCs.
 - Commit step machine: one step function per commit phase.
-  - `step_data_wait`: wait for all data-page writes of ordered-mode files participating in this transaction to complete. Returns `Blocked` on outstanding I/O.
-  - `step_metadata_write`: write the transaction's metadata blocks to the journal. Returns `Blocked` on journal I/O.
-  - `step_commit_record`: write the commit record with checksum. Returns `Blocked` on journal I/O.
-  - `step_checkpoint`: later, write the metadata from the journal back to the metadata PCs' home locations.
+  - `step_data_wait`: wait for all data-page writes of ordered-mode files participating in this transaction to complete. Yields on the owned wait source while I/O is outstanding.
+  - `step_metadata_write`: write the transaction's metadata blocks to the journal. Yields on journal I/O.
+  - `step_commit_record`: write the commit record with checksum. Yields on journal I/O.
+  - `step_checkpoint`: before admitting the next Tier 1 mutation, write the
+    metadata from the journal back to home locations, flush, advance the safe
+    journal tail, refresh caches, and settle the transaction token.
 - Ordering rules:
   - Data writes (for files in this transaction) must reach disk before the commit record.
   - The commit record must reach disk before metadata is checkpointed to its home location.
-  - Checkpoint can happen arbitrarily later; transactions accumulate in the journal until their home-location writes are confirmed durable.
+  - Tier 1 serializes later mutation admission behind checkpoint, safe tail
+    advancement, cache settlement, and token release. Background checkpoint
+    and accumulated committed transactions are Tier 2 optimizations.
 - Flush and force-commit paths for `fsync`.
 
 **Test milestones.**
@@ -782,11 +1052,20 @@ This phase may be absorbed into phases 1–2 depending on reactor maturity. List
 - **T4.2 Crash and e2fsck -n.** Random kill during sustained write workload (1000 iterations); remount; `e2fsck -n` reports clean; no silent corruption detected by secondary integrity checks (file-data CRCs).
 - **T4.3 fsync durability.** Process A writes then fsyncs; crash; remount; A's data is present.
 - **T4.4 No fsync means can lose.** Process writes but does not fsync; crash; may or may not see the data but filesystem is consistent.
-- **T4.5 Concurrent transactions.** Two processes mutating different inodes. Both transactions progress; neither blocks the other unnecessarily; commits serialize correctly.
-- **T4.6 Journal wrap.** Fill the journal; transactions block on checkpoint progress; verify forward progress continues.
+- **T4.5 Concurrent callers, serialized owner.** Two processes mutate different
+  inodes. The mount owner serializes their handles without lost wakeups,
+  starvation, leaked tokens, or unnecessary blocking after the earlier handle
+  settles. Tier 1 does not require simultaneously active transactions.
+- **T4.6 Serialized journal wrap.** Drive sequential transactions across the
+  ring boundary. Checkpoint and safe tail advancement reclaim each extent;
+  admission blocks while the current owner has not settled and resumes with
+  forward progress after reclamation.
 - **T4.7 Interop with `e2fsprogs`.** After clean unmount, mount the same image on Linux, run `fsck.ext4 -f`; Linux reports clean; read a file through Linux; content correct.
 
-**Phase-4 exit criterion.** All T4.* pass. Power-cut torture runs for 1000 iterations without corruption.
+**Phase-4 exit criterion.** All T4.* pass. Power-cut torture runs for 1000
+iterations without corruption, production boot and dynamic mount use the sole
+discovered-journal planner/runtime RW path, and the Tier 1 matrix in §1.7 has no
+unproved row.
 
 **Estimated effort.** 4–6 weeks.
 
@@ -794,22 +1073,38 @@ This phase may be absorbed into phases 1–2 depending on reactor maturity. List
 
 ---
 
-### Phase 5 — Hard cases and hardening
+### Phase 5 — Tier 2 mainstream Linux closure
 
 <!-- txdoc:TX-EXT4-PLAN-PHASE-5-HARD-CASES-HARDENING-1 -->
 
-**Scope.**
+**Ordered slices.** Each slice keeps Tier 1 green and adds its own Linux image,
+error, fsck and crash witnesses.
 
-- Edge cases in extent-tree split/merge (multi-level, very fragmented).
-- Htree rebalancing on directory shrinkage.
-- Inode-table block allocation when filesystem is full.
-- Checksum validation at mount and rejection of corrupted structures.
-- Large file support (>4 GiB; requires 64-bit extent features).
-- xattr support if we determine userland needs it.
-- Stress testing and fuzzing.
-- Performance tuning to hit soft targets from §4.3.
+1. **Mapping and allocation:** arbitrary legal extent depth, multi-child
+   split/merge, unwritten extents, fragmented/large files and cross-group ENOSPC
+   behavior.
+2. **Large directories:** htree collision chains, leaf/index split, deletion
+   and rebalance with checksum-correct directory tails.
+3. **Orphan recovery:** implement `orphan_file` admission/recovery and stress
+   high-concurrency unlinked-open/truncate recovery beyond Tier 1 bounds.
+4. **Metadata compatibility:** common xattrs, `security.*`/`user.*`, POSIX ACLs,
+   special inodes and the VFS credential checks that authorize them.
+5. **Space and coherency:** common fallocate modes, `statfs`, `syncfs`, `msync`,
+   direct-I/O overlap/invalidation and the selected `FIEMAP`/ioctl surface.
+6. **Mount/error lifecycle:** remount/clean-unmount behavior, journal abort and
+   remount-RO policy under injected metadata/device errors.
+7. **Stress and performance:** fsx/fsstress, the declared xfstests set, long SMP
+   mutation, journal-pressure fairness, fuzzing and §4.3 performance targets.
 
-No fixed test milestones; this is an open-ended hardening phase. Exit when the filesystem passes the same stress tests Linux's ext4 passes (fsstress, fsx, xfstests — subset applicable to our feature coverage).
+**Test milestones.** Tier 2 maintains a checked-in manifest containing the
+exact generic/ext4 xfstests selected, excluded tests with a Tier 3 or
+non-filesystem blocker, tool/kernel versions and the last result. In addition,
+Linux-to-Tx and Tx-to-Linux image exchange, large-directory/extent crash cuts,
+ACL/xattr round trips and direct/buffered overlap tests are mandatory.
+
+**Phase-5 exit criterion.** Every §1.8 bullet has a passing vertical slice; the
+xfstests manifest has no unexplained fail/timeout/not-run result; all produced
+images pass `e2fsck -fn`; Tier 1 remains green.
 
 **Dependencies.** Phase 4 complete.
 
@@ -823,7 +1118,12 @@ No fixed test milestones; this is an open-ended hardening phase. Exit when the f
 
 <!-- txdoc:TX-EXT4-PLAN-HOST-RUNNABLE-TESTS-PHASE-0-1 -->
 
-`tx-ext4-format` runs standard `cargo test`. Test image generation uses a `build.rs` that invokes `mkfs.ext4` and `debugfs` at test time (skipped in CI environments without those tools; a pre-generated set of images is committed for reproducibility).
+`tx-ext4-format` runs standard `cargo test`. Fixture generation is an explicit
+tooling command under `tools/ext4/`, never an implicit `build.rs` side effect.
+Generated images are copied before mutation; the manifest records generator
+commands, feature masks, tool versions and hashes. CI may use committed fixtures
+without e2fsprogs, but fixture promotion requires a host with current
+`mke2fs`, `debugfs`, `dumpe2fs` and `e2fsck`.
 
 ### 6.2 Kernel integration tests (phases 1+)
 
@@ -854,6 +1154,23 @@ A dedicated crash-test harness:
 
 After any tx-ext4 unmount, the resulting image is mounted by Linux's ext4 driver and checked. Any divergence (Linux finds errors we don't, or vice versa) is a bug.
 
+### 6.5 Profile and xfstests manifests
+
+<!-- txdoc:TX-EXT4-PLAN-PROFILE-XFSTESTS-MANIFESTS-1 -->
+
+Tier 1 and Tier 2 each maintain a machine-readable manifest. It records the
+accepted feature masks and shape bounds, fixture hashes, Linux/e2fsprogs/
+xfstests revisions, selected tests, results, exclusions and evidence paths.
+Promotion rules are mechanical:
+
+- Tier 1: all declared cases pass; no timeout, crash or not-run result.
+- Tier 2: every selected case passes; every exclusion names a Tier 3 feature or
+  a separately tracked kernel blocker.
+- A tool or kernel version change invalidates the recorded promotion result
+  until the affected fixture/differential set is rerun.
+- `e2fsck -fn` is run offline on a copy. A harness that cannot obtain exclusive
+  image access is a failed run, not a pass or skip.
+
 ---
 
 ## 7. Risk register
@@ -862,24 +1179,44 @@ After any tx-ext4 unmount, the resulting image is mounted by Linux's ext4 driver
 
 | Risk | Phase | Mitigation |
 |---|---|---|
-| Reactor I/O completion wire not ready when phase 1 starts | 1 | Build sync-stub block device; swap at phase 3. |
+| Direct pager and planner/runtime paths remain simultaneously reachable | 2-4 | Cut over callsite by callsite; static gate forbids production direct home writes before Tier 1 promotion. |
 | JBD2 semantics subtly wrong; silent corruption survives `e2fsck` | 4 | Interop-test with Linux on every crash-test iteration. |
-| Extent-tree/htree split logic bugs cause data loss | 2 | Fuzz with random mutation sequences + post-op `e2fsck`. |
-| Metadata PC (option A) lifecycle interactions surprise us | 1 | Keep the metadata-PC surface narrow; if problems arise, revisit design before phase 2. |
+| Extent-tree/htree split logic bugs cause data loss | 5 | Keep Tier 1 shape bounds explicit; fuzz Tier 2 mutations + post-op `e2fsck`. |
+| Metadata-PC lifetime or publication drifts into a second cache | 1-5 | Keep metadata private to the mount; no decoded per-inode cache or VFS live-node retain. |
 | rsext4 format code has bugs we propagate | 0 | Validate all phase-0 output against `debugfs` ground truth (T0.*). |
-| Lock ordering across parent-parent-target in rename deadlocks under load | 2 | Enforce address-ordered locking; write a deadlock-detection test. |
+| Linux behavior changes or prose omits an edge case | all | Pin oracle versions and use differential/xfstests evidence rather than prose inference. |
+| Lock ordering across parent-parent-target in rename deadlocks under load | 2 | Enforce stable object-key ordering; write deadlock and concurrent-rename tests. |
 | Performance soft targets unreachable with current PC/reactor design | 5 | Document the gap; propose design changes as a separate ADR rather than fixing inside tx-ext4. |
 
 ---
 
-## 8. Open decisions deferred to implementation start
+## 8. Resolved implementation decisions
 
 <!-- txdoc:TX-EXT4-PLAN-OPEN-DECISIONS-DEFERRED-IMPLEMENTATION-START-1 -->
 
-1. **Metadata PC variant.** Option A commits to "metadata PCs, not RNodes." Still to decide: is this a new `PageContainerKind::Metadata` variant, or reuse `Anon` with an internal populate-on-fetch helper? Decision at phase 1 kickoff, whichever is simpler; doesn't affect the observable interface.
-2. **Block device trait shape.** Does the block device expose single-block or range reads? What about ordering barriers for journal writes? Decision before phase 1 starts; likely influenced by what virtio-blk provides.
-3. **Async runtime shape for host tests.** Tokio? A minimal custom executor? Decision at phase 0 (for any tests that simulate async I/O on host).
-4. **Error taxonomy.** Map ext4 on-disk errors (bad checksums, out-of-bounds fields) to which errnos at the trait boundary? Decision before phase 2.
+1. **Filesystem placement.** `tx-ext4` is a mounted kernel filesystem instance,
+   not a daemon or independent service. Generic I/O-manager futures provide
+   async execution.
+2. **Metadata storage.** Metadata pages are mount-private PageBacked resources,
+   not RNodes and not a decoded per-inode cache. A future storage optimization
+   cannot change this ownership rule.
+3. **Block I/O.** L5 emits neutral plans; L4/L6 own request lifecycle,
+   scheduling, completion, barriers and direct-I/O coherency. Production ext4
+   does not own a private block scheduler.
+4. **Host execution.** `tx-ext4-format` stays executor-free. Host adapters may
+   drive explicit test operations, but production `tx-ext4` remains free of
+   Tokio and rsext4 runtime APIs.
+5. **Error taxonomy.** The internal format layer distinguishes unsupported,
+   corrupt and device-I/O failures. The syscall/mount boundary matches Linux:
+   initial unsupported feature sets return `EINVAL`, an invalid RO-to-RW
+   remount returns `EROFS`, operation-specific unsupported shapes return
+   `EOPNOTSUPP`, integrity corruption returns `EUCLEAN` where Linux exposes
+   `EFSCORRUPTED`, device failure returns `EIO`, and allocation exhaustion
+   returns `ENOSPC`. A generation/read-set conflict retries or returns the
+   operation's documented transient error before publication.
+6. **Compatibility expansion.** New feature bits enter Tier 1/2 only with a
+   capability-ledger row, deterministic fixture, Linux/e2fsprogs oracle and
+   crash policy. Code presence or rsext4 support is insufficient.
 
 ---
 
@@ -887,4 +1224,13 @@ After any tx-ext4 unmount, the resulting image is mounted by Linux's ext4 driver
 
 <!-- txdoc:TX-EXT4-PLAN-SUCCESS-CRITERION-COMPRESSED-1 -->
 
-tx-kernel boots on qemu-virtio-blk with an ext4 rootfs. A C compiler built on Linux can be run in tx-kernel to compile a C source to an ELF on the same ext4. The result of 1000 random-kill crash tests is: filesystem clean per `e2fsck -n`, file contents match pre-crash fsync expectations, no silent corruption detected through the Linux interop check. This is Linux-2.6-era parity for the filesystem layer.
+**Tier 1:** tx-kernel boots from or mounts the pinned profile on
+qemu-virtio-blk; Alpine/OSComp and a C compiler can create, mutate, fsync,
+rename and execute files on it. After 1000 deterministic crash cuts, every
+image is clean under `e2fsck -fn`, fsync-success data survives, and Linux can
+mount the result RW. Production has one planner/runtime durability path.
+
+**Tier 2:** the §1.8 surface works on mainstream supported Linux ext4 images,
+both image-exchange directions pass, and the versioned xfstests manifest has no
+unexplained failure, timeout or not-run entry. Features outside §1.8 are
+rejected according to §1.6 rather than weakening the claim.

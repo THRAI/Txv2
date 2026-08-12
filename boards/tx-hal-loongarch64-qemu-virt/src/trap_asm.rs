@@ -3,26 +3,6 @@
 #[cfg(target_arch = "loongarch64")]
 core::arch::global_asm!(
     r#"
-    // LoongArch cannot close the final idle race the same way as RISC-V:
-    // `idle` needs CRMD.IE set, so an interrupt can land after IE is enabled
-    // but before `idle` executes.  The trap dispatcher recognizes this
-    // bounded region and redirects ERA to `tx_la64_idle_irq_region_exit`,
-    // matching Linux's __arch_cpu_idle/handle_vint rollback protocol.
-    .section .text.cpuidle, "ax"
-    .align 5
-    .globl tx_la64_idle_prepared
-    .type tx_la64_idle_prepared, @function
-tx_la64_idle_prepared:
-    .globl tx_la64_idle_irq_region_start
-tx_la64_idle_irq_region_start:
-    li.w    $t0, 4
-    csrxchg $t0, $t0, 0x00
-    idle    0
-    .globl tx_la64_idle_irq_region_exit
-tx_la64_idle_irq_region_exit:
-    jr      $ra
-    .size tx_la64_idle_prepared, . - tx_la64_idle_prepared
-
     .section .text.trap, "ax"
     .align 12
     .equ TX_LA64_TF_R0, 0
@@ -304,15 +284,6 @@ tx_la64_qemu_trap_low_end:
     .globl tx_la64_qemu_return_to_userspace
     .type tx_la64_qemu_return_to_userspace, @function
 tx_la64_qemu_return_to_userspace:
-    // `idle 0` deliberately leaves CRMD.IE enabled after wakeup.  Mask
-    // interrupts before changing ERA/PRMD and restoring user registers so an
-    // interrupt cannot observe a half-installed user-return context.  `ertn`
-    // restores the requested user interrupt state from PRMD.PIE.
-    csrrd   $r12, TX_LA64_CSR_CRMD_TRAP
-    li.w    $r13, -5
-    and     $r12, $r12, $r13
-    csrwr   $r12, TX_LA64_CSR_CRMD_TRAP
-
     move    $r31, $a0
     ld.d    $r12, $r31, TX_LA64_TF_ERA
     csrwr   $r12, TX_LA64_CSR_ERA_TRAP
@@ -367,15 +338,6 @@ tx_la64_qemu_activate_enter_userspace:
     // a6 = switch_required
     // All Rust stack-dependent work must be complete before this
     // function. After CRMD.PG is written, do not return to Rust.
-    // The reactor may arrive here with CRMD.IE still enabled after `idle 0`.
-    // Close the complete resume-context / KSAVE / pmap / user-register
-    // transition against timer and device interrupts.  `ertn` later restores
-    // user interrupt state from PRMD.PIE.
-    csrrd   $r12, TX_LA64_CSR_CRMD_TRAP
-    li.w    $r13, -5
-    and     $r12, $r12, $r13
-    csrwr   $r12, TX_LA64_CSR_CRMD_TRAP
-
     st.d    $sp, $a0, TX_LA64_RCTX_SP
     st.d    $r1, $a0, TX_LA64_RCTX_RA
     st.d    $r21, $a0, TX_LA64_RCTX_R21
@@ -391,15 +353,9 @@ tx_la64_qemu_activate_enter_userspace:
     st.d    $r30, $a0, (TX_LA64_RCTX_R22 + 64)
     st.d    $r31, $a0, (TX_LA64_RCTX_R22 + 72)
 
-    // CSRWR is a swap: it writes the requested value and replaces the source
-    // register with the previous CSR value. Keep the live kernel trap-stack,
-    // CPU/TLS, and thread-pointer registers intact while publishing them.
-    move    $r12, $a2
-    csrwr   $r12, TX_LA64_CSR_KSAVE0_TRAP
-    move    $r12, $r21
-    csrwr   $r12, TX_LA64_CSR_KSAVE1_TRAP
-    move    $r12, $r2
-    csrwr   $r12, TX_LA64_CSR_KSAVE2_TRAP
+    csrwr   $a2, TX_LA64_CSR_KSAVE0_TRAP
+    csrwr   $r21, TX_LA64_CSR_KSAVE1_TRAP
+    csrwr   $r2, TX_LA64_CSR_KSAVE2_TRAP
 
     move    $r31, $a1
     ld.d    $r12, $r31, TX_LA64_TF_ERA
@@ -408,51 +364,13 @@ tx_la64_qemu_activate_enter_userspace:
     csrwr   $r12, TX_LA64_CSR_PRMD_TRAP
     csrwr   $zero, TX_LA64_CSR_TLBRERA_TRAP
 
-    // Keep the switch tuple in callee-saved registers across the Rust
-    // begin/finish publication helpers. The original kernel values were
-    // already saved in KernelResumeCtx above, and user values are restored
-    // from the trap frame below.
-    move    $r22, $a3
-    move    $r23, $a4
-    move    $r24, $a5
-    move    $r25, $a6
-    beqz    $r25, .Ltx_la64_activate_done
-
-    // CRMD.IE is already clear. Publish the incoming residency first while
-    // retaining the outgoing bit, then switch hardware, and only afterwards
-    // clear the outgoing residency in the finish helper.
-    move    $a0, $r22
-    move    $a1, $r23
-    la.local $r12, tx_la64_begin_pmap_switch
-    li.d    $r13, TX_LA64_PHYS_ADDR_MASK_TRAP
-    and     $r12, $r12, $r13
-    li.d    $r13, TX_LA64_DMW_CACHED_BASE_TRAP
-    or      $r12, $r12, $r13
-    jirl    $r1, $r12, 0
-
-    // CSRWR returns the previous CSR value in its register operand. Never use
-    // r22-r24 directly here: finish needs the incoming tuple, not the old
-    // hardware tuple returned by CSRWR.
-    move    $r12, $r22
-    csrwr   $r12, 0x18
-    move    $r12, $r23
-    csrwr   $r12, 0x19
-    move    $r12, $r24
-    csrwr   $r12, 0x1a
+    beqz    $a6, .Ltx_la64_activate_done
+    csrwr   $a3, 0x18
+    csrwr   $a4, 0x19
+    csrwr   $a5, 0x1a
     li.d    $r12, 0x00000000000000b0
     csrwr   $r12, 0x00
     invtlb  0x0, $zero, $zero
-
-    move    $a0, $r22
-    move    $a1, $r23
-    move    $a2, $r24
-    la.local $r12, tx_la64_finish_pmap_switch
-    li.d    $r13, TX_LA64_PHYS_ADDR_MASK_TRAP
-    and     $r12, $r12, $r13
-    li.d    $r13, TX_LA64_DMW_CACHED_BASE_TRAP
-    or      $r12, $r12, $r13
-    jirl    $r1, $r12, 0
-
     la.local $r12, .Ltx_la64_activate_done
     li.d    $r13, TX_LA64_PHYS_ADDR_MASK_TRAP
     and     $r12, $r12, $r13
@@ -513,16 +431,6 @@ tx_la64_resume_kernel_after_reschedule:
     ld.d    $r29, $a0, (TX_LA64_RCTX_R22 + 56)
     ld.d    $r30, $a0, (TX_LA64_RCTX_R22 + 64)
     ld.d    $r31, $a0, (TX_LA64_RCTX_R22 + 72)
-
-    // A user exception clears CRMD.IE and this stackless reschedule path
-    // intentionally bypasses ERTN, so PRMD.PIE is never restored for the
-    // reactor context. At this point the kernel stack/TLS, kernel PGDH and
-    // trap-stack KSAVE registers are all live again; enter the ordinary
-    // interruptible kernel state before returning to Rust. Runtime deadlines
-    // are one-shot, so enabling IE here cannot create the former periodic
-    // timer interrupt storm.
-    li.w    $t0, 4
-    csrxchg $t0, $t0, TX_LA64_CSR_CRMD_TRAP
     ret
     .size tx_la64_resume_kernel_after_reschedule, . - tx_la64_resume_kernel_after_reschedule
 
@@ -531,8 +439,8 @@ tx_la64_resume_kernel_after_reschedule:
     .globl tx_la64_qemu_fp_save_context
     .type tx_la64_qemu_fp_save_context, @function
 tx_la64_qemu_fp_save_context:
-    csrrd   $t3, TX_LA64_CSR_EUEN
-    andi    $t0, $t3, 1
+    csrrd   $t0, TX_LA64_CSR_EUEN
+    andi    $t0, $t0, 1
     beqz    $t0, .Ltx_la64_fp_save_none
 
     fst.d   $f0,  $a0,   0
@@ -597,32 +505,8 @@ tx_la64_qemu_fp_save_context:
     or      $t0, $t0, $t1
     st.b    $t0, $a0, 260
 
-    li.w    $t2, 3
-    andi    $t1, $t3, 4
-    bnez    $t1, .Ltx_la64_fp_save_lasx
-    andi    $t1, $t3, 2
-    bnez    $t1, .Ltx_la64_fp_save_lsx
-    b       .Ltx_la64_fp_save_done
-
-.Ltx_la64_fp_save_lasx:
-    .set    tx_la64_simd_off, 288
-    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    xvst    $xr\n, $a0, tx_la64_simd_off
-    .set    tx_la64_simd_off, tx_la64_simd_off + 32
-    .endr
-    ori     $t2, $t2, 12
-    b       .Ltx_la64_fp_save_done
-
-.Ltx_la64_fp_save_lsx:
-    .set    tx_la64_simd_off, 288
-    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    vst     $vr\n, $a0, tx_la64_simd_off
-    .set    tx_la64_simd_off, tx_la64_simd_off + 32
-    .endr
-    ori     $t2, $t2, 4
-
-.Ltx_la64_fp_save_done:
-    st.w    $t2, $a0, 264
+    li.w    $t0, 3
+    st.w    $t0, $a0, 264
     li.w    $a0, 1
     jr      $ra
 
@@ -638,13 +522,8 @@ tx_la64_qemu_fp_restore_context:
     ld.w    $t0, $a0, 264
     andi    $t1, $t0, 1
     beqz    $t1, .Ltx_la64_fp_restore_disable
-    andi    $t1, $t0, 8
-    bnez    $t1, .Ltx_la64_fp_restore_lasx
-    andi    $t1, $t0, 4
-    bnez    $t1, .Ltx_la64_fp_restore_lsx
 
     csrrd   $t2, TX_LA64_CSR_EUEN
-    andi    $t2, $t2, 0xff8
     ori     $t2, $t2, 1
     csrwr   $t2, TX_LA64_CSR_EUEN
 
@@ -680,32 +559,7 @@ tx_la64_qemu_fp_restore_context:
     fld.d   $f29, $a0, 232
     fld.d   $f30, $a0, 240
     fld.d   $f31, $a0, 248
-    b       .Ltx_la64_fp_restore_control
 
-.Ltx_la64_fp_restore_lasx:
-    csrrd   $t2, TX_LA64_CSR_EUEN
-    andi    $t2, $t2, 0xff8
-    ori     $t2, $t2, 7
-    csrwr   $t2, TX_LA64_CSR_EUEN
-    .set    tx_la64_simd_off, 288
-    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    xvld    $xr\n, $a0, tx_la64_simd_off
-    .set    tx_la64_simd_off, tx_la64_simd_off + 32
-    .endr
-    b       .Ltx_la64_fp_restore_control
-
-.Ltx_la64_fp_restore_lsx:
-    csrrd   $t2, TX_LA64_CSR_EUEN
-    andi    $t2, $t2, 0xff8
-    ori     $t2, $t2, 3
-    csrwr   $t2, TX_LA64_CSR_EUEN
-    .set    tx_la64_simd_off, 288
-    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    vld     $vr\n, $a0, tx_la64_simd_off
-    .set    tx_la64_simd_off, tx_la64_simd_off + 32
-    .endr
-
-.Ltx_la64_fp_restore_control:
     ld.w    $t1, $a0, 256
     movgr2fcsr $fcsr0, $t1
 
@@ -729,7 +583,7 @@ tx_la64_qemu_fp_restore_context:
 
 .Ltx_la64_fp_restore_disable:
     csrrd   $t2, TX_LA64_CSR_EUEN
-    andi    $t2, $t2, 0xff8
+    andi    $t2, $t2, 0xffe
     csrwr   $t2, TX_LA64_CSR_EUEN
     jr      $ra
     .size tx_la64_qemu_fp_restore_context, . - tx_la64_qemu_fp_restore_context

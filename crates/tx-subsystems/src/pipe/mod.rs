@@ -97,25 +97,6 @@ pub struct PipeFlags {
     pub packet: bool,
 }
 
-/// Read-only snapshot used by rare error diagnostics.
-///
-/// Keeping the snapshot construction inside the pipe subsystem guarantees
-/// that the ring fields are observed under the same lock as normal I/O.  It
-/// is deliberately not used by the data path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PipeDiagnosticSnapshot {
-    pub readers: u32,
-    pub writers: u32,
-    pub buffered_bytes: usize,
-    pub occupied_slots: usize,
-    pub reserved_gift_slots: usize,
-    pub temporary_pages: usize,
-    pub max_slots: usize,
-    pub available_write_bytes: usize,
-    pub reader_wait_source_id: u64,
-    pub writer_wait_source_id: u64,
-}
-
 /// Anonymous-pipe payload. Carries the descriptor ring, per-side reference
 /// counts, and the two mailbox-backed wait sources.
 ///
@@ -746,42 +727,7 @@ impl PipePayload {
         }
     }
 
-    /// Snapshot the fd-accounting counters for diagnostics.
-    ///
-    /// These counters are intentionally exposed as one pair instead of
-    /// separate mutation-capable accessors.  Kernel diagnostics compare them
-    /// with the live process fd tables to detect a missed fork/dup/close
-    /// accounting transition; pipe semantics must continue to use
-    /// `readable_level` / `writable_level`.
-    pub fn endpoint_count_snapshot(&self) -> (u32, u32) {
-        (
-            self.reader_count.load(Ordering::Acquire),
-            self.writer_count.load(Ordering::Acquire),
-        )
-    }
-
-    /// Capture all state needed to diagnose a failed pipe syscall.
-    ///
-    /// This is called only after a syscall has already decided to return an
-    /// error, so the extra ring lock and formatting cost do not affect normal
-    /// Cargo/BuildStorm traffic.
-    pub fn diagnostic_snapshot(&self) -> PipeDiagnosticSnapshot {
-        let ring = self.ring.lock();
-        PipeDiagnosticSnapshot {
-            readers: self.reader_count.load(Ordering::Acquire),
-            writers: self.writer_count.load(Ordering::Acquire),
-            buffered_bytes: ring.bytes,
-            occupied_slots: ring.occupied_slots(),
-            reserved_gift_slots: ring.reserved_gift_slots,
-            temporary_pages: ring.tmp_pages.len(),
-            max_slots: ring.max_usage,
-            available_write_bytes: ring.available_write_capacity(),
-            reader_wait_source_id: self.reader_wait_source_id,
-            writer_wait_source_id: self.writer_wait_source_id,
-        }
-    }
-
-    /// Snapshot of the reader count. Test-only convenience.
+    /// Snapshot of the reader count. Test-only use today.
     #[cfg(test)]
     fn reader_count_snapshot(&self) -> u32 {
         self.reader_count.load(Ordering::Acquire)

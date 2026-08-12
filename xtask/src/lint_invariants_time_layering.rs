@@ -7,19 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::util::{collect_files, relative};
 use crate::Result;
-
-mod public_api;
-#[cfg(test)]
-mod public_api_tests;
-mod source_set;
-
-#[cfg(test)]
-use public_api::externally_public_item_hits;
-use public_api::externally_public_source_hits;
 
 #[derive(Clone, Copy)]
 struct Rule {
@@ -28,7 +19,6 @@ struct Rule {
     scope: &'static [&'static str],
     needles: &'static [&'static str],
     allow: &'static [&'static str],
-    public_only: bool,
 }
 
 const COMMON_ALLOW: &[&str] = &["/tests/", "/tests.rs", "_tests.rs", "/testing.rs"];
@@ -70,7 +60,6 @@ const RULES: &[Rule] = &[
             "crates/tx-time/",
             "crates/tx-observe/",
         ],
-        public_only: false,
     },
     Rule {
         name: "retired pre-Phase 7 timer surface",
@@ -85,7 +74,6 @@ const RULES: &[Rule] = &[
             RETIRED_REGISTRAR_LOWERING,
         ],
         allow: &[],
-        public_only: false,
     },
     Rule {
         name: "public timer implementation export",
@@ -93,11 +81,7 @@ const RULES: &[Rule] = &[
         scope: &[
             "crates/tx-reactor/src/lib.rs",
             "crates/tx-reactor/src/adapter.rs",
-            "crates/tx-reactor/src/adapter/",
-            "crates/tx-reactor/src/runtime.rs",
-            "crates/tx-reactor/src/runtime/",
             "crates/tx-reactor/src/timer.rs",
-            "crates/tx-reactor/src/timer/",
             "crates/tx-kernel/src/adapter.rs",
             "crates/tx-shims/src/adapter.rs",
         ],
@@ -111,7 +95,6 @@ const RULES: &[Rule] = &[
             RETIRED_TIMER_WAKE_ROUTER,
         ],
         allow: &[],
-        public_only: true,
     },
     Rule {
         name: "broad subsystem wake adapter export",
@@ -119,7 +102,6 @@ const RULES: &[Rule] = &[
         scope: &["crates/tx-subsystems/src/adapter.rs"],
         needles: &["pub use tx_substrate::wake;"],
         allow: &[],
-        public_only: false,
     },
     Rule {
         name: "legacy subsystem wall-clock facade import",
@@ -136,7 +118,6 @@ const RULES: &[Rule] = &[
             "crate::wall_clock::DEFAULT_REALTIME_EPOCH_BASE_NS",
         ],
         allow: &[],
-        public_only: false,
     },
     Rule {
         name: "semantic object storing time service handle",
@@ -150,89 +131,42 @@ const RULES: &[Rule] = &[
             "DeadlineRegistrarHandle",
             "TimerRegistrarHandle",
         ],
-        allow: &[
-            "crates/tx-services/src/time/",
-        ],
-        public_only: false,
+        allow: &["crates/tx-services/src/time/"],
     },
-];
-
-#[cfg(test)]
-const REACTOR_RUNTIME_REQUIRED_SOURCES: &[&str] = &[
-    "crates/tx-reactor/src/runtime",
-    "crates/tx-reactor/src/core/task.rs",
-];
-
-#[cfg(test)]
-const REACTOR_RUNTIME_OPTIONAL_SOURCES: &[&str] = &["crates/tx-reactor/src/runtime.rs"];
-
-#[cfg(test)]
-const PUBLIC_TIME_SURFACE_REQUIRED_SOURCES: &[&str] = &[
-    "crates/tx-reactor/src/lib.rs",
-    "crates/tx-reactor/src/adapter",
-    "crates/tx-reactor/src/runtime",
-    "crates/tx-reactor/src/timer",
-    "crates/tx-kernel/src/adapter.rs",
-    "crates/tx-shims/src/adapter.rs",
-];
-
-#[cfg(test)]
-const PUBLIC_TIME_SURFACE_OPTIONAL_SOURCES: &[&str] = &[
-    "crates/tx-reactor/src/adapter.rs",
-    "crates/tx-reactor/src/runtime.rs",
-    "crates/tx-reactor/src/timer.rs",
 ];
 
 pub(crate) fn lint_invariants_time_layering(root: &Path) -> Result<()> {
     let mut findings = Vec::new();
     let mut by_rule: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut sources = Vec::new();
 
-    for (rel, file) in discover_optional_rust_sources(root, &["crates", "boards", "xtask"], true)? {
-        let text = fs::read_to_string(&file).map_err(|err| format!("{rel}: {err}"))?;
-        sources.push((rel, text));
-    }
-
-    for rule in RULES {
-        if rule.public_only {
-            let public_sources: Vec<_> = sources
-                .iter()
-                .filter(|(rel, _)| scope_matches(rel, rule.scope) && !is_allowed(rel, rule.allow))
-                .cloned()
-                .collect();
-            for hit in externally_public_source_hits(&public_sources, rule.scope, rule.needles)? {
-                let text = public_sources
-                    .iter()
-                    .find_map(|(rel, text)| (rel == &hit.rel).then_some(text))
-                    .expect("public API hit belongs to discovered source");
-                *by_rule.entry(rule.name).or_insert(0) += 1;
-                findings.push(format!(
-                    "{}:{} - {}: {}",
-                    hit.rel,
-                    hit.line,
-                    rule.name,
-                    source_line(text, hit.line)
-                ));
-            }
+    for root_rel in ["crates", "boards", "xtask"] {
+        let path = root.join(root_rel);
+        if !path.exists() {
             continue;
         }
-
-        for (rel, text) in &sources {
-            if !scope_matches(&rel, rule.scope) || is_allowed(&rel, rule.allow) {
-                continue;
-            }
+        for file in collect_files(&path, &["rs"]).map_err(|err| err.to_string())? {
+            let rel = relative(root, &file).replace('\\', "/");
+            let text = fs::read_to_string(&file).map_err(|err| format!("{rel}: {err}"))?;
             for (line_idx, line) in text.lines().enumerate() {
                 let Some(code) = code_before_comment(line) else {
                     continue;
                 };
-                if rule.needles.iter().any(|needle| code.contains(needle)) {
-                    *by_rule.entry(rule.name).or_insert(0) += 1;
-                    findings.push(format!(
-                        "{rel}:{} - {}: {}",
-                        line_idx + 1,
-                        rule.name,
-                        line.trim().chars().take(140).collect::<String>()
-                    ));
+                for rule in RULES {
+                    if !rule.scope.iter().any(|prefix| rel.starts_with(prefix)) {
+                        continue;
+                    }
+                    if is_allowed(&rel, rule.allow) {
+                        continue;
+                    }
+                    if rule.needles.iter().any(|needle| code.contains(needle)) {
+                        *by_rule.entry(rule.name).or_insert(0) += 1;
+                        findings.push(format!(
+                            "{rel}:{} - {}: {}",
+                            line_idx + 1,
+                            rule.name,
+                            line.trim().chars().take(140).collect::<String>()
+                        ));
+                    }
                 }
             }
         }
@@ -274,96 +208,9 @@ pub(crate) fn lint_invariants_time_layering(root: &Path) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-fn discover_rust_sources(
-    root: &Path,
-    sources: &[&str],
-    include_tests: bool,
-) -> Result<Vec<(String, PathBuf)>> {
-    discover_rust_sources_with_requirement(root, sources, include_tests, true)
-}
-
-fn discover_optional_rust_sources(
-    root: &Path,
-    sources: &[&str],
-    include_tests: bool,
-) -> Result<Vec<(String, PathBuf)>> {
-    discover_rust_sources_with_requirement(root, sources, include_tests, false)
-}
-
-#[cfg(test)]
-fn discover_required_and_optional_rust_sources(
-    root: &Path,
-    required: &[&str],
-    optional: &[&str],
-    include_tests: bool,
-) -> Result<Vec<(String, PathBuf)>> {
-    let mut discovered = BTreeMap::new();
-    for (rel, path) in discover_rust_sources(root, required, include_tests)? {
-        discovered.insert(rel, path);
-    }
-    for (rel, path) in discover_optional_rust_sources(root, optional, include_tests)? {
-        discovered.insert(rel, path);
-    }
-    Ok(discovered.into_iter().collect())
-}
-
-fn discover_rust_sources_with_requirement(
-    root: &Path,
-    sources: &[&str],
-    include_tests: bool,
-    required: bool,
-) -> Result<Vec<(String, PathBuf)>> {
-    let mut discovered = BTreeMap::new();
-    for source in sources {
-        let path = root.join(source);
-        if path.is_file() {
-            if path.extension().is_some_and(|extension| extension == "rs") {
-                let rel = relative(root, &path).replace('\\', "/");
-                if include_tests || !is_test_source(&rel) {
-                    discovered.insert(rel, path);
-                }
-            }
-        } else if path.is_dir() {
-            for file in collect_files(&path, &["rs"]).map_err(|err| err.to_string())? {
-                let rel = relative(root, &file).replace('\\', "/");
-                if include_tests || !is_test_source(&rel) {
-                    discovered.insert(rel, file);
-                }
-            }
-        } else if required {
-            return Err(format!("required Rust source is missing: {source}"));
-        }
-    }
-    Ok(discovered.into_iter().collect())
-}
-
-fn is_test_source(rel: &str) -> bool {
-    COMMON_ALLOW.iter().any(|part| rel.contains(part))
-}
-
-fn scope_matches(rel: &str, scope: &[&str]) -> bool {
-    scope.iter().any(|entry| {
-        if entry.ends_with('/') {
-            rel.starts_with(entry)
-        } else {
-            rel == *entry
-        }
-    })
-}
-
 fn is_allowed(rel: &str, allow: &[&str]) -> bool {
-    allow.iter().any(|prefix| rel.starts_with(prefix)) || is_test_source(rel)
-}
-
-fn source_line(text: &str, line: usize) -> String {
-    text.lines()
-        .nth(line.saturating_sub(1))
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .take(140)
-        .collect()
+    allow.iter().any(|prefix| rel.starts_with(prefix))
+        || COMMON_ALLOW.iter().any(|part| rel.contains(part))
 }
 
 fn code_before_comment(line: &str) -> Option<&str> {
@@ -512,274 +359,6 @@ mod tests {
         fs::remove_dir_all(&root).expect("remove temp lint root");
         let err = result.expect_err("shims adapter timer re-export should fail the hard lint");
         assert!(err.contains("time-layering lint found"));
-    }
-
-    #[test]
-    fn public_timer_rule_scans_complete_multiline_items() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tx-time-layering-multiline-public-{}-{unique}",
-            std::process::id()
-        ));
-        let adapter = root.join("crates/tx-reactor/src/adapter");
-        fs::create_dir_all(&adapter).expect("create grouped adapter fixture");
-        fs::write(adapter.join("mod.rs"), "pub mod multiline;\n")
-            .expect("write grouped adapter module root");
-        fs::write(
-            adapter.join("multiline.rs"),
-            r#"
-                #[doc = "TimerRegistry in an attribute string is not an API reference"]
-                // The item visibility starts after attributes and comments.
-                pub use tx_services::time::{
-                    TimerRegistry,
-                };
-
-                pub type PublicTimer =
-                    tx_services::time::TimerRegistry;
-
-                pub fn public_timer(
-                    seed: usize,
-                ) -> tx_services::time::TimerRegistry {
-                    let _ = seed;
-                    loop {}
-                }
-
-                pub(crate) use tx_services::time::{
-                    TimerRegistry as CrateTimerRegistry,
-                };
-                const NOTE: &str = "TimerRegistry";
-                // TimerRegistry in a comment is not an API reference.
-            "#,
-        )
-        .expect("write multiline public fixture");
-
-        let source = fs::read_to_string(adapter.join("multiline.rs"))
-            .expect("read multiline public fixture");
-        let hit_lines: Vec<_> = super::externally_public_item_hits(&source, &["TimerRegistry"])
-            .expect("parse multiline public fixture")
-            .into_iter()
-            .map(|hit| hit.line)
-            .collect();
-        assert_eq!(
-            hit_lines,
-            vec![5, 9, 13],
-            "report the forbidden token line and ignore attribute strings, comments, and pub(crate)"
-        );
-
-        let result = super::lint_invariants_time_layering(&root);
-        fs::remove_dir_all(&root).expect("remove multiline public fixture");
-        let err = result.expect_err("three externally public timer items must be rejected");
-        assert!(
-            err.contains("time-layering lint found 3 issue"),
-            "unexpected multiline public-item result: {err}"
-        );
-    }
-
-    #[test]
-    fn public_api_scanner_ignores_private_implementation_details() {
-        let source = r#"
-            #[TimerRegistry]
-            pub struct PublicNamed {
-                hidden: TimerRegistry,
-                pub visible: u8,
-            }
-
-            pub struct PublicTuple(TimerRegistry, pub u8);
-
-            struct Hidden;
-            impl Hidden {
-                pub fn hidden_method(&self) -> TimerRegistry { loop {} }
-            }
-
-            pub(crate) struct Restricted;
-            impl Restricted {
-                pub fn restricted_method(&self) -> TimerRegistry { loop {} }
-            }
-
-            pub const HARMLESS_CONST: u8 = TimerRegistry::VALUE;
-            pub static HARMLESS_STATIC: u8 = TimerRegistry::VALUE;
-
-            pub fn harmless_fn() -> u8 {
-                let _ = core::mem::size_of::<TimerRegistry>();
-                0
-            }
-
-            impl PublicNamed {
-                pub fn harmless_method(&self) -> u8 {
-                    let _ = core::mem::size_of::<TimerRegistry>();
-                    0
-                }
-            }
-
-            trait PrivateTrait {
-                fn private_signature() -> TimerRegistry;
-            }
-
-            trait SomeTrait { fn execute(&self); }
-            impl SomeTrait for PublicNamed {
-                fn execute(&self) {
-                    let _ = core::mem::size_of::<TimerRegistry>();
-                }
-            }
-
-            pub trait PublicTraitWithBodies {
-                fn harmless_default() -> u8 {
-                    let _ = core::mem::size_of::<TimerRegistry>();
-                    0
-                }
-                const HARMLESS: u8 = TimerRegistry::VALUE;
-            }
-        "#;
-
-        let hits = super::externally_public_item_hits(source, &["TimerRegistry"])
-            .expect("parse private implementation fixture");
-        assert_eq!(
-            hits,
-            Vec::new(),
-            "private fields/types, attributes, expressions, bodies, and trait impls are not public API"
-        );
-    }
-
-    #[test]
-    fn public_api_scanner_reports_only_externally_reachable_signatures() {
-        let source = r#"
-            pub struct Named {
-                pub api_named: TimerRegistry,
-                private_named: TimerRegistry,
-            }
-
-            pub struct Tuple(pub TimerRegistry, TimerRegistry);
-
-            pub enum PublicEnum {
-                NamedVariant { api_enum: TimerRegistry },
-                TupleVariant(TimerRegistry),
-                Unit,
-            }
-
-            pub type Alias<T: TimerRegistry> = T;
-            pub const BAD_CONST: TimerRegistry = loop {};
-            pub static BAD_STATIC: TimerRegistry = loop {};
-
-            pub fn bad_fn() -> TimerRegistry { loop {} }
-
-            pub struct Public;
-            impl Public {
-                pub fn bad_method(&self) -> TimerRegistry { loop {} }
-            }
-
-            pub trait ApiTrait: TimerRegistry {
-                type Assoc: TimerRegistry;
-                const VALUE: TimerRegistry;
-                fn make() -> TimerRegistry;
-                fn body_only() -> u8 {
-                    let _ = core::mem::size_of::<TimerRegistry>();
-                    0
-                }
-            }
-
-            pub mod nested {
-                pub struct Nested;
-                impl self::Nested {
-                    pub fn nested_method(&self) -> TimerRegistry { loop {} }
-                }
-            }
-
-            mod private_mod {
-                pub struct Hidden;
-                impl self::Hidden {
-                    pub fn hidden_nested_method(&self) -> TimerRegistry { loop {} }
-                }
-            }
-        "#;
-        let line_of = |marker: &str| {
-            source
-                .lines()
-                .position(|line| line.contains(marker))
-                .unwrap_or_else(|| panic!("missing marker {marker}"))
-                + 1
-        };
-        let expected: std::collections::BTreeSet<_> = [
-            "api_named",
-            "pub struct Tuple",
-            "NamedVariant",
-            "TupleVariant",
-            "pub type Alias",
-            "BAD_CONST",
-            "BAD_STATIC",
-            "bad_fn",
-            "bad_method",
-            "pub trait ApiTrait",
-            "type Assoc",
-            "const VALUE",
-            "fn make",
-            "nested_method",
-        ]
-        .into_iter()
-        .map(line_of)
-        .collect();
-
-        let actual: std::collections::BTreeSet<_> =
-            super::externally_public_item_hits(source, &["TimerRegistry"])
-                .expect("parse externally reachable API fixture")
-                .into_iter()
-                .map(|hit| hit.line)
-                .collect();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn time_layering_lint_scans_grouped_reactor_runtime_adapter_and_timer_children() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tx-time-layering-grouped-reactor-lint-{}-{unique}",
-            std::process::id()
-        ));
-        for (relative, source) in [
-            (
-                "crates/tx-reactor/src/runtime/mod.rs",
-                "pub mod child;\n".to_owned(),
-            ),
-            (
-                "crates/tx-reactor/src/runtime/child.rs",
-                format!(
-                    "use {}::{};\n",
-                    super::RETIRED_WAKE_TIMER_MODULE,
-                    super::RETIRED_TIMER_WHEEL
-                ),
-            ),
-            (
-                "crates/tx-reactor/src/adapter/mod.rs",
-                "pub mod child;\n".to_owned(),
-            ),
-            (
-                "crates/tx-reactor/src/adapter/child.rs",
-                "pub use tx_services::time::DeviceTimerCallback;\n".to_owned(),
-            ),
-            (
-                "crates/tx-reactor/src/timer/mod.rs",
-                "pub mod child;\n".to_owned(),
-            ),
-            (
-                "crates/tx-reactor/src/timer/child.rs",
-                "pub use tx_services::time::TimerRegistry;\n".to_owned(),
-            ),
-        ] {
-            let path = root.join(relative);
-            fs::create_dir_all(path.parent().expect("grouped source parent"))
-                .expect("create grouped source parent");
-            fs::write(path, source).expect("write grouped source");
-        }
-
-        let result = super::lint_invariants_time_layering(&root);
-        fs::remove_dir_all(&root).expect("remove temp lint root");
-        let err = result.expect_err("every grouped reactor child must be scanned");
-        assert!(err.contains("time-layering lint found 3 issue"));
     }
 
     #[test]
@@ -1113,28 +692,11 @@ mod tests {
     #[test]
     fn reactor_runtime_and_task_do_not_expose_retired_deadline_implementation() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let sources = super::discover_required_and_optional_rust_sources(
-            &root,
-            super::REACTOR_RUNTIME_REQUIRED_SOURCES,
-            super::REACTOR_RUNTIME_OPTIONAL_SOURCES,
-            false,
-        )
-        .expect("discover reactor runtime sources");
-        let rels: std::collections::BTreeSet<_> =
-            sources.iter().map(|(rel, _)| rel.as_str()).collect();
-        for expected in [
-            "crates/tx-reactor/src/runtime/api_facade.rs",
-            "crates/tx-reactor/src/runtime/hart_runtime.rs",
-            "crates/tx-reactor/src/runtime/services.rs",
-            "crates/tx-reactor/src/core/task.rs",
+        for rel in [
+            "crates/tx-reactor/src/runtime.rs",
+            "crates/tx-reactor/src/task.rs",
         ] {
-            assert!(
-                rels.contains(expected),
-                "missing grouped runtime source {expected}"
-            );
-        }
-        for (rel, path) in sources {
-            let text = fs::read_to_string(path).unwrap_or_else(|err| {
+            let text = fs::read_to_string(root.join(rel)).unwrap_or_else(|err| {
                 panic!("read {rel}: {err}");
             });
             for forbidden in [
@@ -1153,43 +715,15 @@ mod tests {
     #[test]
     fn public_api_does_not_reexport_timer_implementation_surface() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let sources = super::discover_required_and_optional_rust_sources(
-            &root,
-            super::PUBLIC_TIME_SURFACE_REQUIRED_SOURCES,
-            super::PUBLIC_TIME_SURFACE_OPTIONAL_SOURCES,
-            false,
-        )
-        .expect("discover public time surfaces");
-        let rels: std::collections::BTreeSet<_> =
-            sources.iter().map(|(rel, _)| rel.as_str()).collect();
-        for expected in [
-            "crates/tx-reactor/src/adapter/bus_wire.rs",
-            "crates/tx-reactor/src/adapter/step_engine.rs",
-            "crates/tx-reactor/src/timer/domain.rs",
-            "crates/tx-reactor/src/timer/route.rs",
+        for rel in [
+            "crates/tx-reactor/src/lib.rs",
+            "crates/tx-reactor/src/adapter.rs",
+            "crates/tx-shims/src/adapter.rs",
         ] {
-            assert!(
-                rels.contains(expected),
-                "missing grouped public source {expected}"
-            );
-        }
-        let public_sources: Vec<_> = sources
-            .iter()
-            .map(|(rel, path)| {
-                let text = fs::read_to_string(path).unwrap_or_else(|err| {
-                    panic!("read {rel}: {err}");
-                });
-                (rel.clone(), text)
-            })
-            .collect();
-        let rule = super::RULES
-            .iter()
-            .find(|rule| rule.name == "public timer implementation export")
-            .expect("public timer implementation rule");
-        let hits = super::externally_public_source_hits(
-            &public_sources,
-            rule.scope,
-            &[
+            let text = fs::read_to_string(root.join(rel)).unwrap_or_else(|err| {
+                panic!("read {rel}: {err}");
+            });
+            for forbidden in [
                 "pub mod timer",
                 "pub use timer",
                 "DeviceTimerCallback",
@@ -1197,128 +731,13 @@ mod tests {
                 "TimerRegistrarHandle",
                 "TimerRegistry",
                 super::RETIRED_TIMER_WAKE_ROUTER,
-            ],
-        )
-        .unwrap_or_else(|err| panic!("scan public source set: {err}"));
-        assert!(
-            hits.is_empty(),
-            "{} re-exports timer implementation at line {}",
-            hits[0].rel,
-            hits[0].line
-        );
-    }
-
-    #[test]
-    fn source_discovery_supports_file_or_directory_without_duplicates() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tx-time-layering-source-discovery-{}-{unique}",
-            std::process::id()
-        ));
-        let grouped = root.join("crates/tx-reactor/src/adapter");
-        fs::create_dir_all(&grouped).expect("create grouped adapter");
-        fs::write(grouped.join("child.rs"), "pub struct Child;\n").expect("write grouped child");
-        fs::write(
-            root.join("crates/tx-reactor/src/adapter.rs"),
-            "pub struct Legacy;\n",
-        )
-        .expect("write legacy adapter");
-
-        let sources = super::discover_optional_rust_sources(
-            &root,
-            &[
-                "crates/tx-reactor/src/timer.rs",
-                "crates/tx-reactor/src/adapter.rs",
-                "crates/tx-reactor/src/adapter",
-                "crates/tx-reactor/src/adapter/child.rs",
-            ],
-            false,
-        )
-        .expect("discover file-or-directory sources");
-        fs::remove_dir_all(&root).expect("remove discovery fixture");
-        assert_eq!(
-            sources.len(),
-            2,
-            "overlapping source specs duplicated a file"
-        );
-        assert!(sources[0].0.ends_with("adapter.rs"));
-        assert!(sources[1].0.ends_with("adapter/child.rs"));
-    }
-
-    #[test]
-    fn source_discovery_rejects_a_missing_required_path() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tx-time-layering-required-source-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(root.join("crates/tx-reactor/src/runtime"))
-            .expect("create runtime source fixture");
-
-        let result = super::discover_rust_sources(
-            &root,
-            &[
-                "crates/tx-reactor/src/runtime",
-                "crates/tx-reactor/src/core/task.rs",
-            ],
-            false,
-        );
-        fs::remove_dir_all(&root).expect("remove required-source fixture");
-        let err = result.expect_err("missing current core/task.rs must fail discovery");
-        assert!(err.contains("crates/tx-reactor/src/core/task.rs"));
-    }
-
-    #[test]
-    fn required_core_task_source_is_discovered_and_linted() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tx-time-layering-core-task-{}-{unique}",
-            std::process::id()
-        ));
-        let runtime = root.join("crates/tx-reactor/src/runtime");
-        let core = root.join("crates/tx-reactor/src/core");
-        fs::create_dir_all(&runtime).expect("create runtime source fixture");
-        fs::create_dir_all(&core).expect("create core source fixture");
-        fs::write(runtime.join("mod.rs"), "pub(crate) struct Runtime;\n")
-            .expect("write runtime source fixture");
-        fs::write(
-            core.join("task.rs"),
-            format!(
-                "use {}::{};\n",
-                super::RETIRED_WAKE_TIMER_MODULE,
-                super::RETIRED_TIMER_WHEEL
-            ),
-        )
-        .expect("write forbidden core task dependency");
-
-        let sources = super::discover_rust_sources(
-            &root,
-            &[
-                "crates/tx-reactor/src/runtime",
-                "crates/tx-reactor/src/core/task.rs",
-            ],
-            false,
-        )
-        .expect("discover current reactor runtime and task sources");
-        assert!(
-            sources
-                .iter()
-                .any(|(rel, _)| rel == "crates/tx-reactor/src/core/task.rs"),
-            "current core/task.rs was not discovered"
-        );
-        let result = super::lint_invariants_time_layering(&root);
-        fs::remove_dir_all(&root).expect("remove core-task fixture");
-        let err = result.expect_err("forbidden current core/task.rs dependency must be caught");
-        assert!(err.contains("time-layering lint found 1 issue"));
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "{rel} must not re-export substrate timer implementation surface {forbidden}"
+                );
+            }
+        }
     }
 
     #[test]

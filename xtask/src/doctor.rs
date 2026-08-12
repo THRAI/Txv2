@@ -133,7 +133,9 @@ pub(crate) fn doctor(root: &Path) -> Result<()> {
     if oscomp.join("kernel").join("run.py").exists() {
         println!("ok: OSComp autotest submodule at {OSCOMP_AUTOTEST}");
     } else {
-        println!("warn: OSComp autotest submodule missing; run `git submodule update --init --recursive`");
+        println!(
+            "warn: OSComp autotest submodule missing; run `git submodule update --init --recursive`"
+        );
     }
 
     if missing_required.is_empty() {

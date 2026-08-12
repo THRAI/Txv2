@@ -132,7 +132,6 @@ impl PmapIf for StubPmap {
 
 impl EntropyIf for StubPmap {}
 impl tx_hal::AuxvIf for StubPmap {}
-impl tx_hal::CacheIf for StubPmap {}
 impl tx_hal::ConsoleIf for StubPmap {
     fn write_bytes(_bytes: &[u8]) {}
 }
@@ -378,7 +377,7 @@ fn sqpoll_kthread_observes_pushed_sqe_within_bounded_ticks() {
     let mailbox = Arc::new(TaskMailbox::new());
     let generation = mailbox.next_generation();
     let _sub = ring
-        .cqe_available_endpoint()
+        .cqe_available_source()
         .prepare(
             Arc::downgrade(&mailbox),
             generation,

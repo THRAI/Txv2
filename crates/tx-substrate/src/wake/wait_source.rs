@@ -103,11 +103,6 @@ impl WaitSource {
         self.subscribers.lock().len()
     }
 
-    /// Snapshot latched readiness bits for opt-in kernel diagnostics.
-    pub fn pending_mask_snapshot(&self) -> u64 {
-        self.pending_mask.load(Ordering::Acquire)
-    }
-
     /// Register `mailbox` as a subscriber. The caller must pass the
     /// `generation` it captured via
     /// [`TaskMailbox::next_generation`](crate::wake::mailbox::TaskMailbox::next_generation)
@@ -123,43 +118,16 @@ impl WaitSource {
         generation: WaitGeneration,
         interests: InterestMask,
     ) -> SubscriberId {
-        self.register_if(mailbox, generation, interests, || true)
-            .expect("unconditional wait-source registration")
-    }
-
-    /// Recheck the blocked predicate and publish the subscriber row under the
-    /// same source lock used by `notify`.
-    ///
-    /// This is the linearization point required by WAIT-2/SCHED-SMP-8.  The
-    /// previous `install_if` implementation evaluated the predicate first and
-    /// acquired `subscribers` only afterwards, leaving a producer notification
-    /// able to land in between and be lost.
-    fn register_if<F>(
-        &self,
-        mailbox: Weak<TaskMailbox>,
-        generation: WaitGeneration,
-        interests: InterestMask,
-        predicate: F,
-    ) -> Option<SubscriberId>
-    where
-        F: FnOnce() -> bool,
-    {
         let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::AcqRel));
         let mailbox_for_pending = mailbox.clone();
-        {
-            let mut subscribers = self.subscribers.lock();
-            if !predicate() {
-                return None;
-            }
-            subscribers.push(Subscriber {
-                mailbox,
-                generation,
-                interests,
-                id,
-            });
-        }
+        self.subscribers.lock().push(Subscriber {
+            mailbox,
+            generation,
+            interests,
+            id,
+        });
         self.deliver_pending_to(mailbox_for_pending, generation, interests);
-        Some(id)
+        id
     }
 
     /// Detach a subscription previously created by [`Self::register`].
@@ -657,13 +625,17 @@ impl<'a> PreparedWaitRegistration<'a> {
     where
         F: FnOnce() -> bool,
     {
-        let id =
-            self.source
-                .register_if(self.mailbox, self.generation, self.interests, predicate)?;
-        Some(WaitRegistrationGuard {
-            source: self.source,
-            id: Some(id),
-        })
+        if predicate() {
+            let id = self
+                .source
+                .register(self.mailbox, self.generation, self.interests);
+            Some(WaitRegistrationGuard {
+                source: self.source,
+                id: Some(id),
+            })
+        } else {
+            None
+        }
     }
 
     /// Commit unconditionally. Used in tests and when the caller

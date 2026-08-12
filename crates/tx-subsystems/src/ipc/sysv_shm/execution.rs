@@ -323,9 +323,7 @@ fn shm_vm_error_to_errno(error: VmMapError) -> Errno {
         | VmMapError::InvalidRange
         | VmMapError::MissingMapping
         | VmMapError::BackingOffsetOverflow => Errno::EINVAL,
-        VmMapError::NoFreeRange | VmMapError::PageAlloc(_) | VmMapError::Private(_) => {
-            Errno::ENOMEM
-        }
+        VmMapError::NoFreeRange | VmMapError::Private(_) => Errno::ENOMEM,
         VmMapError::WouldBlock => Errno::EAGAIN,
         VmMapError::Pmap(_) => Errno::EIO,
     }

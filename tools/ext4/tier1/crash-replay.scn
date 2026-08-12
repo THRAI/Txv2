@@ -1,0 +1,20 @@
+# ext4 Tier 1 crash replay probe.
+#
+# The crash executor will boot each immutable crash image with this script after
+# host-side e2fsck -fn observes it. The probe is intentionally read-mostly:
+# replay/recovery should mount the image and leave it inspectable.
+
+wait ":mount:sdcard:ext4:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox sync; /bin/busybox umount -l /musl; /bin/busybox mkdir -p /musl; /bin/busybox mount -o ro -t ext4 /dev/block/vdb /musl; echo crash-replay-mount:$?\n"
+expect "crash-replay-mount:0" within 30000
+expect "/ # " within 30000
+sleep 500
+
+send "if [ -d /musl ]; then echo crash-replay-inspect:0; else echo crash-replay-inspect:1; fi\n"
+expect "crash-replay-inspect:0" within 10000
+expect "/ # " within 10000
+
+quit

@@ -1,12 +1,12 @@
 use step_engine::Guard;
-use tx_ext4_format::pager::{BlockImage, CheckedPageRead, Page4K, BLOCK_SIZE};
+use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
+use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::page_backed::{
-    reserve_frame_with_reclaim, FilesystemStats, Frame, FsPageBacking,
-};
+use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
+use crate::namespace::journal_mutation_runtime_errno;
 use crate::read_backend::{inode_no, Ext4FsInstance};
 
 use page_allocator::ZeroPolicy;
@@ -77,6 +77,22 @@ fn read_frame_bytes(frame: &Frame, page: &mut Page4K) -> core::result::Result<()
     Ok(())
 }
 
+fn replace_reserved_write_bytes(
+    mutation: &mut Ext4MutationPlan,
+    file_page_index: u64,
+    page: &Page4K,
+) -> core::result::Result<(), Errno> {
+    let Some(write) = mutation
+        .data
+        .iter_mut()
+        .find(|write| write.logical_page == file_page_index)
+    else {
+        return Err(Errno::EIO);
+    };
+    write.bytes = *page;
+    Ok(())
+}
+
 // === FsPageBacking impl =============================================
 //
 // The current read-only `Ext4Pager::read_page` returns
@@ -102,21 +118,6 @@ impl<I> FsPageBacking for Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {
-    fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
-        match self.with_pager(|pager| pager.filesystem_stats()) {
-            Ok(stats) => StepOutcome::done(FilesystemStats {
-                block_size: stats.block_size,
-                total_blocks: stats.total_blocks,
-                free_blocks: stats.free_blocks,
-                available_blocks: stats.available_blocks,
-                total_inodes: stats.total_inodes,
-                free_inodes: stats.free_inodes,
-                max_name_len: stats.max_name_len,
-            }),
-            Err(err) => StepOutcome::err(err.into()),
-        }
-    }
-
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
@@ -133,18 +134,10 @@ where
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
 
-        match self.with_pager(|pager| {
-            pager.read_page_checked(
-                inode,
-                fs_object_id.inode_generation(),
-                file_page_index,
-                &mut page,
-            )
-        }) {
-            Ok(CheckedPageRead::Page(_)) => {}
-            Ok(CheckedPageRead::Missing) => return StepOutcome::err(Errno::ENOENT.into()),
-            Ok(CheckedPageRead::Stale) => return StepOutcome::err(Errno::ESTALE.into()),
-            Err(err) => return StepOutcome::err(err.into()),
+        if let Err(err) =
+            self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
+        {
+            return StepOutcome::err(err.into());
         }
 
         materialize_frame(&page)
@@ -155,20 +148,19 @@ where
         fs_object_id: FsObjectId,
         offset: u64,
         frame: &Frame,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        // Main routes normal writeback through the owned IO manager.  Do not
-        // let this legacy synchronous hook perform a second write when that
-        // backend is active; final-smp's checked inode/write diagnostics remain
-        // below for the legacy path.
-        if !self.legacy_writeback_enabled() {
-            return StepOutcome::err(Errno::ENOSYS.into());
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
         }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
-        let inode = match self.resolve_object(fs_object_id) {
-            Ok((inode, _)) => inode,
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
@@ -176,13 +168,39 @@ where
         if let Err(err) = read_frame_bytes(frame, &mut page) {
             return StepOutcome::err(err.into());
         }
-        match self.with_pager_raw(|pager| pager.write_page(inode, file_page_index, &page)) {
-            Ok(()) => StepOutcome::done(()),
-            Err(err) => {
-                let stats = self.with_pager_raw(|pager| pager.filesystem_stats()).ok();
-                crate::report_writeback_stats(inode.get(), file_page_index, err, stats);
-                StepOutcome::err(crate::read_backend::map_format_error(err).into())
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let reserved = self.buffered_write_reservation(inode, file_page_index);
+        let had_reservation = reserved.is_some();
+        let mut mutation = match reserved {
+            Some(mutation) => mutation,
+            None => match self.with_pager(|pager| {
+                pager.plan_write_page(
+                    inode,
+                    file_page_index,
+                    &page,
+                    FsyncStamp::new(current.ctime as u64),
+                )
+            }) {
+                Ok(mutation) => mutation,
+                Err(err) => return StepOutcome::err(err.into()),
+            },
+        };
+        if had_reservation {
+            if let Err(err) = replace_reserved_write_bytes(&mut mutation, file_page_index, &page) {
+                return StepOutcome::err(err.into());
             }
+        }
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                if had_reservation {
+                    self.clear_buffered_write_reservation(inode, file_page_index);
+                }
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -190,14 +208,86 @@ where
         &self,
         fs_object_id: FsObjectId,
         new_size: u64,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        let inode = match self.resolve_object(fs_object_id) {
-            Ok((inode, _)) => inode,
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let now_sec = tx_subsystems::wall_clock::current_realtime_sec().min(u32::MAX as u64) as u32;
-        match self.with_pager(|pager| pager.set_inode_size_and_times(inode, new_size, now_sec)) {
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_truncate_size(inode, new_size, FsyncStamp::new(current.ctime as u64))
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                let first_removed_page =
+                    new_size.saturating_add(BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+                self.clear_buffered_write_reservations_from(inode, first_removed_page);
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
+    }
+
+    fn prepare_write_range(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        len: usize,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if len == 0 {
+            return StepOutcome::done(());
+        }
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        if self.metadata_mutation_runtime().is_none() {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let Some(end) = offset.checked_add(len as u64) else {
+            return StepOutcome::err(Errno::EINVAL.into());
+        };
+        let file_page_index = offset / BLOCK_SIZE as u64;
+        if end == 0 || (end - 1) / BLOCK_SIZE as u64 != file_page_index {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let zero_page: Page4K = [0; BLOCK_SIZE];
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_write_page(
+                inode,
+                file_page_index,
+                &zero_page,
+                FsyncStamp::new(current.ctime as u64),
+            )
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        if mutation.allocations.is_empty() {
+            return StepOutcome::done(());
+        }
+        match self.reserve_buffered_write(inode, file_page_index, mutation) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(err.into()),
         }
@@ -205,16 +295,13 @@ where
 
     fn fsync_file(
         &self,
-        fs_object_id: FsObjectId,
+        _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if !self.legacy_writeback_enabled() {
             return StepOutcome::err(Errno::ENOSYS.into());
         }
-        match self.resolve_object(fs_object_id) {
-            Ok(_) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
-        }
+        StepOutcome::done(())
     }
 
     // `fallocate` and `supports_reflink` inherit the trait defaults

@@ -164,7 +164,7 @@ pub struct SchedulerShared {
     pub(crate) meta: SpinLock<Vec<Option<TaskSchedMeta>>>,
     pub(crate) stats: SpinLock<SchedulerStats>,
     pick_turn: AtomicU64,
-    placement_turn: AtomicU64,
+    submit_spread_turn: AtomicU64,
 }
 
 impl SchedulerShared {
@@ -190,27 +190,11 @@ impl SchedulerShared {
             .map(f)
     }
 
-    fn reserve_submitted_task(
-        &self,
-        task: TaskId,
-        handle: TaskHandle,
-        initial_meta: InitialSchedMeta,
-        queue: Phase1QueueKind,
-    ) -> (HartId, u64) {
-        let affinity = normalize_affinity(initial_meta.affinity);
-        let queued_turn = self.current_turn();
-        let hart = if initial_meta.kernel_only || !initial_meta.spread_on_submit {
-            first_hart_in_mask(affinity)
-        } else {
-            let turn = self.placement_turn.fetch_add(1, Ordering::Relaxed);
-            round_robin_hart_in_mask(affinity, turn)
-        };
-
+    pub fn insert_meta(&self, task: TaskId, handle: TaskHandle, initial_meta: InitialSchedMeta) {
         let mut meta = self.meta.lock();
         while meta.len() <= task.0 {
             meta.push(None);
         }
-
         meta[task.0] = Some(TaskSchedMeta {
             handle,
             class: initial_meta.class,
@@ -222,14 +206,14 @@ impl SchedulerShared {
             kernel_only: initial_meta.kernel_only,
             userspace_thread: initial_meta.userspace_thread,
             can_migrate: initial_meta.migration == MigrationPolicy::Movable,
+            spread_on_submit: initial_meta.spread_on_submit,
             recently_stolen: false,
             must_migrate_on_stop: false,
             latency_wake: false,
-            queued: true,
-            queued_turn,
-            owner: TaskRunOwner::Queued { hart, queue },
+            queued: false,
+            queued_turn: 0,
+            owner: TaskRunOwner::Parked,
         });
-        (hart, queued_turn)
     }
 
     fn current_turn(&self) -> u64 {
@@ -238,6 +222,10 @@ impl SchedulerShared {
 
     fn advance_turn(&self) -> u64 {
         self.pick_turn.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn next_submit_spread_turn(&self) -> u64 {
+        self.submit_spread_turn.fetch_add(1, Ordering::AcqRel)
     }
 
     pub fn remove_meta(&self, task: TaskId) {
@@ -283,6 +271,11 @@ pub enum TaskRunOwner {
         hart: HartId,
         queue: Phase1QueueKind,
     },
+    /// The task has been removed from a run queue and is being handed to the
+    /// task table.  It must not be re-enqueued until that handoff completes.
+    Dispatching {
+        hart: HartId,
+    },
     Polling {
         hart: HartId,
     },
@@ -309,6 +302,22 @@ pub struct LocalEnqueueRequest {
     pub hart: HartId,
     pub queue: Phase1QueueKind,
     pub front: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LocalQueueMove {
+    pub(crate) task: TaskId,
+    pub(crate) from_hart: HartId,
+    pub(crate) from_queue: Phase1QueueKind,
+    pub(crate) to_hart: HartId,
+    pub(crate) to_queue: Phase1QueueKind,
+    pub(crate) front: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalRunnableAction {
+    Enqueue(LocalEnqueueRequest),
+    Move(LocalQueueMove),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +360,7 @@ pub(crate) struct TaskSchedMeta {
     kernel_only: bool,
     userspace_thread: bool,
     can_migrate: bool,
+    spread_on_submit: bool,
     recently_stolen: bool,
     must_migrate_on_stop: bool,
     latency_wake: bool,
@@ -470,7 +480,6 @@ impl Phase1Scheduler {
     pub const MIN_REBALANCE_IMBALANCE: usize = 2;
     pub const AGING_PROMOTION_TURNS: u64 = 8;
     const AGED_PREEMPTED_STREAK_LIMIT_WHILE_NEW_READY: u64 = 1;
-    const STEAL_SCAN_LIMIT: usize = 8;
 
     pub fn new() -> Self {
         Self {
@@ -478,7 +487,7 @@ impl Phase1Scheduler {
                 meta: SpinLock::new(Vec::new()),
                 stats: SpinLock::new(SchedulerStats::default()),
                 pick_turn: AtomicU64::new(0),
-                placement_turn: AtomicU64::new(0),
+                submit_spread_turn: AtomicU64::new(0),
             },
             compat_locals: Vec::new(),
         }
@@ -565,10 +574,10 @@ impl Phase1Scheduler {
     }
 
     pub fn task_runnable(&mut self, task: TaskId, hint: WakeHint) {
-        if let Some((_placement, request)) =
+        if let Some((_placement, action)) =
             self.task_runnable_from_for_locals(task, hint, HartId(0))
         {
-            self.apply_compat_enqueue(request);
+            self.apply_compat_runnable_action(action);
         }
     }
 
@@ -578,27 +587,13 @@ impl Phase1Scheduler {
         new_affinity: u64,
         current_hart: HartId,
     ) -> Result<Option<RunnablePlacement>, SchedulerAffinityError> {
-        loop {
-            let Some((placement, movement)) =
-                self.set_affinity_for_locals(task, new_affinity, current_hart)?
-            else {
-                return Ok(None);
-            };
-            self.ensure_compat_hart(movement.from_hart);
-            self.ensure_compat_hart(movement.to_hart);
-            let from_local =
-                self.compat_local(movement.from_hart).expect("source hart") as *const _;
-            let to_local = self
-                .compat_local(movement.to_hart)
-                .expect("destination hart") as *const _;
-            // The compatibility local array is not grown after these pointers
-            // are taken. The commit locks both queues in hart-id order.
-            if self.commit_affinity_move_on_locals(movement, unsafe { &*from_local }, unsafe {
-                &*to_local
-            })? {
-                return Ok(Some(placement));
-            }
-        }
+        let Some((placement, movement)) =
+            self.set_affinity_for_locals(task, new_affinity, current_hart)?
+        else {
+            return Ok(None);
+        };
+        self.apply_compat_affinity_move(movement);
+        Ok(Some(placement))
     }
 
     pub fn try_steal(&mut self, thief: HartId, victim: HartId) -> Option<TaskHandle> {
@@ -649,6 +644,38 @@ impl Phase1Scheduler {
         }
     }
 
+    fn apply_compat_runnable_action(&mut self, action: LocalRunnableAction) {
+        match action {
+            LocalRunnableAction::Enqueue(request) => self.apply_compat_enqueue(request),
+            LocalRunnableAction::Move(movement) => {
+                self.ensure_compat_hart(movement.from_hart);
+                self.ensure_compat_hart(movement.to_hart);
+                if let Some(from_local) = self.compat_local(movement.from_hart) {
+                    Self::remove_from_local_queue(movement.task, from_local, movement.from_queue);
+                }
+                if let Some(to_local) = self.compat_local(movement.to_hart) {
+                    Self::push_to_local_queue(
+                        to_local,
+                        movement.task,
+                        movement.to_queue,
+                        movement.front,
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_compat_affinity_move(&mut self, movement: LocalAffinityMove) {
+        self.ensure_compat_hart(movement.from_hart);
+        self.ensure_compat_hart(movement.to_hart);
+        if let Some(from_local) = self.compat_local(movement.from_hart) {
+            Self::remove_from_local_queue(movement.task, from_local, movement.queue);
+        }
+        if let Some(to_local) = self.compat_local(movement.to_hart) {
+            Self::push_to_local_queue(to_local, movement.task, movement.queue, false);
+        }
+    }
+
     fn busiest_compat_steal_victim(&self, thief: HartId) -> Option<HartId> {
         let mut best = None;
         let mut best_depth = 0;
@@ -658,7 +685,7 @@ impl Phase1Scheduler {
                 continue;
             }
             let depths = self.queue_depths(victim);
-            let depth = depths.boosted + depths.new + depths.preempted;
+            let depth = depths.preempted;
             if depth > best_depth {
                 best = Some(victim);
                 best_depth = depth;
@@ -715,100 +742,50 @@ impl Phase1Scheduler {
         current_hart: HartId,
     ) -> Result<Option<(RunnablePlacement, LocalAffinityMove)>, SchedulerAffinityError> {
         let new_affinity = normalize_affinity(new_affinity);
-        self.shared
+        let owner = self
+            .shared
             .with_meta_mut(task, |meta| {
                 if meta.owner == TaskRunOwner::Terminal {
                     return Err(SchedulerAffinityError::TerminalTask);
                 }
 
                 meta.affinity = new_affinity;
-                match meta.owner {
-                    TaskRunOwner::Queued { hart, queue } if !hart_allowed(new_affinity, hart) => {
-                        let target_hart = first_hart_in_mask(new_affinity);
-                        Ok(Some((
-                            RunnablePlacement {
-                                target_hart,
-                                wake_remote: target_hart != current_hart,
-                            },
-                            LocalAffinityMove {
-                                task,
-                                from_hart: hart,
-                                to_hart: target_hart,
-                                queue,
-                            },
-                        )))
-                    }
-                    TaskRunOwner::Polling { hart } if !hart_allowed(new_affinity, hart) => {
-                        meta.must_migrate_on_stop = true;
-                        Ok(None)
-                    }
-                    TaskRunOwner::Parked
-                    | TaskRunOwner::Queued { .. }
-                    | TaskRunOwner::Polling { .. } => Ok(None),
-                    TaskRunOwner::Terminal => Err(SchedulerAffinityError::TerminalTask),
-                }
+                Ok(meta.owner)
             })
-            .ok_or(SchedulerAffinityError::UnknownTask)?
-    }
+            .ok_or(SchedulerAffinityError::UnknownTask)??;
 
-    /// Move a queued task while physical membership and logical ownership are
-    /// one transaction.
-    ///
-    /// Both hart queues are locked in numeric order, then scheduler metadata is
-    /// rechecked. Returning `false` means the task changed state after routing;
-    /// the caller must recompute the affinity action. This is the forced-
-    /// migration form of the SCHED-SMP-1/2 lock-and-recheck rule.
-    pub(crate) fn commit_affinity_move_on_locals(
-        &self,
-        movement: LocalAffinityMove,
-        from_local: &HartSchedulerLocal,
-        to_local: &HartSchedulerLocal,
-    ) -> Result<bool, SchedulerAffinityError> {
-        debug_assert_ne!(movement.from_hart, movement.to_hart);
-
-        if movement.from_hart.0 < movement.to_hart.0 {
-            let mut from_queues = Self::lock_queues_from_local(from_local);
-            let mut to_queues = Self::lock_queues_from_local(to_local);
-            self.commit_affinity_move_locked(movement, &mut from_queues, &mut to_queues)
-        } else {
-            let mut to_queues = Self::lock_queues_from_local(to_local);
-            let mut from_queues = Self::lock_queues_from_local(from_local);
-            self.commit_affinity_move_locked(movement, &mut from_queues, &mut to_queues)
+        match owner {
+            TaskRunOwner::Queued { hart, queue } if !hart_allowed(new_affinity, hart) => {
+                let target_hart = self.apply_queued_affinity_meta_move(task, queue, new_affinity);
+                Ok(Some((
+                    RunnablePlacement {
+                        target_hart,
+                        wake_remote: target_hart != current_hart,
+                    },
+                    LocalAffinityMove {
+                        task,
+                        from_hart: hart,
+                        to_hart: target_hart,
+                        queue,
+                    },
+                )))
+            }
+            TaskRunOwner::Dispatching { hart } | TaskRunOwner::Polling { hart }
+                if !hart_allowed(new_affinity, hart) =>
+            {
+                self.shared
+                    .with_meta_mut(task, |meta| {
+                        meta.must_migrate_on_stop = true;
+                    })
+                    .ok_or(SchedulerAffinityError::UnknownTask)?;
+                Ok(None)
+            }
+            TaskRunOwner::Parked
+            | TaskRunOwner::Queued { .. }
+            | TaskRunOwner::Dispatching { .. }
+            | TaskRunOwner::Polling { .. } => Ok(None),
+            TaskRunOwner::Terminal => Err(SchedulerAffinityError::TerminalTask),
         }
-    }
-
-    fn commit_affinity_move_locked(
-        &self,
-        movement: LocalAffinityMove,
-        from_queues: &mut HartRunQueues,
-        to_queues: &mut HartRunQueues,
-    ) -> Result<bool, SchedulerAffinityError> {
-        let mut meta_table = self.shared.meta.lock();
-        let Some(meta) = meta_table.get_mut(movement.task.0).and_then(Option::as_mut) else {
-            return Err(SchedulerAffinityError::UnknownTask);
-        };
-        if meta.owner == TaskRunOwner::Terminal {
-            return Err(SchedulerAffinityError::TerminalTask);
-        }
-        if !meta.is_queued_on(movement.from_hart, movement.queue)
-            || hart_allowed(meta.affinity, movement.from_hart)
-            || first_hart_in_mask(meta.affinity) != movement.to_hart
-        {
-            return Ok(false);
-        }
-
-        let removed = Self::remove_from_queues(from_queues, movement.task, movement.queue);
-        assert!(
-            removed,
-            "queued task metadata has no matching source queue entry"
-        );
-        Self::push_to_queues(to_queues, movement.task, movement.queue, false);
-        meta.owner = TaskRunOwner::Queued {
-            hart: movement.to_hart,
-            queue: movement.queue,
-        };
-        meta.last_hart = Some(movement.to_hart);
-        Ok(true)
     }
 
     pub fn task_stopped_for_locals(
@@ -829,166 +806,24 @@ impl Phase1Scheduler {
         })
     }
 
-    /// Return the queue owner a polling task would use after this stop.
-    ///
-    /// This is an optimistic routing read. `commit_stopped_on_local` rechecks
-    /// affinity while holding that hart's queue lock.
-    pub(crate) fn stopped_target_hart(&self, task: TaskId, hart: HartId) -> Option<HartId> {
-        self.shared.meta_for(task).map(|meta| {
-            if meta.must_migrate_on_stop && !hart_allowed(meta.affinity, hart) {
-                first_hart_in_mask(meta.affinity)
-            } else {
-                hart
-            }
-        })
-    }
-
-    /// Commit Polling -> Parked/Queued/Terminal as one queue transaction.
-    ///
-    /// Requeueing stop reasons publish both the physical queue entry and
-    /// `TaskRunOwner::Queued` under the destination queue lock. An affinity
-    /// update that raced the optimistic route returns its new target without
-    /// applying runtime accounting, so retrying cannot double-charge a task.
-    pub(crate) fn commit_stopped_on_local(
-        &self,
-        task: TaskId,
-        reason: StopReason,
-        consumed_ns: u64,
-        hart: HartId,
-        claimed_hart: HartId,
-        local: &HartSchedulerLocal,
-    ) -> Result<Option<LocalEnqueueRequest>, HartId> {
-        let queued_turn = self.shared.current_turn();
-        let mut queues = Self::lock_queues_from_local(local);
-        let mut meta_table = self.shared.meta.lock();
-        let Some(meta) = meta_table.get_mut(task.0).and_then(Option::as_mut) else {
-            return Ok(None);
-        };
-
-        let target_hart = if meta.must_migrate_on_stop && !hart_allowed(meta.affinity, hart) {
-            first_hart_in_mask(meta.affinity)
-        } else {
-            hart
-        };
-        if target_hart != claimed_hart {
-            return Err(target_hart);
-        }
-
-        let requeue =
-            Self::apply_stopped_fields(meta, task, reason, consumed_ns, hart, target_hart);
-        let Some((queue, front)) = requeue else {
-            return Ok(None);
-        };
-        Self::push_to_queues(&mut queues, task, queue, front);
-        meta.queued = true;
-        meta.queued_turn = queued_turn;
-        meta.latency_wake = false;
-        meta.owner = TaskRunOwner::Queued {
-            hart: target_hart,
-            queue,
-        };
-        Ok(Some(LocalEnqueueRequest {
-            task,
-            hart: target_hart,
-            queue,
-            front,
-        }))
-    }
-
     pub fn task_runnable_from(
         &mut self,
         task: TaskId,
         hint: WakeHint,
         current_hart: HartId,
     ) -> Option<RunnablePlacement> {
-        let (placement, request) = self.task_runnable_inner_for_locals(task, hint, current_hart)?;
-        self.apply_compat_enqueue(request);
+        let (placement, action) = self.task_runnable_inner_for_locals(task, hint, current_hart)?;
+        self.apply_compat_runnable_action(action);
         Some(placement)
     }
 
-    pub fn task_runnable_from_for_locals(
+    pub(crate) fn task_runnable_from_for_locals(
         &self,
         task: TaskId,
         hint: WakeHint,
         current_hart: HartId,
-    ) -> Option<(RunnablePlacement, LocalEnqueueRequest)> {
+    ) -> Option<(RunnablePlacement, LocalRunnableAction)> {
         self.task_runnable_inner_for_locals(task, hint, current_hart)
-    }
-
-    /// Return the hart a wake would target from the current metadata snapshot.
-    ///
-    /// This is only a routing hint.  [`Self::commit_runnable_on_local`] repeats
-    /// the calculation while holding the destination queue lock and rejects a
-    /// stale hint.  Keeping the recheck in the commit path closes the
-    /// wake-vs-affinity/migration TOCTOU window required by SCHED-SMP-2.
-    pub(crate) fn runnable_target_hart(
-        &self,
-        task: TaskId,
-        hint: WakeHint,
-        current_hart: HartId,
-    ) -> Option<HartId> {
-        self.shared
-            .meta_for(task)
-            .map(|meta| self.wake_target_hart_for_meta(&meta, hint, current_hart))
-    }
-
-    /// Atomically publish `task` as runnable on `claimed_hart`.
-    ///
-    /// The physical queue insertion and `TaskRunOwner::Queued` transition are
-    /// performed while the destination queue lock is held.  The metadata is
-    /// re-read under that lock; if affinity or ownership changed after routing,
-    /// the caller receives the new target and retries with that hart's queue.
-    pub(crate) fn commit_runnable_on_local(
-        &self,
-        task: TaskId,
-        hint: WakeHint,
-        current_hart: HartId,
-        claimed_hart: HartId,
-        local: &HartSchedulerLocal,
-    ) -> Result<Option<RunnablePlacement>, HartId> {
-        let queued_turn = self.shared.current_turn();
-        let mut queues = Self::lock_queues_from_local(local);
-        let mut meta_table = self.shared.meta.lock();
-        let Some(meta) = meta_table.get_mut(task.0).and_then(Option::as_mut) else {
-            return Ok(None);
-        };
-
-        if meta.is_queued() || meta.owner == TaskRunOwner::Terminal {
-            return Ok(None);
-        }
-
-        let target_hart = self.wake_target_hart_for_meta(meta, hint, current_hart);
-        if target_hart != claimed_hart {
-            return Err(target_hart);
-        }
-
-        let (queue, front) = Self::runnable_queue_for_meta(meta, hint);
-        Self::push_to_queues(&mut queues, task, queue, front);
-
-        meta.queued = true;
-        meta.queued_turn = queued_turn;
-        meta.latency_wake = queue == Phase1QueueKind::Preempted
-            && hint == WakeHint::Normal
-            && meta.userspace_thread;
-        meta.owner = TaskRunOwner::Queued {
-            hart: claimed_hart,
-            queue,
-        };
-
-        emit_sched_debug(b"debug.sched.runnable.queue", pack_task_queue(task, queue));
-        emit_sched_debug(
-            b"debug.sched.runnable.front",
-            ((task.0 as i64) << 1) | i64::from(front),
-        );
-        emit_sched_debug(
-            b"debug.sched.runnable.hint",
-            ((task.0 as i64) << 8) | wake_hint_code(hint),
-        );
-
-        Ok(Some(RunnablePlacement {
-            target_hart: claimed_hart,
-            wake_remote: claimed_hart != current_hart,
-        }))
     }
 
     pub fn task_submitted_for_locals(
@@ -1007,8 +842,14 @@ impl Phase1Scheduler {
         task: TaskId,
         handle: TaskHandle,
         initial_meta: InitialSchedMeta,
-        _total_queue_depth: impl FnMut(HartId) -> usize,
+        total_queue_depth: impl FnMut(HartId) -> usize,
     ) -> (LocalEnqueueRequest, QueuedTaskReport) {
+        self.shared.insert_meta(task, handle, initial_meta);
+        let hart = self
+            .shared
+            .meta_for(task)
+            .map(|meta| self.initial_hart_for_meta_with_depths(&meta, total_queue_depth))
+            .unwrap_or_else(|| first_hart_in_mask(normalize_affinity(initial_meta.affinity)));
         let queue = if initial_meta.kernel_only {
             Phase1QueueKind::Kernel
         } else if initial_meta.preempted_on_submit {
@@ -1016,9 +857,18 @@ impl Phase1Scheduler {
         } else {
             Phase1QueueKind::New
         };
-        let (hart, queued_turn) =
-            self.shared
-                .reserve_submitted_task(task, handle, initial_meta, queue);
+        let queued_turn = self.shared.current_turn();
+        self.shared.with_meta_mut(task, |meta| {
+            if initial_meta.spread_on_submit
+                && initial_meta.migration == MigrationPolicy::Pinned
+                && !initial_meta.kernel_only
+            {
+                meta.affinity = 1u64 << hart.0;
+            }
+            meta.queued = true;
+            meta.queued_turn = queued_turn;
+            meta.owner = TaskRunOwner::Queued { hart, queue };
+        });
         emit_sched_debug(b"debug.sched.submit.queue", pack_task_queue(task, queue));
         (
             LocalEnqueueRequest {
@@ -1220,77 +1070,57 @@ impl Phase1Scheduler {
             return None;
         }
 
-        let mut rejected = Vec::new();
-        let mut stolen = None;
-
-        for queue in [
-            Phase1QueueKind::Boosted,
-            Phase1QueueKind::Preempted,
-            Phase1QueueKind::New,
-        ] {
-            for _ in 0..Self::STEAL_SCAN_LIMIT {
-                let task = {
-                    let mut queues = Self::lock_queues_from_local(victim_local);
-                    match queue {
-                        Phase1QueueKind::Kernel => None,
-                        Phase1QueueKind::Boosted => queues.boosted_queue.pop_back(),
-                        Phase1QueueKind::New => queues.new_queue.pop_back(),
-                        Phase1QueueKind::Preempted => queues.preempted_queue.pop_back(),
-                    }
-                };
-                let Some(task) = task else {
-                    break;
-                };
-
-                let Some((reject_still_queued, stolen_handle)) =
-                    self.shared.with_meta_mut(task, |meta| {
-                        let eligible = meta.can_migrate
-                            && !meta.kernel_only
-                            && !meta.recently_stolen
-                            && hart_allowed(meta.affinity, thief)
-                            && meta.is_queued_on(victim, queue);
-                        if !eligible {
-                            return (meta.is_queued_on(victim, queue), None);
-                        }
-
-                        meta.owner = TaskRunOwner::Queued { hart: thief, queue };
-                        meta.last_hart = Some(thief);
-                        meta.recently_stolen = true;
-                        (false, Some(meta.handle))
-                    })
-                else {
-                    continue;
-                };
-                if reject_still_queued {
-                    rejected.push((task, queue));
-                    continue;
-                }
-                if let Some(handle) = stolen_handle {
-                    stolen = Some((task, handle, queue));
-                    break;
-                }
-            }
-            if stolen.is_some() {
-                break;
-            }
-        }
-
-        if !rejected.is_empty() {
-            let mut victim_local = Self::lock_queues_from_local(victim_local);
-            for (task, queue) in rejected.into_iter().rev() {
-                match queue {
-                    Phase1QueueKind::Kernel => {}
-                    Phase1QueueKind::Boosted => victim_local.boosted_queue.push_back(task),
-                    Phase1QueueKind::New => victim_local.new_queue.push_back(task),
-                    Phase1QueueKind::Preempted => victim_local.preempted_queue.push_back(task),
-                }
-            }
-        }
-
-        let (task, handle, queue) = stolen?;
-        Self::push_to_local_queue(thief_local, task, queue, true);
+        // Lock both queue shards in hart-id order.  The metadata owner changes
+        // while both shards are locked, and the task reaches the thief queue
+        // before either lock is released.
+        let handle = if thief.0 < victim.0 {
+            let mut thief_queues = Self::lock_queues_from_local(thief_local);
+            let mut victim_queues = Self::lock_queues_from_local(victim_local);
+            self.steal_preempted_locked(thief, victim, &mut thief_queues, &mut victim_queues)?
+        } else {
+            let mut victim_queues = Self::lock_queues_from_local(victim_local);
+            let mut thief_queues = Self::lock_queues_from_local(thief_local);
+            self.steal_preempted_locked(thief, victim, &mut thief_queues, &mut victim_queues)?
+        };
         Self::mark_need_resched_local(thief_local);
         self.shared.record_work_steal();
+        Some(handle)
+    }
+
+    fn steal_preempted_locked(
+        &self,
+        thief: HartId,
+        victim: HartId,
+        thief_queues: &mut HartRunQueues,
+        victim_queues: &mut HartRunQueues,
+    ) -> Option<TaskHandle> {
+        let queue = Phase1QueueKind::Preempted;
+        let task = victim_queues.preempted_queue.pop_front()?;
+        let Some((reject_still_queued, stolen_handle)) = self.shared.with_meta_mut(task, |meta| {
+            let eligible = meta.can_migrate
+                && !meta.kernel_only
+                && !meta.recently_stolen
+                && hart_allowed(meta.affinity, thief)
+                && meta.is_queued_on(victim, queue);
+            if !eligible {
+                return (meta.is_queued_on(victim, queue), None);
+            }
+
+            meta.owner = TaskRunOwner::Queued { hart: thief, queue };
+            meta.last_hart = Some(thief);
+            meta.recently_stolen = true;
+            (false, Some(meta.handle))
+        }) else {
+            return None;
+        };
+
+        if reject_still_queued {
+            victim_queues.preempted_queue.push_front(task);
+            return None;
+        }
+
+        let handle = stolen_handle?;
+        thief_queues.preempted_queue.push_front(task);
         Some(handle)
     }
 
@@ -1356,6 +1186,33 @@ impl Phase1Scheduler {
         }
     }
 
+    fn initial_hart_for_meta_with_depths(
+        &self,
+        meta: &TaskSchedMeta,
+        mut total_queue_depth: impl FnMut(HartId) -> usize,
+    ) -> HartId {
+        if meta.kernel_only || !meta.spread_on_submit {
+            return first_hart_in_mask(meta.affinity);
+        }
+
+        let affinity = normalize_affinity(meta.affinity);
+        let spread_start = (self.shared.next_submit_spread_turn() as usize) % u64::BITS as usize;
+        let mut best = None;
+        for offset in 0..u64::BITS as usize {
+            let hart = HartId((spread_start + offset) % u64::BITS as usize);
+            if !hart_allowed(affinity, hart) {
+                continue;
+            }
+            let depth = total_queue_depth(hart);
+            match best {
+                Some((_, best_depth)) if depth >= best_depth => {}
+                _ => best = Some((hart, depth)),
+            }
+        }
+        best.map(|(hart, _)| hart)
+            .unwrap_or_else(|| first_hart_in_mask(affinity))
+    }
+
     #[inline]
     fn lock_queues_from_local(local: &HartSchedulerLocal) -> SpinLockGuard<'_, HartRunQueues> {
         local.queues.lock()
@@ -1383,6 +1240,33 @@ impl Phase1Scheduler {
         local.consume_markers()
     }
 
+    fn prepare_queued_affinity_move(&self, task: TaskId, new_affinity: u64) -> HartId {
+        let target_hart = first_hart_in_mask(new_affinity);
+        self.shared.with_meta_mut(task, |meta| {
+            meta.queued = false;
+            meta.owner = TaskRunOwner::Parked;
+            meta.last_hart = Some(target_hart);
+        });
+        target_hart
+    }
+
+    fn apply_queued_affinity_meta_move(
+        &self,
+        task: TaskId,
+        queue: Phase1QueueKind,
+        new_affinity: u64,
+    ) -> HartId {
+        let target_hart = self.prepare_queued_affinity_move(task, new_affinity);
+        self.shared.with_meta_mut(task, |meta| {
+            meta.queued = true;
+            meta.owner = TaskRunOwner::Queued {
+                hart: target_hart,
+                queue,
+            };
+        });
+        target_hart
+    }
+
     pub fn push_to_local_queue(
         local: &HartSchedulerLocal,
         task: TaskId,
@@ -1390,15 +1274,6 @@ impl Phase1Scheduler {
         front: bool,
     ) {
         let mut local = Self::lock_queues_from_local(local);
-        Self::push_to_queues(&mut local, task, queue, front);
-    }
-
-    fn push_to_queues(
-        local: &mut HartRunQueues,
-        task: TaskId,
-        queue: Phase1QueueKind,
-        front: bool,
-    ) {
         let target = match queue {
             Phase1QueueKind::Kernel => &mut local.kernel_queue,
             Phase1QueueKind::Boosted => &mut local.boosted_queue,
@@ -1418,10 +1293,6 @@ impl Phase1Scheduler {
         queue: Phase1QueueKind,
     ) -> bool {
         let mut local = Self::lock_queues_from_local(local);
-        Self::remove_from_queues(&mut local, task, queue)
-    }
-
-    fn remove_from_queues(local: &mut HartRunQueues, task: TaskId, queue: Phase1QueueKind) -> bool {
         let queue = match queue {
             Phase1QueueKind::Kernel => &mut local.kernel_queue,
             Phase1QueueKind::Boosted => &mut local.boosted_queue,
@@ -1454,24 +1325,16 @@ impl Phase1Scheduler {
         local: &HartSchedulerLocal,
         queue: Phase1QueueKind,
     ) -> Option<(TaskHandle, SliceConfig)> {
-        let mut queues = Self::lock_queues_from_local(local);
         loop {
-            let task = {
-                let queue = match queue {
-                    Phase1QueueKind::Kernel => &mut queues.kernel_queue,
-                    Phase1QueueKind::Boosted => &mut queues.boosted_queue,
-                    Phase1QueueKind::New => &mut queues.new_queue,
-                    Phase1QueueKind::Preempted => &mut queues.preempted_queue,
-                };
-                queue.pop_front()?
-            };
-            if let Some(next) = self.finish_popped_task_locked(hart, queue, task) {
+            let task = Self::pop_task_from_local_queue(local, queue)?;
+            let slice = self.slice_for_popped_task(task, queue);
+            if let Some(next) = self.finish_popped_task(hart, queue, task, slice) {
                 if queue == Phase1QueueKind::New {
                     local
                         .aged_preempted_picks_since_new
                         .store(0, Ordering::Release);
                 } else if queue == Phase1QueueKind::Preempted
-                    && self.preempted_queue_has_latency_wake(hart, &queues.preempted_queue)
+                    && self.local_preempted_queue_has_latency_wake(hart, local)
                 {
                     local
                         .aged_preempted_picks_since_new
@@ -1482,30 +1345,30 @@ impl Phase1Scheduler {
         }
     }
 
+    fn pop_task_from_local_queue(
+        local: &HartSchedulerLocal,
+        queue: Phase1QueueKind,
+    ) -> Option<TaskId> {
+        let mut local = Self::lock_queues_from_local(local);
+        let queue = match queue {
+            Phase1QueueKind::Kernel => &mut local.kernel_queue,
+            Phase1QueueKind::Boosted => &mut local.boosted_queue,
+            Phase1QueueKind::New => &mut local.new_queue,
+            Phase1QueueKind::Preempted => &mut local.preempted_queue,
+        };
+        queue.pop_front()
+    }
+
     fn pop_aged_preempted_from_local(
         &self,
         hart: HartId,
         local: &HartSchedulerLocal,
     ) -> Option<(TaskHandle, SliceConfig)> {
-        let current_turn = self.shared.current_turn();
-        let mut queues = Self::lock_queues_from_local(local);
         loop {
-            let index = {
-                let meta_table = self.shared.meta.lock();
-                queues.preempted_queue.iter().position(|task| {
-                    meta_table
-                        .get(task.0)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|meta| {
-                            meta.is_queued_on(hart, Phase1QueueKind::Preempted)
-                                && current_turn.saturating_sub(meta.queued_turn)
-                                    >= Self::AGING_PROMOTION_TURNS
-                        })
-                })
-            }?;
-            let task = queues.preempted_queue.remove(index)?;
+            let task = self.pop_aged_task_from_preempted_queue(hart, local)?;
+            let slice = self.slice_for_popped_task(task, Phase1QueueKind::Preempted);
             if let Some(next) =
-                self.finish_popped_task_locked(hart, Phase1QueueKind::Preempted, task)
+                self.finish_popped_task(hart, Phase1QueueKind::Preempted, task, slice)
             {
                 return Some(next);
             }
@@ -1522,22 +1385,11 @@ impl Phase1Scheduler {
         {
             return None;
         }
-        let mut queues = Self::lock_queues_from_local(local);
         loop {
-            let index = {
-                let meta_table = self.shared.meta.lock();
-                queues.preempted_queue.iter().position(|task| {
-                    meta_table
-                        .get(task.0)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|meta| {
-                            meta.is_queued_on(hart, Phase1QueueKind::Preempted) && meta.latency_wake
-                        })
-                })
-            }?;
-            let task = queues.preempted_queue.remove(index)?;
+            let task = self.pop_latency_wake_task_from_preempted_queue(hart, local)?;
+            let slice = self.slice_for_popped_task(task, Phase1QueueKind::Preempted);
             if let Some(next) =
-                self.finish_popped_task_locked(hart, Phase1QueueKind::Preempted, task)
+                self.finish_popped_task(hart, Phase1QueueKind::Preempted, task, slice)
             {
                 local
                     .aged_preempted_picks_since_new
@@ -1606,6 +1458,47 @@ impl Phase1Scheduler {
         })
     }
 
+    fn pop_aged_task_from_preempted_queue(
+        &self,
+        hart: HartId,
+        local: &HartSchedulerLocal,
+    ) -> Option<TaskId> {
+        let current_turn = self.shared.current_turn();
+        let mut local = Self::lock_queues_from_local(local);
+        let index = local.preempted_queue.iter().position(|task| {
+            self.shared.meta_for(*task).is_some_and(|meta| {
+                meta.is_queued_on(hart, Phase1QueueKind::Preempted)
+                    && current_turn.saturating_sub(meta.queued_turn) >= Self::AGING_PROMOTION_TURNS
+            })
+        })?;
+        local.preempted_queue.remove(index)
+    }
+
+    fn pop_latency_wake_task_from_preempted_queue(
+        &self,
+        hart: HartId,
+        local: &HartSchedulerLocal,
+    ) -> Option<TaskId> {
+        let mut local = Self::lock_queues_from_local(local);
+        let index = local.preempted_queue.iter().position(|task| {
+            self.shared.meta_for(*task).is_some_and(|meta| {
+                meta.is_queued_on(hart, Phase1QueueKind::Preempted) && meta.latency_wake
+            })
+        })?;
+        local.preempted_queue.remove(index)
+    }
+
+    fn slice_for_popped_task(&self, task: TaskId, queue: Phase1QueueKind) -> SliceConfig {
+        match queue {
+            Phase1QueueKind::Kernel => SliceConfig::Cooperative,
+            Phase1QueueKind::Boosted => self.preempted_slice_for_task(task),
+            Phase1QueueKind::New => SliceConfig::Preemptive {
+                slice_ns: Self::NEW_QUEUE_SLICE_NS,
+            },
+            Phase1QueueKind::Preempted => self.preempted_slice_for_task(task),
+        }
+    }
+
     fn preempted_slice_for_task(&self, task: TaskId) -> SliceConfig {
         let slice_ns = self
             .shared
@@ -1621,49 +1514,45 @@ impl Phase1Scheduler {
         SliceConfig::Preemptive { slice_ns }
     }
 
-    /// Complete `Runnable -> Polling` while the caller still owns the
-    /// corresponding hart queue lock.
-    fn finish_popped_task_locked(
+    fn finish_popped_task(
         &self,
         hart: HartId,
         queue: Phase1QueueKind,
         task: TaskId,
+        slice: SliceConfig,
     ) -> Option<(TaskHandle, SliceConfig)> {
-        let mut meta_table = self.shared.meta.lock();
-        let meta = meta_table.get_mut(task.0)?.as_mut()?;
-        if !meta.is_queued_on(hart, queue) {
-            return None;
-        }
-        let slice = Self::slice_for_meta(meta, queue);
-        emit_sched_debug(b"debug.sched.pick.queue", pack_task_queue(task, queue));
-        self.shared.advance_turn();
-        meta.queued = false;
-        meta.latency_wake = false;
-        meta.owner = TaskRunOwner::Polling { hart };
-        meta.current_slice_ns = match slice {
-            SliceConfig::Cooperative => 0,
-            SliceConfig::Preemptive { slice_ns } => slice_ns,
-        };
-        if meta.remaining_budget_ns == 0 {
-            meta.remaining_budget_ns = meta.current_slice_ns;
-        }
-        Some((meta.handle, slice))
+        self.shared.with_meta_mut(task, |meta| {
+            if !meta.is_queued_on(hart, queue) {
+                return None;
+            }
+            emit_sched_debug(b"debug.sched.pick.queue", pack_task_queue(task, queue));
+            self.shared.advance_turn();
+            meta.queued = false;
+            meta.latency_wake = false;
+            meta.owner = TaskRunOwner::Dispatching { hart };
+            meta.current_slice_ns = match slice {
+                SliceConfig::Cooperative => 0,
+                SliceConfig::Preemptive { slice_ns } => slice_ns,
+            };
+            if meta.remaining_budget_ns == 0 {
+                meta.remaining_budget_ns = meta.current_slice_ns;
+            }
+            Some((meta.handle, slice))
+        })?
     }
 
-    fn slice_for_meta(meta: &TaskSchedMeta, queue: Phase1QueueKind) -> SliceConfig {
-        match queue {
-            Phase1QueueKind::Kernel => SliceConfig::Cooperative,
-            Phase1QueueKind::New => SliceConfig::Preemptive {
-                slice_ns: Self::NEW_QUEUE_SLICE_NS,
-            },
-            Phase1QueueKind::Boosted | Phase1QueueKind::Preempted => SliceConfig::Preemptive {
-                slice_ns: if meta.remaining_budget_ns > 0 {
-                    meta.remaining_budget_ns
-                } else {
-                    Self::PREEMPTED_QUEUE_SLICE_NS
-                },
-            },
-        }
+    /// Complete the queue-to-task-table handoff after the task table has
+    /// changed `Runnable` to `Polling` and removed the future.
+    pub fn mark_dispatching_polling(&self, task: TaskId, hart: HartId) -> bool {
+        self.shared
+            .with_meta_mut(task, |meta| {
+                if meta.owner != (TaskRunOwner::Dispatching { hart }) {
+                    return false;
+                }
+                meta.owner = TaskRunOwner::Polling { hart };
+                true
+            })
+            .unwrap_or(false)
     }
 
     fn task_runnable_inner_for_locals(
@@ -1671,24 +1560,92 @@ impl Phase1Scheduler {
         task: TaskId,
         hint: WakeHint,
         current_hart: HartId,
-    ) -> Option<(RunnablePlacement, LocalEnqueueRequest)> {
-        let queued_turn = self.shared.current_turn();
-        let (hart, queue, front) = self.shared.with_meta_mut(task, |meta| {
-            if meta.is_queued() || meta.owner == TaskRunOwner::Terminal {
+    ) -> Option<(RunnablePlacement, LocalRunnableAction)> {
+        let meta = self.shared.meta_for(task)?;
+        let hart = self.wake_target_hart_for_meta(&meta, hint, current_hart);
+        let (queue, front) = if meta.kernel_only {
+            (Phase1QueueKind::Kernel, false)
+        } else {
+            match meta.class {
+                SchedClass::Fair => {
+                    if hint.is_boosted() {
+                        (Phase1QueueKind::Boosted, false)
+                    } else if meta.remaining_budget_ns > 0 {
+                        (
+                            Phase1QueueKind::Preempted,
+                            !meta.userspace_thread || hint == WakeHint::WakeHandoff,
+                        )
+                    } else {
+                        (Phase1QueueKind::New, false)
+                    }
+                }
+                SchedClass::RtFifo
+                | SchedClass::RtRoundRobin
+                | SchedClass::Deadline
+                | SchedClass::Idle => (Phase1QueueKind::New, false),
+            }
+        };
+
+        if meta.owner == TaskRunOwner::Terminal {
+            return None;
+        }
+
+        if matches!(meta.owner, TaskRunOwner::Dispatching { .. }) {
+            // A wake observed during the queue-to-task-table handoff is
+            // retained by TaskTable's wake state and consumed after polling.
+            return None;
+        }
+
+        if let TaskRunOwner::Queued {
+            hart: from_hart,
+            queue: from_queue,
+        } = meta.owner
+        {
+            if !meta.userspace_thread
+                || hint != WakeHint::SignalDelivery
+                || from_queue == Phase1QueueKind::Boosted
+            {
                 return None;
             }
 
-            let hart = self.wake_target_hart_for_meta(meta, hint, current_hart);
-            let (queue, front) = Self::runnable_queue_for_meta(meta, hint);
+            self.shared.with_meta_mut(task, |meta| {
+                meta.latency_wake = false;
+                meta.owner = TaskRunOwner::Queued {
+                    hart: from_hart,
+                    queue,
+                };
+            });
+            emit_sched_debug(b"debug.sched.runnable.queue", pack_task_queue(task, queue));
+            emit_sched_debug(
+                b"debug.sched.runnable.hint",
+                ((task.0 as i64) << 8) | wake_hint_code(hint),
+            );
 
+            return Some((
+                RunnablePlacement {
+                    target_hart: from_hart,
+                    wake_remote: from_hart != current_hart,
+                },
+                LocalRunnableAction::Move(LocalQueueMove {
+                    task,
+                    from_hart,
+                    from_queue,
+                    to_hart: from_hart,
+                    to_queue: queue,
+                    front,
+                }),
+            ));
+        }
+
+        let queued_turn = self.shared.current_turn();
+        self.shared.with_meta_mut(task, |meta| {
             meta.queued = true;
             meta.queued_turn = queued_turn;
             meta.latency_wake = queue == Phase1QueueKind::Preempted
                 && hint == WakeHint::Normal
                 && meta.userspace_thread;
             meta.owner = TaskRunOwner::Queued { hart, queue };
-            Some((hart, queue, front))
-        })??;
+        });
         emit_sched_debug(b"debug.sched.runnable.queue", pack_task_queue(task, queue));
         emit_sched_debug(
             b"debug.sched.runnable.front",
@@ -1704,37 +1661,13 @@ impl Phase1Scheduler {
                 target_hart: hart,
                 wake_remote: hart != current_hart,
             },
-            LocalEnqueueRequest {
+            LocalRunnableAction::Enqueue(LocalEnqueueRequest {
                 task,
                 hart,
                 queue,
                 front,
-            },
+            }),
         ))
-    }
-
-    fn runnable_queue_for_meta(meta: &TaskSchedMeta, hint: WakeHint) -> (Phase1QueueKind, bool) {
-        if meta.kernel_only {
-            return (Phase1QueueKind::Kernel, false);
-        }
-        match meta.class {
-            SchedClass::Fair => {
-                if hint.is_boosted() {
-                    (Phase1QueueKind::Boosted, false)
-                } else if meta.remaining_budget_ns > 0 {
-                    (
-                        Phase1QueueKind::Preempted,
-                        !meta.userspace_thread || hint == WakeHint::WakeHandoff,
-                    )
-                } else {
-                    (Phase1QueueKind::New, false)
-                }
-            }
-            SchedClass::RtFifo
-            | SchedClass::RtRoundRobin
-            | SchedClass::Deadline
-            | SchedClass::Idle => (Phase1QueueKind::New, false),
-        }
     }
 
     fn apply_task_stopped_meta(
@@ -1744,99 +1677,73 @@ impl Phase1Scheduler {
         consumed_ns: u64,
         hart: HartId,
     ) -> Option<(HartId, Option<(Phase1QueueKind, bool)>)> {
-        let mut meta_table = self.shared.meta.lock();
-        let meta = meta_table.get_mut(task.0)?.as_mut()?;
-        let target_hart = if meta.must_migrate_on_stop && !hart_allowed(meta.affinity, hart) {
-            first_hart_in_mask(meta.affinity)
-        } else {
-            hart
-        };
-        let requeue =
-            Self::apply_stopped_fields(meta, task, reason, consumed_ns, hart, target_hart);
+        let mut requeue = None;
+        let mut target_hart = hart;
+        emit_sched_debug(b"debug.sched.stop.reason", pack_task_stop(task, reason));
+        self.shared.with_meta_mut(task, |meta| {
+            meta.queued = false;
+            meta.latency_wake = false;
+            meta.total_runtime_ns = meta.total_runtime_ns.saturating_add(consumed_ns);
+            meta.last_hart = Some(hart);
+            meta.remaining_budget_ns = meta.remaining_budget_ns.saturating_sub(consumed_ns);
+            meta.recently_stolen = false;
+            if meta.must_migrate_on_stop && !hart_allowed(meta.affinity, hart) {
+                target_hart = first_hart_in_mask(meta.affinity);
+                meta.last_hart = Some(target_hart);
+                meta.must_migrate_on_stop = false;
+            }
+
+            match reason {
+                StopReason::SliceExpired => {
+                    meta.remaining_budget_ns = 0;
+                    meta.owner = TaskRunOwner::Parked;
+                    requeue = Some((Phase1QueueKind::Preempted, false));
+                }
+                StopReason::Yielded => {
+                    meta.remaining_budget_ns = 0;
+                    meta.owner = TaskRunOwner::Parked;
+                    requeue = Some(if meta.kernel_only {
+                        (Phase1QueueKind::Kernel, false)
+                    } else {
+                        (Phase1QueueKind::Preempted, false)
+                    });
+                }
+                StopReason::UserspaceTrap => {
+                    if meta.remaining_budget_ns > 0 {
+                        meta.owner = TaskRunOwner::Parked;
+                        requeue = Some((Phase1QueueKind::Preempted, !meta.userspace_thread));
+                    } else {
+                        meta.owner = TaskRunOwner::Parked;
+                        requeue = Some((Phase1QueueKind::Preempted, false));
+                    }
+                }
+                StopReason::PreemptedExternal => {
+                    meta.owner = TaskRunOwner::Parked;
+                    requeue = Some((Phase1QueueKind::Preempted, true));
+                }
+                StopReason::Blocked => {
+                    meta.owner = TaskRunOwner::Parked;
+                }
+                StopReason::Completed => {
+                    meta.owner = TaskRunOwner::Terminal;
+                }
+            }
+        })?;
 
         if let Some((queue, _front)) = requeue {
             let queued_turn = self.shared.current_turn();
-            meta.queued = true;
-            meta.queued_turn = queued_turn;
-            meta.latency_wake = false;
-            meta.owner = TaskRunOwner::Queued {
-                hart: target_hart,
-                queue,
-            };
+            self.shared.with_meta_mut(task, |meta| {
+                meta.queued = true;
+                meta.queued_turn = queued_turn;
+                meta.latency_wake = false;
+                meta.owner = TaskRunOwner::Queued {
+                    hart: target_hart,
+                    queue,
+                };
+            });
         }
 
         Some((target_hart, requeue))
-    }
-
-    fn apply_stopped_fields(
-        meta: &mut TaskSchedMeta,
-        task: TaskId,
-        reason: StopReason,
-        consumed_ns: u64,
-        hart: HartId,
-        target_hart: HartId,
-    ) -> Option<(Phase1QueueKind, bool)> {
-        emit_sched_debug(b"debug.sched.stop.reason", pack_task_stop(task, reason));
-        meta.queued = false;
-        meta.latency_wake = false;
-        meta.total_runtime_ns = meta.total_runtime_ns.saturating_add(consumed_ns);
-        meta.last_hart = Some(hart);
-        meta.remaining_budget_ns = meta.remaining_budget_ns.saturating_sub(consumed_ns);
-        meta.recently_stolen = false;
-        meta.must_migrate_on_stop = false;
-        if target_hart != hart {
-            meta.last_hart = Some(target_hart);
-        }
-
-        match reason {
-            StopReason::SliceExpired => {
-                meta.remaining_budget_ns = 0;
-                meta.owner = TaskRunOwner::Parked;
-                Some((Phase1QueueKind::Preempted, false))
-            }
-            StopReason::Yielded => {
-                meta.remaining_budget_ns = 0;
-                meta.owner = TaskRunOwner::Parked;
-                Some(if meta.kernel_only {
-                    (Phase1QueueKind::Kernel, false)
-                } else {
-                    (Phase1QueueKind::Preempted, false)
-                })
-            }
-            StopReason::UserspaceTrap => {
-                meta.owner = TaskRunOwner::Parked;
-                Some((
-                    Phase1QueueKind::Preempted,
-                    meta.remaining_budget_ns > 0 && !meta.userspace_thread,
-                ))
-            }
-            StopReason::PreemptedExternal => {
-                meta.owner = TaskRunOwner::Parked;
-                Some((Phase1QueueKind::Preempted, true))
-            }
-            StopReason::Blocked => {
-                meta.owner = TaskRunOwner::Parked;
-                None
-            }
-            StopReason::Completed => {
-                meta.owner = TaskRunOwner::Terminal;
-                None
-            }
-        }
-    }
-}
-
-fn round_robin_hart_in_mask(affinity: u64, turn: u64) -> HartId {
-    let affinity = normalize_affinity(affinity);
-    let mut ordinal = turn % u64::from(affinity.count_ones());
-    let mut remaining = affinity;
-    loop {
-        let hart = HartId(remaining.trailing_zeros() as usize);
-        if ordinal == 0 {
-            return hart;
-        }
-        ordinal -= 1;
-        remaining &= remaining - 1;
     }
 }
 
@@ -1906,10 +1813,7 @@ fn emit_sched_debug(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }

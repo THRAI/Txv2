@@ -30,7 +30,7 @@ use crate::vfs::adapter::step_engine::{
 };
 use crate::vfs::notification;
 use crate::vfs::walker;
-use crate::vfs::{Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNodeBacking};
+use crate::vfs::{Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta};
 
 // ============================================================================
 // ChmodOp — fchmodat
@@ -299,7 +299,7 @@ pub struct UnlinkOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub parent_and_child: Option<(Cap<DEntry>, InlineName, Cap<DEntry>)>,
+    pub parent_and_child: Option<(Cap<DEntry>, InlineName, FsObjectId)>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
@@ -308,41 +308,32 @@ impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         let __guard = step_engine::guard();
-        let (parent, name, child) = match self.parent_and_child.take() {
+        let (parent, name, child_id) = match self.parent_and_child.take() {
             Some(p) => p,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let child_dentry = match super::resolution::driver::walk_to_completion(
-                    rooted_at,
-                    self.path,
-                    super::resolution::state::WalkMode::EntityUnfollowed,
-                    super::resolution::state::FinalSymlinkPolicy::NoFollow,
-                    self.cred,
-                    &__guard,
-                ) {
-                    Ok(resolved) => resolved.dentry,
-                    Err(error) => return StepOutcome::err(error.into()),
-                };
+                let child_dentry =
+                    match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
+                        StepOutcome::Done(d) => d,
+                        StepOutcome::Err(e) => return StepOutcome::err(e),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
+                    };
                 let parent_dentry = child_dentry
                     .parent_hint()
                     .unwrap_or_else(|| child_dentry.clone());
                 let child_name = child_dentry.name();
-                self.parent_and_child =
-                    Some((parent_dentry.clone(), child_name, child_dentry.clone()));
-                (parent_dentry, child_name, child_dentry)
+                let child_id = child_dentry.rnode().fs_object_id();
+                self.parent_and_child = Some((parent_dentry.clone(), child_name, child_id));
+                (parent_dentry, child_name, child_id)
             }
         };
         let fs_ops = walker::fs_ops_for(&parent, &__guard).expect("NoFsOps for UnlinkOp");
-        let outcome = fs_ops.unlink(
+        fs_ops.unlink(
             parent.rnode().fs_object_id(),
             name.as_bytes(),
-            child.rnode().fs_object_id(),
+            child_id,
             &__guard,
-        );
-        if matches!(outcome, StepOutcome::Done(())) {
-            parent.remove_cached_child(name);
-        }
-        outcome
+        )
     }
 }
 
@@ -785,7 +776,7 @@ fn live_meta_for_dentry(target: &Cap<DEntry>, guard: &crate::execution::Guard<'_
     // surface through all stat-family calls. The cached RNode meta is the
     // snapshot from materialisation time.
     let ino = target.rnode().fs_object_id();
-    let mut meta = match target.rnode().containing_mount_weak() {
+    match target.rnode().containing_mount_weak() {
         Some(weak) => match weak.upgrade(guard) {
             Some(payload) => match payload.fs_ops().load_inode_meta(ino, guard) {
                 StepOutcome::Done(m) => m,
@@ -794,11 +785,7 @@ fn live_meta_for_dentry(target: &Cap<DEntry>, guard: &crate::execution::Guard<'_
             None => target.rnode().meta(),
         },
         None => target.rnode().meta(),
-    };
-    if let RNodeBacking::PageBacked { pc } = target.rnode().backing() {
-        meta.size = pc.size_bytes();
     }
-    meta
 }
 
 // ============================================================================

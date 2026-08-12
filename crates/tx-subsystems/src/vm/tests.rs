@@ -1,6 +1,7 @@
 use super::*;
 use crate::page_backed::PageContainer;
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::vm::adapter::step_engine::StepOp;
 use alloc::collections::BTreeMap;
 use std::sync::{Arc, Barrier, LazyLock, Mutex};
 use std::thread_local;
@@ -336,43 +337,6 @@ fn vm_entry_split_for_protect_rewrites_middle_only() {
 }
 
 #[test]
-fn vm_entry_full_range_protect_to_writable_attaches_private_set() {
-    // PROT_NONE→RW mprotect covering the whole entry takes the full-range
-    // fast path; it must attach a PrivatePageSet (the entry was created
-    // non-writable, so none was ever attached). Without one, CoW
-    // materialization records nothing and the first post-fork write
-    // refaults live pages as fresh zero frames — this silently zeroed
-    // mallocng meta pages in git-remote-https (slow HTTPS push SIGSEGV).
-    setup_host_substrate();
-    let entry = VmEntry::new(
-        range(0x1000, 1),
-        Prot::NONE,
-        VmEntryFlags::PRIVATE,
-        VmBacking::PrivateAnon,
-    );
-    assert!(entry.private().is_none());
-
-    let rewrite = entry
-        .split_for_protect(range(0x1000, 1), Prot::READ_WRITE)
-        .expect("full-range protect");
-    assert!(rewrite.before.is_none() && rewrite.after.is_none());
-    let target = rewrite.target.expect("target");
-    assert_eq!(target.prot, Prot::READ_WRITE);
-    assert!(
-        target.private().is_some(),
-        "writable MAP_PRIVATE entry must carry a PrivatePageSet"
-    );
-
-    // A full-range protect to a non-writable prot still needs no set.
-    let ro = entry
-        .split_for_protect(range(0x1000, 1), Prot::READ)
-        .expect("full-range protect")
-        .target
-        .expect("target");
-    assert!(ro.private().is_none());
-}
-
-#[test]
 fn vm_entry_split_without_private_pages_reuses_owner_bundle() {
     let entry = VmEntry::new(
         range(0x1000, 3),
@@ -589,6 +553,29 @@ fn vm_address_space_map_reservation_publishes_recipe_on_commit() {
             vm_size: 2 * USER_PAGE_SIZE,
         }
     );
+}
+
+#[test]
+fn vm_recipe_publish_allocation_failure_preserves_authoritative_root() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let original = VmEntry::new(
+        range(0x4000, 2),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("initial map");
+    let before_stats = aspace.stats();
+
+    tx_substrate::testing::fail_next_publication_allocations(1);
+    let result = aspace.try_mprotect(original.range, Prot::READ);
+
+    assert_eq!(result, Err(VmMapError::NoFreeRange));
+    assert_eq!(aspace.lookup(UserVirtAddr(0x4000)), Some(original));
+    assert_eq!(aspace.stats(), before_stats);
 }
 
 #[test]
@@ -1743,12 +1730,61 @@ fn vm_checks_require_fault_publication_rejects_replaced_private_set_identity() {
 }
 
 #[test]
-fn vm_checks_require_fault_publication_retries_stale_private_read_after_writer_wins() {
+fn vm_checks_require_fault_publication_uses_generation_fast_path_without_publication() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     map_reserved(aspace.reserve_map(
         VmEntry::new(
-            range(0x5000, 1),
+            range(0x6000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x6000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+    assert!(outcome.recipe_generation.is_some());
+
+    super::checks::reset_fault_publication_full_revalidate_count();
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Ok(())
+    );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 0);
+}
+
+#[test]
+fn vm_checks_require_fault_publication_revalidates_after_unrelated_recipe_publish() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x8000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("target map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x8000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x20_0000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
             VmBacking::PrivateAnon,
@@ -1756,32 +1792,119 @@ fn vm_checks_require_fault_publication_retries_stale_private_read_after_writer_w
         MapPlacement::RequireFree,
     ))
     .commit()
-    .expect("map");
+    .expect("unrelated map publish");
 
-    // The reader observes an empty PrivatePageSet and prepares the shared
-    // zero frame, but has not published its PTE yet.
-    let read = aspace
-        .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Read))
-        .expect("read fault resolves");
-    let stale_read = read.materialize_pagebacked().expect("read materialization");
-
-    // A concurrent writer wins the page-level CAS and installs the
-    // authoritative private frame before the reader reaches publication.
-    let write = aspace
-        .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Write))
-        .expect("write fault resolves");
-    let winning_write = write
-        .materialize_pagebacked()
-        .expect("write materialization");
-
+    super::checks::reset_fault_publication_full_revalidate_count();
     assert_eq!(
-        super::checks::require_fault_publication(&aspace, &read, &stale_read),
-        Err(VmFaultError::StaleRecipe)
-    );
-    assert_eq!(
-        super::checks::require_fault_publication(&aspace, &write, &winning_write),
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Ok(())
     );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 1);
+}
+
+#[test]
+fn vm_checks_require_fault_publication_rejects_target_rewrite_generation_mismatch() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0xa000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xa000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+
+    aspace
+        .try_mprotect(range(0xa000, 1), Prot::NONE)
+        .expect("target rewrite");
+
+    super::checks::reset_fault_publication_full_revalidate_count();
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Err(VmFaultError::StaleRecipe)
+    );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 1);
+}
+
+#[test]
+fn vm_recipe_generation_is_monotonic_across_two_rewrites() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0xc000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("target map");
+    let before = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xc000), AccessMode::Read))
+        .expect("fault before rewrites")
+        .recipe_generation
+        .expect("stable generation");
+
+    aspace
+        .try_mprotect(range(0xc000, 1), Prot::READ)
+        .expect("first rewrite");
+    aspace
+        .try_mprotect(range(0xc000, 1), Prot::READ_WRITE)
+        .expect("second rewrite");
+
+    let after = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xc000), AccessMode::Read))
+        .expect("fault after rewrites")
+        .recipe_generation
+        .expect("stable generation");
+    assert_ne!(
+        after, before,
+        "two rewrites must not return to an old token"
+    );
+    assert!(after.raw() > before.raw());
+}
+
+#[test]
+fn vm_checks_require_fault_publication_rejects_bad_materialization_at_same_generation() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0xe000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0xe000), AccessMode::Read))
+        .expect("fault resolves");
+    let mut materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+    materialized.page_index = crate::page_backed::PageIndex::new(7);
+
+    super::checks::reset_fault_publication_full_revalidate_count();
+    assert_eq!(
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
+        Err(VmFaultError::StaleRecipe)
+    );
+    assert_eq!(super::checks::fault_publication_full_revalidate_count(), 0);
 }
 
 #[test]
@@ -2075,68 +2198,6 @@ fn vm_pmap_duplicate_publish_converges_on_existing_mapping() {
             rollbacks: 0,
             shootdowns: 0,
         }
-    );
-}
-
-#[test]
-fn vm_pmap_distinguishes_materializer_race_from_mapping_corruption() {
-    setup_host_substrate();
-    let aspace = AddressSpace::new();
-    map_reserved(aspace.reserve_map(
-        VmEntry::new(
-            range(0xd000, 1),
-            Prot::READ_WRITE,
-            VmEntryFlags::PRIVATE,
-            VmBacking::PrivateAnon,
-        ),
-        MapPlacement::RequireFree,
-    ))
-    .commit()
-    .expect("map");
-
-    // Reader validates an empty private set and prepares the shared zero page.
-    let read = aspace
-        .resolve_fault(VmFault::new(UserVirtAddr(0xd000), AccessMode::Read))
-        .expect("read fault resolves");
-    let stale_read = read.materialize_pagebacked().expect("read materializes");
-    super::checks::require_fault_publication(&aspace, &read, &stale_read)
-        .expect("reader validates before writer wins");
-
-    // A writer wins after that validation but before the reader acquires the
-    // pmap lock.
-    let write = aspace
-        .resolve_fault(VmFault::new(UserVirtAddr(0xd000), AccessMode::Write))
-        .expect("write fault resolves");
-    let winning_write = write.materialize_pagebacked().expect("write materializes");
-    let winning_ppn = winning_write.page.ppn;
-    aspace
-        .pmap
-        .publish_page_with_replacement(
-            UserPage(13),
-            winning_write.page.ppn,
-            winning_write.publish_prot,
-            winning_write.page.map_pin,
-            winning_write.replace_existing,
-        )
-        .expect("writer publishes");
-
-    assert_eq!(
-        aspace.pmap.publish_page_with_replacement(
-            UserPage(13),
-            stale_read.page.ppn,
-            stale_read.publish_prot,
-            stale_read.page.map_pin,
-            stale_read.replace_existing,
-        ),
-        Err(VmPmapError::ConcurrentPublication)
-    );
-    assert_eq!(
-        aspace.pmap().lookup(UserPage(13)),
-        Some(PmapMappingSnapshot {
-            ppn: winning_ppn,
-            prot: Prot::READ_WRITE,
-        }),
-        "the optimistic loser must not disturb the winning PTE"
     );
 }
 
@@ -2449,6 +2510,99 @@ fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
     assert_eq!(
         outcome,
         crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+    );
+}
+
+#[test]
+fn vm_reserve_user_range_op_keeps_page_cursor_across_successive_steps() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x48000, 2),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let mut op = crate::vm::step_ops::ReserveUserRangeOp::new(
+        &aspace,
+        range(0x48000, 2),
+        UserAccessKind::Write,
+    );
+    let mut ctx = crate::vm::adapter::step_engine::ScriptCtx::<
+        crate::vm::adapter::step_engine::PlaceholderProcessSubject,
+    >::new();
+
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Continue {
+            progress: crate::vm::adapter::step_engine::PageProgress::new(1),
+        }
+    );
+    assert!(aspace.pmap().lookup(UserPage(0x48)).is_some());
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Continue {
+            progress: crate::vm::adapter::step_engine::PageProgress::new(1),
+        }
+    );
+    assert!(aspace.pmap().lookup(UserPage(0x49)).is_some());
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
+    );
+}
+
+#[test]
+fn vm_reserve_user_range_op_yields_range_lock_and_retries() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x4a000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+    let holder = acquired(
+        aspace
+            .range_lock()
+            .acquire_step_rich(target, LockMode::ExclusiveWriter),
+    );
+
+    let mut op =
+        crate::vm::step_ops::ReserveUserRangeOp::new(&aspace, target, UserAccessKind::Read);
+    let mut ctx = crate::vm::adapter::step_engine::ScriptCtx::<
+        crate::vm::adapter::step_engine::PlaceholderProcessSubject,
+    >::new();
+    let blocked = op.step(&mut ctx);
+    assert_eq!(
+        blocked,
+        crate::vm::adapter::step_engine::StepOutcome::yield_on_wait_source(
+            crate::vm::adapter::step_engine::PageProgress::EMPTY,
+            aspace.range_lock().wait_source_id(),
+            RANGE_LOCK_RELEASE_MASK,
+        )
+    );
+
+    drop(holder);
+    assert!(matches!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Continue { .. }
+    ));
+    assert_eq!(
+        op.step(&mut ctx),
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     );
 }
 

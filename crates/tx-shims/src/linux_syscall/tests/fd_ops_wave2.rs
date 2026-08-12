@@ -7,15 +7,15 @@ use crate::adapter::step_engine::{
 };
 use alloc::sync::Arc;
 use alloc::vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cred::{step_setresuid, CapabilitySet, Uid};
 use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
+use tx_subsystems::mount::settlement::MountRuntimeState;
 use tx_subsystems::mount::{
     mount_for, DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions,
-    MountPayload, SourceLabel,
+    MountPayload, MountPayloadPin, SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::process::{
@@ -23,16 +23,16 @@ use tx_subsystems::process::{
 };
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, StructPayload,
-    S_IFDIR,
+    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
+    StructPayload, S_IFDIR,
 };
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_CLOSE, NR_DUP, NR_DUP3, NR_FACCESSAT, NR_MOUNT,
-    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_STATX, NR_UMOUNT2, NR_UNLINKAT, O_CLOEXEC, O_CREAT,
-    O_DIRECT, O_DIRECTORY, O_EXCL, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC,
-    R_OK, W_OK,
+    AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_CLOSE, NR_DUP, NR_DUP3, NR_FACCESSAT, NR_FDATASYNC,
+    NR_FSYNC, NR_MOUNT, NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_STATX, NR_SYNC, NR_SYNCFS,
+    NR_UMOUNT2, NR_UNLINKAT, O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_EXCL, O_NOCTTY,
+    O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, R_OK, W_OK,
 };
 
 /// errno magnitudes: positive Linux RV64 generic ABI values.
@@ -47,6 +47,9 @@ const E_MFILE: i32 = 24;
 const E_ISDIR: i32 = 21;
 const E_NXIO: i32 = 6;
 const E_LOOP: i32 = 40;
+const E_BUSY: i32 = 16;
+const E_OPNOTSUPP: i32 = 95;
+const E_IO: i32 = 5;
 
 const STAT_BYTES: usize = 128;
 const STAT_MODE_OFF: usize = 16;
@@ -142,86 +145,54 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     (root_dentry, tmpfs)
 }
 
-#[derive(Default)]
-struct RecordingFsyncBacking {
-    fsyncs: AtomicUsize,
+fn mkdir_tmpfs_mountpoint(tmpfs: &Arc<Tmpfs>) -> FsObjectId {
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (mnt_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"mnt", 0o755, &owner_cred, &guard) {
+        StepOutcome::Done(created) => created,
+        other => panic!("mkdir mnt for umount2 lifecycle test: {other:?}"),
+    };
+    mnt_id
 }
 
-impl FsPageBacking for RecordingFsyncBacking {
-    fn fetch_page(
-        &self,
-        _fs_object_id: tx_subsystems::vfs::FsObjectId,
-        _offset: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<tx_subsystems::page_backed::Frame, step_engine::NoProgress> {
-        unreachable!("dup3 flush test has no resident pages")
-    }
+fn mount_tmpfs_on_mnt(
+    ctx: &SyscallCtx<'_>,
+    namespace: &Cap<MountNamespace>,
+) -> (Vec<u8>, Cap<DEntry>, Cap<MountPayload>) {
+    let source = nul_terminate(b"none");
+    let target = nul_terminate(b"/mnt");
+    let fstype = nul_terminate(b"tmpfs");
+    let mount_req = SyscallRequest::new(
+        NR_MOUNT,
+        [
+            source.as_ptr() as u64,
+            target.as_ptr() as u64,
+            fstype.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(mount_req, ctx)),
+        SyscallResult::Return(0)
+    );
 
-    fn flush_page(
-        &self,
-        _fs_object_id: tx_subsystems::vfs::FsObjectId,
-        _offset: u64,
-        _frame: &tx_subsystems::page_backed::Frame,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), step_engine::NoProgress> {
-        StepOutcome::done(())
-    }
-
-    fn truncate(
-        &self,
-        _fs_object_id: tx_subsystems::vfs::FsObjectId,
-        _new_size: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), step_engine::NoProgress> {
-        StepOutcome::done(())
-    }
-
-    fn fsync_file(
-        &self,
-        _fs_object_id: tx_subsystems::vfs::FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), step_engine::NoProgress> {
-        self.fsyncs.fetch_add(1, Ordering::AcqRel);
-        StepOutcome::done(())
-    }
-}
-
-fn recording_page_backed_open_file(
-    fs_ops: Arc<Tmpfs>,
-) -> (
-    Cap<tx_subsystems::vfs::OpenFile>,
-    Arc<RecordingFsyncBacking>,
-) {
-    use tx_subsystems::mount::MountPayloadPin;
-    use tx_subsystems::page_backed::PageContainer;
-    use tx_subsystems::vfs::OpenFileFlags;
-
-    let backing = Arc::new(RecordingFsyncBacking::default());
-    let mount = MountPayload::new_cap(
-        fs_ops,
-        backing.clone(),
-        None,
-        DevId::new(204),
-        MountOptions::default(),
-        "recording-fsync",
-        SourceLabel::Static("recording-fsync"),
-    )
-    .expect("recording fsync mount payload");
-    let pc = PageContainer::new_file_cap(
-        MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
-        tx_subsystems::vfs::FsObjectId::new(2),
-        0,
-    )
-    .expect("recording file page container");
-    let rnode = RNode::new_cap(
-        tx_subsystems::vfs::FsObjectId::new(2),
-        InodeMeta::new(InodeKind::Regular, 0o100644),
-        RNodeBacking::PageBacked { pc },
-    )
-    .expect("recording file rnode");
-    let file = tx_subsystems::vfs::OpenFile::new_cap(rnode, OpenFileFlags::default())
-        .expect("recording open file");
-    (file, backing)
+    let mountpoint = namespace
+        .root_dentry()
+        .cached_child(InlineName::new(b"mnt").expect("mountpoint name"))
+        .expect("cached mountpoint");
+    let mount = namespace
+        .mount_for(&mountpoint)
+        .expect("namespace tmpfs mount");
+    let payload = mount.payload_cap().expect("mounted payload").into_cap();
+    drop(fstype);
+    drop(source);
+    (target, mountpoint, payload)
 }
 
 fn build_devfs_root() -> Cap<DEntry> {
@@ -1383,6 +1354,113 @@ fn dispatch_openat_after_mount_umount_creates_on_uncovered_mountpoint() {
 }
 
 #[test]
+fn dispatch_umount2_mnt_force_returns_eopnotsupp_and_keeps_mount_visible() {
+    const MNT_FORCE: u64 = 1;
+
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    mkdir_tmpfs_mountpoint(&tmpfs);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let mnt_ns = MountNamespace::new_cap(root_mount).expect("mount namespace");
+    step_set_mount_namespace(&proc_cap, mnt_ns.clone()).expect("install mount namespace");
+    let ctx = make_ctx(proc_cap, thread);
+    let (target, mountpoint, _payload) = mount_tmpfs_on_mnt(&ctx, &mnt_ns);
+
+    let umount_req =
+        SyscallRequest::new(NR_UMOUNT2, [target.as_ptr() as u64, MNT_FORCE, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(umount_req, &ctx)),
+        SyscallResult::Error(E_OPNOTSUPP)
+    );
+    assert!(
+        mnt_ns.mount_for(&mountpoint).is_some(),
+        "MNT_FORCE rejection must not withdraw topology"
+    );
+}
+
+#[test]
+fn dispatch_umount2_normal_settles_payload_before_withdrawing_topology() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    mkdir_tmpfs_mountpoint(&tmpfs);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let mnt_ns = MountNamespace::new_cap(root_mount).expect("mount namespace");
+    step_set_mount_namespace(&proc_cap, mnt_ns.clone()).expect("install mount namespace");
+    let ctx = make_ctx(proc_cap, thread);
+    let (target, mountpoint, payload) = mount_tmpfs_on_mnt(&ctx, &mnt_ns);
+
+    assert_eq!(payload.runtime_state(), MountRuntimeState::Open);
+    let umount_req = SyscallRequest::new(NR_UMOUNT2, [target.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(umount_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(mnt_ns.mount_for(&mountpoint).is_none());
+    assert_eq!(payload.runtime_state(), MountRuntimeState::Detached);
+}
+
+#[test]
+fn dispatch_umount2_normal_busy_keeps_payload_open_and_mount_visible() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    mkdir_tmpfs_mountpoint(&tmpfs);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let mnt_ns = MountNamespace::new_cap(root_mount).expect("mount namespace");
+    step_set_mount_namespace(&proc_cap, mnt_ns.clone()).expect("install mount namespace");
+    let ctx = make_ctx(proc_cap, thread);
+    let (target, mountpoint, payload) = mount_tmpfs_on_mnt(&ctx, &mnt_ns);
+    let _external_user = MountPayloadPin::acquire_cap(&payload);
+
+    let umount_req = SyscallRequest::new(NR_UMOUNT2, [target.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(umount_req, &ctx)),
+        SyscallResult::Error(E_BUSY)
+    );
+    assert!(
+        mnt_ns.mount_for(&mountpoint).is_some(),
+        "busy normal umount must not withdraw topology"
+    );
+    assert_eq!(payload.runtime_state(), MountRuntimeState::Open);
+}
+
+#[test]
+fn dispatch_umount2_mnt_detach_with_active_payload_user_withdraws_topology_only() {
+    const MNT_DETACH: u64 = 2;
+
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    mkdir_tmpfs_mountpoint(&tmpfs);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let mnt_ns = MountNamespace::new_cap(root_mount).expect("mount namespace");
+    step_set_mount_namespace(&proc_cap, mnt_ns.clone()).expect("install mount namespace");
+    let ctx = make_ctx(proc_cap, thread);
+    let (target, mountpoint, payload) = mount_tmpfs_on_mnt(&ctx, &mnt_ns);
+    let external_user = MountPayloadPin::acquire_cap(&payload);
+
+    let umount_req =
+        SyscallRequest::new(NR_UMOUNT2, [target.as_ptr() as u64, MNT_DETACH, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(umount_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert!(mnt_ns.mount_for(&mountpoint).is_none());
+    assert_eq!(payload.runtime_state(), MountRuntimeState::DetachedPending);
+    assert_eq!(payload.payload_pin_count(), 1);
+
+    drop(external_user);
+    assert_eq!(payload.runtime_state(), MountRuntimeState::Quiescing);
+    assert_eq!(payload.payload_pin_count(), 1);
+
+    let guard = step_engine::guard();
+    assert_eq!(
+        tx_subsystems::mount::drive_background_mount_settlement_once(&guard),
+        StepOutcome::done(())
+    );
+    assert_eq!(payload.runtime_state(), MountRuntimeState::Detached);
+    assert_eq!(payload.payload_pin_count(), 0);
+}
+
+#[test]
 fn dispatch_openat_creat_uses_process_mount_namespace_without_global_mount_table() {
     let _setup = fd_ops_setup();
     let (_legacy_root_dentry, root_tmpfs, root_mount) = build_tmpfs_root_with_mount();
@@ -1607,6 +1685,138 @@ fn dispatch_umount2_in_cloned_mount_namespace_preserves_parent_and_global_mount(
     );
     assert!(parent_namespace.mount_for(&mountpoint).is_none());
     assert!(mount_for(&root_payload, mnt_id).is_none());
+}
+
+#[test]
+fn dispatch_fsync_reports_payload_error_once_per_open_file() {
+    let _setup = fd_ops_setup();
+    let (_root_dentry, _tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    let payload = root_mount
+        .payload_cap()
+        .expect("root mount payload")
+        .into_cap();
+    let first_file = OpenFile::new_cap_with_mount_payload(
+        root_mount.root_dentry().rnode().clone(),
+        OpenFileFlags::default(),
+        &payload,
+    )
+    .expect("first root open file");
+    let second_file = OpenFile::new_cap_with_mount_payload(
+        root_mount.root_dentry().rnode().clone(),
+        OpenFileFlags::default(),
+        &payload,
+    )
+    .expect("second root open file");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_mount.root_dentry().clone());
+    proc_cap.set_fd(7, Some(first_file));
+    proc_cap.set_fd(8, Some(second_file));
+    let ctx = make_ctx(proc_cap, thread);
+
+    payload.complete_settlement(Err(tx_subsystems::execution::Errno::EIO));
+
+    let fsync_req = SyscallRequest::new(NR_FSYNC, [7, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(fsync_req, &ctx)),
+        SyscallResult::Error(E_IO)
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(fsync_req, &ctx)),
+        SyscallResult::Return(0),
+        "the first open-file cursor consumed this error"
+    );
+
+    let fdatasync_req = SyscallRequest::new(NR_FDATASYNC, [8, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(fdatasync_req, &ctx)),
+        SyscallResult::Error(E_IO),
+        "a second open-file description must retain its own error cursor"
+    );
+}
+
+#[test]
+fn dispatch_fsync_open_after_error_samples_current_payload_error_sequence() {
+    let _setup = fd_ops_setup();
+    let (_root_dentry, _tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    let payload = root_mount
+        .payload_cap()
+        .expect("root mount payload")
+        .into_cap();
+    payload.complete_settlement(Err(tx_subsystems::execution::Errno::EIO));
+
+    let root_file = OpenFile::new_cap_with_mount_payload(
+        root_mount.root_dentry().rnode().clone(),
+        OpenFileFlags::default(),
+        &payload,
+    )
+    .expect("root open file");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_mount.root_dentry().clone());
+    proc_cap.set_fd(7, Some(root_file));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let fsync_req = SyscallRequest::new(NR_FSYNC, [7, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(fsync_req, &ctx)),
+        SyscallResult::Return(0),
+        "a new open-file description samples the already-published error sequence"
+    );
+}
+
+#[test]
+fn dispatch_syncfs_reports_mount_error_once_per_open_file_and_sync_ignores_errors() {
+    let _setup = fd_ops_setup();
+    let (_root_dentry, _tmpfs, root_mount) = build_tmpfs_root_with_mount();
+    let payload = root_mount
+        .payload_cap()
+        .expect("root mount payload")
+        .into_cap();
+    let first_file = OpenFile::new_cap_with_mount_payload(
+        root_mount.root_dentry().rnode().clone(),
+        OpenFileFlags::default(),
+        &payload,
+    )
+    .expect("first root open file");
+    let second_file = OpenFile::new_cap_with_mount_payload(
+        root_mount.root_dentry().rnode().clone(),
+        OpenFileFlags::default(),
+        &payload,
+    )
+    .expect("second root open file");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_mount.root_dentry().clone());
+    let namespace = MountNamespace::new_cap(root_mount).expect("mount namespace");
+    step_set_mount_namespace(&proc_cap, namespace).expect("install mount namespace");
+    proc_cap.set_fd(7, Some(first_file));
+    proc_cap.set_fd(8, Some(second_file));
+    let ctx = make_ctx(proc_cap, thread);
+
+    payload.complete_settlement(Err(tx_subsystems::execution::Errno::EIO));
+
+    let syncfs_req = SyscallRequest::new(NR_SYNCFS, [7, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(syncfs_req, &ctx)),
+        SyscallResult::Error(E_IO)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(syncfs_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    let second_syncfs_req = SyscallRequest::new(NR_SYNCFS, [8, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(second_syncfs_req, &ctx)),
+        SyscallResult::Error(E_IO),
+        "a second open-file description must observe the same mount error once"
+    );
+
+    payload.complete_settlement(Err(tx_subsystems::execution::Errno::EIO));
+    let sync_req = SyscallRequest::new(NR_SYNC, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(sync_req, &ctx)),
+        SyscallResult::Return(0),
+        "sync records mount settlement errors but follows Linux's success return contract"
+    );
 }
 
 /// `openat(.., O_CREAT | O_EXCL)` against an *existing* file
@@ -2224,53 +2434,6 @@ fn dispatch_dup3_at_specific_fd_replaces_existing() {
     assert!(proc_cap.fd(fd_a).is_some());
     drop(path_a);
     drop(path_b);
-}
-
-#[test]
-fn dispatch_dup3_flushes_replaced_page_backed_file() {
-    let _setup = fd_ops_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
-    let owner_cred = Credential {
-        uid: 0,
-        gid: 0,
-        effective_caps: CapabilitySet::FULL,
-    };
-    let guard = ebr_guard();
-    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard);
-    drop(guard);
-
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let path_a = nul_terminate(b"/a");
-    let oldfd = match block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(
-            NR_OPENAT,
-            [
-                AT_FDCWD as i64 as u64,
-                path_a.as_ptr() as u64,
-                O_RDONLY as u64,
-                0,
-                0,
-                0,
-            ],
-        ),
-        &ctx,
-    )) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("openat /a: {other:?}"),
-    };
-    let newfd = 100;
-    let (replaced, backing) = recording_page_backed_open_file(tmpfs);
-    assert!(proc_cap.install_fd(newfd, replaced).is_none());
-
-    let result = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_DUP3, [oldfd as u64, newfd as u64, 0, 0, 0, 0]),
-        &ctx,
-    ));
-
-    assert_eq!(result, SyscallResult::Return(newfd as i64));
-    assert_eq!(backing.fsyncs.load(Ordering::Acquire), 1);
-    drop(path_a);
 }
 
 /// `dup3(oldfd, newfd, O_CLOEXEC)` sets the cloexec bit on the

@@ -572,7 +572,9 @@ fn print_one(
                 println!("    `tx-shell-syscall-fixup` for the observe→fix→verify loop");
             } else {
                 println!("  - add a match arm in {MOD_RS} routing to a handler");
-                println!("  - load `tx-syscall-dispatch` for lane choice (Immediate / OneShotStepOp / async)");
+                println!(
+                    "  - load `tx-syscall-dispatch` for lane choice (Immediate / OneShotStepOp / async)"
+                );
                 println!("  - target an OSComp or LTP test that exercises this syscall");
                 println!("    (see {STATUS_DOC} for the gold-standard correctness bar)");
             }

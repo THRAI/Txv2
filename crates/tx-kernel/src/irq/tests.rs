@@ -27,11 +27,10 @@ use tx_hal::{
 
 use crate::init::{console_tty, CoreInit};
 use crate::irq::{
-    drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats, net_rx_irq_handler,
-    register_irq_handler, rtc_alarm_irq_handler, uart_rx_irq_handler,
+    handler_for, install_irq_handlers, register_irq_handler, rtc_alarm_irq_handler,
+    uart_rx_irq_handler,
 };
 use crate::test_serialise::KERNEL_TEST_LOCK as IRQ_TEST_LOCK;
-use tx_subsystems::net::device::{reset_net_registry_for_test, NetDeviceIrqOutcome};
 use tx_subsystems::signal::Signum;
 
 const TEST_PAGE_SIZE: usize = 4096;
@@ -59,58 +58,6 @@ static IRQ_TEST_UART_UNMASKED: AtomicBool = AtomicBool::new(false);
 
 /// Records that `unmask` was called for the RTC IRQ.
 static IRQ_TEST_RTC_UNMASKED: AtomicBool = AtomicBool::new(false);
-
-/// Records that `unmask` was called for the network IRQ.
-static IRQ_TEST_NET_UNMASKED: AtomicBool = AtomicBool::new(false);
-
-static IRQ_TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
-static IRQ_TEST_COMPLETED_IRQ: AtomicU32 = AtomicU32::new(0);
-static IRQ_TEST_COMPLETE_COUNT: AtomicUsize = AtomicUsize::new(0);
-static IRQ_TEST_NET_ACK_COUNT: AtomicUsize = AtomicUsize::new(0);
-static IRQ_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-static IRQ_TEST_ACK_ORDER: AtomicUsize = AtomicUsize::new(0);
-static IRQ_TEST_COMPLETE_ORDER: AtomicUsize = AtomicUsize::new(0);
-
-struct IrqTestNetDevice;
-
-impl tx_subsystems::net::NetDeviceOps for IrqTestNetDevice {
-    fn receive(&self) -> Option<tx_subsystems::net::RxFrame> {
-        None
-    }
-
-    fn transmit(
-        &self,
-        _frame: &[u8],
-        _guard: &tx_subsystems::execution::Guard<'_>,
-    ) -> tx_subsystems::execution::StepOutcome<()> {
-        tx_subsystems::execution::StepOutcome::Done(())
-    }
-
-    fn mac_addr(&self) -> tx_subsystems::net::EthernetAddress {
-        tx_subsystems::net::EthernetAddress::new([0x02, 0, 0, 0, 0, 0x71])
-    }
-
-    fn mtu(&self) -> u16 {
-        1500
-    }
-
-    fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
-        IRQ_TEST_NET_ACK_COUNT.fetch_add(1, Ordering::AcqRel);
-        let order = IRQ_TEST_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
-        IRQ_TEST_ACK_ORDER.store(order, Ordering::Release);
-        NetDeviceIrqOutcome::default()
-    }
-}
-
-static IRQ_TEST_NET_DEVICE: IrqTestNetDevice = IrqTestNetDevice;
-static IRQ_TEST_NET_REGISTRATION: tx_subsystems::net::NetDeviceRegistration =
-    tx_subsystems::net::NetDeviceRegistration {
-        devt: tx_subsystems::device::DevT::new(97, 0),
-        name: "eth0",
-        ops: &IRQ_TEST_NET_DEVICE,
-    };
-static IRQ_TEST_NET_REGISTRATIONS: &[&tx_subsystems::net::NetDeviceRegistration] =
-    &[&IRQ_TEST_NET_REGISTRATION];
 
 fn drain_rx_queue(buf: &mut [u8]) -> usize {
     let mut queue = IRQ_TEST_RX_QUEUE.lock().expect("rx queue lock");
@@ -177,7 +124,6 @@ impl IrqIf for IrqTestPlatform {
     /// short-circuits on.
     const UART_IRQ: u32 = 7;
     const RTC_IRQ: u32 = 8;
-    const NET_IRQ: u32 = 9;
 
     fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
         unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
@@ -192,22 +138,12 @@ impl IrqIf for IrqTestPlatform {
         IRQ_TEST_LAST_PRIORITY.store(priority as u32, Ordering::Release);
     }
 
-    fn complete(irq: u32) {
-        IRQ_TEST_COMPLETED_IRQ.store(irq, Ordering::Release);
-        IRQ_TEST_COMPLETE_COUNT.fetch_add(1, Ordering::AcqRel);
-        let order = IRQ_TEST_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
-        IRQ_TEST_COMPLETE_ORDER.store(order, Ordering::Release);
-    }
-
     fn unmask(irq: u32) {
         if irq == <Self as IrqIf>::UART_IRQ {
             IRQ_TEST_UART_UNMASKED.store(true, Ordering::Release);
         }
         if irq == <Self as IrqIf>::RTC_IRQ {
             IRQ_TEST_RTC_UNMASKED.store(true, Ordering::Release);
-        }
-        if irq == <Self as IrqIf>::NET_IRQ {
-            IRQ_TEST_NET_UNMASKED.store(true, Ordering::Release);
         }
     }
 }
@@ -230,18 +166,10 @@ impl tx_hal::DeadlineTimerIf for IrqTestPlatform {
 
 impl tx_hal::PersistentClockIf for IrqTestPlatform {}
 
-impl tx_hal::PercpuIf for IrqTestPlatform {
-    fn current_cpu_id() -> tx_hal::CpuId {
-        tx_hal::CpuId(IRQ_TEST_CURRENT_CPU.load(Ordering::Acquire))
-    }
-}
+impl tx_hal::PercpuIf for IrqTestPlatform {}
 impl tx_hal::CacheIf for IrqTestPlatform {}
 impl tx_hal::DmaIf for IrqTestPlatform {}
-impl tx_hal::SmpIf for IrqTestPlatform {
-    fn current_cpu_id() -> tx_hal::CpuId {
-        tx_hal::CpuId(IRQ_TEST_CURRENT_CPU.load(Ordering::Acquire))
-    }
-}
+impl tx_hal::SmpIf for IrqTestPlatform {}
 
 impl tx_hal::EntropyIf for IrqTestPlatform {}
 impl ObserverIf for IrqTestPlatform {}
@@ -306,8 +234,6 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
     crate::irq::reset_pending_uart_rx_for_test();
-    crate::irq::reset_pending_net_irq_for_test();
-    reset_net_registry_for_test();
     IRQ_TEST_RX_QUEUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -316,14 +242,6 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     IRQ_TEST_LAST_PRIORITY.store(0, Ordering::Release);
     IRQ_TEST_UART_UNMASKED.store(false, Ordering::Release);
     IRQ_TEST_RTC_UNMASKED.store(false, Ordering::Release);
-    IRQ_TEST_NET_UNMASKED.store(false, Ordering::Release);
-    IRQ_TEST_CURRENT_CPU.store(0, Ordering::Release);
-    IRQ_TEST_COMPLETED_IRQ.store(0, Ordering::Release);
-    IRQ_TEST_COMPLETE_COUNT.store(0, Ordering::Release);
-    IRQ_TEST_NET_ACK_COUNT.store(0, Ordering::Release);
-    IRQ_TEST_SEQUENCE.store(0, Ordering::Release);
-    IRQ_TEST_ACK_ORDER.store(0, Ordering::Release);
-    IRQ_TEST_COMPLETE_ORDER.store(0, Ordering::Release);
     tx_fs::devfs::reset_rtc_backend_for_test();
     guard
 }
@@ -424,91 +342,6 @@ fn install_irq_handlers_publishes_table_to_platform() {
         IRQ_TEST_RTC_UNMASKED.load(Ordering::Acquire),
         "RTC IRQ should be unmasked after its event source is initialized",
     );
-
-    let installed = handler_for(<IrqTestPlatform as IrqIf>::NET_IRQ).expect("network handler");
-    assert_eq!(
-        (installed as *const ()),
-        (net_rx_irq_handler::<IrqTestPlatform> as *const ()),
-        "NET_IRQ slot should hold the deferred virtio-net handler",
-    );
-    assert!(
-        IRQ_TEST_NET_UNMASKED.load(Ordering::Acquire),
-        "network IRQ should be unmasked after its handler is published",
-    );
-}
-
-#[test]
-fn net_irq_bottom_half_acks_device_before_same_hart_completion() {
-    let _setup = setup();
-    assert_eq!(
-        tx_subsystems::net::register_net_devices(IRQ_TEST_NET_REGISTRATIONS),
-        tx_subsystems::execution::StepOutcome::Done(())
-    );
-
-    assert_eq!(
-        net_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::NET_IRQ),
-        IrqHandled::DeferredWake
-    );
-    assert_eq!(
-        IRQ_TEST_COMPLETE_COUNT.load(Ordering::Acquire),
-        0,
-        "top half must leave controller completion outstanding",
-    );
-
-    assert!(drain_net_rx_irq::<IrqTestPlatform>());
-    assert_eq!(IRQ_TEST_NET_ACK_COUNT.load(Ordering::Acquire), 1);
-    assert_eq!(IRQ_TEST_COMPLETE_COUNT.load(Ordering::Acquire), 1);
-    assert_eq!(
-        IRQ_TEST_COMPLETED_IRQ.load(Ordering::Acquire),
-        <IrqTestPlatform as IrqIf>::NET_IRQ
-    );
-    assert_eq!(IRQ_TEST_ACK_ORDER.load(Ordering::Acquire), 1);
-    assert_eq!(
-        IRQ_TEST_COMPLETE_ORDER.load(Ordering::Acquire),
-        2,
-        "device ACK/poll must precede controller completion",
-    );
-    assert!(!drain_net_rx_irq::<IrqTestPlatform>());
-    assert_eq!(
-        net_irq_stats(),
-        crate::irq::NetIrqStats {
-            claims: 1,
-            completions: 1,
-            wrong_hart_drains: 0,
-            missing_device_drains: 0,
-        }
-    );
-}
-
-#[test]
-fn net_irq_claim_can_only_be_completed_by_its_claimant_hart() {
-    let _setup = setup();
-    assert_eq!(
-        tx_subsystems::net::register_net_devices(IRQ_TEST_NET_REGISTRATIONS),
-        tx_subsystems::execution::StepOutcome::Done(())
-    );
-
-    IRQ_TEST_CURRENT_CPU.store(0, Ordering::Release);
-    assert_eq!(
-        net_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::NET_IRQ),
-        IrqHandled::DeferredWake
-    );
-
-    IRQ_TEST_CURRENT_CPU.store(1, Ordering::Release);
-    assert!(!drain_net_rx_irq::<IrqTestPlatform>());
-    assert_eq!(IRQ_TEST_NET_ACK_COUNT.load(Ordering::Acquire), 0);
-    assert_eq!(IRQ_TEST_COMPLETE_COUNT.load(Ordering::Acquire), 0);
-
-    IRQ_TEST_CURRENT_CPU.store(0, Ordering::Release);
-    assert!(drain_net_rx_irq::<IrqTestPlatform>());
-    let stats = net_irq_stats();
-    assert_eq!(stats.claims, 1);
-    assert_eq!(stats.completions, 1);
-    assert_eq!(
-        stats.wrong_hart_drains, 0,
-        "a non-owner hart checks its own idle slot rather than touching the claimant's slot",
-    );
-    assert_eq!(stats.missing_device_drains, 0);
 }
 
 #[test]

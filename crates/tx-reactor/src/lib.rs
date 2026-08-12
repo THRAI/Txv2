@@ -43,8 +43,8 @@ pub use mailbox::{
     ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
 pub use runtime::{
-    HartPollBudget, HartRunStats, HartRuntimeView, Reactor, ReactorObservability, RunIdleReport,
-    RunStats, SharedReactor, SliceClock, TaskPublishReport,
+    HartRunStats, HartRuntimeView, Reactor, ReactorObservability, RunIdleReport, RunStats,
+    SharedReactor, SliceClock, TaskPublishReport,
 };
 pub use scheduler::{
     HartId, HartSchedulerLocal, InitialSchedMeta, LocalEnqueueRequest, MigrationPolicy,
@@ -54,7 +54,7 @@ pub use scheduler::{
 };
 pub use task::{
     current_deadline_registrar, current_delegate_registry, current_task_mailbox, TaskDrainRecord,
-    TaskId, TaskKey, TaskLifecycleError, TaskRuntimeDiagnostic, TaskStatus,
+    TaskId, TaskKey, TaskLifecycleError, TaskStatus,
 };
 pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};
 pub use yield_now::{yield_now, YieldNow};

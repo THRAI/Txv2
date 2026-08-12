@@ -7,7 +7,8 @@ use std::process::Command;
 
 use crate::target::{Profile, TxTarget};
 use crate::util::{
-    command_exists, option_value, optional_option_value, run_cmd_owned, run_shell, shell_escape,
+    command_exists, command_or_candidates, option_value, optional_option_value, run_cmd_owned,
+    run_shell, shell_escape,
 };
 use crate::Result;
 
@@ -394,11 +395,11 @@ pub(crate) fn ensure_test_initramfs(root: &Path, target: TxTarget) -> Result<Pat
     Ok(out)
 }
 
-/// Append one executable guest helper to the test-init CPIO image.
+/// Add one executable guest helper to the test-init CPIO image.
 ///
-/// Linux accepts concatenated `newc` archives as an initramfs. Keeping this
-/// overlay separate lets focused witnesses add a private helper without
-/// broadening the generic test-init image contract.
+/// The helper is staged only after the generic rootfs was prepared. The CPIO
+/// is then rebuilt as a single archive: the current test-init unpacker does
+/// not consume a second concatenated `newc` archive.
 pub(crate) fn append_test_init_overlay(
     root: &Path,
     target: TxTarget,
@@ -426,28 +427,30 @@ pub(crate) fn append_test_init_overlay(
         ));
     }
 
-    let stage = root
+    let layout = root
         .join("target")
         .join("rootfs")
-        .join(format!("test-init-overlay-{}-{guest_name}", target.name()));
-    if stage.exists() {
-        fs::remove_dir_all(&stage).map_err(|err| err.to_string())?;
+        .join(format!("test-init-{}", target.name()));
+    if !layout.is_dir() {
+        return Err(format!(
+            "missing test-init rootfs {}; build it before adding an overlay",
+            layout.display()
+        ));
     }
-    fs::create_dir_all(&stage).map_err(|err| err.to_string())?;
-    let guest_path = stage.join(guest_name);
+    let guest_path = layout.join(guest_name);
     fs::copy(source, &guest_path).map_err(|err| err.to_string())?;
     #[cfg(unix)]
     fs::set_permissions(&guest_path, fs::Permissions::from_mode(0o755))
         .map_err(|err| err.to_string())?;
 
     let script = format!(
-        "cd '{}' && find . -print | cpio -o -H newc >> '{}'",
-        shell_escape(&stage.display().to_string()),
+        "cd '{}' && find . -print | cpio -o -H newc > '{}'",
+        shell_escape(&layout.display().to_string()),
         shell_escape(&initramfs.display().to_string())
     );
     run_shell(root, &script)?;
     println!(
-        "test-init: appended {} as /{} to {}",
+        "test-init: installed {} as /{} into {}",
         source.display(),
         guest_name,
         initramfs.display()
@@ -461,11 +464,19 @@ fn image_ext4_busybox(
     target: TxTarget,
     output_name: &str,
 ) -> Result<()> {
-    if !command_exists("mkfs.ext4") {
-        return Err("mkfs.ext4 is required to create the busybox ext4 image".into());
-    }
+    let mkfs_ext4 = command_or_candidates(
+        "mkfs.ext4",
+        &[
+            "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/opt/homebrew/sbin/mkfs.ext4",
+            "/opt/homebrew/Cellar/e2fsprogs/1.47.4/sbin/mkfs.ext4",
+            "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/usr/local/sbin/mkfs.ext4",
+        ],
+    )
+    .ok_or_else(|| "mkfs.ext4 is required to create the busybox ext4 image".to_string())?;
     let size = optional_option_value(args, "--size").unwrap_or_else(|| "64M".to_string());
-    let layout = prepare_busybox_rootfs(root, target)?;
+    let layout = prepare_busybox_ext4_rootfs(root, target)?;
     let out = root.join("target").join("images").join(output_name);
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
@@ -478,9 +489,17 @@ fn image_ext4_busybox(
     )?;
     run_cmd_owned(
         root,
-        "mkfs.ext4",
+        &mkfs_ext4,
         &[
             "-F".into(),
+            "-b".into(),
+            "4096".into(),
+            "-I".into(),
+            "256".into(),
+            "-O".into(),
+            "^orphan_file,^metadata_csum_seed".into(),
+            "-E".into(),
+            "lazy_itable_init=0,lazy_journal_init=0".into(),
             "-L".into(),
             "TXROOT".into(),
             "-d".into(),
@@ -490,6 +509,21 @@ fn image_ext4_busybox(
     )?;
     println!("wrote {} ({size})", out.display());
     Ok(())
+}
+
+fn prepare_busybox_ext4_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
+    let busybox = resolve_busybox(root, target)?;
+
+    let layout = root
+        .join("target")
+        .join("rootfs")
+        .join(format!("busybox-ext4-{}", target.name()));
+    if layout.exists() {
+        fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(layout.join("musl")).map_err(|err| err.to_string())?;
+    fs::copy(&busybox, layout.join("musl").join("busybox")).map_err(|err| err.to_string())?;
+    Ok(layout)
 }
 
 fn remove_existing_image(path: &Path) -> Result<()> {
@@ -650,7 +684,9 @@ fn prepare_test_init_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     if layout.exists() {
         fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
     }
-    fs::create_dir_all(layout.join("bin")).map_err(|err| err.to_string())?;
+    for dir in ["bin"] {
+        fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
+    }
 
     fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
     let init_src = root.join("tools").join("test-init").join("tx-test-init.sh");
@@ -999,7 +1035,9 @@ mod tests {
     #[test]
     fn user_smoke_compiler_candidates_include_bare_metal_freestanding_toolchain() {
         assert!(
-            user_smoke_compiler_candidates().contains(&"riscv64-unknown-elf-gcc"),
+            user_smoke_compiler_candidates()
+                .iter()
+                .any(|candidate| *candidate == "riscv64-unknown-elf-gcc"),
             "freestanding helper sources should build with the local bare-metal RISC-V GCC"
         );
     }

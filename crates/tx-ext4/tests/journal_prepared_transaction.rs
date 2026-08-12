@@ -1,34 +1,29 @@
 use std::sync::Arc;
 use tx_ext4::journal::{
-    Ext4MutationPlanSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool,
-    JournalRecordLayout, JournalRing, JournalRingError, MutationJournalImage,
+    Ext4MutationPlanSource, JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource,
+    JournalPagePool, JournalRecordLayout, JournalRing, JournalRingError, MutationJournalImage,
     MutationJournalLayout, PreparedJournalTransaction,
 };
 use tx_ext4::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
 use tx_ext4_format::journal::{
-    Jbd2MetadataUpdate, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
+    Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
 };
 use tx_ext4_format::mutation::{
-    Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
+    Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, RevokeRecord,
+    SealedDataWrite,
 };
 use tx_ext4_format::pager::JournalGeometry;
 use tx_subsystems::fs_iface::{IoDataLeaseId, IoDataSource, PageFrameRef};
-use tx_subsystems::io_manager::block::{DeviceKey, LbaRange};
+use tx_subsystems::io_manager::block::{BioVec, BlockOp, DeviceKey, LbaRange};
 
-static JOURNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn setup() -> std::sync::MutexGuard<'static, ()> {
-    let serial = JOURNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+fn setup() {
     tx_test_support::init_host();
     tx_subsystems::zones::register_all().expect("kernel zones");
-    serial
 }
 
 #[test]
 fn journal_page_pool_reuses_record_page_after_lease_drop() {
-    let _serial = setup();
+    setup();
     let pool = JournalPagePool::new(1).unwrap();
     let guard = tx_substrate::epoch::guard();
     let first = pool.stage(&[0; JBD2_BLOCK_SIZE], &guard).unwrap();
@@ -52,7 +47,7 @@ impl Ext4MutationPlanSource for FixedMutationPlan {
 
 #[test]
 fn prepared_transaction_keeps_all_commit_record_leases() {
-    let _serial = setup();
+    setup();
     let image = Jbd2TransactionImage::encode_legacy(
         7,
         [1; 16],
@@ -77,12 +72,97 @@ fn prepared_transaction_keeps_all_commit_record_leases() {
     .unwrap();
 
     assert_eq!(prepared.record_count(), 3);
-    assert_eq!(prepared.plan().commit_graph().unwrap().nodes().len(), 5);
+    assert_eq!(prepared.plan().commit_graph().unwrap().nodes().len(), 6);
+}
+
+#[test]
+fn prepared_transaction_keeps_every_revoke_page_until_checkpoint_completion() {
+    setup();
+    let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
+    mutation
+        .push_metadata(MetadataBlock {
+            home: 33,
+            role: MetaRole::InodeTable,
+            before_version: 1,
+            after: [2; JBD2_BLOCK_SIZE],
+            depends_on: Vec::new(),
+        })
+        .unwrap();
+    mutation.revokes = (100..)
+        .take(Jbd2Revoke::MAX_BLOCKS_PER_PAGE + 1)
+        .map(|physical_block| RevokeRecord { physical_block })
+        .collect();
+    let image = MutationJournalImage::from_plan(
+        &mutation,
+        MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [1; 16],
+            7,
+            JournalRecordLayout::new(
+                LbaRange::new(80, 8),
+                vec![LbaRange::new(88, 8)],
+                LbaRange::new(120, 8),
+            )
+            .with_revokes(vec![LbaRange::new(96, 8), LbaRange::new(104, 8)]),
+        ),
+    )
+    .unwrap();
+    assert_eq!(image.image.revokes.len(), 2);
+
+    let pool = JournalPagePool::new(6).unwrap();
+    let guard = tx_substrate::epoch::guard();
+    let prepared = PreparedJournalTransaction::stage_mutation(&pool, image, &guard).unwrap();
+    assert_eq!(prepared.record_count(), 6);
+
+    let source = JournalFsyncSource::new();
+    source.begin(prepared).unwrap();
+    let data = tx_subsystems::fs_iface::BackendPageRequest::new(
+        tx_subsystems::fs_iface::FsObjectKey::new(12),
+        tx_subsystems::io_manager::page::PageIoRequestId::new(69),
+        tx_subsystems::io_manager::page::PageIoRange::new(0, 1),
+        tx_subsystems::io_manager::page::PageIoOp::Writeback,
+        tx_subsystems::io_manager::page::PageIoFlags::WRITEBACK,
+        None,
+    );
+    assert!(matches!(
+        source.plan_data(&data),
+        tx_subsystems::fs_iface::BackendPlan::SubmitGraph(_)
+    ));
+    source.complete_data(tx_subsystems::fs_iface::BackendPageCompletion::new(
+        data.object,
+        data.id,
+        data.op,
+        tx_subsystems::io_manager::page::PageIoResult::Done,
+    ));
+    let fsync = tx_subsystems::fs_iface::BackendPageRequest::new(
+        tx_subsystems::fs_iface::FsObjectKey::new(12),
+        tx_subsystems::io_manager::page::PageIoRequestId::new(70),
+        tx_subsystems::io_manager::page::PageIoRange::new(0, 1),
+        tx_subsystems::io_manager::page::PageIoOp::Fsync,
+        tx_subsystems::io_manager::page::PageIoFlags::BARRIER,
+        None,
+    );
+    assert!(matches!(
+        source.plan_fsync(&fsync),
+        tx_subsystems::fs_iface::BackendPlan::SubmitGraph(_)
+    ));
+    source.complete_fsync(tx_subsystems::fs_iface::BackendPageCompletion::new(
+        fsync.object,
+        fsync.id,
+        fsync.op,
+        tx_subsystems::io_manager::page::PageIoResult::Done,
+    ));
+    assert!(source.take_checkpoint_graph().unwrap().is_some());
+    assert!(pool.stage(&[0; JBD2_BLOCK_SIZE], &guard).is_err());
+
+    source.complete_checkpoint_result(Ok(())).unwrap();
+    assert!(pool.stage(&[0; JBD2_BLOCK_SIZE], &guard).is_ok());
 }
 
 #[test]
 fn prepared_transaction_stages_mutation_data_journal_and_checkpoint_leases() {
-    let _serial = setup();
+    setup();
     let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
     mutation.data.push(SealedDataWrite {
         logical_page: 3,
@@ -120,7 +200,7 @@ fn prepared_transaction_stages_mutation_data_journal_and_checkpoint_leases() {
 
     assert_eq!(prepared.record_count(), 5);
     let commit = prepared.plan().commit_graph().unwrap();
-    assert_eq!(commit.nodes().len(), 6);
+    assert_eq!(commit.nodes().len(), 7);
     assert_eq!(commit.nodes()[0].bio.lba, LbaRange::new(56, 8));
     assert_eq!(
         commit.nodes()[1].bio.op,
@@ -141,7 +221,7 @@ fn prepared_transaction_stages_mutation_data_journal_and_checkpoint_leases() {
 
 #[test]
 fn mutation_runtime_stages_plan_into_its_fsync_source() {
-    let _serial = setup();
+    setup();
     let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let runtime = JournalMutationRuntime::new(
         Arc::clone(&source),
@@ -181,7 +261,7 @@ fn mutation_runtime_stages_plan_into_its_fsync_source() {
 
 #[test]
 fn prepared_transaction_uses_l4_owned_data_source_without_copying_it() {
-    let _serial = setup();
+    setup();
     let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
     mutation.data.push(SealedDataWrite {
         logical_page: 0,
@@ -235,7 +315,7 @@ fn prepared_transaction_uses_l4_owned_data_source_without_copying_it() {
 
 #[test]
 fn mutation_runtime_accepts_l4_owned_data_source() {
-    let _serial = setup();
+    setup();
     let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let runtime = JournalMutationRuntime::new(
         Arc::clone(&source),
@@ -283,7 +363,7 @@ fn mutation_runtime_accepts_l4_owned_data_source() {
 
 #[test]
 fn journal_source_commits_only_after_data_graph_completion() {
-    let _serial = setup();
+    setup();
     let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let ring = Arc::new(
         JournalRing::new(
@@ -338,7 +418,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
             &guard,
         )
         .unwrap();
-    let data = tx_subsystems::fs_iface::BackendPageRequest::new_with_source(
+    let data = tx_subsystems::fs_iface::BackendPageRequest::new_with_source_and_target(
         tx_subsystems::fs_iface::FsObjectKey::new(12),
         tx_subsystems::io_manager::page::PageIoRequestId::new(70),
         tx_subsystems::io_manager::page::PageIoRange::new(0, 1),
@@ -346,8 +426,8 @@ fn journal_source_commits_only_after_data_graph_completion() {
         tx_subsystems::io_manager::page::PageIoFlags::WRITEBACK,
         Some(tx_subsystems::io_manager::page::PageGeneration::new(7)),
         IoDataSource::None,
-    )
-    .with_target(tx_subsystems::fs_iface::IoDataTarget::None);
+        tx_subsystems::fs_iface::IoDataTarget::None,
+    );
     assert!(matches!(
         runtime.plan_data(&data),
         tx_subsystems::fs_iface::BackendPlan::SubmitGraph(_)
@@ -374,7 +454,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
     else {
         panic!("data durable must admit commit");
     };
-    assert_eq!(commit.nodes().len(), 4);
+    assert_eq!(commit.nodes().len(), 5);
 
     source.complete_fsync(tx_subsystems::fs_iface::BackendPageCompletion::new(
         fsync.object,
@@ -403,7 +483,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
 
 #[test]
 fn mutation_write_source_stages_l4_data_during_guarded_admission() {
-    let _serial = setup();
+    setup();
     let fsync = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
     let runtime = Arc::new(JournalMutationRuntime::new(
         Arc::clone(&fsync),
@@ -484,4 +564,86 @@ fn mutation_write_source_stages_l4_data_during_guarded_admission() {
         fsync.plan_fsync(&fsync_request),
         tx_subsystems::fs_iface::BackendPlan::SubmitGraph(_)
     ));
+}
+
+#[test]
+fn mutation_write_source_splits_multi_page_direct_sources_per_data_write() {
+    setup();
+    let fsync = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
+    let runtime = Arc::new(JournalMutationRuntime::new(
+        Arc::clone(&fsync),
+        JournalPagePool::new(4).unwrap(),
+        MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [1; 16],
+            8,
+            JournalRecordLayout::new(
+                LbaRange::new(80, 8),
+                vec![LbaRange::new(88, 8)],
+                LbaRange::new(96, 8),
+            ),
+        ),
+    ));
+    let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(8));
+    mutation.data.push(SealedDataWrite {
+        logical_page: 0,
+        physical_block: 7,
+        bytes: [0; JBD2_BLOCK_SIZE],
+    });
+    mutation.data.push(SealedDataWrite {
+        logical_page: 1,
+        physical_block: 8,
+        bytes: [0; JBD2_BLOCK_SIZE],
+    });
+    mutation
+        .push_metadata(MetadataBlock {
+            home: 33,
+            role: MetaRole::InodeTable,
+            before_version: 1,
+            after: [0xC4; JBD2_BLOCK_SIZE],
+            depends_on: Vec::new(),
+        })
+        .unwrap();
+    let writeback = JournalMutationWriteSource::new(FixedMutationPlan(mutation), runtime);
+    let source_vecs = vec![
+        BioVec::new(0x401, 0, JBD2_BLOCK_SIZE as u32),
+        BioVec::new(0x402, 0, JBD2_BLOCK_SIZE as u32),
+    ];
+    let request = tx_subsystems::fs_iface::BackendPageRequest::new_with_source(
+        tx_subsystems::fs_iface::FsObjectKey::new(12),
+        tx_subsystems::io_manager::page::PageIoRequestId::new(72),
+        tx_subsystems::io_manager::page::PageIoRange::new(0, 2),
+        tx_subsystems::io_manager::page::PageIoOp::Writeback,
+        tx_subsystems::io_manager::page::PageIoFlags::WRITEBACK,
+        Some(tx_subsystems::io_manager::page::PageGeneration::new(8)),
+        IoDataSource::direct(IoDataLeaseId::new(88), source_vecs.clone()),
+    );
+    let guard = tx_substrate::epoch::guard();
+
+    writeback.prepare_writeback(&request, &guard).unwrap();
+    let tx_subsystems::fs_iface::BackendPlan::SubmitGraph(data) = writeback.plan_writeback(
+        tx_ext4::planner::Ext4BlockGeometry {
+            device: DeviceKey::new(9),
+            sectors_per_block: 8,
+        },
+        &request,
+        tx_ext4::planner::Ext4ReadMapping::Hole,
+    ) else {
+        panic!("prepared mutation must submit ordered data");
+    };
+
+    assert_eq!(data.nodes().len(), 3);
+    assert_eq!(data.nodes()[0].bio.lba, LbaRange::new(56, 8));
+    assert_eq!(data.nodes()[1].bio.lba, LbaRange::new(64, 8));
+    assert_eq!(data.nodes()[2].bio.op, BlockOp::Barrier);
+    assert_eq!(data.nodes()[2].source, IoDataSource::None);
+    assert_eq!(
+        data.nodes()[0].source,
+        IoDataSource::direct(IoDataLeaseId::new(88), vec![source_vecs[0]])
+    );
+    assert_eq!(
+        data.nodes()[1].source,
+        IoDataSource::direct(IoDataLeaseId::new(88), vec![source_vecs[1]])
+    );
 }

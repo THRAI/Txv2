@@ -202,9 +202,9 @@ LANE-2. **Lane results are domain-shaped and backend-opaque.** Public results
 must not expose raw container nodes, lock guards, atomics, zone policies,
 substrate reservations, RCU roots, source IDs, or mailbox registries.
 
-LANE-3. **Binding and projection callers own the epoch guard.** A lane receives
-the caller's guard and must not create a hidden nested guard. Guard-scoped
-results obey WIT-* and YIELD-*.
+LANE-3. **Binding, projection, and readiness callers own the epoch guard.** A
+lane receives the caller's guard and must not create a hidden nested guard.
+Guard-scoped results obey WIT-* and YIELD-*.
 
 LANE-4. **Binding observation does not silently acquire retention.** Crossing a
 step or yield boundary requires explicit upgrade to `Cap<T>` or
@@ -219,8 +219,8 @@ not authorize operations, substitute for binding witnesses, mutate owner
 state, or install waits.
 
 LANE-7. **Readiness reports expose level state and opaque endpoints, not wake
-truth.** A wake requires a fresh readiness/binding observation and carries no
-guard-scoped evidence.
+truth.** The report is owned with respect to the query guard. A wake requires a
+fresh readiness/binding observation and carries no guard-scoped evidence.
 
 LANE-8. **Visibility precedes notification.** An owner publishes a new binding
 or snapshot before firing any endpoint, bus attachment, completion, or signal
@@ -233,6 +233,29 @@ observer nodes and published roots have no public `Cap` or `Weak` identity.
 LANE-10. **RCU is confined to publication implementation.** Raw atomic roots
 and retirement calls are allowed only in reviewed epoch, zone, and publication
 internals; owner facades remain unchanged when their backend migrates.
+
+LANE-11. **Lane traits are owner implementation contracts, not broad upper
+capabilities.** Checks, execution, projection, wait, scripts, shims, and other
+subsystems consume concern-specific domain facades. They do not receive an
+`&impl BindingLane` or use trait absence to model runtime read-only authority.
+
+LANE-12. **A published root contains observation-stable bindings, not manager
+or state-machine ownership.** Queue contents, completions, dirty/writeback or
+fetch transitions, range conflicts, protocol state, and delivery state remain
+under their manager, reservation, per-entry atomic, or lock contract even when
+the current implementation stores them beside a replaceable index under one
+lock.
+
+LANE-13. **Single-binding publication does not add a fourth owner lane or a
+caller-visible substrate slot type.** Owners expose domain load/replace/
+withdraw operations; staging `AtomicSlot`, raw atomic roots, payload-slot
+locks, and publication reservations remain private. Install-once bindings use
+immutable direct fields or boot/once cells when replacement is not legal.
+
+LANE-14. **Withdrawal from a published root is not semantic revocation.** If
+an old snapshot or already-retained evidence could still authorize an
+operation, the owner performs a generation/dead/withdrawn transition before or
+as part of root publication, and operation commit revalidates that state.
 
 ---
 
@@ -284,7 +307,7 @@ All v4 invariants in these families hold unchanged in v5. Cross-references in th
 | YIELD | new family, 9 invariants |
 | DELEGATE | new family, 9 invariants |
 | SCOPE | new family, 7 invariants |
-| LANE | new family, 10 invariants |
+| LANE | new family, 11 invariants |
 | STEP-1 | rephrased over four-variant outcome |
 | STEP-3 | rephrased over `StepProgress` monoid |
 | SCRIPT-V5-1..3 | new sub-rules for upper/lower split |

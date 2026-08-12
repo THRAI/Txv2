@@ -95,7 +95,6 @@ impl<P: TxPlatform> CoreInit<P> {
 
         mount::register_mount(&rootfs_payload, sys_object_id, sys_mount);
 
-        crate::init::note_mount_line("sysfs /sys sysfs rw 0 0");
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:sysfs:ok\n");
     }

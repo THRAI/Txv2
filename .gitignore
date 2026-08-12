@@ -1,14 +1,7 @@
 /target/
-# vendor blobs are ignored by default (downloaded/large artifacts), BUT any
-# file the kernel `include_bytes!`s is compile-required and must be
-# whitelisted below — otherwise a fresh clone cannot build (netfast lesson).
-# NOTE: must be `/vendor/*` (contents), not `/vendor/` (dir) — a fully
-# ignored directory is never entered, so `!` re-includes would not work.
-/tools/images/vendor/*
-!/tools/images/vendor/tx-netfast-riscv64
-!/tools/images/vendor/busybox-loongarch64-musl
-!/tools/images/vendor/*.sha256
-!/tools/images/vendor/*.SOURCE
+/tools/images/vendor/
+/external/xfstests/
+/external/.xfstests.tmp/
 /.cache/
 **/.venv/
 __pycache__/
@@ -26,4 +19,3 @@ __pycache__/
 .claude/worktrees/
 librust_out.rlib
 /target-codex-check
-local-images

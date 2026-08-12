@@ -30,14 +30,20 @@ pub struct Superblock {
     pub feature_ro_compat: u32,
     pub uuid: [u8; 16],
     pub journal_inode: u32,
+    pub last_orphan: u32,
     pub hash_seed: [u32; 4],
     pub default_hash_version: u8,
+    pub required_extra_isize: u16,
+    pub desired_extra_isize: u16,
     pub checksum_type: u8,
     pub checksum_seed: u32,
     pub checksum: u32,
 }
 
 impl Superblock {
+    pub const FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+    pub const FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
+    pub const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
     pub const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
     pub const FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
     pub const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
@@ -68,6 +74,7 @@ impl Superblock {
             feature_ro_compat: read_u32_le(bytes, 100)?,
             uuid: slice_at(bytes, 104, 16)?.try_into().unwrap(),
             journal_inode: read_u32_le(bytes, 224)?,
+            last_orphan: read_u32_le(bytes, 232)?,
             hash_seed: [
                 read_u32_le(bytes, 236)?,
                 read_u32_le(bytes, 240)?,
@@ -75,6 +82,8 @@ impl Superblock {
                 read_u32_le(bytes, 248)?,
             ],
             default_hash_version: *slice_at(bytes, 252, 1)?.first().unwrap(),
+            required_extra_isize: read_u16_le(bytes, 348)?,
+            desired_extra_isize: read_u16_le(bytes, 350)?,
             checksum_type: *slice_at(bytes, 373, 1)?.first().unwrap(),
             checksum_seed: read_u32_le(bytes, 624)?,
             checksum: read_u32_le(bytes, 1020)?,
@@ -102,12 +111,15 @@ impl Superblock {
         write_u32_le(bytes, 100, self.feature_ro_compat)?;
         slice_at_mut(bytes, 104, 16)?.copy_from_slice(&self.uuid);
         write_u32_le(bytes, 224, self.journal_inode)?;
+        write_u32_le(bytes, 232, self.last_orphan)?;
         write_u32_le(bytes, 236, self.hash_seed[0])?;
         write_u32_le(bytes, 240, self.hash_seed[1])?;
         write_u32_le(bytes, 244, self.hash_seed[2])?;
         write_u32_le(bytes, 248, self.hash_seed[3])?;
         slice_at_mut(bytes, 252, 1)?[0] = self.default_hash_version;
         write_u16_le(bytes, 254, self.desc_size)?;
+        write_u16_le(bytes, 348, self.required_extra_isize)?;
+        write_u16_le(bytes, 350, self.desired_extra_isize)?;
         slice_at_mut(bytes, 373, 1)?[0] = self.checksum_type;
         write_u32_le(bytes, 624, self.checksum_seed)?;
         write_u32_le(bytes, 1020, self.checksum)?;
@@ -140,6 +152,12 @@ impl Superblock {
         self.feature_ro_compat & Self::FEATURE_RO_COMPAT_METADATA_CSUM != 0
     }
 
+    /// Ext4 sets this incompatibility bit before a read-write journalled mount
+    /// admits mutations and clears it only after clean detach.
+    pub const fn needs_recovery(&self) -> bool {
+        self.feature_incompat & Self::FEATURE_INCOMPAT_RECOVER != 0
+    }
+
     pub fn metadata_csum_seed(&self) -> u32 {
         if self.feature_incompat & Self::FEATURE_INCOMPAT_CSUM_SEED != 0 {
             self.checksum_seed
@@ -167,8 +185,11 @@ impl Default for Superblock {
             feature_ro_compat: 0,
             uuid: [0; 16],
             journal_inode: 8,
+            last_orphan: 0,
             hash_seed: [0; 4],
             default_hash_version: 1,
+            required_extra_isize: 0,
+            desired_extra_isize: 0,
             checksum_type: 0,
             checksum_seed: 0,
             checksum: 0,
@@ -184,10 +205,12 @@ pub struct GroupDesc {
     pub free_blocks_count_hi: u16,
     pub free_inodes_count_hi: u16,
     pub used_dirs_count_hi: u16,
+    pub unused_inodes_count_hi: u16,
     pub free_blocks_count: u16,
     pub free_inodes_count: u16,
     pub used_dirs_count: u16,
     pub flags: u16,
+    pub unused_inodes_count: u16,
     pub block_bitmap_hi: u32,
     pub inode_bitmap_hi: u32,
     pub inode_table_hi: u32,
@@ -208,10 +231,12 @@ impl GroupDesc {
             free_blocks_count_hi: 0,
             free_inodes_count_hi: 0,
             used_dirs_count_hi: 0,
+            unused_inodes_count_hi: 0,
             free_blocks_count: read_u16_le(bytes, 12)?,
             free_inodes_count: read_u16_le(bytes, 14)?,
             used_dirs_count: read_u16_le(bytes, 16)?,
             flags: read_u16_le(bytes, 18)?,
+            unused_inodes_count: read_u16_le(bytes, 28)?,
             block_bitmap_hi: 0,
             inode_bitmap_hi: 0,
             inode_table_hi: 0,
@@ -224,6 +249,7 @@ impl GroupDesc {
             desc.free_blocks_count_hi = read_u16_le(bytes, 44)?;
             desc.free_inodes_count_hi = read_u16_le(bytes, 46)?;
             desc.used_dirs_count_hi = read_u16_le(bytes, 48)?;
+            desc.unused_inodes_count_hi = read_u16_le(bytes, 60)?;
         }
         Ok(desc)
     }
@@ -238,6 +264,7 @@ impl GroupDesc {
         write_u16_le(bytes, 14, self.free_inodes_count)?;
         write_u16_le(bytes, 16, self.used_dirs_count)?;
         write_u16_le(bytes, 18, self.flags)?;
+        write_u16_le(bytes, 28, self.unused_inodes_count)?;
         write_u16_le(bytes, 30, self.checksum)?;
         if bytes.len() >= 64 {
             write_u32_le(bytes, 32, self.block_bitmap_hi)?;
@@ -246,6 +273,7 @@ impl GroupDesc {
             write_u16_le(bytes, 44, self.free_blocks_count_hi)?;
             write_u16_le(bytes, 46, self.free_inodes_count_hi)?;
             write_u16_le(bytes, 48, self.used_dirs_count_hi)?;
+            write_u16_le(bytes, 60, self.unused_inodes_count_hi)?;
         }
         Ok(())
     }
@@ -386,6 +414,15 @@ impl Inode {
     pub fn encode(&self, bytes: &mut [u8]) -> Result<()> {
         require_len(bytes, 128)?;
         bytes.fill(0);
+        self.encode_preserving_unknown(bytes)
+    }
+
+    /// Encode modeled inode fields without clearing bytes owned by a newer
+    /// ext4 revision or an unsupported feature. Metadata after-image planning
+    /// starts from the complete on-disk inode and uses this method so an
+    /// unrelated field cannot be lost during a bounded update.
+    pub fn encode_preserving_unknown(&self, bytes: &mut [u8]) -> Result<()> {
+        require_len(bytes, 128)?;
         write_u16_le(bytes, 0, self.mode)?;
         write_u16_le(bytes, 2, self.uid as u16)?;
         write_u32_le(bytes, 4, self.size as u32)?;
@@ -452,6 +489,16 @@ impl Inode {
         Ok(Some(slice_at(&self.i_block, 0, self.size as usize)?))
     }
 
+    pub fn set_inline_symlink_target(&mut self, target: &[u8]) -> Result<()> {
+        if target.len() > EXTENT_ROOT_BYTES {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        self.i_block = [0; EXTENT_ROOT_BYTES];
+        self.i_block[..target.len()].copy_from_slice(target);
+        self.size = target.len() as u64;
+        Ok(())
+    }
+
     pub fn is_dir(&self) -> bool {
         self.mode & Self::S_IFMT == Self::S_IFDIR
     }
@@ -475,11 +522,6 @@ impl Inode {
                 for extent in extents {
                     if let Some(block) = extent.physical_for(logical_block) {
                         return Ok(BlockMapping::Data(block));
-                    }
-                    if extent.contains(logical_block) {
-                        return Ok(BlockMapping::Unwritten(
-                            extent.physical_start + (logical_block - extent.logical_block) as u64,
-                        ));
                     }
                 }
                 Ok(BlockMapping::Hole)
@@ -528,10 +570,6 @@ impl Default for Inode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockMapping {
     Data(u64),
-    /// A physically allocated extent whose contents are not initialized yet.
-    /// Reads return zeroes; the first write converts the covered block to an
-    /// initialized extent without allocating another physical block.
-    Unwritten(u64),
     Hole,
     NeedNode(u64),
 }
@@ -601,30 +639,17 @@ impl Extent {
         Ok(())
     }
 
-    /// Return the number of blocks represented by `ee_len`.
-    ///
-    /// ext4 reserves raw values above 0x8000 for unwritten extents, while
-    /// exactly 0x8000 is the largest initialized extent. Treating bit 15 as a
-    /// plain flag therefore turns a valid 32768-block extent into length zero.
-    pub fn actual_len(&self) -> u32 {
-        if self.len <= Self::UNINITIALIZED_MASK {
-            self.len as u32
-        } else {
-            (self.len - Self::UNINITIALIZED_MASK) as u32
-        }
-    }
-
     pub fn initialized_len(&self) -> u32 {
-        self.actual_len()
+        (self.len & !Self::UNINITIALIZED_MASK) as u32
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.len <= Self::UNINITIALIZED_MASK
+        self.len & Self::UNINITIALIZED_MASK == 0
     }
 
     pub fn contains(&self, logical_block: u32) -> bool {
         logical_block >= self.logical_block
-            && logical_block < self.logical_block.saturating_add(self.actual_len())
+            && logical_block < self.logical_block.saturating_add(self.initialized_len())
     }
 
     pub fn physical_for(&self, logical_block: u32) -> Option<u64> {
@@ -1139,6 +1164,14 @@ pub fn block_bitmap_csum32(seed: u32, bitmap_bytes: &[u8], block_count: u32) -> 
     Ok(crc32c_append(seed, slice_at(bitmap_bytes, 0, byte_count)?))
 }
 
+pub fn inode_bitmap_csum32(seed: u32, bitmap_bytes: &[u8], inode_count: u32) -> Result<u32> {
+    let byte_count = (inode_count as usize)
+        .checked_add(7)
+        .ok_or(Ext4FormatError::OutOfBounds)?
+        / 8;
+    Ok(crc32c_append(seed, slice_at(bitmap_bytes, 0, byte_count)?))
+}
+
 pub fn inode_csum32(
     seed: u32,
     inode_number: u32,
@@ -1172,6 +1205,15 @@ pub fn dirblock_csum32(seed: u32, inode: u32, generation: u32, block_bytes: &[u8
     let inode = inode.to_le_bytes();
     let generation = generation.to_le_bytes();
     metadata_csum32(seed, &[&inode, &generation, block_bytes])
+}
+
+/// Checksum for an external ext4 extent node. The final four bytes are the
+/// extent-tail checksum field and are excluded from the CRC input.
+pub fn extent_block_csum32(seed: u32, inode: u32, generation: u32, block_bytes: &[u8]) -> u32 {
+    let inode = inode.to_le_bytes();
+    let generation = generation.to_le_bytes();
+    let body_len = block_bytes.len().saturating_sub(4);
+    metadata_csum32(seed, &[&inode, &generation, &block_bytes[..body_len]])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

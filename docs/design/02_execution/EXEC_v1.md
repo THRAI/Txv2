@@ -7,7 +7,7 @@
 
 Draft v1 (2026-04-26).
 
-This document specifies **execve**: the cross-subsystem operation that replaces a process's address space, file-descriptor table, and signal-handler state with a new image loaded from a path-resolved binary, while preserving its identity (pid, parent, pgrp, session). Exec is the canonical compositional script — it spans VFS, Mount, Cred, VM, Process, FD, Signal, and ThreadRuntime — and this document fixes the composition. The ELF format parser is a vendored implementation detail of the loader (§8.10), not part of the architectural contract.
+This document specifies **execve**: the cross-subsystem operation that replaces a process's address space, file-descriptor table, and signal-handler state with a new image loaded from a path-resolved binary, while preserving its identity (pid, parent, pgrp, session). Exec is the canonical compositional script — it spans VFS, Mount, Cred, VM, Process, FD, Signal, and ThreadRuntime — and this document fixes the composition. The concrete ELF decoder is a replaceable loader adapter (§8.10), not part of the architectural contract.
 
 Exec has no entities of its own. It owns no `structure/`, no `checks/`, no `execution/`, no projections. It lives entirely as a script under `scripts/process/exec.rs`, drawing on every subsystem it composes. This document is therefore not a subsystem spec in the [`SUBSYSTEM_ANATOMY`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) sense; it is a **script spec**, closer in shape to the cross-subsystem fork example in SUBSYSTEM_ANATOMY §9 than to PROCESS or VM.
 
@@ -36,7 +36,8 @@ Companion documents:
 - The detached-AddressSpace construction model (§9.2): build fully, populate stack via `vm::populate_detached_user_range`, then swap.
 - The `EXEC-PONR` invariant (§15): no allocation, no user memory access, no I/O, no fallible work past phase 6.
 - The `process_execd` tracepoint (§18): a script-level RawTrace publication, fired from the script's publish phase.
-- Static PIE support (§8.7); rejection of `PT_INTERP` (§8.4); rejection of executable stack (§8.4).
+- Static PIE and dynamic-interpreter support (§8.7), including combined
+  main/interpreter/stack/vDSO layout and the `AT_BASE`/`AT_ENTRY` split.
 
 ### Zone-derived type policy
 <!-- txdoc:EXEC-ZONE-DERIVED-TYPE-POLICY -->
@@ -59,12 +60,11 @@ upgraded into caps or payload evidence before reservations and publication.
 <!-- txdoc:EXEC-WHAT-THIS-DOCUMENT-DEFERS -->
 
 - **Non-leader execve.** Tid-rename semantics deferred to Phase 2 per [`PROCESS_v1.md §11.2`](../04_process-signals/PROCESS_v1.md). Non-leader exec returns ENOSYS in v1 (rejected in phase 0).
-- **Dynamic linking (PT_INTERP).** Static binaries only in v1; the loader rejects `PT_INTERP` with ENOEXEC. Phase 2 adds interpreter resolution, second-image loading, `AT_BASE`.
 - **suid / sgid / file capabilities.** Cred is preserved unchanged across exec in v1. The cred mutation reservation (§7) is taken to keep the Phase 2 patch local.
-- **ASLR.** Static-PIE `load_bias` is a deterministic per-arch constant in v1. Random bias added when entropy and address-space randomization land.
-- **AT_SECURE.** Always 0 in v1 (no privilege transition).
 - **Personality flags.** `personality(2)` not implemented.
-- **MAP_DENYWRITE.** Mount-level write inhibition during exec deferred. The binary's PageContainer is COW-shared via the recipes BTree; concurrent writes to the underlying file are visible to the exec'd process via the shared backing — a known POSIX divergence Linux mitigates with MAP_DENYWRITE on text segments. Not addressed in v1.
+- **Executable lease / MAP_DENYWRITE.** Generation-stable executable leases
+  and write inhibition remain deferred. The current `PageContainer` backing
+  does not yet provide Linux-equivalent ETXTBSY semantics.
 - **PT_TLS kernel-side initialization.** §8.8 records `PT_TLS` into `ExecImagePlan.tls` but does not act on it. If the chosen userland requires kernel-initialized TLS before entry, this is promoted to a v1 requirement (§20 risk).
 - **`PTRACE_EVENT_EXEC`.** Flagged at §18; landing with the observation subsystem.
 
@@ -142,7 +142,7 @@ Following SCRIPT-2 (scripts may import from any peer subsystem's `checks/` and `
 - `mount::checks::*` — `require_exec_permitted`, `observe_suid_policy`.
 - `cred::checks::*` — `require_executable`; `cred::execution::compute_exec_credentials`.
 - `vm::scripts::build_aspace_from_image`, `vm::populate_detached_user_range`.
-- `proc::execution::initiate_group_exit_for_exec`, `proc::checks::is_thread_group_leader`.
+- `process::ProcessExecPrep`, `proc::checks::is_thread_group_leader`.
 - `fd_table::execution::prepare_exec_close_cloexec` (added by this document; see §9.5).
 - `sig_actions::execution::prepare_exec_reset` (added by this document; see §9.6).
 - `thread_runtime::execution::commit_exec_context`.
@@ -227,9 +227,14 @@ cred::execution::compute_exec_credentials(auth_w, suid_w, caller_cred)
 Inputs: an `ExecutableFile` (RNode + mount + dentry, with retention promoted from witnesses).
 Outputs: an `ExecImagePlan` (entry, segments, TLS template, auxv-relevant facts).
 
-Role: read the ELF header and program-header table via targeted file reads, validate, translate into txKernel-owned types. The loader does not read segment data; segments materialize lazily after the AS is built and faulted.
+Role: read the ELF header, program-header table, and optional interpreter path
+via targeted file reads; validate them against `ElfLoadPolicy`; translate into
+txKernel-owned types. The loader does not read segment data; segments
+materialize lazily after the AS is built and faulted.
 
-The parser library is a v1 implementation choice (see §8.10), not part of the spec contract. Parser types do not escape `loader.rs`.
+The parser library is an implementation choice (see §8.10), not part of the
+spec contract. `ElfFileParser` exposes only txKernel-owned header and
+program-header values; concrete parser types do not escape the adapter.
 
 Full specification in §8.
 
@@ -256,9 +261,11 @@ Process owns the *outer* identity of the operation. Pid, parent binding, pgrp/se
 ### 3.7 FD / Signal / ThreadRuntime — apply per-Frame replacements
 <!-- txdoc:EXEC-3-7-FD-SIGNAL-THREADRUNTIME-APPLY-PER-FRAME-REPLACEMENTS -->
 
-These three peers receive the prepared replacements built in phase 4 and install them post-PONR:
+These three peers receive the prepared replacements built in phase 4. FD
+closure is coupled to the checked PoNR commit; the remaining replacements are
+installed post-PoNR:
 
-- **FD (fd_table).** `prepare_exec_close_cloexec` (phase 4) produces a private fd table with FD_CLOEXEC entries already absent (§9.5). Phase 7 swaps the Shared<FdTable> slot. The CLOEXEC entries' `Cap<OpenFile>` drops are the publication points (fsnotify on each underlying RNode where applicable).
+- **FD (fd_table).** `ProcessExecPrep::prepare_cloexec_close` (phase 4) retains the complete CLOEXEC set and exact `Cap<OpenFile>` identities (§9.5). `replace_aspace_and_close_cloexec` revalidates under `fds -> fd_cloexec` locks, stores the new AS, and removes only those prevalidated entries. A stale/reused fd fails before the AS store.
 
 - **Signal (sig_actions).** `prepare_exec_reset` (phase 4) produces a private SigActionTable with non-ignored handlers reset to SIG_DFL, ignored handlers preserved (§9.6). Phase 7 swaps the Shared<SigActionTable>. The thread's altstack is cleared inline.
 
@@ -292,7 +299,7 @@ Phase 1 — Resolve and mount policy                      reversible
 Phase 2 — Authorization and credential plan             reversible
 Phase 3 — Load executable image plan                    reversible
 Phase 4 — Prepare detached replacement                  reversible
-Phase 5 — Collapse thread group                         reversible (collapse infallible in v1)
+Phase 5 — Collapse thread group                         pre-PoNR; may return EAGAIN
 ================================================================================
 Phase 6 — Address-space visibility boundary             POINT OF NO RETURN
 ================================================================================
@@ -300,11 +307,18 @@ Phase 7 — Infallible post-swap commits                  irreversible, infallib
 Phase 8 — Publish and enter userspace                   irreversible, infallible
 ```
 
-Phases 0–5 are **reversible**: any failure drops the prepared resources and returns errno to the caller in the *old* AS. Phase 6 is a single store. Phases 7–8 are **infallible**: the EXEC-PONR invariant (§15) constrains them to perform no allocation, no user memory access, no I/O, no fallible computation.
+Phases 0–4 are fully **reversible**: any failure drops the prepared resources
+and returns errno to the caller in the old AS. Phase 5 is still before PoNR and
+retains that AS, but sibling exits already committed during collapse remain
+visible if an in-flight permit forces `EAGAIN`. Phase 6 is a single checked
+store. Phases 7–8 have no recoverable error path: the EXEC-PONR invariant (§15)
+constrains them to perform no allocation, user memory access, or I/O.
 
 The boundary between phases 5 and 6 is the point of no return. The boundary between phases 6 and 7 is the address-space visibility boundary. They are different boundaries:
 
-- After phase 5, the process is irreversibly committed to either exec'ing or dying. (In v1, collapse cannot fail, so this is automatic.)
+- After phase 5 succeeds, the caller is the sole survivor and is irreversibly
+  committed to either exec'ing or dying. A phase-5 `EAGAIN` returns before this
+  boundary with the old AS intact.
 - After phase 6, the new AS is visible. Other observers — procfs readers, ptrace tracers — may see the new AS while phase 7 is still running. v1 does not promise external atomicity of exec across the multi-commit phase 7 sequence.
 
 POSIX permits this. Linux behaves the same way: a `/proc/<pid>/maps` reader concurrent with another process's exec can observe the new maps with the old fd table briefly. POSIX does not require exec to be atomic to external observers.
@@ -336,10 +350,10 @@ This matches the cross-subsystem fork pattern in [`SUBSYSTEM_ANATOMY_v2_1.md §9
 | 1 | VFS, Mount | Resolve path; check NOEXEC; observe NOSUID | ENOENT, ENOTDIR, ELOOP, EACCES |
 | 2 | Cred | Authorize execute; reserve cred lane; compute new cred | EACCES, EPERM |
 | 3 | Loader | Read ELF header and phdrs; validate; translate | ENOEXEC, ENOMEM, EIO |
-| 4 | VM, FD, Signal | Build detached AS; copy argv/envp; populate stack; COW-prepare fd_table and sig_actions | ENOMEM, E2BIG, EFAULT |
-| 5 | Process | If multi-threaded: collapse via GroupExit | (infallible in v1) |
-| 6 | VM | `frame.vm.replace(new_as)` | (infallible) |
-| 7 | FD, Signal, Cred, ThreadRuntime, Process | Install fd_table; close FD_CLOEXEC; install sig_actions; reset; clear altstack; install cred; record exe_file/cmdline; clear group_exit; install trap context | (infallible) |
+| 4 | VM, FD, Signal | Build detached AS; copy argv/envp; populate stack; prepare exact CLOEXEC close plan and sig_actions reset | ENOMEM, E2BIG, EFAULT |
+| 5 | Process, FD | If multi-threaded: collapse via GroupExit; reject a concurrently changed CLOEXEC plan before swap | EAGAIN |
+| 6 | VM, FD | Under the authoritative payload and fd locks, validate the prepared plan, replace `frame.vm`, then remove the prevalidated CLOEXEC entries | (no error after the AS store) |
+| 7 | Signal, Cred, ThreadRuntime, Process | Install sig_actions; reset; clear altstack; install cred; record exe_file/cmdline; clear group_exit; install trap context | (infallible) |
 | 8 | — | `process_execd` tracepoint; return to userspace at new entry | (infallible) |
 
 ---
@@ -420,6 +434,20 @@ Note that EACCES is overloaded: VFS produces it for traversal; Mount produces it
 
 `ENOEXEC` is **not** produced here. Reserved for image-format failures in phase 3.
 
+Before ELF parsing, exec performs one bounded executable-kind probe. A valid
+`#!` line redirects through the same namespace/mount authorization path; at
+most four interpreter redirects are accepted and the fifth returns `ELOOP`.
+The probe is Linux's 256-byte `BINPRM_BUF_SIZE` window. Newline or NUL inside
+the window terminates the line normally. When a full window has neither, exec
+rejects only if the interpreter token itself may be truncated; truncated
+optional text remains valid, with byte 255 reserved as the forced NUL
+terminator. Parsing treats only space and tab as separators, and passes the
+entire trimmed remainder after the interpreter as one optional argument (for
+example, `-S python -O`).
+The original `execve` pathname is retained independently of those redirects for
+`AT_EXECFN`. A file that is neither ELF nor a valid shebang returns `ENOEXEC`.
+The kernel does not synthesize `/bin/sh`; shell fallback belongs to userspace.
+
 ---
 
 ## 7. Phase 2 — Authorization and credential plan
@@ -487,7 +515,22 @@ The reservation is *not* a lock in the traditional sense; concurrent reads of cr
 
 This phase reads the binary's headers, validates them, and translates them into txKernel-owned image-plan types. It performs targeted I/O (which may block), bounded synchronous parsing, and validation. No segment data is read here; segments materialize lazily after the AS is built.
 
-The phase is itself a small script: read header → validate → read phdrs → validate → translate. Each read may yield. Total I/O is bounded by `64 + MAX_PHDRS * 56` bytes (~3.6 KB).
+The main executable and its optional `PT_INTERP` path are opened through
+`step_open_in_mount_namespace` with the process's current `MountNamespace`.
+Absolute paths start at that namespace's root; relative paths start at the
+process cwd. Each resolution retains its final mount witness so `MS_NOEXEC` and
+`MS_NOSUID` policy are applied to the actual main/interpreter mount, including
+symlink and bind-mount crossings. The declared interpreter path is authoritative:
+the core loader does not guess `/glibc`, `/musl`, or basename-derived alternatives.
+
+The phase is itself a small script: read the 64-byte header → validate → read
+the bounded program-header table → validate → optionally read the bounded
+`PT_INTERP` string → translate. Underlying PageBacked/VFS operations preserve
+their `YieldShape`; the syscall-facing `ExecScriptOp` is driven in waiting mode,
+parks on the originating wait source, and restarts reversible preparation before
+EXEC-PONR after wake. A wait is never collapsed into user-visible `EBUSY`. The
+fixed metadata read is bounded by `64 + MAX_PHDRS * 56` bytes; the optional
+interpreter string is separately bounded by `MAX_INTERP_PATH = 4096` bytes.
 
 ### 8.1 Loader public types
 <!-- txdoc:EXEC-8-1-LOADER-PUBLIC-TYPES -->
@@ -500,30 +543,29 @@ pub struct ExecutableFile {
     pub dentry: Cap<DEntry>,
 }
 
-// Output.
+// Parser-independent output.
 pub struct ExecImagePlan {
-    pub arch:       ImageArch,            // RV64 | LA64
-    pub image_type: ImageType,            // Exec | Pie
-    pub load_bias:  UserAddr,             // 0 for ET_EXEC; deterministic constant for ET_DYN
-    pub entry:      UserAddr,             // load_bias + e_entry
-    pub segments:   Vec<LoadSegment>,     // PT_LOAD segments, page-rounded
-    pub interp:     Option<InterpRef>,    // v1: always None; Some → ENOEXEC
-    pub tls:        Option<TlsTemplate>,  // PT_TLS, recorded but not applied in v1
-    pub phdr_va:    UserAddr,             // AT_PHDR (computed; ENOEXEC if uncomputable)
-    pub phent:      u16,                  // AT_PHENT
-    pub phnum:      u16,                  // AT_PHNUM
-    pub flags:      ImageFlags,           // exec_stack request, etc.
+    pub entry:            u64,
+    pub at_phdr:          u64,
+    pub at_phent:         u64,
+    pub at_phnum:         u64,
+    pub load_segments:    Vec<LoadSegment>,
+    pub bss_extension:    Option<BssTail>,
+    pub load_bias:        u64,
+    pub tls:              Option<TlsTemplate>,
+    pub dynamic:          Option<ImageRange>,
+    pub relro:            Option<ImageRange>,
+    pub stack:            StackRequest,
+    pub interpreter_path: Option<Vec<u8>>,
 }
 
 pub struct LoadSegment {
-    pub map_start:        UserAddr,   // floor(load_bias + p_vaddr, PAGE_SIZE)
-    pub map_end:          UserAddr,   // ceil(load_bias + p_vaddr + p_memsz, PAGE_SIZE)
-    pub file_page_offset: u64,        // floor(p_offset, PAGE_SIZE)
-    pub page_delta:       usize,      // (load_bias + p_vaddr) - map_start
-    pub file_size:        u64,        // p_filesz (from start of segment, not from map_start)
-    pub mem_size:         u64,        // p_memsz
-    pub prot:             Prot,       // from PF_R | PF_W | PF_X
-    pub align:            u64,        // p_align (validated to be page-aligned)
+    pub vaddr:      u64,
+    pub memsz:      u64,
+    pub filesz:     u64,
+    pub file_offset: u64,
+    pub flags:      SegmentFlags,
+    pub align:      u64,
 }
 
 pub struct TlsTemplate {
@@ -534,21 +576,23 @@ pub struct TlsTemplate {
     pub vaddr:            UserAddr,    // load_bias + PT_TLS.p_vaddr
 }
 
-pub enum ImageArch { Rv64, La64 }
-pub enum ImageType { Exec, Pie }
-
-pub struct ImageFlags {
-    pub exec_stack: bool,   // PT_GNU_STACK has PF_X — v1 rejects
-}
+pub struct StackRequest { pub executable_requested: bool }
 ```
+
+`PT_TLS`, `PT_DYNAMIC`, `PT_GNU_RELRO`, and `PT_GNU_STACK` are retained as
+metadata for userspace/interpreter policy. The kernel does not process dynamic
+tags, symbols, hashes, dependencies, or relocations.
 
 ### 8.2 The bounded targeted-read model
 <!-- txdoc:EXEC-8-2-THE-BOUNDED-TARGETED-READ-MODEL -->
+<!-- txdoc:EXEC-ELF-STAGED-READ -->
 
 The loader does not read the whole binary into memory. It reads at most:
 
 - 64 bytes for the ELF64 header at offset 0.
 - `phnum * phentsize` bytes for the program-header table at `e_phoff`. Bounded by `MAX_PHDRS = 64` and `phentsize = 56`, so ≤ 3584 bytes.
+- If present, one absolute NUL-terminated `PT_INTERP` path at its declared
+  offset, bounded by `MAX_INTERP_PATH = 4096` bytes.
 
 These reads use a new helper added to PAGE_BACKED (cross-doc edit B1):
 
@@ -572,45 +616,26 @@ The contract differs from the read syscall path:
 
 ### 8.3 Entry: `load_exec_image`
 <!-- txdoc:EXEC-8-3-ENTRY-LOAD-EXEC-IMAGE -->
+<!-- txdoc:EXEC-ELF-PARSER-TRAIT -->
 
 ```rust
-pub async fn load_exec_image(exe: &ExecutableFile) -> Result<ExecImagePlan, Errno> {
-    // 8.3.1 — read and parse the ELF header.
-    let mut hdr_buf = [0u8; ELF64_HEADER_SIZE];  // 64 bytes
-    page_backed::read_exact_at(&exe.rnode, 0, &mut hdr_buf).await?;
-    let header = parse_elf_header(&hdr_buf)?;     // see §8.4
-
-    // 8.3.2 — determine load_bias from image type.
-    let (image_type, load_bias) = compute_load_bias(&header)?;
-
-    // 8.3.3 — read and parse the program-header table.
-    let phdr_size = header.phnum as usize * header.phentsize as usize;
-    let mut phdr_buf = alloc_kernel_buf(phdr_size).map_err(|_| Errno::ENOMEM)?;
-    page_backed::read_exact_at(&exe.rnode, header.phoff, &mut phdr_buf).await?;
-    let phdrs = parse_program_headers(&phdr_buf, header.phnum, header.phentsize)?;
-
-    // 8.3.4 — validate and translate.
-    validate_phdrs(&phdrs, load_bias)?;
-    let segments = translate_pt_loads(&phdrs, load_bias)?;
-    let tls = translate_pt_tls(&phdrs, load_bias);
-    let phdr_va = compute_at_phdr(&header, &phdrs, load_bias)?;
-    let flags = derive_image_flags(&phdrs)?;
-
-    Ok(ExecImagePlan {
-        arch: header.arch,
-        image_type,
-        load_bias,
-        entry: UserAddr(load_bias.0 + header.entry),
-        segments,
-        interp: None,    // v1 rejects PT_INTERP earlier
-        tls,
-        phdr_va,
-        phent: header.phentsize,
-        phnum: header.phnum,
-        flags,
-    })
+pub fn read_elf_image<P: PlatformConfig>(
+    pc: &PageContainer,
+    role: ImageRole,
+) -> Result<ExecImagePlan, ImageReadError> {
+    read_elf_image_with::<Elf08Parser, _>(
+        pc.size_bytes(),
+        ElfLoadPolicy::for_platform::<P>(),
+        role,
+        |offset, out| read_exact_at(pc, offset, out),
+    )
 }
 ```
+
+`read_elf_image_with` owns the staged file-read protocol. `ElfFileParser`
+decodes only the header and program-header table; `build_image_plan` owns all
+platform and exec policy. Production binds the trait to `Elf08Parser`, while
+tests may substitute another decoder without changing I/O or policy.
 
 ### 8.4 Header validation
 <!-- txdoc:EXEC-8-4-HEADER-VALIDATION -->
@@ -624,6 +649,8 @@ Per the canonical ELF64 layout (Elf64_Ehdr), `parse_elf_header` validates:
 | `e_ident[EI_DATA] == ELFDATA2LSB` | ENOEXEC |
 | `e_ident[EI_VERSION] == EV_CURRENT` | ENOEXEC |
 | `e_machine ∈ {EM_RISCV, EM_LOONGARCH}` and matches build target | ENOEXEC |
+| RV64 `e_flags` uses only RVC and soft/single/double float ABI bits; RVE, quad-float, TSO, and unknown bits are rejected | ENOEXEC |
+| LA64 `e_flags` uses ABI modifier 0..3 with optional OBJABI_V1; unknown bits are rejected | ENOEXEC |
 | `e_type ∈ {ET_EXEC, ET_DYN}` | ENOEXEC |
 | `e_phentsize == sizeof(Elf64_Phdr)` (= 56) | ENOEXEC |
 | `e_phnum <= MAX_PHDRS` (= 64) | ENOEXEC |
@@ -631,7 +658,10 @@ Per the canonical ELF64 layout (Elf64_Ehdr), `parse_elf_header` validates:
 
 `MAX_PHDRS = 64` is a hard parsing bound. Real-world static binaries have ≤ 16 program headers; 64 is comfortable headroom.
 
-After header validation, but before phdr-table read: any `PT_INTERP` discovered during phdr translation will be rejected with ENOEXEC (§8.6). v1 does not pre-screen for it at the header level since the header doesn't expose it directly; the rejection happens in `validate_phdrs`.
+`ElfLoadPolicy` supplies the expected target architecture, page size,
+accepted architecture flags, `USER_TOP`, program-header bound, and whether an
+interpreter is allowed. This keeps build-target and final-address policy
+outside the concrete decoder.
 
 ### 8.5 Program-header validation
 <!-- txdoc:EXEC-8-5-PROGRAM-HEADER-VALIDATION -->
@@ -645,18 +675,26 @@ For each `PT_LOAD` segment:
 | `p_vaddr + p_memsz` does not overflow | ENOEXEC |
 | `load_bias + p_vaddr + p_memsz <= USER_TOP` | ENOEXEC |
 | `p_align` is 0, 1, or a power of two | ENOEXEC |
-| `p_align <= PAGE_SIZE` (we don't support huge pages in v1) | ENOEXEC |
 | `p_vaddr % PAGE_SIZE == p_offset % PAGE_SIZE` (ELF congruence) | ENOEXEC |
 | Page-rounded ranges of distinct PT_LOADs do not overlap | ENOEXEC |
 | `p_flags & ~(PF_R \| PF_W \| PF_X) == 0` (no unknown bits) | (ignored, not fatal) |
 
-Encountering `PT_INTERP`: `Errno::ENOEXEC` (v1 rejects dynamic linking).
+One `PT_INTERP` is accepted only for the main image. Its string must be nonempty,
+absolute, NUL-terminated, within the file, and within `MAX_INTERP_PATH`. An
+interpreter that itself declares `PT_INTERP` is rejected as nested.
 
-Encountering `PT_GNU_STACK` with `PF_X`: `Errno::ENOEXEC` (v1 conservative policy; see §8.4 below).
+`PT_GNU_STACK` records the last header's executable request. The VM builder
+selects the final stack protection from an explicit matrix: `PF_X` always gives
+RWX; absent `PF_X` gives RW when a mapped vDSO restorer is available; and a
+target without that restorer retains RWX for the signal-frame trampoline
+fallback. None of this belongs in the syntax parser.
 
-`PT_TLS`: recorded into `ExecImagePlan.tls`. Not validated for executability of TLS init image.
+`PT_TLS`, `PT_DYNAMIC`, and `PT_GNU_RELRO` are range-checked against file,
+mapped LOAD coverage, load bias, and `USER_TOP`, then retained as metadata.
 
-`PT_PHDR`, `PT_NOTE`, `PT_GNU_RELRO`, `PT_GNU_EH_FRAME`: noted for future use; `PT_PHDR` consumed for `AT_PHDR` computation (§8.6).
+`PT_PHDR` is descriptive only and does not participate in `AT_PHDR` computation
+or add a rejection condition (§8.6); other unknown headers must still declare
+an in-file range but do not otherwise affect the plan.
 
 ### 8.6 AT_PHDR computation
 <!-- txdoc:EXEC-8-6-AT-PHDR-COMPUTATION -->
@@ -664,37 +702,39 @@ Encountering `PT_GNU_STACK` with `PF_X`: `Errno::ENOEXEC` (v1 conservative polic
 `AT_PHDR` must be computed and is mandatory in `ExecImagePlan`. The runtime needs it for `dl_iterate_phdr`, stack unwinding via `eh_frame`, and (when interp lands) dynamic-linker bootstrap.
 
 ```
-1. If a PT_PHDR program header exists:
-       phdr_va = load_bias + PT_PHDR.p_vaddr
-2. Else, find the PT_LOAD whose file range covers e_phoff:
-       segment ∈ PT_LOADs where
-           segment.p_offset <= e_phoff
-           e_phoff + e_phnum * e_phentsize <= segment.p_offset + segment.p_filesz
-       phdr_va = load_bias + segment.p_vaddr + (e_phoff - segment.p_offset)
-3. Else: return Errno::ENOEXEC.
+1. Compute table_len = e_phnum * e_phentsize with checked arithmetic for the
+   final user-range check.
+2. In program-header order, find the first PT_LOAD whose declared file range
+   contains the first byte of the table:
+       segment.p_offset <= e_phoff
+       e_phoff < segment.p_offset + segment.p_filesz
+   If none exists: return Errno::ENOEXEC.
+3. Compute the loaded address from that mapping with checked arithmetic:
+       loaded_phdr_va = segment.p_vaddr + (e_phoff - segment.p_offset)
+       phdr_va = load_bias + loaded_phdr_va
+4. Require `phdr_va < USER_TOP` and `phdr_va + table_len <= USER_TOP`, again
+   with checked arithmetic. `PT_PHDR` declarations are ignored, including
+   absent, duplicate, or inconsistent declarations.
 ```
 
-The third case — a binary whose phdr table is not covered by any loaded segment and lacks `PT_PHDR` — is technically permitted by the ELF spec but unusual. Modern toolchains always produce binaries satisfying case 1 or case 2; rejecting case 3 is reasonable and matches Linux's `load_elf_phdrs` behavior in practice.
+This mirrors Linux `load_elf_binary`: `AT_PHDR` follows the file-offset to
+virtual-address delta of the first LOAD containing `e_phoff`. The kernel does
+not impose an additional whole-table-in-one-LOAD or `PT_PHDR` consistency
+policy.
 
 ### 8.7 Static PIE handling and load_bias
 <!-- txdoc:EXEC-8-7-STATIC-PIE-HANDLING-AND-LOAD-BIAS -->
 
-```
-ET_EXEC:                            load_bias = 0
-ET_DYN with no PT_INTERP:           load_bias = ELF_ET_DYN_BASE
-ET_DYN with PT_INTERP:              ENOEXEC (dynamic linking deferred)
-```
+`ET_EXEC` retains load bias zero. `ET_DYN` is parsed relative to an aligned seed
+bias, then the exec script selects the final randomized bias while composing
+the main image, optional interpreter, stack reservation, and vDSO window. Each
+image is rebased atomically with checked arithmetic and its maximum LOAD
+alignment; the selected ranges must be pairwise disjoint and below `USER_TOP`.
 
-`ELF_ET_DYN_BASE` is a per-architecture deterministic constant in v1:
-
-| Arch | ELF_ET_DYN_BASE |
-|---|---|
-| RV64 (Sv39 / Sv48) | `0x2AAAAAAA000` (≈ 2/3 of Sv48 user range) |
-| LA64 | `0x2AAAAAAA000` |
-
-These are nominal; the actual constants live in HAL per-arch headers and may change with the Sv-mode decision. The spec only requires that the value is page-aligned, deterministic, leaves room above for the heap and below for the stack, and is the same across all execs on a given build.
-
-ASLR (random `load_bias`) is deferred. When the entropy subsystem and address-space randomization land, `load_bias` becomes `ELF_ET_DYN_BASE + (random & ASLR_MASK)`. The interface to phase 4 does not change.
+When `PT_INTERP` is present, exec resolves and parses exactly one second image
+with `ImageRole::Interpreter`. Userspace starts at the interpreter entry;
+`AT_ENTRY` remains the main program entry and `AT_BASE` carries the interpreter
+load bias. The kernel does not perform dynamic relocation.
 
 ### 8.8 PT_TLS
 <!-- txdoc:EXEC-8-8-PT-TLS -->
@@ -712,30 +752,39 @@ If the chosen target userland requires kernel-side TLS instantiation, this is pr
 load_exec_image errors:
     ENOEXEC — bad magic, wrong class, wrong endian, wrong machine,
               malformed phdr, e_phnum > MAX_PHDRS, e_phentsize wrong,
-              header/phdr range overflows file, PT_INTERP present,
-              PT_GNU_STACK requests executable stack, segment overlap,
-              segment overflow, AT_PHDR uncomputable, ET_DYN with PT_INTERP
-    ENOMEM  — phdr buffer or segment Vec allocation failed
+              header/phdr/interpreter range overflows file, malformed or
+              invalid PT_INTERP declaration, segment overlap, segment overflow,
+              AT_PHDR uncomputable, metadata outside mapped LOAD coverage
+    ELIBBAD — the separately opened interpreter image is malformed or nested
+    ENOMEM  — fallible phdr/interpreter buffers, plan vectors, or layout
+              allocation failed; preserved for both main and interpreter reads
+    EAGAIN  — PageBacked materialization requested an immediate retry; the exec
+              StepOp returns Continue and remains before PoNR
     EIO     — underlying read error from PAGE_BACKED
 ```
 
-`EACCES` is **not** produced by the loader. NOEXEC mount denial is phase 1 / 2; the loader never sees a NOEXEC binary.
+`EACCES` is **not** produced by the syntax/image-plan loader. Execute-bit and
+`MS_NOEXEC` denial happen on the namespace-resolved executable candidate before
+parsing; the retained mount witness also supplies `MS_NOSUID` policy.
 
 ### 8.10 Implementation note (non-normative)
 <!-- txdoc:EXEC-8-10-IMPLEMENTATION-NOTE-NON-NORMATIVE -->
 
-> The v1 implementation uses the `goblin` crate for ELF parsing, configured for `no_std` with the `alloc` feature:
+> The production implementation uses `elf` 0.8.0 with default features
+> disabled:
 >
 > ```toml
-> goblin = { version = "0.10", default-features = false,
->            features = ["alloc", "endian_fd", "elf64", "elf32"] }
+> elf = { version = "0.8.0", default-features = false }
 > ```
 >
-> Only `goblin::elf::header::Header::parse` and `goblin::elf::program_header::ProgramHeader::parse` are called. The unified `goblin::elf::Elf::parse` is *not* used because it requires a contiguous full-file `&[u8]`, which is incompatible with our targeted-read model.
+> `Elf08Parser` implements the replaceable `ElfFileParser` trait using the
+> crate's low-level `FileHeader` and `ParsingTable` APIs. It decodes syntax;
+> `ElfLoadPolicy`, staged reads, and image-plan validation remain txKernel code.
 >
-> `goblin` types do not escape `loader.rs`. Translation to txKernel-owned types (`ExecImagePlan`, `LoadSegment`, `TlsTemplate`) happens inline.
->
-> This is an implementation choice. The architectural contract is the public `load_exec_image` function and the `ExecImagePlan` output type. A future implementation may swap parsers (the `elf` crate is no_std-clean and a viable alternative) without changing the spec.
+> No `elf` type escapes the adapter. The architectural contract is
+> `ElfFileParser` plus txKernel-owned `ElfHeader`, `ElfProgramHeader`, and
+> `ExecImagePlan` values, so replacing the concrete decoder does not change the
+> file-read protocol or exec policy.
 
 ---
 
@@ -776,7 +825,8 @@ The argv and envp pointer arrays (and the strings they point to) live in the cal
 |---|---|
 | E2BIG | Combined argv+envp size exceeds ARG_MAX |
 | EFAULT | argv or envp pointer is unmapped or unreadable |
-| ENOMEM | Kernel-side string buffer allocation failed |
+| EINVAL | A kernel-side argv/envp element contains an embedded NUL |
+| ENOMEM | Kernel-side string, pointer-vector, or proc reference-vector allocation failed |
 
 After this point, no further reads from the caller's old AS are needed. The path string was already copied in phase 0. Everything from here writes into kernel-heap buffers and the new (detached) AS.
 
@@ -906,25 +956,29 @@ The auxiliary vector communicates per-image and per-system facts to userspace st
 | AT_PHENT | Loader | `image_plan.phent` |
 | AT_PHNUM | Loader | `image_plan.phnum` |
 | AT_ENTRY | Loader | `image_plan.entry` |
-| AT_BASE | Static | 0 (no interpreter in v1) |
+| AT_BASE | Loader/layout | interpreter load bias, or 0 for no interpreter |
 | AT_PAGESZ | HAL | 4096 |
 | AT_HWCAP | HAL | `P::arch_auxv_facts().hwcap` |
 | AT_HWCAP2 | HAL | `P::arch_auxv_facts().hwcap2` (0 on RV64 unless the ABI says otherwise; relevant on LA64) |
-| AT_PLATFORM | HAL | per-arch string ("riscv64" / "loongarch64") |
+| AT_PLATFORM | HAL/Stack | pointer to a NUL-terminated per-arch string selected from `P::ARCH` (`"riscv64"` / `"loongarch64"`) and copied into the stack string pool |
 | AT_RANDOM | Entropy | 16 bytes via `random::get_bytes(&mut buf)` |
 | AT_FLAGS | Static | 0 |
 | AT_UID, AT_EUID, AT_GID, AT_EGID | Cred | from `new_credential` |
 | AT_SECURE | Static | 0 (no privilege transition in v1) |
-| AT_EXECFN | Stack | pointer to a copy of the path string in the stack string pool |
+| AT_EXECFN | Stack | pointer to a NUL-terminated copy of the original `execve` pathname in the stack string pool; shebang/interpreter rewrites do not change it |
 | AT_NULL | Static | 0 (terminator) |
 
 Ownership split (per the reviewer's correction):
 
 - **HAL** owns architecture/platform facts (`AT_HWCAP`, `AT_HWCAP2`, `AT_PAGESZ`, `AT_PLATFORM`).
 - **Entropy subsystem** owns `AT_RANDOM`. v1 fallback: if the entropy subsystem is not yet seeded, use boot-time entropy if available; if not, log a warning and use a weak fixed pattern (this is a known v1 limitation, not a permanent design).
-- **Loader** owns image-derived facts (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY`).
+- **Loader/layout** owns image-derived facts (`AT_PHDR`, `AT_PHENT`,
+  `AT_PHNUM`, main-image `AT_ENTRY`, and optional interpreter `AT_BASE`).
 - **Cred** owns credential facts (`AT_UID`, etc.).
-- **Stack builder** owns layout-derived facts (`AT_EXECFN`).
+- **Stack builder** owns the checked placement and pointer derivation for the
+  argv, envp, `AT_PLATFORM`, and `AT_EXECFN` strings. It rejects arithmetic
+  overflow, embedded NULs in any source string, any address at/above
+  `USER_TOP`, and any result whose initial SP is not 16-byte aligned.
 
 ```rust
 pub fn build_auxv<P: AuxvIf>(
@@ -944,7 +998,7 @@ pub fn build_auxv<P: AuxvIf>(
     auxv.push(AT_PHENT,    image_plan.phent as u64);
     auxv.push(AT_PHNUM,    image_plan.phnum as u64);
     auxv.push(AT_ENTRY,    image_plan.entry.0);
-    auxv.push(AT_BASE,     0);
+    auxv.push(AT_BASE,     interpreter.map_or(0, |image| image.load_bias));
     auxv.push(AT_PAGESZ,   arch_facts.page_size);
     auxv.push(AT_HWCAP,    arch_facts.hwcap);
     auxv.push(AT_HWCAP2,   arch_facts.hwcap2);
@@ -955,53 +1009,52 @@ pub fn build_auxv<P: AuxvIf>(
     auxv.push(AT_EGID,     new_credential.egid as u64);
     auxv.push(AT_SECURE,   0);
     auxv.push_random(at_random);   // 16 bytes embedded later as a string-pool ref
-    auxv.push_platform(arch_facts.platform);
-    auxv.push_execfn(/* string-pool ref to path */);
+    auxv.push_platform(stack_pool.push_cstr(match P::ARCH {
+        Arch::Riscv64 => b"riscv64",
+        Arch::LoongArch64 => b"loongarch64",
+    })?);
+    auxv.push_execfn(stack_pool.push_cstr(original_execve_path)?);
     auxv.push(AT_NULL,     0);
 
     Ok(auxv)
 }
 ```
 
-### 9.5 Prepare private fd_table
+### 9.5 Prepare the exact CLOEXEC close plan
 <!-- txdoc:EXEC-9-5-PREPARE-PRIVATE-FD-TABLE -->
 
 ```rust
-    // 9.5.1 — prepare private fd_table.
-    //          If frame.fd_table.shared_count() > 1 (CLONE_FILES sharing),
-    //          allocate a fresh FdTable with the cloexec entries already
-    //          absent. If shared_count() == 1, no copy needed; return a
-    //          plan that closes cloexec entries in place at commit.
-    let prepared_fd_table = fd_table::execution::prepare_exec_close_cloexec(
-        &caller_proc.payload.frame.fd_table,
-    )?;
-    //  Errors: ENOMEM on allocation.
+    // 9.5.1 — while exec is reversible, snapshot the complete CLOEXEC set.
+    //          Every populated fd retains the exact Cap<OpenFile> identity
+    //          observed now; stale CLOEXEC bits are retained as empty entries.
+    let prepared_cloexec = process_prep.prepare_cloexec_close()?;
+    // Errors: ENOMEM for the plan Vec; EAGAIN/ESRCH for stale lifecycle binding.
 ```
 
-`prepare_exec_close_cloexec` is a new fd-table API. Its semantics:
+The current process model owns one sparse `BTreeMap<u32, Cap<OpenFile>>` plus a
+sparse `BTreeSet<u32>` of CLOEXEC bits. `PreparedCloexecClose` is therefore an
+in-place plan rather than a copied fd table:
 
 ```rust
-pub fn prepare_exec_close_cloexec(
-    fd_table: &Shared<FdTable>,
-) -> Result<PreparedFdTable, Errno>;
+pub struct PreparedCloexecClose {
+    entries: Vec<PreparedCloexecFd>,
+}
 
-pub enum PreparedFdTable {
-    /// CLONE_FILES sharing: a fresh FdTable was allocated, with non-cloexec
-    /// entries cloned (Cap<OpenFile> refcount bumped) and cloexec entries
-    /// dropped. Commit replaces the Shared slot atomically.
-    CowReplaced(Cap<FdTable>),
-
-    /// No sharing: the existing FdTable is to be mutated in place at commit.
-    /// Records which fds need closing (their indices and the Caps to drop).
-    InPlaceClosePlan(CloseOnExecPlan),
+struct PreparedCloexecFd {
+    fd: u32,
+    expected_file: Option<Cap<OpenFile>>,
 }
 ```
 
-**Why this shape.** The process `Frame` shared-slot invariant from [`PROCESS_v1.md §3`](../04_process-signals/PROCESS_v1.md) is that mutation through a shared process-frame slot with `strong_count > 1` requires COW. Exec must respect this: if another process or thread group shares the fd table via `CLONE_FILES`, we cannot remove cloexec entries from *their* view. We allocate a fresh table for our process; the other holders keep theirs unchanged.
-
-For the common case (`strong_count == 1`), no copy is needed; we record the close plan and apply it in place at commit. The cost is `prepared_fd_table` carries a small list of (fd_index, Cap<OpenFile>) pairs.
-
-Either variant of `PreparedFdTable` produces an infallible commit (§12.1). The fallible work — allocation, scanning, Cap cloning — happens here in phase 4.
+The retained capability prevents its zone slot from being reused. Immediately
+before the AS swap, exec holds the authoritative process payload slot and then
+locks `fds -> fd_cloexec`; it requires the complete CLOEXEC set and every
+populated fd identity to match the plan. A concurrent close/dup/fcntl change is
+therefore detected before PoNR as `EAGAIN`, and a reused fd number can never be
+closed from a stale plan. All allocation, scanning, and Cap cloning happens in
+this phase. `CLONE_FILES` sharing is not yet a live process-frame surface; when
+it lands, this section must grow a private-table/COW variant before enabling the
+flag.
 
 ### 9.6 Prepare private sig_actions
 <!-- txdoc:EXEC-9-6-PREPARE-PRIVATE-SIG-ACTIONS -->
@@ -1077,9 +1130,9 @@ The reservation was acquired in phase 2 (§7.2.1). It is held through phase 4 to
 At the end of phase 4, the script holds:
 
 ```
-new_as:               Cap<AddressSpace>            // new mappings, populated stack
+    new_as:               Cap<AddressSpace>            // new mappings, populated stack
 new_credential:       NewCredential                // computed (v1: same as old)
-prepared_fd_table:    PreparedFdTable              // COW or in-place close plan
+    prepared_cloexec:     PreparedCloexecClose          // exact fd identities, preallocated
 prepared_sig_actions: PreparedSigActions           // COW or in-place reset plan
 exe_image_ref:        ExecutableImageRef           // for /proc/<pid>/exe
 cmdline:              ExecCmdlineSnapshot          // for /proc/<pid>/cmdline
@@ -1090,7 +1143,7 @@ If any error occurs from here back to phase 0, the script returns Err. All the a
 
 - `new_as` drops; recipes BTree drops; segment Caps on PageContainers drop; AS reclaims.
 - `new_credential`: by-value, dropped trivially.
-- `prepared_fd_table`: if `CowReplaced(cap)`, the new FdTable Cap drops, reclaiming. If `InPlaceClosePlan`, the close plan drops; nothing was applied.
+- `prepared_cloexec`: retained OpenFile Caps drop; no fd-table mutation was applied.
 - `prepared_sig_actions`: same as fd_table.
 - `exe_image_ref`: three Caps drop, refcounts decrement, no semantic change.
 - `cmdline`: kernel-heap bytes free.
@@ -1098,7 +1151,11 @@ If any error occurs from here back to phase 0, the script returns Err. All the a
 
 The caller's old AS, fd table, sig_actions, credential, exe_file are all unchanged.
 
-After phase 5 (collapse) completes, this stack-unwind rollback is no longer available — collapse is irreversible. But in v1 collapse cannot fail, so the irreversibility is benign.
+Phase 5 may return `EAGAIN` before address-space mutation when another
+lifecycle episode or an already-issued sibling exit permit owns progress. Any
+sibling already exited remains exited, but the caller's old address space and
+prepared replacement state remain rollback-safe. After phase 5 reaches the
+sole-survivor state, this stack-unwind rollback is no longer available.
 
 ---
 
@@ -1106,24 +1163,26 @@ After phase 5 (collapse) completes, this stack-unwind rollback is no longer avai
 <!-- txdoc:EXEC-10-PHASE-5-COLLAPSE-THREAD-GROUP -->
 
 ```rust
-    // 10.1 — multi-thread check.
-    if caller_proc.payload.thread_count.load(Ordering::Acquire) > 1 {
-        // 10.2 — initiate group exit with is_exec=true.
-        //          Wakes all sibling threads; they perform step_thread_exit.
-        //          Returns when remaining_threads reaches 0 (caller is sole survivor).
-        proc::execution::initiate_group_exit_for_exec(caller_proc).await;
-        //  Infallible in v1. May yield through reactor while siblings exit.
-    }
+    // 10.1 — ProcessExecPrep already owns ExecReserved.
+    // 10.2 — transition to ExecCollapsing and claim each sibling TID once.
+    process_prep.collapse_threads(caller_thread)?;
     //  After this point: thread_count == 1 (this thread).
 ```
 
-Per [`PROCESS_v1.md §5`](../04_process-signals/PROCESS_v1.md), `GroupExitState { is_exec: true }` is installed on `payload.group_exit.state`. Sibling threads observe this on next AST or syscall return and call `step_thread_exit`. The initiator awaits the completion channel; when `remaining_threads` decrements to zero, the wait wakes, and the script proceeds with phase 6.
+Per [`PROCESS_v1.md §5`](../04_process-signals/PROCESS_v1.md), the retained
+`ProcessExecPrep` owns a generation-tagged `ExecReserved` episode and moves it
+to `ExecCollapsing`. Each sibling TID receives at most one linear exit permit.
+Only actual roster detach decrements the two thread counts.
 
-Group exit is one-shot per *episode* (cross-doc edit P1). After exec collapse completes and exec commits, the episode is cleared in phase 7.5. The process can later clone new threads, exec again, or call `exit_group` for a fresh episode.
+The lifecycle lane is reusable per episode. After exec commits, the owning RAII
+reservation releases its generation in phase 7.5. The process can later clone
+new threads, exec again, or call `exit_group` for a fresh episode.
 
 In v1, non-leader exec was rejected in phase 0, so the surviving thread is always the thread-group leader. The `thread_count` after collapse is exactly 1.
 
-**Failure modes.** None. Collapse is infallible. (When non-leader exec lands in Phase 2, the tid-rename step may introduce its own failures; those will be handled in their own phase.)
+**Failure modes.** Lifecycle contention and an already-in-flight sibling exit
+return `EAGAIN` before phase 6. An abandoned collapse remains owned by
+`ExecAborting` until the last issued permit finishes and clears the lane.
 
 ---
 
@@ -1133,8 +1192,13 @@ In v1, non-leader exec was rejected in phase 0, so the surviving thread is alway
 This is the point of no return.
 
 ```rust
-    // 11.1 — single-store atomic AS replacement.
-    caller_proc.payload.frame.vm.replace(new_as);
+    // 11.1 — validate the prepared CLOEXEC plan under fds + cloexec locks.
+    // 11.2 — while those locks and the authoritative payload slot stay held,
+    //        replace the AS, then remove exactly the prevalidated fds/bits.
+    let old_as = process_prep.replace_aspace_and_close_cloexec(
+        new_as,
+        prepared_cloexec,
+    )?; // Err is possible only before the AS store.
 ```
 
 `Frame.vm` is a process-frame shared slot whose value is identity-retaining `Cap<AddressSpace>` evidence (see [`PROCESS_v1.md §3`](../04_process-signals/PROCESS_v1.md)). `replace` is a single atomic store, decrementing the old AS's refcount and storing the new AS's Cap. The old AS reaches `strong_count == 0` (since v1's collapse guarantees no other threads of this process exist, and cross-process sharing of the AS is rare) and reclaims.
@@ -1146,7 +1210,18 @@ After this single store:
 - The caller's userspace state is gone. There is no path back.
 - However, *this thread* is still in kernel mode and has not yet returned to userspace. The stale trap frame is fine; we update it before returning.
 
-The store itself cannot fail. `Shared::replace` is a typed atomic operation; the old AS's drop happens via refcount and may take time (PTE teardown, recipes drop) but does not affect the script's progress — it's deferred reclamation.
+The final plan comparison may return `EAGAIN` before mutation. The required
+commit contract after it passes is a bounded, allocation-free close-plan
+application: no vector growth, snapshot cloning, B-tree insertion, or
+recoverable error may follow the AS store.
+
+**Current implementation gap (2026-07-17).** Exact fd removal satisfies the
+pre-store validation contract, but a last pipe/socketpair endpoint decrement
+may synchronously publish through allocation-backed `WaitSource`/mailbox
+delivery; vfork/exit-source publication has the same class of risk. Therefore
+the `ponr-cloexec-plan` progress step remains pending. Closure requires a
+preallocated bounded publication plan, or an equivalent substrate/reactor
+notification path that cannot expand after the AS store.
 
 **This is the only step in exec that mutates `frame.vm`.** Phase 7 mutates other Frame fields (`fd_table`, `sig_actions`), but `vm` is touched exactly once.
 
@@ -1156,9 +1231,8 @@ The store itself cannot fail. `Shared::replace` is a typed atomic operation; the
 The full exec is a sequence of commits:
 
 ```
-phase 6:  frame.vm replaced
-phase 7.1: frame.fd_table replaced (+ cloexec closes)
-phase 7.2: frame.sig_actions replaced (+ disposition reset)
+phase 6:  prepared CLOEXEC plan validated; frame.vm replaced; exact fds closed
+phase 7.1: frame.sig_actions replaced (+ disposition reset)
            thread.alt_stack cleared
 phase 7.3: payload.policy.cred replaced
 phase 7.4: payload.exe_file installed; payload.cmdline installed
@@ -1186,32 +1260,15 @@ Each subsection is one commit point. Order matters for observability (external o
 
 The EXEC-PONR invariant (§15) constrains every action in this phase: no allocation, no user memory access, no I/O, no fallible computation. Each commit is a substrate primitive call or a single field store.
 
-### 12.1 Install fd_table; close FD_CLOEXEC entries
+### 12.1 CLOEXEC commit is already complete
 <!-- txdoc:EXEC-12-1-INSTALL-FD-TABLE-CLOSE-FD-CLOEXEC-ENTRIES -->
 
-```rust
-    // 12.1.1 — install the prepared fd_table.
-    match prepared_fd_table {
-        PreparedFdTable::CowReplaced(new_fd_table) => {
-            caller_proc.payload.frame.fd_table.replace(new_fd_table);
-            //  Old fd_table refcount-decrements. If shared, peers keep theirs.
-            //  Cloexec'd OpenFile Caps already absent from new_fd_table; their
-            //  drops happened during prepare_exec_close_cloexec (phase 9.5).
-        }
-        PreparedFdTable::InPlaceClosePlan(plan) => {
-            //  Apply the close plan to the existing fd_table.
-            //  No allocation; just clearing slots and dropping Caps.
-            fd_table::execution::apply_close_plan_infallible(
-                &caller_proc.payload.frame.fd_table,
-                plan,
-            );
-        }
-    }
-```
-
-Either arm fires the same publication: dropping a `Cap<OpenFile>` for a cloexec'd file may decrement the fd's refcount to zero, which triggers the file's close path. The close path publishes via existing VFS attachments (fsnotify on the parent dentry, `close_port` on the OpenFile per [`SIGNAL_ATTACHMENTS_v1.md §3.2`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md)).
-
-The publications are happening *post-PoNR*, but they are not exec-introduced; they are the existing close-path publications, already specified by VFS. Their timing relative to the AS swap is "after."
+`replace_aspace_and_close_cloexec` applies the plan immediately after the AS
+store while still holding the process payload and fd locks. The removal loop is
+bounded by the preallocated plan and cannot return an error. The target
+contract also requires any resulting pipe/socketpair close publication to use
+preallocated bounded delivery. The current allocation-backed notification path
+does not yet meet that requirement; see the implementation-gap note in §11.
 
 ### 12.2 Install sig_actions; reset; clear altstack
 <!-- txdoc:EXEC-12-2-INSTALL-SIG-ACTIONS-RESET-CLEAR-ALTSTACK -->
@@ -1271,12 +1328,14 @@ Procfs projections read these slots on demand; readers see the new values from t
 <!-- txdoc:EXEC-12-5-CLEAR-GROUPEXIT-EPISODE -->
 
 ```rust
-    // 12.5.1 — clear the episode.
-    //          The episode armed in phase 5 is now discharged.
-    caller_proc.payload.group_exit.state.store(None, Ordering::Release);
+    // 12.5.1 — final authoritative credential commit also consumes
+    //          ProcessExecPrep and releases its lifecycle generation.
+    commit_prepared_exec_cred(prepared_cred);
 ```
 
-Per cross-doc edit P1, GroupExit is one-shot per episode. After this clear, the process can later clone new threads, exec again, or call exit_group with a fresh episode.
+The release is checked while the authoritative identity payload slot still
+names the reserved payload. After it succeeds, the process can later clone new
+threads, exec again, or call exit_group with a fresh episode.
 
 If `payload.thread_count.load() == 1` (which is the case post-collapse), this clear is unobservable in v1. When non-leader exec lands and threads can clone post-exec, this clear matters.
 
@@ -1351,21 +1410,26 @@ The complete error map for phases 0–5:
 |---|---|---|
 | 0 | ENOSYS | Non-leader exec (v1) |
 | 0 | EFAULT | Path pointer unmapped |
+| 0 | ENOENT | Empty pathname |
 | 0 | ENAMETOOLONG | Path > PATH_MAX |
 | 1 | ENOENT | Path component missing |
 | 1 | ENOTDIR | Non-directory in path prefix |
 | 1 | ELOOP | Symlink chain exceeded |
+| 1 | ELOOP | Fifth shebang interpreter redirect |
 | 1 | EACCES | Search permission denied; **or** MS_NOEXEC mount |
 | 2 | EACCES | No execute permission (mode bits, ownership) |
 | 2 | EPERM | Privileged check failed (capability missing) |
-| 2 | EAGAIN | Cred mutation reservation contended (cannot occur in v1) |
+| 2 | EAGAIN | Credential or process lifecycle reservation contended |
 | 3 | ENOEXEC | Image format invalid (full set in §8.9) |
+| 3 | ENOEXEC | Input is neither ELF nor a valid shebang; userspace owns shell fallback |
 | 3 | ENOMEM | Loader buffer allocation failed |
-| 3 | EIO | Underlying read error from binary's PageContainer |
+| 3 | EAGAIN | PageBacked materialization requested immediate retry; StepOp returns `Continue` |
+| 3 | EIO | Underlying non-retry read error from binary's PageContainer |
 | 4 | E2BIG | argv + envp exceeds ARG_MAX |
 | 4 | EFAULT | argv/envp pointer unmapped or unreadable |
-| 4 | ENOMEM | New AS, stack, fd_table COW, sig_actions COW, or auxv allocation failed |
-| 5 | — | Collapse infallible in v1 |
+| 4 | EINVAL | Kernel-side argv/envp input contains an embedded NUL |
+| 4 | ENOMEM | argv/envp and proc reference vectors, new AS, stack, CLOEXEC plan, sig_actions preparation, or auxv allocation failed |
+| 5 | EAGAIN | Competing lifecycle episode or in-flight sibling exit |
 
 Every pre-PoNR error returns to the caller in the *old* AS with `errno` set. The caller's userspace state is unchanged — pid, fds, mappings, signal state, stack pointer all as they were.
 
@@ -1393,19 +1457,25 @@ For a pre-PoNR failure at phase N, the resources held are exactly those construc
 | `image_plan` | Vec<LoadSegment> freed; Cap refs in `interp` (none in v1) decrement |
 | `argv_strings`, `envp_strings` | Heap free |
 | `new_as` | AddressSpace reclaims; segment Caps on PageContainers decrement; recipes BTree drops; pmap entries drop |
-| `prepared_fd_table` | If COW: new FdTable Cap reclaims, OpenFile Cap clones decrement. If in-place plan: plan drops, no application |
+| `prepared_cloexec` | Retained OpenFile Cap clones decrement; fd table and CLOEXEC bits are unchanged |
 | `prepared_sig_actions` | Symmetric to fd_table |
 | `exe_image_ref` | Three Caps decrement |
 | `cmdline` | Heap free |
 
 The script's Future resolves with `Err(errno)`; the syscall return path stores `errno` in the caller's register set and resumes userspace. The caller's AS, fd table, sig_actions, credential, exe_file are unchanged from before exec was called.
 
-### 14.4 Post-collapse-pre-swap: the unreachable corner
+### 14.4 Post-collapse-pre-swap: bounded validation corner
 <!-- txdoc:EXEC-14-4-POST-COLLAPSE-PRE-SWAP-THE-UNREACHABLE-CORNER -->
 
 Between phase 5 (collapse complete) and phase 6 (AS swap), the process is single-threaded but the AS has not been replaced. If a failure could occur here, the process would be in an awkward state: siblings dead, but the leader still runs the old binary.
 
-In v1, this corner is **unreachable**: phase 5 is infallible and phase 6 is a single store. There is no instruction between them that can fail.
+The current implementation admits exactly one recoverable check here:
+`replace_aspace_and_close_cloexec` revalidates the complete preallocated
+CLOEXEC plan under the fd locks. An in-flight sibling fd mutation that completed
+during collapse returns `EAGAIN` before the AS store. The old AS and current fd
+table remain unchanged, though already-completed sibling exits are not rolled
+back. Once this validation passes, the AS store and close-plan removal loop have
+no error path.
 
 Future-proofing: if non-leader exec adds tid-rename steps between collapse and swap, those steps must be infallible (or any failure must abort the whole process via fatal signal, since rolling back collapse is impossible — siblings cannot be resurrected). Phase 2 of cred work that introduces credential install failures must place those failures *before* collapse.
 
@@ -1428,15 +1498,15 @@ This invariant is the load-bearing rule that makes the exec script auditable. Wi
 - **`copy_to_user` on the new AS.** Stack contents are written in phase 4 via `populate_detached_user_range`. No further user-memory writes are needed in phase 7.
 - **Filesystem I/O.** The binary's PageContainer is now wired into the new AS's segment VmEntries; no further reads needed for exec proper. (Subsequent fault-time materialization is normal page-fault handling, not exec.)
 - **Cap upgrades that can fail.** All upgrades happened in phase 2.
-- **BTree operations that can fail.** Recipes BTree allocations happened in `build_aspace_from_image` (phase 4).
+- **BTree operations that can fail.** Recipes and close-plan allocations happened before PoNR. The commit only removes prevalidated `fds`/`fd_cloexec` nodes.
 
 ### 15.2 What the invariant permits in phase 7+
 <!-- txdoc:EXEC-15-2-WHAT-THE-INVARIANT-PERMITS-IN-PHASE-7 -->
 
 - **Atomic stores.** `Shared<T>::replace`, `AtomicSlot::store`, `AtomicU32::store`.
-- **Refcount operations.** `Cap` clone bumps a refcount, and `Cap` drop decrements one. Both are infallible.
+- **Refcount operations.** CLOEXEC commit uses `Cap` drop/decrement only; its retained `Cap` clones and the executable/procfs publication Caps were created before PoNR.
 - **Substrate primitive calls.** `index::commit`, `index::withdraw_commit`, etc., on prepared inputs.
-- **Plan application.** Applying a prepared `CloseOnExecPlan` or `SigResetPlan` — bounded loops over precomputed indices.
+- **Plan application.** Applying `PreparedCloexecClose` or `SigResetPlan` — bounded loops over precomputed indices.
 - **Trap-frame writes.** `commit_exec_context` writes to the thread's saved trap frame (kernel memory, not user memory).
 - **Tracepoint emission.** `trace::process_execd` is fire-and-forget on a RawTrace.
 
@@ -1446,7 +1516,7 @@ This invariant is the load-bearing rule that makes the exec script auditable. Wi
 The invariant is enforced by:
 
 - **Code review.** `scripts/process/exec.rs` phase 7 and phase 8 sections are auditable in isolation; they should be ~30 lines of straight-line code with no error-returning calls.
-- **Type system.** The prepared-plan types (`PreparedFdTable`, `PreparedSigActions`) are constructed only in phase 4 helpers; their `apply_*_infallible` consumers cannot return Result.
+- **Type system.** `PreparedCloexecClose` and `PreparedSigActions` are constructed before PoNR. The CLOEXEC method's `Result` covers only pre-store validation; after the AS store its body has no error branch or allocation.
 - **Lints.** A future lint can verify that phase 7+ functions called from `script_execve` past the swap point have signatures returning `()` or `!`, never `Result`.
 
 There is no runtime check; the invariant is structural.
@@ -1665,7 +1735,7 @@ async fn script_execve(path: UserAddr, argv: UserAddr, envp: UserAddr)
         &new_as, UserAddr(STACK_TOP_DEFAULT.0 - stack_image.bytes.len()), &stack_image.bytes,
     )?;
 
-    let prepared_fd_table    = fd_table::execution::prepare_exec_close_cloexec(&caller_proc.payload.frame.fd_table)?;
+    let prepared_cloexec     = process_prep.prepare_cloexec_close()?;
     let prepared_sig_actions = sig_actions::execution::prepare_exec_reset(&caller_proc.payload.frame.sig_actions)?;
 
     let exe_image_ref = ExecutableImageRef {
@@ -1674,26 +1744,27 @@ async fn script_execve(path: UserAddr, argv: UserAddr, envp: UserAddr)
         rnode:  exe_file.rnode.clone(),
     };
 
-    // ── Last reversible point. Past here, EXEC-PONR applies. ────────
-
     // ─── Phase 5: Collapse thread group ──────────────────────────────
-    if caller_proc.payload.thread_count.load(Ordering::Acquire) > 1 {
-        proc::execution::initiate_group_exit_for_exec(caller_proc).await;
-    }
+    let prepared_cloexec = prepared_exec_cred
+        .process_prep_mut()
+        .prepare_cloexec_close()?;
+    prepared_exec_cred.process_prep_mut().collapse_threads(caller_thread)?;
+    prepared_exec_cred.process_prep_mut().validate_commit_ready()?;
+
+    // ── Last pre-PoNR check. A successful swap starts EXEC-PONR. ─────
 
     // ─── Phase 6: Address-space visibility boundary (PoNR) ───────────
-    caller_proc.payload.frame.vm.replace(new_as);
+    let old_as = prepared_exec_cred
+        .process_prep_mut()
+        .replace_aspace_and_close_cloexec(new_as, prepared_cloexec)?;
 
     // ─── Phase 7: Infallible post-swap commits ───────────────────────
-    install_prepared_fd_table(&caller_proc.payload.frame.fd_table, prepared_fd_table);
     install_prepared_sig_actions(&caller_proc.payload.frame.sig_actions, prepared_sig_actions);
     caller_thread.payload.alt_stack.store(None, Ordering::Release);
-    cred::execution::commit_exec_credential_infallible(
-        &caller_proc.payload.policy, cred_reservation, new_credential,
-    );
     caller_proc.payload.exe_file.store(Some(exe_image_ref), Ordering::Release);
     caller_proc.payload.cmdline.store(cmdline);
-    caller_proc.payload.group_exit.state.store(None, Ordering::Release);
+    commit_prepared_exec_cred(prepared_exec_cred)
+        .expect("checked AS swap preserves the authoritative exec binding");
     thread_runtime::execution::commit_exec_context(
         caller_thread,
         ExecUserContext {
@@ -1727,10 +1798,13 @@ Both share the witness-then-Cap flow and the cross-subsystem reservation+commit 
 <!-- txdoc:EXEC-20-1-IN-SCOPE -->
 
 - Static ELF binaries (ET_EXEC).
-- Static PIE (ET_DYN without PT_INTERP).
+- Static PIE and dynamic main images (`ET_DYN`), including one separately
+  validated `PT_INTERP` image.
+- Combined randomized main/interpreter/stack/vDSO layout with checked rebasing,
+  `AT_ENTRY` for the main image, and `AT_BASE` for the interpreter.
 - Leader-only exec.
 - argv, envp, full auxv (AT_PHDR, AT_PHENT, AT_PHNUM, AT_ENTRY, AT_BASE, AT_PAGESZ, AT_HWCAP, AT_HWCAP2, AT_PLATFORM, AT_RANDOM, AT_FLAGS, AT_UID/EUID/GID/EGID, AT_SECURE, AT_EXECFN).
-- FD_CLOEXEC closure with Shared<FdTable> COW.
+- FD_CLOEXEC closure with a fallibly prepared, exact-identity close plan.
 - Signal disposition reset with Shared<SigActionTable> COW.
 - Altstack clear.
 - Mount NOEXEC denial.
@@ -1745,13 +1819,11 @@ Both share the witness-then-Cap flow and the cross-subsystem reservation+commit 
 | Feature | Defer reason | Phase |
 |---|---|---|
 | Non-leader execve | Tid-rename design needed | Phase 2 |
-| PT_INTERP / dynamic linking | Second image load + AT_BASE machinery | Phase 2 |
 | setuid / setgid (S_ISUID / S_ISGID) | Cred subsystem Phase 2 | Phase 2 |
 | File capabilities | xattr support + cred Phase 2 | Phase 2 |
 | AT_SECURE | Driven by suid/caps; always 0 in v1 | Phase 2 |
-| ASLR | Entropy subsystem maturity | Phase 2 |
 | Personality flags | Linux compat tail | Phase 3+ |
-| MAP_DENYWRITE on text segments | Tracking writers vs. mappers | Phase 3+ |
+| Executable lease / MAP_DENYWRITE | Generation-stable writer/mapper exclusion and ETXTBSY semantics | Phase 3+ |
 | PT_TLS kernel-side initialization | Risk; see §20.3 | v1-promotable |
 | `execveat(AT_EMPTY_PATH)` | Trivial extension; deferred for scope | Phase 2 |
 | `PTRACE_EVENT_EXEC` | Observation subsystem | Observation |
@@ -1785,12 +1857,16 @@ Loader    parses ELF into a parser-agnostic ExecImagePlan (parser library is an 
 VM        builds a detached AddressSpace, populates initial stack, swaps at PoNR
 Process   coordinates GroupExit, preserves identity, holds exe_file/cmdline
 FD/Signal/ThreadRuntime
-          install per-Frame replacements: fd_table, sig_actions, trap context
+          validate/apply CLOEXEC plan; install sig_actions and trap context
 ```
 
 Procfs is not a peer in the sequencing sense; it consumes projections of state set by exec.
 
-The Shared<T> COW preparation pattern (§9.5, §9.6) is the load-bearing mechanism for fd_table and sig_actions: all allocation happens in phase 4, and phase 7's installation is reduced to atomic-store + bounded-loop plan application. The credential mutation reservation (§7) prevents racing setuid; v1 takes the reservation even though it doesn't yet change credentials, keeping the Phase 2 patch local.
+The prepared-plan pattern (§9.5, §9.6) is load-bearing: all allocation happens
+before PoNR. FD commit revalidates exact retained identities under the table
+locks and then performs only removals; signal phase 7 is likewise reduced to
+bounded plan application. The credential mutation reservation (§7) prevents
+racing setuid through commit.
 
 The detached-AddressSpace model (§9.2, §11) is the central architectural improvement over the obvious "teardown + rebuild" implementation. Building the new AS fully off to the side, then swapping at PoNR, makes phase 6 atomic and lets all fallible work happen reversibly in phase 4. `vm::populate_detached_user_range` (cross-doc edit V2) is the new VM API that makes this possible.
 

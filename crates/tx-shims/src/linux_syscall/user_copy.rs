@@ -30,8 +30,9 @@ use tx_subsystems::vm::{
 pub(super) enum ReadCStrError {
     /// No NUL within `max_len` — surface as `-ENAMETOOLONG`.
     TooLong,
-    /// Canonical user-copy error, including `ENOMEM` when the kernel-side
-    /// destination cannot grow.
+    /// Kernel buffer growth failed while copying the string.
+    OutOfMemory,
+    /// Canonical user copy fault (for example, `NULL`/bad pathname).
     Fault(Errno),
 }
 
@@ -115,52 +116,8 @@ pub(super) fn read_user_cstr(
     match bootstrap_read_user_cstr(aspace, uaddr, max_len) {
         Ok(v) => Ok(v),
         Err(Errno::ENAMETOOLONG) => Err(ReadCStrError::TooLong),
+        Err(Errno::ENOMEM) => Err(ReadCStrError::OutOfMemory),
         Err(errno) => Err(ReadCStrError::Fault(errno)),
-    }
-}
-
-/// Wait-capable runtime counterpart of [`read_user_cstr`].
-///
-/// `AddressSpace::read_user_cstr` may yield while another hart materialises
-/// the page containing the string.  A runtime syscall must yield and retry;
-/// translating that normal SMP race to `EIO` makes process launch fail before
-/// `execve` is reached.
-pub(super) async fn read_user_cstr_wait(
-    aspace: &AddressSpace,
-    uaddr: u64,
-    max_len: usize,
-) -> Result<Vec<u8>, ReadCStrError> {
-    use step_engine::{Errno as V3Errno, StepOutcome as V3};
-
-    if uaddr == 0 {
-        return Err(ReadCStrError::Fault(Errno::EFAULT));
-    }
-    if max_len == 0 {
-        return Err(ReadCStrError::TooLong);
-    }
-
-    #[cfg(not(target_os = "none"))]
-    {
-        return read_user_cstr(aspace, uaddr, max_len);
-    }
-
-    #[cfg(target_os = "none")]
-    loop {
-        let outcome = {
-            let guard = user_access_guard();
-            aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &guard)
-        };
-        match outcome {
-            V3::Done(value) => return Ok(value),
-            V3::Err(V3Errno::ENAMETOOLONG) => return Err(ReadCStrError::TooLong),
-            V3::Err(error) => return Err(ReadCStrError::Fault(error.into())),
-            V3::Continue { .. } | V3::Yield { .. } => {
-                // The competing materializer owns the wait token. Yielding the
-                // task lets that transaction publish before we retry the
-                // bounded scan; no epoch guard crosses this await.
-                tx_reactor::yield_now().await;
-            }
-        }
     }
 }
 
@@ -309,24 +266,8 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
     let guard = user_access_guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
-        V3::Err(_first_err) => {
+        V3::Err(V3Errno::EFAULT) => {
             drop(guard);
-            // fork narrow-copy leaves the child's inherited stack/anon pages
-            // unmapped until a refault; a kernel-side read of argv/envp on
-            // those pages comes back not just as EFAULT but as the pmap-layer
-            // "needs refresh" errno (EDESTADDRREQ) too. Either way the fix is
-            // the same: materialise the range by hand (anon pages resolve
-            // synchronously) and retry once. A genuinely bad pointer fails the
-            // retry and falls through to the errno mapping below.
-            if let Some(range) = covering_user_range(uaddr, core::mem::size_of::<T>()) {
-                let _ = aspace.reserve_user_range_for_access(range, UserAccessKind::Read);
-                let retry_guard = user_access_guard();
-                if let V3::Done(v) =
-                    aspace.read_user(UserPtr::<T>::new(uaddr as usize), &retry_guard)
-                {
-                    return Ok(v);
-                }
-            }
             #[cfg(target_os = "none")]
             {
                 Err(Errno::EFAULT)
@@ -493,10 +434,6 @@ pub(super) fn bootstrap_copy_from_user(
 }
 
 /// Wait-capable runtime counterpart of [`bootstrap_copy_from_user`].
-///
-/// A concurrent first-touch of the same user page is normal on SMP. Runtime
-/// syscalls must wait for that VM transaction instead of exposing the
-/// synchronous bootstrap helper's `EIO` collapse to userspace.
 pub(super) async fn bootstrap_copy_from_user_wait(
     aspace: &AddressSpace,
     dst: &mut [u8],
@@ -625,45 +562,11 @@ pub(super) fn bootstrap_copy_to_user(
 }
 
 /// Wait-capable runtime counterpart of [`bootstrap_copy_to_user`].
-///
-/// The destination is prefaulted before copying. Retrying after a racing VM
-/// mutation is safe because the immutable kernel buffer overwrites an
-/// already-copied prefix with the same bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum UserCopyWaitStage {
-    InvalidRange,
-    Reserve,
-    Copy,
-    SynchronousFallback,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct UserCopyWaitFailure {
-    pub errno: Errno,
-    pub stage: UserCopyWaitStage,
-    pub retries: usize,
-}
-
 pub(super) async fn bootstrap_copy_to_user_wait(
     aspace: &AddressSpace,
     uaddr: u64,
     src: &[u8],
 ) -> Result<(), Errno> {
-    bootstrap_copy_to_user_wait_diagnosed(aspace, uaddr, src)
-        .await
-        .map_err(|failure| failure.errno)
-}
-
-/// Diagnostic-preserving form of [`bootstrap_copy_to_user_wait`].
-///
-/// Normal callers use the errno-only wrapper. Pipe reads use this form so an
-/// already-failing Cargo child-launch handshake can say whether the EIO came
-/// from prefault/range reservation or from the final pmap-backed copy.
-pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
-    aspace: &AddressSpace,
-    uaddr: u64,
-    src: &[u8],
-) -> Result<(), UserCopyWaitFailure> {
     use StepOutcome as V3;
     if src.is_empty() {
         return Ok(());
@@ -671,34 +574,18 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
 
     #[cfg(not(target_os = "none"))]
     {
-        return bootstrap_copy_to_user(aspace, uaddr, src).map_err(|errno| UserCopyWaitFailure {
-            errno,
-            stage: UserCopyWaitStage::SynchronousFallback,
-            retries: 0,
-        });
+        return bootstrap_copy_to_user(aspace, uaddr, src);
     }
 
     #[cfg(target_os = "none")]
     {
         let Some(range) = covering_user_range(uaddr, src.len()) else {
-            return Err(UserCopyWaitFailure {
-                errno: Errno::EFAULT,
-                stage: UserCopyWaitStage::InvalidRange,
-                retries: 0,
-            });
+            return Err(Errno::EFAULT);
         };
-        if let Err(errno) = aspace
+        aspace
             .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
-            .await
-        {
-            return Err(UserCopyWaitFailure {
-                errno,
-                stage: UserCopyWaitStage::Reserve,
-                retries: 0,
-            });
-        }
+            .await?;
 
-        let mut retries = 0usize;
         loop {
             let outcome = {
                 let guard = user_access_guard();
@@ -706,26 +593,12 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
             };
             match outcome {
                 V3::Done(_) | V3::Continue { .. } => return Ok(()),
-                V3::Err(error) => {
-                    return Err(UserCopyWaitFailure {
-                        errno: error.into(),
-                        stage: UserCopyWaitStage::Copy,
-                        retries,
-                    });
-                }
+                V3::Err(error) => return Err(error.into()),
                 V3::Yield { .. } => {
-                    retries = retries.saturating_add(1);
                     tx_reactor::yield_now().await;
-                    if let Err(errno) = aspace
+                    aspace
                         .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
-                        .await
-                    {
-                        return Err(UserCopyWaitFailure {
-                            errno,
-                            stage: UserCopyWaitStage::Reserve,
-                            retries,
-                        });
-                    }
+                        .await?;
                 }
             }
         }
@@ -753,17 +626,6 @@ pub(super) fn bootstrap_read_user_cstr(
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
             drop(guard);
-            // See `bootstrap_read_user`: same fork copy-narrowing refault
-            // duty, string flavour.
-            if let Some(range) = covering_user_range(uaddr, max_len) {
-                let _ = aspace.reserve_user_range_for_access(range, UserAccessKind::Read);
-                let retry_guard = user_access_guard();
-                if let V3::Done(v) =
-                    aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &retry_guard)
-                {
-                    return Ok(v);
-                }
-            }
             #[cfg(target_os = "none")]
             {
                 Err(Errno::EFAULT)

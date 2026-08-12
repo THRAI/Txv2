@@ -199,12 +199,12 @@ impl FaultDecodeConfig {
                     panic_msg: None,
                 }),
                 (None, None, None) => {
-                    return Err("provide --serial, --addr, or --scause/--sepc/--stval".into())
+                    return Err("provide --serial, --addr, or --scause/--sepc/--stval".into());
                 }
                 _ => {
                     return Err(
                         "explicit trap input requires --scause HEX --sepc HEX --stval HEX".into(),
-                    )
+                    );
                 }
             }
         };
@@ -953,7 +953,7 @@ fn extract_formal_param<R: gimli::Reader>(
                 register: None,
                 is_indirect: false,
                 type_name,
-            })
+            });
         }
     };
 

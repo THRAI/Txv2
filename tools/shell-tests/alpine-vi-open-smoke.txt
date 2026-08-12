@@ -1,0 +1,16 @@
+# alpine-vi-open-smoke.txt - open BusyBox vi far enough to exercise terminal setup.
+#
+# This reproduces the interactive "TERM=vt100 vi /tmp/a.txt" path without
+# requiring a human to quit the editor. BusyBox vi accepts -c q, so the test
+# starts the editor and immediately exits after terminal initialisation.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "TERM=vt100 vi -c q /tmp/a.txt; echo vi-open-status-$?\n"
+expect "vi-open-status-0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+quit

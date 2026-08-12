@@ -89,22 +89,6 @@ impl FrameMeta {
         self.state.load(Ordering::Acquire)
     }
 
-    pub(crate) fn refcount(&self) -> u32 {
-        (self.state() >> REFCOUNT_SHIFT) & REFCOUNT_MASK
-    }
-
-    pub(crate) fn map_count(&self) -> u32 {
-        (self.state() >> MAP_COUNT_SHIFT) & MAP_COUNT_MASK
-    }
-
-    pub(crate) fn cache_ref(&self) -> u32 {
-        (self.state() >> CACHE_REF_SHIFT) & CACHE_REF_MASK
-    }
-
-    pub(crate) fn pin_count(&self) -> u32 {
-        (self.state() >> PIN_COUNT_SHIFT) & PIN_COUNT_MASK
-    }
-
     pub(crate) fn claim_owned(&self) -> Result<(), AllocError> {
         if self.is_reserved() {
             return Err(AllocError::ReservedFrame);
@@ -214,22 +198,22 @@ impl FrameMeta {
 
     #[doc(hidden)]
     pub fn refcount_for_test(&self) -> u32 {
-        self.refcount()
+        self.state() & REFCOUNT_MASK
     }
 
     #[doc(hidden)]
     pub fn map_count_for_test(&self) -> u32 {
-        self.map_count()
+        (self.state() >> MAP_COUNT_SHIFT) & MAP_COUNT_MASK
     }
 
     #[doc(hidden)]
     pub fn cache_ref_for_test(&self) -> u32 {
-        self.cache_ref()
+        (self.state() >> CACHE_REF_SHIFT) & CACHE_REF_MASK
     }
 
     #[doc(hidden)]
     pub fn pin_count_for_test(&self) -> u32 {
-        self.pin_count()
+        (self.state() >> PIN_COUNT_SHIFT) & PIN_COUNT_MASK
     }
 }
 

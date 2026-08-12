@@ -22,7 +22,6 @@ use tx_substrate::wake::WaitEndpoint;
 use crate::adapter::step_engine::SpinMutex;
 use crate::adapter::wait_mailbox::{ActiveWait, InterestMask, TaskMailbox, WaitGeneration};
 use crate::adapter::wait_routing::{Mask, WaitOutcome};
-use crate::execution::WaitToken;
 
 #[derive(Clone)]
 enum RegisteredWaitSource {
@@ -113,18 +112,6 @@ pub fn register_wait_queue(queue: RawQueue) -> u64 {
     id
 }
 
-/// Register a level-triggered queue under an object-owned source id.
-///
-/// Page-backed waits deliberately pair this readiness predicate with a
-/// `WaitSource` carrying the same id: the queue closes the subscribe-after-
-/// completion race, while the WaitSource preserves owner-aware reactor wakeup.
-pub fn register_wait_queue_with_id(id: u64, queue: RawQueue) {
-    queue.set_source_id(tx_substrate::step::WaitSourceId::new(id));
-    REGISTRY
-        .lock()
-        .insert(id, RegisteredWaitSource::RawQueue(queue));
-}
-
 /// Register an edge-triggered port for wait-source resolution.
 pub fn register_wait_port(port: RawPort) -> u64 {
     let mut registry = REGISTRY.lock();
@@ -138,14 +125,6 @@ pub fn register_wait_port(port: RawPort) -> u64 {
     port.set_source_id(tx_substrate::step::WaitSourceId::new(id));
     registry.insert(id, RegisteredWaitSource::RawPort(port));
     id
-}
-
-/// Register an edge-triggered port under an object-owned source id.
-pub fn register_wait_port_with_id(id: u64, port: RawPort) {
-    port.set_source_id(tx_substrate::step::WaitSourceId::new(id));
-    REGISTRY
-        .lock()
-        .insert(id, RegisteredWaitSource::RawPort(port));
 }
 
 /// Drop the registry's clone of any wait source registered under `id`.
@@ -301,13 +280,6 @@ pub fn wait_on_registered_source_id(source_id: u64, interest: u64) -> Option<Reg
     }
 }
 
-/// Compatibility bridge for subsystems that still carry a structured
-/// [`WaitToken`]. Resolution uses main's unified registered-source registry,
-/// so channel, raw-queue, and raw-port waits all preserve the same semantics.
-pub fn wait_on_token(token: WaitToken) -> Option<RegisteredWaitFuture> {
-    wait_on_registered_source_id(token.source_id(), token.interest())
-}
-
 impl Unpin for RegisteredWaitFuture {}
 impl Unpin for WaitSourceWaitFuture {}
 impl Unpin for RawQueueWaitFuture {}
@@ -382,11 +354,7 @@ impl Future for RawQueueWaitFuture {
         this.mailbox.register_waker(cx.waker().clone());
 
         let ready = if this.subscription.is_some() {
-            // RawQueue is level-triggered. A stale mailbox generation may
-            // suppress an old wake hint, but it must not suppress readiness
-            // that is still asserted by the producer.
             mailbox_ready(&this.mailbox, this.active_wait.as_ref())
-                || (this.queue.peek() & this.mask.bits() != 0)
         } else if this.queue.peek() & this.mask.bits() != 0 {
             true
         } else {
@@ -613,38 +581,5 @@ mod tests {
         assert!(wait_on_registered_source_id(id, 0x1).is_some());
         release_wait_source(id);
         assert!(wait_on_registered_source_id(id, 0x1).is_none());
-    }
-
-    #[test]
-    fn subscribed_raw_queue_rechecks_level_after_stale_mailbox_event() {
-        let queue = RawQueue::new();
-        let mut wait = RawQueueWaitFuture {
-            queue: queue.clone(),
-            mask: Mask::from_bits(0x4),
-            subscription: None,
-            mailbox: Arc::new(TaskMailbox::new()),
-            active_wait: None,
-        };
-        let waker = core::task::Waker::noop();
-        let mut cx = core::task::Context::from_waker(waker);
-
-        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
-        assert!(wait.subscription.is_some());
-
-        // Keep the old queue subscription but advance the driver's active
-        // generation. The resulting SourceFired event is intentionally stale;
-        // the queue's asserted level remains authoritative.
-        let generation = wait.mailbox.next_generation();
-        wait.active_wait = Some(ActiveWait::new(
-            generation,
-            queue.source_id(),
-            InterestMask::new(0x4),
-        ));
-        queue.fire(0x4);
-
-        assert!(matches!(
-            Pin::new(&mut wait).poll(&mut cx),
-            Poll::Ready(WaitOutcome::Ready)
-        ));
     }
 }

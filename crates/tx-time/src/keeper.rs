@@ -29,10 +29,6 @@ pub type VvarPublishHook = fn(VvarSnapshot);
 
 static REALTIME_TIMER_NOTIFIER: AtomicUsize = AtomicUsize::new(0);
 static VVAR_PUBLISH_HOOK: AtomicUsize = AtomicUsize::new(0);
-/// Platform monotonic-ns reader for callers without a `P` bound. Page-backed
-/// writeback stamps file mtimes below the platform generic, so it cannot
-/// reach `timekeeper_clock::<P>()`. Zero until the boot path installs one.
-static MONOTONIC_NS_SOURCE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn install_realtime_timer_notifier(notifier: RealtimeTimerNotifier) {
     REALTIME_TIMER_NOTIFIER.store(notifier as usize, Ordering::Release);
@@ -40,26 +36,6 @@ pub fn install_realtime_timer_notifier(notifier: RealtimeTimerNotifier) {
 
 pub fn install_vvar_publish_hook(hook: VvarPublishHook) {
     VVAR_PUBLISH_HOOK.store(hook as usize, Ordering::Release);
-}
-
-/// Install the platform's monotonic clock reader so non-generic code can
-/// read CLOCK_REALTIME via [`realtime_now_ns_hooked`].
-pub fn install_monotonic_ns_source(source: fn() -> u64) {
-    MONOTONIC_NS_SOURCE.store(source as usize, Ordering::Release);
-}
-
-/// CLOCK_REALTIME for callers without a `P` bound. `None` until the boot
-/// path installs the monotonic source, so host unit tests (which never
-/// install one) keep epoch timestamps instead of inventing a clock.
-pub fn realtime_now_ns_hooked() -> Option<u64> {
-    let raw = MONOTONIC_NS_SOURCE.load(Ordering::Acquire);
-    if raw == 0 {
-        return None;
-    }
-    // SAFETY: the only store is `install_monotonic_ns_source`, which writes a
-    // valid `fn() -> u64`; fn pointers are non-null and never deallocated.
-    let source: fn() -> u64 = unsafe { core::mem::transmute(raw) };
-    Some(add_signed_ns(source(), WALL_CLOCK.realtime_offset_ns()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,7 +496,7 @@ impl WallClock {
             let mut post = post;
             let _ = notifier(generation, timer_registrar, &mut post);
         }
-        Ok((generation, offset))
+        Ok((generation, offset as i64))
     }
 
     fn generation(&self) -> u64 {
@@ -689,7 +665,7 @@ fn realtime_timer_notifier() -> Option<RealtimeTimerNotifier> {
     if hook == 0 {
         return None;
     }
-    Some(unsafe { core::mem::transmute::<usize, RealtimeTimerNotifier>(hook) })
+    Some(unsafe { core::mem::transmute(hook) })
 }
 
 fn vvar_publish_hook() -> Option<VvarPublishHook> {
@@ -697,7 +673,7 @@ fn vvar_publish_hook() -> Option<VvarPublishHook> {
     if hook == 0 {
         return None;
     }
-    Some(unsafe { core::mem::transmute::<usize, VvarPublishHook>(hook) })
+    Some(unsafe { core::mem::transmute(hook) })
 }
 
 #[cfg(test)]
@@ -783,46 +759,6 @@ mod tests {
             .expect("timerfd hook must run after the writer lock is released");
         REENTRANT_CALLBACKS.fetch_add(1, Ordering::AcqRel);
         0
-    }
-
-    #[test]
-    fn installed_hooks_round_trip_exact_function_pointer_behavior() {
-        let _guard = TEST_CLOCK_LOCK
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        reset_for_test();
-        PUBLISHED_REALTIME_SEC.store(0, Ordering::Release);
-        TIMERFD_NOTIFICATION_GENERATION.store(0, Ordering::Release);
-        install_vvar_publish_hook(publish_snapshot);
-        install_realtime_timer_notifier(notify_timerfd);
-
-        let publish = vvar_publish_hook().expect("installed VVAR hook must decode");
-        let notifier = realtime_timer_notifier().expect("installed timer notifier must decode");
-        assert!(core::ptr::fn_addr_eq(
-            publish,
-            publish_snapshot as VvarPublishHook
-        ));
-        assert!(core::ptr::fn_addr_eq(
-            notifier,
-            notify_timerfd as RealtimeTimerNotifier
-        ));
-
-        publish(VvarSnapshot {
-            realtime_generation: 0,
-            cycle_last: 0,
-            mask: 0,
-            mult: 0,
-            shift: 0,
-            realtime_sec: 37,
-            realtime_nsec_shifted: 0,
-            monotonic_sec: 41,
-            monotonic_nsec_shifted: 0,
-        });
-        let mut post = |_mailbox: &TaskMailbox, _event: MailboxEvent| false;
-        assert_eq!(notifier(43, None, &mut post), 0);
-        assert_eq!(PUBLISHED_REALTIME_SEC.load(Ordering::Acquire), 37);
-        assert_eq!(PUBLISHED_MONOTONIC_SEC.load(Ordering::Acquire), 41);
-        assert_eq!(TIMERFD_NOTIFICATION_GENERATION.load(Ordering::Acquire), 43);
     }
 
     #[test]

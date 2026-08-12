@@ -5,7 +5,7 @@ extern crate alloc;
 extern crate std;
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 mod boot_static;
 mod boot_trampoline;
@@ -34,12 +34,12 @@ use pmap::topology as pmap_topology;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
-    CpuPinGuard, DeadlineTimerIf, DmaAddr, DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind,
-    IrqDispatchTable, IrqHandled, IrqIf, LocalExecutionGuard, MemoryRegion, MemoryRegionKind,
-    MonotonicCounterIf, ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr,
-    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
-    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode,
-    PtNodeAllocator, SecondaryEntry, SmpIf, TimeIf, VdsoCounterInfo, VirtAddr,
+    DeadlineTimerIf, DmaAddr, DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable,
+    IrqHandled, IrqIf, LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr, PlatformConfig,
+    PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator,
+    SecondaryEntry, SmpIf, VdsoCounterInfo, VirtAddr,
 };
 
 pub struct Platform;
@@ -60,8 +60,11 @@ fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
 
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
-const MAX_BOOT_CPUS: usize = 8;
-pub(crate) const PLIC_PHYS_BASE: usize = 0x0c00_0000;
+const MAX_BOOT_CPUS: usize = 4;
+#[cfg(target_arch = "riscv64")]
+const PLIC_PHYS_BASE: usize = 0x0c00_0000;
+#[cfg(target_arch = "riscv64")]
+const PLIC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + PLIC_PHYS_BASE;
 /// QEMU virt machine's NS16550-compatible UART. PLIC IRQ 10
 /// ([`IrqIf::UART_IRQ`]) is wired to this UART, but the device
 /// itself only raises RX-data-available IRQs when its IER (offset
@@ -98,26 +101,17 @@ const GOLDFISH_RTC_ALARM_STATUS: usize = 0x18;
 const GOLDFISH_RTC_CLEAR_INTERRUPT: usize = 0x1c;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
 const IPI_KIND_COUNT: usize = 5;
-static IPI_STATE_LOCKS: [AtomicBool; MAX_BOOT_CPUS] =
-    [const { AtomicBool::new(false) }; MAX_BOOT_CPUS];
-static IPI_PENDING: [AtomicU8; MAX_BOOT_CPUS] = [const { AtomicU8::new(0) }; MAX_BOOT_CPUS];
+const IPI_CPU_SLOTS: usize = u64::BITS as usize;
+static IPI_STATE_LOCKS: [AtomicBool; IPI_CPU_SLOTS] =
+    [const { AtomicBool::new(false) }; IPI_CPU_SLOTS];
+static IPI_PENDING_CPUS: [AtomicU64; IPI_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
 static IPI_ACKED_CPUS: [AtomicU64; IPI_KIND_COUNT] = [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
 #[cfg(test)]
 static TEST_IPI_TRANSPORT_MASK: AtomicU64 = AtomicU64::new(0);
-/// Harts whose hardware currently has this ASID installed in `satp`.
-///
-/// This is a root-lifetime reference: it is cleared as soon as a hart has
-/// switched away and is used to decide when page-table pages may be freed.
+#[cfg(test)]
+static TEST_LOCAL_MEMBARRIER_ACTIONS: AtomicUsize = AtomicUsize::new(0);
 static ASID_RESIDENCY: [AtomicU64; pmap::ASID_CAPACITY] =
-    [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
-/// Harts which may retain TLB entries tagged with this ASID.
-///
-/// Unlike `ASID_RESIDENCY`, a context switch must not clear this mask. RISC-V
-/// permits tagged entries to survive a `satp` switch, so a hart that ran an
-/// address space earlier still needs every later unmap/protection shootdown.
-/// The mask is reset only after a full all-hart ASID invalidation immediately
-/// before ASID reuse.
-static ASID_TLB_HARTS: [AtomicU64; pmap::ASID_CAPACITY] =
     [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
 static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_IRQ_TABLE: AtomicPtr<IrqDispatchTable> = AtomicPtr::new(core::ptr::null_mut());
@@ -127,17 +121,6 @@ pub struct Rv64PerCpuArea {
     cpu_id: usize,
     kernel_stack_top: AtomicUsize,
     irq_depth: AtomicUsize,
-    /// Dedicated architecture trap-stack top. The RV64 trap-vector reads
-    /// this field directly through kernel `tp` for from-kernel traps, so
-    /// its offset is part of the assembly ABI.
-    trap_stack_top: AtomicUsize,
-    /// Software ASID whose user root is currently installed in `satp`.
-    ///
-    /// This cannot be reconstructed from `satp.ASID` on hardware that
-    /// implements zero ASID bits, so it must be tracked per hart.
-    active_user_asid: AtomicUsize,
-    /// Nesting depth of non-migratable kernel sections (EBR/zone guards).
-    cpu_pin_depth: AtomicUsize,
 }
 
 impl Rv64PerCpuArea {
@@ -146,9 +129,6 @@ impl Rv64PerCpuArea {
             cpu_id,
             kernel_stack_top: AtomicUsize::new(0),
             irq_depth: AtomicUsize::new(0),
-            trap_stack_top: AtomicUsize::new(0),
-            active_user_asid: AtomicUsize::new(0),
-            cpu_pin_depth: AtomicUsize::new(0),
         }
     }
 
@@ -165,20 +145,11 @@ impl Rv64PerCpuArea {
     }
 }
 
-const RV64_PERCPU_TRAP_STACK_TOP_OFFSET: usize = 24;
-const _: () = assert!(
-    core::mem::offset_of!(Rv64PerCpuArea, trap_stack_top) == RV64_PERCPU_TRAP_STACK_TOP_OFFSET
-);
-
 static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
     Rv64PerCpuArea::new(0),
     Rv64PerCpuArea::new(1),
     Rv64PerCpuArea::new(2),
     Rv64PerCpuArea::new(3),
-    Rv64PerCpuArea::new(4),
-    Rv64PerCpuArea::new(5),
-    Rv64PerCpuArea::new(6),
-    Rv64PerCpuArea::new(7),
 ];
 
 /// Per-hart save area for the reschedule longjmp (slice 2 of the
@@ -186,7 +157,7 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
 /// `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`).
 ///
 /// The userspace-entry shim (`tx_rv64_enter_userspace_save_resume`)
-/// stashes (sp, ra, s0..s11) here before `sret`. The trap-shell
+/// stashes (sp, ra, kernel tp, s0..s11) here before `sret`. The trap-shell
 /// longjmp helper (`tx_rv64_resume_kernel_after_reschedule`)
 /// restores them on `TrapAction::Reschedule` and `ret`s back to the
 /// kernel-side caller of `enter_userspace_with_context`.
@@ -198,7 +169,8 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
 pub struct KernelResumeCtx {
     pub sp: usize,      // offset 0
     pub ra: usize,      // offset 8
-    pub s: [usize; 12], // offset 16..112
+    pub tp: usize,      // offset 16
+    pub s: [usize; 12], // offset 24..120
 }
 
 // These offsets are referenced by literal byte offset in the trap-vector
@@ -207,10 +179,12 @@ pub struct KernelResumeCtx {
 // reorder triggers a compile-time mismatch with the static_assert.
 const _KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
 const _KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
-const _KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
-const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
+const _KERNEL_RESUME_CTX_TP_OFFSET: usize = 16;
+const _KERNEL_RESUME_CTX_S0_OFFSET: usize = 24;
+const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 15 * 8);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == _KERNEL_RESUME_CTX_SP_OFFSET);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == _KERNEL_RESUME_CTX_RA_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, tp) == _KERNEL_RESUME_CTX_TP_OFFSET);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == _KERNEL_RESUME_CTX_S0_OFFSET);
 
 /// Per-hart cell with `Sync` because the only writer/reader is the
@@ -235,41 +209,25 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
+        tp: 0,
         s: [0; 12],
     }),
 ];
@@ -287,17 +245,13 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
 /// `KERNEL_RO`); plain `static [u8; N]` lands in `.rodata` and
 /// the trap-vector's first store would fault.
 ///
-/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 512 KiB`.
+/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 256 KiB`.
 const RV64_TRAP_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
 pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);
 
 static RV64_TRAP_STACKS: [PerHartCell<Rv64TrapStack>; MAX_BOOT_CPUS] = [
-    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
-    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
-    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
-    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
@@ -325,7 +279,10 @@ pub extern "C" fn tx_rv64_kernel_tls_from_trap_stack_top(trap_stack_top: usize) 
     let mut cpu = 0;
     while cpu < MAX_BOOT_CPUS {
         let cpu_id = CpuId(cpu);
-        if trap_stack_top_for_cpu(cpu_id) == trap_stack_top {
+        let stack = RV64_TRAP_STACKS[cpu].as_ptr();
+        let base = stack as usize;
+        let top = base + RV64_TRAP_STACK_SIZE;
+        if trap_stack_top > base && trap_stack_top <= top {
             return percpu_tls_for_cpu(cpu_id).unwrap_or(cpu);
         }
         cpu += 1;
@@ -353,11 +310,10 @@ impl PlatformConfig for Platform {
     const DIRECT_MAP_BASE: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::DIRECT_MAP_BASE);
     const DIRECT_MAP_SIZE: usize = pmap_topology::DIRECT_MAP_SIZE;
     const KERNEL_VIRT_BASE: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::KERNEL_VIRT_BASE);
-    const KERNEL_PAGE_TABLE_ACTIVE_AT_SUBSTRATE_INIT: bool = true;
     const USER_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_TOP);
     const USER_RESERVED_TOP_SIZE: usize = pmap_topology::USER_RESERVED_TOP_SIZE;
     const USER_ALLOC_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_ALLOC_TOP);
-    const KERNEL_STACK_SIZE: usize = 512 * 1024;
+    const KERNEL_STACK_SIZE: usize = 128 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 3;
     const ASID_BITS: u8 = 16;
@@ -371,14 +327,6 @@ impl BootPlatformIf for Platform {
     fn boot_handoff(cpu_id: usize, firmware_arg: usize) -> BootHandoff {
         let bag = BootStaticBag::<IdentityLive>::capture_once(firmware_arg);
         pmap::adopt_high_linked_bootstrap_pmap(bag);
-        // QEMU with 8 GiB RAM may place the firmware DTB near the top of RAM
-        // (the official lane passes 0x27fe00000), outside the trampoline's
-        // initial 1 GiB direct-map leaf. Preseed the leaf containing the DTB
-        // before the parser dereferences the firmware pointer through its
-        // high direct-map alias.
-        #[cfg(target_arch = "riscv64")]
-        pmap::cover_boot_firmware_dtb_from_bag(bag, PhysAddr(firmware_arg))
-            .expect("firmware DTB is outside the RV64 bootstrap direct map");
 
         BootStaticBag::<IdentityLive>::take_global()
             .publish_boot_info_before_identity_drop(firmware_arg)
@@ -400,17 +348,13 @@ impl InitIf for Platform {
 
 impl BootInfoIf for Platform {
     fn boot_info() -> &'static BootInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref() // 取内核初始化信息
+        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref()
     }
 }
 
 impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref() // 取硬件信息
-    }
-
-    fn devices() -> &'static [tx_hal::DeviceInfo] {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref()
+        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()
     }
 }
 
@@ -439,9 +383,6 @@ impl ConsoleIf for Platform {
         read_sbi_console_bytes(buf)
     }
 }
-// PmapIf 的板级实现:除 activate_user_pmap(写 satp)外,几乎每个方法都是一行转发到
-// pmap 模块的对应函数(内核映射→kernel_space,用户映射→address_space,节点→pt_node);
-// shootdown 系列在本地 sfence 之外额外追加 SBI 远程 IPI(remote_sfence_vma*)。
 impl PmapIf for Platform {
     fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
         pmap::bootstrap_pmap_info()
@@ -487,10 +428,6 @@ impl PmapIf for Platform {
         pmap::commit_kernel_mapping(reservation, permissions);
     }
 
-    fn commit_new_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
-        pmap::commit_new_kernel_mapping(reservation, permissions);
-    }
-
     fn unmap_kernel_mapping(
         virt: tx_hal::VirtAddr,
         kind: PmapReserveKind,
@@ -509,26 +446,6 @@ impl PmapIf for Platform {
     fn shootdown_kernel_mapping(invalidation: PmapInvalidation) {
         pmap::shootdown_kernel_mapping(invalidation);
         remote_sfence_vma(invalidation);
-    }
-
-    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
-        let Some(first) = invalidations.first().copied() else {
-            return;
-        };
-        let mut start = first.virt().0;
-        let mut end = start.saturating_add(first.size());
-        for invalidation in &invalidations[1..] {
-            start = start.min(invalidation.virt().0);
-            end = end.max(invalidation.virt().0.saturating_add(invalidation.size()));
-        }
-
-        // Kernel mappings are shared by every address space. The current RV64
-        // backend already upgrades a single invalidation to one local full
-        // sfence, so do that once for the whole batch and issue one remote SBI
-        // range request instead of one request per 4-KiB page.
-        let merged = PmapInvalidation::new(VirtAddr(start), end.saturating_sub(start));
-        pmap::shootdown_kernel_mapping(merged);
-        remote_sfence_vma(merged);
     }
 
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
@@ -582,64 +499,50 @@ impl PmapIf for Platform {
         pmap::shootdown_mappings(asid, invalidations);
     }
 
-    fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
-        pmap::synchronize_new_mappings(asid, invalidations);
-    }
-
-    /// 写 satp 指向 `root.phys()`(带 Sv39 模式位 + 该 root 的 ASID),再发一条本地 sfence.vma。
+    /// Write `satp` to point at `root.phys()` with Sv39 mode bits and
+    /// the root's ASID, then issue a local `sfence.vma`.
     ///
-    /// 线程运行时在 `TrapIf::enter_userspace_with_context` 之前紧接着调它,好让用户态取指
-    /// 看到本进程的页表。不调的话 satp 还指着引导 trampoline 留下的内核引导根(没有用户映射),
-    /// 用户态每条取指都会永久缺页。
+    /// Called from the thread runtime right before
+    /// `TrapIf::enter_userspace_with_context` so user-mode fetches see
+    /// the per-process pmap. Without this satp would still point at the
+    /// kernel bootstrap root from the boot trampoline (which has no
+    /// user mappings), and every user-mode instruction fetch would
+    /// fault forever.
     fn activate_user_pmap(root: &PmapRoot) {
-        let asid_usable = hw_asid_tagging_usable();
-        // Keep the outgoing root resident until hardware has stopped using
-        // it.  During the switch both ASIDs are conservatively resident on
-        // this hart; an unnecessary shootdown is safe, an early root free is
-        // not.
-        let switch = begin_asid_switch_on_current_cpu(root.asid());
+        mark_asid_resident_on_current_cpu(root.asid());
         #[cfg(target_arch = "riscv64")]
         unsafe {
             const SATP_MODE_SV39: usize = 0x8 << 60;
             let ppn = root.phys().0 >> 12;
-            // 零/窄 ASID 硬件(VF2 U74 实现 0 位):硬件反正会截断标签;这里写 0,
-            // 让下面的快路径比较仍有意义(否则读回被截断的字段永远不等于我们算的 satp,
-            // 每次进用户态都被迫走慢路径)。
-            let asid = if asid_usable {
-                root.asid().0 as usize
-            } else {
-                0
-            };
+            let asid = root.asid().0 as usize;
             let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
-            // 快路径:回到同一个地址空间(常见的 syscall 返回)。不写 CSR、不 fence——
-            // 这个 root 的 TLB 项仍有效(ASID 硬件按 ASID 隔离;退化硬件靠下面的切换即刷
-            // 保证 TLB 里只留当前空间的项)。
+            // Fast path: returning to the same address space (the common
+            // syscall return). No CSR write, no fence — TLB entries for
+            // this ASID are still valid.
             let current: usize;
             core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
             if current == satp {
-                finish_asid_switch_on_current_cpu(switch);
                 return;
             }
-            // 换了 root:写 satp。ASID 硬件(QEMU:16 位)上无需在地址空间
-            // 切换点额外 fence:
-            //  - TLB 项带 ASID 标签,切 ASID 不用 fence。
-            //  - PTE 的 invalid→valid 发布由 VmPmap 提交后的 ASID 范围
-            //    shootdown 完成可见性，不依赖这里补刷。
-            //  - ASID 复用在 root 销毁时 fence(invalidate_root_translations 切到引导根并在那 sfence.vma)。
-            // 以前这里无条件 sfence.vma 会在每次进用户态时全刷 TLB——QEMU TCG 下相当于每次
-            // syscall 返回都 full tlb_flush(约 ms 级),是 LTP shell 测试耗时的主项(net_stress 预算之战)。
+            // Different root/ASID: write satp WITHOUT a global sfence.vma.
+            // Correctness per the RISC-V privileged spec:
+            //  - TLB entries are ASID-tagged; switching ASIDs needs no fence.
+            //  - Invalid (V=0) PTEs are never cached, so invalid→valid map
+            //    commits are picked up by the next hardware walk unfenced
+            //    (`fill_mapping` fences only when overwriting a valid PTE).
+            //  - ASID reuse is fenced at root teardown
+            //    (`invalidate_root_translations` switches to the bootstrap
+            //    root and issues sfence.vma there).
+            // The previous unconditional `sfence.vma` here flushed the whole
+            // TLB on EVERY userspace entry — under QEMU TCG that meant a
+            // full tlb_flush per syscall return (~ms each), the dominant
+            // term of LTP shell-test runtime (net_stress budget battle).
             core::arch::asm!(
                 "csrw satp, {satp}",
                 satp = in(reg) satp,
                 options(nostack)
             );
-            // 退化(零 ASID)硬件:所有空间共享标签 0,上个空间的项对这个空间仍生效——
-            // 所以切换即刷(board `ls` fork/COW 死循环的根因,2026-07-03)。QEMU 从不走这个分支。
-            if !asid_usable {
-                core::arch::asm!("sfence.vma", options(nostack));
-            }
         }
-        finish_asid_switch_on_current_cpu(switch);
         #[cfg(not(target_arch = "riscv64"))]
         let _ = root;
     }
@@ -650,24 +553,11 @@ impl IrqIf for Platform {
     /// QEMU `virt` machine's 16550 UART is wired at PLIC IRQ 10.
     /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
     const UART_IRQ: u32 = 10;
-    fn uart_irq() -> u32 {
-        uart_device_info()
-            .and_then(|uart| uart.irq)
-            .unwrap_or(Self::UART_IRQ)
-    }
-
     /// QEMU `virt` machine's goldfish RTC is wired at PLIC IRQ 11.
     const RTC_IRQ: u32 = GOLDFISH_RTC_IRQ;
-    /// `virtio1@0x1000_2000` is MMIO slot 1; QEMU wires slot N to
-    /// `VIRTIO_IRQ + N`, so the boot network device uses PLIC IRQ 2.
-    const NET_IRQ: u32 = 2;
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
-    }
-
-    fn in_trap_context() -> bool {
-        current_stack_is_trap_stack()
     }
 
     fn interrupts_enabled() -> bool {
@@ -737,7 +627,7 @@ impl IrqIf for Platform {
 }
 impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
-        time::read_ns(<Self as MonotonicCounterIf>::frequency_hz())
+        time::read_ns(Self::frequency_hz())
     }
 
     fn frequency_hz() -> u64 {
@@ -745,9 +635,7 @@ impl MonotonicCounterIf for Platform {
     }
 
     fn vdso_counter_info() -> Option<VdsoCounterInfo> {
-        Some(time::vdso_counter_info(
-            <Self as MonotonicCounterIf>::frequency_hz(),
-        ))
+        Some(time::vdso_counter_info(Self::frequency_hz()))
     }
 
     fn read_vdso_counter() -> u64 {
@@ -757,7 +645,7 @@ impl MonotonicCounterIf for Platform {
 
 impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
-        time::set_deadline_ns(deadline, <Self as MonotonicCounterIf>::frequency_hz());
+        time::set_deadline_ns(deadline, Self::frequency_hz());
     }
 
     fn cancel_deadline() {
@@ -815,33 +703,9 @@ impl PercpuIf for Platform {
         write_kernel_tls(value as usize);
     }
 
-    fn pin_current_cpu() -> CpuPinGuard {
-        let cpu = current_cpu_id();
-        current_percpu_area()
-            .expect("RV64 per-CPU area must exist before CPU pinning")
-            .cpu_pin_depth
-            .fetch_add(1, Ordering::Relaxed);
-        CpuPinGuard::with_unpin(cpu, rv64_unpin_cpu)
-    }
-
-    fn cpu_pin_depth() -> usize {
-        current_percpu_area()
-            .map(|area| area.cpu_pin_depth.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
     unsafe fn install_kernel_stack(top: VirtAddr) {
         unsafe { install_kernel_stack(top) };
     }
-}
-
-fn rv64_unpin_cpu(cpu: CpuId) {
-    debug_assert_eq!(cpu, current_cpu_id());
-    let previous = current_percpu_area()
-        .expect("RV64 per-CPU area must exist while dropping CPU pin")
-        .cpu_pin_depth
-        .fetch_sub(1, Ordering::Release);
-    assert!(previous != 0, "RV64 CPU pin nesting underflow");
 }
 impl CacheIf for Platform {
     fn fence_all() {
@@ -888,22 +752,7 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        // Use every startable hart published by the firmware/QEMU topology by
-        // default. `tx.maxcpus=N` is an explicit upper bound, including
-        // `tx.maxcpus=1` for a diagnostic single-core boot. The boot hart is
-        // always retained even when firmware omits it from the startable mask.
-        let dtb_mask = boot_static::startable_harts();
-        let discovered = if dtb_mask != 0 {
-            CpuMask::from_bits(dtb_mask & CpuMask::first(MAX_BOOT_CPUS).bits())
-        } else {
-            CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
-        };
-        let current = current_cpu_id();
-        let base = CpuMask::from_bits(discovered.bits() | CpuMask::single(current).bits());
-        let requested = max_cpus_from_cmdline()
-            .unwrap_or_else(|| base.count())
-            .clamp(1, MAX_BOOT_CPUS);
-        limit_cpus(base, requested, current)
+        CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
     }
 
     fn online_cpus() -> CpuMask {
@@ -919,26 +768,22 @@ impl SmpIf for Platform {
     fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
         let possible = Self::possible_cpus();
         let current = current_cpu_id();
-        let mut wait_mask = CpuMask::EMPTY;
+        let mut started_mask = CpuMask::EMPTY;
 
-        for acked in &IPI_ACKED_CPUS {
-            acked.store(0, Ordering::Release);
-        }
+        reset_ipi_software_state();
         pmap::install_secondary_identity_bridge();
         for cpu in 0..MAX_BOOT_CPUS {
             let cpu = CpuId(cpu);
             if cpu == current || !possible.contains(cpu) {
                 continue;
             }
-            let error = start_secondary_hart(cpu, entry);
-            if error == SBI_SUCCESS || error == SBI_ERR_ALREADY_AVAILABLE {
-                wait_mask = CpuMask::from_bits(wait_mask.bits() | CpuMask::single(cpu).bits());
+            if start_secondary_hart(cpu, entry) {
+                started_mask =
+                    CpuMask::from_bits(started_mask.bits() | CpuMask::single(cpu).bits());
             }
         }
-        let online = wait_for_online_secondaries(wait_mask);
-        if online == wait_mask.count() {
-            pmap::remove_secondary_identity_bridge();
-        }
+        let online = wait_for_online_secondaries(started_mask);
+        pmap::remove_secondary_identity_bridge();
 
         online
     }
@@ -957,67 +802,8 @@ impl SmpIf for Platform {
         core::hint::spin_loop();
     }
 
-    fn prepare_interrupt_wait() -> tx_hal::InterruptWaitState {
-        #[cfg(target_arch = "riscv64")]
-        {
-            let previous_sstatus: usize;
-            unsafe {
-                // Keep sie.SSIE/STIE/SEIE enabled, but defer trap delivery by
-                // clearing the global SIE bit before the caller's final work
-                // check. The RISC-V privileged specification requires WFI to
-                // resume for a locally-enabled pending interrupt regardless
-                // of the global interrupt-enable bit. An IPI that races the
-                // check therefore remains pending instead of being handled
-                // and cleared immediately before WFI.
-                core::arch::asm!(
-                    "csrrci {previous}, sstatus, 2",
-                    previous = out(reg) previous_sstatus,
-                    options(nostack)
-                );
-            }
-            return tx_hal::InterruptWaitState::from_raw(previous_sstatus);
-        }
-
-        #[cfg(not(target_arch = "riscv64"))]
-        tx_hal::InterruptWaitState::from_raw(0)
-    }
-
-    fn cancel_interrupt_wait(state: tx_hal::InterruptWaitState) {
-        #[cfg(target_arch = "riscv64")]
-        if state.raw() & 0x2 != 0 {
-            unsafe {
-                core::arch::asm!("csrsi sstatus, 2", options(nostack));
-            }
-        }
-
-        #[cfg(not(target_arch = "riscv64"))]
-        let _ = state;
-    }
-
-    fn wait_for_interrupt_prepared(state: tx_hal::InterruptWaitState) {
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            // Interrupt delivery is still globally masked here, so a wake
-            // arriving after the final queue check remains pending until WFI
-            // observes it. Restore the caller's SIE state only after WFI has
-            // returned.
-            core::arch::asm!("wfi", options(nostack));
-            if state.raw() & 0x2 != 0 {
-                core::arch::asm!("csrsi sstatus, 2", options(nostack));
-            }
-        }
-
-        #[cfg(not(target_arch = "riscv64"))]
-        {
-            let _ = state;
-            core::hint::spin_loop();
-        }
-    }
-
     fn pending_ipi(kind: IpiKind) -> bool {
-        let cpu = current_cpu_id();
-        cpu.0 < IPI_PENDING.len()
-            && IPI_PENDING[cpu.0].load(Ordering::Acquire) & ipi_kind_bit(kind) != 0
+        ipi_pending_on_cpu(current_cpu_id(), kind)
     }
 
     fn park_this_cpu() -> ! {
@@ -1027,65 +813,27 @@ impl SmpIf for Platform {
         }
     }
 
-    fn quiesce_this_cpu() -> ! {
-        time::cancel_deadline();
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            // No handler may re-enter the reactor/zone runtime after the AP
-            // published its shutdown acknowledgement.
-            core::arch::asm!(
-                "csrci sstatus, 2",
-                "csrw sie, zero",
-                options(nomem, nostack)
-            );
-        }
-        loop {
-            #[cfg(target_arch = "riscv64")]
-            unsafe {
-                core::arch::asm!("wfi", options(nomem, nostack));
-            }
-            #[cfg(not(target_arch = "riscv64"))]
-            core::hint::spin_loop();
-        }
-    }
-
     fn send_ipi(target: CpuId, kind: IpiKind) {
         if target == current_cpu_id() {
             return;
         }
-        if target.0 >= IPI_PENDING.len() {
-            return;
-        }
-        let locked = lock_ipi_targets(CpuMask::single(target));
-        IPI_PENDING[target.0].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
-        send_sbi_ipi(CpuMask::single(target));
-        unlock_ipi_targets(locked);
+        send_software_ipi(CpuMask::single(target), kind);
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-        let targets = remote_ipi_targets_from(mask, current_cpu_id());
-        let locked = lock_ipi_targets(targets);
-        let mut bits = targets.bits();
-        while bits != 0 {
-            let cpu = bits.trailing_zeros() as usize;
-            if cpu < IPI_PENDING.len() {
-                IPI_PENDING[cpu].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
-            }
-            bits &= bits - 1;
+        let current = current_cpu_id();
+        let current_mask = CpuMask::single(current);
+        let remote_mask = CpuMask::from_bits(mask.bits() & !current_mask.bits());
+        send_software_ipi(remote_mask, kind);
+        if mask.contains(current) {
+            process_local_ipi(current, kind);
         }
-        send_sbi_ipi(targets);
-        unlock_ipi_targets(locked);
     }
 
     fn ack_ipi(kind: IpiKind) {
         let cpu = current_cpu_id();
-        if cpu.0 >= IPI_PENDING.len() {
-            return;
-        }
         let locked = lock_ipi_targets(CpuMask::single(cpu));
-        IPI_PENDING[cpu.0].fetch_and(!ipi_kind_bit(kind), Ordering::AcqRel);
-        mark_ipi_ack(cpu, kind);
-        if IPI_PENDING[cpu.0].load(Ordering::Acquire) == 0 {
+        if acknowledge_ipi_on_cpu(cpu, kind) {
             clear_supervisor_software_interrupt();
         }
         unlock_ipi_targets(locked);
@@ -1097,30 +845,6 @@ impl SmpIf for Platform {
 
     fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
         CpuMask::from_bits(IPI_ACKED_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire))
-    }
-
-    fn wait_for_ipi_ack_cpus(mask: CpuMask, kind: IpiKind) -> usize {
-        let target = mask.bits();
-        if target == 0 {
-            return 0;
-        }
-
-        // QEMU TCG does not give every vCPU an equal host timeslice. A fixed
-        // spin count can expire before the last otherwise-healthy AP runs,
-        // which made the 8-hart boot smoke intermittently report 6/7 acks.
-        // Use the same architectural timebase discipline as secondary boot.
-        let start_ns = time::read_ns(<Platform as TimeIf>::frequency_hz());
-        let deadline_ns = start_ns.saturating_add(RV64_IPI_ACK_TIMEOUT_NS);
-        loop {
-            let acked = Self::ipi_ack_cpus(kind).bits() & target;
-            if acked == target {
-                return mask.count();
-            }
-            if time::read_ns(<Platform as TimeIf>::frequency_hz()) >= deadline_ns {
-                return acked.count_ones() as usize;
-            }
-            core::hint::spin_loop();
-        }
     }
 }
 
@@ -1301,9 +1025,6 @@ fn install_early_percpu(cpu_id: CpuId) {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         let trap_stack_top = trap_stack_top_for_cpu(cpu_id);
-        RV64_PERCPU_AREAS[cpu_id.0]
-            .trap_stack_top
-            .store(trap_stack_top, Ordering::Release);
         core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
     }
 
@@ -1410,140 +1131,11 @@ fn valid_plic_irq(irq: u32) -> bool {
     irq != 0 && irq < PLIC_MAX_IRQ
 }
 
-/// Parse `tx.maxcpus=N` from the boot cmdline. Boards without a cmdline
-/// (host tests, missing chosen node) get `None`, so the firmware topology is
-/// used without an additional cap.
-///
-/// The VF2 U-Boot control FDT MISDESCRIBES hart0 (claims
-/// u74-mc + mmu-type sv39 + status okay for what is physically an
-/// MMU-less S7 monitor core — verified with `fdt print /cpus/cpu@0`
-/// on the board, 2026-07-02). Real-board boot commands should therefore keep
-/// passing an explicit `tx.maxcpus` policy; QEMU's generated FDT is the
-/// authoritative default for the final SMP lane.
-fn max_cpus_from_cmdline() -> Option<usize> {
-    let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
-        .boot_info_ref()
-        .cmdline?;
-    for token in cmdline.split_whitespace() {
-        if let Some(value) = token.strip_prefix("tx.maxcpus=") {
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
-/// Keep at most `limit` cpus from `base`, always retaining `keep`
-/// (the boot hart), then lowest hart ids first.
-fn limit_cpus(base: CpuMask, limit: usize, keep: CpuId) -> CpuMask {
-    let mut bits = 0u64;
-    let mut taken = 0usize;
-    if base.contains(keep) {
-        bits |= CpuMask::single(keep).bits();
-        taken = 1;
-    }
-    for cpu in 0..u64::BITS as usize {
-        if taken >= limit {
-            break;
-        }
-        let cpu = CpuId(cpu);
-        if cpu == keep || !base.contains(cpu) {
-            continue;
-        }
-        bits |= CpuMask::single(cpu).bits();
-        taken += 1;
-    }
-    CpuMask::from_bits(bits)
-}
-
-/// Hardware-implemented `satp.ASID` width in bits, probed once via
-/// Linux's boot trick: write all-ones into the WARL ASID field, read
-/// back, count surviving bits (`usize::MAX` = not probed yet).
-///
-/// Board reality (2026-07-03, `ls`-loop root cause): the VF2's
-/// JH7110 U74 implements **zero** ASID bits — hardware truncates
-/// every satp ASID write, so ALL address spaces share hardware tag 0
-/// and the "ASID-tagged TLB entries need no fence on address-space
-/// switch" fast path is physically void there: a parent shell's
-/// stale read-only TLB entry stays live for the forked child at the
-/// same VA, and the child's COW store faults forever (asid-qualified
-/// sfences can't name the truncated tag either). QEMU implements the
-/// full 16 bits, which hid all of this. When the implemented width
-/// cannot represent `pmap::ASID_CAPACITY`, we degrade: satp always
-/// carries ASID 0, every address-space switch issues a full local
-/// `sfence.vma`, and per-VA shootdowns flush across all ASIDs — the
-/// scheme Chronix/Del0n1x use unconditionally on this board.
-static HW_ASID_BITS: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-fn hw_asid_bits() -> usize {
-    let cached = HW_ASID_BITS.load(Ordering::Relaxed);
-    if cached != usize::MAX {
-        return cached;
-    }
-    let mut probed = probe_hw_asid_bits();
-    // Debug knob: `tx.pmap.asid-bits=N` caps the detected width so the
-    // zero-ASID degrade path (VF2 U74 reality) can be exercised and
-    // debugged under QEMU, which implements the full 16 bits.
-    if let Some(forced) = asid_bits_cap_from_cmdline() {
-        probed = probed.min(forced);
-    }
-    HW_ASID_BITS.store(probed, Ordering::Relaxed);
-    #[cfg(target_arch = "riscv64")]
-    {
-        trap::console_write_literal(b"txkernel:pmap:asid-bits=0x");
-        trap::console_write_hex(probed);
-        trap::console_write_literal(b"\n");
-    }
-    probed
-}
-
-#[cfg(target_arch = "riscv64")]
-fn probe_hw_asid_bits() -> usize {
-    unsafe {
-        let orig: usize;
-        core::arch::asm!("csrr {0}, satp", out(reg) orig, options(nomem, nostack));
-        let probe = orig | (0xFFFFusize << 44);
-        let read: usize;
-        core::arch::asm!("csrw satp, {0}", in(reg) probe, options(nostack));
-        core::arch::asm!("csrr {0}, satp", out(reg) read, options(nomem, nostack));
-        core::arch::asm!("csrw satp, {0}", in(reg) orig, options(nostack));
-        core::arch::asm!("sfence.vma", options(nostack));
-        ((read >> 44) & 0xFFFF).count_ones() as usize
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn probe_hw_asid_bits() -> usize {
-    // Host builds have no satp; report the full RISC-V field width so
-    // host tests exercise the (QEMU-equivalent) tagged fast path.
-    16
-}
-
-/// True when the hardware ASID width can uniquely tag our whole
-/// software ASID space; false = degrade to flush-on-switch.
-pub(crate) fn hw_asid_tagging_usable() -> bool {
-    hw_asid_bits() >= pmap::ASID_CAPACITY.trailing_zeros() as usize
-}
-
-fn asid_bits_cap_from_cmdline() -> Option<usize> {
-    let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
-        .boot_info_ref()
-        .cmdline?;
-    for token in cmdline.split_whitespace() {
-        if let Some(value) = token.strip_prefix("tx.pmap.asid-bits=") {
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
 fn current_plic_context() -> usize {
     plic_context_for_cpu(current_cpu_id())
 }
 
 fn plic_context_for_cpu(cpu: CpuId) -> usize {
-    if let Some(context) = boot_static::plic_scontext_for_hart(cpu.0) {
-        return context as usize;
-    }
     cpu.0.saturating_mul(2).saturating_add(1)
 }
 
@@ -1625,18 +1217,13 @@ fn goldfish_rtc_ack_alarm_irq() {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn plic_virt_base() -> usize {
-    pmap_topology::DIRECT_MAP_BASE + boot_static::plic_phys_base()
-}
-
-#[cfg(target_arch = "riscv64")]
 fn plic_read_u32(offset: usize) -> u32 {
-    unsafe { ((plic_virt_base() + offset) as *const u32).read_volatile() }
+    unsafe { ((PLIC_BASE + offset) as *const u32).read_volatile() }
 }
 
 #[cfg(target_arch = "riscv64")]
 fn plic_write_u32(offset: usize, value: u32) {
-    unsafe { ((plic_virt_base() + offset) as *mut u32).write_volatile(value) };
+    unsafe { ((PLIC_BASE + offset) as *mut u32).write_volatile(value) };
 }
 
 /// Enable the 16550 UART's "received-data-available" interrupt
@@ -1654,33 +1241,15 @@ fn plic_write_u32(offset: usize, value: u32) {
 ///
 /// Idempotent: writing IER and `csrs` instructions just set the
 /// same bits.
-fn uart_device_info() -> Option<tx_hal::DeviceInfo> {
-    BootStaticBag::<IdentityDropped>::global_ref()
-        .platform_devices_ref()
-        .iter()
-        .copied()
-        .find(|device| device.kind == tx_hal::DeviceKind::Uart)
-}
-
 #[cfg(target_arch = "riscv64")]
 fn enable_uart_rx_irq() {
-    const UART_IER_INDEX: usize = 1;
+    // 16550 IER offset = 1; bit 0 = ERBFI (Enable Received Data
+    // Available Interrupt).
+    const UART_IER_OFFSET: usize = 1;
     const UART_IER_ERBFI: u8 = 0x01;
-    let (uart_base, reg_shift, reg_io_width) = match uart_device_info() {
-        Some(uart) => (
-            pmap_topology::DIRECT_MAP_BASE + uart.mmio.start.0,
-            uart.reg_shift as usize,
-            uart.reg_io_width,
-        ),
-        None => (UART_BASE, 0, 1),
-    };
     unsafe {
-        let ier_addr = uart_base + (UART_IER_INDEX << reg_shift);
-        if reg_io_width == 4 {
-            (ier_addr as *mut u32).write_volatile(u32::from(UART_IER_ERBFI));
-        } else {
-            (ier_addr as *mut u8).write_volatile(UART_IER_ERBFI);
-        }
+        let ier = (UART_BASE + UART_IER_OFFSET) as *mut u8;
+        ier.write_volatile(UART_IER_ERBFI);
 
         // sie |= SEIE (bit 9) and sstatus |= SIE (bit 1).
         let seie = 1usize << 9;
@@ -1970,23 +1539,6 @@ fn irq_context_depth() -> usize {
     current_irq_depth_cell().load(Ordering::Acquire)
 }
 
-#[inline]
-fn current_stack_is_trap_stack() -> bool {
-    #[cfg(target_arch = "riscv64")]
-    {
-        let sp: usize;
-        unsafe {
-            core::arch::asm!("mv {sp}, sp", sp = out(reg) sp, options(nomem, nostack));
-        }
-        let cpu = <Platform as SmpIf>::current_cpu_id();
-        let top = trap_stack_top_for_cpu(cpu);
-        return (top.saturating_sub(RV64_TRAP_STACK_SIZE)..top).contains(&sp);
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    false
-}
-
 fn current_irq_depth_cell() -> &'static AtomicUsize {
     current_percpu_area()
         .map(|area| &area.irq_depth)
@@ -2073,12 +1625,8 @@ const fn ipi_kind_index(kind: IpiKind) -> usize {
     }
 }
 
-const fn ipi_kind_bit(kind: IpiKind) -> u8 {
-    1u8 << ipi_kind_index(kind)
-}
-
 fn lock_ipi_targets(mask: CpuMask) -> u64 {
-    let mut bits = mask.bits() & CpuMask::first(MAX_BOOT_CPUS).bits();
+    let mut bits = mask.bits();
     let mut locked = 0;
     while bits != 0 {
         let cpu = bits.trailing_zeros() as usize;
@@ -2103,15 +1651,55 @@ fn unlock_ipi_targets(mut bits: u64) {
     }
 }
 
-fn mark_ipi_ack(cpu_id: CpuId, kind: IpiKind) {
-    if cpu_id.0 < u64::BITS as usize {
-        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
+fn send_software_ipi(mask: CpuMask, kind: IpiKind) {
+    let locked = lock_ipi_targets(mask);
+    IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_or(mask.bits(), Ordering::Release);
+    send_sbi_ipi(mask);
+    unlock_ipi_targets(locked);
+}
+
+fn process_local_ipi(cpu: CpuId, kind: IpiKind) {
+    let _irq_guard = <Platform as IrqIf>::exclude_local_execution();
+    let cpu_mask = CpuMask::single(cpu);
+    let locked = lock_ipi_targets(cpu_mask);
+    IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_or(cpu_mask.bits(), Ordering::Release);
+    execute_local_ipi_action(kind);
+    if acknowledge_ipi_on_cpu(cpu, kind) {
+        clear_supervisor_software_interrupt();
+    }
+    unlock_ipi_targets(locked);
+}
+
+fn execute_local_ipi_action(kind: IpiKind) {
+    if kind == IpiKind::Membarrier {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        #[cfg(test)]
+        TEST_LOCAL_MEMBARRIER_ACTIONS.fetch_add(1, Ordering::AcqRel);
     }
 }
 
-#[cfg(test)]
+fn ipi_pending_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    bit != 0 && IPI_PENDING_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire) & bit != 0
+}
+
+fn any_ipi_pending_on_cpu(cpu: CpuId) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    bit != 0
+        && IPI_PENDING_CPUS
+            .iter()
+            .any(|pending| pending.load(Ordering::Acquire) & bit != 0)
+}
+
+fn acknowledge_ipi_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    IPI_PENDING_CPUS[ipi_kind_index(kind)]
+        .fetch_and(!CpuMask::single(cpu).bits(), Ordering::AcqRel);
+    mark_ipi_ack(cpu, kind);
+    !any_ipi_pending_on_cpu(cpu)
+}
+
 fn reset_ipi_software_state() {
-    for pending in &IPI_PENDING {
+    for pending in &IPI_PENDING_CPUS {
         pending.store(0, Ordering::Release);
     }
     for acked in &IPI_ACKED_CPUS {
@@ -2119,22 +1707,23 @@ fn reset_ipi_software_state() {
     }
 }
 
-const SBI_SUCCESS: isize = 0;
-const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
-const RV64_SECONDARY_BOOT_TIMEOUT_NS: u64 = 2_000_000_000;
-const RV64_IPI_ACK_TIMEOUT_NS: u64 = 2_000_000_000;
+fn mark_ipi_ack(cpu_id: CpuId, kind: IpiKind) {
+    if cpu_id.0 < u64::BITS as usize {
+        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
+    }
+}
 
-fn start_secondary_hart(cpu: CpuId, entry: SecondaryEntry) -> isize {
+fn start_secondary_hart(cpu: CpuId, entry: SecondaryEntry) -> bool {
     #[cfg(target_arch = "riscv64")]
     {
         let start_addr = boot_static::secondary_start_entry();
-        sbi_hart_start(cpu.0, start_addr, entry as usize)
+        sbi_hart_start(cpu.0, start_addr, entry as usize) == 0
     }
 
     #[cfg(not(target_arch = "riscv64"))]
     {
         let _ = (cpu, entry);
-        -2
+        false
     }
 }
 
@@ -2144,20 +1733,10 @@ fn wait_for_online_secondaries(target: CpuMask) -> usize {
         return 0;
     }
 
-    // AP initialization installs per-hart substrate, observation and reactor
-    // state before publishing ONLINE_CPUS. A fixed spin count expires at
-    // different wall times on different QEMU hosts and used to let the BSP
-    // continue with only a subset of `-smp 8` online. Use the architectural
-    // monotonic timer so the wait is independent of emulation speed.
-    let start_ns = time::read_ns(<Platform as TimeIf>::frequency_hz());
-    let deadline_ns = start_ns.saturating_add(RV64_SECONDARY_BOOT_TIMEOUT_NS);
-    loop {
+    for _ in 0..100_000 {
         let online = ONLINE_CPUS.load(Ordering::Acquire) & target;
         if online == target {
             return online.count_ones() as usize;
-        }
-        if time::read_ns(<Platform as TimeIf>::frequency_hz()) >= deadline_ns {
-            break;
         }
         core::hint::spin_loop();
     }
@@ -2197,16 +1776,6 @@ pub(crate) fn remote_sfence_vma_asid_batch(asid: Asid, invalidations: &[PmapInva
 
     #[cfg(target_arch = "riscv64")]
     {
-        let asid_usable = hw_asid_tagging_usable();
-        if !asid_usable {
-            // Zero-ASID hardware cannot isolate address spaces, and the U74
-            // CIP-1200 workaround requires an unqualified full fence on every
-            // target hart. A range-limited SBI request would merely move the
-            // local stale-translation bug to a remote hart.
-            let error = sbi_remote_sfence_vma(targets.bits(), 0, 0, 0);
-            assert_eq!(error, 0, "SBI remote full sfence.vma failed");
-            return;
-        }
         for invalidation in invalidations {
             let error = sbi_remote_sfence_vma_asid(
                 targets.bits(),
@@ -2215,7 +1784,7 @@ pub(crate) fn remote_sfence_vma_asid_batch(asid: Asid, invalidations: &[PmapInva
                 invalidation.size(),
                 asid.0 as usize,
             );
-            assert_eq!(error, 0, "SBI remote sfence.vma failed");
+            assert_eq!(error, 0, "SBI remote sfence.vma.asid failed");
         }
     }
 
@@ -2236,116 +1805,29 @@ fn remote_sfence_targets_for_asid(asid: Asid) -> CpuMask {
 }
 
 fn remote_sfence_targets_for_asid_from(asid: Asid, online: CpuMask, current: CpuId) -> CpuMask {
-    let cached = asid_tlb_hart_mask(asid);
-    CpuMask::from_bits(cached.bits() & online.bits() & !CpuMask::single(current).bits())
+    let resident = asid_residency_mask(asid);
+    CpuMask::from_bits(resident.bits() & online.bits() & !CpuMask::single(current).bits())
 }
 
-#[derive(Clone, Copy, Debug)]
-struct AsidSwitch {
-    cpu: CpuId,
-    previous: usize,
-    next: usize,
-    tracked: bool,
-}
-
-/// Publish the incoming ASID without removing the outgoing one.
-///
-/// The returned token records the old software state.  The caller must install
-/// the new hardware root before passing it to
-/// [`finish_asid_switch_on_current_cpu`].
-fn begin_asid_switch_on_current_cpu(asid: Asid) -> AsidSwitch {
+fn mark_asid_resident_on_current_cpu(asid: Asid) {
     let cpu = current_cpu_id();
     if (asid.0 as usize) >= ASID_RESIDENCY.len() || cpu.0 >= u64::BITS as usize {
-        return AsidSwitch {
-            cpu,
-            previous: 0,
-            next: asid.0 as usize,
-            tracked: false,
-        };
-    }
-    let next = asid.0 as usize;
-    let previous = RV64_PERCPU_AREAS[cpu.0]
-        .active_user_asid
-        .load(Ordering::Acquire);
-    ASID_RESIDENCY[next].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
-    // Publish possible TLB ownership before installing `satp`. A concurrent
-    // unmap can now conservatively include this hart even while the hardware
-    // switch is in progress.
-    ASID_TLB_HARTS[next].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
-    AsidSwitch {
-        cpu,
-        previous,
-        next,
-        tracked: true,
-    }
-}
-
-/// Publish completion after `satp` no longer names the outgoing root.
-fn finish_asid_switch_on_current_cpu(switch: AsidSwitch) {
-    if !switch.tracked {
         return;
     }
-    RV64_PERCPU_AREAS[switch.cpu.0]
-        .active_user_asid
-        .store(switch.next, Ordering::Release);
-    if switch.previous != 0
-        && switch.previous != switch.next
-        && switch.previous < ASID_RESIDENCY.len()
-    {
-        ASID_RESIDENCY[switch.previous].fetch_and(!(1u64 << switch.cpu.0), Ordering::AcqRel);
+    ASID_RESIDENCY[asid.0 as usize].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
+}
+
+#[cfg(any(target_arch = "riscv64", test))]
+pub(crate) fn clear_current_asid_residency() {
+    let asid = current_satp_asid();
+    if asid.0 == 0 || (asid.0 as usize) >= ASID_RESIDENCY.len() {
+        return;
     }
-}
-
-/// Complete a software-only transition for host tests and boot helpers.
-///
-/// Real pmap activation uses begin/switch/finish explicitly.
-#[cfg(test)]
-fn mark_asid_resident_on_current_cpu(asid: Asid) {
-    let switch = begin_asid_switch_on_current_cpu(asid);
-    finish_asid_switch_on_current_cpu(switch);
-}
-
-/// Leave the current user root in the only safe order:
-///
-/// 1. install the permanent bootstrap kernel root,
-/// 2. invalidate local translations,
-/// 3. publish that this hart is no longer resident in the software ASID.
-///
-/// Clearing residency before changing `satp` lets a concurrent root destroy
-/// free page-table pages that this hart can still walk.
-pub(crate) fn deactivate_current_user_pmap() {
     let cpu = current_cpu_id();
-    if cpu.0 >= RV64_PERCPU_AREAS.len() || cpu.0 >= u64::BITS as usize {
+    if cpu.0 >= u64::BITS as usize {
         return;
     }
-    let asid = RV64_PERCPU_AREAS[cpu.0]
-        .active_user_asid
-        .load(Ordering::Acquire);
-    if asid == 0 || asid >= ASID_RESIDENCY.len() {
-        return;
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        const SATP_MODE_SV39: usize = 0x8 << 60;
-        let bootstrap_root = BootStaticBag::<IdentityDropped>::global_ref().bootstrap_root_phys();
-        let bootstrap_satp = SATP_MODE_SV39 | (bootstrap_root.0 >> 12);
-        core::arch::asm!("csrw satp, {satp}", satp = in(reg) bootstrap_satp, options(nostack));
-        // With usable ASID tags, changing from the process ASID to bootstrap
-        // ASID 0 does not require discarding either address space's cached
-        // translations. ASID_TLB_HARTS retains the old ownership bit so a
-        // later unmap/root teardown still targets this hart. Zero-ASID U74
-        // hardware has no isolation and must retain the conservative full
-        // fence on every root switch.
-        if !hw_asid_tagging_usable() {
-            core::arch::asm!("sfence.vma", options(nostack));
-        }
-    }
-
-    RV64_PERCPU_AREAS[cpu.0]
-        .active_user_asid
-        .store(0, Ordering::Release);
-    ASID_RESIDENCY[asid].fetch_and(!(1u64 << cpu.0), Ordering::AcqRel);
+    ASID_RESIDENCY[asid.0 as usize].fetch_and(!(1u64 << cpu.0), Ordering::AcqRel);
 }
 
 fn asid_residency_mask(asid: Asid) -> CpuMask {
@@ -2355,76 +1837,9 @@ fn asid_residency_mask(asid: Asid) -> CpuMask {
     CpuMask::from_bits(ASID_RESIDENCY[asid.0 as usize].load(Ordering::Acquire))
 }
 
-fn asid_tlb_hart_mask(asid: Asid) -> CpuMask {
-    if (asid.0 as usize) >= ASID_TLB_HARTS.len() {
-        return CpuMask::EMPTY;
-    }
-    CpuMask::from_bits(ASID_TLB_HARTS[asid.0 as usize].load(Ordering::Acquire))
-}
-
-#[cfg(test)]
 pub(crate) fn clear_asid_residency(asid: Asid) {
     if (asid.0 as usize) < ASID_RESIDENCY.len() {
         ASID_RESIDENCY[asid.0 as usize].store(0, Ordering::Release);
-        ASID_TLB_HARTS[asid.0 as usize].store(0, Ordering::Release);
-    }
-}
-
-/// Invalidate one ASID on every online hart before its numeric value is
-/// returned to the allocator.
-///
-/// Current residency is intentionally not used as a filter: a hart that
-/// switched away can retain tagged TLB entries until an explicit fence.
-pub(crate) fn invalidate_asid_on_all_harts(asid: Asid) {
-    #[cfg(target_arch = "riscv64")]
-    {
-        let asid_usable = hw_asid_tagging_usable();
-        unsafe {
-            if asid_usable {
-                core::arch::asm!(
-                    "sfence.vma x0, {asid}",
-                    asid = in(reg) asid.0 as usize,
-                    options(nostack)
-                );
-            } else {
-                core::arch::asm!("sfence.vma", options(nostack));
-            }
-        }
-
-        let targets = remote_sfence_targets();
-        if !targets.is_empty() {
-            let error = if asid_usable {
-                // OpenSBI defines start=0,size=0 as a full ASID-scoped
-                // invalidation on every target hart.
-                sbi_remote_sfence_vma_asid(targets.bits(), 0, 0, 0, asid.0 as usize)
-            } else {
-                sbi_remote_sfence_vma(targets.bits(), 0, 0, 0)
-            };
-            assert_eq!(error, 0, "SBI global ASID invalidation failed");
-        }
-
-        // This function is called only after residency reached zero. Once the
-        // local and remote full-ASID fences complete, no hart can retain a
-        // translation under this numeric tag, so reuse starts with an empty
-        // history mask.
-        ASID_TLB_HARTS[asid.0 as usize].store(0, Ordering::Release);
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    if (asid.0 as usize) < ASID_TLB_HARTS.len() {
-        ASID_TLB_HARTS[asid.0 as usize].store(0, Ordering::Release);
-    }
-}
-
-/// Wait until no hart can page-walk through this address-space root.
-///
-/// Callers must first stop all threads that can re-enter the address space.
-/// The acquire loop pairs with `deactivate_current_user_pmap`'s release-side
-/// publication and deliberately has no unsafe timeout: freeing a still-live
-/// root is worse than exposing a lifecycle bug as a hang.
-pub(crate) fn wait_for_asid_quiescence(asid: Asid) {
-    while !asid_residency_mask(asid).is_empty() {
-        core::hint::spin_loop();
     }
 }
 
@@ -2459,10 +1874,6 @@ fn send_sbi_ipi(mask: CpuMask) {
 
     #[cfg(not(target_arch = "riscv64"))]
     let _ = mask;
-}
-
-fn remote_ipi_targets_from(mask: CpuMask, current: CpuId) -> CpuMask {
-    mask.without(current)
 }
 
 fn rv64_fence_all() {
@@ -2509,26 +1920,13 @@ impl BootStaticBag<IdentityLive> {
     }
 
     unsafe fn publish_boot_info_from_fdt(&mut self) {
-        let dtb_addr = self.firmware_dtb().parse_addr();
+        let dtb_addr = self.firmware_dtb().mapped_addr();
         let memory_regions = unsafe { self.memory_regions_mut() };
         let cmdline = unsafe { self.cmdline_mut() };
         memory_regions.fill(reserved_region());
         cmdline.fill(0);
 
         let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
-
-        let devices = unsafe { self.platform_devices_mut() };
-        let device_count = unsafe { dtb::parse_devices_from_fdt(dtb_addr, &mut devices[..]) };
-        self.publish_platform_device_count(device_count);
-
-        if let Some(plic) = devices[..device_count]
-            .iter()
-            .find(|device| device.kind == tx_hal::DeviceKind::IntController)
-        {
-            self.publish_plic_phys_base(plic.mmio.start.0);
-        }
-        let scontexts = unsafe { self.plic_scontexts_mut() };
-        unsafe { dtb::parse_plic_scontexts_from_fdt(dtb_addr, scontexts) };
         let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz, possible_cpu_count) =
             if let Some(parsed) = parsed {
                 (
@@ -2550,26 +1948,6 @@ impl BootStaticBag<IdentityLive> {
             };
         self.publish_timebase_frequency_hz(timebase_frequency_hz);
         self.publish_possible_cpu_count(possible_cpu_count);
-        if let Some(parsed) = parsed {
-            self.publish_startable_harts(parsed.startable_harts);
-        }
-
-        let reserved_count = unsafe {
-            dtb::parse_reserved_regions_from_fdt(
-                dtb_addr,
-                &mut memory_regions[memory_region_count..],
-            )
-        };
-        let memory_region_count = memory_region_count + reserved_count;
-
-        if let Some(lowest) = memory_regions[..memory_region_count]
-            .iter()
-            .map(|region| region.base.0)
-            .min()
-        {
-            let _ = pmap::cover_direct_map_low_from_bag(self, PhysAddr(lowest));
-        }
-
         let memory_region_count =
             reserve_firmware_loader_region(memory_regions, memory_region_count);
 

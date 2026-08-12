@@ -16,23 +16,25 @@ use crate::procfs::{
 };
 use alloc::format;
 use alloc::string::String;
+use tx_subsystems::execution::Guard;
 use tx_subsystems::net::NetNamespacePayload;
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
 
-pub fn render(fs_object_id: FsObjectId) -> String {
-    render_with_netns(fs_object_id, None)
+pub fn render(fs_object_id: FsObjectId, guard: &Guard<'_>) -> String {
+    render_with_netns(fs_object_id, None, guard)
 }
 
 pub fn render_with_netns(
     fs_object_id: FsObjectId,
     caller_netns: Option<&NetNamespacePayload>,
+    guard: &Guard<'_>,
 ) -> String {
     if let Some(pid) = pid_from_status_id(fs_object_id) {
-        return render_status(pid);
+        return render_status(pid, guard);
     }
     if let Some(pid) = pid_from_stat_id(fs_object_id) {
-        return render_stat(pid);
+        return render_stat(pid, guard);
     }
     if let Some(pid) = pid_from_cmdline_id(fs_object_id) {
         return render_cmdline(pid);
@@ -41,10 +43,10 @@ pub fn render_with_netns(
         return render_mounts();
     }
     if let Some(pid) = pid_from_maps_id(fs_object_id) {
-        return render_maps(pid);
+        return render_maps(pid, guard);
     }
     if let Some(pid) = pid_from_smaps_id(fs_object_id) {
-        return render_smaps(pid);
+        return render_smaps(pid, guard);
     }
     if let Some(pid) = pid_from_uid_map_id(fs_object_id) {
         return render_userns_id_map(pid, false);
@@ -199,20 +201,20 @@ fn render_if_inet6() -> String {
             let _ = write!(out, "{b:02x}");
         }
         // ifindex prefixlen scope flags(IFA_F_PERMANENT=0x80) devname
-        let _ = writeln!(
+        let _ = write!(
             out,
-            " {:02x} {:02x} {:02x} {:02x} {:>8}",
+            " {:02x} {:02x} {:02x} {:02x} {:>8}\n",
             link.ifindex, prefix, scope, 0x80u8, link.name
         );
     }
     out
 }
 
-fn render_stat(pid: Pid) -> String {
+fn render_stat(pid: Pid, guard: &Guard<'_>) -> String {
     let Some(proc) = process::process_by_pid(pid) else {
         return String::new();
     };
-    let ppid = proc.parent_pid();
+    let ppid = proc.parent_pid_with_guard(guard);
     let pgrp = proc.pgrp_cap().pgid;
     let session = proc.pgrp_cap().session_cap().sid;
 
@@ -243,32 +245,7 @@ fn render_cmdline(pid: Pid) -> String {
     }
 }
 
-/// Boot-time mount table assembled by kernel init. Runtime mount mutation is
-/// still outside this projection, but publishing the actual boot mounts keeps
-/// `df` and mount discovery consistent with the selected root filesystem.
-static MOUNTS_PTR: core::sync::atomic::AtomicPtr<u8> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-static MOUNTS_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-pub fn procfs_set_mounts(table: String) {
-    let leaked: &'static str = alloc::boxed::Box::leak(table.into_boxed_str());
-    MOUNTS_LEN.store(leaked.len(), core::sync::atomic::Ordering::Release);
-    MOUNTS_PTR.store(
-        leaked.as_ptr() as *mut u8,
-        core::sync::atomic::Ordering::Release,
-    );
-}
-
 fn render_mounts() -> String {
-    let ptr = MOUNTS_PTR.load(core::sync::atomic::Ordering::Acquire);
-    if !ptr.is_null() {
-        let len = MOUNTS_LEN.load(core::sync::atomic::Ordering::Acquire);
-        // SAFETY: `procfs_set_mounts` publishes storage leaked for the kernel
-        // lifetime, and release/acquire orders the matching length.
-        let table =
-            unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) };
-        return String::from(table);
-    }
     String::from(
         "rootfs / rootfs rw 0 0\n\
 proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
@@ -364,7 +341,7 @@ fn render_uptime() -> String {
     format!("{secs}.{hundredths:02} {secs}.{hundredths:02}\n")
 }
 
-fn render_maps(pid: Pid) -> String {
+fn render_maps(pid: Pid, guard: &Guard<'_>) -> String {
     use tx_subsystems::vm::VmEntryBacking;
 
     let Some(proc) = process::process_by_pid(pid) else {
@@ -374,7 +351,7 @@ fn render_maps(pid: Pid) -> String {
         return String::new();
     };
 
-    let mut entries = aspace.recipes_snapshot();
+    let mut entries = aspace.recipes_snapshot_with_guard(guard);
     // Sort by start address for canonical output.
     entries.sort_by_key(|e| e.range.start());
 
@@ -412,7 +389,8 @@ fn render_maps(pid: Pid) -> String {
 
         use alloc::format;
         out.push_str(&format!(
-            "{start:x}-{end:x} {r}{w}{x}{p} {offset:08x} 00:00 0 {backing_desc}{locked}\n",
+            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}{}\n",
+            start, end, r, w, x, p, offset, backing_desc, locked,
         ));
     }
 
@@ -422,7 +400,7 @@ fn render_maps(pid: Pid) -> String {
 /// `/proc/<pid>/smaps`: each mapping's header line (as in `maps`) followed by
 /// the per-mapping size/rss/locked block. mlock LTP tests read the `Locked:`
 /// field to confirm the region is resident after `mlock`/`mlockall`.
-fn render_smaps(pid: Pid) -> String {
+fn render_smaps(pid: Pid, guard: &Guard<'_>) -> String {
     use tx_subsystems::vm::{VmEntryBacking, USER_PAGE_SIZE};
 
     let Some(proc) = process::process_by_pid(pid) else {
@@ -432,7 +410,7 @@ fn render_smaps(pid: Pid) -> String {
         return String::new();
     };
 
-    let mut entries = aspace.recipes_snapshot();
+    let mut entries = aspace.recipes_snapshot_with_guard(guard);
     entries.sort_by_key(|e| e.range.start());
 
     let mut out = String::new();
@@ -466,7 +444,8 @@ fn render_smaps(pid: Pid) -> String {
         let locked_kb = if entry.flags.locked { size_kb } else { 0 };
 
         out.push_str(&format!(
-            "{start:x}-{end:x} {r}{w}{x}{p} {offset:08x} 00:00 0 {backing_desc}\n",
+            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}\n",
+            start, end, r, w, x, p, offset, backing_desc,
         ));
         out.push_str(&format!(
             "Size:           {:8} kB\n\
@@ -549,7 +528,7 @@ const fn state_name(state: char) -> &'static str {
 /// `/proc/<pid>/status` — enough for LTP's getdatasize() (`VmData:` line). VmData
 /// is reported as a stable 0 (no per-mapping accounting re-homed yet), which is
 /// sufficient for the leak check (before == after). Re-homed; PR#50 dropped it.
-fn render_status(pid: Pid) -> String {
+fn render_status(pid: Pid, guard: &Guard<'_>) -> String {
     let Some(proc) = process::process_by_pid(pid) else {
         return String::new();
     };
@@ -562,7 +541,7 @@ fn render_status(pid: Pid) -> String {
     // read this field from /proc/self/status to confirm pages are locked.
     let mut vm_lck_kb = 0usize;
     if let Some(aspace) = proc.aspace_cap() {
-        for entry in aspace.recipes_snapshot() {
+        for entry in aspace.recipes_snapshot_with_guard(guard) {
             if entry.flags.locked {
                 vm_lck_kb += entry.range.page_count() * (tx_subsystems::vm::USER_PAGE_SIZE / 1024);
             }
@@ -576,7 +555,7 @@ VmData:\t{:8} kB\nVmLck:\t{:8} kB\n",
         state_name(state),
         pid.0,
         pid.0,
-        proc.parent_pid().0,
+        proc.parent_pid_with_guard(guard).0,
         proc.live_thread_count(),
         0,
         vm_lck_kb,

@@ -21,8 +21,8 @@ use crate::adapter::boot_runtime::userspace::{
 };
 use crate::adapter::step_engine::{Cap, PayloadCap};
 use tx_hal::{
-    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
+    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, CpuId,
+    InitIf, ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
     PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 use tx_shims::linux_syscall::{
@@ -35,8 +35,9 @@ use tx_subsystems::process::ExitStatus;
 use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_payload, current_thread_payload, drain_pending_syscall_return,
-    ThreadPayload,
+    clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
+    clear_current_userspace_thread_identity, current_thread_payload, current_userspace_payload,
+    current_userspace_thread_identity, drain_pending_syscall_return, ThreadPayload,
 };
 use tx_subsystems::vm::{
     AccessMode, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmFault,
@@ -175,6 +176,7 @@ impl tx_hal::MonotonicCounterIf for TestPlatform {
 
 static TEST_MONOTONIC_NS: AtomicU64 = AtomicU64::new(0);
 static TEST_HAL_DEADLINE_ARM_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 
 impl tx_hal::DeadlineTimerIf for TestPlatform {
     fn set_deadline_ns(_deadline: u64) {
@@ -186,10 +188,18 @@ impl tx_hal::DeadlineTimerIf for TestPlatform {
 
 impl tx_hal::PersistentClockIf for TestPlatform {}
 
-impl tx_hal::PercpuIf for TestPlatform {}
+impl tx_hal::PercpuIf for TestPlatform {
+    fn current_cpu_id() -> CpuId {
+        CpuId(TEST_CURRENT_CPU.load(Ordering::Acquire))
+    }
+}
 impl tx_hal::CacheIf for TestPlatform {}
 impl tx_hal::DmaIf for TestPlatform {}
-impl tx_hal::SmpIf for TestPlatform {}
+impl tx_hal::SmpIf for TestPlatform {
+    fn current_cpu_id() -> CpuId {
+        CpuId(TEST_CURRENT_CPU.load(Ordering::Acquire))
+    }
+}
 impl tx_hal::EntropyIf for TestPlatform {}
 impl ObserverIf for TestPlatform {}
 
@@ -246,8 +256,14 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_pid_counter();
     tx_subsystems::cross_crate_test_support::reset_tid_counter();
     TEST_MONOTONIC_NS.store(0, Ordering::Release);
+    TEST_CURRENT_CPU.store(0, Ordering::Release);
     // Ensure the per-hart slot is empty across tests.
-    let _ = clear_current_thread_payload(0);
+    for hart in 0..4 {
+        let _ = clear_current_thread_identity(hart);
+        let _ = clear_current_thread_payload(hart);
+        let _ = clear_current_userspace_payload(hart);
+        let _ = clear_current_userspace_thread_identity(hart);
+    }
     USERSPACE_A0_LOG
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -766,6 +782,59 @@ fn per_hart_slotted_clears_slot_on_pending_exit() {
     assert!(
         current_thread_payload(0).is_none(),
         "slot cleared after Pending poll exit",
+    );
+}
+
+#[test]
+fn timer_preempt_consumption_clears_userspace_slot_before_repoll() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    payload.store_saved_user_context(Some(tx_hal::UserTrapContext::empty()));
+
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload.clone(), future);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(
+        current_userspace_payload(0).is_some(),
+        "first userspace entry publishes the hart-local userspace payload",
+    );
+    assert!(
+        current_userspace_thread_identity(0).is_some(),
+        "first userspace entry publishes the hart-local userspace identity",
+    );
+
+    let active = payload
+        .active_userspace_request()
+        .expect("first userspace request published");
+    payload
+        .userspace_slot()
+        .record_timer_preemption(active)
+        .expect("timer preempt marks the active userspace run");
+
+    TEST_CURRENT_CPU.store(2, Ordering::Release);
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(
+        current_userspace_payload(0).is_none(),
+        "consuming a timer preempt must clear the old hart userspace payload before repoll",
+    );
+    assert!(
+        current_userspace_thread_identity(0).is_none(),
+        "consuming a timer preempt must clear the old hart userspace identity before repoll",
+    );
+    assert!(
+        current_userspace_payload(2).is_none(),
+        "timer-preempt cleanup must not leave a replacement slot on the repoll hart",
+    );
+    assert!(
+        payload.active_userspace_request().is_none(),
+        "timer preempt consumption clears the active request token",
     );
 }
 
@@ -1567,6 +1636,11 @@ fn thread_future_sigreturn_restores_user_edited_frame_context_and_mask() {
     let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
     let aspace = init.aspace_cap().expect("aspace alive");
 
+    let mut parked = tx_hal::UserTrapContext::empty();
+    parked.pc = 0x1234_5678;
+    parked.regs[10] = 0xdead_beef;
+    payload.store_saved_signal_context(Some(parked));
+
     let mut handler_ctx = tx_hal::UserTrapContext::empty();
     handler_ctx.regs[2] = 0x7000;
     payload.store_saved_user_context(Some(handler_ctx));
@@ -1624,6 +1698,11 @@ fn thread_future_sigreturn_preserves_user_blocked_sigcancel_mask() {
         .expect("INIT_PROCESS populated post-bootstrap");
     let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
     let aspace = init.aspace_cap().expect("aspace alive");
+
+    let mut parked = tx_hal::UserTrapContext::empty();
+    parked.pc = 0x1234_5678;
+    parked.regs[10] = 0xdead_beef;
+    payload.store_saved_signal_context(Some(parked));
 
     let mut handler_ctx = tx_hal::UserTrapContext::empty();
     handler_ctx.regs[2] = 0x7000;

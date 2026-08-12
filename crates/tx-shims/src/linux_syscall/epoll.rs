@@ -9,7 +9,7 @@ use crate::adapter::reactor_entry::WaitSource;
 use crate::adapter::step_engine::{InterestMask, StepOutcome, WaitSourceId};
 use crate::linux_syscall::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, errno_to_i32, SyscallCtx, SyscallResult,
-    EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, EMFILE_VALUE, ENOMEM_VALUE, ENOSYS_VALUE,
+    EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE, ENOSYS_VALUE,
 };
 use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
 use tx_subsystems::{
@@ -343,9 +343,11 @@ pub(super) fn sys_epoll_create1(flags: u32, ctx: &SyscallCtx<'_>) -> SyscallResu
     };
 
     // Install as an fd in the calling process.
-    let Some(fd) = ctx.process.install_new_fd(of, cloexec) else {
-        return SyscallResult::Error(EMFILE_VALUE);
-    };
+    let fd = ctx.process.allocate_fd();
+    let _ = ctx.process.install_fd(fd, of);
+    if cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
 
     SyscallResult::Return(fd as i64)
 }

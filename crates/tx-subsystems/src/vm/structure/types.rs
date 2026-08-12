@@ -581,33 +581,6 @@ impl VmEntry {
         }
     }
 
-    /// Whether `other`, when placed immediately after `self`, continues the
-    /// same backing byte stream. Adjacent mappings of the same file are only
-    /// coalescible when the right-hand file offset follows the left range;
-    /// two independent mappings that both start at offset zero must remain
-    /// separate VMAs.
-    pub(in crate::vm) fn has_contiguous_backing_with(&self, other: &Self) -> bool {
-        match (self.backing, other.backing) {
-            (VmEntryBacking::None, VmEntryBacking::None)
-            | (VmEntryBacking::PrivateAnon, VmEntryBacking::PrivateAnon) => true,
-            (
-                VmEntryBacking::Page {
-                    offset: left_offset,
-                },
-                VmEntryBacking::Page {
-                    offset: right_offset,
-                },
-            ) => {
-                self.owners.page.as_ref() == other.owners.page.as_ref()
-                    && u64::try_from(self.range.len())
-                        .ok()
-                        .and_then(|len| left_offset.checked_add(len))
-                        == Some(right_offset)
-            }
-            _ => false,
-        }
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn debug_owner_strong_count(&self) -> usize {
         Arc::strong_count(&self.owners)
@@ -635,33 +608,13 @@ impl VmEntry {
         }
 
         if self.range == target {
-            let target_entry = match target_prot {
-                Some(prot) => {
-                    let mut entry = self.clone();
-                    entry.prot = prot;
-                    // Invariant (mirrors `reserve_map` admission and
-                    // `sub_entry` below): a writable MAP_PRIVATE entry must
-                    // carry a `PrivatePageSet`. A full-range PROT_NONE→RW
-                    // mprotect lands here with `private: None` (the entry was
-                    // created non-writable, so no set was ever attached);
-                    // without a set, CoW materialization has nowhere to record
-                    // private frames, content lives only in PTEs, and the
-                    // first post-fork write refaults the page as a fresh zero
-                    // frame — silently zeroing live data (mallocng meta pages
-                    // in git-remote-https).
-                    if entry.owners.private.is_none() && prot.write && !entry.flags.shared {
-                        let set = PrivatePageSet::new_cap()
-                            .map_err(PrivatePageError::Zone)
-                            .map_err(VmEntryError::Private)?;
-                        entry = entry.with_private(Some(set));
-                    }
-                    Some(entry)
-                }
-                None => None,
-            };
             return Ok(VmEntryRewrite {
                 before: None,
-                target: target_entry,
+                target: target_prot.map(|prot| {
+                    let mut entry = self.clone();
+                    entry.prot = prot;
+                    entry
+                }),
                 after: None,
             });
         }
@@ -937,7 +890,6 @@ pub enum VmMapError {
     WouldBlock,
     BackingOffsetOverflow,
     Pmap(VmPmapError),
-    PageAlloc(page_allocator::AllocError),
     Private(PrivatePageError),
 }
 
@@ -1073,11 +1025,28 @@ impl VmFault {
     }
 }
 
+/// Stable even publication sequence captured with an owned recipe lookup.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RecipeGeneration(u64);
+
+impl RecipeGeneration {
+    pub(in crate::vm) const fn new(sequence: u64) -> Self {
+        debug_assert!(sequence.is_multiple_of(2));
+        Self(sequence)
+    }
+
+    #[cfg(test)]
+    pub(in crate::vm) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmFaultOutcome {
     pub page_range: UserRange,
     pub entry: VmEntry,
     pub private_identity: Option<u32>,
+    pub recipe_generation: Option<RecipeGeneration>,
     pub access: AccessMode,
     pub pmap_materialization_deferred: bool,
 }
@@ -1327,20 +1296,6 @@ impl VmFaultOutcome {
                 // reservation and tries again.
                 let new = allocate_private_materialized_page_from_source(snap.ppn, true)?;
                 let new_ppn = new.ppn;
-                {
-                    let va = self.page_range.start().as_usize();
-                    if crate::vm::probe::watch_overlap(va, va + USER_PAGE_SIZE) {
-                        crate::vm::probe::probe_emit(
-                            "cowrep",
-                            &[
-                                va as u64,
-                                snap.ppn.0 as u64,
-                                new_ppn.0 as u64,
-                                crate::vm::probe::frame_fingerprint(snap.ppn),
-                            ],
-                        );
-                    }
-                }
                 let cache_pin =
                     page_allocator::acquire_cache_pin(new_ppn).map_err(page_alloc_error)?;
                 let frame = PrivateFrame::new(new_ppn, PrivateFrameState::Exclusive, cache_pin);
@@ -1428,13 +1383,6 @@ impl VmFaultOutcome {
                 match materialize_zero_frame() {
                     Ok(page) => {
                         emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 5);
-                        let va = self.page_range.start().as_usize();
-                        if crate::vm::probe::watch_overlap(va, va + USER_PAGE_SIZE) {
-                            crate::vm::probe::probe_emit(
-                                "zread",
-                                &[va as u64, self.entry.range.start().as_usize() as u64],
-                            );
-                        }
                         page
                     }
                     Err(error) => return VmFaultMaterializationStep::Err(error),
@@ -1513,17 +1461,6 @@ impl VmFaultOutcome {
                 match allocate_private_materialized_page(true) {
                     Ok(page) => {
                         emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 1);
-                        let va = self.page_range.start().as_usize();
-                        if crate::vm::probe::watch_overlap(va, va + USER_PAGE_SIZE) {
-                            crate::vm::probe::probe_emit(
-                                "zmiss",
-                                &[
-                                    va as u64,
-                                    page.ppn.0 as u64,
-                                    self.entry.range.start().as_usize() as u64,
-                                ],
-                            );
-                        }
                         page
                     }
                     Err(error) => return VmFaultMaterializationStep::Err(error),

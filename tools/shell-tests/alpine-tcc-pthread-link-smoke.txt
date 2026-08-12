@@ -1,0 +1,44 @@
+# alpine-tcc-pthread-link-smoke.txt - default TCC link for a pthread program.
+#
+# Run with:
+#   cargo xtask shell-test --target rv64-qemu --profile alpine \
+#     --append-cmdline tx.mount.sdcard=0 \
+#     --extra-rv64-ext4 target/images/alpine-tcc-dev-root-rv64-qemu.ext4 \
+#     --script tools/shell-tests/alpine-tcc-pthread-link-smoke.txt
+
+wait ":mount:bdevfs:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "echo tcc-pthread-link-start\n"
+expect "tcc-pthread-link-start" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "mkdir -p /mnt/tcc; mount -t ext4 /dev/block/vda /mnt/tcc; echo normal-mount-status:$?\n"
+expect "normal-mount-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+send "mkdir -p /usr /lib; ln -sf /mnt/tcc/usr/include /usr/include; ln -sf /mnt/tcc/usr/lib/tcc /usr/lib/tcc; ln -sf /mnt/tcc/usr/lib/crt1.o /usr/lib/crt1.o; ln -sf /mnt/tcc/usr/lib/crti.o /usr/lib/crti.o; ln -sf /mnt/tcc/usr/lib/crtn.o /usr/lib/crtn.o; ln -sf /mnt/tcc/usr/lib/libc.a /usr/lib/libc.a; ln -sf /mnt/tcc/usr/lib/libc.so /usr/lib/libc.so; ln -sf /mnt/tcc/usr/lib/libtcc.so /usr/lib/libtcc.so; ln -sf /mnt/tcc/lib/ld-musl-riscv64.so.1 /lib/ld-musl-riscv64.so.1; ln -sf /mnt/tcc/usr/bin/tcc /usr/bin/tcc; echo tcc-compat-links:$?\n"
+expect "tcc-compat-links:0" within 20000
+expect "/ # " within 20000
+
+sleep 500
+send "cat > /tmp/pthread.c <<'EOF'\n#include <pthread.h>\n#include <stdio.h>\nstatic void *worker(void *arg) { puts((const char *)arg); return (void *)3; }\nint main(void) {\n  pthread_t th;\n  void *ret = 0;\n  if (pthread_create(&th, 0, worker, \"tcc-pthread-worker\") != 0) return 10;\n  if (pthread_join(th, &ret) != 0) return 11;\n  printf(\"tcc-pthread-ret:%ld\\n\", (long)ret);\n  return ret == (void *)3 ? 0 : 12;\n}\nEOF\n"
+expect "/ # " within 10000
+
+sleep 500
+send "tcc /tmp/pthread.c -o /tmp/pthread; echo pthread-link-status:$?\n"
+expect "pthread-link-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+send "/tmp/pthread; echo pthread-run-status:$?\n"
+expect "tcc-pthread-worker" within 30000
+expect "tcc-pthread-ret:3" within 30000
+expect "pthread-run-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+quit

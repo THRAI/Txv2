@@ -42,7 +42,7 @@ pub use structure::{
     InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
     ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, StructPayload, Timespec, VfsName,
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID,
-    S_ISVTX, VFS_NAME_MAX, render_dentry_path_in_namespace,
+    S_ISVTX, VFS_NAME_MAX,
 };
 pub use walker::{
     step_open, step_open_in_mount_namespace, step_open_in_mount_namespace_with_mount,

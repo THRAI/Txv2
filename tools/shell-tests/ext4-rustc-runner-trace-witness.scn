@@ -1,0 +1,11 @@
+# Trace the runner preflight only. The nonzero exit is diagnostic output, not
+# a build acceptance result.
+
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox mkdir -p /mnt/ext4-test; /bin/busybox mount -t ext4 -o rw /dev/block/vda /mnt/ext4-test; TX_EXT4_TEST_DEVICE=/dev/block/vda TX_EXT4_SCRATCH_DEVICE=/dev/block/vdb TX_EXT4_WORKLOAD_DEVICE=/dev/block/vdc /bin/sh -x /mnt/ext4-test/run-rustc-kernel-build.sh; echo ext4-runner-trace-status:$?\n"
+expect "ext4-runner-trace-status:" within 30000
+expect "/ # " within 10000
+
+quit

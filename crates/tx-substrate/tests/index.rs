@@ -7,7 +7,8 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct TestPlatform;
 
 impl PercpuIf for TestPlatform {}
-unsafe fn restore_test_local_execution(_: usize) {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
+
 impl IrqIf for TestPlatform {
     fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
         unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
@@ -61,6 +62,5 @@ fn committed_lookup_is_guard_observed_without_cloning_value() {
 
     assert_eq!(observed.key(), &8);
     assert_eq!(observed.value().number, 12);
-    drop(observed);
     assert!(index.lookup(&9, &guard).is_none());
 }

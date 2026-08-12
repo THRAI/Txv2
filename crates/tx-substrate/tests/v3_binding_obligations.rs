@@ -13,17 +13,6 @@
 
 use tx_substrate::step::BindingObligation;
 
-// The helpers must remain const-callable, and these catalog truths must hold.
-const _: () = {
-    assert!(BindingObligation::ResolutionOnly.rank() == 0);
-    assert!(BindingObligation::Addressability.rank() == 1);
-    assert!(BindingObligation::Operational.rank() == 2);
-    assert!(BindingObligation::Operational.at_least(BindingObligation::Operational));
-    assert!(BindingObligation::Operational.at_least(BindingObligation::ResolutionOnly));
-    assert!(BindingObligation::Operational.requires_operability());
-    assert!(!BindingObligation::ResolutionOnly.requires_operability());
-};
-
 // -- BindingObligation closed catalog ----------------------------------------
 
 #[test]
@@ -143,4 +132,29 @@ fn binding_obligation_requires_operability_only_for_operational() {
             "requires_operability broke for {obligation:?}",
         );
     }
+}
+
+// -- const-context smoke -----------------------------------------------------
+
+#[test]
+fn binding_obligation_helpers_are_const() {
+    // Compile-only: invoke at_least, rank, requires_operability in a
+    // const context. If any helper loses `const`, this stops compiling.
+    const RANK_RES: u8 = BindingObligation::ResolutionOnly.rank();
+    const RANK_ADDR: u8 = BindingObligation::Addressability.rank();
+    const RANK_OP: u8 = BindingObligation::Operational.rank();
+    const AT_LEAST_REFL: bool =
+        BindingObligation::Operational.at_least(BindingObligation::Operational);
+    const AT_LEAST_DOWN: bool =
+        BindingObligation::Operational.at_least(BindingObligation::ResolutionOnly);
+    const REQ_OP_TRUE: bool = BindingObligation::Operational.requires_operability();
+    const REQ_OP_FALSE: bool = BindingObligation::ResolutionOnly.requires_operability();
+
+    assert_eq!(RANK_RES, 0);
+    assert_eq!(RANK_ADDR, 1);
+    assert_eq!(RANK_OP, 2);
+    const { assert!(AT_LEAST_REFL) };
+    const { assert!(AT_LEAST_DOWN) };
+    const { assert!(REQ_OP_TRUE) };
+    const { assert!(!REQ_OP_FALSE) };
 }

@@ -1,0 +1,339 @@
+//! Typed L4 service ownership for page-backed I/O.
+//!
+//! PageBacked retains PageSlot and retained data-lease semantics. This manager
+//! owns only request scheduling, completion routing, and its service wake
+//! endpoint, so no PageContainer state lock is needed to drive the L4 queue.
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::fs_iface::{IoDataSource, IoDataTarget};
+use crate::io_manager::runtime::{IoServiceKind, ServiceKick, ServiceWakeSource};
+use crate::page_backed::OwnedFileIoRequest;
+use crate::sync::SpinMutex;
+use crate::{
+    io_manager::backend::{BlockPageCompletion, PageFrameRef},
+    io_manager::block::BlockCompletion,
+};
+
+#[cfg(test)]
+use super::service::PageWaitError;
+use super::service::PageWaiter;
+use super::service::{
+    PageService, PageServiceBackendOutcome, PageServiceBackendPrepared,
+    PageServiceBackendSubmitError, PageServiceBlockCompletionPrepared, PageServiceL6Applied,
+    PageServiceTaggedBlockCompletionError,
+};
+use super::{
+    PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
+    PageIoRequest, PageIoRequestId, PageL6Receipt,
+};
+#[cfg(test)]
+use super::{PageIoCompletion, PageQueueError};
+#[cfg(test)]
+use crate::io_manager::backend::PageCompletion;
+
+#[derive(Debug)]
+pub(crate) struct PageIoSubmissionManager {
+    state: SpinMutex<PageIoSubmissionState>,
+}
+
+#[cfg(test)]
+static PAGE_IO_SUBMISSION_MANAGER_LOCK_ACQUISITIONS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_page_io_submission_manager_lock_acquisitions_for_test() {
+    PAGE_IO_SUBMISSION_MANAGER_LOCK_ACQUISITIONS_FOR_TEST.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn page_io_submission_manager_lock_acquisitions_for_test() -> usize {
+    PAGE_IO_SUBMISSION_MANAGER_LOCK_ACQUISITIONS_FOR_TEST.load(Ordering::Acquire)
+}
+
+impl PageIoSubmissionManager {
+    fn lock_state(&self) -> tx_substrate::SpinMutexGuard<'_, PageIoSubmissionState> {
+        #[cfg(test)]
+        PAGE_IO_SUBMISSION_MANAGER_LOCK_ACQUISITIONS_FOR_TEST.fetch_add(1, Ordering::AcqRel);
+        self.state.lock()
+    }
+}
+
+#[derive(Debug)]
+struct PageIoSubmissionState {
+    service: PageService,
+    admitted_file_requests: BTreeMap<PageIoRequestId, AdmittedFileRequest>,
+    background_graphs: BTreeSet<PageIoRequestId>,
+    wake_source: Option<Arc<ServiceWakeSource>>,
+}
+
+/// The retained page-cache evidence was previously guarded by
+/// `PageContainerState`. L4 now provides that same mutex-protected custody;
+/// access is only by immutable projection or one terminal removal.
+#[derive(Debug)]
+struct AdmittedFileRequest(OwnedFileIoRequest);
+
+// SAFETY: the wrapped CachePin is never dereferenced or cloned through this
+// wrapper. Every access is serialized by PageIoSubmissionManager.state, and a
+// terminal path moves it back to PageBacked for the PageSlot transition.
+unsafe impl Send for AdmittedFileRequest {}
+
+/// Typed L4 ownership token retained by a page-backed object.
+#[derive(Clone, Debug)]
+pub(crate) struct PageIoSubmissionHandle(Arc<PageIoSubmissionManager>);
+
+impl PageIoSubmissionHandle {
+    pub(crate) fn new(max_pending: usize) -> Self {
+        Self(Arc::new(PageIoSubmissionManager {
+            state: SpinMutex::new(PageIoSubmissionState {
+                service: PageService::new(max_pending),
+                admitted_file_requests: BTreeMap::new(),
+                background_graphs: BTreeSet::new(),
+                wake_source: None,
+            }),
+        }))
+    }
+
+    pub(crate) fn with_service<R>(&self, f: impl FnOnce(&mut PageService) -> R) -> R {
+        f(&mut self.0.lock_state().service)
+    }
+
+    /// Publish a queued L4 request and its retained data owner together.
+    ///
+    /// The service can become runnable as soon as `PageService::submit`
+    /// returns. Keeping both mutations under the manager lock prevents a
+    /// concurrent service turn from observing a request before its source or
+    /// target lease has been installed.
+    pub(crate) fn submit_owned_file_request(
+        &self,
+        pc: PageContainerKey,
+        range: PageIoRange,
+        op: PageIoOp,
+        priority: PageIoPriority,
+        flags: PageIoFlags,
+        generation_hint: Option<PageGeneration>,
+        make_owner: impl FnOnce(PageIoRequest) -> OwnedFileIoRequest,
+    ) -> Option<PageIoRequestId> {
+        let mut state = self.0.lock_state();
+        let id = state
+            .service
+            .submit(pc, range, op, priority, flags, generation_hint)
+            .ok()?;
+        let request = PageIoRequest::new(id, pc, range, op, priority, flags, generation_hint);
+        let replaced = state
+            .admitted_file_requests
+            .insert(id, AdmittedFileRequest(make_owner(request)));
+        debug_assert!(replaced.is_none(), "L4 request identifiers are unique");
+        Some(id)
+    }
+
+    /// L4 retains the page-cache source/target bundle from admission until its
+    /// terminal completion. PageBacked only consumes the bundle to apply the
+    /// corresponding PageSlot transition.
+    pub(crate) fn admit_file_request(&self, owner: OwnedFileIoRequest) -> bool {
+        let request_id = owner.request().id;
+        self.0
+            .state
+            .lock()
+            .admitted_file_requests
+            .insert(request_id, AdmittedFileRequest(owner))
+            .is_none()
+    }
+
+    pub(crate) fn file_request_data(
+        &self,
+        request_id: PageIoRequestId,
+    ) -> (IoDataSource, IoDataTarget) {
+        let state = self.0.lock_state();
+        state
+            .admitted_file_requests
+            .get(&request_id)
+            .map(|owner| (owner.0.source(), owner.0.target()))
+            .unwrap_or((IoDataSource::None, IoDataTarget::None))
+    }
+
+    pub(crate) fn file_request(&self, request_id: PageIoRequestId) -> Option<PageIoRequest> {
+        self.0
+            .state
+            .lock()
+            .admitted_file_requests
+            .get(&request_id)
+            .map(|owner| owner.0.request().clone())
+    }
+
+    pub(crate) fn take_file_request(
+        &self,
+        request_id: PageIoRequestId,
+    ) -> (Option<OwnedFileIoRequest>, Vec<PageWaiter>) {
+        let mut state = self.0.lock_state();
+        let owner = state
+            .admitted_file_requests
+            .remove(&request_id)
+            .map(|owner| owner.0);
+        let waiters = state.service.retire_submission(request_id);
+        (owner, waiters)
+    }
+
+    pub(crate) fn register_waiter(&self, request_id: PageIoRequestId, waiter: PageWaiter) {
+        self.with_service(|service| {
+            let _ = service.wait_on(request_id, waiter);
+        });
+    }
+
+    pub(crate) fn mark_background_graph(&self, request_id: PageIoRequestId) {
+        self.0.lock_state().background_graphs.insert(request_id);
+    }
+
+    pub(crate) fn take_background_graph(&self, request_id: PageIoRequestId) -> bool {
+        self.0.lock_state().background_graphs.remove(&request_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_file_request_count(&self) -> usize {
+        self.0.lock_state().admitted_file_requests.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_file_writeback_count(&self) -> usize {
+        self.0
+            .state
+            .lock()
+            .admitted_file_requests
+            .values()
+            .filter(|owner| owner.0.request().op == PageIoOp::Writeback)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_file_read_count(&self) -> usize {
+        self.0
+            .state
+            .lock()
+            .admitted_file_requests
+            .values()
+            .filter(|owner| owner.0.request().op == PageIoOp::Read)
+            .count()
+    }
+
+    pub(crate) fn prepare_backend_outcome(
+        &self,
+        outcome: PageServiceBackendOutcome,
+        request: PageIoRequest,
+    ) -> Result<PageServiceBackendPrepared, PageServiceBackendSubmitError> {
+        self.with_service(|service| service.prepare_backend_outcome(outcome, request))
+    }
+
+    pub(crate) fn apply_l6_receipt(
+        &self,
+        receipt: PageL6Receipt,
+    ) -> Result<PageServiceL6Applied, PageServiceBackendSubmitError> {
+        self.with_service(|service| service.apply_l6_receipt(receipt))
+    }
+
+    pub(crate) fn prepare_block_completion_routes<F>(
+        &self,
+        completion: BlockCompletion,
+        page_routes: Vec<BlockPageCompletion>,
+        allow_external_completion: bool,
+        frame_for: F,
+    ) -> Result<PageServiceBlockCompletionPrepared, PageServiceTaggedBlockCompletionError>
+    where
+        F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
+    {
+        self.with_service(|service| {
+            service.prepare_block_completion_routes(
+                completion,
+                page_routes,
+                allow_external_completion,
+                frame_for,
+            )
+        })
+    }
+
+    pub(crate) fn attach_wake_source(&self, wake_source: Arc<ServiceWakeSource>) -> bool {
+        let mut state = self.0.lock_state();
+        if state.wake_source.is_some() {
+            return false;
+        }
+        state.wake_source = Some(wake_source);
+        true
+    }
+
+    pub(crate) fn kick(&self, service: IoServiceKind) {
+        let wake_source = self.0.lock_state().wake_source.clone();
+        if let Some(wake_source) = wake_source {
+            let _ = wake_source.kick_with_post(ServiceKick::new(service), |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
+    }
+
+    pub(crate) fn has_wake_source(&self) -> bool {
+        self.0.lock_state().wake_source.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_submission(
+        &self,
+        pc: PageContainerKey,
+        range: PageIoRange,
+        op: PageIoOp,
+    ) -> Option<PageIoRequest> {
+        self.with_service(|service| service.find_submission(pc, range, op).cloned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit(
+        &self,
+        pc: PageContainerKey,
+        range: PageIoRange,
+        op: PageIoOp,
+        priority: PageIoPriority,
+        flags: PageIoFlags,
+        generation_hint: Option<PageGeneration>,
+    ) -> Result<PageIoRequestId, PageQueueError> {
+        self.with_service(|service| service.submit(pc, range, op, priority, flags, generation_hint))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_completion(&self, completion: PageIoCompletion) {
+        self.with_service(|service| service.push_completion(completion));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_page_completion(&self, completion: PageCompletion) {
+        self.with_service(|service| service.push_page_completion(completion));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_on(
+        &self,
+        request_id: PageIoRequestId,
+        waiter: PageWaiter,
+    ) -> Result<(), PageWaitError> {
+        self.with_service(|service| service.wait_on(request_id, waiter))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submission_len(&self) -> usize {
+        self.with_service(|service| service.submission_len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiter_count(&self, request_id: PageIoRequestId) -> usize {
+        self.with_service(|service| service.waiter_count(request_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_background_request(
+        &self,
+        pc: PageContainerKey,
+        range: PageIoRange,
+    ) -> Result<PageIoRequest, PageQueueError> {
+        self.with_service(|service| service.reserve_background_request(pc, range))
+    }
+}

@@ -87,7 +87,7 @@ pub fn reserve<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneReservation<T>,
     let meta = unsafe { slot.as_ref().meta() };
     loop {
         let cur = meta.load(Ordering::Acquire);
-        if cur.state() != SlotState::Free || cur.retain() != 0 {
+        if cur.state() != SlotState::Free || cur.retain() != 0 || cur.generation_exhausted() {
             zone.return_slot(slot);
             return Err(ZoneError::InvalidState);
         }
@@ -135,25 +135,9 @@ pub fn sign<T: 'static>(mut reservation: ZoneReservation<T>, value: T) -> Cap<T>
     // inside a `StepOp::step` body (OBS-A-1).
     if MUTATION_EMIT_ENABLED.load(Ordering::Relaxed) {
         if let Some(em) = tx_observe::current() {
-            use tx_observe::encode::{encode_mutation_zone_sign, mutation_zone_sign_tag};
-            use tx_observe::{EventNameId, TxTraceLevel};
-            use tx_observe_types::PayloadMutationZoneSign;
-
             let object_id = cap.trace_id();
             let kind_byte = (object_id >> 56) as u8;
-            let p = PayloadMutationZoneSign {
-                object_id,
-                kind: kind_byte,
-                _pad: [0u8; 7],
-            };
-            let (payload_bytes, _) = encode_mutation_zone_sign(&p);
-            em.instant(
-                TxTraceLevel::Mutation,
-                EventNameId::from_raw(0x4d5a5347u32), // "MZSG" — mutation.zone_sign
-                tx_observe::SpanId::NONE,
-                mutation_zone_sign_tag(),
-                &payload_bytes,
-            );
+            em.mutation_zone_sign(object_id, kind_byte);
         }
     }
 

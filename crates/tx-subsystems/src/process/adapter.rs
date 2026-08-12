@@ -85,7 +85,7 @@ pub mod wait_routing {
     {
         source.notify_with_owner_post(
             tx_substrate::step::InterestMask::new(mask_bits),
-            MailboxSchedulerHint::Normal,
+            MailboxSchedulerHint::LifecycleWake,
             |mailbox, event, _hint| post(mailbox, event),
         )
     }

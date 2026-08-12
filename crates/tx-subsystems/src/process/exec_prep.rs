@@ -277,25 +277,6 @@ impl ProcessExecPrep {
                 crate::process::structure::decr_pipe_fd_ref(file);
             }
         }
-        // Preserve final-smp's unified detached-file protocol without giving
-        // up main's transactional pre-PoNR plan. All descriptor counts are
-        // decremented first; only then may writeback or socket FIN/EOF become
-        // visible. The finalizer deduplicates shared OpenFile descriptions.
-        let guard = crate::process::adapter::step_engine::borrow_current_guard()
-            .unwrap_or_else(crate::process::adapter::step_engine::guard);
-        for (index, entry) in plan.entries.iter().enumerate() {
-            let Some(file) = entry.expected_file.as_ref() else {
-                continue;
-            };
-            if plan.entries[..index]
-                .iter()
-                .filter_map(|earlier| earlier.expected_file.as_ref())
-                .any(|earlier| earlier.raw() == file.raw())
-            {
-                continue;
-            }
-            let _ = super::execution::finalize_detached_open_file_without_retry(file, &guard);
-        }
         Ok(previous)
     }
 

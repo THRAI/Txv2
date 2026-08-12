@@ -19,7 +19,7 @@ static RECLAIM_SLOT_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct Slot<T: 'static> {
     /// Packed lifecycle word for this slot.
     pub(crate) meta: SlotMeta,
-    /// Object storage. Initialized only in Reserved/Live/Dead/Retiring states.
+    /// Object storage. Initialized only in Reserved/Live/Retiring states.
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
@@ -64,7 +64,7 @@ impl<T: 'static> Slot<T> {
     }
 }
 
-pub(crate) unsafe fn reclaim_slot<T: 'static>(ptr: *mut u8) {
+pub(crate) unsafe fn reclaim_slot<T: 'static>(slot: NonNull<Slot<T>>) {
     let trace_seq = reclaim_slot_trace_sample();
     if let Some(seq) = trace_seq {
         emit_reclaim_slot_trace(b"debug.zone.reclaim_slot.begin", seq);
@@ -74,31 +74,27 @@ pub(crate) unsafe fn reclaim_slot<T: 'static>(ptr: *mut u8) {
             core::mem::size_of::<T>() as i64,
         );
     }
-    let slot = ptr as *mut Slot<T>;
     unsafe {
         // EBR has proven that no guard-scoped IdentRef can still dereference
         // this object, so it is now safe to run T's destructor.
-        ptr::drop_in_place((*slot).data_ptr());
+        ptr::drop_in_place(slot.as_ref().data_ptr());
 
         loop {
-            let cur = (*slot).meta().load(Ordering::Acquire);
+            let cur = slot.as_ref().meta().load(Ordering::Acquire);
             debug_assert_eq!(cur.state(), SlotState::Retiring);
-            debug_assert_eq!(cur.retain(), 0);
 
-            let new = cur
-                .inc_generation()
-                .with_retain(0)
-                .with_state(SlotState::Free);
-            if (*slot)
+            let new = cur.next_free_generation();
+            if slot
+                .as_ref()
                 .meta()
                 .compare_exchange(cur, new, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                let slot = NonNull::new_unchecked(slot);
-                let slab = ZoneSlab::from_slot(slot);
-                // Return only the slot here. Whole-slab retirement is skipped
-                // inside EBR callbacks to avoid nested EBR enqueue paths.
-                slab.as_ref().zone().return_slot_from_reclaim(slot);
+                if !new.generation_exhausted() {
+                    let slab = ZoneSlab::from_slot(slot);
+                    // Whole-slab retirement is skipped inside EBR callbacks.
+                    slab.as_ref().zone().return_slot_from_reclaim(slot);
+                }
                 break;
             }
         }
@@ -115,9 +111,6 @@ fn reclaim_slot_trace_sample() -> Option<i64> {
 
 fn emit_reclaim_slot_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }

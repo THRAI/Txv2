@@ -29,9 +29,9 @@ fn pick_id_and_slice(
     scheduler: &mut Phase1Scheduler,
     hart: HartId,
 ) -> Option<(TaskId, SliceConfig)> {
-    scheduler
-        .pick_next(hart)
-        .map(|(handle, slice)| (handle.id(), slice))
+    let (handle, slice) = scheduler.pick_next(hart)?;
+    assert!(scheduler.mark_dispatching_polling(handle.id(), hart));
+    Some((handle.id(), slice))
 }
 
 #[test]
@@ -203,6 +203,34 @@ fn submitted_movable_fair_tasks_spread_across_allowed_harts() {
 }
 
 #[test]
+fn spread_on_submit_rotates_when_queues_are_consumed_between_submits() {
+    let mut scheduler = Phase1Scheduler::new();
+
+    for (index, hart) in [HartId(0), HartId(1), HartId(2), HartId(3)]
+        .into_iter()
+        .enumerate()
+    {
+        let task = TaskId(230 + index);
+        scheduler.task_submitted(
+            task,
+            TaskHandle::new(task),
+            InitialSchedMeta::fair()
+                .with_affinity(0b1111)
+                .pinned()
+                .spread_on_submit()
+                .userspace_thread(),
+        );
+
+        assert_eq!(scheduler.queue_depths(hart).new, 1);
+        assert_eq!(scheduler.task_affinity(task), Some(1u64 << hart.0));
+        assert_eq!(
+            pick_id_and_slice(&mut scheduler, hart).map(|x| x.0),
+            Some(task)
+        );
+    }
+}
+
+#[test]
 fn pinned_spread_on_submit_uses_initial_spread_without_enabling_steal() {
     let mut scheduler = Phase1Scheduler::new();
     let first = TaskId(240);
@@ -221,6 +249,8 @@ fn pinned_spread_on_submit_uses_initial_spread_without_enabling_steal() {
         assert!(!scheduler.can_migrate(task));
     }
 
+    assert_eq!(scheduler.task_affinity(first), Some(0b0001));
+    assert_eq!(scheduler.task_affinity(second), Some(0b0010));
     assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
     assert_eq!(scheduler.queue_depths(HartId(1)).new, 1);
     assert_eq!(
@@ -1286,8 +1316,8 @@ fn idle_steal_prefers_busiest_preempted_victim() {
         scheduler
             .try_steal_from_any(HartId(0))
             .map(|handle| handle.id()),
-        Some(busy_second),
-        "idle steal should choose the hart with the deepest preempted queue",
+        Some(busy_first),
+        "idle steal should choose the deepest victim hart and take its preempted front",
     );
     assert_eq!(scheduler.queue_depths(HartId(1)).preempted, 1);
     assert_eq!(scheduler.queue_depths(HartId(2)).preempted, 1);
@@ -1295,28 +1325,19 @@ fn idle_steal_prefers_busiest_preempted_victim() {
 }
 
 #[test]
-fn work_stealing_can_take_new_queue_but_respects_affinity() {
+fn work_stealing_only_takes_preempted_front_and_respects_affinity() {
     let mut scheduler = Phase1Scheduler::new();
-    let new_task = submit_fair_affinity(&mut scheduler, 41, 0b0011);
     let restricted_task = submit_fair_affinity(&mut scheduler, 42, 0b0001);
+    let allowed_task = submit_fair_affinity(&mut scheduler, 41, 0b0011);
 
     assert_eq!(
         scheduler.try_steal(HartId(1), HartId(0)).map(|h| h.id()),
-        Some(new_task)
+        None,
+        "direct steal must not take tasks from the New queue",
     );
-    assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
-    assert_eq!(scheduler.queue_depths(HartId(1)).new, 1);
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 2);
+    assert_eq!(scheduler.queue_depths(HartId(1)).new, 0);
 
-    assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
-        Some(new_task)
-    );
-    scheduler.task_stopped(
-        new_task,
-        StopReason::SliceExpired,
-        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
-        HartId(1),
-    );
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
         Some(restricted_task)
@@ -1327,12 +1348,26 @@ fn work_stealing_can_take_new_queue_but_respects_affinity() {
         Phase1Scheduler::NEW_QUEUE_SLICE_NS,
         HartId(0),
     );
-
-    assert_eq!(scheduler.try_steal(HartId(1), HartId(0)), None);
     assert_eq!(
-        scheduler.task_owner(new_task),
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(allowed_task)
+    );
+    scheduler.task_stopped(
+        allowed_task,
+        StopReason::SliceExpired,
+        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        HartId(0),
+    );
+
+    assert_eq!(
+        scheduler.try_steal(HartId(1), HartId(0)),
+        None,
+        "direct steal must not bypass an ineligible preempted front task",
+    );
+    assert_eq!(
+        scheduler.task_owner(allowed_task),
         Some(TaskRunOwner::Queued {
-            hart: HartId(1),
+            hart: HartId(0),
             queue: Phase1QueueKind::Preempted,
         })
     );
@@ -1440,7 +1475,7 @@ fn rebalance_waits_for_period_and_moves_one_preempted_task() {
         .rebalance_at(HartId(1), Phase1Scheduler::BALANCE_PERIOD_NS)
         .expect("rebalance should steal one task")
         .id();
-    assert_eq!(stolen, third);
+    assert_eq!(stolen, first);
     assert_eq!(scheduler.stats().work_steals, 1);
     assert_eq!(scheduler.stats().rebalance_moves, 1);
     assert_eq!(scheduler.queue_depths(HartId(0)).preempted, 2);
@@ -1482,7 +1517,7 @@ fn rebalance_respects_minimum_imbalance() {
     );
     assert_eq!(
         scheduler.try_steal(HartId(1), HartId(0)).map(|h| h.id()),
-        Some(second)
+        Some(first)
     );
 
     assert_eq!(

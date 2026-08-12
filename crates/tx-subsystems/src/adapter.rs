@@ -32,8 +32,10 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::registry_summary as wake_registry_summary;
     pub use tx_substrate::zone::{
-        self as zone, register_zone_for, reserve_for, sign, sign_for, Cap, Dead, Entity, IdentRef,
+        freeze_for_shutdown, is_initialized, maintenance_tick, register_zone_for,
+        registered_zone_count, reserve_for, sign, sign_for, snapshot, Cap, Dead, Entity, IdentRef,
         OperationalCapExt, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError, ZoneInfo,
+        ZoneMaintenanceBudget, ZoneMaintenanceStats,
     };
 }
 

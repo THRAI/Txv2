@@ -122,7 +122,6 @@ impl PmapIf for StubPmap {
 
 impl EntropyIf for StubPmap {}
 impl tx_hal::AuxvIf for StubPmap {}
-impl tx_hal::CacheIf for StubPmap {}
 impl tx_hal::ConsoleIf for StubPmap {
     fn write_bytes(_bytes: &[u8]) {}
 }
@@ -400,6 +399,7 @@ fn push_fault(ctx: &SyscallCtx<'_>, fd: u32, fault_addr: u64) {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         alloc::sync::Weak::new(),
+        None,
     );
     let token_id = guard.id();
     // Detach the guard so it doesn't fire CancelOnDrop on the slot.

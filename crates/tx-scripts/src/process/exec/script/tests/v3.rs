@@ -256,7 +256,7 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
         let container = match inner.inodes.get(&fs_object_id) {
             Some(ExecTestInode::Regular { container, .. }) => container.clone(),
             Some(ExecTestInode::RegularNonPageBacked { .. }) => {
-                return V3Outcome::err(Errno::ENODEV.into())
+                return V3Outcome::err(Errno::ENODEV.into());
             }
             Some(ExecTestInode::Directory) => return V3Outcome::err(Errno::EISDIR.into()),
             Some(ExecTestInode::Symlink { .. }) => return V3Outcome::err(Errno::EINVAL.into()),

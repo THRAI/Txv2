@@ -29,14 +29,7 @@ run_lane() {
   local img="$OUTDIR/sd-$TAG-$lane.img"
   local log="$OUTDIR/$TAG-$lane.log"
   local cmdline="tx.boot.mode=ltp tx.oscomp.groups=ltp-runtest:${MODULE:-syscalls}:$FILES${EXTRA_CMDLINE:+ $EXTRA_CMDLINE}"
-  local source_img="target/oscomp/testdata/sdcard-${arch}.img"
-  if [ "$arch" = rv ] && [ -n "${LTP_BIN_RV_IMAGE:-}" ]; then
-    source_img="$LTP_BIN_RV_IMAGE"
-  elif [ "$arch" = la ] && [ -n "${LTP_BIN_LA_IMAGE:-}" ]; then
-    source_img="$LTP_BIN_LA_IMAGE"
-  fi
-  printf 'source image: %s\n' "$source_img" > "$OUTDIR/$TAG-$lane.meta"
-  cp "$source_img" "$img" || return 1
+  cp "target/oscomp/testdata/sdcard-${arch}.img" "$img" || return 1
   if [ "$arch" = rv ]; then
     ( timeout -s KILL "$TMO" qemu-system-riscv64 -machine virt \
       -kernel "${KERNEL_DIR:-target/oscomp/submit}/kernel-rv" \

@@ -116,25 +116,23 @@ fn source_function_body<'a>(src: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn thread_exit_repairs_userspace_before_zombie_and_process_teardown() {
-    let body = source_function_body(include_str!("execution.rs"), "fn step_thread_exit_inner");
-    let cleanup = body
-        .find("notify_thread_exit_userspace_in_aspace")
-        .expect("userspace-visible thread cleanup present");
-    let zombify = body
-        .find("set_thread_zombie(&thread")
-        .expect("thread zombify present");
-    let process_exit = body
-        .find("step_process_exit(&parent")
-        .expect("last-thread process teardown present");
+fn robust_list_walk_drops_process_payload_guard_before_user_memory_walk() {
+    let body = source_function_body(include_str!("execution.rs"), "fn walk_robust_list");
+    let aspace_snapshot = body
+        .find("let aspace = payload.aspace_cap();")
+        .expect("aspace snapshot present");
+    let guard_drop = body[aspace_snapshot..]
+        .find("drop(proc_guard);")
+        .map(|idx| aspace_snapshot + idx)
+        .expect("process payload guard is explicitly dropped");
+    let first_user_read = body[aspace_snapshot..]
+        .find("read_user_")
+        .map(|idx| aspace_snapshot + idx)
+        .expect("robust walk reads userspace");
 
     assert!(
-        cleanup < zombify,
-        "clear_child_tid/robust repair precedes zombify"
-    );
-    assert!(
-        cleanup < process_exit,
-        "userspace repair precedes address-space teardown"
+        guard_drop < first_user_read,
+        "robust-list userspace reads must happen after dropping process.payload guard"
     );
 }
 

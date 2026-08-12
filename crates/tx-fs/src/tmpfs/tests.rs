@@ -1584,7 +1584,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     match rnode.backing() {
         RNodeBacking::PageBacked { pc } => {
             // Sanity: the container's `page_count` matches tmpfs's
-            // static cap (`TMPFS_FILE_PAGE_CAP`). `size_bytes`
+            // static cap (`TMPFS_FILE_PAGE_CAP = 2048`). `size_bytes`
             // initialises to `page_count * USER_PAGE_SIZE` (the
             // PageContainer's capacity); inode-visible size lives on
             // `InodeMeta::size`, not the container, so we don't pin
@@ -1593,11 +1593,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
             // RNode means writes via `FsPageBacking` and reads via
             // `OpenFile::step_read` / `read_exact_at` see the same
             // underlying pages.
-            assert_eq!(
-                pc.page_count(),
-                crate::tmpfs::TMPFS_FILE_PAGE_CAP,
-                "tmpfs file page-cap shape"
-            );
+            assert_eq!(pc.page_count(), 2048, "tmpfs file page-cap shape");
         }
         other => panic!("expected PageBacked backing for regular file, got {other:?}"),
     }

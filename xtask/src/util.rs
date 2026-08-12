@@ -283,6 +283,17 @@ pub(crate) fn command_exists(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn command_or_candidates(program: &str, candidates: &[&str]) -> Option<String> {
+    if command_exists(program) {
+        return Some(program.to_string());
+    }
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| command_exists(candidate))
+        .map(str::to_string)
+}
+
 pub(crate) fn collect_files(root: &Path, extensions: &[&str]) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     collect_files_inner(root, root, extensions, &mut out)?;
@@ -330,6 +341,27 @@ pub(crate) fn shell_join(args: &[String]) -> String {
         .map(|arg| shell_escape(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_tty_winsize_cmdline, parse_stty_size};
+
+    #[test]
+    fn parse_stty_size_accepts_positive_rows_and_cols() {
+        assert_eq!(parse_stty_size("33 101\n"), Some((33, 101)));
+        assert_eq!(parse_stty_size("0 101\n"), None);
+        assert_eq!(parse_stty_size("33\n"), None);
+        assert_eq!(parse_stty_size("33 101 extra\n"), None);
+    }
+
+    #[test]
+    fn append_tty_winsize_cmdline_adds_kernel_tokens() {
+        let rendered = append_tty_winsize_cmdline("tx.profile=alpine console=ttyS0");
+        assert!(rendered.starts_with("tx.profile=alpine console=ttyS0 "));
+        assert!(rendered.contains("tx.tty.rows="));
+        assert!(rendered.contains("tx.tty.cols="));
+    }
 }
 
 pub(crate) fn shell_escape(value: &str) -> String {

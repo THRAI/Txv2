@@ -6,12 +6,11 @@ use tx_hal::{
 };
 
 use crate::{
-    asid_residency_mask, asid_tlb_hart_mask, begin_asid_switch_on_current_cpu,
-    clear_asid_residency, deactivate_current_user_pmap, dispatch_trap_frame, enter_irq_context,
-    finish_asid_switch_on_current_cpu, for_each_console_byte_for_sbi, limit_cpus,
-    mark_asid_resident_on_current_cpu, mark_ipi_ack, percpu_tls_for_cpu, remote_ipi_targets_from,
-    remote_sfence_targets_for_asid_from, remote_sfence_targets_from, trap::classify_rv64_trap,
-    Platform, Rv64TrapFrame, MAX_BOOT_CPUS, RV64_PERCPU_AREAS,
+    asid_residency_mask, clear_asid_residency, clear_current_asid_residency, dispatch_trap_frame,
+    enter_irq_context, for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu,
+    mark_ipi_ack, percpu_tls_for_cpu, remote_sfence_targets_for_asid_from,
+    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
+    RV64_PERCPU_AREAS,
 };
 
 static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -49,12 +48,12 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         TrapAction::Reschedule
     }
 
-    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId) -> TrapAction {
         assert!(<Platform as IrqIf>::in_irq_context());
         TrapAction::Resume
     }
 
-    fn on_ipi(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_ipi(_cpu: CpuId) -> TrapAction {
         assert!(<Platform as IrqIf>::in_irq_context());
         TrapAction::Resume
     }
@@ -200,33 +199,14 @@ fn percpu_install_sets_kernel_tls_pointer_and_current_cpu() {
     let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
     let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
 
-    <Platform as PercpuIf>::install_early_percpu(CpuId(7));
+    <Platform as PercpuIf>::install_early_percpu(CpuId(2));
 
     let kernel_tls = <Platform as PercpuIf>::read_kernel_tls() as usize;
-    assert_eq!(MAX_BOOT_CPUS, 8);
-    assert_eq!(RV64_PERCPU_AREAS.len(), 8);
-    assert_eq!(Some(kernel_tls), percpu_tls_for_cpu(CpuId(7)));
-    assert_eq!(<Platform as PercpuIf>::current_cpu_id(), CpuId(7));
-    assert_eq!(<Platform as SmpIf>::current_cpu_id(), CpuId(7));
+    assert_eq!(Some(kernel_tls), percpu_tls_for_cpu(CpuId(2)));
+    assert_eq!(<Platform as PercpuIf>::current_cpu_id(), CpuId(2));
+    assert_eq!(<Platform as SmpIf>::current_cpu_id(), CpuId(2));
 
     <Platform as PercpuIf>::write_kernel_tls(saved_tls);
-}
-
-#[test]
-fn cpu_limit_keeps_boot_hart_and_caps_discovered_topology() {
-    let discovered = CpuMask::first(8);
-    assert_eq!(
-        limit_cpus(discovered, 1, CpuId(3)),
-        CpuMask::single(CpuId(3))
-    );
-    assert_eq!(limit_cpus(discovered, 4, CpuId(3)).count(), 4);
-    assert!(limit_cpus(discovered, 4, CpuId(3)).contains(CpuId(3)));
-
-    let sparse = CpuMask::from_bits((1 << 1) | (1 << 4) | (1 << 7));
-    assert_eq!(
-        limit_cpus(sparse, 2, CpuId(4)),
-        CpuMask::from_bits((1 << 1) | (1 << 4))
-    );
 }
 
 #[test]
@@ -399,6 +379,23 @@ fn qemu_mmio_regions_include_goldfish_rtc() {
     assert_eq!(rtc.phys.size, 0x1000);
     assert_eq!(rtc.virt.start, VirtAddr(0xffff_ffc0_0010_1000));
     assert_eq!(rtc.virt.size, 0x1000);
+}
+
+#[test]
+fn qemu_mmio_regions_include_three_virtio_block_slots() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    let regions = crate::boot_static::qemu_mmio_regions();
+    for (idx, name) in ["virtio0", "virtio1", "virtio2"].iter().enumerate() {
+        let region = regions
+            .iter()
+            .find(|region| region.name == *name)
+            .expect("virtio mmio region");
+        let offset = idx as usize * 0x1000;
+        assert_eq!(region.phys.start, PhysAddr(0x1000_1000 + offset));
+        assert_eq!(region.virt.start, VirtAddr(0xffff_ffc0_1000_1000 + offset));
+        assert_eq!(region.phys.size, 0x1000);
+        assert_eq!(region.virt.size, 0x1000);
+    }
 }
 
 #[test]
@@ -877,16 +874,7 @@ fn remote_sfence_targets_are_empty_for_uniprocessor_online_mask() {
 }
 
 #[test]
-fn remote_ipi_targets_exclude_current_hart() {
-    assert_eq!(
-        remote_ipi_targets_from(CpuMask::from_bits(0b1111), CpuId(2)).bits(),
-        0b1011
-    );
-    assert!(remote_ipi_targets_from(CpuMask::single(CpuId(0)), CpuId(0)).is_empty());
-}
-
-#[test]
-fn remote_sfence_targets_include_harts_with_stale_asid_tlb_history() {
+fn remote_sfence_targets_are_limited_to_asid_residency() {
     let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let asid = tx_hal::Asid(9);
     clear_asid_residency(asid);
@@ -900,62 +888,8 @@ fn remote_sfence_targets_include_harts_with_stale_asid_tlb_history() {
 
     assert_eq!(targets.bits(), 0b1000);
     assert_eq!(asid_residency_mask(asid).bits(), 0b1010);
-    deactivate_current_user_pmap();
-    assert_eq!(
-        asid_tlb_hart_mask(asid).bits(),
-        0b1010,
-        "switching away must retain the ASID TLB-history bit"
-    );
-    assert_eq!(
-        remote_sfence_targets_for_asid_from(asid, CpuMask::from_bits(0b1111), CpuId(0)).bits(),
-        0b1010,
-        "later invalidation must still reach every hart that ran the ASID"
-    );
+    clear_current_asid_residency();
     clear_asid_residency(asid);
-}
-
-#[test]
-fn asid_switch_retains_old_residency_until_hardware_transition_finishes() {
-    let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let old = tx_hal::Asid(10);
-    let new = tx_hal::Asid(11);
-    let cpu = CpuId(2);
-    clear_asid_residency(old);
-    clear_asid_residency(new);
-
-    <Platform as PercpuIf>::install_early_percpu(cpu);
-    mark_asid_resident_on_current_cpu(old);
-    let switch = begin_asid_switch_on_current_cpu(new);
-
-    assert_eq!(asid_residency_mask(old).bits(), CpuMask::single(cpu).bits());
-    assert_eq!(asid_residency_mask(new).bits(), CpuMask::single(cpu).bits());
-    assert_eq!(
-        RV64_PERCPU_AREAS[cpu.0]
-            .active_user_asid
-            .load(core::sync::atomic::Ordering::Acquire),
-        old.0 as usize,
-        "software active root must remain old until satp changes"
-    );
-
-    finish_asid_switch_on_current_cpu(switch);
-
-    assert!(asid_residency_mask(old).is_empty());
-    assert_eq!(asid_residency_mask(new).bits(), CpuMask::single(cpu).bits());
-    assert_eq!(
-        asid_tlb_hart_mask(old).bits(),
-        CpuMask::single(cpu).bits(),
-        "old tagged translations may survive the context switch"
-    );
-    assert_eq!(
-        RV64_PERCPU_AREAS[cpu.0]
-            .active_user_asid
-            .load(core::sync::atomic::Ordering::Acquire),
-        new.0 as usize
-    );
-
-    deactivate_current_user_pmap();
-    clear_asid_residency(old);
-    clear_asid_residency(new);
 }
 
 #[test]
@@ -980,7 +914,7 @@ fn ipi_ack_observation_can_be_cleared_by_mask() {
 
 #[test]
 #[cfg(not(target_arch = "riscv64"))]
-fn broadcast_excludes_self_and_keeps_kind_state_isolated() {
+fn broadcast_self_and_remote_runs_local_membarrier_and_isolates_kind_state() {
     let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
     let current = CpuId(0);
@@ -990,6 +924,7 @@ fn broadcast_excludes_self_and_keeps_kind_state_isolated() {
 
     super::reset_ipi_software_state();
     super::TEST_IPI_TRANSPORT_MASK.store(0, std::sync::atomic::Ordering::Release);
+    super::TEST_LOCAL_MEMBARRIER_ACTIONS.store(0, std::sync::atomic::Ordering::Release);
     <Platform as PercpuIf>::install_early_percpu(current);
 
     <Platform as SmpIf>::broadcast_ipi(targets, IpiKind::Membarrier);
@@ -999,8 +934,12 @@ fn broadcast_excludes_self_and_keeps_kind_state_isolated() {
         CpuMask::single(remote).bits()
     );
     assert_eq!(
+        super::TEST_LOCAL_MEMBARRIER_ACTIONS.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Membarrier),
-        CpuMask::EMPTY
+        CpuMask::single(current)
     );
     assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
@@ -1014,20 +953,21 @@ fn broadcast_excludes_self_and_keeps_kind_state_isolated() {
     <Platform as SmpIf>::ack_ipi(IpiKind::Membarrier);
     assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Membarrier),
-        CpuMask::single(remote)
+        targets
     );
 
     super::reset_ipi_software_state();
     super::TEST_IPI_TRANSPORT_MASK.store(0, std::sync::atomic::Ordering::Release);
+    super::TEST_LOCAL_MEMBARRIER_ACTIONS.store(0, std::sync::atomic::Ordering::Release);
     <Platform as PercpuIf>::install_early_percpu(current);
     <Platform as SmpIf>::broadcast_ipi(targets, IpiKind::Maintenance);
     assert_eq!(
-        super::TEST_IPI_TRANSPORT_MASK.load(std::sync::atomic::Ordering::Acquire),
-        CpuMask::single(remote).bits()
+        super::TEST_LOCAL_MEMBARRIER_ACTIONS.load(std::sync::atomic::Ordering::Acquire),
+        0
     );
     assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
-        CpuMask::EMPTY
+        CpuMask::single(current)
     );
     assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Membarrier),
@@ -1039,7 +979,7 @@ fn broadcast_excludes_self_and_keeps_kind_state_isolated() {
     <Platform as SmpIf>::ack_ipi(IpiKind::Maintenance);
     assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
-        CpuMask::single(remote)
+        targets
     );
 
     super::reset_ipi_software_state();

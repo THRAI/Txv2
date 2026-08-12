@@ -132,6 +132,124 @@ fn late_interesting_trap_overrides_timer_preemption() {
 }
 
 #[test]
+fn running_trap_completion_rejects_pending_entry_token() {
+    let slot = UserspaceRunSlot::new();
+    let wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+
+    assert_eq!(
+        slot.complete_running_trap(request, syscall_trap(7)),
+        Err(UserspaceRunError::NotRunning(request)),
+        "trap-shell handoff must not resolve an entry token before userspace dispatch",
+    );
+    assert_eq!(
+        slot.status().expect("request remains active").phase,
+        UserspaceRunPhase::Pending,
+    );
+}
+
+#[test]
+fn running_trap_completion_accepts_dispatched_userspace() {
+    let slot = UserspaceRunSlot::new();
+    let mut wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+
+    slot.dispatch(request).expect("dispatch userspace");
+    let trap = syscall_trap(8);
+    let resolved = slot
+        .complete_running_trap(request, trap)
+        .expect("running trap resolves dispatched userspace");
+
+    assert_eq!(resolved.phase, UserspaceRunPhase::Resolved);
+    assert_eq!(resolved.trap, Some(trap));
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+}
+
+#[test]
+fn running_trap_completion_can_replace_timer_preempt_placeholder() {
+    let slot = UserspaceRunSlot::new();
+    let mut wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+
+    slot.dispatch(request).expect("dispatch userspace");
+    slot.record_timer_preemption(request)
+        .expect("timer preempt placeholder");
+    let trap = fatal_trap(99);
+    let resolved = slot
+        .complete_running_trap(request, trap)
+        .expect("late real trap overrides timer preempt placeholder");
+
+    assert_eq!(resolved.phase, UserspaceRunPhase::Resolved);
+    assert_eq!(resolved.trap, Some(trap));
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+}
+
+#[test]
+fn running_trap_completion_rejects_stale_request_against_current_request() {
+    let slot = UserspaceRunSlot::new();
+    let first = slot.start_request().expect("start first request");
+    let first_request = first.request();
+    drop(first);
+
+    let mut second = slot.start_request().expect("start second request");
+    let second_request = second.request();
+    assert_ne!(first_request, second_request);
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(Pin::new(&mut second).poll(&mut cx), Poll::Pending);
+    slot.dispatch(second_request)
+        .expect("dispatch current userspace request");
+
+    assert_eq!(
+        slot.complete_running_trap(first_request, syscall_trap(9)),
+        Err(UserspaceRunError::StaleRequest {
+            attempted: first_request,
+            active: second_request,
+        }),
+        "trap-shell handoff must not resolve a newer userspace run with an old token",
+    );
+    assert_eq!(
+        slot.status().expect("second request still active").request,
+        second_request,
+    );
+    assert_eq!(wakes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn running_trap_completion_rejects_second_non_timer_resolution() {
+    let slot = UserspaceRunSlot::new();
+    let mut wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+
+    slot.dispatch(request).expect("dispatch userspace");
+    let first = syscall_trap(10);
+    slot.complete_running_trap(request, first)
+        .expect("first running trap resolves");
+
+    assert_eq!(
+        slot.complete_running_trap(request, fatal_trap(11)),
+        Err(UserspaceRunError::AlreadyResolved(request)),
+        "only a timer-preempt placeholder may be replaced by a later real trap",
+    );
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(first));
+}
+
+#[test]
 fn double_completion_is_rejected() {
     let slot = UserspaceRunSlot::new();
     let wait = slot.start_request().expect("start userspace wait");

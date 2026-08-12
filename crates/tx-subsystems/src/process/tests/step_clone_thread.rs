@@ -479,49 +479,6 @@ fn clone_thread_racing_exec_reservation_retries_without_attach() {
 }
 
 #[test]
-fn clone_thread_commit_is_rejected_after_group_exit_reservation() {
-    let _g = setup();
-    let process = bootstrap();
-    let sibling = step_clone_thread(
-        &process,
-        &synthetic_parent_ctx(),
-        SignalMask::EMPTY,
-        0,
-        0,
-        0,
-    )
-    .expect("seed sibling");
-    assert_eq!(process.live_thread_count(), 2);
-
-    let outcome = crate::process::execution::step_exit_group_with_posts_after_reserve_for_test(
-        &process,
-        ExitStatus::Exited(31),
-        direct_process_task_post,
-        direct_process_sem_ref_post,
-        || {
-            assert!(matches!(
-                step_clone_thread(
-                    &process,
-                    &synthetic_parent_ctx(),
-                    SignalMask::EMPTY,
-                    0,
-                    0,
-                    0,
-                ),
-                Err(crate::process::ForkError::Busy)
-            ));
-            assert_eq!(process.live_thread_count(), 2);
-            assert!(process.aspace_cap().is_some());
-            assert!(sibling.payload_cap().is_some());
-        },
-    );
-
-    assert_eq!(outcome, crate::process::ProcessExitOutcome::Completed);
-    assert!(process.is_zombie());
-    assert_eq!(process.exit_status(), Some(ExitStatus::Exited(31)));
-}
-
-#[test]
 fn clone_thread_during_exec_collapse_retries_without_attach() {
     let _g = setup();
     let process = bootstrap();

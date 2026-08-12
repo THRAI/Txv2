@@ -46,9 +46,11 @@ fn install_kernel_object_fd(ctx: &SyscallCtx<'_>, object: KernelObjectFile) -> S
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let Some(fd) = ctx.process.install_new_fd(open_file, false) else {
-        return SyscallResult::Error(EMFILE_VALUE);
+    let fd = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(err) => return err,
     };
+    let _ = ctx.process.install_fd(fd, open_file);
     SyscallResult::Return(fd as i64)
 }
 

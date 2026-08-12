@@ -67,11 +67,9 @@ fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
 
     let report = check_schema_text(
         &schema,
-        SchemaRustSources {
-            record_rs: &record_rs,
-            payload_rs: &payload_rs,
-            types_lib_rs: &types_lib_rs,
-        },
+        &record_rs,
+        &payload_rs,
+        &types_lib_rs,
         &cargo_toml,
         &analyzer_py,
         &perfetto_writer,
@@ -351,15 +349,11 @@ struct CheckReport {
     hart_emitter_methods: usize,
 }
 
-struct SchemaRustSources<'a> {
-    record_rs: &'a str,
-    payload_rs: &'a str,
-    types_lib_rs: &'a str,
-}
-
 fn check_schema_text(
     schema: &str,
-    rust_sources: SchemaRustSources<'_>,
+    record_rs: &str,
+    payload_rs: &str,
+    types_lib_rs: &str,
     cargo_toml: &str,
     analyzer_py: &str,
     perfetto_writer: &str,
@@ -398,14 +392,14 @@ fn check_schema_text(
         .map(|entry| entry.name.clone())
         .collect();
 
-    let levels = parse_rust_enum_discriminants(rust_sources.record_rs, "TxTraceLevel")?;
-    let record_kinds = parse_rust_enum_discriminants(rust_sources.record_rs, "TxTraceKind")?;
-    let payloads = parse_rust_enum_discriminants(rust_sources.payload_rs, "TxPayloadTag")?;
-    let payload_structs = parse_payload_struct_fields(rust_sources.payload_rs)?;
-    let payload_sizes = parse_payload_size_assertions(rust_sources.types_lib_rs)?;
+    let levels = parse_rust_enum_discriminants(record_rs, "TxTraceLevel")?;
+    let record_kinds = parse_rust_enum_discriminants(record_rs, "TxTraceKind")?;
+    let payloads = parse_rust_enum_discriminants(payload_rs, "TxPayloadTag")?;
+    let payload_structs = parse_payload_struct_fields(payload_rs)?;
+    let payload_sizes = parse_payload_size_assertions(types_lib_rs)?;
     let cfgs = parse_workspace_cfgs(cargo_toml)?;
     let schema_projections = projection_schemas_from_schema(&schema.host.projections)?;
-    let track_consts = parse_explicit_track_consts(rust_sources.payload_rs)?;
+    let track_consts = parse_explicit_track_consts(payload_rs)?;
     let writer_track_names = parse_explicit_track_names(perfetto_writer)?;
     let hart_emitter_methods = parse_hart_emitter_public_methods(tx_observe_lib_rs)?;
     check_event_family_refs(&schema)?;
@@ -491,7 +485,7 @@ fn parse_payload_struct_fields(text: &str) -> Result<BTreeMap<String, Vec<Payloa
     while let Some(idx) = rest.find("pub struct Payload") {
         rest = &rest[idx + "pub struct ".len()..];
         let name_end = rest
-            .find([' ', '{'])
+            .find(|ch: char| ch == ' ' || ch == '{')
             .ok_or("unterminated payload struct name")?;
         let name = rest[..name_end].to_string();
         let open = rest[name_end..]
@@ -1639,11 +1633,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tx_lock_metrics)'] }
         assert_eq!(
             check_schema_text(
                 schema,
-                SchemaRustSources {
-                    record_rs,
-                    payload_rs,
-                    types_lib_rs: minimal_types_lib_rs(),
-                },
+                record_rs,
+                payload_rs,
+                minimal_types_lib_rs(),
                 cargo_toml,
                 analyzer_py,
                 minimal_perfetto_writer(),
@@ -1702,11 +1694,9 @@ pub enum TxTraceLevel { Boundary = 0 }
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -1760,11 +1750,9 @@ ANALYZER_DECODER_VERSION = "test"
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -1835,11 +1823,9 @@ RECORD_SQL_SCHEMA = []
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -1904,11 +1890,9 @@ def run_python_projection():
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -1975,11 +1959,9 @@ def build_derived_tables():
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -2037,11 +2019,9 @@ pub enum TxTraceLevel { Boundary = 0 }
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -2103,11 +2083,9 @@ pub enum TxTraceLevel { Boundary = 0 }
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -2171,11 +2149,9 @@ pub struct PayloadCounterValue {
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs,
-            },
+            record_rs,
+            payload_rs,
+            types_lib_rs,
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
@@ -2249,11 +2225,9 @@ fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> {
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             perfetto_writer,
@@ -2320,11 +2294,9 @@ impl HartEmitter {
 
         let err = check_schema_text(
             schema,
-            SchemaRustSources {
-                record_rs,
-                payload_rs,
-                types_lib_rs: minimal_types_lib_rs(),
-            },
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),

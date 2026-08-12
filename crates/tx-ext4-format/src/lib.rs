@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod capability;
 pub mod journal;
 mod journal_replay;
 pub mod mapping;
@@ -9,7 +10,10 @@ pub mod mutation;
 pub mod ondisk;
 pub mod pager;
 
-pub use journal_replay::{clean_replayed_journal, replay_journal, JournalReplayReport};
+pub use journal_replay::{
+    clean_replayed_journal, recover_if_required, replay_journal, JournalReplayReport,
+    RecoveryReport,
+};
 
 pub type Result<T> = core::result::Result<T, Ext4FormatError>;
 
@@ -20,18 +24,5 @@ pub enum Ext4FormatError {
     OutOfBounds,
     Truncated,
     Unsupported,
-    /// The extent tree cannot grow any deeper while inserting a new
-    /// logical-to-physical mapping.  Keep the insertion context in the
-    /// error so callers and tests do not have to infer an opaque ENOSYS.
-    ExtentTreeFull {
-        inode: u32,
-        logical_block: u32,
-        depth: u16,
-        entries: u16,
-    },
     WouldBlock,
-    NotEmpty,
-    IsDirectory,
-    NotDirectory,
-    InvalidInput,
 }

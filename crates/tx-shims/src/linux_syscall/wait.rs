@@ -1,10 +1,11 @@
 //! Syscall-side wait-source parking.
 //!
-//! Blocking syscall arms converge here.  The semantic object owns the
-//! `WaitSource`; the syscall driver subscribes its task mailbox and re-polls
-//! authoritative state after a matching wake.
+//! Blocking syscall arms that still hand-drive subsystem steps converge here
+//! instead of constructing legacy `WaitToken` values. The semantic object owns
+//! the `WaitSource`; the syscall driver only subscribes its task mailbox and
+//! re-polls the subsystem after a matching wake.
 
-use core::future::{poll_fn, Future};
+use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -21,13 +22,6 @@ use tx_services::time::{
 };
 
 use super::SyscallCtx;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum WaitSourceDeadline {
-    Source,
-    Deadline,
-    NotInstalled,
-}
 
 pub(super) fn deadline_timer(
     ctx: &SyscallCtx<'_>,
@@ -89,22 +83,9 @@ impl Future for DeadlineTimerFuture {
                 }
             }
         }
+
         Poll::Pending
     }
-}
-
-pub(super) async fn await_wait_source(
-    ctx: &SyscallCtx<'_>,
-    source: WaitSourceId,
-    interests: InterestMask,
-) {
-    let Some(mailbox) = ctx.mailbox.as_ref() else {
-        return;
-    };
-    let Some(wait_source) = lookup_source(source) else {
-        return;
-    };
-    await_wait_source_handle_on_mailbox(mailbox, wait_source, source, interests).await;
 }
 
 pub(super) async fn await_wait_endpoint(
@@ -122,81 +103,6 @@ pub(super) async fn await_wait_endpoint(
         interests,
     )
     .await;
-}
-
-/// Install a subscription while rechecking the blocked predicate under the
-/// source notification commit lock.  This closes the check-before-subscribe
-/// SMP lost-wakeup window.
-pub(super) async fn await_wait_source_if<F>(
-    ctx: &SyscallCtx<'_>,
-    source: WaitSourceId,
-    interests: InterestMask,
-    still_blocked: F,
-) -> bool
-where
-    F: FnOnce() -> bool,
-{
-    let Some(mailbox) = ctx.mailbox.as_ref() else {
-        return false;
-    };
-    let Some(wait_source) = lookup_source(source) else {
-        return false;
-    };
-
-    let generation = mailbox.next_generation();
-    let active = ActiveWait::new(generation, source, interests);
-    let prepared = wait_source.prepare(Arc::downgrade(mailbox), generation, interests);
-    let Some(registration) = prepared.install_if(still_blocked) else {
-        return false;
-    };
-
-    MailboxSourceFuture { mailbox, active }.await;
-    drop(registration);
-    true
-}
-
-/// The lost-wakeup-safe source wait combined with an absolute deadline from
-/// the unified time service.
-pub(super) async fn await_wait_source_if_until<F>(
-    ctx: &SyscallCtx<'_>,
-    source: WaitSourceId,
-    interests: InterestMask,
-    deadline_ns: u64,
-    still_blocked: F,
-) -> WaitSourceDeadline
-where
-    F: FnOnce() -> bool,
-{
-    let Some(mailbox) = ctx.mailbox.as_ref() else {
-        return WaitSourceDeadline::NotInstalled;
-    };
-    let Some(wait_source) = lookup_source(source) else {
-        return WaitSourceDeadline::NotInstalled;
-    };
-    let Some(mut deadline) = deadline_timer(ctx, deadline_ns) else {
-        return WaitSourceDeadline::NotInstalled;
-    };
-
-    let generation = mailbox.next_generation();
-    let active = ActiveWait::new(generation, source, interests);
-    let prepared = wait_source.prepare(Arc::downgrade(mailbox), generation, interests);
-    let Some(registration) = prepared.install_if(still_blocked) else {
-        return WaitSourceDeadline::Source;
-    };
-
-    let mut source = MailboxSourceFuture { mailbox, active };
-    let outcome = poll_fn(|cx| {
-        if Pin::new(&mut source).poll(cx).is_ready() {
-            return Poll::Ready(WaitSourceDeadline::Source);
-        }
-        if Pin::new(&mut deadline).poll(cx).is_ready() {
-            return Poll::Ready(WaitSourceDeadline::Deadline);
-        }
-        Poll::Pending
-    })
-    .await;
-    drop(registration);
-    outcome
 }
 
 pub(super) async fn await_any_wait_source(
@@ -311,13 +217,6 @@ impl Future for MailboxSourceFuture<'_> {
                 return Poll::Ready(());
             }
         }
-        // Overflow is a wake hint: the caller must re-read authoritative
-        // object state.  Consuming it also prevents a permanently runnable
-        // task after a full mailbox dropped the concrete event.
-        if self.mailbox.take_overflow() {
-            self.mailbox.clear_waker();
-            return Poll::Ready(());
-        }
         Poll::Pending
     }
 }
@@ -351,10 +250,6 @@ impl Future for MailboxAnySourceFuture<'_> {
                 self.mailbox.clear_waker();
                 return Poll::Ready(true);
             }
-        }
-        if self.mailbox.take_overflow() {
-            self.mailbox.clear_waker();
-            return Poll::Ready(true);
         }
         Poll::Pending
     }

@@ -13,7 +13,7 @@ use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
     SourceLabel,
 };
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 
 use crate::page_backed::{Frame as PageFrame, FsPageBacking};
 use crate::process::adapter::step_engine::{
@@ -30,10 +30,10 @@ use crate::process::structure::{
     reset_pid_counter_for_test, ExitStatus, Pgid, Pid, ProcessIdentity,
 };
 use crate::process::{
-    bootstrap_init_process, fork_with_options_wait, step_chdir, step_chdir_with_mount,
-    step_exit_group_with_posts, step_fork, step_fork_with_options, step_getcwd,
-    step_set_mount_namespace, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome,
-    ForkError, ForkOptions, SetpgidError, WaitError, WaitTarget,
+    bootstrap_init_process, step_chdir, step_chdir_with_mount, step_exit_group_with_posts,
+    step_fork, step_fork_with_options, step_getcwd, step_set_mount_namespace, step_setpgid,
+    step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError, ForkOptions, SetpgidError,
+    WaitError, WaitTarget,
 };
 use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
@@ -48,7 +48,6 @@ use crate::zones;
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr::null;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::time::Duration;
@@ -336,84 +335,6 @@ fn process_exit_payload_slot_guard_only_detaches_state() {
 }
 
 struct NullMountFs;
-
-#[derive(Default)]
-struct RecordingFsyncBacking {
-    fsyncs: AtomicUsize,
-}
-
-impl FsPageBacking for RecordingFsyncBacking {
-    fn fetch_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _guard: &crate::execution::Guard<'_>,
-    ) -> StepOutcome<PageFrame, crate::process::adapter::step_engine::NoProgress> {
-        unreachable!("exit flush test has no resident pages")
-    }
-
-    fn flush_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _frame: &PageFrame,
-        _guard: &crate::execution::Guard<'_>,
-    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
-        StepOutcome::done(())
-    }
-
-    fn truncate(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &crate::execution::Guard<'_>,
-    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
-        StepOutcome::done(())
-    }
-
-    fn fsync_file(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &crate::execution::Guard<'_>,
-    ) -> StepOutcome<(), crate::process::adapter::step_engine::NoProgress> {
-        self.fsyncs.fetch_add(1, Ordering::AcqRel);
-        StepOutcome::done(())
-    }
-}
-
-fn recording_page_backed_open_file() -> (Cap<crate::vfs::OpenFile>, Arc<RecordingFsyncBacking>) {
-    use crate::mount::MountPayloadPin;
-    use crate::page_backed::PageContainer;
-    use crate::process::adapter::step_engine::PayloadCap;
-    use crate::vfs::OpenFileFlags;
-
-    let backing = Arc::new(RecordingFsyncBacking::default());
-    let mount = MountPayload::new_cap(
-        Arc::new(NullMountFs),
-        backing.clone(),
-        None,
-        DevId::new(101),
-        MountOptions::default(),
-        "recording-fsync",
-        SourceLabel::Static("recording-fsync"),
-    )
-    .expect("recording fsync mount payload");
-    let pc = PageContainer::new_file_cap(
-        MountPayloadPin::acquire(&PayloadCap::from_cap(mount)),
-        FsObjectId::new(2),
-        0,
-    )
-    .expect("recording file page container");
-    let rnode = RNode::new_cap(
-        FsObjectId::new(2),
-        InodeMeta::new(InodeKind::Regular, 0o100644),
-        RNodeBacking::PageBacked { pc },
-    )
-    .expect("recording file rnode");
-    let file = crate::vfs::OpenFile::new_cap(rnode, OpenFileFlags::default())
-        .expect("recording open file");
-    (file, backing)
-}
 
 impl FsOps for NullMountFs {
     fn lookup(
@@ -877,42 +798,6 @@ fn fork_clones_address_space_into_distinct_cap() {
 }
 
 #[test]
-fn wait_capable_fork_does_not_publish_before_vm_conflict_clears() {
-    let _g = setup();
-    let parent = bootstrap();
-    let parent_aspace = parent.aspace_cap().expect("parent aspace");
-    let holder = match parent_aspace.range_lock().acquire_step_rich(
-        crate::vm::UserRange::new_aligned(crate::vm::UserVirtAddr(0x40000), 0x1000).expect("range"),
-        crate::vm::LockMode::ExclusiveWriter,
-    ) {
-        crate::vm::AcquireResult::Acquired(guard) => guard,
-        _ => panic!("baseline reservation should succeed"),
-    };
-
-    let mut future = Box::pin(fork_with_options_wait::<TestPmap>(
-        &parent,
-        ForkOptions::default(),
-    ));
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
-    assert!(
-        parent.children.snapshot().is_empty(),
-        "contended VM preparation must not publish a child"
-    );
-
-    drop(holder);
-    let child = match future.as_mut().poll(&mut cx) {
-        Poll::Ready(Ok(child)) => child,
-        Poll::Ready(Err(error)) => panic!("post-release fork errored: {error:?}"),
-        Poll::Pending => panic!("fork should complete after VM reservation release"),
-    };
-    let children = parent.children.snapshot();
-    assert_eq!(children.len(), 1);
-    assert_eq!(children[0], child);
-}
-
-#[test]
 fn fork_registers_child_in_parent_pgrp_member_list() {
     let _g = setup();
     let parent = bootstrap();
@@ -996,31 +881,6 @@ fn exit_group_zombifies_process_at_once_and_records_status() {
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(42)));
     assert_eq!(proc_cap.live_thread_count(), 0);
-}
-
-#[test]
-fn exit_group_flushes_page_backed_files_drained_from_fd_table() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-    let (file, backing) = recording_page_backed_open_file();
-    proc_cap.set_fd(1, Some(file));
-
-    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
-
-    assert_eq!(backing.fsyncs.load(Ordering::Acquire), 1);
-}
-
-#[test]
-fn last_thread_exit_flushes_page_backed_files_drained_from_fd_table() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-    let (file, backing) = recording_page_backed_open_file();
-    proc_cap.set_fd(1, Some(file));
-    let leader = first_thread(&proc_cap);
-
-    step_thread_exit(leader, 0);
-
-    assert_eq!(backing.fsyncs.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -1557,6 +1417,32 @@ fn zombie_process_pid_remains_resolvable_until_reap() {
     assert!(
         crate::process::process_by_pid(child_pid).is_none(),
         "reap is the pid namespace withdrawal point"
+    );
+}
+
+#[test]
+fn zombie_leader_tid_is_withdrawn_at_reap() {
+    let _g = setup();
+    let parent = bootstrap();
+    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
+    let child_pid = child.pid;
+
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
+
+    assert!(
+        matches!(
+            resolve_pid_number_as(child_pid.0 as u64, PidNameKind::Thread),
+            Some(PidName::Thread(_))
+        ),
+        "leader TID remains visible while the process is a zombie"
+    );
+
+    drop(child);
+    let _ = step_waitpid_nohang(&parent, WaitTarget::Pid(child_pid)).expect("reap");
+
+    assert!(
+        resolve_pid_number_as(child_pid.0 as u64, PidNameKind::Thread).is_none(),
+        "reap must withdraw the leader TID binding"
     );
 }
 

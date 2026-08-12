@@ -402,23 +402,23 @@ impl FsOps for BdevFsMountPayload {
         guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         if meta.kind() != InodeKind::BlockDevice {
-            return StepOutcome::err(Errno::ENOSYS);
+            return StepOutcome::err(Errno::ENOSYS.into());
         }
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(devt) = devt_for_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
 
         // Per txdoc:BDEV-FS-COHERENCE-1: reuse the existing
         // PageContainer when one is still live for this devt.
         let container = match self.get_or_create_pc(devt, reg, fs_object_id, mount, guard) {
             Ok(pc) => pc,
-            Err(e) => return StepOutcome::err(e),
+            Err(e) => return StepOutcome::err(e.into()),
         };
 
         match RNode::new_cap_in_mount(
@@ -428,7 +428,7 @@ impl FsOps for BdevFsMountPayload {
             mount,
         ) {
             Ok(rnode) => StepOutcome::done(rnode),
-            Err(_) => StepOutcome::err(Errno::ENOMEM),
+            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
     }
 
@@ -452,7 +452,7 @@ impl FsOps for BdevFsMountPayload {
             .unwrap_or(BDEVFS_ROOT_ID);
         let entry = match DirEntry::new(child_id, InodeKind::BlockDevice, reg.name.as_bytes()) {
             Ok(e) => e,
-            Err(err) => return StepOutcome::err(err),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
@@ -465,7 +465,7 @@ impl FsOps for BdevFsMountPayload {
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn create_inode(
@@ -476,7 +476,7 @@ impl FsOps for BdevFsMountPayload {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn unlink(
@@ -486,7 +486,7 @@ impl FsOps for BdevFsMountPayload {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rename(
@@ -497,7 +497,7 @@ impl FsOps for BdevFsMountPayload {
         _new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn link(
@@ -507,7 +507,7 @@ impl FsOps for BdevFsMountPayload {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn mkdir(
@@ -518,7 +518,7 @@ impl FsOps for BdevFsMountPayload {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rmdir(
@@ -528,7 +528,7 @@ impl FsOps for BdevFsMountPayload {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn symlink(
@@ -539,7 +539,7 @@ impl FsOps for BdevFsMountPayload {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn destroy_inode(
@@ -555,7 +555,7 @@ impl FsOps for BdevFsMountPayload {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
-        StepOutcome::err(Errno::EINVAL)
+        StepOutcome::err(Errno::EINVAL.into())
     }
 
     fn chmod_inode(
@@ -565,7 +565,7 @@ impl FsOps for BdevFsMountPayload {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn chown_inode(
@@ -576,7 +576,7 @@ impl FsOps for BdevFsMountPayload {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 }
 
@@ -592,10 +592,10 @@ impl FsPageBacking for BdevFsMountPayload {
         guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
 
         let handle = BlockDeviceHandle::whole(reg);
@@ -603,7 +603,7 @@ impl FsPageBacking for BdevFsMountPayload {
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
         if !offset.is_multiple_of(page_size) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
 
         let start_lba = offset / block_size;
@@ -617,7 +617,7 @@ impl FsPageBacking for BdevFsMountPayload {
         if blocks_per_page == 1 {
             let owned = match allocate_owned_page() {
                 Some(f) => f,
-                None => return StepOutcome::err(Errno::ENOMEM),
+                None => return StepOutcome::err(Errno::ENOMEM.into()),
             };
             let ppn = owned.ppn();
             let mut frames = [Frame::new(ppn)];
@@ -626,7 +626,7 @@ impl FsPageBacking for BdevFsMountPayload {
                 StepOutcome::Done(()) => {}
                 StepOutcome::Err(e) => return StepOutcome::err(e),
                 StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    return StepOutcome::err(Errno::EIO);
+                    return StepOutcome::err(Errno::EIO.into());
                 }
             }
             let _permanent = owned.into_permanent_frame();
@@ -634,12 +634,12 @@ impl FsPageBacking for BdevFsMountPayload {
         } else {
             let target_owned = match allocate_owned_page() {
                 Some(f) => f,
-                None => return StepOutcome::err(Errno::ENOMEM),
+                None => return StepOutcome::err(Errno::ENOMEM.into()),
             };
             let target_ppn = target_owned.ppn();
             let target_addr = match page_allocator::frame_kernel_addr(target_ppn) {
                 Ok(addr) => addr,
-                Err(_) => return StepOutcome::err(Errno::EFAULT),
+                Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
             };
 
             for i in 0..blocks_per_page {
@@ -650,7 +650,7 @@ impl FsPageBacking for BdevFsMountPayload {
 
                 let temp_owned = match allocate_owned_page() {
                     Some(f) => f,
-                    None => return StepOutcome::err(Errno::ENOMEM),
+                    None => return StepOutcome::err(Errno::ENOMEM.into()),
                 };
                 let temp_ppn = temp_owned.ppn();
                 let mut frames = [Frame::new(temp_ppn)];
@@ -659,7 +659,7 @@ impl FsPageBacking for BdevFsMountPayload {
                     StepOutcome::Done(()) => {
                         let src_addr = match page_allocator::frame_kernel_addr(frames[0].ppn()) {
                             Ok(addr) => addr,
-                            Err(_) => return StepOutcome::err(Errno::EFAULT),
+                            Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                         };
                         let byte_offset = i.saturating_mul(block_size) as usize;
                         let bytes_to_copy =
@@ -674,7 +674,7 @@ impl FsPageBacking for BdevFsMountPayload {
                     }
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                        return StepOutcome::err(Errno::EIO);
+                        return StepOutcome::err(Errno::EIO.into());
                     }
                 }
                 drop(temp_owned);
@@ -694,10 +694,10 @@ impl FsPageBacking for BdevFsMountPayload {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
 
         let handle = BlockDeviceHandle::whole(reg);
@@ -705,7 +705,7 @@ impl FsPageBacking for BdevFsMountPayload {
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
         if !offset.is_multiple_of(page_size) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
 
         let start_lba = offset / block_size;
@@ -713,7 +713,7 @@ impl FsPageBacking for BdevFsMountPayload {
         let blocks_per_page = page_size / block_size;
 
         if start_lba >= device_blocks {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
 
         if blocks_per_page == 1 {
@@ -722,13 +722,13 @@ impl FsPageBacking for BdevFsMountPayload {
                 StepOutcome::Done(()) => StepOutcome::done(()),
                 StepOutcome::Err(e) => StepOutcome::err(e),
                 StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    StepOutcome::err(Errno::EIO)
+                    StepOutcome::err(Errno::EIO.into())
                 }
             }
         } else {
             let src_addr = match page_allocator::frame_kernel_addr(frame.ppn()) {
                 Ok(addr) => addr,
-                Err(_) => return StepOutcome::err(Errno::EFAULT),
+                Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
             };
 
             for i in 0..blocks_per_page {
@@ -739,12 +739,12 @@ impl FsPageBacking for BdevFsMountPayload {
 
                 let temp_owned = match allocate_owned_page() {
                     Some(f) => f,
-                    None => return StepOutcome::err(Errno::ENOMEM),
+                    None => return StepOutcome::err(Errno::ENOMEM.into()),
                 };
                 let temp_ppn = temp_owned.ppn();
                 let temp_addr = match page_allocator::frame_kernel_addr(temp_ppn) {
                     Ok(addr) => addr,
-                    Err(_) => return StepOutcome::err(Errno::EFAULT),
+                    Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                 };
                 let byte_offset = i.saturating_mul(block_size) as usize;
                 let bytes_to_copy =
@@ -763,7 +763,7 @@ impl FsPageBacking for BdevFsMountPayload {
                     StepOutcome::Done(()) => {}
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                        return StepOutcome::err(Errno::EIO);
+                        return StepOutcome::err(Errno::EIO.into());
                     }
                 }
                 drop(temp_owned);
@@ -779,7 +779,7 @@ impl FsPageBacking for BdevFsMountPayload {
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         // v1: block-device size is immutable (BDEV_FS.md §10.4).
-        StepOutcome::err(Errno::EINVAL)
+        StepOutcome::err(Errno::EINVAL.into())
     }
 
     fn fsync_file(
@@ -788,17 +788,17 @@ impl FsPageBacking for BdevFsMountPayload {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let handle = BlockDeviceHandle::whole(reg);
         match handle.barrier(guard) {
             StepOutcome::Done(()) => StepOutcome::done(()),
             StepOutcome::Err(e) => StepOutcome::err(e),
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                StepOutcome::err(Errno::EIO)
+                StepOutcome::err(Errno::EIO.into())
             }
         }
     }
@@ -861,13 +861,13 @@ impl FsOps for BdevFs {
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         // No coherence index — every call allocates a fresh PC.
         if meta.kind() != InodeKind::BlockDevice {
-            return StepOutcome::err(Errno::ENOSYS);
+            return StepOutcome::err(Errno::ENOSYS.into());
         }
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
 
         let total_bytes = reg
@@ -880,7 +880,7 @@ impl FsOps for BdevFs {
             total_bytes,
         ) {
             Ok(c) => c,
-            Err(_) => return StepOutcome::err(Errno::ENOMEM),
+            Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
         };
 
         match RNode::new_cap_in_mount(
@@ -890,7 +890,7 @@ impl FsOps for BdevFs {
             mount,
         ) {
             Ok(rnode) => StepOutcome::done(rnode),
-            Err(_) => StepOutcome::err(Errno::ENOMEM),
+            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
     }
 
@@ -914,7 +914,7 @@ impl FsOps for BdevFs {
             .unwrap_or(BDEVFS_ROOT_ID);
         let entry = match DirEntry::new(child_id, InodeKind::BlockDevice, reg.name.as_bytes()) {
             Ok(e) => e,
-            Err(err) => return StepOutcome::err(err),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
@@ -925,7 +925,7 @@ impl FsOps for BdevFs {
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn create_inode(
@@ -936,7 +936,7 @@ impl FsOps for BdevFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn unlink(
@@ -946,7 +946,7 @@ impl FsOps for BdevFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rename(
@@ -957,7 +957,7 @@ impl FsOps for BdevFs {
         _new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn link(
@@ -967,7 +967,7 @@ impl FsOps for BdevFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn mkdir(
@@ -978,7 +978,7 @@ impl FsOps for BdevFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rmdir(
@@ -988,7 +988,7 @@ impl FsOps for BdevFs {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn symlink(
@@ -999,7 +999,7 @@ impl FsOps for BdevFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn destroy_inode(
@@ -1015,7 +1015,7 @@ impl FsOps for BdevFs {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
-        StepOutcome::err(Errno::EINVAL)
+        StepOutcome::err(Errno::EINVAL.into())
     }
 
     fn chmod_inode(
@@ -1025,7 +1025,7 @@ impl FsOps for BdevFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn chown_inode(
@@ -1036,7 +1036,7 @@ impl FsOps for BdevFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 }
 
@@ -1048,10 +1048,10 @@ impl FsPageBacking for BdevFs {
         guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
 
         let handle = BlockDeviceHandle::whole(reg);
@@ -1059,7 +1059,7 @@ impl FsPageBacking for BdevFs {
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
         if !offset.is_multiple_of(page_size) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
 
         let start_lba = offset / block_size;
@@ -1073,7 +1073,7 @@ impl FsPageBacking for BdevFs {
         if blocks_per_page == 1 {
             let owned = match allocate_owned_page() {
                 Some(f) => f,
-                None => return StepOutcome::err(Errno::ENOMEM),
+                None => return StepOutcome::err(Errno::ENOMEM.into()),
             };
             let ppn = owned.ppn();
             let mut frames = [Frame::new(ppn)];
@@ -1082,7 +1082,7 @@ impl FsPageBacking for BdevFs {
                 StepOutcome::Done(()) => {}
                 StepOutcome::Err(e) => return StepOutcome::err(e),
                 StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    return StepOutcome::err(Errno::EIO);
+                    return StepOutcome::err(Errno::EIO.into());
                 }
             }
             let _permanent = owned.into_permanent_frame();
@@ -1090,12 +1090,12 @@ impl FsPageBacking for BdevFs {
         } else {
             let target_owned = match allocate_owned_page() {
                 Some(f) => f,
-                None => return StepOutcome::err(Errno::ENOMEM),
+                None => return StepOutcome::err(Errno::ENOMEM.into()),
             };
             let target_ppn = target_owned.ppn();
             let target_addr = match page_allocator::frame_kernel_addr(target_ppn) {
                 Ok(addr) => addr,
-                Err(_) => return StepOutcome::err(Errno::EFAULT),
+                Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
             };
 
             for i in 0..blocks_per_page {
@@ -1106,7 +1106,7 @@ impl FsPageBacking for BdevFs {
 
                 let temp_owned = match allocate_owned_page() {
                     Some(f) => f,
-                    None => return StepOutcome::err(Errno::ENOMEM),
+                    None => return StepOutcome::err(Errno::ENOMEM.into()),
                 };
                 let temp_ppn = temp_owned.ppn();
                 let mut frames = [Frame::new(temp_ppn)];
@@ -1115,7 +1115,7 @@ impl FsPageBacking for BdevFs {
                     StepOutcome::Done(()) => {
                         let src_addr = match page_allocator::frame_kernel_addr(frames[0].ppn()) {
                             Ok(addr) => addr,
-                            Err(_) => return StepOutcome::err(Errno::EFAULT),
+                            Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                         };
                         let byte_offset = i.saturating_mul(block_size) as usize;
                         let bytes_to_copy =
@@ -1130,7 +1130,7 @@ impl FsPageBacking for BdevFs {
                     }
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                        return StepOutcome::err(Errno::EIO);
+                        return StepOutcome::err(Errno::EIO.into());
                     }
                 }
                 drop(temp_owned);
@@ -1150,10 +1150,10 @@ impl FsPageBacking for BdevFs {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
 
         let handle = BlockDeviceHandle::whole(reg);
@@ -1161,7 +1161,7 @@ impl FsPageBacking for BdevFs {
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
         if !offset.is_multiple_of(page_size) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
 
         let start_lba = offset / block_size;
@@ -1169,7 +1169,7 @@ impl FsPageBacking for BdevFs {
         let blocks_per_page = page_size / block_size;
 
         if start_lba >= device_blocks {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
 
         if blocks_per_page == 1 {
@@ -1178,13 +1178,13 @@ impl FsPageBacking for BdevFs {
                 StepOutcome::Done(()) => StepOutcome::done(()),
                 StepOutcome::Err(e) => StepOutcome::err(e),
                 StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    StepOutcome::err(Errno::EIO)
+                    StepOutcome::err(Errno::EIO.into())
                 }
             }
         } else {
             let src_addr = match page_allocator::frame_kernel_addr(frame.ppn()) {
                 Ok(addr) => addr,
-                Err(_) => return StepOutcome::err(Errno::EFAULT),
+                Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
             };
 
             for i in 0..blocks_per_page {
@@ -1195,12 +1195,12 @@ impl FsPageBacking for BdevFs {
 
                 let temp_owned = match allocate_owned_page() {
                     Some(f) => f,
-                    None => return StepOutcome::err(Errno::ENOMEM),
+                    None => return StepOutcome::err(Errno::ENOMEM.into()),
                 };
                 let temp_ppn = temp_owned.ppn();
                 let temp_addr = match page_allocator::frame_kernel_addr(temp_ppn) {
                     Ok(addr) => addr,
-                    Err(_) => return StepOutcome::err(Errno::EFAULT),
+                    Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                 };
                 let byte_offset = i.saturating_mul(block_size) as usize;
                 let bytes_to_copy =
@@ -1219,7 +1219,7 @@ impl FsPageBacking for BdevFs {
                     StepOutcome::Done(()) => {}
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                        return StepOutcome::err(Errno::EIO);
+                        return StepOutcome::err(Errno::EIO.into());
                     }
                 }
                 drop(temp_owned);
@@ -1234,7 +1234,7 @@ impl FsPageBacking for BdevFs {
         _new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EINVAL)
+        StepOutcome::err(Errno::EINVAL.into())
     }
 
     fn fsync_file(
@@ -1243,17 +1243,17 @@ impl FsPageBacking for BdevFs {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let Some(reg) = device_by_index(idx) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let handle = BlockDeviceHandle::whole(reg);
         match handle.barrier(guard) {
             StepOutcome::Done(()) => StepOutcome::done(()),
             StepOutcome::Err(e) => StepOutcome::err(e),
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                StepOutcome::err(Errno::EIO)
+                StepOutcome::err(Errno::EIO.into())
             }
         }
     }
@@ -1270,7 +1270,7 @@ impl FsPageBacking for BdevFs {
 fn allocate_zeroed_page() -> StepOutcome<Frame, NoProgress> {
     let owned = match allocate_owned_page() {
         Some(f) => f,
-        None => return StepOutcome::err(Errno::ENOMEM),
+        None => return StepOutcome::err(Errno::ENOMEM.into()),
     };
     let ppn = owned.ppn();
     let _permanent = owned.into_permanent_frame();
@@ -1291,12 +1291,21 @@ fn allocate_owned_page() -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use tx_subsystems::device::{
+        BlockDevice, BlockDeviceOps, BlockDurabilityCapabilities, PhysicalBlockNumber,
+    };
     use tx_subsystems::io_manager::block::{BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
     use tx_subsystems::mount::{DevId, MountOptions, SourceLabel};
     use tx_subsystems::page_backed::{read_exact_at, PageContainerKind};
 
     struct PatternBlockDevice;
+
+    static RECORDING_EVENT: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_WRITE_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_BARRIER_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_BARRIER_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static RECORDING_DEVICE_FIRST_BYTE: AtomicU8 = AtomicU8::new(0);
 
     impl BlockDeviceOps for PatternBlockDevice {
         fn read_blocks(
@@ -1321,14 +1330,38 @@ mod tests {
         fn write_blocks(
             &self,
             _block_id: PhysicalBlockNumber,
-            _source: &[Frame],
+            source: &[Frame],
             _guard: &Guard<'_>,
         ) -> StepOutcome<(), NoProgress> {
+            let Some(frame) = source.first() else {
+                return StepOutcome::err(Errno::EINVAL.into());
+            };
+            let address = match page_allocator::frame_kernel_addr(frame.ppn()) {
+                Ok(address) => address,
+                Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
+            };
+            RECORDING_DEVICE_FIRST_BYTE.store(unsafe { *address }, Ordering::SeqCst);
+            RECORDING_WRITE_ORDER.store(
+                RECORDING_EVENT.fetch_add(1, Ordering::SeqCst) + 1,
+                Ordering::SeqCst,
+            );
             StepOutcome::done(())
         }
 
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            RECORDING_BARRIER_COUNT.fetch_add(1, Ordering::SeqCst);
+            RECORDING_BARRIER_ORDER.store(
+                RECORDING_EVENT.fetch_add(1, Ordering::SeqCst) + 1,
+                Ordering::SeqCst,
+            );
             StepOutcome::done(())
+        }
+
+        fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+            BlockDurabilityCapabilities {
+                fua: false,
+                flush: true,
+            }
         }
     }
 
@@ -1362,6 +1395,11 @@ mod tests {
             device::register_block_devices(PATTERN_REGS),
             StepOutcome::Done(())
         );
+        RECORDING_EVENT.store(0, Ordering::SeqCst);
+        RECORDING_WRITE_ORDER.store(0, Ordering::SeqCst);
+        RECORDING_BARRIER_ORDER.store(0, Ordering::SeqCst);
+        RECORDING_BARRIER_COUNT.store(0, Ordering::SeqCst);
+        RECORDING_DEVICE_FIRST_BYTE.store(0, Ordering::SeqCst);
     }
 
     fn bdevfs_mount_payload(bdevfs: &Arc<BdevFsMountPayload>) -> Cap<MountPayload> {
@@ -1465,7 +1503,13 @@ mod tests {
             snapshot[0].handle().len_lba(),
             PATTERN_REG.ops.total_blocks()
         );
-        assert_eq!(snapshot[0].container().page_count(), first_pc.page_count());
+        assert_eq!(
+            snapshot[0]
+                .container()
+                .expect("live snapshot container")
+                .page_count(),
+            first_pc.page_count()
+        );
     }
 
     #[test]
@@ -1507,5 +1551,39 @@ mod tests {
         assert_eq!(barrier.lba, LbaRange::new(0, 0));
         assert!(barrier.vecs.is_empty());
         assert!(barrier.flags.contains(BlockFlags::BARRIER));
+    }
+
+    #[test]
+    fn bdevfs_flushes_dirty_frame_before_exactly_one_barrier() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bdevfs_test();
+        let guard = step_engine::guard();
+        let bdevfs = BdevFsMountPayload::new();
+        let fs_object_id = match bdevfs.lookup(BDEVFS_ROOT_ID, b"vdr", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup vdr failed: {other:?}"),
+        };
+        let owned = allocate_owned_page().expect("recording frame");
+        let frame = Frame::new(owned.ppn());
+        page_allocator::testing::write_frame_bytes_for_test(frame.ppn(), 0, &[0xa5]);
+
+        assert_eq!(
+            bdevfs.flush_page(fs_object_id, 0, &frame, &guard),
+            StepOutcome::done(())
+        );
+        assert_eq!(
+            bdevfs.fsync_file(fs_object_id, &guard),
+            StepOutcome::done(())
+        );
+
+        assert_eq!(RECORDING_DEVICE_FIRST_BYTE.load(Ordering::SeqCst), 0xa5);
+        assert_eq!(RECORDING_BARRIER_COUNT.load(Ordering::SeqCst), 1);
+        assert!(
+            RECORDING_WRITE_ORDER.load(Ordering::SeqCst)
+                < RECORDING_BARRIER_ORDER.load(Ordering::SeqCst),
+            "dirty frame write must precede the durability barrier"
+        );
     }
 }

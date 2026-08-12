@@ -74,6 +74,7 @@ How work runs: the step primitive and the runtime that drives it.
 
 <!-- txdoc:INDEX-MEMORY-VM-1 -->
 
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — canonical target dual-plane contract for PageBacked file data, pure filesystem layout planning, the existing BIO DAG, global memory pressure, reclaim providers, allocation slow paths, and zero-copy payload I/O; current ext4/PageBacked implementation readiness is `Ready: no`.
 - [`PAGE_BACKED_v1.md`](03_memory-vm/PAGE_BACKED_v1.md) — `PageContainer`, three-variant `RNodeBacking`; unifies files, tmpfs, shm, memfd, anon mmap, MMIO devices.
 - [`VM_v1_2.md`](03_memory-vm/VM_v1_2.md) — `AddressSpace`, `VmEntry`, recipes BTree, `RangeLock`, scripts for mmap/munmap/mprotect/mremap/fault/fork/exec.
 - [`VDSO_TIME_ABI_v1.md`](03_memory-vm/VDSO_TIME_ABI_v1.md) — vDSO time ABI, VVAR publication, special VM mapping, exec auxv, libc fallback, and signal restorer contract.
@@ -93,10 +94,11 @@ How work runs: the step primitive and the runtime that drives it.
 
 - [`MOUNT_v1.md`](05_filesystem/MOUNT_v1.md) — mount subsystem: mount namespaces, mount tree, mountpoint index, filesystem-instance hosting, mount/umount steps.
 - [`VFS_CHECKS_V2.1.md`](05_filesystem/VFS_CHECKS_V2.1.md) — VFS walker, witness consumption at STEP-4 stage 2, refinement wrappers.
-- [`IO_MANAGER_v1.md`](05_filesystem/IO_MANAGER_v1.md) — I/O control plane between PageContainer, filesystem planning, block submission, and device execution; L4/L5/L6 service-future split, batching, readahead, direct-I/O coherency.
+- [`IO_MANAGER_v1.md`](05_filesystem/IO_MANAGER_v1.md) — file-I/O execution plane between PageContainer, pure filesystem planning/Tx lowering, block submission, and device execution; L4/L5/L6 split, batching, readahead mechanics, direct-I/O coherency, and typed completion.
 - [`BDEV_FS.md`](05_filesystem/BDEV_FS.md) — block-device pseudo-filesystem; bytes ↔ blocks translation over PAGE_BACKED.
 - [`bringup_fs_specs_v_1 (1).md`](<05_filesystem/bringup_fs_specs_v_1 (1).md>) — bringup filesystem specs for tmpfs, initramfs cpio `newc`, and minimal procfs.
-- [`TX_EXT4_PLAN_v1_2.md`](05_filesystem/TX_EXT4_PLAN_v1_2.md) — ext4 backend project plan; stateless-per-inode rule, cache & reclaim policy.
+- [`TX_EXT4_PLAN_v1_2.md`](05_filesystem/TX_EXT4_PLAN_v1_2.md) — Tx-native ext4 backend plan: Linux/e2fsprogs authority, Tier 1 controlled production profile, Tier 2 mainstream compatibility, mutation admission, cache and reclaim policy.
+- [`EXT4_LIFECYCLE_v1.md`](05_filesystem/EXT4_LIFECYCLE_v1.md) — canonical Tier 1 correctness lifecycle: owned file-I/O terminalization, ext4 mutation custody, mount settlement, fail-closed production convergence, and crash/e2fsprogs acceptance.
 
 ## 06 · Devices
 
@@ -113,8 +115,8 @@ How work runs: the step primitive and the runtime that drives it.
 
 **For a new contributor.** 00 active docs → 01 HAL → 01 PAGE_SUBSTRATE → 01 BUS → 02 STEP_MODEL → 02 THREAD_RUNTIME → pick a subsystem (03–06).
 
-**For VM work.** 00 01_CONCEPTS_v5, 02_INVARIANTS_v5, object_model_v2, SUBSYSTEM_ANATOMY_v2_1 → 01 PAGE_SUBSTRATE → 03 PAGE_BACKED → 03 VM.
+**For VM work.** 00 01_CONCEPTS_v5, 02_INVARIANTS_v5, object_model_v2, SUBSYSTEM_ANATOMY_v2_1 → 01 PAGE_SUBSTRATE → 03 MEMORY_IO_ARCHITECTURE → 03 PAGE_BACKED → 03 VM.
 
-**For filesystem / driver work.** 00 (all) → 01 HAL → 01 BUS → 03 PAGE_BACKED → 05 MOUNT → 05 VFS_CHECKS → 05 IO_MANAGER → 05 BDEV_FS → 05 bringup_fs_specs → 05 TX_EXT4_PLAN; for block drivers add 06 DEVICE; for char devices add 06 DEVICE → 06 TTY.
+**For filesystem / driver work.** 00 (all) → 01 HAL → 01 BUS → 03 MEMORY_IO_ARCHITECTURE → 03 PAGE_BACKED → 05 MOUNT → 05 VFS_CHECKS → 05 IO_MANAGER → 05 BDEV_FS → 05 bringup_fs_specs → 05 TX_EXT4_PLAN → 05 EXT4_LIFECYCLE; for block drivers add 06 DEVICE; for char devices add 06 DEVICE → 06 TTY.
 
 **For process / signal work.** 00 (all) → 02 03_STEP_MODEL_v2 → 02 THREAD_RUNTIME → 02 cred_service / rlimit_service → 04 PROCESS → 04 SIGNAL → 04 SIGNAL_ATTACHMENTS → 02 EXEC.

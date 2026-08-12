@@ -306,7 +306,7 @@ fn signal_mailbox_phase_a_plumbing() {
     let signalfd_mailbox = Arc::new(TaskMailbox::new());
     let signalfd_generation = signalfd_mailbox.next_generation();
     let signalfd_registration = signalfd
-        .read_endpoint()
+        .wait_source()
         .prepare(
             Arc::downgrade(&signalfd_mailbox),
             signalfd_generation,

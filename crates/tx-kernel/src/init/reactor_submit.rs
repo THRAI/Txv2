@@ -101,7 +101,7 @@ impl<P: TxPlatform> CoreInit<P> {
             .retain(|(_, existing)| *existing != task);
     }
 
-    pub(super) fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
+    fn thread_reactor_task(tid: u32) -> Option<boot_runtime::TaskKey> {
         THREAD_REACTOR_TASKS
             .lock()
             .iter()
@@ -154,17 +154,22 @@ impl<P: TxPlatform> CoreInit<P> {
         if removed != 0 && step_engine::borrow_current_guard().is_none() {
             let first = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             let second = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
-            let vm_recipe_reclaims =
-                tx_subsystems::vm::drain_deferred_recipe_reclaims(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             emit_child_submit_marker(
                 "debug.child_submit.ebr_reclaimed",
-                first.reclaimed.saturating_add(second.reclaimed) as i64,
+                first
+                    .bag_reclaimed
+                    .saturating_add(second.bag_reclaimed)
+                    .saturating_add(first.publication_dropped)
+                    .saturating_add(second.publication_dropped) as i64,
             );
-            emit_child_submit_marker("debug.child_submit.ebr_remaining", second.remaining as i64);
             emit_child_submit_marker(
-                "debug.child_submit.vm_recipe_reclaimed",
-                vm_recipe_reclaims as i64,
+                "debug.child_submit.ebr_remaining",
+                second
+                    .bag_remaining
+                    .saturating_add(second.publication_remaining) as i64,
             );
+            crate::zones::try_bounded_maintenance_tick();
+            crate::zones::try_bounded_maintenance_tick();
         } else if removed != 0 {
             emit_child_submit_marker(
                 "debug.child_submit.ebr_deferred_active_guard",
@@ -270,6 +275,23 @@ impl<P: TxPlatform> CoreInit<P> {
         emit_child_submit_marker("debug.child_submit.reactor.with.before", child_tid as i64);
         let reactor_with_start = clone_path_clock_now();
         let may_drain_terminal = step_engine::borrow_current_guard().is_none();
+        let initial_meta = {
+            let spread_child = Self::spread_child_submit_for_current_process(&child_thread);
+            if spread_child {
+                // The explicit scheduler witness lane still wants the freshly
+                // submitted child to be placed aggressively so it can measure
+                // cross-hart child publication.  Ordinary OSComp clones should
+                // not enter through the Preempted queue, though: the parent is
+                // still the thread that must receive the clone return and keep
+                // the test harness moving.  Putting every child ahead of the
+                // parent can starve the parent on SMP4 clone-heavy prefixes.
+                Self::userspace_child_thread_sched_meta_for(submit_cpu)
+                    .spread_on_submit()
+                    .preempted_on_submit()
+            } else {
+                Self::userspace_thread_sched_meta_for(submit_cpu)
+            }
+        };
         let submitted = BOOT_REACTOR.with(|reactor| {
             if may_drain_terminal {
                 // Concurrent userspace polling can run an entire hot pthread
@@ -305,7 +327,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     task_payload.clone(),
                     crate::thread_future::run_thread::<P>(child_thread, task_payload),
                 ),
-                Self::userspace_child_thread_sched_meta_for(submit_cpu).preempted_on_submit(),
+                initial_meta,
                 submit_hart,
                 &mut signal,
             )
@@ -323,6 +345,14 @@ impl<P: TxPlatform> CoreInit<P> {
         );
         if let Some(report) = submitted {
             let task_key = report.task;
+            Self::emit_smp_witness_child_submit(
+                submit_hart,
+                report.publish.hart,
+                report.publish.queue,
+                report.dispatch.placements,
+                report.dispatch.remote_ipis,
+                report.dispatch.local_reschedules,
+            );
             emit_child_submit_marker(
                 "debug.child_submit.publish.queue",
                 phase1_queue_code(report.publish.queue),
@@ -353,6 +383,67 @@ impl<P: TxPlatform> CoreInit<P> {
             emit_clone_path_duration(b"debug.clone_path.child_submit.total_ns", total_start);
             false
         }
+    }
+
+    fn spread_child_submit_for_current_process(
+        child_thread: &Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
+    ) -> bool {
+        if !cfg!(any(
+            tx_userspace_child_spread_smp1,
+            tx_userspace_child_spread_smp4
+        )) {
+            return false;
+        }
+        let Some(owner) = child_thread.upgrade_owner_proc() else {
+            return false;
+        };
+        let Some(leader) = owner.nth_thread(0) else {
+            return false;
+        };
+        if leader.tid == child_thread.tid {
+            return false;
+        }
+        let Some(cmdline) = owner.ident_cmdline() else {
+            return false;
+        };
+        cmdline
+            .windows(b"smp-scheduler-witness".len())
+            .any(|window| window == b"smp-scheduler-witness")
+    }
+
+    fn emit_smp_witness_child_submit(
+        submit_hart: boot_runtime::HartId,
+        publish_hart: boot_runtime::HartId,
+        queue: boot_runtime::Phase1QueueKind,
+        placements: usize,
+        remote_ipis: usize,
+        local_reschedules: usize,
+    ) {
+        if !cfg!(tx_smp_scheduler_witness) {
+            let _ = (
+                submit_hart,
+                publish_hart,
+                queue,
+                placements,
+                remote_ipis,
+                local_reschedules,
+            );
+            return;
+        }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sched-witness:child-submit:submit=");
+        Self::write_signed_decimal(submit_hart.0 as i32);
+        tx_hal::console_write_str::<P>(":publish=");
+        Self::write_signed_decimal(publish_hart.0 as i32);
+        tx_hal::console_write_str::<P>(":queue=");
+        Self::write_signed_decimal(phase1_queue_code(queue) as i32);
+        tx_hal::console_write_str::<P>(":placements=");
+        Self::write_decimal_unsigned(placements);
+        tx_hal::console_write_str::<P>(":remote-ipis=");
+        Self::write_decimal_unsigned(remote_ipis);
+        tx_hal::console_write_str::<P>(":local-reschedules=");
+        Self::write_decimal_unsigned(local_reschedules);
+        tx_hal::console_write_str::<P>("\n");
     }
 }
 

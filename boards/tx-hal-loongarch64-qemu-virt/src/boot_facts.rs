@@ -164,20 +164,6 @@ pub(crate) fn boot_cmdline_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(BOOT_CMDLINE) as *mut u8
 }
 
-/// Parse `tx.maxcpus=N` from the published boot cmdline (None before
-/// boot facts are published or when the knob is absent — callers use the
-/// discovered firmware topology). Mirrors the rv64 board's knob.
-pub(crate) fn max_cpus_from_cmdline() -> Option<usize> {
-    let info = unsafe { &*(boot_info_ptr() as *const BootInfo) };
-    let cmdline = info.cmdline?;
-    for token in cmdline.split_whitespace() {
-        if let Some(value) = token.strip_prefix("tx.maxcpus=") {
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
 pub(crate) fn boot_info_ptr() -> *mut BootInfo {
     core::ptr::addr_of_mut!(BOOT_INFO)
 }

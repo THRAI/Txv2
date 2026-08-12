@@ -9,9 +9,9 @@
 //!
 //! `PmapResidentStore` is the production cfg-selected alias used by `VmPmap`.
 //! `PmapResidentStoreWith<B>` is the backend-neutral facade for A/B tests and
-//! future implementations. Production uses the chunked backend so a large
-//! address space never has to grow one physically-contiguous resident array.
-//! Tests retain the address-sorted `Vec` backend for behavior comparison.
+//! future implementations. The default backend is an address-sorted `Vec`,
+//! preserved for behavior and comparison. `tx_vm_pmap_chunked_resident` selects
+//! a chunked backend that avoids global suffix shifts on range teardown.
 
 use alloc::vec::Vec;
 use core::fmt::Debug;
@@ -19,8 +19,12 @@ use core::fmt::Debug;
 use super::{PmapMapping, PmapMappingSnapshot};
 use crate::vm::UserPage;
 
+#[cfg(not(tx_vm_pmap_chunked_resident))]
+type DefaultPmapResidentStoreImpl = VecPmapResidentStore;
+#[cfg(tx_vm_pmap_chunked_resident)]
 type DefaultPmapResidentStoreImpl = ChunkedPmapResidentStore;
 
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
 const CHUNK_CAPACITY: usize = 64;
 
 pub(super) type PmapResidentStore = PmapResidentStoreWith<DefaultPmapResidentStoreImpl>;
@@ -135,12 +139,12 @@ impl IntoIterator for DrainedMappings {
 }
 
 #[derive(Debug, Default)]
-#[cfg(test)]
+#[cfg(any(test, not(tx_vm_pmap_chunked_resident)))]
 pub(super) struct VecPmapResidentStore {
     entries: Vec<(UserPage, PmapMapping)>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, not(tx_vm_pmap_chunked_resident)))]
 impl PmapResidentStoreImpl for VecPmapResidentStore {
     fn len(&self) -> usize {
         self.entries.len()
@@ -221,7 +225,7 @@ impl PmapResidentStoreImpl for VecPmapResidentStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, not(tx_vm_pmap_chunked_resident)))]
 impl VecPmapResidentStore {
     fn search(&self, page: UserPage) -> Result<usize, usize> {
         self.entries
@@ -230,11 +234,13 @@ impl VecPmapResidentStore {
 }
 
 #[derive(Debug, Default)]
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
 pub(super) struct ChunkedPmapResidentStore {
     chunks: Vec<ResidentChunk>,
     len: usize,
 }
 
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
 impl PmapResidentStoreImpl for ChunkedPmapResidentStore {
     fn len(&self) -> usize {
         self.len
@@ -402,6 +408,7 @@ impl PmapResidentStoreImpl for ChunkedPmapResidentStore {
     }
 }
 
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
 impl ChunkedPmapResidentStore {
     fn find_chunk_for_page(&self, page: UserPage) -> Option<usize> {
         let index = self
@@ -436,10 +443,12 @@ impl ChunkedPmapResidentStore {
 }
 
 #[derive(Debug, Default)]
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
 struct ResidentChunk {
     entries: Vec<(UserPage, PmapMapping)>,
 }
 
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
 impl ResidentChunk {
     fn new() -> Self {
         Self {

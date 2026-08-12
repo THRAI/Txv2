@@ -28,7 +28,7 @@ use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
 use crate::linux_syscall::reset_uts_nodename_for_test;
 use tx_substrate::step::InterestMask;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
@@ -49,6 +49,7 @@ use tx_subsystems::zones;
 use super::{
     dispatch, dispatch_cap_only_immediate, dispatch_clone_oneshot,
     dispatch_direct_trap_payload_oneshot, dispatch_process_aspace_immediate,
+    dispatch_thread_exit_oneshot_with_posts,
     dispatch_thread_aspace_oneshot, dispatch_thread_payload_aspace_oneshot, dispatch_vm_hot,
     dispatch_writev_hot, SyscallCtx, SyscallResult, BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES, CLONE_VFORK,
     EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
@@ -173,7 +174,6 @@ impl tx_hal::ConsoleIf for ShimsTestPmap {
 }
 
 impl SmpIf for ShimsTestPmap {}
-impl tx_hal::CacheIf for ShimsTestPmap {}
 
 impl tx_hal::TrapIf for ShimsTestPmap {}
 impl tx_hal::SignalFrameIf for ShimsTestPmap {}
@@ -194,10 +194,29 @@ static SHIMS_TEST_NS_COUNTER: core::sync::atomic::AtomicU64 =
 const SHIMS_TEST_NS_BASE: u64 = 5_000_000_000;
 static EXIT_GROUP_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+static EXIT_GROUP_REF_POST_HINT: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(255);
 
 fn counting_mailbox_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
     EXIT_GROUP_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     mailbox.post(event)
+}
+
+fn counting_mailbox_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    EXIT_GROUP_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let code = match hint {
+        MailboxSchedulerHint::Normal => 0,
+        MailboxSchedulerHint::WakeHandoff => 1,
+        MailboxSchedulerHint::LifecycleWake => 2,
+        MailboxSchedulerHint::PriorityBoost => 3,
+        MailboxSchedulerHint::SignalDelivery => 4,
+    };
+    EXIT_GROUP_REF_POST_HINT.store(code, core::sync::atomic::Ordering::Release);
+    mailbox.post_with_scheduler_hint(event, hint)
 }
 
 impl tx_hal::MonotonicCounterIf for ShimsTestPmap {
@@ -311,14 +330,13 @@ fn setup() -> TestSetup {
     tx_services::time::reset_for_test();
     tx_subsystems::time_hooks::ensure_hooks_installed();
     reset_uts_nodename_for_test();
-    // FsObjectId values are reused by fresh tmpfs instances. Timestamp
-    // overrides therefore belong to one serialised test setup only.
-    super::fs_basic::clear_stat_meta_overrides();
     tx_subsystems::net::reset_initial_net_namespace_for_test();
+    tx_subsystems::mount::reset_mount_table_for_test();
     tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
     tx_subsystems::net::device::reset_net_registry_for_test();
     tx_subsystems::net::reset_netfilter_for_test();
     super::reset_itimer_registry_for_test();
+    super::clear_stat_meta_overrides();
     tx_fs::devfs::reset_rtc_backend_for_test();
     SHIMS_TEST_RTC_NS.store(
         tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS,
@@ -686,6 +704,7 @@ fn dispatch_exit_group_marks_process_zombie() {
 fn dispatch_exit_group_uses_syscall_ctx_mailbox_ref_post_for_parent_exit_source() {
     let _setup = setup();
     EXIT_GROUP_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    EXIT_GROUP_REF_POST_HINT.store(255, core::sync::atomic::Ordering::Release);
 
     let parent = bootstrap();
     let child = step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork child");
@@ -704,7 +723,8 @@ fn dispatch_exit_group_uses_syscall_ctx_mailbox_ref_post_for_parent_exit_source(
         .expect("registered parent exit wait-source subscriber");
 
     let thread = first_thread(&child);
-    let ctx = make_ctx(child.clone(), thread).with_mailbox_ref_post(counting_mailbox_ref_post);
+    let ctx = make_ctx(child.clone(), thread)
+        .with_mailbox_ref_post_with_hint(counting_mailbox_ref_post_with_hint);
     let req = SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
 
@@ -714,6 +734,68 @@ fn dispatch_exit_group_uses_syscall_ctx_mailbox_ref_post_for_parent_exit_source(
         EXIT_GROUP_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
         1,
         "parent exit wait-source should publish through SyscallCtx mailbox-ref post",
+    );
+    assert_eq!(
+        EXIT_GROUP_REF_POST_HINT.load(core::sync::atomic::Ordering::Acquire),
+        2,
+        "process exit-source wakes should preserve LifecycleWake priority",
+    );
+    match mailbox.poll().expect("parent exit source should post") {
+        MailboxEvent::SourceFired {
+            generation: got_generation,
+            source,
+            interests,
+        } => {
+            assert_eq!(got_generation, generation);
+            assert_eq!(source, parent_source.id());
+            assert_ne!(interests.raw() & EXIT_SOURCE_CHILD_ZOMBIFIED, 0);
+        }
+        other => panic!("expected SourceFired, got {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_exit_oneshot_uses_injected_mailbox_ref_post_for_parent_exit_source() {
+    let _setup = setup();
+    EXIT_GROUP_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+
+    let parent = bootstrap();
+    let child = step_fork::<ShimsTestPmap>(&parent, false, false).expect("fork child");
+    let parent_source = parent
+        .exit_endpoint()
+        .expect("live parent has exit endpoint");
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _guard = parent_source
+        .prepare(
+            Arc::downgrade(&mailbox),
+            generation,
+            InterestMask::new(EXIT_SOURCE_CHILD_ZOMBIFIED),
+        )
+        .install_if(|| true)
+        .expect("registered parent exit wait-source subscriber");
+
+    let thread = first_thread(&child);
+    let req = SyscallRequest::new(NR_EXIT, [3, 0, 0, 0, 0, 0]);
+    let result = dispatch_thread_exit_oneshot_with_posts(
+        &req,
+        &thread,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        counting_mailbox_ref_post,
+    );
+
+    assert_eq!(result, Some(SyscallResult::NoReturn));
+    assert!(child.is_zombie());
+    assert_eq!(child.exit_status(), Some(ExitStatus::Exited(3)));
+    assert_eq!(
+        EXIT_GROUP_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "NR_EXIT final-thread cascade should publish parent exit wait-source through injected mailbox-ref post",
     );
     match mailbox.poll().expect("parent exit source should post") {
         MailboxEvent::SourceFired {
@@ -1390,8 +1472,8 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     const HANDLER_ADDR: u64 = 0xCAFE_F00D_DEAD_BEEFu64;
-    let act: [u64; 3] = [HANDLER_ADDR, 0, 0]; // handler/flags/mask
-    let mut oldact: [u64; 3] = [0xDEADu64; 3];
+    let act: [u64; 4] = [HANDLER_ADDR, 0, 0, 0]; // handler/flags/mask/unused
+    let mut oldact: [u64; 4] = [0xDEADu64; 4];
 
     // Install: oldact reports prev (Default == 0).
     let r1 = block_on(dispatch::<ShimsTestPmap>(
@@ -1415,7 +1497,7 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
     );
 
     // Query (act == NULL): oldact reports the just-installed handler.
-    let mut oldact2: [u64; 3] = [0xDEADu64; 3];
+    let mut oldact2: [u64; 4] = [0xDEADu64; 4];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,
@@ -1448,8 +1530,10 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     const SA_RESTART: u64 = 0x1000_0000;
     const FLAGS: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     const MASK: u64 = u64::MAX;
-    let act: [u64; 3] = [HANDLER_ADDR, FLAGS, MASK];
-    let mut oldact: [u64; 3] = [0xDEADu64; 3];
+    const UNUSED: u64 = 0x4444_5555_6666_7777;
+
+    let act: [u64; 4] = [HANDLER_ADDR, FLAGS, MASK, UNUSED];
+    let mut oldact: [u64; 4] = [0xDEADu64; 4];
 
     let r1 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
@@ -1466,9 +1550,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
         &ctx,
     ));
     assert_eq!(r1, SyscallResult::Return(0));
-    assert_eq!(oldact, [0, 0, 0]);
+    assert_eq!(oldact, [0, 0, 0, 0]);
 
-    let mut observed: [u64; 3] = [0xDEADu64; 3];
+    let mut observed: [u64; 4] = [0xDEADu64; 4];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,
@@ -1492,6 +1576,10 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     assert_ne!(
         observed[2] & tx_subsystems::signal::Signum::SIGTERM.bit(),
         0
+    );
+    assert_eq!(
+        observed[3], UNUSED,
+        "RV64 musl has no SA_RESTORER, so the last word is ABI-unused"
     );
 }
 

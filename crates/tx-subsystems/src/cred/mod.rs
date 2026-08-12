@@ -36,8 +36,8 @@ pub mod checks;
 
 use adapter::step_engine::{
     self, Cap, CredentialView, Guard, NoProgress, OneShotStepOp, PayloadCap,
-    RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Zone, ZoneAllocated,
-    ZoneError,
+    RestrictionStackHandle, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, Zone,
+    ZoneAllocated, ZoneError,
 };
 
 use crate::execution::Errno;
@@ -283,16 +283,24 @@ pub fn step_set_capability_sets(
 /// seccomp / landlock surfaces; until then `SubjectAuthority` just
 /// needs *some* cap to satisfy the type signature. The
 /// `RestrictionStackHandle` placeholder is a unit-typed
-/// `ZoneAllocated` struct in `adapter::step_engine`, so each call
-/// reserves a fresh slot in the placeholder zone and signs the
-/// unit-typed value into it. The resulting cap is short-lived (the
-/// syscall arm drops it at script-frame exit; EBR retires the slab).
+/// `ZoneAllocated` struct in `adapter::step_engine`. Because the value carries
+/// no per-syscall state, production reuses one cached cap and returns a retained
+/// clone per script frame. This preserves the empty-restriction semantics while
+/// avoiding one placeholder zone allocation on every syscall.
 ///
-/// Cost is one zone reservation per syscall entry — acceptable for
-/// the placeholder; PR-K replaces with the proper slot-style append-
-/// only stack.
+/// PR-K replaces this placeholder with the proper slot-style append-only stack.
+static PLACEHOLDER_RESTRICTIONS_CAP: SpinMutex<Option<Cap<RestrictionStackHandle>>> =
+    SpinMutex::new(None);
+
 pub fn placeholder_restrictions_cap() -> Result<Cap<RestrictionStackHandle>, ZoneError> {
-    step_engine::sign(RestrictionStackHandle::placeholder())
+    let mut cached = PLACEHOLDER_RESTRICTIONS_CAP.lock();
+    if let Some(cap) = cached.as_ref().and_then(Cap::try_clone_live) {
+        return Ok(cap);
+    }
+
+    let cap = step_engine::sign(RestrictionStackHandle::placeholder())?;
+    *cached = Some(cap.clone());
+    Ok(cap)
 }
 
 impl Cred {

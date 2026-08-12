@@ -12,7 +12,7 @@
 //!   pmap pipeline methods used by the RV64 assembly path.
 //! - individual tests then exercise bootstrap aliasing, identity teardown,
 //!   direct-map/MMIO mapping, typed PT-node fallback, root lifecycle, and
-//!   protect/unmap retention.
+//!   protect/unmap pruning.
 //!
 //! These stay as a private unit-test module instead of crate-level integration
 //! tests because they intentionally inspect board-private PTEs, PT-node pool
@@ -31,18 +31,18 @@ use super::address_space::{
     reserve_mapping_from_root, unmap_mapping_from_root,
 };
 use super::kernel_space::{
-    commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag,
-    cover_boot_firmware_dtb_from_bag, extend_direct_map_from_bag, protect_kernel_mapping_from_bag,
-    reserve_direct_map_1g_from_bag, reserve_kernel_mapping_from_bag,
-    rollback_kernel_mapping_from_bag, unmap_kernel_mapping_from_bag,
+    commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag, extend_direct_map_from_bag,
+    protect_kernel_mapping_from_bag, reserve_direct_map_1g_from_bag,
+    reserve_kernel_mapping_from_bag, rollback_kernel_mapping_from_bag,
+    unmap_kernel_mapping_from_bag,
 };
 use super::pt_node::{
     alloc_pt_node_from_bag, free_pt_node_from_bag, install_pt_node_allocator_for_test,
     pt_node_allocated_for_test, register_committed_pt_node, reset_committed_pt_nodes_for_test,
 };
 use super::pte::{
-    encode_leaf_pte, page_table_mut_from_phys, pte_is_branch, pte_phys, PTE_A, PTE_D, PTE_G, PTE_R,
-    PTE_U, PTE_V, PTE_W, PTE_X,
+    encode_leaf_pte, page_table_mut_from_phys, pte_phys, PTE_A, PTE_D, PTE_G, PTE_R, PTE_U, PTE_V,
+    PTE_W, PTE_X,
 };
 use super::topology::{
     bootstrap_satp_value, rv64_1g_leaf_index, rv64_2m_leaf_index, rv64_4k_leaf_index,
@@ -469,38 +469,22 @@ fn direct_map_extension_is_idempotent_for_existing_leaf() {
 }
 
 #[test]
-fn high_firmware_dtb_preseeds_its_direct_map_leaf_without_publishing_a_gap() {
+fn direct_map_extension_accounts_for_the_preinstalled_fdt_leaf() {
     let _guard = pmap_test_guard();
     let mut bag = test_bag();
-    publish_bootstrap_bag(&mut bag);
+    let fdt_leaf = PhysAddr(QEMU_RAM_BASE + QEMU_BOOTSTRAP_MAP_SIZE * 3);
+    map_bootstrap_pmap(&mut bag).map_direct_map_leaf(fdt_leaf);
+    bag.publish_bootstrap_pmap_info();
 
-    let official_dtb = PhysAddr(0x2_7fe0_0000);
-    cover_boot_firmware_dtb_from_bag(&bag, official_dtb).expect("cover official high DTB leaf");
+    extend_direct_map_from_bag(&bag, PhysAddr(QEMU_RAM_BASE + QEMU_BOOTSTRAP_MAP_SIZE * 4))
+        .expect("extend through FDT leaf");
 
-    let leaf_phys = PhysAddr(0x2_4000_0000);
-    let slot = rv64_1g_leaf_index(EXPECTED_DIRECT_MAP_BASE + leaf_phys.0);
+    let info = bag.bootstrap_pmap_info_ref().expect("pmap info");
+    assert_eq!(info.direct_map.size, QEMU_BOOTSTRAP_MAP_SIZE * 4);
+    assert_eq!(info.mapped.size, QEMU_BOOTSTRAP_MAP_SIZE * 4);
     assert_eq!(
-        bag.bootstrap_root_ref().0[slot],
-        encode_leaf_pte(leaf_phys, PTE_R | PTE_W | PTE_G)
-    );
-    assert_eq!(
-        bag.bootstrap_pmap_info_ref()
-            .expect("pmap info")
-            .direct_map
-            .size,
-        QEMU_BOOTSTRAP_MAP_SIZE,
-        "a non-contiguous bootstrap leaf must not inflate the published span"
-    );
-
-    extend_direct_map_from_bag(&bag, PhysAddr(0x2_8000_0000))
-        .expect("extend the contiguous direct map through the preseeded leaf");
-    assert_eq!(
-        bag.bootstrap_pmap_info_ref()
-            .expect("pmap info")
-            .direct_map
-            .size,
-        8 * QEMU_BOOTSTRAP_MAP_SIZE,
-        "the existing DTB leaf must join the published contiguous span"
+        bag.bootstrap_root_ref().0[rv64_1g_leaf_index(EXPECTED_DIRECT_MAP_BASE + fdt_leaf.0)],
+        encode_leaf_pte(fdt_leaf, PTE_R | PTE_W | PTE_G)
     );
 }
 
@@ -651,7 +635,6 @@ fn unmap_kernel_mapping_clears_leaf_and_reports_invalidation() {
     let _guard = pmap_test_guard();
     reset_typed_pt_allocator_test_state();
     reset_pt_node_pool_for_test();
-    reset_committed_pt_nodes_for_test();
     let mut bag = test_bag();
     publish_bootstrap_bag(&mut bag);
 
@@ -677,14 +660,9 @@ fn unmap_kernel_mapping_clears_leaf_and_reports_invalidation() {
     assert_eq!(result.invalidation().virt(), virt);
     assert_eq!(result.invalidation().size(), 2 * 1024 * 1024);
 
-    assert!(pte_is_branch(
-        bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)]
-    ));
-    let l1 = l1_table_for_test(&bag, virt).expect("retained kernel l1");
-    assert_eq!(l1.0[rv64_2m_leaf_index(virt.0)], 0);
+    assert_eq!(bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)], 0);
 
     shootdown_kernel_mapping(result.invalidation());
-    reset_committed_pt_nodes_for_test();
 }
 
 #[test]
@@ -777,7 +755,7 @@ fn shootdown_batch_coalesces_contiguous_invalidations() {
 }
 
 #[test]
-fn committed_kernel_4k_unmap_retains_intermediate_tables() {
+fn committed_4k_unmap_releases_empty_intermediate_tables() {
     let _guard = pmap_test_guard();
     reset_typed_pt_allocator_test_state();
     reset_pt_node_pool_for_test();
@@ -805,16 +783,11 @@ fn committed_kernel_4k_unmap_retains_intermediate_tables() {
         .expect("leaf should unmap");
 
     assert_eq!(result.phys(), phys);
-    assert!(pte_is_branch(
-        bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)]
-    ));
-    l1_table_for_test(&bag, virt).expect("retained kernel L1");
-    let l0 = l0_table_for_test(&bag, virt).expect("retained kernel L0");
-    assert_eq!(l0.0[rv64_4k_leaf_index(virt.0)], 0);
+    assert_eq!(bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)], 0);
     assert_eq!(
         TEST_TYPED_RELEASED.load(Ordering::Acquire),
-        0,
-        "kernel L0/L1 must remain until a globally quiescent teardown"
+        2,
+        "empty L0 and L1 tables should release their typed frames"
     );
 
     reset_typed_pt_allocator_test_state();
@@ -964,14 +937,13 @@ fn destroying_process_root_tears_down_committed_user_tables() {
 }
 
 #[test]
-fn process_root_unmap_retains_user_tables_until_root_destroy() {
+fn process_root_maps_protects_unmaps_and_prunes_user_tables() {
     let _guard = pmap_test_guard();
     reset_typed_pt_allocator_test_state();
     reset_pt_node_pool_for_test();
     let mut bag = test_bag();
     publish_bootstrap_bag(&mut bag);
 
-    let baseline_nodes = pt_node_allocated_for_test().count_ones();
     let root = create_pmap_root_from_bag(&bag).expect("process root");
     let virt = VirtAddr(0x4000);
     let phys = PhysAddr(0x8100_0000);
@@ -1011,18 +983,15 @@ fn process_root_unmap_retains_user_tables_until_root_destroy() {
     assert_eq!(result.phys(), phys);
 
     let root_table = unsafe { page_table_mut_from_phys(root.phys()) };
-    assert!(pte_is_branch(root_table.0[rv64_1g_leaf_index(virt.0)]));
-    let l1 = l1_table_mut_from_root(root_table, virt).expect("retained user l1");
-    let l0 = l0_table_mut(l1, virt).expect("retained user l0");
-    assert_eq!(l0.0[rv64_4k_leaf_index(virt.0)], 0);
+    assert_eq!(root_table.0[rv64_1g_leaf_index(virt.0)], 0);
     assert_eq!(
-        pt_node_allocated_for_test().count_ones(),
-        baseline_nodes + 3,
-        "process root and its empty L1/L0 must remain until root destroy"
+        pt_node_allocated_for_test(),
+        1,
+        "only the process root should remain allocated"
     );
 
     destroy_pmap_root_from_bag(&bag, root);
-    assert_eq!(pt_node_allocated_for_test().count_ones(), baseline_nodes);
+    assert_eq!(pt_node_allocated_for_test(), 0);
 }
 
 #[test]
