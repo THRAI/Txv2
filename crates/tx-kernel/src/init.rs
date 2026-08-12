@@ -1080,9 +1080,11 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         use tx_fs::tx_ext4::{
-            mount_ext4_read_write, BlockDeviceImage, Ext4FileIoRuntimeBinder,
+            mount_ext4_read_only, mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
+            Ext4FileIoRuntimeBinder, JournalPagePool,
         };
         use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+        use tx_subsystems::io_manager::block::DeviceKey;
 
         let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
             Self::write_board_sentinel_prefix();
@@ -1092,21 +1094,6 @@ impl<P: TxPlatform> CoreInit<P> {
             return false;
         };
 
-        let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_write(image) {
-            Ok(out) => out,
-            Err(_) => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
-                tx_hal::console_write_str::<P>(dev_name);
-                tx_hal::console_write_str::<P>(":err\n");
-                return false;
-            }
-        };
-        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
-            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
-        )));
-
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
         if dev_name == "vda"
             && Self::should_autodetect_boot_media_layout(
@@ -1114,10 +1101,17 @@ impl<P: TxPlatform> CoreInit<P> {
                 boot_info.initrd.is_some(),
             )
         {
-            let fs_ops = mount_output.fs_ops();
+            let probe = match mount_ext4_read_only(BlockDeviceImage::new(reg.ops)) {
+                Ok(out) => out,
+                Err(_) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:probe-err\n");
+                    return false;
+                }
+            };
             if Self::mounted_media_is_preliminary_suite(
-                fs_ops.as_ref(),
-                mount_output.root_fs_object_id,
+                probe.fs_ops().as_ref(),
+                probe.root_fs_object_id,
             ) {
                 PRELIMINARY_OSCOMP_MEDIA.store(true, Ordering::Release);
                 Self::write_board_sentinel_prefix();
@@ -1132,7 +1126,42 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>(":boot-media:layout:final\n");
         }
 
-        let ext4_payload = MountPayload::new_cap(
+        let device = DeviceKey::new(reg.devt.raw());
+        let image = BlockDeviceImage::new(reg.ops);
+        let Some(geometry) = image.block_geometry(device) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+            tx_hal::console_write_str::<P>(dev_name);
+            tx_hal::console_write_str::<P>(":geometry-err\n");
+            return false;
+        };
+        let pool = match JournalPagePool::new(32) {
+            Ok(pool) => pool,
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                tx_hal::console_write_str::<P>(dev_name);
+                tx_hal::console_write_str::<P>(":journal-pool-err\n");
+                return false;
+            }
+        };
+        let mount_output = match mount_ext4_read_write_with_discovered_journal(
+            image, geometry, device, pool,
+        ) {
+            Ok(out) => out,
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                tx_hal::console_write_str::<P>(dev_name);
+                tx_hal::console_write_str::<P>(":err\n");
+                return false;
+            }
+        };
+        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+        )));
+
+        let ext4_payload = MountPayload::new_cap_with_backend_planner(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
@@ -1140,6 +1169,7 @@ impl<P: TxPlatform> CoreInit<P> {
             MountOptions::default(),
             "ext4",
             SourceLabel::Static(dev_name),
+            mount_output.backend_planner(),
         )
         .expect("mount_sdcard_as_root_if_requested: payload reservation");
 
