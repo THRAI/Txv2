@@ -22,6 +22,49 @@ use crate::adapter::step_engine::{self as step_engine};
 #[cfg(test)]
 use crate::adapter::step_engine::{page_allocator, StepOutcome};
 
+/// Finals first-stage PID 1 policy. The script is executed by the Bash from
+/// the official root filesystem, so the kernel does not overwrite `/init`.
+const FINAL_TESTCODE: &[u8] = include_bytes!("final_testcode.sh");
+
+fn buildstorm_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
+    <P as tx_hal::BootInfoIf>::boot_info()
+        .cmdline
+        .is_some_and(|cmdline| {
+            cmdline
+                .split_ascii_whitespace()
+                .any(|token| token == "tx.profile=buildstorm")
+        })
+}
+
+fn cagent_diag_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
+    <P as tx_hal::BootInfoIf>::boot_info()
+        .cmdline
+        .is_some_and(|cmdline| {
+            cmdline
+                .split_ascii_whitespace()
+                .any(|token| token == "tx.profile=cagentdiag")
+        })
+}
+
+/// The judge boots a block-backed root without selecting an explicit init
+/// lane. Explicit developer profiles keep using the BootPlan path below.
+fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
+    if !ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
+        return true;
+    };
+    !cmdline.split_ascii_whitespace().any(|token| {
+        token.starts_with("init=")
+            || token.starts_with("tx.runsh=")
+            || matches!(
+                token,
+                "tx.profile=onsite" | "tx.profile=busybox" | "tx.profile=pretest"
+            )
+    })
+}
+
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
@@ -252,6 +295,60 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>(":cpu0-local=");
             Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
             tx_hal::console_write_str::<P>("\n");
+        }
+
+        // Finals default: keep the official block-backed ext4 image mounted
+        // at `/` and run the competition policy through the image's Bash.
+        if final_testcode_autorun_enabled::<P>() {
+            let default_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+            ];
+            let buildstorm_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+                b"TX_FINAL_MODE=buildstorm-only",
+            ];
+            let cagent_diag_envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+                b"TX_FINAL_MODE=cagent-diag",
+            ];
+            let envp = if cagent_diag_profile_enabled::<P>() {
+                cagent_diag_envp
+            } else if buildstorm_profile_enabled::<P>() {
+                buildstorm_envp
+            } else {
+                default_envp
+            };
+            let argv: &[&[u8]] = &[b"bash", b"-c", FINAL_TESTCODE];
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/bin/bash",
+                argv,
+                envp,
+                &cred,
+            ));
+            Self::write_board_sentinel_prefix();
+            match outcome {
+                Ok(()) => {
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:ok\n");
+                    return;
+                }
+                Err(e) => {
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:fail:");
+                    tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                    tx_hal::console_write_str::<P>("\n");
+                    panic!("bootstrap exec for finals /bin/bash failed: {e:?}");
+                }
+            }
         }
 
         let sdcard_test_init = match boot_plan.first_userspace {
