@@ -151,6 +151,7 @@ static PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: Platform::BOARD,
     spi_sd: Some(SPI0_CS0_SD),
     mmio_regions: MMIO_REGIONS,
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };
@@ -528,6 +529,8 @@ mod tests {
 
     #[test]
     fn rtc_irq_absent_uses_zero_sentinel() {
+        assert_eq!(<Platform as IrqIf>::uart_irq(), 0);
         assert_eq!(<Platform as IrqIf>::RTC_IRQ, 0);
+        assert_eq!(<Platform as IrqIf>::rtc_irq(), 0);
     }
 }

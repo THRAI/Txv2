@@ -55,7 +55,10 @@ pub fn step_write_for_process(
     step_write(tty, bytes, guard)
 }
 
-fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+pub(super) fn kick_transport(
+    tty: &Cap<TtyIdentity>,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize, ByteProgress> {
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out};
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -106,17 +109,11 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
                     if let Some((carrier, interests)) =
                         crate::tty::notification::wait_source_parts(&shape)
                     {
-                        let written = progress.bytes();
+                        let written = progress.bytes().min(chunk.len());
                         if written < chunk.len() {
                             restore_front(tty, &payload, &chunk[written..]);
-                        } else {
-                            // Defensive: if the driver claimed it advanced
-                            // more than we passed, restore nothing.
                         }
                         if written == 0 {
-                            // Pure block: restore the chunk so a later kick
-                            // can try again.
-                            restore_front(tty, &payload, &chunk);
                             crate::tty::notification::yield_on_wait_source(
                                 ByteProgress::EMPTY,
                                 carrier,
@@ -262,7 +259,27 @@ pub fn step_write(
     });
 
     if consumed == 0 {
-        return crate::tty::notification::yield_writable_for_tty(tty.raw() as u64);
+        // RX-side echo and another writer can leave bytes in the shared output
+        // queue. The transport kick is the operation that creates space, so a
+        // writer must try it before parking on writable readiness; otherwise a
+        // full queue waits for the very drain this branch skipped.
+        use crate::tty::adapter::step_engine::StepOutcome as V3Out;
+        return match kick_transport(tty, guard) {
+            V3Out::Done(drained) if drained > 0 => V3Out::Continue {
+                progress: ByteProgress::EMPTY,
+            },
+            V3Out::Done(_) => crate::tty::notification::yield_writable_for_tty(tty.raw() as u64),
+            V3Out::Continue { .. } => V3Out::Continue {
+                progress: ByteProgress::EMPTY,
+            },
+            // The transport progress belongs to bytes that were already in
+            // the shared output queue. None of this call's input was consumed.
+            V3Out::Yield { shape, .. } => V3Out::Yield {
+                progress: ByteProgress::EMPTY,
+                shape,
+            },
+            V3Out::Err(err) => V3Out::Err(err),
+        };
     }
 
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out};
@@ -425,11 +442,35 @@ mod tests {
         }
     }
 
+    struct PartialBlockingOps {
+        carrier: u64,
+        interest: u64,
+    }
+
+    impl CharDeviceOps for PartialBlockingOps {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+            StepOutcome::Done(0)
+        }
+
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+            let written = usize::from(!bytes.is_empty());
+            StepOutcome::yield_on_wait_source(
+                ByteProgress::new(written),
+                self.carrier,
+                self.interest,
+            )
+        }
+    }
+
     static BLOCKING_OPS: BlockingOps = BlockingOps {
         carrier: 0xABCD_0001,
         interest: 0x42,
     };
     static COMPLETING_OPS: CompletingOps = CompletingOps;
+    static PARTIAL_BLOCKING_OPS: PartialBlockingOps = PartialBlockingOps {
+        carrier: 0xABCD_0002,
+        interest: 0x43,
+    };
 
     static BLOCKING_BINDING: CharDeviceBinding = CharDeviceBinding {
         devt: DevT::new(4, 65),
@@ -440,6 +481,11 @@ mod tests {
         devt: DevT::new(4, 66),
         name: "tty-completing",
         ops: &COMPLETING_OPS,
+    };
+    static PARTIAL_BLOCKING_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(4, 67),
+        name: "tty-partial-blocking",
+        ops: &PARTIAL_BLOCKING_OPS,
     };
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
@@ -541,6 +587,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn step_write_full_queue_drains_before_retrying_new_bytes() {
+        let _setup = setup();
+        let tty = alloc_tty_with(
+            TtyKind::SerialHardware,
+            20,
+            "ttyV3-full",
+            TtyPayload::new_hardware(&COMPLETING_BINDING),
+        );
+        let payload = tty.live_payload().expect("live tty payload");
+        payload.with_output_queue(|queue| {
+            for _ in 0..crate::tty::structure::payload::OUTPUT_CAP {
+                queue.push(b'e').expect("output queue capacity");
+            }
+        });
+
+        let guard = step_engine::guard();
+        let first = step_write(&tty, b"X", &guard);
+        assert!(
+            matches!(
+                first,
+                StepOutcome::Continue { progress } if progress.is_empty()
+            ),
+            "full output queue must be drained before retry: {first:?}",
+        );
+        assert!(payload.with_output_queue(|queue| queue.is_empty()));
+
+        assert!(matches!(
+            step_write(&tty, b"X", &guard),
+            StepOutcome::Done(1)
+        ));
+        assert!(payload.with_output_queue(|queue| queue.is_empty()));
+        drop(guard);
+    }
+
+    #[test]
+    fn step_write_full_queue_does_not_report_old_transport_progress() {
+        let _setup = setup();
+        let tty = alloc_tty_with(
+            TtyKind::SerialHardware,
+            21,
+            "ttyV3-full-partial",
+            TtyPayload::new_hardware(&PARTIAL_BLOCKING_BINDING),
+        );
+        let payload = tty.live_payload().expect("live tty payload");
+        payload.with_output_queue(|queue| {
+            for _ in 0..crate::tty::structure::payload::OUTPUT_CAP {
+                queue.push(b'e').expect("output queue capacity");
+            }
+        });
+
+        let guard = step_engine::guard();
+        let outcome = step_write(&tty, b"X", &guard);
+        assert!(matches!(
+            outcome,
+            StepOutcome::Yield { progress, .. } if progress.is_empty()
+        ));
+        assert_eq!(
+            payload.with_output_queue(|queue| queue.len()),
+            crate::tty::structure::payload::OUTPUT_CAP - 1,
+        );
+        drop(guard);
+    }
+
     /// **Load-bearing test.** When the hardware kick blocks after
     /// `process_output` consumed bytes, `step_write` emits
     /// `AdvancedThenBlocked(consumed, wait)`. `step_write` must
@@ -596,6 +706,8 @@ mod tests {
             }
             other => panic!("expected v3 Yield::OnWaitSource with byte progress, got {other:?}"),
         }
+        let payload = tty.live_payload().expect("live tty payload");
+        assert_eq!(payload.with_output_queue(|queue| queue.len()), 5);
     }
 
     // -- step_write_for_caller tests --------------------------------

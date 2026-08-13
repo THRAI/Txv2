@@ -69,7 +69,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Tcp(TcpState::Connected { .. }) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;
@@ -84,7 +84,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::UnixStream(UnixStreamState::Connected { .. }) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;
@@ -97,7 +97,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Sctp(TcpState::Connected { .. }) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;
@@ -110,7 +110,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. }) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;
@@ -124,7 +124,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             | UnixDatagramState::Connected { .. }
             | UnixDatagramState::ConnectedPair { .. },
         ) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;
@@ -134,7 +134,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::RawIcmp(_) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;
@@ -144,7 +144,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             }
         }
         SocketProtocol::Rds(RdsState::Bound { .. }) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;
@@ -156,7 +156,7 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
         SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
         | SocketProtocol::Packet(_) => {
-            if io.recv_len > 0
+            if io.recv_ready
                 || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
             {
                 mask |= PollMask::IN;

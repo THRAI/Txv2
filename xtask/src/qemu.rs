@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::image::{
     alpine_initramfs_name, busybox_initramfs_name, busybox_root_ext4_name, test_initramfs_name,
 };
+use crate::network_scenario::{NetworkBackend, NetworkScenario, ScenarioTarget};
 use crate::target::{Profile, TxTarget};
 use crate::util::{
     append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
@@ -45,6 +46,7 @@ pub(crate) enum QemuNet {
     User,
     Tap(String),
     Bridge(String),
+    Scenario(NetworkScenario),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,12 +80,24 @@ enum SentinelState {
 
 pub(crate) fn qemu(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
+    if target == TxTarget::La64Ls2k1000 {
+        return Err(
+            "la64-2k1000 is a physical-board target; use build/image and U-Boot, not qemu".into(),
+        );
+    }
     let profile = Profile::parse(&option_value(&args, "--profile")?)?;
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
-    let options = qemu_options(root, &args)?;
+    let options = qemu_options(root, target, &args)?;
     let command = qemu_command(root, target, profile, &options)?;
 
     println!("{}", shell_join(&command));
+    if let QemuNet::Scenario(scenario) = &options.net {
+        let expected = scenario.expectations();
+        println!(
+            "net-expect: address={:?} gateway={:?} dns={:?}",
+            expected.address, expected.gateway, expected.dns
+        );
+    }
     if options.expect_sentinel {
         println!("serial: {}", serial_log_relative(target, profile).display());
         println!("expect: {}", expected_sentinel(target));
@@ -118,7 +132,7 @@ pub(crate) fn qemu(root: &Path, args: Vec<String>) -> Result<()> {
     }
 }
 
-fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
+fn qemu_options(root: &Path, target: TxTarget, args: &[String]) -> Result<QemuOptions> {
     let timeout = optional_option_value(args, "--timeout-ms")
         .map(|value| {
             value
@@ -151,7 +165,7 @@ fn qemu_options(root: &Path, args: &[String]) -> Result<QemuOptions> {
     let append_cmdline = optional_option_value(args, "--append-cmdline");
     let extra_rv64_ext4 = optional_option_value(args, "--extra-rv64-ext4")
         .map(|path| resolve_path(root, PathBuf::from(path)));
-    let net = qemu_net(args)?;
+    let net = qemu_net(root, target, args)?;
     let host_ping = host_ping_options(args, expect_sentinel, &net)?;
 
     Ok(QemuOptions {
@@ -186,7 +200,20 @@ fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
     Ok(values)
 }
 
-pub(crate) fn qemu_net(args: &[String]) -> Result<QemuNet> {
+pub(crate) fn qemu_net(root: &Path, target: TxTarget, args: &[String]) -> Result<QemuNet> {
+    let scenario_path = optional_option_value(args, "--net-scenario");
+    if scenario_path.is_some() && args.iter().any(|arg| arg == "--net") {
+        return Err("--net-scenario PATH conflicts with explicit --net".into());
+    }
+    if let Some(path) = scenario_path {
+        let path = resolve_path(root, PathBuf::from(path));
+        let scenario = NetworkScenario::from_path(&path).map_err(|error| error.to_string())?;
+        scenario
+            .ensure_target(scenario_target(target))
+            .map_err(|error| error.to_string())?;
+        return Ok(QemuNet::Scenario(scenario));
+    }
+
     let Some(value) = optional_option_value(args, "--net") else {
         return Ok(QemuNet::None);
     };
@@ -239,9 +266,9 @@ fn host_ping_options(
     if !expect_sentinel {
         return Err("--host-ping-guest requires --expect-sentinel".into());
     }
-    if !matches!(net, QemuNet::Tap(_) | QemuNet::Bridge(_)) {
+    if !qemu_net_supports_host_ping(net) {
         return Err(
-            "--host-ping-guest requires --net tap:<ifname> or --net bridge:<bridge>".into(),
+            "--host-ping-guest requires --net tap:<ifname> or --net bridge:<bridge>, or an equivalent --net-scenario".into(),
         );
     }
 
@@ -277,6 +304,61 @@ fn host_ping_options(
         count,
         timeout,
     }))
+}
+
+fn qemu_net_supports_host_ping(net: &QemuNet) -> bool {
+    match net {
+        QemuNet::Tap(_) | QemuNet::Bridge(_) => true,
+        QemuNet::Scenario(scenario) => matches!(
+            scenario.backend(),
+            NetworkBackend::Tap { .. } | NetworkBackend::Bridge { .. }
+        ),
+        QemuNet::None | QemuNet::User => false,
+    }
+}
+
+fn scenario_target(target: TxTarget) -> ScenarioTarget {
+    match target {
+        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => ScenarioTarget::QemuRv64,
+        TxTarget::La64Qemu => ScenarioTarget::QemuLa64,
+        TxTarget::La64Ls2k1000 => unreachable!("physical board rejected before QEMU setup"),
+    }
+}
+
+fn resolved_network_scenario(target: TxTarget, net: &QemuNet) -> Result<Option<NetworkScenario>> {
+    let scenario_target = scenario_target(target);
+    let scenario = match net {
+        QemuNet::None => return Ok(None),
+        QemuNet::Scenario(scenario) => scenario.clone(),
+        QemuNet::User => NetworkScenario::default_qemu_user(scenario_target)
+            .map_err(|error| error.to_string())?,
+        QemuNet::Tap(ifname) => NetworkScenario::default_qemu_user(scenario_target)
+            .and_then(|scenario| {
+                scenario.with_backend(NetworkBackend::Tap {
+                    id: "net0".into(),
+                    ifname: ifname.clone(),
+                })
+            })
+            .map_err(|error| error.to_string())?,
+        QemuNet::Bridge(bridge) => NetworkScenario::default_qemu_user(scenario_target)
+            .and_then(|scenario| {
+                scenario.with_backend(NetworkBackend::Bridge {
+                    id: "net0".into(),
+                    bridge: bridge.clone(),
+                })
+            })
+            .map_err(|error| error.to_string())?,
+    };
+    scenario
+        .ensure_target(scenario_target)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(scenario))
+}
+
+pub(crate) fn network_guest_cmdline(target: TxTarget, net: &QemuNet) -> Result<Vec<String>> {
+    Ok(resolved_network_scenario(target, net)?
+        .map(|scenario| scenario.render_guest_cmdline())
+        .unwrap_or_default())
 }
 
 fn qemu_command(
@@ -347,6 +429,7 @@ fn qemu_command(
             args.push(opensbi_bios(root));
         }
         TxTarget::La64Qemu => {}
+        TxTarget::La64Ls2k1000 => unreachable!("physical board rejected before QEMU setup"),
     }
 
     if options.expect_sentinel {
@@ -386,7 +469,12 @@ fn qemu_command(
             (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
         let cmdline_base = format!("{cmdline_base}{maxcpus_suffix}");
-        let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
+        let cmdline_base = merge_network_guest_cmdline(
+            &cmdline_base,
+            target,
+            &options.net,
+            options.append_cmdline.as_deref(),
+        )?;
         let cmdline = append_tty_winsize_cmdline(&cmdline_base);
         // LA64's unified high kernel load base is not compatible with
         // QEMU's direct `-initrd` placement.  The board copies the image
@@ -418,7 +506,12 @@ fn qemu_command(
             )
         };
         let cmdline_base = format!("{cmdline_base}{maxcpus_suffix}");
-        let cmdline_base = append_extra_cmdline(&cmdline_base, options.append_cmdline.as_deref());
+        let cmdline_base = merge_network_guest_cmdline(
+            &cmdline_base,
+            target,
+            &options.net,
+            options.append_cmdline.as_deref(),
+        )?;
         let cmdline = append_tty_winsize_cmdline(&cmdline_base);
         let initramfs = root
             .join("target")
@@ -445,12 +538,15 @@ fn qemu_command(
                 args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
             }
             TxTarget::La64Qemu => {
-                args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0".into());
+                args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0,addr=1".into());
             }
             TxTarget::Rv64Qemu => {
                 // The RV64 block probe expects the first virtio-mmio slot.
                 // Pinning avoids device-order changes when networking is on.
                 args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
+            }
+            TxTarget::La64Ls2k1000 => {
+                unreachable!("physical board rejected before QEMU setup")
             }
         }
         args.push("-drive".into());
@@ -477,7 +573,7 @@ fn qemu_command(
         args.push("-device".into());
         args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
     }
-    append_net_args(&mut args, target, &options.net);
+    append_net_args(&mut args, target, &options.net)?;
     args.push("-d".into());
     args.push("guest_errors".into());
     args.push("-D".into());
@@ -496,6 +592,20 @@ fn append_extra_cmdline(base: &str, extra: Option<&str>) -> String {
     }
 }
 
+pub(crate) fn merge_network_guest_cmdline(
+    base: &str,
+    target: TxTarget,
+    net: &QemuNet,
+    user_extra: Option<&str>,
+) -> Result<String> {
+    let scenario_tokens = network_guest_cmdline(target, net)?.join(" ");
+    let with_scenario = append_extra_cmdline(base, Some(&scenario_tokens));
+    // Kernel boot-argument parsing uses the first value for a key. Scenario
+    // tokens intentionally precede free-form user additions, so an appended
+    // `tx.net.*` duplicate cannot override the validated scenario.
+    Ok(append_extra_cmdline(&with_scenario, user_extra))
+}
+
 fn qemu_smp(target: TxTarget, profile: Profile, options: &QemuOptions) -> usize {
     if let Some(smp) = options.smp {
         return smp;
@@ -505,48 +615,35 @@ fn qemu_smp(target: TxTarget, profile: Profile, options: &QemuOptions) -> usize 
         (TxTarget::Rv64Qemu, Profile::Alpine) => 1,
         (TxTarget::Rv64Qemu | TxTarget::La64Qemu, _) => 4,
         (TxTarget::Rv64M1DockMock, _) => 1,
-    }
-}
-
-pub(crate) fn append_net_args(args: &mut Vec<String>, target: TxTarget, net: &QemuNet) {
-    match net {
-        QemuNet::None => {}
-        QemuNet::User => {
-            args.push("-netdev".into());
-            args.push("user,id=net0".into());
-            push_net_device(args, target);
-        }
-        QemuNet::Tap(ifname) => {
-            args.push("-netdev".into());
-            args.push(format!(
-                "tap,id=net0,ifname={ifname},script=no,downscript=no"
-            ));
-            push_net_device(args, target);
-        }
-        QemuNet::Bridge(bridge) => {
-            args.push("-netdev".into());
-            args.push(format!("bridge,id=net0,br={bridge}"));
-            push_net_device(args, target);
+        (TxTarget::La64Ls2k1000, _) => {
+            unreachable!("physical board rejected before QEMU setup")
         }
     }
 }
 
-fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
-    args.push("-device".into());
-    match target {
-        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
-            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0".into());
+pub(crate) fn append_net_args(
+    args: &mut Vec<String>,
+    target: TxTarget,
+    net: &QemuNet,
+) -> Result<()> {
+    match resolved_network_scenario(target, net)? {
+        Some(scenario) => {
+            args.extend(
+                scenario
+                    .render_qemu_network_args(scenario_target(target))
+                    .map_err(|error| error.to_string())?,
+            );
         }
-        TxTarget::La64Qemu => {
-            args.push("virtio-net-pci,netdev=net0".into());
-        }
+        None => args.extend(["-nic".to_owned(), "none".to_owned()]),
     }
+    Ok(())
 }
 
 fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => None,
         TxTarget::La64Qemu => Some("la464"),
+        TxTarget::La64Ls2k1000 => unreachable!("physical board rejected before QEMU setup"),
     }
 }
 
@@ -555,6 +652,9 @@ fn qemu_memory(target: TxTarget, profile: Profile) -> &'static str {
         (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
         (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
         (TxTarget::La64Qemu, _) => "1152M",
+        (TxTarget::La64Ls2k1000, _) => {
+            unreachable!("physical board rejected before QEMU setup")
+        }
     }
 }
 
@@ -885,6 +985,18 @@ mod tests {
     }
 
     #[test]
+    fn qemu_rejects_physical_target_before_setup() {
+        let args = vec![
+            "--target".into(),
+            "la64-2k1000".into(),
+            "--profile".into(),
+            "smoke".into(),
+        ];
+        let err = qemu(Path::new("/path/that/does/not/exist"), args).unwrap_err();
+        assert!(err.contains("physical-board target"));
+    }
+
+    #[test]
     fn derives_rv64_qemu_sentinel_from_board_name() {
         assert_eq!(
             expected_sentinel(TxTarget::Rv64Qemu),
@@ -1041,25 +1153,21 @@ mod tests {
 
     #[test]
     fn qemu_smoke_command_captures_serial_without_block_image() {
+        let root = Path::new("/tmp/tx");
         let options = QemuOptions {
             expect_sentinel: true,
             ..test_options()
         };
-        let command = qemu_command(
-            Path::new("/tmp/tx"),
-            TxTarget::Rv64Qemu,
-            Profile::Smoke,
-            &options,
-        )
-        .unwrap();
+        let command = qemu_command(root, TxTarget::Rv64Qemu, Profile::Smoke, &options).unwrap();
         let rendered = command.join(" ");
         assert!(rendered.contains("qemu-system-riscv64"));
         assert!(rendered.contains("-machine virt"));
         assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-rv64-qemu-smoke.serial.log"));
-        assert!(rendered.contains(
-            "-kernel /tmp/tx/target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt"
-        ));
+        assert!(rendered.contains(&format!(
+            "-kernel {}",
+            TxTarget::Rv64Qemu.kernel_path(root).display()
+        )));
         assert!(
             rendered.contains("-initrd /tmp/tx/target/images/test-init-initramfs-rv64-qemu.cpio")
         );
@@ -1134,7 +1242,8 @@ mod tests {
         .unwrap();
         let rendered = command.join(" ");
 
-        assert!(rendered.contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0"));
+        assert!(rendered
+            .contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0,addr=1"));
         assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
         assert!(rendered.contains(
             "-fw_cfg name=opt/tx.cmdline,string=tx.profile=busybox tx.boot.mode=busybox console=ttyS0"
@@ -1165,7 +1274,7 @@ mod tests {
         .unwrap()
         .join(" ");
         assert!(rv64.contains("-netdev user,id=net0"));
-        assert!(rv64.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"));
+        assert!(rv64.contains("-device virtio-net-device,netdev=net0"));
 
         let la64 = qemu_command(
             Path::new("/tmp/tx"),
@@ -1185,22 +1294,157 @@ mod tests {
     }
 
     #[test]
+    fn qemu_net_none_explicitly_disables_machine_default_nics() {
+        for target in [TxTarget::Rv64Qemu, TxTarget::La64Qemu] {
+            let command = qemu_command(
+                Path::new("/tmp/tx"),
+                target,
+                Profile::Smoke,
+                &QemuOptions {
+                    expect_sentinel: true,
+                    no_block: true,
+                    net: QemuNet::None,
+                    ..test_options()
+                },
+            )
+            .unwrap()
+            .join(" ");
+            assert!(command.contains("-nic none"));
+            assert!(!command.contains("virtio-net"));
+        }
+    }
+
+    #[test]
+    fn rv64_busybox_block_and_network_use_distinct_mmio_buses() {
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Busybox,
+            &QemuOptions {
+                net: QemuNet::User,
+                ..test_options()
+            },
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("-device virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0"));
+        assert!(command.contains("-device virtio-net-device,netdev=net0"));
+        assert!(!command.contains("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"));
+    }
+
+    #[test]
     fn qemu_net_parses_tap_and_bridge_backends() {
+        let root = Path::new("/tmp/tx");
         assert_eq!(
-            qemu_net(&["--net".into(), "tap:tap0".into()]).unwrap(),
+            qemu_net(
+                root,
+                TxTarget::Rv64Qemu,
+                &["--net".into(), "tap:tap0".into()]
+            )
+            .unwrap(),
             QemuNet::Tap("tap0".into())
         );
         assert_eq!(
-            qemu_net(&["--net".into(), "bridge:br0".into()]).unwrap(),
+            qemu_net(
+                root,
+                TxTarget::Rv64Qemu,
+                &["--net".into(), "bridge:br0".into()]
+            )
+            .unwrap(),
             QemuNet::Bridge("br0".into())
         );
-        assert!(qemu_net(&["--net".into(), "tap:".into()]).is_err());
+        assert!(qemu_net(root, TxTarget::Rv64Qemu, &["--net".into(), "tap:".into()]).is_err());
+    }
+
+    #[test]
+    fn qemu_net_scenario_conflicts_with_explicit_net() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let error = qemu_net(
+            root,
+            TxTarget::Rv64Qemu,
+            &[
+                "--net".into(),
+                "user".into(),
+                "--net-scenario".into(),
+                "tools/network-scenarios/default-qemu-user-rv64.toml".into(),
+            ],
+        )
+        .expect_err("explicit net and scenario must conflict");
+        assert!(error.contains("conflicts with explicit --net"));
+    }
+
+    #[test]
+    fn qemu_consumer_uses_relocated_changed_subnet_scenario() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let net = qemu_net(
+            root,
+            TxTarget::Rv64Qemu,
+            &[
+                "--net-scenario".into(),
+                "tools/network-scenarios/mutations/rv64-relocated-changed-subnet.toml".into(),
+            ],
+        )
+        .expect("load mutation scenario");
+        let command = qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Smoke,
+            &QemuOptions {
+                no_block: true,
+                append_cmdline: Some("tx.net.mode=none tx.test.user=1".into()),
+                net,
+                ..test_options()
+            },
+        )
+        .expect("render scenario through qemu consumer")
+        .join(" ");
+
+        assert!(command.contains("bus=virtio-mmio-bus.7"));
+        assert!(command.contains("old-location-decoy"));
+        assert!(command.contains("bus=virtio-mmio-bus.1"));
+        assert!(command.contains("post-network-rng"));
+        assert!(command.contains("net=172.31.44.0/24"));
+        let before = command.find("old-location-decoy").expect("before decoy");
+        let network = command
+            .find("virtio-net-device")
+            .expect("relocated network device");
+        let after = command.find("post-network-rng").expect("after auxiliary");
+        assert!(before < network && network < after);
+        let scenario_mode = command.find("tx.net.mode=dhcp").expect("scenario mode");
+        let user_mode = command.find("tx.net.mode=none").expect("user duplicate");
+        assert!(
+            scenario_mode < user_mode,
+            "scenario value must win first-match parsing"
+        );
+    }
+
+    #[test]
+    fn qemu_net_scenario_rejects_target_mismatch() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let error = qemu_net(
+            root,
+            TxTarget::La64Qemu,
+            &[
+                "--net-scenario".into(),
+                "tools/network-scenarios/default-qemu-user-rv64.toml".into(),
+            ],
+        )
+        .expect_err("RV64 scenario must not render for LA64");
+        assert!(error.contains("does not match requested target qemu-la64"));
     }
 
     #[test]
     fn qemu_host_ping_requires_sentinel_and_tap_or_bridge() {
         let without_sentinel = qemu_options(
             Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
             &[
                 "--target".into(),
                 "rv64-qemu".into(),
@@ -1217,6 +1461,7 @@ mod tests {
 
         let user_net = qemu_options(
             Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
             &[
                 "--target".into(),
                 "rv64-qemu".into(),
@@ -1234,9 +1479,27 @@ mod tests {
     }
 
     #[test]
+    fn qemu_host_ping_scenario_accepts_only_tap_or_bridge_backend() {
+        let user =
+            NetworkScenario::default_qemu_user(ScenarioTarget::QemuRv64).expect("default scenario");
+        assert!(!qemu_net_supports_host_ping(&QemuNet::Scenario(
+            user.clone()
+        )));
+
+        let tap = user
+            .with_backend(NetworkBackend::Tap {
+                id: "net0".into(),
+                ifname: "tap0".into(),
+            })
+            .expect("tap scenario");
+        assert!(qemu_net_supports_host_ping(&QemuNet::Scenario(tap)));
+    }
+
+    #[test]
     fn qemu_host_ping_parses_options_and_command() {
         let options = qemu_options(
             Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
             &[
                 "--target".into(),
                 "rv64-qemu".into(),
@@ -1269,6 +1532,7 @@ mod tests {
     fn qemu_smp_option_overrides_target_default() {
         let options = qemu_options(
             Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
             &[
                 "--expect-sentinel".into(),
                 "--target".into(),
@@ -1341,6 +1605,7 @@ mod tests {
     fn qemu_boot_mode_option_rejects_unknown_values() {
         let err = qemu_options(
             Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
             &[
                 "--target".into(),
                 "rv64-qemu".into(),

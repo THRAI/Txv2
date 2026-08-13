@@ -168,9 +168,10 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_unix_stream_peer(socket.raw()));
         }
         SocketProtocol::UnixStream(UnixStreamState::Init | UnixStreamState::Closed) => {}
-        SocketProtocol::NetlinkRoute(_)
-        | SocketProtocol::NetlinkNetfilter(_)
-        | SocketProtocol::Packet(_) => {}
+        SocketProtocol::Packet(_) => {
+            bindings_withdrawn += withdraw_ok(table.withdraw_packet_socket(socket.raw()));
+        }
+        SocketProtocol::NetlinkRoute(_) | SocketProtocol::NetlinkNetfilter(_) => {}
     }
 
     if deferred_tcp_close {
@@ -433,13 +434,11 @@ fn withdraw_udp_bound_if_owner(
     local: crate::net::structure::IpEndpoint,
     guard: &Guard<'_>,
 ) -> usize {
-    let Some(bound) = table.lookup_udp_bound_exact(local, guard) else {
-        return 0;
-    };
-    if bound.raw() != socket.raw() {
-        return 0;
-    }
-    withdraw_ok(table.withdraw_udp_bound(local))
+    usize::from(
+        table
+            .withdraw_udp_bound_owner(local, socket.raw(), guard)
+            .is_ok(),
+    )
 }
 
 fn withdraw_tcp_bound_if_owner(

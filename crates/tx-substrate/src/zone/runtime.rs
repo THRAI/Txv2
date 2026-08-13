@@ -5,9 +5,12 @@
 //! once before any zone reservation can run.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use tx_hal::{CpuId, CpuPinGuard, PercpuIf, PhysAddr, SmpIf, TxPlatform};
+use tx_hal::{
+    CpuId, CpuPinGuard, CpuPinReason, IrqIf, LocalExecutionGuard, PercpuIf, PhysAddr, SmpIf,
+    TxPlatform,
+};
 
 use super::ZoneError;
 
@@ -22,8 +25,9 @@ pub enum ZoneRuntimeState {
 
 static ZONE_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static ZONE_RUNTIME_STATE: AtomicUsize = AtomicUsize::new(ZoneRuntimeState::NotReady as usize);
-/// Number of CPUs that may access per-CPU buckets.
-static POSSIBLE_CPUS: AtomicUsize = AtomicUsize::new(1);
+/// Raw CPU-ID mask for CPUs that may access per-CPU buckets. The mask may be
+/// sparse, so its population count cannot be used as an array bound.
+static POSSIBLE_CPU_MASK: AtomicU64 = AtomicU64::new(1);
 /// Runtime page size used for slab layout and page-base recovery.
 static PAGE_SIZE: AtomicUsize = AtomicUsize::new(4096);
 /// Base virtual address of the direct map.
@@ -45,8 +49,12 @@ impl RuntimeHookCell {
 }
 
 pub fn init_on_bsp<P: TxPlatform>() -> Result<(), ZoneError> {
-    let possible_cpus = P::possible_cpu_count();
-    if possible_cpus == 0 || possible_cpus > MAX_ZONE_CPUS {
+    let possible_cpu_mask = P::possible_cpus();
+    let possible_cpu_count = possible_cpu_mask.count();
+    if possible_cpu_count == 0
+        || possible_cpu_count > MAX_ZONE_CPUS
+        || !possible_cpu_mask.contains(<P as PercpuIf>::current_cpu_id())
+    {
         return Err(ZoneError::InvalidState);
     }
 
@@ -54,7 +62,7 @@ pub fn init_on_bsp<P: TxPlatform>() -> Result<(), ZoneError> {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| ZoneError::AlreadyInitialized)?;
 
-    POSSIBLE_CPUS.store(possible_cpus, Ordering::Release);
+    POSSIBLE_CPU_MASK.store(possible_cpu_mask.bits(), Ordering::Release);
     PAGE_SIZE.store(P::PAGE_SIZE, Ordering::Release);
     DIRECT_MAP_BASE.store(P::DIRECT_MAP_BASE.0, Ordering::Release);
     unsafe {
@@ -85,7 +93,12 @@ pub fn init_for_test_with_possible_cpus(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| ZoneError::AlreadyInitialized)?;
 
-    POSSIBLE_CPUS.store(possible_cpus, Ordering::Release);
+    let possible_cpu_bits = if possible_cpus == MAX_ZONE_CPUS {
+        u64::MAX
+    } else {
+        (1u64 << possible_cpus) - 1
+    };
+    POSSIBLE_CPU_MASK.store(possible_cpu_bits, Ordering::Release);
     PAGE_SIZE.store(page_size, Ordering::Release);
     DIRECT_MAP_BASE.store(direct_map_base, Ordering::Release);
     unsafe {
@@ -97,8 +110,10 @@ pub fn init_for_test_with_possible_cpus(
 }
 
 pub fn init_on_ap(cpu: CpuId) -> Result<(), ZoneError> {
-    ensure_initialized()?;
-    if cpu.0 >= POSSIBLE_CPUS.load(Ordering::Acquire) {
+    // `Running` is published only after the mask, address facts, hooks, and
+    // registry have all been installed by the BSP.
+    ensure_running()?;
+    if !is_possible_cpu(cpu) {
         return Err(ZoneError::InvalidState);
     }
     // Once all known zones are registered, each AP gets an empty local bucket
@@ -160,14 +175,18 @@ pub fn freeze_for_shutdown() -> Result<(), ZoneError> {
     }
 }
 
-pub fn pin_current_cpu() -> Result<CpuPinGuard, ZoneError> {
+pub fn pin_current_cpu(reason: CpuPinReason) -> Result<CpuPinGuard, ZoneError> {
     ensure_running()?;
-    let guard = unsafe { ((*HOOKS.get()).pin_current_cpu)() };
-    if guard.cpu_id().0 < POSSIBLE_CPUS.load(Ordering::Acquire) {
+    let guard = unsafe { ((*HOOKS.get()).pin_current_cpu)(reason) };
+    if is_possible_cpu(guard.cpu_id()) {
         Ok(guard)
     } else {
         Err(ZoneError::InvalidState)
     }
+}
+
+pub(crate) fn exclude_local_execution() -> LocalExecutionGuard {
+    unsafe { ((*HOOKS.get()).exclude_local_execution)() }
 }
 
 pub fn page_size() -> usize {
@@ -186,10 +205,20 @@ pub fn direct_map_ptr(phys: PhysAddr) -> Result<*mut u8, ZoneError> {
 }
 
 #[doc(hidden)]
+pub fn set_direct_map_base_for_test(direct_map_base: usize) -> Result<(), ZoneError> {
+    ensure_running()?;
+    if direct_map_base == 0 {
+        return Err(ZoneError::InvalidState);
+    }
+    DIRECT_MAP_BASE.store(direct_map_base, Ordering::Release);
+    Ok(())
+}
+
+#[doc(hidden)]
 pub unsafe fn reset_for_test() {
     ZONE_RUNTIME_INITIALIZED.store(false, Ordering::Release);
     ZONE_RUNTIME_STATE.store(ZoneRuntimeState::NotReady as usize, Ordering::Release);
-    POSSIBLE_CPUS.store(1, Ordering::Release);
+    POSSIBLE_CPU_MASK.store(1, Ordering::Release);
     PAGE_SIZE.store(4096, Ordering::Release);
     DIRECT_MAP_BASE.store(0, Ordering::Release);
     unsafe {
@@ -198,26 +227,40 @@ pub unsafe fn reset_for_test() {
 }
 
 struct RuntimeHooks {
-    pin_current_cpu: fn() -> CpuPinGuard,
+    pin_current_cpu: fn(CpuPinReason) -> CpuPinGuard,
+    exclude_local_execution: fn() -> LocalExecutionGuard,
 }
 
 impl RuntimeHooks {
     const fn default() -> Self {
         Self {
             pin_current_cpu: default_pin_current_cpu,
+            exclude_local_execution: default_exclude_local_execution,
         }
     }
 
     fn for_platform<P>() -> Self
     where
-        P: PercpuIf + SmpIf,
+        P: IrqIf + PercpuIf + SmpIf,
     {
         Self {
-            pin_current_cpu: P::pin_current_cpu,
+            pin_current_cpu: P::pin_current_cpu_for,
+            exclude_local_execution: P::exclude_local_execution,
         }
     }
 }
 
-fn default_pin_current_cpu() -> CpuPinGuard {
-    CpuPinGuard::new(CpuId(0))
+fn default_pin_current_cpu(reason: CpuPinReason) -> CpuPinGuard {
+    CpuPinGuard::new(CpuId(0)).with_reason(reason)
+}
+
+fn default_exclude_local_execution() -> LocalExecutionGuard {
+    unsafe { LocalExecutionGuard::new(0, default_restore_local_execution) }
+}
+
+unsafe fn default_restore_local_execution(_saved_state: usize) {}
+
+fn is_possible_cpu(cpu: CpuId) -> bool {
+    cpu.0 < MAX_ZONE_CPUS
+        && tx_hal::CpuMask::from_bits(POSSIBLE_CPU_MASK.load(Ordering::Acquire)).contains(cpu)
 }

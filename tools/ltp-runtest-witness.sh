@@ -52,9 +52,9 @@ run_lane() {
       -kernel "${KERNEL_DIR:-target/oscomp/submit}/kernel-la" \
       -m 1G -nographic -smp 1 \
       -drive file="$img",if=none,format=raw,id=x0,file.locking=off \
-      -device virtio-blk-pci,drive=x0 \
+      -device virtio-blk-pci,drive=x0,addr=1 \
       -no-reboot \
-      -device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
+      -device virtio-net-pci,netdev=net0,addr=2 -netdev user,id=net0 \
       -rtc base=utc \
       -append "$cmdline" 2>&1 | stdbuf -o0 tr -d '\000\r' > "$log" ) &
   fi

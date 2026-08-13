@@ -249,7 +249,7 @@ fn net_delegate_poll_transmits_socket_udp_to_mock_device() {
             .expect("client payload")
             .io_snapshot()
             .send_space,
-        SocketOptionSet::default_udp().socket.send_buf_size
+        udp_send_capacity(&client)
     );
 
     let tx = device.tx_frames();
@@ -361,10 +361,7 @@ fn udp_device_tx_busy_keeps_datagram_for_retry() {
         .expect("client payload")
         .io_snapshot()
         .send_space;
-    assert_eq!(
-        send_space_after_send,
-        SocketOptionSet::default_udp().socket.send_buf_size - 5
-    );
+    assert_eq!(send_space_after_send, udp_send_capacity(&client) - 5);
 
     let tx_sink = MockPacketTxSink {
         inner: SmoltcpPacketTxSink {
@@ -418,7 +415,7 @@ fn udp_device_tx_busy_keeps_datagram_for_retry() {
             .expect("client payload")
             .io_snapshot()
             .send_space,
-        SocketOptionSet::default_udp().socket.send_buf_size
+        udp_send_capacity(&client)
     );
 }
 
@@ -526,6 +523,15 @@ fn connected_udp_client(
         StepOutcome::Done(bytes.len())
     );
     client
+}
+
+fn udp_send_capacity(socket: &tx_substrate::zone::Cap<SocketIdentity>) -> usize {
+    socket
+        .acquire_operational()
+        .expect("UDP payload")
+        .raw_udp_socket()
+        .expect("UDP socket")
+        .send_capacity()
 }
 
 fn tx_frames_contain_udp(

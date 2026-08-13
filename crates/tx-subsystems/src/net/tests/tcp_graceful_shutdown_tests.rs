@@ -218,6 +218,72 @@ fn out_of_order_fin_does_not_publish_eof_before_missing_bytes_arrive() {
 }
 
 #[test]
+fn out_of_order_data_preserves_immediate_ack_until_egress_accepts_it() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    clear_delegate_queue();
+
+    let (client, accepted) = prepare_connected_loopback_pair(40_202, 50_202);
+    let accepted_payload = accepted.acquire_operational().expect("accepted payload");
+    let accepted_raw = accepted_payload.raw_tcp_socket().expect("accepted raw tcp");
+    assert_eq!(
+        accepted_raw
+            .enqueue_tx_bytes(b"abcdefgh")
+            .expect("queue server payload")
+            .bytes,
+        8
+    );
+    let first = accepted_raw
+        .dispatch_segment()
+        .expect("server payload segment");
+    assert_eq!(first.payload, b"abcdefgh");
+
+    // Deliver a copy one segment into the future. smoltcp returns an
+    // immediate duplicate/SACK reply for this hole and records that ACK as
+    // sent while constructing it.
+    let mut future = first.clone();
+    future.tcp.seq_number = future.tcp.seq_number + first.payload_len();
+    let client_payload = client.acquire_operational().expect("client payload");
+    let client_raw = client_payload.raw_tcp_socket().expect("client raw tcp");
+    let publish = client_raw.process_segment(&future);
+    assert_eq!(publish.recv_bytes_added, 0);
+    assert_eq!(
+        client_raw.poll_at(smoltcp::time::Instant::ZERO),
+        smoltcp::socket::PollAt::Now,
+        "the immediate hole ACK must remain visible as egress work"
+    );
+
+    // Backpressure must not consume the immediate reply.
+    let refused = client_raw.dispatch_segment_via(smoltcp::time::Instant::ZERO, 1500, |_| false);
+    assert_eq!(refused.emitted, Some(false));
+
+    let mut hole_ack = None;
+    let accepted_ack =
+        client_raw.dispatch_segment_via(smoltcp::time::Instant::ZERO, 1500, |segment| {
+            hole_ack = segment.tcp.ack_number;
+            true
+        });
+    assert_eq!(accepted_ack.emitted, Some(true));
+    assert_eq!(hole_ack, Some(first.tcp.seq_number));
+
+    // Filling the gap makes both payloads contiguous and requires a new
+    // cumulative immediate ACK covering all sixteen bytes.
+    let publish = client_raw.process_segment(&first);
+    assert_eq!(publish.recv_bytes_added, 16);
+    let cumulative = client_raw
+        .dispatch_segment()
+        .expect("gap-filling cumulative ACK");
+    assert_eq!(
+        cumulative.tcp.ack_number,
+        Some(first.tcp.seq_number + first.payload_len() * 2)
+    );
+    assert_eq!(client_raw.recv_available(), 16);
+}
+
+#[test]
 fn net_delegate_timer_tick_also_drives_connected_tcp() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

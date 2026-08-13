@@ -16,43 +16,28 @@ use tx_subsystems::net::delegate::{
     net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver, NetDelegateSupervisor,
     NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
 };
-#[cfg(test)]
-use tx_subsystems::net::device::VIRTIO_NET0_DEVICE;
-use tx_subsystems::net::device::{
-    net_device_by_name, net_device_snapshot, VIRTIO_NET0_REGISTRATION,
-};
 use tx_subsystems::net::execution::{DeviceTxBudget, LoopbackPollBudget};
-use tx_subsystems::net::packet::{
-    PacketDispatch, PacketSource, PacketTxReadiness, PacketTxResult, PacketTxSink,
-};
-use tx_subsystems::net::protocol::{EtherIface, IfaceCommon, LoopbackIface};
-use tx_subsystems::net::structure::{Ipv4Address, Ipv6Address};
-use tx_subsystems::net::{
-    initial_loopback_iface, initial_net_namespace_payload, NetAdminAuthority,
-    NetNamespaceRouteConfig,
-};
+use tx_subsystems::net::initial_loopback_iface;
+use tx_subsystems::net::packet::{PacketDispatch, PacketSource};
+use tx_subsystems::net::protocol::LoopbackIface;
 
 use super::{CoreInit, BOOT_REACTOR};
 
 const DEADLINE_UPDATED: tx_reactor::wait::Mask = tx_reactor::wait::Mask::from_bits(0x1);
-const BOOT_ETH_IPV4: Ipv4Address = Ipv4Address::new([10, 0, 2, 15]);
-const BOOT_ETH_NETMASK: Ipv4Address = Ipv4Address::new([255, 255, 255, 0]);
-const BOOT_ETH_GATEWAY: Ipv4Address = Ipv4Address::new([10, 0, 2, 2]);
-/// V5-2: static v6 address for the boot NIC, mirroring `BOOT_ETH_IPV4` under
-/// the same SLIRP convention (`fec0::/64`, host side `fec0::2`, DNS `fec0::3`).
-const BOOT_ETH_IPV6: Ipv6Address =
-    Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15]);
-const BOOT_ETH_IPV6_PREFIX_LEN: u8 = 64;
-const BOOT_ETH_NAME: &str = "eth0";
 
 static BOOT_NET_RUNTIME: SpinMutex<Option<&'static BootNetRuntime>> = SpinMutex::new(None);
+
+fn net_delegate_sched_meta(current_cpu: tx_hal::CpuId) -> tx_reactor::InitialSchedMeta {
+    tx_reactor::InitialSchedMeta::fair()
+        .pinned()
+        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
+}
 
 struct BootNetDeadlineState {
     supervisor: NetDelegateSupervisor,
 }
 
 struct BootNetRuntime {
-    ether_iface: EtherIface,
     deadline_channel: tx_reactor::wait::Channel,
     deadline_state: SpinMutex<BootNetDeadlineState>,
 }
@@ -75,20 +60,7 @@ impl BootNetRuntime {
         smoltcp_base: Instant,
         reactor_base_ns: u64,
     ) -> Self {
-        let netdev = boot_net_registration();
-        publish_boot_net_device_to_namespace(netdev);
         Self {
-            ether_iface: EtherIface::new(
-                netdev,
-                IfaceCommon::with_gateway(
-                    BOOT_ETH_IPV4,
-                    BOOT_ETH_NETMASK,
-                    Some(BOOT_ETH_GATEWAY),
-                    netdev.ops.mtu(),
-                ),
-                netdev.ops.mac_addr(),
-                BOOT_ETH_NAME,
-            ),
             deadline_channel,
             deadline_state: SpinMutex::new(BootNetDeadlineState {
                 supervisor: NetDelegateSupervisor::new(smoltcp_base, reactor_base_ns),
@@ -140,162 +112,20 @@ impl BootNetRuntime {
     }
 }
 
-fn boot_net_registration() -> &'static tx_subsystems::net::device::NetDeviceRegistration {
-    net_device_by_name(b"eth0")
-        .or_else(|| net_device_snapshot().into_iter().next())
-        .unwrap_or(&VIRTIO_NET0_REGISTRATION)
-}
-
-fn publish_boot_net_device_to_namespace(
-    registration: &'static tx_subsystems::net::device::NetDeviceRegistration,
-) {
-    let namespace = initial_net_namespace_payload();
-    let authority = NetAdminAuthority::for_test_or_bootstrap();
-    if let Some(link) = namespace
-        .link_snapshot()
-        .into_iter()
-        .find(|link| link.name == registration.name)
-    {
-        let _ = namespace.set_device_ipv4_addr_by_ifindex(
-            authority,
-            link.ifindex,
-            Some(BOOT_ETH_IPV4),
-            Some(24),
-        );
-    } else {
-        let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
-    }
-    // V5-2: same treatment for IPv6. This kernel has no RA/SLAAC/DHCPv6 and
-    // generates no link-local address, so without this seed `eth0` comes up
-    // with NO v6 address at all: `/proc/net/if_inet6` lists only `lo`,
-    // `decide_ipv6_route` answers `Unreachable` for every destination, and the
-    // whole (working) external v6 datapath is unreachable until a human types
-    // `ip -6 addr add`. Address chosen to mirror BOOT_ETH_IPV4 under the same
-    // SLIRP convention (host side `fec0::2`, DNS `fec0::3`).
-    //
-    // Deliberately NO `::/0` default route, unlike the v4 seed below. v4's
-    // default route is real — 10.0.2.2 genuinely NATs to the v4 internet — but
-    // SLIRP does not route IPv6 off `fec0::/64`, and advertising a default
-    // router that cannot forward turns a fast `EADDRNOTAVAIL` into a connect
-    // that hangs until TCP gives up. On-link (`fec0::2`/`fec0::3`) needs no
-    // route entry: the connected prefix covers it. A host with real v6
-    // upstream can still `ip -6 route add default via ...` (the V3b gateway
-    // path is verified on hardware), and a future RA/SLAAC stage would install
-    // it from the advertisement instead of guessing here.
-    if let Some(link) = namespace
-        .link_snapshot()
-        .into_iter()
-        .find(|link| link.name == registration.name)
-    {
-        let _ = namespace.set_device_ipv6_addr_by_ifindex(
-            authority,
-            link.ifindex,
-            Some(BOOT_ETH_IPV6),
-            Some(BOOT_ETH_IPV6_PREFIX_LEN),
-        );
-    }
-    // Boot default route (0.0.0.0/0 via the SLIRP gateway). On Linux this
-    // line is DHCP's job; the boot lane configures the iface statically, so
-    // the FIB must be seeded here too. Without it every off-link v4 dst is
-    // unroutable: TCP connect selects no source address, `step_send`
-    // hard-fails, and `gateway_for_device` leaves the per-link iface without
-    // a gateway so TX dies EADDRNOTAVAIL before ARP. The L2 next-hop is
-    // already covered by the static gateway ARP installed at runtime setup.
-    // EEXIST on re-publish is benign.
-    let _ = namespace.add_ipv4_route(
-        authority,
-        NetNamespaceRouteConfig {
-            dst: Ipv4Address::UNSPECIFIED,
-            prefix_len: 0,
-            gateway: Some(BOOT_ETH_GATEWAY),
-            oif_name: Some(registration.name),
-            preferred_src: Some(BOOT_ETH_IPV4),
-            table: 254,
-            protocol: 3,   // RTPROT_BOOT
-            scope: 0,      // RT_SCOPE_UNIVERSE
-            route_type: 1, // RTN_UNICAST
-        },
-    );
-}
-
-impl BootNetRuntime {
-    /// Cross-feed NDP learning to the namespace's iface for the SAME netdev.
-    ///
-    /// The boot lane drains the shared RX queue into its own v4-only iface,
-    /// but external v6 TX/pending live on the namespace's
-    /// `ensure_ether_iface_for_link` iface — without this, an NA lands in the
-    /// boot iface's table and the namespace iface re-solicits forever.
-    /// `learn_ndisc_from_dispatch` learns without replying (no guard), so the
-    /// boot iface remains the only NS responder.
-    fn cross_feed_ndisc(&self, dispatch: &PacketDispatch, now: Instant) {
-        for iface in initial_net_namespace_payload().ether_ifaces_snapshot() {
-            if iface.netdev.devt == self.ether_iface.netdev.devt {
-                iface.learn_ndisc_from_dispatch(dispatch, now);
-            }
-        }
-    }
-}
-
 impl PacketSource for BootNetRuntime {
     fn next_packet(&self) -> Option<PacketDispatch> {
-        let frame = self.ether_iface.netdev.ops.receive()?;
-        let dispatch = self.ether_iface.process_frame_at(
-            frame,
-            Instant::ZERO,
-            Option::<&tx_subsystems::execution::Guard<'_>>::None,
-        );
-        self.cross_feed_ndisc(&dispatch, Instant::ZERO);
-        Some(dispatch)
+        None
     }
 
     fn next_packet_at(
         &self,
-        now: Instant,
-        guard: &tx_subsystems::execution::Guard<'_>,
-    ) -> Option<PacketDispatch> {
-        let frame = self.ether_iface.netdev.ops.receive()?;
-        let dispatch = self.ether_iface.process_frame_at(frame, now, Some(guard));
-        self.cross_feed_ndisc(&dispatch, now);
-        Some(dispatch)
-    }
-}
-
-impl PacketTxSink for BootNetRuntime {
-    fn readiness(&self, guard: &tx_subsystems::execution::Guard<'_>) -> PacketTxReadiness {
-        self.ether_iface.netdev.ops.tx_readiness(guard)
-    }
-
-    fn ip_mtu(&self) -> u16 {
-        self.ether_iface.netdev.ops.mtu()
-    }
-
-    fn readiness_at(
-        &self,
         _now: Instant,
-        guard: &tx_subsystems::execution::Guard<'_>,
-    ) -> PacketTxReadiness {
-        self.readiness(guard)
-    }
-
-    fn source_ipv4(&self) -> Option<Ipv4Address> {
-        Some(BOOT_ETH_IPV4)
-    }
-
-    fn transmit(
-        &self,
-        frame: &[u8],
-        guard: &tx_subsystems::execution::Guard<'_>,
-    ) -> PacketTxResult {
-        self.ether_iface.dispatch_ip_at(frame, Instant::ZERO, guard)
-    }
-
-    fn transmit_at(
-        &self,
-        frame: &[u8],
-        now: Instant,
-        guard: &tx_subsystems::execution::Guard<'_>,
-    ) -> PacketTxResult {
-        self.ether_iface.dispatch_ip_at(frame, now, guard)
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> Option<PacketDispatch> {
+        // Physical-device RX is owned by `drive_all_net_namespace_runtimes_at`.
+        // Keeping this source empty prevents a private boot iface from draining
+        // frames before the namespace's current address/FIB view can see them.
+        None
     }
 }
 
@@ -318,14 +148,6 @@ impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
 
     fn packet_source(&self) -> &dyn PacketSource {
         self.runtime
-    }
-
-    fn packet_tx_sink(&self) -> Option<&dyn PacketTxSink> {
-        Some(self.runtime)
-    }
-
-    fn ether_iface(&self) -> Option<&EtherIface> {
-        Some(&self.runtime.ether_iface)
     }
 
     fn device_tx_budget(&self) -> DeviceTxBudget {
@@ -414,14 +236,11 @@ impl<P: TxPlatform> CoreInit<P> {
                     )
                     .await;
                 },
-                // The network state machine has one protocol owner. Pin both
-                // its future and its timer publisher to the same hart so the
-                // delegate's wait registration, wake routing, and protocol
-                // ownership cannot move independently between polls. User
-                // processes remain movable across every online CPU.
-                tx_reactor::InitialSchedMeta::kernel()
-                    .pinned()
-                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                // The network state machine has one protocol owner, so keep
+                // it on one hart. It is a long-lived, self-waking service and
+                // must share the fair queue with the userspace consumers that
+                // drain its socket work.
+                net_delegate_sched_meta(current_cpu),
             )
         })
     }
@@ -454,22 +273,6 @@ impl<P: TxPlatform> CoreInit<P> {
             runtime
         })?;
 
-        // Static ARP for the SLIRP gateway (10.0.2.2 -> 52:55:0a:00:02:02):
-        // dynamic ARP replies are learned by the per-namespace device iface,
-        // not this one, so without this the SYN is dropped pending resolution
-        // and re-ARPs forever. Harmless for loopback-only boots (never routed).
-        runtime.ether_iface.install_static_arp(
-            BOOT_ETH_GATEWAY,
-            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]),
-        );
-        // P2-S6: SLIRP's DNS server (10.0.2.3) uses the same synthetic-MAC
-        // convention as the gateway; the static entry unblocks the first
-        // query (ARP learning hardening is P4/D10).
-        runtime.ether_iface.install_static_arp(
-            Ipv4Address::new([10, 0, 2, 3]),
-            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x03]),
-        );
-
         let mut slot = BOOT_NET_RUNTIME.lock();
         if let Some(existing) = *slot {
             Some(existing)
@@ -483,7 +286,6 @@ impl<P: TxPlatform> CoreInit<P> {
 #[cfg(test)]
 pub(super) fn reset_boot_net_runtime_for_test() {
     *BOOT_NET_RUNTIME.lock() = None;
-    VIRTIO_NET0_DEVICE.clear_for_test_or_bootstrap();
 }
 
 fn instant_from_ns(ns: u64) -> Instant {
@@ -534,5 +336,24 @@ async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
             | tx_reactor::wait::WaitOutcome::Interrupted
             | tx_reactor::wait::WaitOutcome::Killed => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tx_hal::CpuId;
+    use tx_reactor::{MigrationPolicy, SchedClass};
+
+    use super::net_delegate_sched_meta;
+
+    #[test]
+    fn net_delegate_is_a_pinned_fair_service() {
+        let meta = net_delegate_sched_meta(CpuId(1));
+
+        assert_eq!(meta.class, SchedClass::Fair);
+        assert!(!meta.kernel_only);
+        assert!(!meta.userspace_thread);
+        assert_eq!(meta.migration, MigrationPolicy::Pinned);
+        assert_eq!(meta.affinity, 0b10);
     }
 }

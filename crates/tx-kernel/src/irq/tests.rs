@@ -27,10 +27,13 @@ use tx_hal::{
 
 use crate::init::{console_tty, CoreInit};
 use crate::irq::{
-    drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats, net_rx_irq_handler,
-    register_irq_handler, rtc_alarm_irq_handler, uart_rx_irq_handler,
+    drain_net_rx_irq, handler_for, install_irq_handlers, net_irq_stats,
+    poll_console_rx_into_pending, publish_deferred_net_claim, register_irq_handler,
+    rtc_alarm_irq_handler, try_acquire_console_rx_ingest, try_read_console_bytes,
+    uart_rx_irq_handler, UART_RX_PENDING, UART_RX_PENDING_CAP,
 };
 use crate::test_serialise::KERNEL_TEST_LOCK as IRQ_TEST_LOCK;
+use tx_subsystems::device_binding::BoundDeviceKey;
 use tx_subsystems::net::device::{reset_net_registry_for_test, NetDeviceIrqOutcome};
 use tx_subsystems::signal::Signum;
 
@@ -41,7 +44,7 @@ const TEST_PAGE_SIZE: usize = 4096;
 // `install_dispatch_table`.
 // ---------------------------------------------------------------------------
 
-struct IrqTestPlatform;
+pub(crate) struct IrqTestPlatform;
 
 /// Bytes to feed to the next `read_bytes` call.
 static IRQ_TEST_RX_QUEUE: Mutex<std::vec::Vec<u8>> = Mutex::new(std::vec::Vec::new());
@@ -56,20 +59,67 @@ static IRQ_TEST_LAST_PRIORITY: AtomicU32 = AtomicU32::new(0);
 
 /// Records that `unmask` was called for the UART IRQ.
 static IRQ_TEST_UART_UNMASKED: AtomicBool = AtomicBool::new(false);
+static IRQ_TEST_UART_MASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_UART_UNMASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Records that `unmask` was called for the RTC IRQ.
 static IRQ_TEST_RTC_UNMASKED: AtomicBool = AtomicBool::new(false);
 
-/// Records that `unmask` was called for the network IRQ.
-static IRQ_TEST_NET_UNMASKED: AtomicBool = AtomicBool::new(false);
+static IRQ_TEST_RUNTIME_UART_IRQ: AtomicU32 = AtomicU32::new(17);
+static IRQ_TEST_RUNTIME_RTC_IRQ: AtomicU32 = AtomicU32::new(18);
+const IRQ_TEST_DEVICE_IRQ: u32 = 19;
 
 static IRQ_TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_COMPLETED_IRQ: AtomicU32 = AtomicU32::new(0);
 static IRQ_TEST_COMPLETE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_NET_ACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_NET_MASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_NET_UNMASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_ACK_ORDER: AtomicUsize = AtomicUsize::new(0);
 static IRQ_TEST_COMPLETE_ORDER: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_UNMASK_ORDER: AtomicUsize = AtomicUsize::new(0);
+static IRQ_TEST_LOCAL_EXCLUSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+static REENTRANT_CONSOLE_READS: AtomicUsize = AtomicUsize::new(0);
+
+struct ReentrantConsole;
+
+impl ConsoleIf for ReentrantConsole {
+    fn write_bytes(_bytes: &[u8]) {}
+
+    fn read_bytes(buf: &mut [u8]) -> usize {
+        REENTRANT_CONSOLE_READS.fetch_add(1, Ordering::AcqRel);
+        let mut nested = [0u8; 1];
+        assert_eq!(
+            try_read_console_bytes::<Self>(&mut nested),
+            0,
+            "an IRQ-style nested reader must not re-enter the console source",
+        );
+        buf[0] = b'R';
+        1
+    }
+}
+
+static BLOCKING_CONSOLE_ENTERED: AtomicBool = AtomicBool::new(false);
+static BLOCKING_CONSOLE_RELEASE: AtomicBool = AtomicBool::new(false);
+static BLOCKING_CONSOLE_READS: AtomicUsize = AtomicUsize::new(0);
+
+struct BlockingConsole;
+
+impl ConsoleIf for BlockingConsole {
+    fn write_bytes(_bytes: &[u8]) {}
+
+    fn read_bytes(buf: &mut [u8]) -> usize {
+        BLOCKING_CONSOLE_READS.fetch_add(1, Ordering::AcqRel);
+        BLOCKING_CONSOLE_ENTERED.store(true, Ordering::Release);
+        while !BLOCKING_CONSOLE_RELEASE.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        buf[0] = b'S';
+        1
+    }
+}
 
 struct IrqTestNetDevice;
 
@@ -109,9 +159,6 @@ static IRQ_TEST_NET_REGISTRATION: tx_subsystems::net::NetDeviceRegistration =
         name: "eth0",
         ops: &IRQ_TEST_NET_DEVICE,
     };
-static IRQ_TEST_NET_REGISTRATIONS: &[&tx_subsystems::net::NetDeviceRegistration] =
-    &[&IRQ_TEST_NET_REGISTRATION];
-
 fn drain_rx_queue(buf: &mut [u8]) -> usize {
     let mut queue = IRQ_TEST_RX_QUEUE.lock().expect("rx queue lock");
     let n = queue.len().min(buf.len());
@@ -140,6 +187,7 @@ static IRQ_TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: IrqTestPlatform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };
@@ -172,14 +220,24 @@ impl tx_hal::SignalFrameIf for IrqTestPlatform {}
 unsafe fn restore_test_local_execution(_saved_state: usize) {}
 
 impl IrqIf for IrqTestPlatform {
+    const MAX_IRQ: u32 = 64;
+
     /// Pick a non-zero IRQ so the test isn't accidentally aliased to
     /// the IRQ-0 sentinel that `KernelTrapDispatcher::on_external_irq`
     /// short-circuits on.
     const UART_IRQ: u32 = 7;
     const RTC_IRQ: u32 = 8;
-    const NET_IRQ: u32 = 9;
+
+    fn uart_irq() -> u32 {
+        IRQ_TEST_RUNTIME_UART_IRQ.load(Ordering::Acquire)
+    }
+
+    fn rtc_irq() -> u32 {
+        IRQ_TEST_RUNTIME_RTC_IRQ.load(Ordering::Acquire)
+    }
 
     fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        IRQ_TEST_LOCAL_EXCLUSION_COUNT.fetch_add(1, Ordering::AcqRel);
         unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
     }
 
@@ -199,15 +257,27 @@ impl IrqIf for IrqTestPlatform {
         IRQ_TEST_COMPLETE_ORDER.store(order, Ordering::Release);
     }
 
-    fn unmask(irq: u32) {
-        if irq == <Self as IrqIf>::UART_IRQ {
-            IRQ_TEST_UART_UNMASKED.store(true, Ordering::Release);
+    fn mask(irq: u32) {
+        if irq == Self::uart_irq() {
+            IRQ_TEST_UART_MASK_COUNT.fetch_add(1, Ordering::AcqRel);
         }
-        if irq == <Self as IrqIf>::RTC_IRQ {
+        if irq == IRQ_TEST_DEVICE_IRQ {
+            IRQ_TEST_NET_MASK_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn unmask(irq: u32) {
+        if irq == Self::uart_irq() {
+            IRQ_TEST_UART_UNMASKED.store(true, Ordering::Release);
+            IRQ_TEST_UART_UNMASK_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        if irq == Self::rtc_irq() {
             IRQ_TEST_RTC_UNMASKED.store(true, Ordering::Release);
         }
-        if irq == <Self as IrqIf>::NET_IRQ {
-            IRQ_TEST_NET_UNMASKED.store(true, Ordering::Release);
+        if irq == IRQ_TEST_DEVICE_IRQ {
+            IRQ_TEST_NET_UNMASK_COUNT.fetch_add(1, Ordering::AcqRel);
+            let order = IRQ_TEST_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
+            IRQ_TEST_UNMASK_ORDER.store(order, Ordering::Release);
         }
     }
 }
@@ -315,15 +385,27 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     IRQ_TEST_INSTALLED_TABLE_PTR.store(0, Ordering::Release);
     IRQ_TEST_LAST_PRIORITY.store(0, Ordering::Release);
     IRQ_TEST_UART_UNMASKED.store(false, Ordering::Release);
+    IRQ_TEST_UART_MASK_COUNT.store(0, Ordering::Release);
+    IRQ_TEST_UART_UNMASK_COUNT.store(0, Ordering::Release);
+    super::UART_RX_IRQ_DEFERRED_MASKED.store(false, Ordering::Release);
     IRQ_TEST_RTC_UNMASKED.store(false, Ordering::Release);
-    IRQ_TEST_NET_UNMASKED.store(false, Ordering::Release);
+    IRQ_TEST_RUNTIME_UART_IRQ.store(17, Ordering::Release);
+    IRQ_TEST_RUNTIME_RTC_IRQ.store(18, Ordering::Release);
     IRQ_TEST_CURRENT_CPU.store(0, Ordering::Release);
     IRQ_TEST_COMPLETED_IRQ.store(0, Ordering::Release);
     IRQ_TEST_COMPLETE_COUNT.store(0, Ordering::Release);
     IRQ_TEST_NET_ACK_COUNT.store(0, Ordering::Release);
+    IRQ_TEST_NET_MASK_COUNT.store(0, Ordering::Release);
+    IRQ_TEST_NET_UNMASK_COUNT.store(0, Ordering::Release);
     IRQ_TEST_SEQUENCE.store(0, Ordering::Release);
     IRQ_TEST_ACK_ORDER.store(0, Ordering::Release);
     IRQ_TEST_COMPLETE_ORDER.store(0, Ordering::Release);
+    IRQ_TEST_UNMASK_ORDER.store(0, Ordering::Release);
+    IRQ_TEST_LOCAL_EXCLUSION_COUNT.store(0, Ordering::Release);
+    REENTRANT_CONSOLE_READS.store(0, Ordering::Release);
+    BLOCKING_CONSOLE_ENTERED.store(false, Ordering::Release);
+    BLOCKING_CONSOLE_RELEASE.store(false, Ordering::Release);
+    BLOCKING_CONSOLE_READS.store(0, Ordering::Release);
     tx_fs::devfs::reset_rtc_backend_for_test();
     guard
 }
@@ -347,6 +429,47 @@ fn init_has_pending_sigint() -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn console_rx_reader_rejects_nested_and_cross_hart_consumers() {
+    let _setup = setup();
+
+    let mut byte = [0u8; 1];
+    assert_eq!(try_read_console_bytes::<ReentrantConsole>(&mut byte), 1);
+    assert_eq!(byte, [b'R']);
+    assert_eq!(
+        REENTRANT_CONSOLE_READS.load(Ordering::Acquire),
+        1,
+        "the nested contender must not call the platform reader",
+    );
+
+    let owner = std::thread::spawn(|| {
+        let mut byte = [0u8; 1];
+        let n = try_read_console_bytes::<BlockingConsole>(&mut byte);
+        (n, byte)
+    });
+    while !BLOCKING_CONSOLE_ENTERED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let mut contender_byte = [0u8; 1];
+    assert_eq!(
+        try_read_console_bytes::<BlockingConsole>(&mut contender_byte),
+        0,
+        "a concurrent hart must skip instead of reading the UART twice",
+    );
+    assert_eq!(contender_byte, [0]);
+    BLOCKING_CONSOLE_RELEASE.store(true, Ordering::Release);
+
+    let (n, owner_byte) = owner.join().expect("console owner thread");
+    assert_eq!(n, 1);
+    assert_eq!(owner_byte, [b'S']);
+    assert_eq!(
+        BLOCKING_CONSOLE_READS.load(Ordering::Acquire),
+        1,
+        "only one concurrent consumer may reach ConsoleIf::read_bytes",
+    );
+}
 
 /// `register_irq_handler(VIRT_UART_IRQ, fake_handler)` populates the
 /// global dispatch table at the slot indexed by the IRQ number.
@@ -376,13 +499,12 @@ fn register_irq_handler_populates_dispatch_table_slot() {
     );
 }
 
-/// `install_irq_handlers::<P>()` registers the UART RX handler under
-/// `<P as IrqIf>::UART_IRQ` and publishes the dispatch table to the
-/// platform via `install_dispatch_table`.
+/// `install_irq_handlers::<P>()` registers handlers under the IRQ numbers
+/// returned by the platform's runtime accessors and publishes the dispatch
+/// table via `install_dispatch_table`.
 ///
-/// Asserts Open Q #6's late-binding shape: tx-kernel reads the IRQ
-/// number through `<P as IrqIf>::UART_IRQ` only — no `pub const
-/// VIRT_UART_IRQ` baked into tx-kernel.
+/// The test deliberately makes those values differ from the associated
+/// constant fallbacks so it catches any regression to constant-only wiring.
 #[test]
 fn install_irq_handlers_publishes_table_to_platform() {
     let _setup = setup();
@@ -391,7 +513,13 @@ fn install_irq_handlers_publishes_table_to_platform() {
 
     install_irq_handlers::<IrqTestPlatform>();
 
-    let installed = handler_for(<IrqTestPlatform as IrqIf>::UART_IRQ).expect("UART handler");
+    let uart_irq = <IrqTestPlatform as IrqIf>::uart_irq();
+    let rtc_irq = <IrqTestPlatform as IrqIf>::rtc_irq();
+
+    assert_ne!(uart_irq, <IrqTestPlatform as IrqIf>::UART_IRQ);
+    assert_ne!(rtc_irq, <IrqTestPlatform as IrqIf>::RTC_IRQ);
+
+    let installed = handler_for(uart_irq).expect("UART handler");
     assert_eq!(
         (installed as *const ()),
         (uart_rx_irq_handler::<IrqTestPlatform> as *const ()),
@@ -414,7 +542,7 @@ fn install_irq_handlers_publishes_table_to_platform() {
         "UART IRQ should be unmasked so console input wakes the reactor",
     );
 
-    let installed = handler_for(<IrqTestPlatform as IrqIf>::RTC_IRQ).expect("RTC handler");
+    let installed = handler_for(rtc_irq).expect("RTC handler");
     assert_eq!(
         (installed as *const ()),
         (rtc_alarm_irq_handler::<IrqTestPlatform> as *const ()),
@@ -424,29 +552,38 @@ fn install_irq_handlers_publishes_table_to_platform() {
         IRQ_TEST_RTC_UNMASKED.load(Ordering::Acquire),
         "RTC IRQ should be unmasked after its event source is initialized",
     );
+}
 
-    let installed = handler_for(<IrqTestPlatform as IrqIf>::NET_IRQ).expect("network handler");
-    assert_eq!(
-        (installed as *const ()),
-        (net_rx_irq_handler::<IrqTestPlatform> as *const ()),
-        "NET_IRQ slot should hold the deferred virtio-net handler",
-    );
+#[test]
+fn install_irq_handlers_skips_runtime_zero_sentinels() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+    IRQ_TEST_RUNTIME_UART_IRQ.store(32, Ordering::Release);
+    IRQ_TEST_RUNTIME_RTC_IRQ.store(0, Ordering::Release);
+
+    install_irq_handlers::<IrqTestPlatform>();
+
     assert!(
-        IRQ_TEST_NET_UNMASKED.load(Ordering::Acquire),
-        "network IRQ should be unmasked after its handler is published",
+        handler_for(32).is_some(),
+        "runtime UART IRQ must be installed"
     );
+    assert!(handler_for(<IrqTestPlatform as IrqIf>::UART_IRQ).is_none());
+    assert!(handler_for(<IrqTestPlatform as IrqIf>::RTC_IRQ).is_none());
+    assert!(IRQ_TEST_UART_UNMASKED.load(Ordering::Acquire));
+    assert!(!IRQ_TEST_RTC_UNMASKED.load(Ordering::Acquire));
 }
 
 #[test]
 fn net_irq_bottom_half_acks_device_before_same_hart_completion() {
     let _setup = setup();
-    assert_eq!(
-        tx_subsystems::net::register_net_devices(IRQ_TEST_NET_REGISTRATIONS),
-        tx_subsystems::execution::StepOutcome::Done(())
-    );
 
     assert_eq!(
-        net_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::NET_IRQ),
+        publish_deferred_net_claim::<IrqTestPlatform>(
+            IRQ_TEST_DEVICE_IRQ,
+            BoundDeviceKey(0),
+            &IRQ_TEST_NET_REGISTRATION,
+        ),
         IrqHandled::DeferredWake
     );
     assert_eq!(
@@ -454,19 +591,27 @@ fn net_irq_bottom_half_acks_device_before_same_hart_completion() {
         0,
         "top half must leave controller completion outstanding",
     );
+    assert_eq!(IRQ_TEST_NET_MASK_COUNT.load(Ordering::Acquire), 1);
+    assert_eq!(IRQ_TEST_NET_UNMASK_COUNT.load(Ordering::Acquire), 0);
 
     assert!(drain_net_rx_irq::<IrqTestPlatform>());
     assert_eq!(IRQ_TEST_NET_ACK_COUNT.load(Ordering::Acquire), 1);
     assert_eq!(IRQ_TEST_COMPLETE_COUNT.load(Ordering::Acquire), 1);
     assert_eq!(
         IRQ_TEST_COMPLETED_IRQ.load(Ordering::Acquire),
-        <IrqTestPlatform as IrqIf>::NET_IRQ
+        IRQ_TEST_DEVICE_IRQ
     );
     assert_eq!(IRQ_TEST_ACK_ORDER.load(Ordering::Acquire), 1);
     assert_eq!(
         IRQ_TEST_COMPLETE_ORDER.load(Ordering::Acquire),
         2,
         "device ACK/poll must precede controller completion",
+    );
+    assert_eq!(IRQ_TEST_NET_UNMASK_COUNT.load(Ordering::Acquire), 1);
+    assert_eq!(
+        IRQ_TEST_UNMASK_ORDER.load(Ordering::Acquire),
+        3,
+        "controller completion must precede unmask",
     );
     assert!(!drain_net_rx_irq::<IrqTestPlatform>());
     assert_eq!(
@@ -483,14 +628,14 @@ fn net_irq_bottom_half_acks_device_before_same_hart_completion() {
 #[test]
 fn net_irq_claim_can_only_be_completed_by_its_claimant_hart() {
     let _setup = setup();
-    assert_eq!(
-        tx_subsystems::net::register_net_devices(IRQ_TEST_NET_REGISTRATIONS),
-        tx_subsystems::execution::StepOutcome::Done(())
-    );
 
     IRQ_TEST_CURRENT_CPU.store(0, Ordering::Release);
     assert_eq!(
-        net_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::NET_IRQ),
+        publish_deferred_net_claim::<IrqTestPlatform>(
+            IRQ_TEST_DEVICE_IRQ,
+            BoundDeviceKey(0),
+            &IRQ_TEST_NET_REGISTRATION,
+        ),
         IrqHandled::DeferredWake
     );
 
@@ -508,7 +653,6 @@ fn net_irq_claim_can_only_be_completed_by_its_claimant_hart() {
         stats.wrong_hart_drains, 0,
         "a non-owner hart checks its own idle slot rather than touching the claimant's slot",
     );
-    assert_eq!(stats.missing_device_drains, 0);
 }
 
 #[test]
@@ -529,7 +673,7 @@ fn rtc_irq_handler_publishes_alarm_event_to_devfs_rtc_state() {
     );
 
     assert_eq!(
-        rtc_alarm_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::RTC_IRQ),
+        rtc_alarm_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::rtc_irq()),
         IrqHandled::Wake
     );
     assert_eq!(
@@ -570,7 +714,7 @@ fn dispatch_irq_routes_uart_rx_to_tty_deferred_ingest() {
         queue.extend_from_slice(b"X\n");
     }
 
-    let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::UART_IRQ);
+    let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq());
     assert_eq!(
         handled,
         IrqHandled::Wake,
@@ -597,8 +741,14 @@ fn dispatch_irq_routes_uart_rx_to_tty_deferred_ingest() {
 
     // Drain the deferred buffer the way the reactor loop does on every
     // WFI return.
+    let exclusions_before = IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire);
     let drained = CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty();
     assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
+    assert_eq!(
+        IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire),
+        exclusions_before + 3,
+        "the snapshot, final empty check, and owner-release handoff recheck must exclude the local IRQ top half",
+    );
 
     // Normal-context drain should now contain the committed line.
     let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
@@ -610,6 +760,171 @@ fn dispatch_irq_routes_uart_rx_to_tty_deferred_ingest() {
         snapshot, b"X\n",
         "step_ingest should have queued the committed line into the input queue",
     );
+}
+
+#[test]
+fn uart_rx_irq_leaves_fifo_untouched_when_pending_buffer_is_contended() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"Y\n");
+    }
+
+    let pending = UART_RX_PENDING.lock();
+    let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq());
+    assert_eq!(handled, IrqHandled::Wake);
+    assert_eq!(IRQ_TEST_UART_MASK_COUNT.load(Ordering::Acquire), 1);
+    assert_eq!(
+        IRQ_TEST_RX_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_slice(),
+        b"Y\n",
+        "a contended top half must not consume bytes from the hardware FIFO",
+    );
+    drop(pending);
+
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+    );
+    assert_eq!(IRQ_TEST_UART_UNMASK_COUNT.load(Ordering::Acquire), 1);
+
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        2,
+    );
+}
+
+#[test]
+fn uart_rx_irq_masks_level_source_while_pending_buffer_is_full() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+
+    {
+        let mut pending = UART_RX_PENDING.lock();
+        pending.len = UART_RX_PENDING_CAP;
+    }
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"Z\n");
+    }
+
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+    assert_eq!(IRQ_TEST_UART_MASK_COUNT.load(Ordering::Acquire), 1);
+    assert_eq!(
+        IRQ_TEST_RX_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_slice(),
+        b"Z\n",
+        "a full software buffer must leave the hardware FIFO for the rearmed IRQ",
+    );
+
+    UART_RX_PENDING.lock().len = 0;
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+    );
+    assert_eq!(IRQ_TEST_UART_UNMASK_COUNT.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn console_rx_polling_cannot_overtake_an_irq_buffered_chunk() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+
+    let ingest_owner = try_acquire_console_rx_ingest().expect("test owns deferred ingest");
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"A");
+    }
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+        "a competing reactor must not enter the TTY ingest path",
+    );
+
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"B\n");
+    }
+    let exclusions_before = IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire);
+    assert_eq!(poll_console_rx_into_pending::<IrqTestPlatform>(), 2);
+    assert_eq!(
+        IRQ_TEST_LOCAL_EXCLUSION_COUNT.load(Ordering::Acquire),
+        exclusions_before + 1,
+        "polling must exclude its local UART IRQ across the shared pending-buffer drain",
+    );
+    drop(ingest_owner);
+
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        3,
+    );
+    let tty = console_tty().expect("console TTY");
+    let payload = tty.live_payload().expect("console TTY payload");
+    let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
+        let mut tmp = [0u8; 8];
+        let n = queue.drain_to_slice(&mut tmp);
+        tmp[..n].to_vec()
+    });
+    assert_eq!(snapshot, b"AB\n");
+}
+
+#[test]
+fn console_rx_deferred_ingest_stays_on_a_nonzero_boot_hart() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+    crate::irq::install_console_rx_owner(tx_hal::CpuId(3));
+    IRQ_TEST_CURRENT_CPU.store(3, Ordering::Release);
+
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.extend_from_slice(b"C\n");
+    }
+    assert_eq!(
+        uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq()),
+        IrqHandled::Wake,
+    );
+
+    IRQ_TEST_CURRENT_CPU.store(1, Ordering::Release);
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        0,
+        "an AP reactor must leave the boot console's pending bytes untouched",
+    );
+
+    IRQ_TEST_CURRENT_CPU.store(3, Ordering::Release);
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        2,
+    );
+    let tty = console_tty().expect("console TTY");
+    let payload = tty.live_payload().expect("console TTY payload");
+    let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
+        let mut tmp = [0u8; 4];
+        let n = queue.drain_to_slice(&mut tmp);
+        tmp[..n].to_vec()
+    });
+    assert_eq!(snapshot, b"C\n");
 }
 
 #[test]
@@ -633,7 +948,7 @@ fn dispatch_irq_vintr_delivers_sigint_to_foreground_pgrp() {
         queue.push(0x03);
     }
 
-    let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::UART_IRQ);
+    let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::uart_irq());
     assert_eq!(handled, IrqHandled::Wake);
     assert_eq!(
         CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),

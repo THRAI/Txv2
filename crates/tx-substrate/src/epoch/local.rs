@@ -415,21 +415,36 @@ impl CpuLocalEpochState {
         self.callback_depth.load(Ordering::Acquire) != 0
     }
 
-    pub(crate) fn enter(&self, epoch: u64) {
-        debug_assert_eq!(
-            self.local_epoch.load(Ordering::Relaxed),
-            0,
-            "epoch guards cannot be nested on the same CPU"
-        );
-        // SeqCst pairs with the domain's guard acquisition fence and keeps the
-        // published epoch visible before protected reads proceed.
-        self.local_epoch.store(epoch, Ordering::SeqCst);
-        self.active_guards.fetch_add(1, Ordering::Relaxed);
+    /// Enter one reader guard and return its effective epoch.
+    ///
+    /// Every guard contributes one membership pin and one depth count, while
+    /// only the outermost 0 -> 1 transition publishes `local_epoch`.
+    pub(crate) fn enter(&self, epoch: u64) -> u64 {
+        let previous_depth = self.active_guards.fetch_add(1, Ordering::Relaxed);
+        if previous_depth == 0 {
+            debug_assert_eq!(self.local_epoch.load(Ordering::Relaxed), 0);
+            // SeqCst pairs with the domain's guard acquisition fence and keeps
+            // the published epoch visible before protected reads proceed.
+            self.local_epoch.store(epoch, Ordering::SeqCst);
+            epoch
+        } else {
+            let entered_epoch = self.local_epoch.load(Ordering::Acquire);
+            assert_ne!(
+                entered_epoch, 0,
+                "nested epoch guard found a quiescent CPU-local participant"
+            );
+            entered_epoch
+        }
     }
 
     pub(crate) fn leave(&self) {
-        self.local_epoch.store(0, Ordering::Release);
-        self.active_guards.fetch_sub(1, Ordering::Relaxed);
+        let previous_depth = self.active_guards.fetch_sub(1, Ordering::Relaxed);
+        assert!(previous_depth > 0, "epoch guard depth underflow");
+        if previous_depth == 1 {
+            // Release keeps every protected access before the participant is
+            // advertised as quiescent to a concurrent collector.
+            self.local_epoch.store(0, Ordering::Release);
+        }
     }
 
     pub(crate) fn current(&self) -> u64 {

@@ -86,7 +86,7 @@ mod tests {
             envp: &[b"PATH=/bin"],
             tty_winsize: None,
             test_init_requested,
-            mount_sdcard: true,
+            mount_sdcard_device: Some("vda"),
         }
     }
 

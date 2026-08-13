@@ -12,6 +12,7 @@ use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
     self as step_engine, init, init_on_ap, spin_mutex, ByteProgress, Cap, SpinMutex, StepOutcome,
 };
+use crate::devices::binder::{publish_static_devices, EmptyDeviceBundle, StaticDeviceBundle};
 use crate::init::boot_plan::{BootPlan, RootfsSetup};
 use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
@@ -141,6 +142,7 @@ static OWNER_WAKE_SMP_DELEGATE_TOKEN: SpinMutex<Option<boot_runtime::DelegateTok
 static OWNER_WAKE_SMP_DELEGATE_REGISTRY: SpinMutex<Option<Arc<boot_runtime::DelegateRegistry>>> =
     spin_mutex(None, b"debug.lock.kernel.owner_wake_registry");
 static RCU_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
+static LA64_MASKED_SHOOTDOWN_STAGE: AtomicU64 = AtomicU64::new(0);
 static FILE_IO_SERVICE_REACTOR_TASKS: SpinMutex<Vec<boot_runtime::TaskId>> =
     spin_mutex(Vec::new(), b"debug.lock.kernel.file_io_service_tasks");
 
@@ -187,6 +189,58 @@ const OWNER_WAKE_STAGE_DELEGATE: u64 = 4;
 const RCU_SMP_STAGE_READER_ACTIVE: u64 = 1;
 const RCU_SMP_STAGE_RELEASE_READER: u64 = 2;
 const RCU_SMP_STAGE_READER_DONE: u64 = 3;
+const LA64_MASKED_SHOOTDOWN_ARMED: u64 = 1;
+const LA64_MASKED_SHOOTDOWN_ACTIVE: u64 = 2;
+const LA64_MASKED_SHOOTDOWN_RELEASE: u64 = 3;
+const LA64_MASKED_SHOOTDOWN_DONE: u64 = 4;
+const LA64_MASKED_SHOOTDOWN_CANCELLED: u64 = 5;
+
+struct La64MaskedShootdownTarget<P: TxPlatform> {
+    target_cpu: CpuId,
+    _platform: PhantomData<fn() -> P>,
+}
+
+impl<P: TxPlatform> Future for La64MaskedShootdownTarget<P> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        assert_eq!(
+            <P as tx_hal::SmpIf>::current_cpu_id(),
+            self.target_cpu,
+            "masked shootdown target CPU"
+        );
+
+        if LA64_MASKED_SHOOTDOWN_STAGE.load(Ordering::Acquire) == LA64_MASKED_SHOOTDOWN_CANCELLED {
+            return Poll::Ready(());
+        }
+
+        let irq_guard = P::exclude_local_execution();
+        assert!(
+            !P::interrupts_enabled(),
+            "masked shootdown target interrupts"
+        );
+        if LA64_MASKED_SHOOTDOWN_STAGE
+            .compare_exchange(
+                LA64_MASKED_SHOOTDOWN_ARMED,
+                LA64_MASKED_SHOOTDOWN_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            drop(irq_guard);
+            return Poll::Ready(());
+        }
+
+        while LA64_MASKED_SHOOTDOWN_STAGE.load(Ordering::Acquire) != LA64_MASKED_SHOOTDOWN_RELEASE {
+            P::service_pending_tlb_shootdown();
+            core::hint::spin_loop();
+        }
+        drop(irq_guard);
+        LA64_MASKED_SHOOTDOWN_STAGE.store(LA64_MASKED_SHOOTDOWN_DONE, Ordering::Release);
+        Poll::Ready(())
+    }
+}
 
 struct RcuSmpGuardedReader<P: TxPlatform> {
     target_cpu: CpuId,
@@ -467,7 +521,7 @@ static SYS_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.sys_mount");
 
 /// Global sdcard ext4 mount at `/musl`. Populated by
-/// `mount_sdcard_at_musl` when a `vda` block device is registered.
+/// `mount_sdcard_at_musl` when the selected block device is registered.
 /// Boards without a block device silently leave this `None`.
 static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.musl_mount");
@@ -716,8 +770,8 @@ impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
 /// smoke task, the board boot sentinel, and shutdown. VFS, device, scheduler,
 /// process, and userspace init are intentionally deferred until their
 /// substrate contracts exist.
-pub struct CoreInit<P: TxPlatform> {
-    _platform: PhantomData<P>,
+pub struct CoreInit<P: TxPlatform, D: StaticDeviceBundle<P> = EmptyDeviceBundle> {
+    _composition: PhantomData<fn() -> (P, D)>,
 }
 
 mod boot_args;
@@ -727,18 +781,72 @@ mod helpers;
 mod net;
 mod reactor_submit;
 
+impl<P, D> CoreInit<P, D>
+where
+    P: TxPlatform + 'static,
+    D: StaticDeviceBundle<P>,
+{
+    /// Instantiate the compile-time platform/device composition witness.
+    pub const fn new() -> Self {
+        Self {
+            _composition: PhantomData,
+        }
+    }
+
+    /// Enter the legacy-compatible boot flow with a monomorphized binder hook
+    /// for the board-selected device bundle.
+    ///
+    /// Only the two orchestration methods carry the function item; the many
+    /// `CoreInit<P>` helper modules remain platform-generic and need not grow a
+    /// second type parameter.
+    pub fn boot(handoff: BootHandoff) -> ! {
+        let _composition = Self::new();
+        CoreInit::<P, EmptyDeviceBundle>::boot_legacy(handoff, Self::bind_device_bundle)
+    }
+
+    fn bind_device_bundle() {
+        let outcome = publish_static_devices::<P, D>()
+            .expect("compile-time device bundle binding transaction failed");
+        CoreInit::<P>::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":devices:bind:graph=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.graph.devices.len());
+        tx_hal::console_write_str::<P>(":bound=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.report.bound.len());
+        tx_hal::console_write_str::<P>(":unsupported=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.report.unsupported.len());
+        tx_hal::console_write_str::<P>(":failed=");
+        CoreInit::<P>::write_decimal_unsigned(outcome.report.failed.len());
+        tx_hal::console_write_str::<P>("\n");
+        for failure in outcome.report.failed {
+            CoreInit::<P>::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":devices:bind:failed:");
+            tx_hal::console_write_str::<P>(
+                failure.driver.map(|driver| driver.0).unwrap_or("no-driver"),
+            );
+            tx_hal::console_write_str::<P>("\n");
+        }
+    }
+}
+
 impl<P: TxPlatform> CoreInit<P> {
     fn monotonic_now_ns() -> u64 {
         timekeeper_clock::<P>().monotonic_now_ns()
+    }
+
+    fn procfs_cpuinfo_snapshot() -> tx_fs::procfs::CpuInfoSnapshot {
+        tx_fs::procfs::CpuInfoSnapshot::new(
+            <P as tx_hal::PlatformConfig>::ARCH,
+            <P as tx_hal::SmpIf>::online_cpus(),
+        )
     }
 
     fn deadline_timer() -> HalDeadlineTimer<P> {
         HalDeadlineTimer::<P>::new()
     }
 
-    pub fn boot(handoff: BootHandoff) -> ! {
+    fn boot_legacy(handoff: BootHandoff, bind_device_bundle: fn()) -> ! {
         Self::init_early(handoff);
-        Self::init_substrate_if_ready(handoff);
+        Self::init_substrate_if_ready(handoff, bind_device_bundle);
         // Unpack boot media and drive `exec_script` synchronously so
         // the init leader's `saved_user_context` is seeded with the
         // selected userspace image's entry-point + initial stack
@@ -784,10 +892,11 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn init_early(handoff: BootHandoff) {
+        crate::irq::install_console_rx_owner(handoff.cpu_id);
         P::init_early(handoff);
     }
 
-    fn init_substrate_if_ready(handoff: BootHandoff) {
+    fn init_substrate_if_ready(handoff: BootHandoff, bind_device_bundle: fn()) {
         if P::SUBSTRATE_BOOT_READY {
             // PROBE(proxy-push segv hunt): the vmwatch page-lifecycle probes
             // in tx-subsystems::vm are compiled in but quiet by default.
@@ -804,6 +913,8 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::boot_secondary_cpus();
             Self::run_smp_shootdown_smoke();
             Self::run_smp_ipi_smoke();
+            Self::run_la64_reverse_ipi_smoke();
+            Self::run_la64_masked_shootdown_smoke();
             Self::run_reactor_dispatcher_smoke();
             Self::run_reactor_owner_wake_smp_smoke();
             Self::run_rcu_smp_smoke();
@@ -847,6 +958,10 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::register_console_hardware();
             Self::install_irq_handlers();
             Self::init_rtc_device();
+            // Execute the board-selected static providers and drivers at the
+            // device-init seam. The separate legacy block path remains until
+            // block transports migrate to the typed resource graph.
+            bind_device_bundle();
             Self::init_block_devices();
             Self::init_net_devices();
             Self::mount_rootfs_from_boot_media();
@@ -857,8 +972,14 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_sysfs_at_sys();
             Self::mount_bdevfs_at_dev_block();
             let boot_plan = BootPlan::read::<P>();
-            if boot_plan.args.mount_sdcard {
-                Self::mount_sdcard_at_musl();
+            let runsh_lane = exec::cmdline_value::<P>("tx.runsh").is_some();
+            let alpine_sidecar = boot_plan.args.mode == boot_args::BootMode::Alpine;
+            if let Some(device_name) = boot_plan.args.mount_sdcard_device {
+                Self::mount_sdcard_at_musl(
+                    device_name,
+                    alpine_sidecar || runsh_lane,
+                    boot_plan.rootfs_setup == RootfsSetup::LegacyKernelShims && !runsh_lane,
+                );
             }
             publish_proc_mounts();
             // Scratch directories are runtime infrastructure, not image
@@ -869,10 +990,9 @@ impl<P: TxPlatform> CoreInit<P> {
             // shebang shims, `/tmp`, identity files, resolver databases. The
             // lane boots without a mode flag, so `BootPlan` classifies it as
             // `LinuxLike` and would skip all of that — and then git's helper
-            // spawn and the `overlay_image_dirs_for_runsh` bind mounts have
+            // spawn and the Alpine image-directory overlays have
             // nothing to attach to. The pre-merge tree had no such gate and
             // always populated; force the legacy behaviour for this lane.
-            let runsh_lane = exec::cmdline_value::<P>("tx.runsh").is_some();
             match boot_plan.rootfs_setup {
                 _ if runsh_lane => {
                     Self::populate_rootfs_shebang_shims();
@@ -948,7 +1068,8 @@ impl<P: TxPlatform> CoreInit<P> {
     {
         let config = Self::file_io_service_task_config();
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-        let meta = tx_reactor::InitialSchedMeta::kernel()
+        let meta = tx_reactor::InitialSchedMeta::fair()
+            .pinned()
             .with_affinity(tx_hal::CpuMask::single(current_cpu).bits());
         submit(runtime, config, meta)
     }
@@ -1079,7 +1200,7 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Delegates to `crate::irq::install_irq_handlers::<P>` which
     /// registers the UART RX handler under
-    /// `<P as IrqIf>::UART_IRQ`, publishes
+    /// `<P as IrqIf>::uart_irq()`, publishes
     /// `IRQ_DISPATCH_TABLE` to the platform via
     /// `<P as IrqIf>::install_dispatch_table`, then unmasks. The
     /// UART RX handler reads the boot console TTY from `CONSOLE_TTY`,
@@ -1101,12 +1222,14 @@ impl<P: TxPlatform> CoreInit<P> {
     /// registry. LA64 QEMU currently wires a static VirtIO-PCI disk here; other
     /// boards may legitimately publish no block devices.
     pub(crate) fn init_block_devices() {
-        let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
-            crate::devices::KernelBlockDevices::<P>::new(),
-        ));
-        match devices.init_and_register() {
-            StepOutcome::Done(()) => {}
-            other => panic!("init_block_devices: registration failed: {other:?}"),
+        if tx_subsystems::device::block_device_snapshot().is_empty() {
+            let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                crate::devices::KernelBlockDevices::<P>::new(),
+            ));
+            match devices.init_and_register() {
+                StepOutcome::Done(()) => {}
+                other => panic!("init_block_devices: registration failed: {other:?}"),
+            }
         }
 
         Self::write_board_sentinel_prefix();
@@ -1115,15 +1238,18 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::probe_ext4_superblock_smoke();
     }
 
-    /// If a `vda` block device is registered, read its first 4 KiB through the
-    /// `tx_fs::tx_ext4::BlockDeviceImage` adapter and emit a sentinel reporting
-    /// whether the bytes at offset 1024+56 spell the ext4 magic (`0x53 0xef`).
-    /// Boards without a block device (e.g. m1dock-mock) silently no-op.
+    /// If the selected root block device is registered, read its first 4 KiB
+    /// through the `tx_fs::tx_ext4::BlockDeviceImage` adapter and emit a
+    /// sentinel reporting whether the bytes at offset 1024+56 spell the ext4
+    /// magic (`0x53 0xef`). Boards without a selected block root silently no-op.
     fn probe_ext4_superblock_smoke() {
         use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
         use tx_subsystems::device::block_device_by_name;
 
-        let Some(reg) = block_device_by_name(b"vda") else {
+        let Some(root_name) = Self::root_device_name() else {
+            return;
+        };
+        let Some(reg) = block_device_by_name(root_name.as_bytes()) else {
             return;
         };
         let image = BlockDeviceImage::new(reg.ops);
@@ -1145,22 +1271,12 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
-    /// Initialize tier-2 net devices before boot net runtime selection.
-    /// Boards without a present virtio-net device legitimately publish
-    /// no net devices; `submit_net_runtime_tasks` will keep using the
-    /// staging registration in that case.
+    /// Report the immutable network registry published by the static binder.
+    /// Zero devices is valid and leaves only loopback in the initial namespace.
     pub(crate) fn init_net_devices() {
-        let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
-            crate::devices::KernelNetDevices::<P>::new(),
-        ));
-        match devices.init_and_register() {
-            StepOutcome::Done(()) => {}
-            other => panic!("init_net_devices: registration failed: {other:?}"),
-        }
-
         Self::write_board_sentinel_prefix();
-        if tx_subsystems::net::net_device_by_name(b"eth0").is_some() {
-            tx_hal::console_write_str::<P>(":devices:net:eth0:ok\n");
+        if !tx_subsystems::net::net_device_snapshot().is_empty() {
+            tx_hal::console_write_str::<P>(":devices:net:bound:ok\n");
             Self::write_board_sentinel_prefix();
         }
         tx_hal::console_write_str::<P>(":devices:net:ok\n");
@@ -1251,6 +1367,10 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>(":missing\n");
             return false;
         };
+        // The parsed cmdline token may live in firmware-owned storage. Use the
+        // registry's static name for every long-lived mount label and for
+        // diagnostics emitted after filesystem allocation has started.
+        let dev_name = reg.name;
 
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
         if dev_name == "vda"
@@ -1281,8 +1401,39 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>(":boot-media:layout:final\n");
         }
 
+        let read_only = Self::root_mount_is_read_only();
         let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
+        if read_only {
+            let mount_output = match mount_ext4_read_only(image) {
+                Ok(out) => out,
+                Err(_) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                    tx_hal::console_write_str::<P>(dev_name);
+                    tx_hal::console_write_str::<P>(":err\n");
+                    return false;
+                }
+            };
+            mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+                Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+            )));
+            let ext4_payload = MountPayload::new_cap_with_backend_planner(
+                mount_output.fs_ops().clone(),
+                mount_output.fs_page_backing().clone(),
+                None,
+                mount::allocate_dev_id(),
+                MountOptions {
+                    flags: MountFlags::READ_ONLY,
+                },
+                "ext4",
+                SourceLabel::Static(dev_name),
+                mount_output.backend_planner(),
+            )
+            .expect("mount_sdcard_as_root_if_requested: payload reservation");
+            mount_output.bind_mount_payload(&ext4_payload);
+            return Self::publish_ext4_root_mount(dev_name, true, mount_output, ext4_payload);
+        }
         let Some(geometry) = image.block_geometry(device) else {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
@@ -1328,7 +1479,15 @@ impl<P: TxPlatform> CoreInit<P> {
         .expect("mount_sdcard_as_root_if_requested: payload reservation");
 
         mount_output.bind_mount_payload(&ext4_payload);
+        Self::publish_ext4_root_mount(dev_name, false, mount_output, ext4_payload)
+    }
 
+    fn publish_ext4_root_mount(
+        dev_name: &'static str,
+        read_only: bool,
+        mount_output: tx_fs::tx_ext4::MountedExt4<tx_fs::tx_ext4::BlockDeviceImage>,
+        ext4_payload: Cap<MountPayload>,
+    ) -> bool {
         let ext4_root_rnode = {
             let raw = RNode::new(
                 mount_output.root_fs_object_id,
@@ -1347,7 +1506,11 @@ impl<P: TxPlatform> CoreInit<P> {
             ext4_root_rnode,
             None,
             ext4_payload,
-            MountFlags::empty(),
+            if read_only {
+                MountFlags::READ_ONLY
+            } else {
+                MountFlags::empty()
+            },
         )
         .expect("mount_sdcard_as_root_if_requested: mount identity reservation");
 
@@ -1361,7 +1524,8 @@ impl<P: TxPlatform> CoreInit<P> {
         *ROOT_MOUNT.lock() = Some(mount);
         ROOTFS_FROM_BOOT_MEDIA.store(true, Ordering::Release);
 
-        note_mount_line(&alloc::format!("/dev/{dev_name} / ext4 rw 0 0"));
+        let mode = if read_only { "ro" } else { "rw" };
+        note_mount_line(&alloc::format!("/dev/{dev_name} / ext4 {mode} 0 0"));
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
         tx_hal::console_write_str::<P>(dev_name);
@@ -1405,18 +1569,36 @@ impl<P: TxPlatform> CoreInit<P> {
 
     /// Resolve the root block device to mount from the boot cmdline, the way
     /// Linux's `root=` parameter works. `tx.root=<name>` names the block
-    /// device directly (`vda` for the QEMU virtio disk, `mmcblk0` for the
-    /// SD card on the board, …). The legacy `tx.root=sdcard` alias resolves to
-    /// `vda`.  Explicit `tx.root=` always wins.  Initramfs/busybox and
-    /// `tx.profile=pretest` boots retain the tmpfs-root compatibility layout;
-    /// otherwise QEMU defaults to `vda` so a judge does not need a custom
-    /// kernel command line. Returns `None` for a tmpfs-root boot.
+    /// device directly (`vda` for the QEMU virtio disk, `sda` for the 2K1000
+    /// SATA disk, or `mmcblk0` for an SD card). The legacy `tx.root=sdcard`
+    /// alias resolves to `vda`. Explicit `tx.root=` always wins. Initramfs/busybox and
+    /// `tx.profile=pretest`, legacy `tx.runsh=`, and typed compatibility modes
+    /// whose boot plan installs kernel rootfs shims retain the tmpfs-root
+    /// layout; otherwise QEMU defaults to `vda` so a judge does not need a
+    /// custom kernel command line. Returns `None` for a tmpfs-root boot.
     fn root_device_name() -> Option<&'static str> {
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
         Self::root_device_name_from_boot(
             boot_info.cmdline.unwrap_or(""),
             boot_info.initrd.is_some(),
         )
+    }
+
+    fn root_mount_is_read_only() -> bool {
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        Self::root_mount_is_read_only_from_boot(cmdline)
+    }
+
+    fn root_mount_is_read_only_from_boot(cmdline: &str) -> bool {
+        let mut read_only = false;
+        for token in cmdline.split_ascii_whitespace() {
+            match token {
+                "ro" => read_only = true,
+                "rw" => read_only = false,
+                _ => {}
+            }
+        }
+        read_only
     }
 
     fn root_device_name_from_boot(cmdline: &'static str, has_initrd: bool) -> Option<&'static str> {
@@ -1430,10 +1612,14 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
+        let boot_mode = boot_args::boot_mode_from_cmdline_str(Some(cmdline));
         if has_initrd
-            || cmdline
-                .split_ascii_whitespace()
-                .any(|token| token == "tx.profile=busybox" || token == "tx.profile=pretest")
+            || boot_mode.uses_kernel_rootfs_shims()
+            || cmdline.split_ascii_whitespace().any(|token| {
+                token == "tx.profile=busybox"
+                    || token == "tx.profile=pretest"
+                    || token.starts_with("tx.runsh=")
+            })
         {
             return None;
         }
@@ -1560,7 +1746,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
             {
                 V3::Done(out) => out,
-                V3::Err(step_engine::Errno::EEXIST) => {
+                V3::Err(step_engine::Errno::EEXIST) | V3::Err(step_engine::Errno::EROFS) => {
                     let dev_object_id =
                         match root_payload
                             .fs_ops
@@ -1585,7 +1771,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     );
                     (dev_object_id, dev_meta)
                 }
-                V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                V3::Err(step_engine::Errno::ENOSYS) => {
                     (root_fs_object_id, root_mount.root().meta())
                 }
                 other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
@@ -1684,6 +1870,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // the platform. Inject the boot-time Time facade read once.
         tx_fs::procfs::procfs_register_uptime_clock(Self::monotonic_now_ns);
         tx_fs::procfs::procfs_register_boot_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline);
+        tx_fs::procfs::procfs_register_cpuinfo_provider(Self::procfs_cpuinfo_snapshot);
 
         let root_mount = ROOT_MOUNT
             .lock()
@@ -1706,7 +1893,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 .mkdir(root_fs_object_id, b"proc", 0o555, &cred, &guard)
             {
                 V3::Done(out) => out,
-                V3::Err(step_engine::Errno::EEXIST) => {
+                V3::Err(step_engine::Errno::EEXIST) | V3::Err(step_engine::Errno::EROFS) => {
                     let id = match rootfs_payload
                         .fs_ops
                         .lookup(root_fs_object_id, b"proc", &guard)
@@ -1722,7 +1909,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     };
                     (id, meta)
                 }
-                V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
+                V3::Err(step_engine::Errno::ENOSYS) => {
                     (root_fs_object_id, root_mount.root().meta())
                 }
                 other => panic!("mount_procfs_at_proc: mkdir(/proc) failed: {other:?}"),
@@ -1813,7 +2000,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 .mkdir(root_fs_object_id, b"sys", 0o755, &cred, &guard)
             {
                 V3::Done(out) => out,
-                V3::Err(step_engine::Errno::EEXIST) => {
+                V3::Err(step_engine::Errno::EEXIST) | V3::Err(step_engine::Errno::EROFS) => {
                     let id = match rootfs_payload
                         .fs_ops
                         .lookup(root_fs_object_id, b"sys", &guard)
@@ -2095,28 +2282,54 @@ impl<P: TxPlatform> CoreInit<P> {
 
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
     ///
-    /// If a `vda` block device is registered (RV64 QEMU virtio-blk
-    /// path), opens its ext4 image via `BlockDeviceImage`, mounts it
-    /// read-only, creates `/musl` in the rootfs tmpfs, and binds the
-    /// ext4 mount there. Boards without a block device silently skip.
+    /// The selected block device is opened via `BlockDeviceImage`, mounted,
+    /// and attached at `/musl`. Compatibility modes keep the historical
+    /// read-write OSComp layout; Alpine and `tx.runsh` use a read-only
+    /// sidecar so their source filesystem is never mutated.
     ///
     /// **Order invariant:** must follow `mount_devfs_at_dev` (ROOT_MOUNT
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
-    pub(crate) fn mount_sdcard_at_musl() {
+    pub(crate) fn mount_sdcard_at_musl(
+        requested_device: &'static str,
+        read_only: bool,
+        install_legacy_shims: bool,
+    ) {
         if ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
             return;
         }
 
-        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage, Ext4FileIoRuntimeBinder};
-        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+        tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
+        use tx_fs::tx_ext4::{mount_ext4_read_only, mount_ext4_read_write, BlockDeviceImage};
+        use tx_subsystems::device::block_device_by_name;
 
-        let Some(reg) = block_device_by_name(b"vda") else {
+        let Some(reg) = block_device_by_name(requested_device.as_bytes()) else {
             return;
         };
+        let device_name = reg.name;
 
         let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_only(image) {
+        // Plain direct backend mount, NOT the journal-discovering variant.
+        //
+        // `mount_ext4_read_write_with_discovered_journal` attaches a backend
+        // planner, which routes page fetches through the async io_manager
+        // (`try_materialize_file_page_from_backend_plan`). That path only
+        // completes once block-completion interrupts are being serviced,
+        // which is not true during bootstrap exec: the fetch for the first
+        // userspace image parks forever, `exec_script` never resolves, and
+        // boot falls through to `/init` -> ENOENT -> panic.
+        //
+        // Without the planner the fetch falls back to ext4's synchronous
+        // `fetch_page` (`tx-ext4/src/pager.rs`). That is what the pre-merge
+        // tree did and what `tools/verify-git-net.sh` passes 8/8 on.
+        // Journalled writeback for this mount is given up in exchange; the
+        // sdcard image is a test fixture, and the pre-merge tree ran the
+        // same way.
+        let mount_output = match if read_only {
+            mount_ext4_read_only(image)
+        } else {
+            mount_ext4_read_write(image)
+        } {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -2124,10 +2337,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 return;
             }
         };
-        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
-            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
-        )));
-
         let root_mount = ROOT_MOUNT
             .lock()
             .clone()
@@ -2160,17 +2369,22 @@ impl<P: TxPlatform> CoreInit<P> {
         let musl_dentry_on_root =
             publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"musl", musl_rnode_in_root);
 
-        // Plain read-only mounts have no async backend planner, so preliminary
-        // bootstrap reads retain the established synchronous path.
-        let ext4_payload = MountPayload::new_cap_with_backend_planner(
+        // Plain direct mounts have no async backend planner, so bootstrap reads
+        // retain the established synchronous path in both RO and RW modes.
+        let ext4_payload = MountPayload::new_cap(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
             mount::allocate_dev_id(),
-            MountOptions::default(),
+            MountOptions {
+                flags: if read_only {
+                    MountFlags::READ_ONLY
+                } else {
+                    MountFlags::empty()
+                },
+            },
             "ext4",
-            SourceLabel::Static("vda"),
-            mount_output.backend_planner(),
+            SourceLabel::Static(device_name),
         )
         .expect("mount_sdcard_at_musl: ext4 payload reservation");
 
@@ -2206,7 +2420,11 @@ impl<P: TxPlatform> CoreInit<P> {
             ext4_root_rnode,
             Some(root_mount),
             ext4_payload,
-            MountFlags::empty(),
+            if read_only {
+                MountFlags::READ_ONLY
+            } else {
+                MountFlags::empty()
+            },
         )
         .expect("mount_sdcard_at_musl: mount identity reservation");
 
@@ -2229,7 +2447,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // calls a handful of utilities by bare name (for example `cp hello
         // /tmp/hello`).  Publish those names as BusyBox symlinks so PATH
         // lookup observes the same applet contract as a normal BusyBox rootfs.
-        {
+        if install_legacy_shims {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
                 tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
@@ -2325,7 +2543,8 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        note_mount_line("/dev/vda /musl ext4 rw 0 0");
+        let mode = if read_only { "ro" } else { "rw" };
+        note_mount_line(&alloc::format!("/dev/{device_name} /musl ext4 {mode} 0 0"));
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:sdcard:ext4:ok\n");
     }
@@ -2526,6 +2745,137 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":smp:ipi:ok\n");
+    }
+
+    fn run_la64_reverse_ipi_smoke() {
+        if P::ARCH != tx_hal::Arch::LoongArch64 {
+            return;
+        }
+        let Some(target_cpu) = Self::first_remote_online_cpu() else {
+            return;
+        };
+
+        let bsp_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let bsp_mask = CpuMask::single(bsp_cpu);
+        let current_hart = boot_runtime::HartId(bsp_cpu.0);
+        P::clear_ipi_ack_cpus(IpiKind::Maintenance, bsp_mask);
+
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let submit_report = BOOT_REACTOR
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    async move {
+                        P::send_ipi(bsp_cpu, IpiKind::Maintenance);
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
+            .expect("boot reactor must be initialized before reverse IPI smoke");
+        assert_eq!(submit_report.remote_ipis, 1, "reverse IPI smoke submit");
+        assert!(
+            Self::wait_for_ipi_ack_with_deadline(bsp_mask, IpiKind::Maintenance),
+            "reverse IPI smoke BSP acknowledgement"
+        );
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":smp:ipi:bidirectional:ok\n");
+    }
+
+    fn run_la64_masked_shootdown_smoke() {
+        if P::ARCH != tx_hal::Arch::LoongArch64 {
+            return;
+        }
+        let Some(target_cpu) = Self::first_remote_online_cpu() else {
+            return;
+        };
+
+        LA64_MASKED_SHOOTDOWN_STAGE.store(LA64_MASKED_SHOOTDOWN_ARMED, Ordering::Release);
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let current_hart = boot_runtime::HartId(current_cpu.0);
+        let mut signal = SmpRescheduleSignal::<P>::new();
+        let submit_report = BOOT_REACTOR
+            .with(|reactor| {
+                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                    La64MaskedShootdownTarget::<P> {
+                        target_cpu,
+                        _platform: PhantomData,
+                    },
+                    boot_runtime::InitialSchedMeta::kernel()
+                        .with_affinity(CpuMask::single(target_cpu).bits()),
+                    current_hart,
+                    &mut signal,
+                );
+                report
+            })
+            .expect("boot reactor must be initialized before masked shootdown smoke");
+        assert_eq!(
+            submit_report.remote_ipis, 1,
+            "masked shootdown smoke submit"
+        );
+
+        if !Self::wait_for_la64_masked_shootdown_stage(LA64_MASKED_SHOOTDOWN_ACTIVE) {
+            match LA64_MASKED_SHOOTDOWN_STAGE.compare_exchange(
+                LA64_MASKED_SHOOTDOWN_ARMED,
+                LA64_MASKED_SHOOTDOWN_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => panic!("masked shootdown target did not start before deadline"),
+                Err(LA64_MASKED_SHOOTDOWN_ACTIVE) => {}
+                Err(stage) => panic!("masked shootdown target entered invalid stage {stage}"),
+            }
+        }
+
+        P::shootdown_kernel_mapping(tx_hal::PmapInvalidation::new(tx_hal::VirtAddr(0), 4096));
+        LA64_MASKED_SHOOTDOWN_STAGE.store(LA64_MASKED_SHOOTDOWN_RELEASE, Ordering::Release);
+        assert!(
+            Self::wait_for_la64_masked_shootdown_stage(LA64_MASKED_SHOOTDOWN_DONE),
+            "masked shootdown target did not finish before deadline"
+        );
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":smp:shootdown:masked-progress:ok\n");
+    }
+
+    fn wait_for_ipi_ack_with_deadline(mask: CpuMask, kind: IpiKind) -> bool {
+        Self::wait_for_boot_smoke_condition(|| {
+            P::ipi_ack_cpus(kind).bits() & mask.bits() == mask.bits()
+        })
+    }
+
+    fn wait_for_la64_masked_shootdown_stage(expected: u64) -> bool {
+        Self::wait_for_boot_smoke_condition(|| {
+            LA64_MASKED_SHOOTDOWN_STAGE.load(Ordering::Acquire) == expected
+        })
+    }
+
+    fn wait_for_boot_smoke_condition(mut ready: impl FnMut() -> bool) -> bool {
+        const TIMEOUT_NS: u64 = 10_000_000_000;
+
+        if P::frequency_hz() == 0 {
+            for _ in 0..AP_REACTOR_WAIT_SPINS {
+                if ready() {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+            return false;
+        }
+
+        let deadline = P::read_ns().saturating_add(TIMEOUT_NS);
+        loop {
+            if ready() {
+                return true;
+            }
+            if P::read_ns() >= deadline {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
     }
 
     fn run_reactor_dispatcher_smoke() {
@@ -3313,8 +3663,8 @@ impl<P: TxPlatform> CoreInit<P> {
     /// (`/musl/usr` -> `/usr`, `/musl/lib` -> `/lib`, `/musl/bin` -> `/bin`,
     /// `/musl/sbin` -> `/sbin`) over the empty rootfs skeleton directories.
     ///
-    /// For the `tx.runsh` (on-site-finals git) lane only — call it from the
-    /// bootstrap path when `tx.runsh` is set.
+    /// Used by `tx.profile=alpine` and the legacy `tx.runsh` lane after the
+    /// initramfs has populated the tmpfs mountpoints.
     ///
     /// The image is mounted at `/musl`, but its binaries and its own *absolute*
     /// symlinks assume a real root layout: `/usr/bin/git`, `/bin/sh ->
@@ -3326,11 +3676,10 @@ impl<P: TxPlatform> CoreInit<P> {
     /// empty tmpfs dirs, so a plain top-level symlink can't take their place
     /// (EEXIST). Instead, mount the matching ext4 subtree over each empty
     /// skeleton dir, so the mounted image behaves as the root fs for the
-    /// helper-spawn paths git relies on. Gated to this lane, so the OSComp
-    /// tmpfs layout is untouched. Best-effort: a missing image dir or a backend
-    /// that would block is skipped rather than aborting boot. (Ported from
-    /// net-git e7992ef8 — git Task2.)
-    pub(super) fn overlay_image_dirs_for_runsh() {
+    /// helper-spawn paths Git relies on. The caller gates this away from the
+    /// OSComp tmpfs layout. Best-effort: a missing image dir is skipped rather
+    /// than aborting boot.
+    pub(super) fn overlay_alpine_image_dirs() {
         use step_engine::StepOutcome as V3;
         let Some(musl_mount) = MUSL_MOUNT.lock().clone() else {
             return;
@@ -3342,6 +3691,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
         let ext4_payload = ext4_payload.into_cap();
+        let overlay_flags = musl_mount.flags();
         let ext4_fs_ops = ext4_payload.fs_ops.clone();
         let ext4_root_id = musl_mount.root().fs_object_id();
         let Ok(rootfs_payload) = root_mount.payload_cap() else {
@@ -3416,7 +3766,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 ext4_sub_rnode,
                 Some(root_mount.clone()),
                 ext4_payload.clone(),
-                MountFlags::empty(),
+                overlay_flags,
             ) else {
                 continue;
             };
@@ -3425,7 +3775,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 mnt_ns.register_mount(&mountpoint_dentry, overlay_mount);
             }
             Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":runsh:overlay:");
+            tx_hal::console_write_str::<P>(":alpine:overlay:");
             tx_hal::console_write_bytes::<P>(name);
             tx_hal::console_write_str::<P>(":ok\n");
         }

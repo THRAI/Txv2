@@ -16,6 +16,7 @@ pub mod trap;
 pub mod trap_handoff;
 pub mod vdso;
 
+use devices::binder::StaticDeviceBundle;
 use tx_hal::{BootHandoff, TxPlatform};
 
 /// Bounded-trace dump threshold.
@@ -64,8 +65,12 @@ mod host_check_allocator {
     static HOST_CHECK_ALLOCATOR: HostCheckAllocator = HostCheckAllocator;
 }
 
-pub fn kernel_main<P: TxPlatform + 'static>(handoff: BootHandoff) -> ! {
-    init::CoreInit::<P>::boot(handoff)
+pub fn kernel_main<P, D>(handoff: BootHandoff) -> !
+where
+    P: TxPlatform + 'static,
+    D: StaticDeviceBundle<P>,
+{
+    init::CoreInit::<P, D>::boot(handoff)
 }
 
 pub fn panic_shutdown<P: TxPlatform>() -> ! {

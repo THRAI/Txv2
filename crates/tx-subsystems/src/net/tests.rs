@@ -1,7 +1,7 @@
 use super::structure::{
     registry, AcceptWireSet, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
     Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, PollMask, ProtocolNumber, RawIcmpState,
-    RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6, SockShutdownCmd,
+    RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd,
     SocketIdentity, SocketKind, SocketOptionSet, SocketProtocol, SocketType, TcpConnectDisposition,
     TcpConnectProgress, TcpFlowGenerationTry, TcpState, TcpTlsUlpState, UdpInner, ValidSocketType,
 };
@@ -26,8 +26,8 @@ use crate::net::device::{
 };
 use crate::net::execution::{
     socket_accept_wait_token, socket_recv_wait_token, socket_send_wait_token,
-    socket_urgent_wait_token, step_accept, step_bind, step_connect, step_listen, step_poll_ready,
-    step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending,
+    socket_urgent_wait_token, step_accept, step_bind, step_connect, step_listen, step_packet_send,
+    step_poll_ready, step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending,
     step_process_loopback_pending_zero, step_process_loopback_tcp,
     step_process_loopback_udp_on_iface, step_process_network_events,
     step_process_network_events_at, step_process_network_events_in_namespace_at,
@@ -35,10 +35,11 @@ use crate::net::execution::{
     step_recv_kernel_bytes, step_send, step_send_kernel_bytes, step_send_to_kernel_bytes,
     step_send_to_kernel_bytes_with_poll_kick, step_send_udp_loopback_kernel_bytes,
     step_send_udp_loopback_kernel_bytes_on_iface, step_shutdown, step_socket_close,
-    step_socket_create, step_tcp_backlog_cleanup, step_tcp_close_staging,
-    step_tcp_connection_cleanup, step_tcp_loopback_handshake, step_tcp_loopback_handshake_on_iface,
-    step_tcp_loopback_transfer, DeviceTxBudget, LoopbackPollBudget, NET_EVENT_BUDGET,
-    TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    step_socket_create, step_socket_create_in_namespace, step_tcp_backlog_cleanup,
+    step_tcp_close_staging, step_tcp_connection_cleanup, step_tcp_loopback_handshake,
+    step_tcp_loopback_handshake_on_iface, step_tcp_loopback_transfer, DeviceTxBudget,
+    LoopbackPollBudget, NET_EVENT_BUDGET, TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS,
+    TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 use crate::net::facade::{
     drive_socket_nonblocking, socket_create_facade, socket_listen_facade, socket_poll_ready_facade,
@@ -59,10 +60,11 @@ use crate::net::protocol::{
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::{
     add_dnat_rule_for_test_or_bootstrap, add_masquerade_rule_for_test_or_bootstrap,
-    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4, netfilter_conntrack_snapshot,
-    netfilter_rules_snapshot, netfilter_stats_snapshot, require_net_admin,
-    reset_netfilter_for_test, NetAdminAuthority, NetNamespaceLinkInfo, NetfilterConntrackProtocol,
-    NetfilterFrameContext, NetfilterHook, NetfilterIpv4Cidr, NetfilterNatKind,
+    apply_postrouting_nat_ipv4, apply_prerouting_nat_ipv4, drive_net_namespace_runtime_at,
+    netfilter_conntrack_snapshot, netfilter_rules_snapshot, netfilter_stats_snapshot,
+    require_net_admin, reset_netfilter_for_test, NetAdminAuthority, NetNamespaceLinkInfo,
+    NetfilterConntrackProtocol, NetfilterFrameContext, NetfilterHook, NetfilterIpv4Cidr,
+    NetfilterNatKind,
 };
 use crate::{device::DevT, execution::Guard};
 use core::future::Future;
@@ -84,6 +86,7 @@ mod loopback_pending_tests;
 mod loopback_tests;
 mod netdevice_staging_tests;
 mod nfnetlink_tests;
+mod packet_socket_io_tests;
 mod projection_tests;
 mod rds_sctp_ltp_tests;
 mod rtnetlink_tests;

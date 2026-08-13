@@ -2004,6 +2004,20 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                     | crate::page_backed::PageContainerKind::Device { .. } => None,
                 })
         {
+            if !container.has_file_io_service_runtime() {
+                let guard = step_engine::guard();
+                return match crate::page_backed::step_fsync(container, &guard) {
+                    V3::Done(()) => V3::Done(()),
+                    V3::Err(e) => V3::Err(e),
+                    V3::Continue { .. } => V3::Continue {
+                        progress: NoProgress,
+                    },
+                    V3::Yield { shape, .. } => V3::Yield {
+                        progress: NoProgress,
+                        shape,
+                    },
+                };
+            }
             if self.raw_block_device && mount.payload().backend_planner().is_none() {
                 let guard = step_engine::guard();
                 return match crate::page_backed::step_raw_block_fsync(container, &guard) {

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,6 +14,7 @@ pub(crate) enum TxTarget {
     Rv64Qemu,
     Rv64M1DockMock,
     La64Qemu,
+    La64Ls2k1000,
 }
 
 impl TxTarget {
@@ -21,15 +23,21 @@ impl TxTarget {
             "rv64-qemu" => Ok(Self::Rv64Qemu),
             "rv64-m1dock-mock" => Ok(Self::Rv64M1DockMock),
             "la64-qemu" => Ok(Self::La64Qemu),
+            "la64-2k1000" => Ok(Self::La64Ls2k1000),
             other => Err(format!(
-                "unknown target '{other}', expected rv64-qemu, rv64-m1dock-mock, la64-qemu, or all"
+                "unknown target '{other}', expected rv64-qemu, rv64-m1dock-mock, la64-qemu, la64-2k1000, or all"
             )),
         }
     }
 
     pub(crate) fn all_for(value: &str) -> Result<Vec<Self>> {
         if value == "all" {
-            Ok(vec![Self::Rv64Qemu, Self::Rv64M1DockMock, Self::La64Qemu])
+            Ok(vec![
+                Self::Rv64Qemu,
+                Self::Rv64M1DockMock,
+                Self::La64Qemu,
+                Self::La64Ls2k1000,
+            ])
         } else {
             Ok(vec![Self::parse(value)?])
         }
@@ -40,6 +48,7 @@ impl TxTarget {
             Self::Rv64Qemu => "rv64-qemu",
             Self::Rv64M1DockMock => "rv64-m1dock-mock",
             Self::La64Qemu => "la64-qemu",
+            Self::La64Ls2k1000 => "la64-2k1000",
         }
     }
 
@@ -48,6 +57,7 @@ impl TxTarget {
             Self::Rv64Qemu => "tx-kernel-riscv64-qemu-virt",
             Self::Rv64M1DockMock => "tx-kernel-riscv64-m1dock-mock",
             Self::La64Qemu => "tx-kernel-loongarch64-qemu-virt",
+            Self::La64Ls2k1000 => "tx-kernel-loongarch64-2k1000",
         }
     }
 
@@ -56,6 +66,7 @@ impl TxTarget {
             Self::Rv64Qemu => "qemu-riscv64-virt",
             Self::Rv64M1DockMock => "sipeed-m1-dock-mock",
             Self::La64Qemu => "qemu-loongarch64-virt",
+            Self::La64Ls2k1000 => "loongson-2k1000",
         }
     }
 
@@ -63,6 +74,7 @@ impl TxTarget {
         match self {
             Self::Rv64Qemu | Self::Rv64M1DockMock => "qemu-system-riscv64",
             Self::La64Qemu => "qemu-system-loongarch64",
+            Self::La64Ls2k1000 => panic!("la64-2k1000 is a physical-board target"),
         }
     }
 
@@ -70,6 +82,7 @@ impl TxTarget {
         match self {
             Self::Rv64Qemu | Self::Rv64M1DockMock => "virt",
             Self::La64Qemu => "virt",
+            Self::La64Ls2k1000 => panic!("la64-2k1000 is a physical-board target"),
         }
     }
 
@@ -78,10 +91,20 @@ impl TxTarget {
     }
 
     pub(crate) fn kernel_path_for_profile(self, root: &Path, release: bool) -> PathBuf {
-        root.join("target")
+        let target_dir = env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            })
+            .unwrap_or_else(|| root.join("target"));
+        target_dir
             .join(target_triple(self).unwrap_or_else(|_| match self {
                 Self::Rv64Qemu | Self::Rv64M1DockMock => RV64_TARGET.to_string(),
-                Self::La64Qemu => LA64_TARGET_PREFERRED.to_string(),
+                Self::La64Qemu | Self::La64Ls2k1000 => LA64_TARGET_PREFERRED.to_string(),
             }))
             .join(if release { "release" } else { "debug" })
             .join(self.package())
@@ -119,7 +142,7 @@ impl Profile {
 pub(crate) fn target_triple(target: TxTarget) -> Result<String> {
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => Ok(RV64_TARGET.to_string()),
-        TxTarget::La64Qemu => {
+        TxTarget::La64Qemu | TxTarget::La64Ls2k1000 => {
             let installed = installed_targets().ok();
             let supported = supported_targets()?;
             select_la64_target(installed.as_ref(), &supported)
@@ -212,6 +235,22 @@ mod tests {
 
     fn set(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_and_maps_la64_ls2k1000_target() {
+        let target = TxTarget::parse("la64-2k1000").unwrap();
+        assert_eq!(target, TxTarget::La64Ls2k1000);
+        assert_eq!(target.name(), "la64-2k1000");
+        assert_eq!(target.package(), "tx-kernel-loongarch64-2k1000");
+        assert_eq!(target.board_name(), "loongson-2k1000");
+    }
+
+    #[test]
+    fn all_targets_include_la64_ls2k1000() {
+        assert!(TxTarget::all_for("all")
+            .unwrap()
+            .contains(&TxTarget::La64Ls2k1000));
     }
 
     #[test]

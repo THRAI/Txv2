@@ -79,7 +79,7 @@ pub(crate) fn emulate_user_unaligned(frame: &mut La64TrapFrame) -> UnalignedOutc
         AccessKind::Load => {
             let mut raw = 0;
             if let Err(fault) = read_user_value(frame.badv, decoded.width, &mut raw) {
-                return UnalignedOutcome::Fault(fault);
+                return UnalignedOutcome::Fault(user_data_fault(fault, false));
             }
 
             let value = if decoded.signed {
@@ -92,7 +92,7 @@ pub(crate) fn emulate_user_unaligned(frame: &mut La64TrapFrame) -> UnalignedOutc
         AccessKind::Store => {
             let value = read_register(frame, decoded);
             if let Err(fault) = write_user_value(frame.badv, decoded.width, value) {
-                return UnalignedOutcome::Fault(fault);
+                return UnalignedOutcome::Fault(user_data_fault(fault, true));
             }
         }
     }
@@ -266,6 +266,15 @@ fn write_user_value(addr: usize, width: usize, value: u64) -> Result<(), FaultIn
             bytes.as_ptr(),
             width,
         )
+    }
+}
+
+fn user_data_fault(fault: FaultInfo, write: bool) -> FaultInfo {
+    FaultInfo {
+        address: fault.address,
+        write,
+        instruction: false,
+        from_user: true,
     }
 }
 
@@ -459,6 +468,35 @@ mod tests {
         assert_eq!(sign_extend(0x8000_0001, 4), 0xffff_ffff_8000_0001);
         assert_eq!(mask_width(0xffff_ffff_8000_0001, 4), 0x8000_0001);
         assert_eq!(mask_width(0x1234_5678_9abc_def0, 8), 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn user_unaligned_data_faults_preserve_address_and_restore_user_provenance() {
+        let raw_fault = FaultInfo {
+            address: VirtAddr(0x4925_000),
+            write: false,
+            instruction: true,
+            from_user: false,
+        };
+
+        assert_eq!(
+            user_data_fault(raw_fault, false),
+            FaultInfo {
+                address: VirtAddr(0x4925_000),
+                write: false,
+                instruction: false,
+                from_user: true,
+            }
+        );
+        assert_eq!(
+            user_data_fault(raw_fault, true),
+            FaultInfo {
+                address: VirtAddr(0x4925_000),
+                write: true,
+                instruction: false,
+                from_user: true,
+            }
+        );
     }
 
     #[test]

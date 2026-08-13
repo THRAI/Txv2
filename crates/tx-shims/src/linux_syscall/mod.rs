@@ -66,9 +66,9 @@ use tx_subsystems::page_backed::{
     AnonSwapPolicy, PageContainer, PageContainerKind, TruncateOp as FdTruncateOp,
 };
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_waitpid_nohang, ChdirOp, ChdirOutcome, CloseOp,
-    Dup3Op, DupOp, ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid, ProcessIdentity,
-    SetpgidOp, SetsidOp, WaitError, WaitTarget,
+    process_by_pid, process_group_by_pgid, seed_child_leader_context, step_waitpid_nohang, ChdirOp,
+    ChdirOutcome, CloseOp, Dup3Op, DupOp, ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid,
+    ProcessIdentity, SetpgidOp, SetsidOp, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -83,7 +83,7 @@ use tx_subsystems::thread_runtime::{
 };
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
-    step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
+    step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp_for_process,
     step_ioctl_tiocswinsz, IoctlCaller,
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};

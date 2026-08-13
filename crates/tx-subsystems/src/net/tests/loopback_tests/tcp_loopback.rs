@@ -48,6 +48,47 @@ fn tcp_loopback_pollcontext_moves_data_through_packet_queue() {
 }
 
 #[test]
+fn tcp_pollcontext_refires_recv_publish_when_has_data_wire_is_already_set() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, _local, _remote) =
+        prepare_loopback_connect_with_client_send_buf(41_167, 51_167, 5);
+    let guard = tx_substrate::epoch::guard();
+    let iface = LoopbackIface::new(IfaceCommon::new(
+        Ipv4Address::LOOPBACK,
+        Ipv4Address::new([255, 0, 0, 0]),
+        1500,
+    ));
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+    accepted.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"hello", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(5)
+    );
+
+    let mut ctx = PollContext::new(smoltcp::time::Instant::ZERO);
+    assert!(ctx.poll_egress_one(&client, &iface, &guard).is_some());
+    let ingress = ctx.poll_ingress(&iface, &guard, 64);
+
+    assert_eq!(ingress.bytes_moved, 5);
+    assert_eq!(
+        ingress.publishes.len(),
+        1,
+        "physical ingress must re-publish data even while HAS_DATA is set; a reader may be clearing the wire before sleep"
+    );
+}
+
+#[test]
 fn tcp_loopback_default_steps_use_persistent_loopback_iface() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

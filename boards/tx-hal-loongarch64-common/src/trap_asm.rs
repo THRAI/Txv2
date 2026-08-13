@@ -82,10 +82,6 @@ tx_la64_idle_irq_region_exit:
     .equ TX_LA64_CSR_LLBCTL_TRAP, 0x60
     .equ TX_LA64_LLBCTL_KLO_TRAP, 0x4
     .equ TX_LA64_DMW_CACHED_BASE_TRAP, 0x9000000000000000
-    .equ TX_LA64_UART0_UNCACHED_TRAP, 0x800000001fe00000
-    .equ TX_LA64_UART_THR_TRAP, 0
-    .equ TX_LA64_UART_LSR_TRAP, 5
-    .equ TX_LA64_UART_LSR_THRE_TRAP, 0x20
     .equ TX_LA64_PHYS_ADDR_MASK_TRAP, 0x0000ffffffffffff
     .equ TX_LA64_RCTX_SP, 0
     .equ TX_LA64_RCTX_RA, 8
@@ -94,25 +90,15 @@ tx_la64_idle_irq_region_exit:
     .equ TX_LA64_RCTX_R22, 32
     .equ TX_LA64_PRMD_PPLV_USER, 3
 
-    .macro TX_LA64_TRACE_CHAR ch, tmp0, tmp1
-        li.d    \tmp0, TX_LA64_UART0_UNCACHED_TRAP
-    987:
-        ld.bu   \tmp1, \tmp0, TX_LA64_UART_LSR_TRAP
-        andi    \tmp1, \tmp1, TX_LA64_UART_LSR_THRE_TRAP
-        beqz    \tmp1, 987b
-        li.w    \tmp1, \ch
-        st.b    \tmp1, \tmp0, TX_LA64_UART_THR_TRAP
-    .endm
-
     .section .text.trap, "ax"
 
-    .globl tx_la64_qemu_trap_low_start
-    .type tx_la64_qemu_trap_low_start, @function
-tx_la64_qemu_trap_low_start:
+    .globl tx_la64_trap_low_start
+    .type tx_la64_trap_low_start, @function
+tx_la64_trap_low_start:
 
-    .globl tx_la64_qemu_exception_vector
-    .type tx_la64_qemu_exception_vector, @function
-tx_la64_qemu_exception_vector:
+    .globl tx_la64_exception_vector
+    .type tx_la64_exception_vector, @function
+tx_la64_exception_vector:
     csrwr   $r12, TX_LA64_CSR_KSAVE3_TRAP
     csrrd   $r12, TX_LA64_CSR_PRMD_TRAP
     andi    $r12, $r12, TX_LA64_PRMD_PPLV_USER
@@ -190,7 +176,7 @@ tx_la64_qemu_exception_vector:
 .Ltx_la64_kernel_tls_ready:
 
     move    $a0, $sp
-    la.local $r12, tx_la64_qemu_kernel_trap_entry
+    la.local $r12, tx_la64_kernel_trap_entry
     li.d    $r13, TX_LA64_PHYS_ADDR_MASK_TRAP
     and     $r12, $r12, $r13
     li.d    $r13, TX_LA64_DMW_CACHED_BASE_TRAP
@@ -245,12 +231,12 @@ tx_la64_qemu_exception_vector:
     ld.d    $r31, $r31, TX_LA64_TF_R31
 .Ltx_la64_trap_ertn:
     ertn
-    .size tx_la64_qemu_exception_vector, . - tx_la64_qemu_exception_vector
+    .size tx_la64_exception_vector, . - tx_la64_exception_vector
 
     .align 12
-    .globl tx_la64_qemu_tlb_refill_vector
-    .type tx_la64_qemu_tlb_refill_vector, @function
-tx_la64_qemu_tlb_refill_vector:
+    .globl tx_la64_tlb_refill_vector
+    .type tx_la64_tlb_refill_vector, @function
+tx_la64_tlb_refill_vector:
     // Fast TLB refill path: walk page-table directories directly
     // and fill TLB without constructing a full trap frame.
     csrwr   $r12, TX_LA64_CSR_TLBRSAVE_TRAP
@@ -295,15 +281,15 @@ tx_la64_qemu_tlb_refill_vector:
     csrrd   $r13, TX_LA64_CSR_KSAVE3_TRAP
     csrrd   $r12, TX_LA64_CSR_TLBRSAVE_TRAP
     ertn
-    .size tx_la64_qemu_tlb_refill_vector, . - tx_la64_qemu_tlb_refill_vector
+    .size tx_la64_tlb_refill_vector, . - tx_la64_tlb_refill_vector
 
-    .globl tx_la64_qemu_trap_low_end
-    .type tx_la64_qemu_trap_low_end, @function
-tx_la64_qemu_trap_low_end:
+    .globl tx_la64_trap_low_end
+    .type tx_la64_trap_low_end, @function
+tx_la64_trap_low_end:
 
-    .globl tx_la64_qemu_return_to_userspace
-    .type tx_la64_qemu_return_to_userspace, @function
-tx_la64_qemu_return_to_userspace:
+    .globl tx_la64_return_to_userspace
+    .type tx_la64_return_to_userspace, @function
+tx_la64_return_to_userspace:
     // `idle 0` deliberately leaves CRMD.IE enabled after wakeup.  Mask
     // interrupts before changing ERA/PRMD and restoring user registers so an
     // interrupt cannot observe a half-installed user-return context.  `ertn`
@@ -353,11 +339,11 @@ tx_la64_qemu_return_to_userspace:
     ld.d    $sp, $r31, TX_LA64_TF_R3
     ld.d    $r31, $r31, TX_LA64_TF_R31
     ertn
-    .size tx_la64_qemu_return_to_userspace, . - tx_la64_qemu_return_to_userspace
+    .size tx_la64_return_to_userspace, . - tx_la64_return_to_userspace
 
-    .globl tx_la64_qemu_activate_enter_userspace
-    .type tx_la64_qemu_activate_enter_userspace, @function
-tx_la64_qemu_activate_enter_userspace:
+    .globl tx_la64_activate_enter_userspace
+    .type tx_la64_activate_enter_userspace, @function
+tx_la64_activate_enter_userspace:
     // a0 = *mut KernelResumeCtx
     // a1 = *const La64TrapFrame
     // a2 = trap_stack_top
@@ -494,7 +480,7 @@ tx_la64_qemu_activate_enter_userspace:
     ld.d    $sp, $r31, TX_LA64_TF_R3
     ld.d    $r31, $r31, TX_LA64_TF_R31
     ertn
-    .size tx_la64_qemu_activate_enter_userspace, . - tx_la64_qemu_activate_enter_userspace
+    .size tx_la64_activate_enter_userspace, . - tx_la64_activate_enter_userspace
 
     .globl tx_la64_resume_kernel_after_reschedule
     .type tx_la64_resume_kernel_after_reschedule, @function
@@ -528,9 +514,9 @@ tx_la64_resume_kernel_after_reschedule:
 
     .equ TX_LA64_CSR_EUEN, 0x02
 
-    .globl tx_la64_qemu_fp_save_context
-    .type tx_la64_qemu_fp_save_context, @function
-tx_la64_qemu_fp_save_context:
+    .globl tx_la64_fp_save_context
+    .type tx_la64_fp_save_context, @function
+tx_la64_fp_save_context:
     csrrd   $t3, TX_LA64_CSR_EUEN
     andi    $t0, $t3, 1
     beqz    $t0, .Ltx_la64_fp_save_none
@@ -630,11 +616,11 @@ tx_la64_qemu_fp_save_context:
     st.w    $zero, $a0, 264
     move    $a0, $zero
     jr      $ra
-    .size tx_la64_qemu_fp_save_context, . - tx_la64_qemu_fp_save_context
+    .size tx_la64_fp_save_context, . - tx_la64_fp_save_context
 
-    .globl tx_la64_qemu_fp_restore_context
-    .type tx_la64_qemu_fp_restore_context, @function
-tx_la64_qemu_fp_restore_context:
+    .globl tx_la64_fp_restore_context
+    .type tx_la64_fp_restore_context, @function
+tx_la64_fp_restore_context:
     ld.w    $t0, $a0, 264
     andi    $t1, $t0, 1
     beqz    $t1, .Ltx_la64_fp_restore_disable
@@ -732,7 +718,7 @@ tx_la64_qemu_fp_restore_context:
     andi    $t2, $t2, 0xff8
     csrwr   $t2, TX_LA64_CSR_EUEN
     jr      $ra
-    .size tx_la64_qemu_fp_restore_context, . - tx_la64_qemu_fp_restore_context
+    .size tx_la64_fp_restore_context, . - tx_la64_fp_restore_context
 "#
 );
 

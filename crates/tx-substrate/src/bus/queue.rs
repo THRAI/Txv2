@@ -276,6 +276,27 @@ impl RawQueue {
         let _ = self.try_clear(bits);
     }
 
+    /// Atomically snapshot and consume the requested readiness bits.
+    ///
+    /// `peek()` followed by `clear()` is not equivalent: a producer can fire
+    /// the same bit between those two operations and the later clear then
+    /// erases the new event. Event-loop owners use this method when a set bit
+    /// means "work was requested" rather than persistent level readiness.
+    pub fn take(&self, bits: u64) -> u64 {
+        self.try_take(bits).unwrap_or(0)
+    }
+
+    pub fn try_take(&self, bits: u64) -> Result<u64, RawWireError> {
+        let mut state = self.state.lock();
+        if state.terminal {
+            return Err(RawWireError::Terminal);
+        }
+
+        let taken = state.ready_bits & bits;
+        state.ready_bits &= !bits;
+        Ok(taken)
+    }
+
     pub fn try_clear(&self, bits: u64) -> Result<(), RawWireError> {
         let mut state = self.state.lock();
         if state.terminal {

@@ -57,6 +57,149 @@ write_file() {
     "$bb" chmod "$mode" "$path" 2>/dev/null || chmod "$mode" "$path"
 }
 
+select_dhcp_interface() {
+    selector=$1
+    net_class_dir=${TX_TEST_NET_CLASS_DIR:-/sys/class/net}
+    dhcp_iface=
+
+    if [ -n "$selector" ]; then
+        if [ "$selector" = lo ] || [ ! -e "$net_class_dir/$selector" ]; then
+            log "dhcp:fail:invalid-interface:$selector"
+            return 1
+        fi
+        dhcp_iface=$selector
+        return 0
+    fi
+
+    iface_count=0
+    for net_path in "$net_class_dir"/*; do
+        [ -e "$net_path" ] || continue
+        candidate=${net_path##*/}
+        [ "$candidate" = lo ] && continue
+        dhcp_iface=$candidate
+        iface_count=$((iface_count + 1))
+    done
+
+    case "$iface_count" in
+        0)
+            log "dhcp:fail:no-interface"
+            return 1
+            ;;
+        1)
+            return 0
+            ;;
+        *)
+            log "dhcp:fail:ambiguous-interface"
+            dhcp_iface=
+            return 1
+            ;;
+    esac
+}
+
+write_udhcpc_hook() {
+    dhcp_hook=${TX_TEST_DHCP_HOOK:-/tmp/tx-test-udhcpc.script}
+    write_file "$dhcp_hook" 0755 \
+        '#!/bin/sh' \
+        'set -e' \
+        'bb=/bin/busybox' \
+        'resolv_conf=/etc/resolv.conf' \
+        'delete_default_routes() {' \
+        '    while "$bb" ip -4 route del default dev "$interface" 2>/dev/null; do :; done' \
+        '}' \
+        'case "$1" in' \
+        '    deconfig)' \
+        '        delete_default_routes' \
+        '        "$bb" ip -4 addr flush dev "$interface"' \
+        '        ;;' \
+        '    bound|renew)' \
+        '        delete_default_routes' \
+        '        "$bb" ip -4 addr flush dev "$interface"' \
+        '        lease_address=$ip' \
+        '        lease_mask=$mask' \
+        '        [ -n "$lease_mask" ] || lease_mask=$subnet' \
+        '        if [ -n "$lease_mask" ]; then' \
+        '            lease_address="$ip/$lease_mask"' \
+        '        fi' \
+        '        if [ -n "$broadcast" ]; then' \
+        '            "$bb" ip -4 addr add "$lease_address" broadcast "$broadcast" dev "$interface"' \
+        '        else' \
+        '            "$bb" ip -4 addr add "$lease_address" dev "$interface"' \
+        '        fi' \
+        '        "$bb" ip link set dev "$interface" up' \
+        '        for gateway in $router; do' \
+        '            "$bb" ip -4 route add default via "$gateway" dev "$interface"' \
+        '            break' \
+        '        done' \
+        '        : > "$resolv_conf.tmp"' \
+        '        if [ -n "$search" ]; then' \
+        '            printf "search %s\n" "$search" >> "$resolv_conf.tmp"' \
+        '        elif [ -n "$domain" ]; then' \
+        '            printf "search %s\n" "$domain" >> "$resolv_conf.tmp"' \
+        '        fi' \
+        '        for nameserver in $dns; do' \
+        '            printf "nameserver %s\n" "$nameserver" >> "$resolv_conf.tmp"' \
+        '        done' \
+        '        "$bb" chmod 0644 "$resolv_conf.tmp"' \
+        '        "$bb" mv -f "$resolv_conf.tmp" "$resolv_conf"' \
+        '        ;;' \
+        'esac'
+}
+
+bootstrap_userspace_dhcp() {
+    selector=$1
+    log "dhcp:start"
+    select_dhcp_interface "$selector" || return 1
+    log "dhcp:interface:$dhcp_iface"
+
+    if ! write_udhcpc_hook; then
+        log "dhcp:fail:hook"
+        return 1
+    fi
+    if ! "$bb" ip link set dev "$dhcp_iface" up; then
+        log "dhcp:fail:link-up:$dhcp_iface"
+        return 1
+    fi
+
+    "$bb" udhcpc -f -q -n -t 3 -T 3 \
+        -p "/var/run/udhcpc.$dhcp_iface.pid" \
+        -i "$dhcp_iface" -s "$dhcp_hook"
+    udhcpc_status=$?
+    lease=$("$bb" ip -4 addr show dev "$dhcp_iface" 2>/dev/null \
+        | "$bb" awk '/inet / { split($2, addr, "/"); print addr[1]; exit }')
+    default_gateway=$("$bb" ip -4 route show default 2>/dev/null \
+        | "$bb" awk '/^default / { print $3; exit }')
+    dns_server=$("$bb" awk '/^nameserver / { print $2; exit }' /etc/resolv.conf 2>/dev/null)
+    if [ "$udhcpc_status" -ne 0 ]; then
+        log "dhcp:fail:udhcpc:$udhcpc_status"
+        return 1
+    fi
+    if [ -z "$lease" ]; then
+        log "dhcp:fail:no-lease"
+        return 1
+    fi
+    if [ -z "$default_gateway" ]; then
+        log "dhcp:fail:no-default-route"
+        return 1
+    fi
+    if [ -z "$dns_server" ]; then
+        log "dhcp:fail:no-dns"
+        return 1
+    fi
+
+    log "dhcp:lease:$lease"
+    log "dhcp:ok"
+    return 0
+}
+
+run_payload_with_network_bootstrap() {
+    network_mode=$(cmdline_value tx.net.mode 2>/dev/null)
+    if [ "$network_mode" = dhcp ]; then
+        iface_selector=$(cmdline_value tx.net.iface 2>/dev/null)
+        bootstrap_userspace_dhcp "$iface_selector" || return 1
+    fi
+    run_payload "$@"
+}
+
 setup_base_tree() {
     mkdir_p /bin /usr/bin /etc /tmp /var/tmp /var/run/netns /var/lib/misc /var/log \
         /sys /boot /lib/modules/6.1.0-txkernel /tx-ltp/bin /tx-ltp/trace-bin
@@ -248,6 +391,10 @@ run_payload() {
     return "$tx_status"
 }
 
+if [ "${TX_TEST_INIT_LIB_ONLY:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 log "setup:start"
 
 # The scheduler witness runs before the broader boot overlays so it can
@@ -287,7 +434,7 @@ setup_base_tree
 install_ltp_helpers
 log "setup:ok"
 
-run_payload "$@"
+run_payload_with_network_bootstrap "$@"
 status=$?
 reap_children
 log "exit:$status"

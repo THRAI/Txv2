@@ -1,4 +1,6 @@
 use super::*;
+use crate::net::step_unix_socketpair_connect;
+use alloc::vec::Vec;
 
 #[test]
 fn ipv4_address_preserves_octets() {
@@ -90,6 +92,84 @@ fn isolated_net_namespaces_allow_same_tcp_endpoint_bind() {
 }
 
 #[test]
+fn unix_socketpair_peer_table_supports_hackbench_scale_and_reuse() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let netns = crate::net::create_isolated_net_namespace_for_test("unix-pairs-hackbench")
+        .expect("net namespace")
+        .payload_cap()
+        .expect("net namespace payload");
+    let table = netns.socket_table();
+    let mut pairs = Vec::new();
+
+    for _ in 0..300 {
+        let first = registry::create_socket_in_namespace(
+            SocketKind::UnixStream,
+            SocketOptionSet::default_tcp(),
+            netns.clone(),
+        )
+        .expect("first socket");
+        let second = registry::create_socket_in_namespace(
+            SocketKind::UnixStream,
+            SocketOptionSet::default_tcp(),
+            netns.clone(),
+        )
+        .expect("second socket");
+
+        assert_eq!(
+            step_unix_socketpair_connect(&first, &second, &guard),
+            StepOutcome::Done(())
+        );
+        assert_eq!(
+            table
+                .lookup_unix_stream_peer(first.raw(), &guard)
+                .expect("first peer")
+                .raw(),
+            second.raw()
+        );
+        assert_eq!(
+            table
+                .lookup_unix_stream_peer(second.raw(), &guard)
+                .expect("second peer")
+                .raw(),
+            first.raw()
+        );
+        pairs.push((first, second));
+    }
+
+    for (first, second) in &pairs {
+        assert!(matches!(
+            step_socket_close(first, &guard),
+            StepOutcome::Done(_)
+        ));
+        assert!(table.lookup_unix_stream_peer(first.raw(), &guard).is_none());
+        assert!(table
+            .lookup_unix_stream_peer(second.raw(), &guard)
+            .is_none());
+    }
+
+    let first = registry::create_socket_in_namespace(
+        SocketKind::UnixStream,
+        SocketOptionSet::default_tcp(),
+        netns.clone(),
+    )
+    .expect("reuse first socket");
+    let second = registry::create_socket_in_namespace(
+        SocketKind::UnixStream,
+        SocketOptionSet::default_tcp(),
+        netns,
+    )
+    .expect("reuse second socket");
+    assert_eq!(
+        step_unix_socketpair_connect(&first, &second, &guard),
+        StepOutcome::Done(())
+    );
+}
+
+#[test]
 fn net_namespace_link_snapshot_reports_loopback_first() {
     init_zones();
     let payload = crate::net::initial_net_namespace_payload();
@@ -122,6 +202,7 @@ fn socket_type_validation_maps_to_kind() {
     let dgram_udplite = ValidSocketType::validate(2, 2, 136).expect("udplite socket");
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let raw_icmp = ValidSocketType::validate(2, 3, 1).expect("raw icmp socket");
+    let raw_ipv4 = ValidSocketType::validate(2, 3, 255).expect("raw ipv4 control socket");
     let xfrm = ValidSocketType::validate(16, 3, 6).expect("netlink xfrm socket");
     let nft = ValidSocketType::validate(16, 3, 12).expect("netlink netfilter socket");
     let packet = ValidSocketType::validate(17, 3, 0x0300).expect("packet socket");
@@ -162,6 +243,10 @@ fn socket_type_validation_maps_to_kind() {
     assert_eq!(raw_icmp.sock_type, SocketType::Raw);
     assert_eq!(
         SocketKind::from_valid_socket_type(raw_icmp),
+        Ok(SocketKind::RawIcmp)
+    );
+    assert_eq!(
+        SocketKind::from_valid_socket_type(raw_ipv4),
         Ok(SocketKind::RawIcmp)
     );
     assert_eq!(
@@ -228,6 +313,37 @@ fn raw_icmp_socket_identity_payload_split() {
     );
     assert!(SOCKET_TABLE
         .snapshot_raw_icmp(&guard)
+        .iter()
+        .any(|candidate| candidate.raw() == socket.raw()));
+}
+
+#[test]
+fn packet_socket_registers_and_close_withdraws_from_namespace_table() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let valid =
+        ValidSocketType::validate(17, 2, i32::from(u16::to_be(0x0800))).expect("packet dgram");
+    let socket = match step_socket_create(valid, &guard) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("unexpected packet create outcome: {other:?}"),
+    };
+
+    assert_eq!(socket.kind, SocketKind::Packet);
+    assert!(SOCKET_TABLE
+        .snapshot_packet_sockets(&guard)
+        .iter()
+        .any(|candidate| candidate.raw() == socket.raw()));
+
+    let close = match step_socket_close(&socket, &guard) {
+        StepOutcome::Done(close) => close,
+        other => panic!("unexpected packet close outcome: {other:?}"),
+    };
+    assert_eq!(close.bindings_withdrawn, 1);
+    assert!(!SOCKET_TABLE
+        .snapshot_packet_sockets(&guard)
         .iter()
         .any(|candidate| candidate.raw() == socket.raw()));
 }
@@ -500,6 +616,17 @@ fn raw_udp_socket_preserves_option_capacity_with_compact_backing_buffers() {
     assert_eq!(raw.send_packet_capacity(), 2);
     assert!(!raw.can_recv());
     assert!(raw.can_send());
+}
+
+#[test]
+fn default_udp_options_keep_logical_size_with_compact_ring_backing() {
+    let options = SocketOptionSet::default_udp();
+    let raw = RawUdpSocket::new(&options);
+
+    assert_eq!(options.socket.recv_buf_size, 262_144);
+    assert_eq!(options.socket.send_buf_size, 262_144);
+    assert_eq!(raw.recv_capacity(), 65_536);
+    assert_eq!(raw.send_capacity(), 65_536);
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use super::boot_smp;
+use super::la64_extioi::*;
 use super::la64_irq_trap::*;
 use super::la64_percpu::{
     la64_current_cpu_id, la64_install_kernel_stack, la64_read_kernel_tls, la64_read_stable_counter,
@@ -12,7 +13,7 @@ use core::sync::atomic::AtomicU8;
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
-    fn tx_la64_qemu_activate_enter_userspace(
+    fn tx_la64_activate_enter_userspace(
         resume_ctx: *mut KernelResumeCtx,
         frame: *const La64TrapFrame,
         trap_stack_top: usize,
@@ -382,7 +383,7 @@ impl TrapIf for Platform {
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
             trace_la64_user_entry_probe(cpu, ctx, &*frame, &pmap_switch, stack_top);
-            tx_la64_qemu_activate_enter_userspace(
+            tx_la64_activate_enter_userspace(
                 resume_ctx,
                 frame,
                 stack_top,
@@ -573,6 +574,24 @@ impl IrqIf for Platform {
     const MAX_IRQ: u32 = QEMU_LA64_GSI_BASE + QEMU_LA64_PCH_PIC_IRQS;
     const UART_IRQ: u32 = QEMU_LA64_UART0_IRQ;
     const RTC_IRQ: u32 = QEMU_LA64_RTC_IRQ;
+
+    fn pci_intx_irq(function: PciFunctionId, pin: u8) -> Option<IrqResource> {
+        if function.segment != 0 || function.bus != 0 || !(1..=4).contains(&pin) {
+            return None;
+        }
+        let pin_index = u32::from(pin - 1);
+        let line = QEMU_LA64_GSI_BASE
+            + QEMU_LA64_PCI_INTX_BASE
+            + ((pin_index + u32::from(function.device)) % 4);
+        Some(IrqResource {
+            role: ResourceRole::Index(0),
+            line,
+            trigger: IrqTrigger::Level,
+            polarity: IrqPolarity::Low,
+            sharing: IrqSharing::Shared,
+            origin: LA64_PCI_HOST_ORIGIN,
+        })
+    }
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0
@@ -817,7 +836,7 @@ impl PercpuIf for Platform {
     }
 }
 
-fn la64_unpin_cpu(cpu: CpuId) {
+fn la64_unpin_cpu(cpu: CpuId, _reason: CpuPinReason) {
     debug_assert_eq!(cpu, la64_current_cpu_id());
     let previous = LA64_CPU_PIN_DEPTHS[cpu.0].fetch_sub(1, Ordering::Release);
     assert!(previous != 0, "LA64 CPU pin nesting underflow");
@@ -839,7 +858,11 @@ impl CacheIf for Platform {
         la64_ibar();
     }
 }
-impl DmaIf for Platform {}
+impl DmaIf for Platform {
+    fn publish_to_device() {
+        la64_dbar();
+    }
+}
 impl SmpIf for Platform {
     fn current_cpu_id() -> CpuId {
         la64_current_cpu_id()

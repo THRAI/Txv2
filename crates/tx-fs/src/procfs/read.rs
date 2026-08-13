@@ -16,6 +16,7 @@ use crate::procfs::{
 };
 use alloc::format;
 use alloc::string::String;
+use tx_hal::{Arch, CpuMask};
 use tx_subsystems::net::NetNamespacePayload;
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
@@ -277,8 +278,58 @@ devfs /dev devfs rw,nosuid 0 0\n",
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuInfoSnapshot {
+    pub arch: Arch,
+    pub online_cpus: CpuMask,
+}
+
+impl CpuInfoSnapshot {
+    pub const fn new(arch: Arch, online_cpus: CpuMask) -> Self {
+        Self { arch, online_cpus }
+    }
+}
+
+static CPUINFO_PROVIDER_FN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn procfs_register_cpuinfo_provider(f: fn() -> CpuInfoSnapshot) {
+    CPUINFO_PROVIDER_FN.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
 fn render_cpuinfo() -> String {
-    String::from("processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n")
+    let raw = CPUINFO_PROVIDER_FN.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return render_cpuinfo_snapshot(CpuInfoSnapshot::new(Arch::Riscv64, CpuMask::from_bits(1)));
+    }
+    // SAFETY: `raw` was published by `procfs_register_cpuinfo_provider` from
+    // a valid function pointer and is acquired before it is invoked.
+    let provider: fn() -> CpuInfoSnapshot = unsafe { core::mem::transmute(raw) };
+    render_cpuinfo_from_provider(provider)
+}
+
+fn render_cpuinfo_from_provider(provider: fn() -> CpuInfoSnapshot) -> String {
+    render_cpuinfo_snapshot(provider())
+}
+
+fn render_cpuinfo_snapshot(snapshot: CpuInfoSnapshot) -> String {
+    match snapshot.arch {
+        Arch::Riscv64 => {
+            String::from("processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n")
+        }
+        Arch::LoongArch64 => {
+            let mut out = String::new();
+            let mut online_bits = snapshot.online_cpus.bits();
+            while online_bits != 0 {
+                let cpu = online_bits.trailing_zeros();
+                out.push_str(&format!(
+                    "processor\t: {cpu}\narchitecture\t: loongarch64\n\n"
+                ));
+                online_bits &= online_bits - 1;
+            }
+            out
+        }
+    }
 }
 
 /// Monotonic-nanosecond reader registered by kernel init (mirrors the
@@ -689,4 +740,72 @@ fn render_sysvipc_shm() -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    const RV_CPUINFO: &str = "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n";
+
+    static TEST_ONLINE_CPUS: AtomicU64 = AtomicU64::new(1);
+
+    fn dynamic_la_cpuinfo() -> CpuInfoSnapshot {
+        CpuInfoSnapshot::new(
+            Arch::LoongArch64,
+            CpuMask::from_bits(TEST_ONLINE_CPUS.load(Ordering::Acquire)),
+        )
+    }
+
+    #[test]
+    fn cpuinfo_preserves_riscv_text() {
+        assert_eq!(
+            render_cpuinfo_snapshot(CpuInfoSnapshot::new(
+                Arch::Riscv64,
+                CpuMask::from_bits(0b1111),
+            )),
+            RV_CPUINFO
+        );
+    }
+
+    #[test]
+    fn cpuinfo_renders_each_online_loongarch_cpu() {
+        assert_eq!(
+            render_cpuinfo_snapshot(CpuInfoSnapshot::new(
+                Arch::LoongArch64,
+                CpuMask::from_bits(0b11),
+            )),
+            "processor\t: 0\narchitecture\t: loongarch64\n\n\
+             processor\t: 1\narchitecture\t: loongarch64\n\n"
+        );
+    }
+
+    #[test]
+    fn cpuinfo_uses_set_bits_as_logical_cpu_ids() {
+        let rendered = render_cpuinfo_snapshot(CpuInfoSnapshot::new(
+            Arch::LoongArch64,
+            CpuMask::from_bits(0b1010),
+        ));
+
+        assert!(rendered.contains("processor\t: 1\n"));
+        assert!(rendered.contains("processor\t: 3\n"));
+        assert!(!rendered.contains("processor\t: 0\n"));
+        assert!(!rendered.contains("processor\t: 2\n"));
+        assert!(!rendered.contains("rv64imafdc"));
+        assert!(!rendered.contains("sv39"));
+    }
+
+    #[test]
+    fn cpuinfo_provider_reads_the_live_online_mask() {
+        TEST_ONLINE_CPUS.store(0b1, Ordering::Release);
+        let first = render_cpuinfo_from_provider(dynamic_la_cpuinfo);
+        TEST_ONLINE_CPUS.store(0b11, Ordering::Release);
+        let second = render_cpuinfo_from_provider(dynamic_la_cpuinfo);
+
+        assert!(first.contains("processor\t: 0\n"));
+        assert!(!first.contains("processor\t: 1\n"));
+        assert!(second.contains("processor\t: 0\n"));
+        assert!(second.contains("processor\t: 1\n"));
+    }
 }

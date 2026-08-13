@@ -430,6 +430,7 @@ static PAGE_BACKED_SERVICE_BLOCK_DEVICE: PageBackedServiceBlockDevice =
 static PAGE_BACKED_SERVICE_LAST_READ: AtomicU64 = AtomicU64::new(u64::MAX);
 static PAGE_BACKED_SERVICE_LAST_READ_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static PAGE_BACKED_SERVICE_LAST_READ_CONTIGUOUS: AtomicBool = AtomicBool::new(false);
+static PAGE_BACKED_SERVICE_READS: AtomicUsize = AtomicUsize::new(0);
 static PAGE_BACKED_SERVICE_BLOCK_REG: BlockDeviceRegistration = BlockDeviceRegistration {
     devt: DevT::new(0, 8),
     name: "pagebacked-service-block",
@@ -451,6 +452,7 @@ impl BlockDeviceOps for PageBackedServiceBlockDevice {
                 .all(|pair| pair[1].ppn().0 == pair[0].ppn().0.saturating_add(1)),
             Ordering::SeqCst,
         );
+        PAGE_BACKED_SERVICE_READS.fetch_add(1, Ordering::SeqCst);
         V3Out::Done(())
     }
 
@@ -1909,6 +1911,38 @@ fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
             submitted_generation: PageGeneration::new(2),
             redirtied: false,
         }
+    );
+}
+
+#[test]
+fn file_close_without_service_runtime_leaves_pages_dirty_for_synchronous_backing() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(196), 4);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("slot fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+
+    assert!(!pc.has_file_io_service_runtime());
+    assert_eq!(pc.queue_dirty_file_writeback(), 0);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(page).expect("slot").state,
+        PageSlotState::Dirty { ppn }
     );
 }
 
@@ -4331,33 +4365,26 @@ fn file_page_io_service_op_drives_aggregate_turn_as_step_op() {
 }
 
 #[test]
-fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
-    fn block_on_ready<F: core::future::Future>(future: F) -> F::Output {
-        let waker = core::task::Waker::noop();
-        let mut cx = core::task::Context::from_waker(waker);
-        let mut future = core::pin::pin!(future);
-        match future.as_mut().poll(&mut cx) {
-            core::task::Poll::Ready(output) => output,
-            core::task::Poll::Pending => panic!("expected service task loop to complete"),
-        }
-    }
+fn file_page_io_service_task_loop_yields_between_self_kicked_turns() {
+    use core::future::Future as _;
 
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = Arc::new(RecordingFs::new());
-    struct DeviceBioPlanner {
-        buffer_ppn: Ppn,
-    }
+    struct DeviceBioPlanner;
 
     impl BackendPlanner for DeviceBioPlanner {
-        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            let crate::fs_iface::IoDataTarget::PageCache { frame, .. } = request.target else {
+                return BackendPlan::Err(Errno::EINVAL);
+            };
             BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
                 DeviceKey::new(8),
                 BlockOp::Read,
-                LbaRange::new(64, 1),
+                LbaRange::new(64 + request.range.start_page(), 1),
                 alloc::vec![BioVec::new(
-                    self.buffer_ppn.0 as u64,
+                    frame.ppn().0 as u64,
                     0,
                     crate::vm::USER_PAGE_SIZE as u32,
                 )],
@@ -4366,17 +4393,16 @@ fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
         }
     }
 
-    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
-    let planner = Arc::new(DeviceBioPlanner {
-        buffer_ppn: completion_ppn,
-    });
+    let planner = Arc::new(DeviceBioPlanner);
     let pc =
         file_page_container_with_planner(fs.clone(), fs.clone(), FsObjectId::new(99), 4, planner);
-    let page = PageIndex::new(1);
+    let pages = [PageIndex::new(1), PageIndex::new(2)];
 
-    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
-        V3Out::Yield { .. } => {}
-        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    for page in pages {
+        match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+            V3Out::Yield { .. } => {}
+            other => panic!("expected async yield after bio-only plan, got {other:?}"),
+        }
     }
     drop(guard);
 
@@ -4385,52 +4411,54 @@ fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
         mailbox.post(event)
     });
     PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+    PAGE_BACKED_SERVICE_READS.store(0, Ordering::SeqCst);
 
-    let report = block_on_ready(crate::device::page_container_file_io_service_task_loop(
+    let mut task = core::pin::pin!(crate::device::page_container_file_io_service_task_loop(
         &pc,
         BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
         &wake_source,
         crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
-            1,
+            2,
             ServiceBudget::new(1),
             ServiceBudget::new(1),
         ),
     ));
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
 
-    assert_eq!(report.waits_ready, 1);
-    assert_eq!(report.ready_turns, 1);
+    assert!(matches!(
+        task.as_mut().poll(&mut cx),
+        core::task::Poll::Pending
+    ));
+    assert_eq!(
+        PAGE_BACKED_SERVICE_READS.load(Ordering::SeqCst),
+        1,
+        "one Future::poll must advance at most one ready service turn"
+    );
+
+    let report = match task.as_mut().poll(&mut cx) {
+        core::task::Poll::Ready(report) => report,
+        core::task::Poll::Pending => panic!("second poll should finish the bounded service task"),
+    };
+
+    assert_eq!(report.waits_ready, 2);
+    assert_eq!(report.ready_turns, 2);
     assert_eq!(report.waits_failed, 0);
+    assert_eq!(report.dispatched, 1);
+    assert_eq!(report.device_completions, 1);
+    assert_eq!(report.page_completions, 2);
     let turn = report.last_turn.expect("service turn");
-    assert!(turn
-        .page_before
-        .as_ref()
-        .is_some_and(|page| page.work.is_empty()));
-    assert!(turn
-        .page_after
-        .as_ref()
-        .is_some_and(|page| page.work.is_empty()));
-    assert_eq!(turn.block.dispatched, 1);
-    assert_eq!(turn.block.device_completions, 1);
-    assert_eq!(turn.block.page_completions, 1);
     assert_eq!(
         turn.next,
         crate::device::PageContainerFileIoServiceNext::Sleeping
     );
-    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
-    assert_eq!(pc.lookup(page), Some(completion_ppn));
+    assert_eq!(PAGE_BACKED_SERVICE_READS.load(Ordering::SeqCst), 1);
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 65);
+    assert!(pages.into_iter().all(|page| pc.lookup(page).is_some()));
 }
 
 #[test]
 fn file_page_io_service_owned_task_loop_holds_typed_claim_for_static_submission() {
-    fn block_on_ready<F: core::future::Future>(future: F) -> F::Output {
-        let waker = core::task::Waker::noop();
-        let mut cx = core::task::Context::from_waker(waker);
-        let mut future = core::pin::pin!(future);
-        match future.as_mut().poll(&mut cx) {
-            core::task::Poll::Ready(output) => output,
-            core::task::Poll::Pending => panic!("expected owned service task loop to complete"),
-        }
-    }
     fn assert_send_static_future<F>(future: F) -> F
     where
         F: core::future::Future<Output = crate::device::PageContainerFileIoServiceTaskReport>
@@ -4444,18 +4472,19 @@ fn file_page_io_service_owned_task_loop_holds_typed_claim_for_static_submission(
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = Arc::new(RecordingFs::new());
-    struct DeviceBioPlanner {
-        buffer_ppn: Ppn,
-    }
+    struct DeviceBioPlanner;
 
     impl BackendPlanner for DeviceBioPlanner {
-        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            let crate::fs_iface::IoDataTarget::PageCache { frame, .. } = request.target else {
+                return BackendPlan::Err(Errno::EINVAL);
+            };
             BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
                 DeviceKey::new(8),
                 BlockOp::Read,
-                LbaRange::new(64, 1),
+                LbaRange::new(64 + request.range.start_page(), 1),
                 alloc::vec![BioVec::new(
-                    self.buffer_ppn.0 as u64,
+                    frame.ppn().0 as u64,
                     0,
                     crate::vm::USER_PAGE_SIZE as u32,
                 )],
@@ -4464,10 +4493,7 @@ fn file_page_io_service_owned_task_loop_holds_typed_claim_for_static_submission(
         }
     }
 
-    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
-    let planner = Arc::new(DeviceBioPlanner {
-        buffer_ppn: completion_ppn,
-    });
+    let planner = Arc::new(DeviceBioPlanner);
     let pc = file_page_container_cap_with_planner(
         fs.clone(),
         fs.clone(),
@@ -4475,11 +4501,13 @@ fn file_page_io_service_owned_task_loop_holds_typed_claim_for_static_submission(
         4,
         planner,
     );
-    let page = PageIndex::new(1);
+    let pages = [PageIndex::new(1), PageIndex::new(2)];
 
-    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
-        V3Out::Yield { .. } => {}
-        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    for page in pages {
+        match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+            V3Out::Yield { .. } => {}
+            other => panic!("expected async yield after bio-only plan, got {other:?}"),
+        }
     }
     drop(guard);
 
@@ -4490,35 +4518,52 @@ fn file_page_io_service_owned_task_loop_holds_typed_claim_for_static_submission(
     );
     let _ = claim.kick(IoServiceKind::Page);
     PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+    PAGE_BACKED_SERVICE_READS.store(0, Ordering::SeqCst);
 
-    let report = block_on_ready(assert_send_static_future(
+    let mut task = core::pin::pin!(assert_send_static_future(
         crate::device::page_container_file_io_service_task_loop_owned(
             claim,
             crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
-                1,
+                2,
                 ServiceBudget::new(1),
                 ServiceBudget::new(1),
             ),
         ),
     ));
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
 
-    assert_eq!(report.waits_ready, 1);
-    assert_eq!(report.ready_turns, 1);
+    assert!(matches!(
+        task.as_mut().poll(&mut cx),
+        core::task::Poll::Pending
+    ));
+    assert_eq!(
+        PAGE_BACKED_SERVICE_READS.load(Ordering::SeqCst),
+        1,
+        "one Future::poll must advance at most one owned service turn"
+    );
+
+    let report = match task.as_mut().poll(&mut cx) {
+        core::task::Poll::Ready(report) => report,
+        core::task::Poll::Pending => {
+            panic!("second poll should finish the bounded owned service task")
+        }
+    };
+
+    assert_eq!(report.waits_ready, 2);
+    assert_eq!(report.ready_turns, 2);
     assert_eq!(report.waits_failed, 0);
+    assert_eq!(report.dispatched, 1);
+    assert_eq!(report.device_completions, 1);
+    assert_eq!(report.page_completions, 2);
     let turn = report.last_turn.expect("service turn");
-    assert!(turn
-        .page_before
-        .as_ref()
-        .is_some_and(|page| page.work.is_empty()));
-    assert!(turn
-        .page_after
-        .as_ref()
-        .is_some_and(|page| page.work.is_empty()));
-    assert_eq!(turn.block.dispatched, 1);
-    assert_eq!(turn.block.device_completions, 1);
-    assert_eq!(turn.block.page_completions, 1);
-    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
-    assert_eq!(pc.lookup(page), Some(completion_ppn));
+    assert_eq!(
+        turn.next,
+        crate::device::PageContainerFileIoServiceNext::Sleeping
+    );
+    assert_eq!(PAGE_BACKED_SERVICE_READS.load(Ordering::SeqCst), 1);
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 65);
+    assert!(pages.into_iter().all(|page| pc.lookup(page).is_some()));
 }
 
 #[test]
@@ -5478,6 +5523,7 @@ fn fsync_op_backend_complete_notifies_planner_once() {
         2,
         planner.clone(),
     );
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7110))));
     let mut op = crate::page_backed::FsyncOp::new(&pc);
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
 
@@ -5509,6 +5555,7 @@ fn fsync_op_backend_error_completes_and_wakes_with_errno_once() {
         2,
         planner.clone(),
     );
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7111))));
     let mut op = crate::page_backed::FsyncOp::new(&pc);
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
 
@@ -5540,6 +5587,7 @@ fn fsync_op_zero_l6_admission_completes_with_queue_errno_once() {
         2,
         planner.clone(),
     );
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7112))));
     for lba in 0..1024 {
         pc.block_submission
             .submit_untracked_for_test(BioPlan::new(
@@ -5579,6 +5627,7 @@ fn vfs_fsync_op_uses_backend_fallback_to_terminal_success() {
         2,
         planner.clone(),
     );
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7113))));
     let mut op = crate::vfs::FileFsyncOp {
         page_backing: fs.clone(),
         fs_object_id: FsObjectId::new(111),
@@ -5596,6 +5645,35 @@ fn vfs_fsync_op_uses_backend_fallback_to_terminal_success() {
     assert_eq!(op.step(&mut ctx), V3Out::Done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
     assert_eq!(planner.completions.lock().len(), 1);
+}
+
+#[test]
+fn vfs_fsync_op_without_service_runtime_uses_synchronous_backing() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(204),
+        2,
+        planner,
+    );
+    assert!(!pc.has_file_io_service_runtime());
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs.clone(),
+        fs_object_id: FsObjectId::new(204),
+        page_container: Some(pc.clone()),
+        raw_block_device: false,
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(op.step(&mut ctx), V3Out::done(()));
+    assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
 }
 
 #[test]
@@ -5663,6 +5741,7 @@ fn fsync_op_waits_for_dirty_frontier_before_calling_backing() {
     let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
     let pc =
         file_page_container_with_planner(fs.clone(), fs.clone(), FsObjectId::new(103), 2, planner);
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7114))));
     let page = PageIndex::new(0);
     let frame = cached_frame_for_test();
     let ppn = frame.ppn;

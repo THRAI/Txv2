@@ -95,6 +95,7 @@ static TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: TestPlatform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };
@@ -789,6 +790,154 @@ fn per_hart_slotted_commits_explicit_thread_exit_status() {
         Some(tx_subsystems::process::ExitStatus::Exited(7))
     );
     assert!(init.is_zombie());
+}
+
+/// Exercise the production last-thread cascade rather than
+/// `process::step_exit_group_with_posts`' host-only synchronous completion.
+/// A service process owns a live TCP listener through its fd table, the
+/// `PerHartSlotted` task reports the same group-exit terminal intent used by
+/// `run_thread`, and the resumable thread-exit operation must release both the
+/// parent wait4 wake and the listener binding before it completes.
+#[test]
+fn per_hart_group_exit_releases_listener_wakes_wait4_and_allows_immediate_rebind() {
+    let _g = setup();
+    let _parent_thread_payload = bootstrap_payload();
+    let parent = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let child = tx_subsystems::process::execution::step_fork::<TestPlatform>(&parent, false, false)
+        .expect("fork service child");
+    let child_leader = child.nth_thread(0).expect("service child leader");
+    let child_payload = child_leader
+        .payload_cap_for_test()
+        .expect("service child thread payload");
+
+    let netns =
+        tx_subsystems::net::create_isolated_net_namespace_for_test("thread-exit-listener-test")
+            .expect("isolated net namespace");
+    let netns_payload = netns.payload_cap().expect("live net namespace payload");
+    let (listener_file, listener) = {
+        let guard = crate::adapter::step_engine::guard();
+        let opened = match tx_subsystems::net::step_socket_open_file_in_namespace(
+            2,
+            1,
+            6,
+            netns_payload.clone(),
+            &guard,
+        ) {
+            crate::adapter::step_engine::StepOutcome::Done(opened) => opened,
+            _ => panic!("create listener socket did not complete"),
+        };
+        (opened.file, opened.identity)
+    };
+    let local = tx_subsystems::net::KernelSockAddr::V4(tx_subsystems::net::SockAddrIn::new(
+        48_763,
+        tx_subsystems::net::Ipv4Address::LOOPBACK,
+    ));
+    {
+        let guard = crate::adapter::step_engine::guard();
+        assert_eq!(
+            tx_subsystems::net::step_bind(&listener, local, &guard),
+            crate::adapter::step_engine::StepOutcome::Done(())
+        );
+        assert_eq!(
+            tx_subsystems::net::step_listen(&listener, 8, &guard),
+            crate::adapter::step_engine::StepOutcome::Done(())
+        );
+    }
+    let listener_fd = child
+        .install_new_fd(listener_file, false)
+        .expect("install listener fd in service process");
+    assert_eq!(listener.fd_ref_count(), 1);
+
+    // Keep a replacement socket ready. Before process exit the exact endpoint
+    // is occupied; after the fd drain it must be bindable immediately.
+    let replacement = {
+        let guard = crate::adapter::step_engine::guard();
+        match tx_subsystems::net::step_socket_open_file_in_namespace(2, 1, 6, netns_payload, &guard)
+        {
+            crate::adapter::step_engine::StepOutcome::Done(opened) => opened.identity,
+            _ => panic!("create replacement socket did not complete"),
+        }
+    };
+    {
+        let guard = crate::adapter::step_engine::guard();
+        assert!(matches!(
+            tx_subsystems::net::step_bind(&replacement, local, &guard),
+            crate::adapter::step_engine::StepOutcome::Err(
+                crate::adapter::step_engine::Errno::EADDRINUSE
+            )
+        ));
+    }
+
+    // Model the parent's blocking wait4 registration and retain the scheduler
+    // hint so this test distinguishes a lifecycle wake from an ordinary post.
+    let exit_endpoint = parent
+        .exit_endpoint()
+        .expect("live parent exposes child-exit endpoint");
+    let wait_mailbox = std::sync::Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = wait_mailbox.next_generation();
+    let _wait_registration = exit_endpoint
+        .prepare(
+            std::sync::Arc::downgrade(&wait_mailbox),
+            generation,
+            tx_substrate::step::InterestMask::new(
+                tx_subsystems::process::EXIT_SOURCE_CHILD_ZOMBIFIED,
+            ),
+        )
+        .install_if(|| true)
+        .expect("install parent wait4 registration");
+
+    // Returning GroupExit from the wrapped task reaches the production
+    // drive_thread_exit_with_status_and_posts -> ThreadExitOp path. It does
+    // not invoke the cfg(test) loop in step_exit_group_with_posts.
+    let inner = async { ThreadTaskResult::GroupExit };
+    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(child_leader, child_payload, inner);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Ready(()));
+
+    assert!(
+        child.is_zombie(),
+        "last-thread exit zombifies service process"
+    );
+    assert!(child.fd(listener_fd).is_none(), "exit drains listener fd");
+    assert_eq!(listener.fd_ref_count(), 0, "exit drops final socket fd ref");
+    assert!(
+        !listener.is_payload_live(),
+        "last close releases listener payload and table bindings"
+    );
+    assert_eq!(
+        wait_mailbox.take_scheduler_hint(),
+        tx_substrate::wake::MailboxSchedulerHint::LifecycleWake,
+        "child exit publishes a lifecycle-priority wait4 wake"
+    );
+    assert!(matches!(
+        wait_mailbox.poll(),
+        Some(MailboxEvent::SourceFired {
+            source,
+            interests,
+            ..
+        }) if source.raw() == exit_endpoint.id().raw()
+            && interests.raw() == tx_subsystems::process::EXIT_SOURCE_CHILD_ZOMBIFIED
+    ));
+
+    {
+        let guard = crate::adapter::step_engine::guard();
+        assert_eq!(
+            tx_subsystems::net::step_bind(&replacement, local, &guard),
+            crate::adapter::step_engine::StepOutcome::Done(()),
+            "listener endpoint is reusable as soon as exit completes"
+        );
+    }
+    assert_eq!(
+        tx_subsystems::process::execution::step_waitpid_nohang(
+            &parent,
+            tx_subsystems::process::execution::WaitTarget::Pid(child.pid),
+        ),
+        Ok((child.pid, ExitStatus::Exited(0))),
+        "parent wait4/WNOHANG core observes and reaps the exited service"
+    );
 }
 
 /// `PerHartSlotted` also binds the reactor task mailbox into the

@@ -3,10 +3,14 @@
 #[cfg_attr(not(test), allow(unused_extern_crates))]
 extern crate alloc;
 
+pub mod device_resource;
 pub mod hart_local;
+mod irq;
 pub mod time;
 
+pub use device_resource::*;
 pub use hart_local::{HartLocal, MAX_HARTS};
+pub use irq::*;
 
 use core::marker::PhantomData;
 
@@ -72,14 +76,34 @@ impl CpuMask {
 #[must_use]
 pub struct CpuPinGuard {
     cpu_id: CpuId,
-    unpin: Option<fn(CpuId)>,
+    reason: CpuPinReason,
+    unpin: Option<fn(CpuId, CpuPinReason)>,
     _not_send_sync: PhantomData<*mut ()>,
+}
+
+/// Stable, low-cardinality reason attached to a platform CPU pin.
+///
+/// Platforms may use this value for bounded diagnostics. It is deliberately
+/// semantic rather than caller-address based so observation does not require
+/// stack walking or serial output on the pin/unpin hot path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CpuPinReason {
+    Unclassified = 0,
+    EpochGuard = 1,
+    EpochBorrow = 2,
+    EpochRetire = 3,
+    EpochDrain = 4,
+    ZoneBucketPop = 5,
+    ZoneBucketMerge = 6,
+    ZoneBucketFlush = 7,
 }
 
 impl CpuPinGuard {
     pub const fn new(cpu_id: CpuId) -> Self {
         Self {
             cpu_id,
+            reason: CpuPinReason::Unclassified,
             unpin: None,
             _not_send_sync: PhantomData,
         }
@@ -88,23 +112,43 @@ impl CpuPinGuard {
     /// Construct a platform-backed CPU pin. The platform must have already
     /// entered its non-migratable section. `unpin` leaves that section when
     /// the guard drops.
-    pub const fn with_unpin(cpu_id: CpuId, unpin: fn(CpuId)) -> Self {
+    pub const fn with_unpin(cpu_id: CpuId, unpin: fn(CpuId, CpuPinReason)) -> Self {
+        Self::with_reasoned_unpin(cpu_id, CpuPinReason::Unclassified, unpin)
+    }
+
+    /// Construct a platform-backed CPU pin with a bounded diagnostic reason.
+    pub const fn with_reasoned_unpin(
+        cpu_id: CpuId,
+        reason: CpuPinReason,
+        unpin: fn(CpuId, CpuPinReason),
+    ) -> Self {
         Self {
             cpu_id,
+            reason,
             unpin: Some(unpin),
             _not_send_sync: PhantomData,
         }
     }
 
+    /// Attach a diagnostic reason while preserving ownership of this guard.
+    pub const fn with_reason(mut self, reason: CpuPinReason) -> Self {
+        self.reason = reason;
+        self
+    }
+
     pub const fn cpu_id(&self) -> CpuId {
         self.cpu_id
+    }
+
+    pub const fn reason(&self) -> CpuPinReason {
+        self.reason
     }
 }
 
 impl Drop for CpuPinGuard {
     fn drop(&mut self) {
         if let Some(unpin) = self.unpin {
-            unpin(self.cpu_id);
+            unpin(self.cpu_id, self.reason);
         }
     }
 }
@@ -302,6 +346,7 @@ pub struct PlatformInfo {
     pub board: &'static str,
     pub spi_sd: Option<SpiSdInfo>,
     pub mmio_regions: &'static [MmioRegion],
+    pub device_resources: &'static DeviceResourceGraph,
     pub timebase_frequency_hz: u64,
     pub possible_cpu_count: usize,
 }
@@ -313,9 +358,22 @@ pub struct PlatformInfo {
 pub enum DeviceKind {
     Uart,
     IntController,
+    /// Firmware-described clock-controller register bank mapped for a
+    /// platform device's clock/reset preparation hook.
+    ClockController,
+    /// Firmware-described outer-cache controller used for non-coherent DMA
+    /// maintenance. Platforms without such a controller simply omit it.
+    CacheController,
+    /// QEMU's `google,goldfish-rtc` register model.
+    ///
+    /// Keep this backend-specific: a board-local RTC such as the JH7110 RTC
+    /// is not register-compatible and must not be routed through Goldfish
+    /// MMIO merely because both devices are clocks.
+    GoldfishRtc,
     VirtioMmio,
     PciEcam,
     SdController,
+    Dwmac,
 }
 
 /// One statically published platform-device fact.
@@ -413,12 +471,39 @@ pub trait BootInfoIf {
 pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
 
+    /// Make firmware-described platform controls (for example clocks and
+    /// resets) usable before a concrete driver touches its device MMIO.
+    fn prepare_platform_device(
+        _device: &'static PlatformDevice,
+    ) -> Result<(), PlatformDevicePrepareError> {
+        Ok(())
+    }
+
     /// Platform devices discovered before the heap becomes available.
     ///
     /// Boards without a firmware device table may keep the empty default and
     /// let their generic-device setup use its documented legacy fallback.
     fn devices() -> &'static [DeviceInfo] {
         &[]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformDevicePrepareError {
+    MissingFirmwareNode,
+    MalformedFirmwareProperty,
+    UnsupportedProvider,
+    ControlTimeout,
+}
+
+impl PlatformDevicePrepareError {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MissingFirmwareNode => "missing-firmware-node",
+            Self::MalformedFirmwareProperty => "malformed-firmware-property",
+            Self::UnsupportedProvider => "unsupported-provider",
+            Self::ControlTimeout => "control-timeout",
+        }
     }
 }
 
@@ -777,6 +862,41 @@ pub struct BootstrapPmapInfo {
     pub identity: Option<VirtRange>,
     pub pt_node_pool: PhysRange,
     pub reserved_page_tables: &'static [PhysRange],
+}
+
+/// Local cadence state for waits which must make lock-free TLB progress.
+///
+/// The first failed wait runs the supplied progress operation. Later calls run
+/// it at attempts 64, 128, and so on, while retaining a processor spin hint on
+/// every attempt. Keeping this pure mechanism in HAL lets a board use it
+/// without depending upward on substrate.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TlbProgressSpinWait {
+    failed_attempts: usize,
+}
+
+impl TlbProgressSpinWait {
+    const CADENCE: usize = 64;
+
+    pub const fn new() -> Self {
+        Self { failed_attempts: 0 }
+    }
+
+    /// Record one failed wait and periodically run `progress`.
+    ///
+    /// `progress` must not allocate, block, or acquire the resource being
+    /// waited on.
+    #[inline(always)]
+    pub fn spin_with<F>(&mut self, mut progress: F)
+    where
+        F: FnMut(),
+    {
+        self.failed_attempts = self.failed_attempts.wrapping_add(1);
+        if self.failed_attempts == 1 || self.failed_attempts & (Self::CADENCE - 1) == 0 {
+            progress();
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// 虚拟内存/页表子系统的接口:让通用内核建/改/删地址空间映射,不碰架构页表格式。
@@ -1288,119 +1408,6 @@ pub trait EntropyIf {
     }
 }
 
-pub trait IrqIf {
-    const MAX_IRQ: u32 = 0;
-
-    /// Platform-specific IRQ number for the boot console UART.
-    ///
-    /// The kernel's `install_irq_handlers` reads this through
-    /// `<P as IrqIf>::UART_IRQ` to register the UART RX dispatcher
-    /// without naming a board constant directly. Boards that have no
-    /// dedicated UART IRQ (or run on a host-only test platform) keep
-    /// the `0` sentinel default; production boards override.
-    /// See `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
-    /// §"Open questions #6".
-    const UART_IRQ: u32 = 0;
-
-    /// Runtime UART IRQ number. Boards with firmware discovery can override
-    /// this while retaining `UART_IRQ` as a static fallback.
-    fn uart_irq() -> u32 {
-        Self::UART_IRQ
-    }
-
-    /// Platform-specific IRQ number for the boot network device.
-    const NET_IRQ: u32 = 0;
-
-    /// Runtime network IRQ number. A zero value means polling-only.
-    fn net_irq() -> u32 {
-        Self::NET_IRQ
-    }
-
-    /// Platform-specific IRQ number for a wake-capable persistent-clock RTC.
-    ///
-    /// Boards without a hardware RTC alarm interrupt keep the `0` sentinel
-    /// default. The generic kernel may use this to register an IRQ handler that
-    /// publishes an RTC device event; HAL itself must not know devfs or RTC
-    /// userspace state.
-    const RTC_IRQ: u32 = 0;
-
-    fn in_irq_context() -> bool {
-        false
-    }
-
-    /// Return whether the current execution is using an architecture trap
-    /// stack.
-    ///
-    /// Synchronous exceptions such as syscalls are not IRQ context, but they
-    /// still run on a small per-hart trap stack on stackless platforms.
-    /// Substrates use this fact to defer destructor-heavy maintenance until
-    /// control has returned to a normal kernel/reactor stack.
-    fn in_trap_context() -> bool {
-        Self::in_irq_context()
-    }
-
-    fn interrupts_enabled() -> bool {
-        true
-    }
-
-    /// Save maskable local interrupt admission and disable it until the returned
-    /// guard is dropped. This does not provide CPU affinity or NMI exclusion.
-    fn exclude_local_execution() -> LocalExecutionGuard;
-
-    fn claim() -> u32 {
-        0
-    }
-
-    fn complete(_irq: u32) {}
-
-    fn mask(_irq: u32) {}
-
-    fn unmask(_irq: u32) {}
-
-    fn set_priority(_irq: u32, _priority: u8) {}
-
-    fn install_dispatch_table(_table: &'static IrqDispatchTable) {}
-
-    fn dispatch_irq(_irq: u32) -> IrqHandled {
-        IrqHandled::Done
-    }
-}
-
-pub const IRQ_DISPATCH_TABLE_SIZE: usize = 1024;
-
-pub type IrqHandlerFn = fn(irq: u32) -> IrqHandled;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IrqHandled {
-    Done,
-    Wake,
-    /// The handler requested a reactor wake and retained ownership of the
-    /// controller completion. It must later call [`IrqIf::complete`] exactly
-    /// once from the same controller context that performed the claim.
-    DeferredWake,
-    NotMine,
-}
-
-pub struct IrqDispatchTable {
-    pub entries: [Option<IrqHandlerFn>; IRQ_DISPATCH_TABLE_SIZE],
-}
-
-impl IrqDispatchTable {
-    pub const SIZE: usize = IRQ_DISPATCH_TABLE_SIZE;
-
-    pub const fn new() -> Self {
-        Self {
-            entries: [None; IRQ_DISPATCH_TABLE_SIZE],
-        }
-    }
-}
-
-impl Default for IrqDispatchTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The instruction or architectural source a vDSO may read without entering
 /// the kernel. `None` keeps the vDSO on its syscall fallback path.
 #[repr(u32)]
@@ -1572,6 +1579,13 @@ pub trait PercpuIf {
         CpuPinGuard::new(Self::current_cpu_id())
     }
 
+    /// Pin the current CPU and attach a bounded semantic reason for platform
+    /// diagnostics. Platforms that need the reason at acquisition time may
+    /// override this method; existing platform pins inherit it automatically.
+    fn pin_current_cpu_for(reason: CpuPinReason) -> CpuPinGuard {
+        Self::pin_current_cpu().with_reason(reason)
+    }
+
     /// Current nesting depth of platform CPU pins.
     ///
     /// A non-zero value means the current execution context must not migrate
@@ -1615,6 +1629,16 @@ pub trait DmaIf: PlatformConfig {
     fn sync_for_device(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
 
     fn sync_for_cpu(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+
+    /// Order descriptor/buffer publication before a following device MMIO
+    /// notification such as a DMA tail-pointer write.
+    ///
+    /// The default is sufficient for coherent host mocks. Real platforms
+    /// whose architecture distinguishes normal-memory and device-I/O ordering
+    /// must override this with the architecture's DMA/MMIO write barrier.
+    fn publish_to_device() {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    }
 }
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;

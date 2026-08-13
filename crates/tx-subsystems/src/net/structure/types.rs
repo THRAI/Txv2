@@ -124,7 +124,9 @@ impl SocketKind {
             (AddressFamily::Inet, SocketType::SeqPacket, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
             (AddressFamily::Inet, SocketType::Dgram, 1)
-            | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
+            // IPPROTO_RAW is also the conventional ioctl/control handle used
+            // by BusyBox before udhcpc opens its AF_PACKET data socket.
+            | (AddressFamily::Inet, SocketType::Raw, 1 | 255) => Ok(Self::RawIcmp),
             (AddressFamily::Inet, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Inet6, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
             (AddressFamily::Inet6, SocketType::Stream, 132) => Ok(Self::Sctp),

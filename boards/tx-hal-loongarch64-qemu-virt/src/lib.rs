@@ -3,29 +3,36 @@
 #[cfg(test)]
 extern crate std;
 
+use tx_hal::CpuPinReason;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
-    CpuPinGuard, DeadlineTimerIf, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf,
-    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink,
-    LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, MonotonicCounterIf,
-    ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr, PhysRange,
-    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
-    PmapPermissions, PmapReservation, PmapReservationIntermediates, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator, SavedSignalFrame, SecondaryEntry,
-    SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf, TrapAction, TrapClass, TrapFrameMut,
-    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext,
-    UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
+    CpuPinGuard, DeadlineTimerIf, DeviceId, DeviceLocalId, DeviceMatchId, DeviceResource,
+    DeviceResourceGraph, DeviceStatus, DmaCoherency, DmaConstraints, DmaDomain, DmaDomainId,
+    DmaDomainRef, DmaIf, DmaTranslation, EntropyIf, FaultInfo, FpSimdIf, InitIf,
+    InterruptWaitState, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, IrqPolarity, IrqResource,
+    IrqSharing, IrqTrigger, KernelTrapSink, LocalExecutionGuard, MemoryRegion, MemoryRegionKind,
+    MmioFlags, MmioRegion, MmioResource, MonotonicCounterIf, ObserverIf, PciFunctionId, PercpuIf,
+    PersistentClockError, PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
+    PtNodeAllocator, ResourceOrigin, ResourceOriginKind, ResourceProviderId, ResourceRole,
+    SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf,
+    TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView,
+    TrapIf, TrapPreviousMode, UserFpContext, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
+    VirtRange,
 };
 
 pub use boot_args::capture_loongarch64_qemu_boot_args;
 use boot_facts::ensure_static_boot_facts;
+#[cfg(test)]
+use la64_extioi::reset_la64_extioi_claim_state_for_test;
 use la64_irq_trap::classify_la64_trap;
 pub use la64_irq_trap::{dispatch_trap_frame, return_to_userspace};
 pub(crate) use la64_percpu::la64_current_cpu_id;
 #[cfg(target_arch = "loongarch64")]
 use la64_pmap::la64_kernel_addr_to_phys;
-use la64_pmap::{la64_cached_virt, la64_uncached_virt, uart_put_byte, uart_try_get_byte};
+use la64_pmap::{la64_cached_virt, la64_uncached_virt};
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
@@ -94,6 +101,8 @@ const QEMU_LA64_HIGH_RAM_BASE: usize = 0x9000_0000;
 // (`direct_map_covers_phys_end`, `extend_direct_map`); the actual frame-metadata
 // span is still carved from the real firmware memory map, not from this size.
 const QEMU_LA64_DIRECT_MAP_SIZE: usize = LA64_PHYS_ADDR_MASK + 1;
+const LA64_DIRECT_MAP_SIZE: usize = QEMU_LA64_DIRECT_MAP_SIZE;
+const LA64_DMW_MAPPED_PHYS_BASE: usize = QEMU_LA64_RAM_BASE;
 const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
@@ -107,7 +116,11 @@ const QEMU_LA64_GSI_BASE: u32 = 64;
 const QEMU_LA64_PCH_PIC_IRQS: u32 = 64;
 #[cfg_attr(not(test), allow(dead_code))]
 const QEMU_LA64_UART0_IRQ: u32 = 66;
-const QEMU_LA64_RTC_IRQ: u32 = QEMU_LA64_GSI_BASE + 3;
+const QEMU_LA64_RTC_IRQ: u32 = QEMU_LA64_GSI_BASE + 6;
+// QEMU's LoongArch `virt` GPEX host routes PCI INTx outputs to PCH-PIC
+// inputs 16..19. `IrqIf::pci_intx_irq` swizzles the actual enumerated
+// function and pin; no network-device slot is fixed here.
+const QEMU_LA64_PCI_INTX_BASE: u32 = 16;
 const QEMU_LA64_PCIE_ECAM_BASE: usize = 0x2000_0000;
 const QEMU_LA64_PCIE_ECAM_SIZE: usize = 0x0800_0000;
 const QEMU_LA64_PCIE_MMIO32_BASE: usize = 0x4000_0000;
@@ -230,6 +243,7 @@ const LA64_EIOINTC_COREISR_START: usize = 0x400;
 const LA64_EIOINTC_IRQS: u32 = 256;
 const LA64_PCH_PIC_MASK_START: usize = 0x20;
 const LA64_PCH_PIC_CLEAR_START: usize = 0x80;
+const LA64_PCH_PIC_HTMSI_VECTOR_START: usize = 0x200;
 const LS7A_RTC_TOYWRITE0: usize = 0x24;
 const LS7A_RTC_TOYWRITE1: usize = 0x28;
 const LS7A_RTC_TOYREAD0: usize = 0x2c;
@@ -337,6 +351,9 @@ static LA64_HOST_EIOINTC_ENABLE0: AtomicU64 = AtomicU64::new(0);
 static LA64_HOST_EIOINTC_COREISR0: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_PCH_PIC_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(not(target_arch = "loongarch64"))]
+static LA64_HOST_PCH_PIC_HTMSI_VECTOR: [AtomicU8; QEMU_LA64_PCH_PIC_IRQS as usize] =
+    [const { AtomicU8::new(0) }; QEMU_LA64_PCH_PIC_IRQS as usize];
 
 #[cfg(all(not(target_arch = "loongarch64"), test))]
 struct HostLs7aRtcState {
@@ -363,12 +380,6 @@ impl HostLs7aRtcState {
 
     fn reset(&mut self) {
         *self = Self::new();
-    }
-
-    fn set_toy_time(&mut self, ns: u64) {
-        let (toy0, toy1) = ls7a_toy_registers_from_unix_ns(ns).expect("valid toy time");
-        self.registers[LS7A_RTC_TOYREAD0 / core::mem::size_of::<u32>()] = toy0;
-        self.registers[LS7A_RTC_TOYREAD1 / core::mem::size_of::<u32>()] = toy1;
     }
 
     fn read_u32(&mut self, offset: usize) -> u32 {
@@ -796,8 +807,8 @@ fn la64_rewind_pc(raw: NonNull<()>, bytes: usize) {
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
-    fn tx_la64_qemu_fp_save_context(ctx: *mut UserFpContext) -> usize;
-    fn tx_la64_qemu_fp_restore_context(ctx: *const UserFpContext);
+    fn tx_la64_fp_save_context(ctx: *mut UserFpContext) -> usize;
+    fn tx_la64_fp_restore_context(ctx: *const UserFpContext);
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -840,7 +851,7 @@ fn la64_set_fpu_enabled(_enabled: bool) {}
 
 #[cfg(target_arch = "loongarch64")]
 fn la64_save_fp_context(state: &mut UserFpContext) {
-    let saved = unsafe { tx_la64_qemu_fp_save_context(core::ptr::addr_of_mut!(*state)) };
+    let saved = unsafe { tx_la64_fp_save_context(core::ptr::addr_of_mut!(*state)) };
     if saved == 0 {
         *state = UserFpContext::empty();
     }
@@ -853,7 +864,7 @@ fn la64_save_fp_context(state: &mut UserFpContext) {
 
 #[cfg(target_arch = "loongarch64")]
 fn la64_restore_fp_context_raw(state: &UserFpContext) {
-    unsafe { tx_la64_qemu_fp_restore_context(core::ptr::addr_of!(*state)) };
+    unsafe { tx_la64_fp_restore_context(core::ptr::addr_of!(*state)) };
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
@@ -906,6 +917,36 @@ const UART_LSR: usize = 0x05;
 #[cfg(target_arch = "loongarch64")]
 const UART_LSR_DR: u8 = 1 << 0;
 const UART_LSR_THRE: u8 = 1 << 5;
+
+fn uart_put_byte(byte: u8) {
+    let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
+    let mut wait = tx_hal::TlbProgressSpinWait::new();
+
+    unsafe {
+        while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
+            wait.spin_with(|| {
+                la64_pmap::service_la64_pending_tlb_shootdown();
+            });
+        }
+        core::ptr::write_volatile(base.add(UART_THR), byte);
+    }
+}
+
+fn uart_try_get_byte() -> Option<u8> {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *const u8;
+        if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_DR == 0 {
+            return None;
+        }
+        Some(core::ptr::read_volatile(base.add(UART_RBR)))
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        None
+    }
+}
 
 // The early UART is reachable through QEMU's current direct/identity execution
 // convention. Phase-3 substrate MMIO mapping treats this exact page as already
@@ -983,6 +1024,87 @@ static MMIO_REGIONS: &[MmioRegion] = &[
             .union(MmioFlags::WRITE),
     },
 ];
+
+const LA64_PCI_HOST_PROVIDER: ResourceProviderId = ResourceProviderId("la64-pci-host");
+const LA64_PCI_HOST_ORIGIN: ResourceOrigin = ResourceOrigin {
+    provider: LA64_PCI_HOST_PROVIDER,
+    record: "pci-host0",
+    kind: ResourceOriginKind::PlatformStatic,
+};
+const LA64_PCI_DMA_DOMAIN_ID: DmaDomainId = DmaDomainId {
+    provider: LA64_PCI_HOST_PROVIDER,
+    local: 0,
+};
+static LA64_PCI_DMA_DOMAINS: [DmaDomain; 1] = [DmaDomain {
+    id: LA64_PCI_DMA_DOMAIN_ID,
+    translation: DmaTranslation::Direct { offset: 0 },
+    constraints: DmaConstraints {
+        dma_address_bits: <Platform as PlatformConfig>::PHYS_ADDR_BITS,
+        min_alignment: 1,
+        segment_boundary: None,
+        max_segment_len: usize::MAX,
+        max_segments: u16::MAX,
+    },
+    coherency: if <Platform as PlatformConfig>::DMA_COHERENT {
+        DmaCoherency::Coherent
+    } else {
+        DmaCoherency::NonCoherent
+    },
+    origin: LA64_PCI_HOST_ORIGIN,
+}];
+static LA64_PCI_HOST_MATCHES: [DeviceMatchId; 1] =
+    [DeviceMatchId::FirmwareCompatible("pci-host-ecam-generic")];
+static LA64_PCI_HOST_RESOURCES: [DeviceResource; 3] = [
+    DeviceResource::Mmio(MmioResource {
+        role: ResourceRole::Named("ecam"),
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_PCIE_ECAM_BASE),
+            size: QEMU_LA64_PCIE_ECAM_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_ECAM_BASE)),
+            size: QEMU_LA64_PCIE_ECAM_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+        origin: LA64_PCI_HOST_ORIGIN,
+    }),
+    DeviceResource::Mmio(MmioResource {
+        role: ResourceRole::Named("mmio32"),
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_PCIE_MMIO32_BASE),
+            size: QEMU_LA64_PCIE_MMIO32_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_MMIO32_BASE)),
+            size: QEMU_LA64_PCIE_MMIO32_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+        origin: LA64_PCI_HOST_ORIGIN,
+    }),
+    DeviceResource::DmaDomain(DmaDomainRef {
+        role: ResourceRole::Index(0),
+        domain: LA64_PCI_DMA_DOMAIN_ID,
+    }),
+];
+static LA64_PCI_HOST_DEVICES: [tx_hal::PlatformDevice; 1] = [tx_hal::PlatformDevice {
+    id: DeviceId {
+        provider: LA64_PCI_HOST_PROVIDER,
+        local: DeviceLocalId::PlatformKey("pci-host0"),
+    },
+    status: DeviceStatus::Enabled,
+    matches: &LA64_PCI_HOST_MATCHES,
+    resources: &LA64_PCI_HOST_RESOURCES,
+    origin: LA64_PCI_HOST_ORIGIN,
+}];
+static LA64_DEVICE_RESOURCE_GRAPH: DeviceResourceGraph = DeviceResourceGraph {
+    platform_mmio: &[],
+    devices: &LA64_PCI_HOST_DEVICES,
+    dma_domains: &LA64_PCI_DMA_DOMAINS,
+};
 
 fn ls7a_toy_registers_from_unix_ns(ns: u64) -> Result<(u32, u32), PersistentClockError> {
     let seconds = ns / NANOS_PER_SEC;
@@ -1257,11 +1379,19 @@ mod boot_facts;
 mod boot_firmware;
 mod boot_smp;
 mod dtb;
+mod la64_extioi;
+#[path = "../../tx-hal-loongarch64-common/src/la64_ipi.rs"]
+mod la64_ipi;
+#[path = "../../tx-hal-loongarch64-common/src/la64_irq_trap.rs"]
 mod la64_irq_trap;
+#[path = "../../tx-hal-loongarch64-common/src/la64_percpu.rs"]
 mod la64_percpu;
+#[path = "../../tx-hal-loongarch64-common/src/la64_pmap.rs"]
 mod la64_pmap;
+#[path = "../../tx-hal-loongarch64-common/src/la64_unaligned.rs"]
 mod la64_unaligned;
 mod platform_impls;
+#[path = "../../tx-hal-loongarch64-common/src/trap_asm.rs"]
 mod trap_asm;
 
 #[cfg(test)]

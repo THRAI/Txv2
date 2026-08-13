@@ -7,11 +7,30 @@ use tx_hal::{BootHandoff, KernelMain};
 
 type ActivePlatform = tx_hal_loongarch64_qemu_virt::Platform;
 
+struct ActiveDeviceBundle;
+
+static ACTIVE_PROVIDERS: [tx_hal::ResourceProviderDescriptor<ActivePlatform>; 1] =
+    [tx_kernel::devices::virtio_pci_net::resource_provider_descriptor::<ActivePlatform>()];
+static ACTIVE_DRIVERS: [tx_kernel::devices::binder::StaticDriverDescriptor<ActivePlatform>; 1] =
+    [tx_kernel::devices::virtio_pci_net::driver_descriptor::<
+        ActivePlatform,
+    >()];
+
+impl tx_kernel::devices::binder::StaticDeviceBundle<ActivePlatform> for ActiveDeviceBundle {
+    fn resource_providers() -> &'static [tx_hal::ResourceProviderDescriptor<ActivePlatform>] {
+        &ACTIVE_PROVIDERS
+    }
+
+    fn drivers() -> &'static [tx_kernel::devices::binder::StaticDriverDescriptor<ActivePlatform>] {
+        &ACTIVE_DRIVERS
+    }
+}
+
 struct Kernel;
 
 impl KernelMain<ActivePlatform> for Kernel {
     fn kernel_main(handoff: BootHandoff) -> ! {
-        tx_kernel::kernel_main::<ActivePlatform>(handoff)
+        tx_kernel::kernel_main::<ActivePlatform, ActiveDeviceBundle>(handoff)
     }
 }
 
@@ -32,7 +51,7 @@ pub extern "C" fn rust_entry(
 }
 
 #[no_mangle]
-pub extern "C" fn tx_kernel_loongarch64_qemu_trap_dispatch(
+pub extern "C" fn tx_kernel_loongarch64_trap_dispatch(
     frame: *mut tx_hal_loongarch64_qemu_virt::La64TrapFrame,
 ) -> tx_hal::TrapAction {
     let Some(frame) = (unsafe { frame.as_mut() }) else {

@@ -8,7 +8,7 @@ use crate::net::execution::{
     step_process_loopback_pending_in_namespace, step_process_network_events_in_namespace_at,
     step_process_network_tick_in_namespace, step_process_network_tick_loopback_in_namespace,
     ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome, LoopbackPendingOutcome, LoopbackPollBudget,
-    ARP_FLUSH_BUDGET_DEFAULT,
+    ARP_FLUSH_BUDGET_DEFAULT, NET_EVENT_BUDGET,
 };
 use crate::net::namespace::{
     drive_all_net_namespace_runtimes_at, initial_net_namespace_payload, NetNamespacePayload,
@@ -17,10 +17,7 @@ use crate::net::packet::{PacketSource, PacketTxSink};
 use crate::net::protocol::{EtherIface, LoopbackIface};
 use crate::wait_source;
 
-use super::{
-    net_delegate_clear, net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token,
-    DelegateWireSet,
-};
+use super::{net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token, DelegateWireSet};
 
 pub trait NetDelegateDriver {
     fn now(&self) -> Instant;
@@ -100,6 +97,15 @@ pub struct NetDelegateTaskReport {
     pub last_deadline: Option<Instant>,
 }
 
+const READY_STEPS_BEFORE_COOPERATIVE_YIELD: usize = 1;
+
+fn should_yield_after_ready_step(config: NetDelegateTaskConfig, ready_steps: usize) -> bool {
+    ready_steps % READY_STEPS_BEFORE_COOPERATIVE_YIELD == 0
+        && config
+            .max_ready_steps
+            .is_none_or(|max_ready_steps| ready_steps < max_ready_steps)
+}
+
 pub async fn net_delegate_task_loop(
     driver: &dyn NetDelegateDriver,
     config: NetDelegateTaskConfig,
@@ -146,11 +152,16 @@ where
 
         report.waits_ready += 1;
         report.ready_steps += 1;
-        let guard = tx_substrate::epoch::guard();
-        let outcome = net_delegate_step_once(&driver, &guard);
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            net_delegate_step_once(&driver, &guard)
+        };
         report.runtime.merge(outcome);
         report.last_deadline = outcome.next_deadline;
         on_deadline(outcome.next_deadline);
+        if should_yield_after_ready_step(config, report.ready_steps) {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
@@ -181,11 +192,16 @@ pub async fn net_delegate_task_loop_with_deadline_hook(
 
         report.waits_ready += 1;
         report.ready_steps += 1;
-        let guard = tx_substrate::epoch::guard();
-        let outcome = net_delegate_step_once(driver, &guard);
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            net_delegate_step_once(driver, &guard)
+        };
         report.runtime.merge(outcome);
         report.last_deadline = outcome.next_deadline;
         on_deadline(outcome.next_deadline);
+        if should_yield_after_ready_step(config, report.ready_steps) {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
@@ -204,10 +220,12 @@ pub fn net_delegate_step_once(
             .saturating_mul(1_000),
     );
 
-    let ready = net_delegate_queue().peek();
+    // Consume work requests atomically. A separate peek/clear pair can erase a
+    // same-bit kick that arrives between the two operations and never wakes us
+    // again because the bit was still set when the producer fired it.
+    let ready = net_delegate_queue().take((DelegateWireSet::POLL | DelegateWireSet::TICK).bits());
     let poll_seen = ready & DelegateWireSet::POLL.bits() != 0;
     let tick_seen = ready & DelegateWireSet::TICK.bits() != 0;
-    net_delegate_clear(DelegateWireSet::POLL | DelegateWireSet::TICK);
 
     let mut outcome = NetDelegateRuntimeOutcome {
         poll_seen,
@@ -232,7 +250,9 @@ pub fn net_delegate_step_once(
         outcome.backlog_failed += events.backlog.half_open_failed;
         outcome.next_deadline =
             earliest_deadline(outcome.next_deadline, events.backlog.next_deadline);
-
+        if events.packets_seen == NET_EVENT_BUDGET {
+            outcome.wakes_fired += net_delegate_kick_poll();
+        }
         if let Some(iface) = driver.loopback_iface() {
             let StepOutcome::Done(loopback) = step_process_loopback_pending_in_namespace(
                 driver.now(),

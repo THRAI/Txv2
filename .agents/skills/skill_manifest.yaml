@@ -256,6 +256,9 @@ skills:
       - xtask/src/shell_test.rs
       - xtask/src/image.rs
       - xtask/src/lint.rs
+      - xtask/src/lint_net_portability.rs
+      - xtask/src/network_scenario.rs
+      - tools/network-scenarios
       - xtask/src/boundary_report.rs
       - xtask/src/check_build.rs
       - xtask/src/ci.rs

@@ -2,6 +2,8 @@
 #![feature(associated_type_defaults)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use tx_hal::{CpuId, TxPlatform};
 
@@ -40,7 +42,7 @@ pub use publication::{
     ReservedCommitInvariant,
 };
 pub use slot::AtomicSlot;
-pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard};
+pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard, SpinWait};
 pub use zone::{BindingToken, PublishedBinding};
 
 #[doc(hidden)]
@@ -649,10 +651,11 @@ pub fn init<P: TxPlatform>() {
     // order); the emit is a no-op in that case.
     let phase_span = emit_phase_span_begin(
         tx_observe_types::BootPhaseKind::SubstrateBsp,
-        0, // BSP is always hart 0
+        <P as tx_hal::PercpuIf>::current_cpu_id().0 as u8,
     );
 
     let _ = P::platform_info();
+    sync::install_platform_spin_progress::<P>();
     boot_memory::init_from_hal::<P>();
     epoch::init_on_bsp::<P>().expect("tx_substrate::init epoch initialization failed");
     zone::init_on_bsp::<P>().expect("tx_substrate::init zone initialization failed");

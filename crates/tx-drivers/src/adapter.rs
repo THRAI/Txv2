@@ -17,7 +17,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::page_allocator::{
-        self, BitmapPageAllocator, DmaPin, OwnedFrameRun, ZeroPolicy,
+        self, BitmapPageAllocator, DmaPin, DmaRunRequest, OwnedFrameRun, ZeroPolicy,
     };
     pub use tx_substrate::step::{NoProgress, StepOutcome};
 }

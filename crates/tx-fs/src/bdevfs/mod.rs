@@ -1465,7 +1465,7 @@ mod tests {
             snapshot[0].handle().len_lba(),
             PATTERN_REG.ops.total_blocks()
         );
-        assert_eq!(snapshot[0].container().page_count(), first_pc.page_count());
+        assert!(snapshot[0].is_live(&guard));
     }
 
     #[test]

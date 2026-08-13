@@ -1,0 +1,262 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-04-userspace-dhcp-client",
+  "title": "Enable userspace DHCP through generic Linux packet sockets",
+  "status": "active",
+  "created": "2026-08-04",
+  "updated": "2026-08-04",
+  "owner": "msp-and-codex",
+  "summary": "Make the existing BusyBox udhcpc work through generic AF_PACKET, readiness, rtnetlink, and device paths without implementing DHCP in the kernel or embedding interface, address, topology, repository, or credential facts in production code.",
+  "scope": {
+    "in": [
+      "per-network-namespace packet socket registration and close withdrawal",
+      "generic AF_PACKET SOCK_RAW and SOCK_DGRAM Ethernet transmit and receive semantics",
+      "AF_INET SOCK_RAW IPPROTO_RAW control-socket compatibility used by BusyBox interface ioctls",
+      "protocol and ifindex receive filtering with readiness publication",
+      "layer-2 ingress for interfaces that are up but have no IP address",
+      "BusyBox udhcpc control-plane compatibility through existing rtnetlink, ioctl, poll, and VFS paths",
+      "scenario-driven RV64 and LA64 QEMU DHCP witnesses",
+      "runsh Alpine /sbin overlay and parameterized public Git clone witness",
+      "deferred VF2 and unspecified LA real-board acceptance hooks"
+    ],
+    "out": [
+      "an in-kernel DHCP state machine or DHCP packet parser",
+      "DHCPv6, router advertisements, SLAAC, or an in-kernel DNS resolver",
+      "DWMAC, StarFive PHY, DMA, or IRQ implementation",
+      "a fabricated LA real-board profile before the board model is known",
+      "automatic ambiguous multi-uplink selection",
+      "embedded proxies, Git remotes, credentials, CA material, or time policy"
+    ],
+    "write_sets": [
+      "crates/tx-subsystems/src/net",
+      "crates/tx-shims/src/linux_syscall/socket.rs and packet-socket tests",
+      "crates/tx-kernel/src/init/net.rs and rootfs_shims.rs",
+      "xtask/src/shell_test.rs and tools/udhcpc witnesses",
+      "docs/progress DHCP plan and status records"
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/01_substrate/HAL_v1.md",
+      "docs/design/06_devices/DEVICE.md",
+      "docs/design/07_net/REFACTOR_PLAN_A_v2.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-08-04-userspace-dhcp-client-plan.md",
+      "docs/progress/research/2026-08-04-portable-network-device-plan.md",
+      "docs/progress/plans/2026-08-04-portable-network-device.json"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "phase-0-contract-baseline",
+      "title": "Freeze the userspace DHCP and no-hardcoding contract",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-08-04-userspace-dhcp-client-plan.md",
+        "docs/progress/plans/2026-08-04-userspace-dhcp-client.json"
+      ],
+      "verification": [
+        "The plan distinguishes kernel Linux ABI work from userspace DHCP protocol work.",
+        "Production-code prohibitions include process, port, interface, address, topology, repository, and credential special cases.",
+        "The baseline identifies fake AF_PACKET success, absent RX fanout, no packet registry, and no-address ingress starvation."
+      ],
+      "notes": "The local QEMU packet-socket slice is implementation-ready; hardware acceptance remains conditional on each board driver."
+    },
+    {
+      "id": "phase-1-packet-registry",
+      "title": "Add per-namespace packet socket registration and lifecycle",
+      "status": "complete",
+      "depends_on": [
+        "phase-0-contract-baseline"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/structure/table.rs",
+        "crates/tx-subsystems/src/net/execution/step_socket_create.rs",
+        "crates/tx-subsystems/src/net/execution/step_socket_close.rs",
+        "crates/tx-subsystems/src/net/tests"
+      ],
+      "verification": [
+        "Packet sockets are registered only in their owning namespace.",
+        "Close withdraws the packet socket before payload retirement.",
+        "Capacity exhaustion is explicit and tested."
+      ],
+      "notes": "Use the existing raw-ICMP registry lifecycle as the local pattern."
+    },
+    {
+      "id": "phase-2-packet-rx",
+      "title": "Fan out real device ingress to matching packet sockets",
+      "status": "complete",
+      "depends_on": [
+        "phase-1-packet-registry"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/namespace.rs",
+        "crates/tx-subsystems/src/net/execution",
+        "crates/tx-kernel/src/init/net.rs",
+        "crates/tx-subsystems/src/net/tests"
+      ],
+      "verification": [
+        "SOCK_RAW receives a complete Ethernet frame and SOCK_DGRAM receives the payload.",
+        "Protocol, ETH_P_ALL, bound ifindex, unbound ifindex, namespace, and close filtering are covered.",
+        "One device receive feeds packet subscribers and normal L3 demux without competing drains.",
+        "An up interface with no IPv4 address still receives packet frames.",
+        "The first queued frame publishes receive readiness and wakes poll."
+      ],
+      "notes": "Each subscriber receives an independent copy; one full queue cannot block other consumers."
+    },
+    {
+      "id": "phase-3-packet-tx",
+      "title": "Transmit packet socket data through the selected real net device",
+      "status": "complete",
+      "depends_on": [
+        "phase-2-packet-rx"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/net/execution",
+        "crates/tx-subsystems/src/net/namespace.rs",
+        "crates/tx-shims/src/linux_syscall/socket.rs",
+        "crates/tx-shims/src/linux_syscall/tests/socket_fdtable/netlink_packet.rs"
+      ],
+      "verification": [
+        "SOCK_RAW transmits the caller's complete frame unchanged to a veth peer.",
+        "SOCK_DGRAM constructs the Ethernet header from namespace device and sockaddr_ll facts.",
+        "Invalid/down devices, malformed addresses, oversize frames, and busy devices return bounded errors.",
+        "The synthetic ARP self-reply production path is removed."
+      ],
+      "notes": "The syscall shim owns only user-copy and ABI translation; the net subsystem owns device semantics."
+    },
+    {
+      "id": "phase-4-control-plane",
+      "title": "Make DHCP-produced namespace and FIB state authoritative",
+      "status": "in-progress",
+      "depends_on": [
+        "phase-3-packet-tx"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/init/net.rs",
+        "crates/tx-kernel/src/init/boot_args.rs",
+        "crates/tx-subsystems/src/net",
+        "xtask"
+      ],
+      "verification": [
+        "The BusyBox udhcpc script can replace address, route, and DNS state.",
+        "Ordinary TCP and UDP egress uses the current namespace address and FIB after replacement.",
+        "Static, DHCP, and none modes are external inputs and require no kernel rebuild."
+      ],
+      "notes": "The dhcp/none boot modes now leave address and route truth exclusively in the namespace and the boot delegate no longer owns a private EtherIface. The legacy static QEMU values remain as a compatibility default; moving those values into the external scenario renderer is still pending."
+    },
+    {
+      "id": "phase-5-rv64-qemu-dhcp",
+      "title": "Run a real RV64 QEMU BusyBox udhcpc witness",
+      "status": "complete",
+      "depends_on": [
+        "phase-4-control-plane"
+      ],
+      "paths": [
+        "xtask/src/shell_test.rs",
+        "xtask/src/qemu.rs",
+        "tools/shell-tests",
+        "tools"
+      ],
+      "verification": [
+        "QEMU network arguments are actually connected to the shell-test command.",
+        "A temporary copy of the Alpine ext4 image is used.",
+        "A fixture-provided non-default subnet produces a real udhcpc lease, route, DNS, and gateway ping.",
+        "The serial log contains native udhcpc output and stable DHCP sentinels."
+      ],
+      "notes": "The parameterized witness acquired 172.31.44.20 from a non-default fixture, reached its DHCP-provided gateway and DNS, then completed a TLS-verified shallow clone of the externally supplied public xv6 GitHub remote. Concrete values are fixture inputs only."
+    },
+    {
+      "id": "phase-6-la64-negative-matrix",
+      "title": "Reuse the witness on LA64 QEMU and cover bounded failures",
+      "status": "pending",
+      "depends_on": [
+        "phase-5-rv64-qemu-dhcp"
+      ],
+      "paths": [
+        "xtask",
+        "tools",
+        "docs/progress"
+      ],
+      "verification": [
+        "LA64 QEMU passes the same guest DHCP ABI witness.",
+        "No-server, down-link, bad-ifindex, queue-full, and device-busy cases fail within the timeout ladder.",
+        "Changing subnet, device placement, registration order, and ifindex does not require source edits."
+      ],
+      "notes": "Do not weaken the RV64 witness or add architecture-specific DHCP logic."
+    },
+    {
+      "id": "phase-7-real-board-hooks",
+      "title": "Attach the common DHCP witness to ready real-board drivers",
+      "status": "pending",
+      "depends_on": [
+        "phase-6-la64-negative-matrix"
+      ],
+      "paths": [
+        "boards",
+        "xtask",
+        "tools",
+        "docs/progress"
+      ],
+      "verification": [
+        "VF2 uses the common witness after DWMAC and StarFive support is ready.",
+        "The future LA board adds only its platform profile and driver resources.",
+        "No fictional LA target, controller value, address, or topology is introduced before hardware identification."
+      ],
+      "notes": "Hardware-dependent acceptance remains deferred, not silently skipped or claimed complete."
+    }
+  ],
+  "verification": [
+    {
+      "command": "focused tx-subsystems, tx-shims, and xtask packet/DHCP prerequisite tests",
+      "status": "passed",
+      "notes": "Packet registry 1/1, packet RX/TX 2/2, AF_PACKET syscall wire tests 3/3, AF_INET IPPROTO_RAW control socket 1/1, and shell-test rendering 5/5 passed."
+    },
+    {
+      "command": "cargo xtask full-build --target rv64-qemu --no-image",
+      "status": "passed",
+      "notes": "Final RV64 QEMU doctor and kernel build passed; existing compiler warnings remain."
+    },
+    {
+      "command": "TX_DHCP_GIT_URL=<public-remote> bash tools/verify-udhcpc-rv64.sh",
+      "status": "passed",
+      "notes": "A non-default QEMU subnet produced a real BusyBox lease, DHCP gateway ping, DHCP DNS lookup, TLS-verified GitHub shallow clone, and guest HEAD f5dea58."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Workspace build passed. The existing tx-shims 37 failures and tx-kernel 3 failures remain (two init chmod assertions and the ThreadFuture size budget); the focused packet/DHCP tests pass."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "failed",
+      "notes": "The pre-existing 23 broken links and 6 stale-vocabulary warnings remain; neither new DHCP document is reported."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "The global walk still stops at the pre-existing invalid completed step status in the 2026-07-24 network-time plan; this record passes jq structure and status assertions."
+    }
+  ],
+  "risks": [
+    "Boot and namespace runtimes can compete for the same receive queue unless packet fanout is inserted at the actual single ingress owner.",
+    "Treating SOCK_DGRAM as SOCK_RAW breaks BusyBox udhcpc even when transmit reaches the device.",
+    "Skipping interfaces without IPv4 prevents the first DHCP offer from being observed.",
+    "Synthetic ARP behavior and the default QEMU lease can create false-positive witnesses.",
+    "Updating namespace configuration without removing boot-runtime private address and route truth leaves later TCP and Git traffic on stale values.",
+    "A plaintext GitHub credential exists in a local helper script and must never enter logs or test fixtures."
+  ],
+  "blockers": [
+    "VF2 completion requires the separate DWMAC and StarFive hardware phase.",
+    "The real LA board acceptance requires the board model and firmware facts.",
+    "Full four-mode automatic networking still depends on portable-network Phase 6 removing private boot-network truth."
+  ],
+  "handoff": {
+    "needed": true,
+    "path": null
+  }
+}

@@ -45,6 +45,10 @@
 //!
 //! Substring matching is plain literal — no regex. For multi-line
 //! patterns use a substring of one line.
+//! When `--net-scenario PATH` is present, send/wait/expect strings may use
+//! `@TX_SCENARIO_ADDRESS@`, `@TX_SCENARIO_PREFIX@`,
+//! `@TX_SCENARIO_GATEWAY@`, and `@TX_SCENARIO_DNS@`. Values come from that
+//! scenario's guest/backend expectations; missing values are an error.
 //!
 //! ## Group selection
 //!
@@ -78,6 +82,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::image::{alpine_initramfs_name, busybox_initramfs_name};
+use crate::qemu::{append_net_args, merge_network_guest_cmdline, qemu_net, QemuNet};
 use crate::target::{Profile, TxTarget};
 use crate::util::{
     append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
@@ -91,6 +96,11 @@ const ESC_KEY_DELAY: Duration = Duration::from_millis(500);
 
 pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
+    if target == TxTarget::La64Ls2k1000 {
+        return Err(
+            "shell-test is QEMU-only; use the serial real-board workflow for la64-2k1000".into(),
+        );
+    }
     let profile = Profile::parse(
         &optional_option_value(&args, "--profile").unwrap_or_else(|| "busybox".to_string()),
     )?;
@@ -113,6 +123,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         .map(|value| validate_boot_mode_value(&value).map(|()| value))
         .transpose()?;
     let append_cmdline = optional_option_value(&args, "--append-cmdline");
+    let net = qemu_net(root, target, &args)?;
     let smp: usize = optional_option_value(&args, "--smp")
         .map(|s| {
             s.parse::<usize>()
@@ -134,7 +145,8 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
 
     let script_text = fs::read_to_string(&script_path)
         .map_err(|err| format!("failed to read {}: {err}", script_path.display()))?;
-    let script = parse_script(&script_text)?;
+    let mut script = parse_script(&script_text)?;
+    expand_scenario_placeholders(&mut script, &net)?;
 
     if script.setup.is_empty() && script.groups.is_empty() {
         return Err("script is empty (no directives)".into());
@@ -220,6 +232,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let extra_rv64_ext4 = extra_rv64_ext4.clone();
                 let boot_mode = boot_mode.clone();
                 let append_cmdline = append_cmdline.clone();
+                let net = net.clone();
                 thread::spawn(move || loop {
                     let idx = next.fetch_add(1, Ordering::Relaxed);
                     if idx >= groups.len() {
@@ -234,6 +247,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                         extra_rv64_ext4: extra_rv64_ext4.as_deref(),
                         boot_mode: boot_mode.as_deref(),
                         append_cmdline: append_cmdline.as_deref(),
+                        net: &net,
                         setup: &setup,
                         group,
                     };
@@ -298,6 +312,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         extra_rv64_ext4.as_deref(),
         append_cmdline.as_deref(),
         boot_mode.as_deref(),
+        &net,
     )?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
 
@@ -649,6 +664,83 @@ struct Script {
     groups: Vec<NamedGroup>,
 }
 
+const SCENARIO_ADDRESS: &str = "@TX_SCENARIO_ADDRESS@";
+const SCENARIO_PREFIX: &str = "@TX_SCENARIO_PREFIX@";
+const SCENARIO_GATEWAY: &str = "@TX_SCENARIO_GATEWAY@";
+const SCENARIO_DNS: &str = "@TX_SCENARIO_DNS@";
+
+fn expand_scenario_placeholders(script: &mut Script, net: &QemuNet) -> Result<()> {
+    let scenario = match net {
+        QemuNet::Scenario(scenario) => Some(scenario),
+        _ => None,
+    };
+
+    for directive in script.setup.iter_mut().chain(
+        script
+            .groups
+            .iter_mut()
+            .flat_map(|group| &mut group.directives),
+    ) {
+        let text = match directive {
+            Directive::Wait { needle, .. } | Directive::Expect { needle, .. } => needle,
+            Directive::Send(text) => text,
+            Directive::Group(_) | Directive::Sleep(_) | Directive::Quit => continue,
+        };
+        expand_scenario_text(text, scenario)?;
+    }
+    Ok(())
+}
+
+fn expand_scenario_text(
+    text: &mut String,
+    scenario: Option<&crate::network_scenario::NetworkScenario>,
+) -> Result<()> {
+    let uses_scenario = [
+        SCENARIO_ADDRESS,
+        SCENARIO_PREFIX,
+        SCENARIO_GATEWAY,
+        SCENARIO_DNS,
+    ]
+    .iter()
+    .any(|placeholder| text.contains(placeholder));
+    if !uses_scenario {
+        return if text.contains("@TX_SCENARIO_") {
+            Err(format!("unknown network-scenario placeholder in {text:?}"))
+        } else {
+            Ok(())
+        };
+    }
+
+    let scenario = scenario.ok_or_else(|| {
+        "network-scenario placeholders require shell-test --net-scenario PATH".to_string()
+    })?;
+    let expected = scenario.expectations();
+    let address = expected.address.map(|(address, _)| address.to_string());
+    let prefix = expected.address.map(|(_, prefix)| prefix.to_string());
+    let gateway = expected.gateway.map(|gateway| gateway.to_string());
+    let dns = expected.dns.map(|dns| dns.to_string());
+    for (placeholder, value) in [
+        (SCENARIO_ADDRESS, address),
+        (SCENARIO_PREFIX, prefix),
+        (SCENARIO_GATEWAY, gateway),
+        (SCENARIO_DNS, dns),
+    ] {
+        if text.contains(placeholder) {
+            let value = value.ok_or_else(|| {
+                format!(
+                    "network scenario {:?} does not define {placeholder}",
+                    scenario.name
+                )
+            })?;
+            *text = text.replace(placeholder, &value);
+        }
+    }
+    if text.contains("@TX_SCENARIO_") {
+        return Err(format!("unknown network-scenario placeholder in {text:?}"));
+    }
+    Ok(())
+}
+
 fn parse_script(text: &str) -> Result<Script> {
     let mut script = Script::default();
     let mut current: Option<NamedGroup> = None;
@@ -817,6 +909,7 @@ struct IsolatedGroupRun<'a> {
     extra_rv64_ext4: Option<&'a Path>,
     boot_mode: Option<&'a str>,
     append_cmdline: Option<&'a str>,
+    net: &'a QemuNet,
     setup: &'a [Directive],
     group: &'a NamedGroup,
 }
@@ -850,6 +943,7 @@ fn run_group_isolated_inner(
         run.extra_rv64_ext4,
         run.append_cmdline,
         run.boot_mode,
+        run.net,
     ) {
         Ok(c) => c,
         Err(e) => return Some(format!("qemu command: {e}")),
@@ -910,6 +1004,7 @@ fn build_qemu_command(
     extra_rv64_ext4: Option<&Path>,
     append_cmdline: Option<&str>,
     boot_mode: Option<&str>,
+    net: &QemuNet,
 ) -> Result<Vec<String>> {
     // Reuse the existing qemu_command builder by constructing an
     // args list and invoking the same dispatcher path. We can't call
@@ -934,6 +1029,9 @@ fn build_qemu_command(
             (TxTarget::La64Qemu, _) => "1152M",
             (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
             (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
+            (TxTarget::La64Ls2k1000, _) => {
+                unreachable!("physical board rejected before shell-test setup")
+            }
         }
         .into(),
         "-smp".into(),
@@ -963,10 +1061,7 @@ fn build_qemu_command(
         }
         Profile::Smoke => unreachable!("rejected above"),
     };
-    let cmdline = match append_cmdline {
-        Some(extra) if !extra.trim().is_empty() => format!("{cmdline_base} {}", extra.trim()),
-        _ => cmdline_base,
-    };
+    let cmdline = merge_network_guest_cmdline(&cmdline_base, target, net, append_cmdline)?;
     args.push(append_tty_winsize_cmdline(&cmdline));
     if let Some(path) = extra_rv64_ext4 {
         if target != TxTarget::Rv64Qemu {
@@ -980,6 +1075,7 @@ fn build_qemu_command(
         args.push("-device".into());
         args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
     }
+    append_net_args(&mut args, target, net)?;
     Ok(args)
 }
 
@@ -998,6 +1094,7 @@ mod tests {
             None,
             None,
             None,
+            &QemuNet::None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1024,6 +1121,7 @@ mod tests {
             None,
             None,
             None,
+            &QemuNet::None,
         )
         .expect("build qemu command");
         assert!(command.join(" ").contains("-smp 4"));
@@ -1041,6 +1139,7 @@ mod tests {
             Some(image),
             None,
             None,
+            &QemuNet::None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1060,6 +1159,7 @@ mod tests {
             None,
             Some("tx.mount.sdcard=0"),
             None,
+            &QemuNet::None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1080,6 +1180,7 @@ mod tests {
             None,
             None,
             Some("contest"),
+            &QemuNet::None,
         )
         .expect("build qemu command");
         let rendered = command.join(" ");
@@ -1087,6 +1188,111 @@ mod tests {
         assert!(rendered.contains("tx.profile=alpine"));
         assert!(rendered.contains("tx.boot.mode=contest"));
         assert!(!rendered.contains("tx.boot.mode=alpine"));
+    }
+
+    #[test]
+    fn shell_test_user_network_is_rendered_into_qemu_command() {
+        let root = Path::new("/tmp/tx");
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            None,
+            None,
+            None,
+            &QemuNet::User,
+        )
+        .expect("build QEMU command with user networking");
+
+        let rendered = command.join(" ");
+        assert!(rendered.contains("-netdev user,id=net0"));
+        assert!(rendered.contains("-device virtio-net-device,netdev=net0"));
+    }
+
+    #[test]
+    fn shell_test_consumer_uses_relocated_changed_subnet_scenario() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let net = qemu_net(
+            root,
+            TxTarget::Rv64Qemu,
+            &[
+                "--net-scenario".into(),
+                "tools/network-scenarios/mutations/rv64-relocated-changed-subnet.toml".into(),
+            ],
+        )
+        .expect("load mutation scenario");
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            None,
+            Some("tx.net.mode=none"),
+            None,
+            &net,
+        )
+        .expect("render scenario through shell-test consumer")
+        .join(" ");
+
+        assert!(command.contains("bus=virtio-mmio-bus.7"));
+        assert!(command.contains("old-location-decoy"));
+        assert!(command.contains("bus=virtio-mmio-bus.1"));
+        assert!(command.contains("post-network-rng"));
+        assert!(command.contains("net=172.31.44.0/24"));
+        let before = command.find("old-location-decoy").expect("before decoy");
+        let network = command
+            .find("virtio-net-device")
+            .expect("relocated network device");
+        let after = command.find("post-network-rng").expect("after auxiliary");
+        assert!(before < network && network < after);
+        let scenario_mode = command.find("tx.net.mode=dhcp").expect("scenario mode");
+        let user_mode = command.find("tx.net.mode=none").expect("user duplicate");
+        assert!(scenario_mode < user_mode);
+    }
+
+    #[test]
+    fn shell_test_expands_network_scenario_values_in_directives() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let net = qemu_net(
+            root,
+            TxTarget::Rv64Qemu,
+            &[
+                "--net-scenario".into(),
+                "tools/network-scenarios/mutations/rv64-relocated-changed-subnet.toml".into(),
+            ],
+        )
+        .expect("load mutation scenario");
+        let mut script = parse_script(
+            r#"send "addr=@TX_SCENARIO_ADDRESS@/@TX_SCENARIO_PREFIX@ gw=@TX_SCENARIO_GATEWAY@\n"
+expect "dns=@TX_SCENARIO_DNS@" within 1000"#,
+        )
+        .expect("parse script");
+
+        expand_scenario_placeholders(&mut script, &net).expect("expand scenario values");
+
+        assert!(matches!(
+            &script.setup[0],
+            Directive::Send(text) if text == "addr=172.31.44.77/24 gw=172.31.44.9\n"
+        ));
+        assert!(matches!(
+            &script.setup[1],
+            Directive::Expect { needle, .. } if needle == "dns=172.31.44.10"
+        ));
+    }
+
+    #[test]
+    fn shell_test_rejects_scenario_placeholder_without_scenario() {
+        let mut script = parse_script(r#"send "@TX_SCENARIO_GATEWAY@\n""#).expect("parse script");
+
+        let error = expand_scenario_placeholders(&mut script, &QemuNet::User)
+            .expect_err("placeholder without scenario must fail");
+
+        assert!(error.contains("--net-scenario"));
     }
 
     #[test]

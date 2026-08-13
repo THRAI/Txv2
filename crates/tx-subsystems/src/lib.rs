@@ -10,6 +10,7 @@ pub mod adapter;
 pub mod aio;
 pub mod cred;
 pub mod device;
+pub mod device_binding;
 pub mod epoll;
 pub mod eventfd;
 pub mod execution;

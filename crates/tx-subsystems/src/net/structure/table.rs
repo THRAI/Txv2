@@ -11,20 +11,23 @@ use super::types::{AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address, UnixSock
 const LOCAL_ENDPOINT_SLOTS: usize = 256;
 const LISTENER_SLOTS: usize = 128;
 const CONNECTION_SLOTS: usize = 256;
+// Short-lived TCP connection churn can keep more than 256 published bound and
+// flow entries live concurrently. Keep the indexes bounded while matching the
+// established high-churn AF_UNIX table capacity.
+const TCP_BOUND_SLOTS: usize = 4096;
+const TCP_CONNECTION_SLOTS: usize = 4096;
 const RAW_ICMP_SLOTS: usize = 128;
+const PACKET_SOCKET_SLOTS: usize = 128;
 const UNIX_PATH_NODE_SLOTS: usize = 256;
 const UNIX_BOUND_SLOTS: usize = 256;
+const UDP_BOUND_OWNER_SLOTS: usize = 256;
 // hackbench (cyclictest's stress phase) creates hundreds of AF_UNIX
-// socketpairs concurrently; each pair inserts two peer entries. main bumped
-// this to 4096 to clear an `insert_unix_peer` ENOMEM ("Creating fdpair
-// (error: Out of memory)"). But each net namespace owns a whole `SocketTable`
-// and the per-namespace table is currently `Box::leak`-ed (never freed), so a
-// 4096-slot index makes every namespace leak ~500KB; a handful of LTP net
-// tests (each in its own netns) then exhaust the kernel heap
-// ("memory allocation of N bytes failed"). Until the namespace teardown frees
-// its `SocketTable`, keep the feature-tested 256 (the leak stays at ~30KB/ns).
-// Re-raising this requires fixing the per-namespace `SocketTable` leak first.
-const UNIX_STREAM_PEER_SLOTS: usize = 256;
+// socketpairs concurrently; each pair inserts two peer entries. 256 slots make
+// `insert_unix_peer` return ENOMEM before the stress helper can start. Isolated
+// namespaces now own their heap-allocated table and `NetNamespacePayload::drop`
+// destroys and deallocates it after the runtime-list reference is pruned, so
+// this capacity no longer turns every retired namespace into a permanent leak.
+const UNIX_STREAM_PEER_SLOTS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalEndpointKey {
@@ -86,6 +89,31 @@ pub struct RawIcmpSocketKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketSocketKey {
+    pub socket_raw: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UdpBoundOwnerKey {
+    local: LocalEndpointKey,
+    socket_raw: u32,
+}
+
+impl UdpBoundOwnerKey {
+    const fn new(endpoint: IpEndpoint, socket_raw: u32) -> Self {
+        Self {
+            local: LocalEndpointKey::new(endpoint),
+            socket_raw,
+        }
+    }
+}
+
+struct UdpBoundOwner {
+    local: LocalEndpointKey,
+    socket: Cap<SocketIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnixStreamPeerKey {
     pub socket_raw: u32,
 }
@@ -115,16 +143,18 @@ impl ListenerKey {
 }
 
 pub struct SocketTable {
-    tcp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
+    tcp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, TCP_BOUND_SLOTS>,
     tcp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
-    tcp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
+    tcp_connections: Index<ConnectionKey, Cap<SocketIdentity>, TCP_CONNECTION_SLOTS>,
     sctp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     sctp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
     sctp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     rds_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     udp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
+    udp_bound_owners: Index<UdpBoundOwnerKey, UdpBoundOwner, UDP_BOUND_OWNER_SLOTS>,
     udp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     raw_icmp: Index<RawIcmpSocketKey, Cap<SocketIdentity>, RAW_ICMP_SLOTS>,
+    packet_sockets: Index<PacketSocketKey, Cap<SocketIdentity>, PACKET_SOCKET_SLOTS>,
     unix_path_nodes: Index<UnixSocketPath, (), UNIX_PATH_NODE_SLOTS>,
     unix_bound: Index<UnixSocketPath, Cap<SocketIdentity>, UNIX_BOUND_SLOTS>,
     unix_stream_peers: Index<UnixStreamPeerKey, Cap<SocketIdentity>, UNIX_STREAM_PEER_SLOTS>,
@@ -132,16 +162,15 @@ pub struct SocketTable {
 }
 
 pub(crate) struct TcpDisconnectIndexReservations<'a> {
-    forward: Option<WithdrawReservation<'a, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>>,
+    forward:
+        Option<WithdrawReservation<'a, ConnectionKey, Cap<SocketIdentity>, TCP_CONNECTION_SLOTS>>,
     reverse: Option<TcpReverseIndexReservation<'a>>,
-    bound: Option<
-        WithdrawReservation<'a, LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
-    >,
+    bound: Option<WithdrawReservation<'a, LocalEndpointKey, Cap<SocketIdentity>, TCP_BOUND_SLOTS>>,
 }
 
 enum TcpReverseIndexReservation<'a> {
-    Vacant(IndexReservation<'a, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>),
-    Occupied(WithdrawReservation<'a, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>),
+    Vacant(IndexReservation<'a, ConnectionKey, Cap<SocketIdentity>, TCP_CONNECTION_SLOTS>),
+    Occupied(WithdrawReservation<'a, ConnectionKey, Cap<SocketIdentity>, TCP_CONNECTION_SLOTS>),
 }
 
 impl TcpDisconnectIndexReservations<'_> {
@@ -197,8 +226,10 @@ impl SocketTable {
             sctp_connections: Index::new(),
             rds_bound: Index::new(),
             udp_bound: Index::new(),
+            udp_bound_owners: Index::new(),
             udp_connections: Index::new(),
             raw_icmp: Index::new(),
+            packet_sockets: Index::new(),
             unix_path_nodes: Index::new(),
             unix_bound: Index::new(),
             unix_stream_peers: Index::new(),
@@ -222,10 +253,51 @@ impl SocketTable {
         endpoint: IpEndpoint,
         socket: Cap<SocketIdentity>,
     ) -> Result<(), IndexError> {
-        self.udp_bound
-            .reserve(LocalEndpointKey::new(endpoint))?
-            .commit(socket);
-        Ok(())
+        let owner_key = UdpBoundOwnerKey::new(endpoint, socket.raw());
+        self.udp_bound_owners
+            .reserve(owner_key)?
+            .commit(UdpBoundOwner {
+                local: LocalEndpointKey::new(endpoint),
+                socket: socket.clone(),
+            });
+
+        match self.udp_bound.reserve(LocalEndpointKey::new(endpoint)) {
+            Ok(reservation) => {
+                reservation.commit(socket);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = mutation::withdraw(&self.udp_bound_owners, &owner_key);
+                Err(error)
+            }
+        }
+    }
+
+    /// Add another `SO_REUSEADDR` owner and make it the active ingress target.
+    ///
+    /// The complete owner set is retained separately from the single active
+    /// demux entry. Closing the active owner can therefore promote a surviving
+    /// owner instead of leaving the endpoint unbound.
+    pub fn replace_udp_bound_owner(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        let owner_key = UdpBoundOwnerKey::new(endpoint, socket.raw());
+        self.udp_bound_owners
+            .reserve(owner_key)?
+            .commit(UdpBoundOwner {
+                local: LocalEndpointKey::new(endpoint),
+                socket: socket.clone(),
+            });
+
+        match mutation::swap(&self.udp_bound, &LocalEndpointKey::new(endpoint), socket) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let _ = mutation::withdraw(&self.udp_bound_owners, &owner_key);
+                Err(index_error_from_mutation(error))
+            }
+        }
     }
 
     pub fn bind_sctp(
@@ -316,6 +388,15 @@ impl SocketTable {
     pub fn register_raw_icmp(&self, socket: Cap<SocketIdentity>) -> Result<(), IndexError> {
         self.raw_icmp
             .reserve(RawIcmpSocketKey {
+                socket_raw: socket.raw(),
+            })?
+            .commit(socket);
+        Ok(())
+    }
+
+    pub fn register_packet_socket(&self, socket: Cap<SocketIdentity>) -> Result<(), IndexError> {
+        self.packet_sockets
+            .reserve(PacketSocketKey {
                 socket_raw: socket.raw(),
             })?
             .commit(socket);
@@ -418,7 +499,7 @@ impl SocketTable {
         key: ConnectionKey,
         owner: u32,
     ) -> Result<
-        Option<WithdrawReservation<'_, ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>>,
+        Option<WithdrawReservation<'_, ConnectionKey, Cap<SocketIdentity>, TCP_CONNECTION_SLOTS>>,
         MutationError,
     > {
         reserve_owned_socket(&self.tcp_connections, &key, owner)
@@ -485,6 +566,47 @@ impl SocketTable {
         mutation::withdraw(&self.udp_bound, &LocalEndpointKey::new(endpoint))
     }
 
+    /// Remove one logical UDP binding and restore another reuse owner when the
+    /// removed socket was the active ingress target.
+    pub fn withdraw_udp_bound_owner(
+        &self,
+        endpoint: IpEndpoint,
+        socket_raw: u32,
+        guard: &Guard<'_>,
+    ) -> Result<(), MutationError> {
+        mutation::withdraw(
+            &self.udp_bound_owners,
+            &UdpBoundOwnerKey::new(endpoint, socket_raw),
+        )?;
+
+        let local = LocalEndpointKey::new(endpoint);
+        let replacement = self
+            .udp_bound_owners
+            .snapshot_values_filter_map(guard, |owner| {
+                (owner.local == local)
+                    .then(|| owner.socket.try_clone_live())
+                    .flatten()
+            })
+            .into_iter()
+            .next();
+
+        let removed_active =
+            mutation::withdraw_if(&self.udp_bound, &local, |active| active.raw() == socket_raw)?;
+        if removed_active.is_none() {
+            return Ok(());
+        }
+
+        if let Some(replacement) = replacement {
+            match self.udp_bound.reserve(local) {
+                Ok(reservation) => reservation.commit(replacement),
+                // A concurrent bind already restored an active ingress owner.
+                Err(IndexError::Duplicate) => {}
+                Err(error) => return Err(mutation_error_from_index(error)),
+            }
+        }
+        Ok(())
+    }
+
     pub fn withdraw_udp_connection(
         &self,
         key: ConnectionKey,
@@ -494,6 +616,13 @@ impl SocketTable {
 
     pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
         mutation::withdraw(&self.raw_icmp, &RawIcmpSocketKey { socket_raw })
+    }
+
+    pub fn withdraw_packet_socket(
+        &self,
+        socket_raw: u32,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.packet_sockets, &PacketSocketKey { socket_raw })
     }
 
     pub fn withdraw_unix_bound(
@@ -860,6 +989,11 @@ impl SocketTable {
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 
+    pub fn snapshot_packet_sockets(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.packet_sockets
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
     pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.unix_bound
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
@@ -883,8 +1017,26 @@ fn reserve_owned_socket<'a, K: Eq, const N: usize>(
     }
 }
 
+fn index_error_from_mutation(error: MutationError) -> IndexError {
+    match error {
+        MutationError::AlreadyPresent => IndexError::Duplicate,
+        MutationError::Missing => IndexError::Missing,
+        MutationError::Full => IndexError::Full,
+        MutationError::Busy => IndexError::Busy,
+    }
+}
+
+fn mutation_error_from_index(error: IndexError) -> MutationError {
+    match error {
+        IndexError::Duplicate => MutationError::AlreadyPresent,
+        IndexError::Missing => MutationError::Missing,
+        IndexError::Full => MutationError::Full,
+        IndexError::Busy => MutationError::Busy,
+    }
+}
+
 fn reserve_tcp_reverse_slot(
-    index: &Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
+    index: &Index<ConnectionKey, Cap<SocketIdentity>, TCP_CONNECTION_SLOTS>,
     local: IpEndpoint,
     remote: IpEndpoint,
 ) -> Result<TcpReverseIndexReservation<'_>, MutationError> {
@@ -962,6 +1114,10 @@ impl InitialSocketTableProxy {
         self.with_table(|table| table.register_raw_icmp(socket))
     }
 
+    pub fn register_packet_socket(&self, socket: Cap<SocketIdentity>) -> Result<(), IndexError> {
+        self.with_table(|table| table.register_packet_socket(socket))
+    }
+
     pub fn bind_unix(
         &self,
         path: UnixSocketPath,
@@ -1027,6 +1183,13 @@ impl InitialSocketTableProxy {
 
     pub fn withdraw_raw_icmp(&self, socket_raw: u32) -> Result<Cap<SocketIdentity>, MutationError> {
         self.with_table(|table| table.withdraw_raw_icmp(socket_raw))
+    }
+
+    pub fn withdraw_packet_socket(
+        &self,
+        socket_raw: u32,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        self.with_table(|table| table.withdraw_packet_socket(socket_raw))
     }
 
     pub fn withdraw_unix_bound(
@@ -1171,6 +1334,10 @@ impl InitialSocketTableProxy {
 
     pub fn snapshot_raw_icmp(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.with_table(|table| table.snapshot_raw_icmp(guard))
+    }
+
+    pub fn snapshot_packet_sockets(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.with_table(|table| table.snapshot_packet_sockets(guard))
     }
 
     pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {

@@ -1394,9 +1394,10 @@ fn step_flush_page_backed_open_file_without_retry(
     // provisional inode size.  Commit the PageContainer's byte-precise EOF
     // before the dirty slots move to Writeback, then admit their data without
     // turning close into an fsync durability barrier.
-    if pc
-        .file_backend_context()
-        .is_some_and(|context| context.payload().backend_planner().is_some())
+    if pc.has_file_io_service_runtime()
+        && pc
+            .file_backend_context()
+            .is_some_and(|context| context.payload().backend_planner().is_some())
     {
         let size_result = pc.publish_exact_size_for_close_visibility(guard);
         let _ = pc.queue_dirty_file_writeback_retained(pc.clone());
@@ -1441,9 +1442,10 @@ fn retry_deferred_page_writebacks(guard: &step_engine::Guard<'_>, budget: usize)
     };
 
     for pc in batch {
-        if pc
-            .file_backend_context()
-            .is_some_and(|context| context.payload().backend_planner().is_some())
+        if pc.has_file_io_service_runtime()
+            && pc
+                .file_backend_context()
+                .is_some_and(|context| context.payload().backend_planner().is_some())
         {
             let _ = pc.queue_dirty_file_writeback_retained(pc.clone());
             continue;

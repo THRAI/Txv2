@@ -86,7 +86,9 @@ pub(crate) fn doctor(root: &Path) -> Result<()> {
             } else {
                 let help = match target {
                     TxTarget::Rv64Qemu => "tools/images/fetch-busybox.sh",
-                    TxTarget::La64Qemu => "tools/images/build-busybox-loongarch64.sh",
+                    TxTarget::La64Qemu | TxTarget::La64Ls2k1000 => {
+                        "tools/images/build-busybox-loongarch64.sh"
+                    }
                     TxTarget::Rv64M1DockMock => unreachable!("not checked here"),
                 };
                 println!("warn: TX_BUSYBOX not set and {relpath} missing; run `{help}`");

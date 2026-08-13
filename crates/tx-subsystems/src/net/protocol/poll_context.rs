@@ -12,10 +12,9 @@ use crate::net::protocol::{
 use crate::net::structure::registry;
 use crate::net::structure::table::{SocketTable, SOCKET_TABLE};
 use crate::net::structure::{
-    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, RecvWireSet, SendWireSet,
-    SocketIdentity, SocketKind, SocketProtocol, TcpBacklogEntry, TcpConnectAttempt,
-    TcpConnectDisposition, TcpState, TcpStateGeneration, UdpInner,
-    TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketKind,
+    SocketProtocol, TcpBacklogEntry, TcpConnectAttempt, TcpConnectDisposition, TcpState,
+    TcpStateGeneration, UdpInner, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 
 use super::SmoltcpTcpSegment;
@@ -367,9 +366,13 @@ impl PollContext {
             };
 
             let mut publish = NetworkPublish::none();
-            if target_payload.record_recv_payload(datagram.src, datagram.dst, datagram.payload) {
-                publish.recv_has_data = true;
-            }
+            let _became_readable =
+                target_payload.record_recv_payload(datagram.src, datagram.dst, datagram.payload);
+            // Re-publish the authoritative UDP record level even when the
+            // queue was already non-empty. In particular, an empty datagram
+            // has recv_len == 0, and a concurrent reader may have cleared the
+            // edge hint while this ingress pass was running.
+            publish.recv_has_data = target_payload.recv_ready();
             self.sockets_touched += 1;
             bytes_moved += payload_len;
             if publish.has_any() {
@@ -577,9 +580,12 @@ impl PollContext {
         }
 
         let publish = NetworkPublish {
-            recv_has_data: protocol_publish.recv_readable
-                || target.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
-                    && recv_available > 0,
+            // Re-fire even when HAS_DATA is already set. A reader may have
+            // observed an empty ring and be about to clear the wire and sleep;
+            // suppressing this publish loses the final data/FIN wake in that
+            // interleaving. Repeated fire is idempotent and matches the generic
+            // packet-event ingress path.
+            recv_has_data: protocol_publish.recv_readable || recv_available > 0,
             send_has_space: !protocol_publish.connected && protocol_publish.send_writable,
             recv_broken: protocol_publish.broken || protocol_publish.recv_closed,
             send_broken: protocol_publish.broken || protocol_publish.send_closed,

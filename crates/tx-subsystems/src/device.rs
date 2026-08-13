@@ -1255,8 +1255,11 @@ async fn page_container_file_io_service_task_loop_claim(
 
         report.waits_ready += 1;
         report.ready_turns += 1;
-        let guard = step_engine::guard();
-        let Some(container) = claim.container.upgrade(&guard) else {
+        let container = {
+            let guard = step_engine::guard();
+            claim.container.upgrade(&guard)
+        };
+        let Some(container) = container else {
             report.waits_failed += 1;
             break;
         };
@@ -1264,7 +1267,6 @@ async fn page_container_file_io_service_task_loop_claim(
         // complete page/block/page service turn: page completions publish a
         // new immutable resident root and can consume more retire credits than
         // one guarded epoch can replenish.
-        drop(guard);
         claim.retain_manager_custody();
         let turn = match drive_page_container_file_io_service_once_compact(
             &container,
@@ -1292,6 +1294,12 @@ async fn page_container_file_io_service_task_loop_claim(
                 .unwrap_or(0)
             + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
         report.last_turn = Some(turn);
+        if config
+            .max_ready_turns
+            .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+        {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
@@ -1344,6 +1352,12 @@ pub async fn page_container_file_io_service_task_loop(
                 .unwrap_or(0)
             + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
         report.last_turn = Some(turn);
+        if config
+            .max_ready_turns
+            .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+        {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
@@ -1553,34 +1567,100 @@ fn step_result_to_result(outcome: StepOutcome<(), NoProgress>) -> Result<(), Err
 }
 
 static BLOCK_REGISTRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static BLOCK_REGISTRY_PREPARED: AtomicBool = AtomicBool::new(false);
 static BLOCK_REGISTRY_LEN: AtomicUsize = AtomicUsize::new(0);
 static mut BLOCK_REGISTRY: [Option<&'static BlockDeviceRegistration>; MAX_STATIC_BLOCK_DEVICES] =
     [None; MAX_STATIC_BLOCK_DEVICES];
 
-pub fn register_block_devices(
-    regs: &'static [&'static BlockDeviceRegistration],
-) -> StepOutcome<(), NoProgress> {
-    if BLOCK_REGISTRY_INITIALIZED.swap(true, Ordering::AcqRel) {
-        return StepOutcome::Err(Errno::EEXIST.into());
+/// Validated, unpublished block-device registry proposal.
+///
+/// Only one proposal may be live at a time. Dropping it without committing
+/// releases that boot-time reservation and leaves the registry unchanged.
+#[must_use = "a prepared block-device registry must be committed or dropped"]
+pub struct PreparedBlockDeviceRegistry<'a> {
+    regs: &'a [&'static BlockDeviceRegistration],
+    committed: bool,
+}
+
+impl PreparedBlockDeviceRegistry<'_> {
+    /// Publish the fully validated registry in one infallible boot-time step.
+    ///
+    /// The prepared-token reservation excludes another commit. Entries are
+    /// written first and the length is the final reader-visible publication.
+    pub fn commit(mut self) {
+        debug_assert!(!BLOCK_REGISTRY_INITIALIZED.load(Ordering::Acquire));
+        for (idx, reg) in self.regs.iter().copied().enumerate() {
+            unsafe {
+                BLOCK_REGISTRY[idx] = Some(reg);
+            }
+        }
+        BLOCK_REGISTRY_LEN.store(self.regs.len(), Ordering::Release);
+        BLOCK_REGISTRY_INITIALIZED.store(true, Ordering::Release);
+        self.committed = true;
+        BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for PreparedBlockDeviceRegistry<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Validate and reserve one fixed block-device registry transaction.
+///
+/// Capacity, duplicate `name`, and duplicate `devt` checks complete before
+/// acquiring the proposal token. Failure never sets `INITIALIZED`, writes an
+/// entry, or publishes a non-zero length, so a later corrected proposal may
+/// retry without a test-only reset.
+pub fn prepare_block_devices<'a>(
+    regs: &'a [&'static BlockDeviceRegistration],
+) -> Result<PreparedBlockDeviceRegistry<'a>, Errno> {
+    if BLOCK_REGISTRY_INITIALIZED.load(Ordering::Acquire) {
+        return Err(Errno::EEXIST);
     }
     if regs.len() > MAX_STATIC_BLOCK_DEVICES {
-        return StepOutcome::Err(Errno::ENOMEM.into());
+        return Err(Errno::ENOMEM);
     }
-
     for (idx, reg) in regs.iter().copied().enumerate() {
         if regs[..idx]
             .iter()
             .copied()
             .any(|seen| seen.devt == reg.devt || seen.name == reg.name)
         {
-            return StepOutcome::Err(Errno::EEXIST.into());
-        }
-        unsafe {
-            BLOCK_REGISTRY[idx] = Some(reg);
+            return Err(Errno::EEXIST);
         }
     }
-    BLOCK_REGISTRY_LEN.store(regs.len(), Ordering::Release);
-    StepOutcome::Done(())
+
+    if BLOCK_REGISTRY_PREPARED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Errno::EEXIST);
+    }
+    if BLOCK_REGISTRY_INITIALIZED.load(Ordering::Acquire) {
+        BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
+        return Err(Errno::EEXIST);
+    }
+
+    Ok(PreparedBlockDeviceRegistry {
+        regs,
+        committed: false,
+    })
+}
+
+pub fn register_block_devices(
+    regs: &'static [&'static BlockDeviceRegistration],
+) -> StepOutcome<(), NoProgress> {
+    match prepare_block_devices(regs) {
+        Ok(prepared) => {
+            prepared.commit();
+            StepOutcome::Done(())
+        }
+        Err(errno) => StepOutcome::Err(errno.into()),
+    }
 }
 
 pub fn block_device_by_name(name: &[u8]) -> Option<&'static BlockDeviceRegistration> {
@@ -1620,6 +1700,7 @@ pub fn reset_block_registry_for_test() {
     }
     BLOCK_REGISTRY_LEN.store(0, Ordering::Release);
     BLOCK_REGISTRY_INITIALIZED.store(false, Ordering::Release);
+    BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1837,7 +1918,30 @@ mod tests {
     }
 
     #[test]
-    fn static_block_registry_rejects_duplicate_names_or_devts() {
+    fn prepared_block_registry_is_unpublished_and_drop_is_retryable() {
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        reset_block_registry_for_test();
+        let regs: alloc::vec::Vec<&'static BlockDeviceRegistration> = alloc::vec![&BLOCK_REG];
+
+        let prepared = prepare_block_devices(&regs).expect("valid local-slice proposal");
+        assert!(block_device_snapshot().is_empty());
+        assert!(matches!(prepare_block_devices(&regs), Err(Errno::EEXIST)));
+        drop(prepared);
+        assert!(block_device_snapshot().is_empty());
+
+        prepare_block_devices(&regs)
+            .expect("dropped proposal releases reservation")
+            .commit();
+        assert!(core::ptr::eq(
+            block_device_by_name(b"vda1").expect("committed vda1"),
+            &BLOCK_REG
+        ));
+    }
+
+    #[test]
+    fn static_block_registry_validation_failures_are_retryable() {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -1847,13 +1951,35 @@ mod tests {
             name: "vda1",
             ops: &BLOCK_OPS,
         };
-        static REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG, &DUP_NAME];
+        static DUP_DEVT: BlockDeviceRegistration = BlockDeviceRegistration {
+            devt: DevT::new(8, 1),
+            name: "other",
+            ops: &BLOCK_OPS,
+        };
+        static DUP_NAME_REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG, &DUP_NAME];
+        static DUP_DEVT_REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG, &DUP_DEVT];
+        static TOO_MANY: [&BlockDeviceRegistration; MAX_STATIC_BLOCK_DEVICES + 1] =
+            [&BLOCK_REG; MAX_STATIC_BLOCK_DEVICES + 1];
+        static VALID: &[&BlockDeviceRegistration] = &[&BLOCK_REG];
 
         assert_eq!(
-            register_block_devices(REGS),
+            register_block_devices(DUP_NAME_REGS),
             StepOutcome::Err(Errno::EEXIST.into())
         );
         assert!(block_device_snapshot().is_empty());
+        assert_eq!(
+            register_block_devices(DUP_DEVT_REGS),
+            StepOutcome::Err(Errno::EEXIST.into())
+        );
+        assert!(block_device_snapshot().is_empty());
+        assert_eq!(
+            register_block_devices(&TOO_MANY),
+            StepOutcome::Err(Errno::ENOMEM.into())
+        );
+        assert!(block_device_snapshot().is_empty());
+
+        assert_eq!(register_block_devices(VALID), StepOutcome::Done(()));
+        assert_eq!(block_device_snapshot().len(), 1);
     }
 
     #[test]

@@ -890,7 +890,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
         let PageContainerKind::File { mount, .. } = self.pc.kind() else {
             return V3::done(());
         };
-        if mount.payload().backend_planner().is_none() {
+        if mount.payload().backend_planner().is_none() || !self.pc.has_file_io_service_runtime() {
             let guard = step_engine::guard();
             return step_fsync(self.pc, &guard);
         }

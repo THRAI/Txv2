@@ -68,6 +68,7 @@ static TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: TestPlatform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };
@@ -346,6 +347,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
     tx_subsystems::device::reset_block_registry_for_test();
+    tx_subsystems::net::device::reset_net_registry_for_test();
     tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
     CONSOLE_CAPTURED_BYTES
@@ -386,6 +388,7 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_rtc_device();
     CoreInit::<TestPlatform>::init_block_devices();
+    CoreInit::<TestPlatform>::init_net_devices();
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
@@ -428,6 +431,15 @@ fn reactor_epoch_boundary_replenishes_publication_retire_credit_under_load() {
     drop(replenished);
     drop(published);
     tx_test_support::drain_to_quiescence();
+}
+
+#[test]
+fn zero_network_registry_does_not_publish_a_staging_device() {
+    let _setup = setup();
+
+    CoreInit::<TestPlatform>::init_net_devices();
+
+    assert!(tx_subsystems::net::net_device_snapshot().is_empty());
 }
 
 struct FileIoRuntimeTestBlockDevice;
@@ -503,7 +515,7 @@ fn boot_init_submits_registered_file_io_service_runtimes() {
 }
 
 #[test]
-fn file_io_runtime_task_submission_owns_one_runtime() {
+fn file_io_runtime_task_submission_is_pinned_fair_work() {
     let _serial = setup();
     let pc = tx_subsystems::page_backed::PageContainer::new_cap(
         tx_subsystems::page_backed::PageContainerKind::Anon {
@@ -520,15 +532,32 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
     let runtime = runtimes.pop().expect("one file I/O runtime claim");
     assert!(runtimes.is_empty());
     let mut submitted = 0;
+    let mut submitted_meta = None;
 
     assert!(CoreInit::<TestPlatform>::submit_file_io_runtime_task_with(
         runtime,
-        |_runtime, _config, _meta| {
+        |_runtime, _config, meta| {
             submitted += 1;
+            submitted_meta = Some(meta);
             true
         },
     ));
     assert_eq!(submitted, 1);
+
+    let meta = submitted_meta.expect("file I/O runtime scheduling metadata");
+    assert_eq!(meta.class, tx_reactor::SchedClass::Fair);
+    assert!(!meta.kernel_only);
+    assert!(!meta.userspace_thread);
+    assert_eq!(meta.migration, tx_reactor::MigrationPolicy::Pinned);
+    assert_eq!(meta.affinity, 0b1);
+
+    let mut scheduler = tx_reactor::Phase1Scheduler::new();
+    let task = tx_reactor::TaskId(0);
+    scheduler.task_submitted(task, tx_reactor::TaskHandle::new(task), meta);
+    let depths = scheduler.queue_depths(tx_reactor::HartId(0));
+    assert_eq!(depths.kernel, 0);
+    assert_eq!(depths.new, 1);
+    assert!(!scheduler.can_migrate(task));
 }
 
 #[test]
@@ -569,6 +598,10 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         Some("mmcblk0")
     );
     assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sda", true),
+        Some("sda")
+    );
+    assert_eq!(
         CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sdcard", false),
         Some("vda")
     );
@@ -581,6 +614,25 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         None
     );
     assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot(
+            "tx.runsh=/musl/tx-run.sh console=ttyS0",
+            false,
+        ),
+        None
+    );
+    for compatibility_mode in [
+        "tx.boot.mode=oscomp",
+        "tx.boot.mode=ltp",
+        "tx.boot.mode=test",
+        "tx.oscomp.groups=netperf-musl",
+    ] {
+        assert_eq!(
+            CoreInit::<TestPlatform>::root_device_name_from_boot(compatibility_mode, false),
+            None,
+            "{compatibility_mode} needs the tmpfs-root shim layout"
+        );
+    }
+    assert_eq!(
         CoreInit::<TestPlatform>::root_device_name_from_boot("", true),
         None
     );
@@ -588,6 +640,25 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=vda", true),
         Some("vda")
     );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot(
+            "tx.boot.mode=oscomp tx.root=vda",
+            false,
+        ),
+        Some("vda")
+    );
+}
+
+#[test]
+fn root_mount_mode_honors_the_last_standard_ro_or_rw_token() {
+    assert!(!CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(""));
+    assert!(CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(
+        "tx.root=sda ro"
+    ));
+    assert!(!CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot("tx.root=sda ro rw"));
+    assert!(CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(
+        "tx.root=sda rw ro"
+    ));
 }
 
 #[test]

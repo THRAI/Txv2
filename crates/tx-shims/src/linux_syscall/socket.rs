@@ -11,12 +11,12 @@ use tx_services::time::{ClockRead, TimekeeperClock};
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::protocol::loopback_iface;
 use tx_subsystems::net::{
-    net_namespace_payload_from_file, net_namespace_payloads_snapshot, netlink_netfilter_recv,
-    netlink_netfilter_send, netlink_route_recv, netlink_route_recv_packet,
-    netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
-    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
-    step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
-    step_sctp_peeloff, step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
+    net_namespace_payload_from_file, netlink_netfilter_recv, netlink_netfilter_send,
+    netlink_route_recv, netlink_route_recv_packet, netlink_route_send_with_netns_resolvers,
+    netlink_xfrm_recv, netlink_xfrm_send, require_net_raw, socket_open_file_from_identity,
+    step_accept, step_bind, step_connect, step_listen, step_packet_send, step_poll_ready,
+    step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes, step_sctp_peeloff,
+    step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
     step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_open_file_in_namespace,
     step_tcp_loopback_handshake, step_tcp_loopback_transfer, step_unix_socketpair_connect,
@@ -104,11 +104,6 @@ const IFNAMSIZ: usize = 16;
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
 const PACKET_HOST: u8 = 0;
-const ETH_P_IP: u16 = 0x0800;
-const ETH_P_ARP: u16 = 0x0806;
-const ARPOP_REQUEST: u16 = 1;
-const ARPOP_REPLY: u16 = 2;
-const ARP_ETH_IPV4_PACKET_BYTES: usize = 28;
 
 pub(super) fn is_netlink_socket_kind(kind: SocketKind) -> bool {
     matches!(
@@ -807,23 +802,17 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                 _ => return SyscallResult::Error(errno_to_i32(Errno::EDESTADDRREQ)),
             }
         };
-        let Some(netns) = ctx.process.net_namespace() else {
-            return SyscallResult::Error(ESRCH_VALUE);
-        };
-        if sockaddr.ifindex <= 0
-            || !netns
-                .link_snapshot()
-                .into_iter()
-                .any(|link| link.ifindex == sockaddr.ifindex as u32)
-        {
-            return SyscallResult::Error(ENODEV_VALUE);
-        }
         let mut bytes = alloc::vec![0; len];
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
-        maybe_queue_packet_arp_reply(ctx, &socket, &payload, &netns, sockaddr, &bytes);
-        return SyscallResult::Return(len as i64);
+        let guard = tx_substrate::epoch::guard();
+        return match step_packet_send(&socket, sockaddr, &bytes, flags, &guard) {
+            StepOutcome::Done(sent) => SyscallResult::Return(sent as i64),
+            StepOutcome::Continue { .. } => SyscallResult::Return(len as i64),
+            StepOutcome::Yield { .. } => SyscallResult::Error(EAGAIN_VALUE),
+            StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
     }
 
     let ignore_dst = tcp_sendto_ignores_destination(&socket);
@@ -1218,91 +1207,6 @@ where
             StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }
     }
-}
-
-fn maybe_queue_packet_arp_reply(
-    ctx: &SyscallCtx<'_>,
-    socket: &Cap<SocketIdentity>,
-    payload: &SocketOperationalEvidence,
-    netns: &NetNamespacePayload,
-    sockaddr: SockAddrLl,
-    bytes: &[u8],
-) {
-    if sockaddr.protocol != ETH_P_ARP || bytes.len() < ARP_ETH_IPV4_PACKET_BYTES {
-        return;
-    }
-    if u16::from_be_bytes([bytes[0], bytes[1]]) != ARPHRD_ETHER
-        || u16::from_be_bytes([bytes[2], bytes[3]]) != ETH_P_IP
-        || bytes[4] != 6
-        || bytes[5] != 4
-        || u16::from_be_bytes([bytes[6], bytes[7]]) != ARPOP_REQUEST
-    {
-        return;
-    }
-
-    let sender_mac = match <[u8; 6]>::try_from(&bytes[8..14]) {
-        Ok(mac) => mac,
-        Err(_) => return,
-    };
-    let sender_ip = match <[u8; 4]>::try_from(&bytes[14..18]) {
-        Ok(ip) => ip,
-        Err(_) => return,
-    };
-    let target_ip = match <[u8; 4]>::try_from(&bytes[24..28]) {
-        Ok(ip) => Ipv4Address::new(ip),
-        Err(_) => return,
-    };
-
-    let Some(target_mac) = packet_arp_target_mac(netns, target_ip) else {
-        return;
-    };
-    let target_ip = target_ip.octets();
-
-    let mut reply = alloc::vec![0u8; ARP_ETH_IPV4_PACKET_BYTES];
-    reply[0..2].copy_from_slice(&ARPHRD_ETHER.to_be_bytes());
-    reply[2..4].copy_from_slice(&ETH_P_IP.to_be_bytes());
-    reply[4] = 6;
-    reply[5] = 4;
-    reply[6..8].copy_from_slice(&ARPOP_REPLY.to_be_bytes());
-    reply[8..14].copy_from_slice(&target_mac);
-    reply[14..18].copy_from_slice(&target_ip);
-    reply[18..24].copy_from_slice(&sender_mac);
-    reply[24..28].copy_from_slice(&sender_ip);
-
-    let mut source_addr = [0u8; 8];
-    source_addr[..target_mac.len()].copy_from_slice(&target_mac);
-    let source = SockAddrLl::with_link_layer_addr(
-        ETH_P_ARP,
-        sockaddr.ifindex,
-        ARPHRD_ETHER,
-        PACKET_HOST,
-        source_addr,
-        target_mac.len() as u8,
-    );
-    if payload.record_packet_frame(source, reply).unwrap_or(false) {
-        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
-    }
-}
-
-fn packet_arp_target_mac(netns: &NetNamespacePayload, target_ip: Ipv4Address) -> Option<[u8; 6]> {
-    find_packet_arp_target_mac_in_netns(netns, target_ip).or_else(|| {
-        net_namespace_payloads_snapshot()
-            .into_iter()
-            .find_map(|candidate| find_packet_arp_target_mac_in_netns(&candidate, target_ip))
-    })
-}
-
-fn find_packet_arp_target_mac_in_netns(
-    netns: &NetNamespacePayload,
-    target_ip: Ipv4Address,
-) -> Option<[u8; 6]> {
-    netns.link_snapshot().into_iter().find_map(|link| {
-        if link.ipv4_addr == Some(target_ip) && !link.is_loopback {
-            link.mac.map(|mac| mac.octets())
-        } else {
-            None
-        }
-    })
 }
 
 /// Parsed sctp_sndrcvinfo ancillary data from a sendmsg control message.

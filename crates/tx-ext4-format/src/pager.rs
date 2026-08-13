@@ -73,6 +73,14 @@ impl PhysicalBlockRange {
 pub trait BlockImage {
     fn total_blocks(&self) -> u64;
     fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()>;
+
+    /// Read a regular-file data block. Kernel-backed images may override this
+    /// to populate a bounded read-ahead window without applying that policy to
+    /// metadata and journal reads.
+    fn read_data_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        self.read_block(block, out)
+    }
+
     fn write_block(&mut self, block: u64, data: &Page4K) -> Result<()>;
     fn barrier(&mut self) -> Result<()>;
 
@@ -420,6 +428,14 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.image.read_block(block, out)
     }
 
+    fn read_data_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        if let Some(pending) = self.pending_metadata.get(&block) {
+            out.copy_from_slice(pending);
+            return Ok(());
+        }
+        self.image.read_data_block(block, out)
+    }
+
     /// Publish metadata after-images that have been accepted by the mounted
     /// mutation runtime but not yet checkpointed to their home blocks.
     pub fn stage_mutation_after_images(&mut self, mutation: &Ext4MutationPlan) {
@@ -516,7 +532,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
             BlockMapping::Data(block) => {
-                self.read_block(block, out)?;
+                self.read_data_block(block, out)?;
                 let valid_len = core::cmp::min(BLOCK_SIZE as u64, disk_inode.size - page_start);
                 out[valid_len as usize..].fill(0);
                 Ok(PageRead::Data { block })

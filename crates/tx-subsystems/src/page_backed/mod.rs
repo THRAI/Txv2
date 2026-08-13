@@ -1244,6 +1244,15 @@ fn record_map_pin_for_test() {
 }
 
 impl PageContainer {
+    /// Whether this container has a live L4/L6 file-I/O runtime attached.
+    ///
+    /// Merely having a file-backed PageContainer is not enough to use its
+    /// asynchronous submission queues: legacy/final-smp ext4 mounts perform
+    /// synchronous backing operations and deliberately install no service
+    /// runtime. Callers must fall back to `FsPageBacking` in that case.
+    pub fn has_file_io_service_runtime(&self) -> bool {
+        self.page_submission.has_wake_source()
+    }
     pub fn new(kind: PageContainerKind, page_count: u64) -> Self {
         let capacity = page_count.saturating_mul(crate::vm::USER_PAGE_SIZE as u64);
         let page_submission = PageIoSubmissionHandle::new(1024);
@@ -2106,6 +2115,12 @@ impl PageContainer {
         &self,
         container_keepalive: Option<Cap<PageContainer>>,
     ) -> usize {
+        // Close is fire-and-forget. Without a registered runtime there is no
+        // consumer for the asynchronous queue, so leave pages Dirty for the
+        // synchronous backing path instead of stranding them in Writeback.
+        if !self.has_file_io_service_runtime() {
+            return 0;
+        }
         let Some(frontier) = self.snapshot_file_fsync_frontier() else {
             return 0;
         };

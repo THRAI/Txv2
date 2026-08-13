@@ -131,7 +131,7 @@ pub fn step_recv_kernel_bytes(
 /// the clear prevents that producer's wake from being erased.
 fn clear_recv_data_if_empty(socket: &Cap<SocketIdentity>, payload: &SocketPayload) {
     socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
-    if payload.io_snapshot().recv_len != 0 {
+    if payload.recv_ready() {
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
 }

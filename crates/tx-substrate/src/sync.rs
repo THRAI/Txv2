@@ -11,7 +11,81 @@
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+type SpinProgressFn = fn();
+
+static PLATFORM_SPIN_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the selected platform's lock-free spin progress callback.
+///
+/// Substrate initialization calls this once before secondary CPUs are brought
+/// online. Repeating the installation for the same platform is harmless; a
+/// different callback is rejected because changing the selected platform at
+/// runtime would violate the static HAL model.
+#[doc(hidden)]
+pub fn install_platform_spin_progress<P: tx_hal::PmapIf>() {
+    let callback = P::service_pending_tlb_shootdown as usize;
+    match PLATFORM_SPIN_PROGRESS.compare_exchange(0, callback, Ordering::Release, Ordering::Acquire)
+    {
+        Ok(_) => {}
+        Err(installed) => assert_eq!(
+            installed, callback,
+            "tx-substrate platform spin progress callback changed after installation"
+        ),
+    }
+}
+
+#[inline(always)]
+fn platform_spin_progress() {
+    let callback = PLATFORM_SPIN_PROGRESS.load(Ordering::Acquire);
+    if callback == 0 {
+        return;
+    }
+
+    // SAFETY: `install_platform_spin_progress` stores only a `fn()` pointer,
+    // and the one-time installation keeps that pointer valid for the kernel's
+    // lifetime.
+    let callback: SpinProgressFn = unsafe { core::mem::transmute(callback) };
+    callback();
+}
+
+/// Local state for a contended spin wait.
+///
+/// Keep one value per acquisition loop. [`Self::tick`] provides the selected
+/// platform's lock-free progress point, while [`Self::tick_with`] lets an
+/// existing architecture-specific wait use the same bounded cadence.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpinWait {
+    wait: tx_hal::TlbProgressSpinWait,
+}
+
+impl SpinWait {
+    pub const fn new() -> Self {
+        Self {
+            wait: tx_hal::TlbProgressSpinWait::new(),
+        }
+    }
+
+    /// Record one failed wait and periodically run platform progress.
+    #[inline(always)]
+    pub fn tick(&mut self) {
+        self.tick_with(platform_spin_progress);
+    }
+
+    /// Record one failed wait and periodically run `progress`.
+    ///
+    /// The callback runs on the first failed wait and then at most once per 64
+    /// failures. It must not allocate, block, or acquire the lock being waited
+    /// on. The processor hint still runs on every failed attempt.
+    #[inline(always)]
+    pub fn tick_with<F>(&mut self, mut progress: F)
+    where
+        F: FnMut(),
+    {
+        self.wait.spin_with(&mut progress);
+    }
+}
 
 pub struct SpinMutex<T, M = LockMetricsOff> {
     locked: AtomicBool,
@@ -110,30 +184,44 @@ impl<T, M: LockMetricsMode> SpinMutex<T, M> {
 
     #[inline]
     pub fn lock(&self) -> SpinMutexGuard<'_, T, M> {
-        self.lock_with_progress(|| {})
-    }
-
-    /// Acquire the lock while periodically running a non-blocking progress
-    /// hook.
-    ///
-    /// This is intentionally opt-in. Architecture code can use it at locks
-    /// which participate in a synchronous cross-CPU protocol (for example a
-    /// maskable software-IPI TLB shootdown) without imposing HAL work on every
-    /// ordinary kernel spin lock.
-    #[inline]
-    pub fn lock_with_progress<F>(&self, mut progress: F) -> SpinMutexGuard<'_, T, M>
-    where
-        F: FnMut(),
-    {
         let mut timing = M::Timing::start(&self.metrics);
+        let mut wait = SpinWait::new();
         while self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             timing.spin();
-            progress();
-            core::hint::spin_loop();
+            wait.tick();
+        }
+        timing.acquired(self);
+        SpinMutexGuard {
+            mutex: self,
+            timing,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Acquire the lock while periodically running a non-blocking progress
+    /// hook.
+    ///
+    /// Architecture code can use this at waits which already own their
+    /// progress operation. Ordinary [`Self::lock`] acquisitions use the
+    /// platform callback installed during substrate initialization.
+    #[inline]
+    pub fn lock_with_progress<F>(&self, mut progress: F) -> SpinMutexGuard<'_, T, M>
+    where
+        F: FnMut(),
+    {
+        let mut timing = M::Timing::start(&self.metrics);
+        let mut wait = SpinWait::new();
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            timing.spin();
+            wait.tick_with(&mut progress);
         }
         timing.acquired(self);
         SpinMutexGuard {

@@ -1035,6 +1035,123 @@ fn dispatch_udp_reuseaddr_rebind_keeps_new_owner_after_old_close() {
 }
 
 #[test]
+fn dispatch_udp_reuseaddr_rebind_restores_old_owner_after_new_close() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let old_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let new_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let bind_addr = sockaddr_in([0, 0, 0, 0], 49_111);
+    let connect_addr = sockaddr_in([127, 0, 0, 1], 49_111);
+    let one: i32 = 1;
+
+    for fd in [old_fd, new_fd] {
+        assert_eq!(
+            socket_req(
+                NR_SETSOCKOPT,
+                [
+                    fd as u64,
+                    SOL_SOCKET as u64,
+                    SO_REUSEADDR as u64,
+                    (&one as *const i32) as u64,
+                    core::mem::size_of::<i32>() as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+    }
+
+    for fd in [old_fd, new_fd] {
+        assert_eq!(
+            socket_req(
+                NR_BIND,
+                [
+                    fd as u64,
+                    bind_addr.as_ptr() as u64,
+                    SOCKADDR_IN_BYTES as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+    }
+
+    assert_eq!(
+        socket_req(NR_CLOSE, [new_fd as u64, 0, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                connect_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let payload = *b"restored-owner";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    let moved = {
+        let guard = tx_substrate::epoch::guard();
+        match step_process_loopback_pending(
+            smoltcp::time::Instant::ZERO,
+            loopback_iface(),
+            LoopbackPollBudget::default(),
+            &guard,
+        ) {
+            tx_substrate::step::StepOutcome::Done(outcome) => outcome,
+            other => panic!("unexpected loopback outcome: {other:?}"),
+        }
+    };
+    assert_udp_delivery_progress(moved.udp_bytes_moved, payload.len());
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                old_fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&out[..payload.len()], &payload);
+}
+
+#[test]
 fn dispatch_udp_reuseaddr_listener_does_not_steal_connected_flow() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

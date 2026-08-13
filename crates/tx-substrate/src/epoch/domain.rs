@@ -8,14 +8,14 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
-use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
 use super::guard::Guard;
 use super::local::{
     CpuLocalEpochState, CpuMembership, LOCAL_RETIRE_RESERVATION_CAPACITY as LOCAL_RETIRE_CAPACITY,
 };
 use super::RcuHead;
-use tx_hal::{CpuId, CpuPinGuard, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
+use tx_hal::{CpuId, CpuPinGuard, CpuPinReason, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
 
 const INITIAL_EPOCH: u64 = 1;
 pub(crate) const MAX_EPOCH_CPUS: usize = 64;
@@ -124,8 +124,9 @@ pub(crate) struct EpochDomain {
     initialized: AtomicBool,
     /// Monotonic epoch used to decide when retired nodes become reclaimable.
     global_epoch: CachePadded<AtomicU64>,
-    /// Number of CPUs the platform says may participate in EBR.
-    possible_cpus: CachePadded<AtomicUsize>,
+    /// Raw CPU-ID mask for CPUs that may participate in EBR. Hardware CPU IDs
+    /// may be sparse, so population count cannot be used as an array bound.
+    possible_cpu_mask: CachePadded<AtomicU64>,
     /// Changes whenever a CPU enters or leaves the participating set.
     membership_version: CachePadded<AtomicU64>,
     /// Platform callbacks are installed once at BSP init and then read lock-free.
@@ -347,7 +348,7 @@ impl LocalRetireGuard {
 
         let hooks = self.domain.hooks();
         assert_eq!(
-            (hooks.pin_current_cpu)().cpu_id(),
+            (hooks.pin_current_cpu)(CpuPinReason::EpochRetire).cpu_id(),
             self.cpu_id,
             "epoch reclaim callback crossed a CPU migration point"
         );
@@ -408,7 +409,7 @@ impl Drop for LocalRetireReservation {
         if !self.armed {
             return;
         }
-        let cpu_pin = (GLOBAL_DOMAIN.hooks().pin_current_cpu)();
+        let cpu_pin = (GLOBAL_DOMAIN.hooks().pin_current_cpu)(CpuPinReason::EpochRetire);
         assert_eq!(
             cpu_pin.cpu_id(),
             self.cpu_id,
@@ -427,7 +428,7 @@ impl EpochDomain {
         Self {
             initialized: AtomicBool::new(false),
             global_epoch: CachePadded::new(AtomicU64::new(INITIAL_EPOCH)),
-            possible_cpus: CachePadded::new(AtomicUsize::new(1)),
+            possible_cpu_mask: CachePadded::new(AtomicU64::new(1)),
             membership_version: CachePadded::new(AtomicU64::new(0)),
             hooks: UnsafeCell::new(PlatformHooks::default()),
             cpu_states: [const { CpuLocalEpochState::new() }; MAX_EPOCH_CPUS],
@@ -446,9 +447,14 @@ impl EpochDomain {
     where
         P: PercpuIf + SmpIf + IrqIf,
     {
-        let possible_cpus = P::possible_cpu_count();
-        if possible_cpus == 0 || possible_cpus > MAX_EPOCH_CPUS {
+        let possible_cpu_mask = P::possible_cpus();
+        let possible_cpu_count = possible_cpu_mask.count();
+        if possible_cpu_count == 0 || possible_cpu_count > MAX_EPOCH_CPUS {
             return Err(EpochError::TooManyCpus);
+        }
+        let current_cpu = <P as PercpuIf>::current_cpu_id();
+        if current_cpu.0 >= MAX_EPOCH_CPUS || !possible_cpu_mask.contains(current_cpu) {
+            return Err(EpochError::InvalidCpu);
         }
 
         let _guard = self.lock.lock();
@@ -457,7 +463,9 @@ impl EpochDomain {
         }
         admission_hook();
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
-        self.possible_cpus.0.store(possible_cpus, Ordering::Release);
+        self.possible_cpu_mask
+            .0
+            .store(possible_cpu_mask.bits(), Ordering::Release);
         self.membership_version.0.store(0, Ordering::Release);
         unsafe {
             *self.hooks.get() = PlatformHooks::for_platform::<P>();
@@ -467,7 +475,10 @@ impl EpochDomain {
             self.cpu_states[cpu].reset();
         }
 
-        self.admit_cpu_locked(<P as PercpuIf>::current_cpu_id())?;
+        self.admit_cpu_locked(current_cpu)?;
+        // Publish only after the mask, hooks, queue, and BSP-local state are
+        // fully installed. AP initialization and guard acquisition use
+        // Acquire loads of this flag.
         self.initialized.store(true, Ordering::Release);
         Ok(())
     }
@@ -476,7 +487,7 @@ impl EpochDomain {
         let _guard = self.lock.lock();
         self.initialized.store(false, Ordering::Release);
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
-        self.possible_cpus.0.store(1, Ordering::Release);
+        self.possible_cpu_mask.0.store(1, Ordering::Release);
         self.membership_version.0.store(0, Ordering::Release);
         unsafe {
             *self.hooks.get() = PlatformHooks::default();
@@ -499,7 +510,7 @@ impl EpochDomain {
     }
 
     fn admit_cpu_locked(&'static self, cpu: CpuId) -> Result<(), EpochError> {
-        if cpu.0 >= self.possible_cpus.0.load(Ordering::Acquire) {
+        if !self.is_possible_cpu(cpu) {
             return Err(EpochError::InvalidCpu);
         }
         let local = &self.cpu_states[cpu.0];
@@ -522,7 +533,7 @@ impl EpochDomain {
         if (hooks.in_irq_context)() {
             return Err(EpochError::CpuNotOnline);
         }
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochRetire);
         let cpu_id = cpu_pin.cpu_id();
         let local_execution = (hooks.exclude_local_execution)();
         let Some(local) = self.cpu_state(cpu_id) else {
@@ -556,7 +567,7 @@ impl EpochDomain {
         if (hooks.in_irq_context)() {
             return Err(EpochError::CpuNotOnline);
         }
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochRetire);
         let cpu_id = cpu_pin.cpu_id();
         let local = self.cpu_state(cpu_id).ok_or(EpochError::InvalidCpu)?;
         if !local.try_pin_online() {
@@ -589,7 +600,7 @@ impl EpochDomain {
             "epoch guards must not be created in IRQ context"
         );
 
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochGuard);
         let cpu_id = cpu_pin.cpu_id();
         let local = self
             .cpu_state(cpu_id)
@@ -600,19 +611,11 @@ impl EpochDomain {
         );
 
         let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
-        let active_epoch = local.current();
-        if active_epoch != 0 {
-            local.unpin();
-            panic!(
-                "epoch::guard nested on CPU {} with active epoch {}; use borrow_current_guard()",
-                cpu_id.0, active_epoch
-            );
-        }
-        local.enter(current_epoch);
+        let entered_epoch = local.enter(current_epoch);
         // Publish the local epoch before any protected load can float above the
         // guard acquisition. This is the core EBR reader-side ordering rule.
         fence(Ordering::SeqCst);
-        Guard::new(local, cpu_id, current_epoch, cpu_pin)
+        Guard::new(local, cpu_id, entered_epoch, cpu_pin)
     }
 
     /// Return a borrow-mode guard for the current CPU if one is already active
@@ -624,7 +627,7 @@ impl EpochDomain {
             return None;
         }
         let hooks = self.hooks();
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochBorrow);
         let cpu_id = cpu_pin.cpu_id();
         let local = self.cpu_state(cpu_id)?;
         if local.membership() != CpuMembership::Online {
@@ -659,6 +662,20 @@ impl EpochDomain {
         }
         if !self.initialized.load(Ordering::Acquire) {
             return DrainStats::default();
+        }
+
+        let hooks = self.hooks();
+        if (hooks.in_irq_context)() || (hooks.in_trap_context)() {
+            // Deferred publication drops and EBR reclaim callbacks both run
+            // arbitrary destructors. Leave them for a normal-stack drain and
+            // report the pending count so a consumed maintenance request is
+            // re-armed by `service_local_drain_request`.
+            return DrainStats {
+                bag_remaining: self.total_retired_count(),
+                publication_remaining: self.total_publication_pending(),
+                ..DrainStats::default()
+            }
+            .with_compat_totals();
         }
 
         let publication = crate::publication::drain_deferred_drops(budget);
@@ -716,7 +733,7 @@ impl EpochDomain {
         let mut membership_change = Some(membership_change);
         let mut scan_attempts = 0usize;
         let hooks = self.hooks();
-        let current_cpu = (hooks.pin_current_cpu)().cpu_id();
+        let current_cpu = (hooks.pin_current_cpu)(CpuPinReason::EpochDrain).cpu_id();
         loop {
             scan_attempts += 1;
             let version = self.membership_version.0.load(Ordering::Acquire);
@@ -724,7 +741,11 @@ impl EpochDomain {
             let next = current.saturating_add(1);
             let mut blocked = false;
 
-            for cpu in 0..self.possible_cpus.0.load(Ordering::Acquire) {
+            let possible_cpu_mask = self.possible_cpu_mask();
+            for cpu in 0..MAX_EPOCH_CPUS {
+                if !possible_cpu_mask.contains(CpuId(cpu)) {
+                    continue;
+                }
                 let state = &self.cpu_states[cpu];
                 if !matches!(
                     state.membership(),
@@ -776,7 +797,7 @@ impl EpochDomain {
             return None;
         }
         let hooks = self.hooks();
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochDrain);
         let local = self.cpu_state(cpu_pin.cpu_id())?;
         if local.membership() != CpuMembership::Online || !local.take_drain_request() {
             return None;
@@ -798,7 +819,7 @@ impl EpochDomain {
             return Err(EpochError::NotInitialized);
         }
         let hooks = self.hooks();
-        let coordinator_pin = (hooks.pin_current_cpu)();
+        let coordinator_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochDrain);
         let coordinator_cpu = coordinator_pin.cpu_id();
         if coordinator_cpu == target {
             return Err(EpochError::InvalidCpu);
@@ -961,11 +982,19 @@ impl EpochDomain {
     }
 
     fn cpu_state(&'static self, cpu: CpuId) -> Option<&'static CpuLocalEpochState> {
-        if cpu.0 < self.possible_cpus.0.load(Ordering::Acquire) {
+        if self.is_possible_cpu(cpu) {
             Some(&self.cpu_states[cpu.0])
         } else {
             None
         }
+    }
+
+    fn possible_cpu_mask(&self) -> tx_hal::CpuMask {
+        tx_hal::CpuMask::from_bits(self.possible_cpu_mask.0.load(Ordering::Acquire))
+    }
+
+    fn is_possible_cpu(&self, cpu: CpuId) -> bool {
+        cpu.0 < MAX_EPOCH_CPUS && self.possible_cpu_mask().contains(cpu)
     }
 
     fn hooks(&'static self) -> PlatformHooks {
@@ -973,11 +1002,11 @@ impl EpochDomain {
     }
 
     unsafe fn reset_for_test(&'static self) {
+        let _guard = self.lock.lock();
         self.initialized.store(false, Ordering::Release);
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
-        self.possible_cpus.0.store(1, Ordering::Release);
+        self.possible_cpu_mask.0.store(1, Ordering::Release);
         self.membership_version.0.store(0, Ordering::Release);
-        let _guard = self.lock.lock();
         *self.hooks.get() = PlatformHooks::default();
         for cpu in 0..MAX_EPOCH_CPUS {
             self.cpu_states[cpu].reset();
@@ -989,7 +1018,7 @@ impl EpochDomain {
             initialized: self.initialized.load(Ordering::Acquire),
             global_epoch: self.global_epoch.0.load(Ordering::Acquire),
             active_guards: self.active_guard_count(),
-            possible_cpus: self.possible_cpus.0.load(Ordering::Acquire),
+            possible_cpus: self.possible_cpu_mask().count(),
         }
     }
 
@@ -1009,14 +1038,32 @@ impl EpochDomain {
             return false;
         }
         let hooks = self.hooks();
-        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochDrain);
         self.cpu_state(cpu_pin.cpu_id())
             .is_some_and(CpuLocalEpochState::retire_active)
     }
 
     fn active_guard_count(&'static self) -> usize {
-        (0..self.possible_cpus.0.load(Ordering::Acquire))
+        let possible_cpu_mask = self.possible_cpu_mask();
+        (0..MAX_EPOCH_CPUS)
+            .filter(|cpu| possible_cpu_mask.contains(CpuId(*cpu)))
             .map(|cpu| self.cpu_states[cpu].active_guard_count())
+            .sum()
+    }
+
+    fn total_retired_count(&self) -> usize {
+        let possible_cpu_mask = self.possible_cpu_mask();
+        (0..MAX_EPOCH_CPUS)
+            .filter(|cpu| possible_cpu_mask.contains(CpuId(*cpu)))
+            .map(|cpu| self.cpu_states[cpu].bag_retired_count())
+            .sum()
+    }
+
+    fn total_publication_pending(&self) -> usize {
+        let possible_cpu_mask = self.possible_cpu_mask();
+        (0..MAX_EPOCH_CPUS)
+            .filter(|cpu| possible_cpu_mask.contains(CpuId(*cpu)))
+            .map(|cpu| crate::publication::deferred_drop_count(CpuId(cpu)))
             .sum()
     }
 
@@ -1066,9 +1113,10 @@ mod tests {
 
 #[derive(Clone, Copy)]
 struct PlatformHooks {
-    pin_current_cpu: fn() -> CpuPinGuard,
+    pin_current_cpu: fn(CpuPinReason) -> CpuPinGuard,
     exclude_local_execution: fn() -> LocalExecutionGuard,
     in_irq_context: fn() -> bool,
+    in_trap_context: fn() -> bool,
     request_maintenance: fn(CpuId),
 }
 
@@ -1078,6 +1126,7 @@ impl PlatformHooks {
             pin_current_cpu: default_pin_current_cpu,
             exclude_local_execution: default_exclude_local_execution,
             in_irq_context: default_in_irq_context,
+            in_trap_context: default_in_trap_context,
             request_maintenance: default_request_maintenance,
         }
     }
@@ -1087,16 +1136,17 @@ impl PlatformHooks {
         P: PercpuIf + SmpIf + IrqIf,
     {
         Self {
-            pin_current_cpu: P::pin_current_cpu,
+            pin_current_cpu: P::pin_current_cpu_for,
             exclude_local_execution: P::exclude_local_execution,
             in_irq_context: P::in_irq_context,
+            in_trap_context: P::in_trap_context,
             request_maintenance: |cpu| P::send_ipi(cpu, tx_hal::IpiKind::Maintenance),
         }
     }
 }
 
-fn default_pin_current_cpu() -> CpuPinGuard {
-    CpuPinGuard::new(CpuId(0))
+fn default_pin_current_cpu(reason: CpuPinReason) -> CpuPinGuard {
+    CpuPinGuard::new(CpuId(0)).with_reason(reason)
 }
 
 fn default_exclude_local_execution() -> LocalExecutionGuard {
@@ -1106,6 +1156,10 @@ fn default_exclude_local_execution() -> LocalExecutionGuard {
 unsafe fn default_restore_local_execution(_saved_state: usize) {}
 
 fn default_in_irq_context() -> bool {
+    false
+}
+
+fn default_in_trap_context() -> bool {
     false
 }
 

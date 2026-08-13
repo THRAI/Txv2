@@ -197,7 +197,12 @@ fn ether_iface_arp_miss_sends_request_and_keeps_udp_datagram() {
             .expect("client payload")
             .io_snapshot()
             .send_space,
-        SocketOptionSet::default_udp().socket.send_buf_size
+        client
+            .acquire_operational()
+            .expect("client payload")
+            .raw_udp_socket()
+            .expect("UDP socket")
+            .send_capacity()
     );
     assert_eq!(iface.pending_arp_len(), 0);
 }
@@ -252,7 +257,12 @@ fn ether_iface_arp_reply_learns_cache_and_udp_retry_uses_peer_mac() {
             .expect("client payload")
             .io_snapshot()
             .send_space,
-        SocketOptionSet::default_udp().socket.send_buf_size
+        client
+            .acquire_operational()
+            .expect("client payload")
+            .raw_udp_socket()
+            .expect("UDP socket")
+            .send_capacity()
     );
 
     let tx = device.ops.tx_frames();

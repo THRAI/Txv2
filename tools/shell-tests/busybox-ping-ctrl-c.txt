@@ -1,0 +1,22 @@
+# busybox-ping-ctrl-c.txt — foreground job-control SIGINT regression.
+#
+# Run with:
+#   cargo xtask shell-test --target rv64-qemu \
+#     --script tools/shell-tests/busybox-ping-ctrl-c.txt
+#
+# Loopback keeps this witness independent of DHCP and QEMU user networking.
+# BusyBox ash starts ping in a foreground process group, TIOCSPGRP must publish
+# that canonical group, and the TTY VINTR byte (Ctrl-C, 0x03) must terminate it.
+
+wait "/ # " within 30000
+
+sleep 500
+send "/bin/busybox ping 127.0.0.1\n"
+expect "64 bytes from 127.0.0.1" within 8000
+
+sleep 500
+send "\x03"
+expect "/ # " within 8000
+
+sleep 500
+quit

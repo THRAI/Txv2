@@ -4,7 +4,7 @@ use super::*;
 fn dispatch_zero_length_udp_sendmsg_recvmsg_consumes_one_datagram() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();
-    let (_process, ctx) = socket_ctx();
+    let (process, ctx) = socket_ctx();
     let server_fd = socket_dgram(&ctx, SOCK_DGRAM);
     let client_fd = socket_dgram(&ctx, SOCK_DGRAM);
     let server_addr = sockaddr_in([127, 0, 0, 1], 49_102);
@@ -66,6 +66,41 @@ fn dispatch_zero_length_udp_sendmsg_recvmsg_consumes_one_datagram() {
         ),
         SyscallResult::Return(0)
     );
+
+    // A zero-byte UDP record is still level-readable. Exercise the syscall
+    // facade after deliberately clearing the edge hint so ppoll must consult
+    // the authoritative datagram queue rather than recv byte count.
+    let server_file = process.fd(server_fd as u32).expect("resolve UDP file");
+    let server_socket = crate::linux_syscall::socket::socket_identity_from_file(&server_file)
+        .expect("resolve UDP socket");
+    server_socket
+        .readiness
+        .clear_recv(tx_subsystems::net::RecvWireSet::HAS_DATA);
+    let mut pollfd = TestPollfd {
+        fd: server_fd as i32,
+        events: TEST_POLLIN,
+        revents: -1,
+    };
+    let zero_timeout = TestTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_PPOLL,
+            [
+                (&mut pollfd as *mut TestPollfd) as u64,
+                1,
+                (&zero_timeout as *const TestTimespec) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(1)
+    );
+    assert_ne!(pollfd.revents & TEST_POLLIN, 0);
 
     let mut source_addr = [0u8; SOCKADDR_IN_BYTES as usize];
     let mut recv_hdr = TestMsghdr {

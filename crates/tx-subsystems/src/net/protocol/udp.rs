@@ -194,6 +194,14 @@ impl RawUdpSocket {
         self.inner.lock().socket.payload_recv_bytes()
     }
 
+    /// Whether at least one complete datagram is queued for receive.
+    ///
+    /// UDP readiness is record-based: an empty datagram is readable even
+    /// though its payload contributes zero bytes to `recv_available`.
+    pub fn recv_ready(&self) -> bool {
+        self.inner.lock().socket.can_recv()
+    }
+
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
         let inner = &mut *self.inner.lock();
         let socket = &mut inner.socket;

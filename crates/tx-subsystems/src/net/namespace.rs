@@ -17,8 +17,9 @@ use crate::net::device::{
     EthernetAddress, NetDeviceKind, NetDeviceRegistration,
 };
 use crate::net::execution::{
-    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
-    step_process_network_events_in_namespace_at, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
+    step_flush_pending_arp, step_packet_ingress_fanout,
+    step_process_device_tx_pending_in_namespace_at, step_process_network_events_in_namespace_at,
+    ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
 };
 use crate::net::netfilter::{
     apply_postrouting_nat_ipv4_in_namespace, apply_prerouting_nat_ipv4_in_namespace,
@@ -2047,6 +2048,17 @@ impl NetNamespacePayload {
         ifaces
     }
 
+    fn up_ether_links(&self) -> Vec<(NetNamespaceLinkInfo, &'static NetDeviceRegistration)> {
+        self.link_snapshot()
+            .into_iter()
+            .filter(|link| !link.is_loopback && link.is_up)
+            .filter_map(|link| {
+                self.find_device_by_ifindex(link.ifindex)
+                    .map(|registration| (link, registration))
+            })
+            .collect()
+    }
+
     fn ensure_ether_iface_for_link(
         &self,
         registration: &'static NetDeviceRegistration,
@@ -2158,16 +2170,22 @@ fn bridge_master_for(
 
 struct NamespaceEtherPacketSource<'a> {
     namespace: &'a NetNamespacePayload,
-    iface: &'a EtherIface,
+    registration: &'static NetDeviceRegistration,
+    iface: Option<&'a EtherIface>,
     forwarded: Cell<usize>,
     pending_resolution: Cell<usize>,
     dropped: Cell<usize>,
 }
 
 impl<'a> NamespaceEtherPacketSource<'a> {
-    fn new(namespace: &'a NetNamespacePayload, iface: &'a EtherIface) -> Self {
+    fn new(
+        namespace: &'a NetNamespacePayload,
+        registration: &'static NetDeviceRegistration,
+        iface: Option<&'a EtherIface>,
+    ) -> Self {
         Self {
             namespace,
+            registration,
             iface,
             forwarded: Cell::new(0),
             pending_resolution: Cell::new(0),
@@ -2198,23 +2216,28 @@ impl<'a> NamespaceEtherPacketSource<'a> {
 
 impl PacketSource for NamespaceEtherPacketSource<'_> {
     fn next_packet(&self) -> Option<PacketDispatch> {
-        let frame = self.iface.netdev.ops.receive()?;
-        Some(
-            self.iface
-                .process_frame_at(frame, Instant::ZERO, Option::<&Guard<'_>>::None),
-        )
+        let frame = self.registration.ops.receive()?;
+        let guard = tx_substrate::epoch::guard();
+        step_packet_ingress_fanout(self.namespace, self.registration, &frame, &guard);
+        Some(self.iface.map_or(PacketDispatch::Unsupported, |iface| {
+            iface.process_frame_at(frame, Instant::ZERO, Option::<&Guard<'_>>::None)
+        }))
     }
 
     fn next_packet_at(&self, now: Instant, guard: &Guard<'_>) -> Option<PacketDispatch> {
-        let frame = self.iface.netdev.ops.receive()?;
-        if let Some(outcome) = self
-            .namespace
-            .try_forward_ingress_frame(self.iface, &frame, now, guard)
-        {
-            self.record_forwarding(outcome);
-            return Some(PacketDispatch::Unsupported);
+        let frame = self.registration.ops.receive()?;
+        step_packet_ingress_fanout(self.namespace, self.registration, &frame, guard);
+        if let Some(iface) = self.iface {
+            if let Some(outcome) = self
+                .namespace
+                .try_forward_ingress_frame(iface, &frame, now, guard)
+            {
+                self.record_forwarding(outcome);
+                return Some(PacketDispatch::Unsupported);
+            }
+            return Some(iface.process_frame_at(frame, now, Some(guard)));
         }
-        Some(self.iface.process_frame_at(frame, now, Some(guard)))
+        Some(PacketDispatch::Unsupported)
     }
 }
 
@@ -2242,10 +2265,16 @@ pub fn drive_net_namespace_runtime_at(
 
     outcome.merge_bridge(net_namespace.poll_bridges(guard));
 
-    for iface in net_namespace.configured_ether_ifaces() {
+    for (link, registration) in net_namespace.up_ether_links() {
         outcome.ifaces_seen += 1;
 
-        let source = NamespaceEtherPacketSource::new(&net_namespace, iface);
+        let iface = if link.ipv4_addr.is_some() {
+            net_namespace.ensure_ether_iface_for_link(registration, link)
+        } else {
+            None
+        };
+
+        let source = NamespaceEtherPacketSource::new(&net_namespace, registration, iface);
         if let StepOutcome::Done(events) =
             step_process_network_events_in_namespace_at(&source, net_namespace.clone(), now, guard)
         {
@@ -2255,6 +2284,9 @@ pub fn drive_net_namespace_runtime_at(
         }
         outcome.merge_forwarding(source.forwarding_outcome());
 
+        let Some(iface) = iface else {
+            continue;
+        };
         let sink = EtherPacketTxSink { iface };
         if let StepOutcome::Done(device_tx) = step_process_device_tx_pending_in_namespace_at(
             &sink,
