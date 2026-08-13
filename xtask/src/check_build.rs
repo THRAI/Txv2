@@ -59,12 +59,21 @@ pub(crate) fn check(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn build(root: &Path, target_value: &str) -> Result<()> {
-    build_with_features_with_profile(root, target_value, &[], false)
-}
-
-pub(crate) fn build_release(root: &Path, target_value: &str) -> Result<()> {
-    build_with_features_with_profile(root, target_value, &[], true)
+pub(crate) fn build_with_mode(
+    root: &Path,
+    target_value: &str,
+    release: bool,
+    kernel_only: bool,
+) -> Result<()> {
+    if kernel_only {
+        validate_kernel_only_target(target_value)?;
+    }
+    build_with_features_with_profile(
+        root,
+        target_value,
+        build_mode_features(kernel_only),
+        release,
+    )
 }
 
 /// Build the kernel binary for `target_value`, forwarding cargo
@@ -113,4 +122,41 @@ fn build_with_features_with_profile(
         run_cmd(root, "cargo", &cmd)?;
     }
     Ok(())
+}
+
+fn validate_kernel_only_target(target_value: &str) -> Result<()> {
+    if target_value == TxTarget::La64Ls2k1000.name() {
+        Ok(())
+    } else {
+        Err(format!(
+            "--kernel-only is supported only for --target {}",
+            TxTarget::La64Ls2k1000.name()
+        ))
+    }
+}
+
+fn build_mode_features(kernel_only: bool) -> &'static [&'static str] {
+    if kernel_only {
+        &["kernel-only"]
+    } else {
+        &[]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_only_is_scoped_to_the_ls2k1000_target() {
+        assert!(validate_kernel_only_target("la64-2k1000").is_ok());
+        assert!(validate_kernel_only_target("rv64-qemu").is_err());
+        assert!(validate_kernel_only_target("all").is_err());
+    }
+
+    #[test]
+    fn kernel_only_selects_the_board_package_feature() {
+        assert_eq!(build_mode_features(true), &["kernel-only"]);
+        assert!(build_mode_features(false).is_empty());
+    }
 }

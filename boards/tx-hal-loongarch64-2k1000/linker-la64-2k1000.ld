@@ -6,6 +6,9 @@ KERNEL_LINK_BASE = 0x9000000098000000;
 KERNEL_BOOT_PHYS_SIZE = 0x1000;
 KERNEL_LINK_OFFSET = KERNEL_LINK_BASE - KERNEL_LOAD_BASE;
 INITRD_TRANSPORT_BASE = 0x98800000;
+RAM1_END = 0xc0000000;
+__kernel_only_mode = DEFINED(TX_KERNEL_ONLY) ? 1 : 0;
+__kernel_payload_limit = __kernel_only_mode ? RAM1_END : INITRD_TRANSPORT_BASE;
 
 SECTIONS
 {
@@ -70,9 +73,12 @@ SECTIONS
 
     . = ALIGN(4K);
     __kernel_end = .;
+    __kernel_end_phys = __kernel_end - KERNEL_LINK_OFFSET;
 
-    ASSERT((__kernel_end - KERNEL_LINK_OFFSET) <= INITRD_TRANSPORT_BASE,
+    ASSERT(__kernel_only_mode || __kernel_end_phys <= INITRD_TRANSPORT_BASE,
            "2K1000 kernel overlaps validated initrd transport address")
+    ASSERT(!__kernel_only_mode || __kernel_end_phys <= RAM1_END,
+           "2K1000 kernel-only image exceeds RAM1")
 
     /DISCARD/ : {
         *(.eh_frame .eh_frame.*)
