@@ -588,7 +588,11 @@ impl RawTcpSocket {
             if before.can_send != after.can_send && after.can_send {
                 publish.send_writable = true;
             }
-            if matches!(segment.tcp.control, TcpControl::Fin) && !protocol_state.is_recv_shut {
+            // Publish EOF only after smoltcp has accepted an in-order FIN.
+            // A raw FIN flag is insufficient: smoltcp intentionally ignores
+            // a FIN that arrives beyond a receive-sequence hole.
+            if !before.recv_fin_received && after.recv_fin_received && !protocol_state.is_recv_shut
+            {
                 protocol_state.is_recv_shut = true;
                 publish.recv_readable = true;
                 publish.recv_closed = true;
@@ -854,6 +858,7 @@ struct SocketProtocolObservation {
     can_send: bool,
     may_send: bool,
     is_active: bool,
+    recv_fin_received: bool,
 }
 
 fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
@@ -861,6 +866,7 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
         state: socket.state(),
         can_send: socket.can_send(),
         may_send: socket.may_send(),
+        recv_fin_received: socket.recv_fin_received(),
         is_active: matches!(
             socket.state(),
             tcp::State::Established

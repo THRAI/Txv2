@@ -1,5 +1,5 @@
 - 2026-08-13 (**`main@4f14845d` 与 portable-net/VF2 分支 `c62e8824` 的语义合并、
-  QEMU 网络压力与 Git 验收已闭合；实板等待串口重新接入**).
+  QEMU 网络压力/Git 与 post-merge VF2 实板验收已闭合**).
   **Changed**：全部 merge marker 已清零。合并以 main 的新 FS/PageBacked、进程退出/
   wait4、VM、EBR local-retire/publication 与 CPU membership 为底，同时保留分支的
   sparse `CpuMask`/`CpuPinReason`、LA QEMU TLB、Loongson 2K1000、VF2 DWMAC/MMC、
@@ -21,16 +21,27 @@
   均为 10/10，IRQ claim/completion 分别为 91/91 与 101/101。LA QEMU 独立 musl
   netperf 为 5/5（含 TCP_CRR）；现有 VF2 与 2K1000 实板账本分别保留 40/40 HTTP、
   600/600 ping、完整 clone，以及 7818-object/17.47 MiB clone、1077/1077 ping 的
-  当前分支历史证据，但本次 merge artifact 尚未在实板重跑。
-  **Remaining / Next**：当前没有 `/dev/ttyACM*`/`ttyUSB*`，所以 post-merge 的 VF2
-  与 2K1000 压力/clone 仍等待串口接入；LA direct-OSComp 的旧 BusyBox udhcpc 虽
+  当前分支历史证据。post-merge VF2 首次启动暴露普通 selected-init 路径把 ext4
+  PageBacked 的合法 `Deferred(OnWaitSource)` 当成终态错误；现在 sdcard、selected-init
+  与 `/bin/sh` fallback 共用 pre-PoNR file-I/O reactor restart driver。首次 Git clone
+  又复现既有 TCP 乱序 FIN 合并回退：原代码按原始 FIN 位提前发布 EOF，而 smoltcp
+  尚未接受越过接收洞的 FIN；现恢复 `recv_fin_received()` false→true 权威边沿。
+  修复版 VF2 uImage SHA-256 为 `edb981ce0630fe5124e274971f6417751f135be595dbd1e10acfe50632a409e6`，
+  四 hart、IPI/shootdown/RCU、DWMAC、MMC/ext4、`bootstrap-exec:ok` 均通过；最终镜像
+  完成 10x4 HTTP 40/40、同窗 ping 300/300，以及 RAM-only `/dev/shm` GitHub shallow
+  clone（84/84 objects，HEAD `f5dea58c...`）、`git fsck --full` RC=0，同窗 ping
+  600/600，全部 0% 丢包且无 panic/RX-DMA stall。
+  **Remaining / Next**：post-merge Loongson 2K1000 实板仍需串口接回后用 merge artifact
+  重跑；LA direct-OSComp 的旧 BusyBox udhcpc 虽
   收到 lease event，却未把地址发布到接口，glibc `AI_ADDRCONFIG` 组因此仍不能在
   该单一 harness 中启动。LA Makefile 的逗号多组值还会被 `fw_cfg string=` 拆参；
   official netperf 脚本 `kill -9` 后不 `wait`，以及 iperf 零延迟重启存在次级 harness
   race。`cargo -q xtask unit` 仍只有既有 tx-shims dispatch 群和两个 tx-kernel
   libctest 命令断言失败；progress validate/docs lint 的旧 blocker 未在本次扩大修复。
-  下一步是在两块实板接回后部署普通 merge commit artifact，分别重跑长时网络压力、
-  完整 Git clone/fsck 与 IRQ/pin/TLB sentinel；禁止强推或重写历史。完整命令、日志、
+  VF2 上 BusyBox `du` 对已通过 Git status/fsck 的 tmpfs clone 报一个消失的临时项并
+  显示 0，占用统计/目录快照语义需作为独立 FS 后续检查，不影响本轮 Git 数据完整性。
+  下一步是接回 2K1000 后重跑长时网络压力、完整 Git clone/fsck 与 IRQ/pin/TLB
+  sentinel；禁止强推或重写历史。完整命令、日志、
   取舍与剩余失败见
   `msp/debug-logs/2026-08-13-main-merge-conflict-network-validation.md`。
 

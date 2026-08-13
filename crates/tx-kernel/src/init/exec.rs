@@ -68,6 +68,34 @@ fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
 /// `tx.runsh` exec restarts allowed before reporting failure. Each restart
 /// re-runs reversible Phase-1 preparation after driving the boot reactor once.
 const RUNSH_EXEC_POLL_BUDGET: usize = 1 << 16;
+const MAX_BOOTSTRAP_EXEC_RESTARTS: usize = 16 * 1024;
+
+/// Restart reversible bootstrap exec preparation after its async dependency
+/// has been serviced. `Deferred` and `Retry` are both pre-PoNR outcomes; a
+/// successful attempt crosses the exec visibility boundary exactly once.
+fn drive_restartable_bootstrap_exec(
+    mut attempt: impl FnMut() -> Result<(), tx_scripts::process::exec::ExecError>,
+    mut service_once: impl FnMut(bool) -> bool,
+) -> Result<(), tx_scripts::process::exec::ExecError> {
+    use tx_scripts::process::exec::ExecError;
+
+    for _ in 0..MAX_BOOTSTRAP_EXEC_RESTARTS {
+        match attempt() {
+            Err(ExecError::Deferred(shape)) => {
+                if !service_once(true) {
+                    return Err(ExecError::Deferred(shape));
+                }
+            }
+            Err(ExecError::Retry) => {
+                if !service_once(false) {
+                    return Err(ExecError::Retry);
+                }
+            }
+            result => return result,
+        }
+    }
+    Err(ExecError::Retry)
+}
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Drive bootstrap exec while file pages are populated through the async
@@ -82,35 +110,30 @@ impl<P: TxPlatform> CoreInit<P> {
         envp: &[&[u8]],
         cred: &tx_subsystems::vfs::Credential,
     ) -> Result<(), tx_scripts::process::exec::ExecError> {
-        use tx_scripts::process::exec::ExecError;
-
-        const MAX_BOOTSTRAP_EXEC_RESTARTS: usize = 16 * 1024;
-        for _ in 0..MAX_BOOTSTRAP_EXEC_RESTARTS {
-            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                process, thread, path, argv, envp, cred,
-            ));
-            match outcome {
-                Err(ExecError::Deferred(shape)) => {
+        drive_restartable_bootstrap_exec(
+            || {
+                bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                    process, thread, path, argv, envp, cred,
+                ))
+            },
+            |deferred| {
+                if deferred {
                     let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
                     P::service_pending_tlb_shootdown();
                     let _ = step_engine::drain_requested_with_budget(64);
                     crate::zones::try_bounded_maintenance_tick();
                     let _ = Self::drain_device_irq_bottom_halves();
                     if Self::boot_reactor_once(cpu).is_none() {
-                        return Err(ExecError::Deferred(shape));
+                        return false;
                     }
                     let _ = Self::drain_device_irq_bottom_halves();
-                }
-                Err(ExecError::Retry) => {
+                    true
+                } else {
                     let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-                    if Self::boot_reactor_once(cpu).is_none() {
-                        return Err(ExecError::Retry);
-                    }
+                    Self::boot_reactor_once(cpu).is_some()
                 }
-                result => return result,
-            }
-        }
-        Err(ExecError::Retry)
+            },
+        )
     }
 
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -617,14 +640,14 @@ impl<P: TxPlatform> CoreInit<P> {
             } else {
                 (sdcard_bin, &direct_argv)
             };
-            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            let outcome = Self::bootstrap_exec_with_file_io(
                 &init,
                 &thread,
                 sdcard_bin,
                 sdcard_argv,
                 sdcard_envp,
                 &cred,
-            ));
+            );
             match outcome {
                 Ok(()) => {
                     Self::write_board_sentinel_prefix();
@@ -666,21 +689,20 @@ impl<P: TxPlatform> CoreInit<P> {
         // a guard at the call site (per
         // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
         let argv: &[&[u8]] = &[argv0];
-        let mut outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-            &init, &thread, init_path, argv, envp, &cred,
-        ));
+        let mut outcome =
+            Self::bootstrap_exec_with_file_io(&init, &thread, init_path, argv, envp, &cred);
         // If /bin/busybox failed, try /bin/sh (symlink → busybox).
         // Some initramfs layouts only resolve correctly through the
         // symlink path.
         if outcome.is_err() && init_path != b"/bin/sh" && init_path != b"/init" {
-            let sh_outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            let sh_outcome = Self::bootstrap_exec_with_file_io(
                 &init,
                 &thread,
                 b"/bin/sh",
                 &[b"sh"],
                 envp,
                 &cred,
-            ));
+            );
             if sh_outcome.is_ok() {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
@@ -2430,6 +2452,35 @@ const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
 mod tests {
     use super::*;
     use alloc::string::String;
+    use core::cell::Cell;
+
+    #[test]
+    fn bootstrap_exec_restart_driver_services_deferred_io_before_retry() {
+        let attempts = Cell::new(0usize);
+        let services = Cell::new(0usize);
+        let shape = tx_substrate::step::YieldShape::on_wait_source(0x105, 0x1);
+
+        let result = drive_restartable_bootstrap_exec(
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    Err(tx_scripts::process::exec::ExecError::Deferred(shape))
+                } else {
+                    Ok(())
+                }
+            },
+            |deferred| {
+                assert!(deferred, "OnWaitSource must take the deferred service path");
+                services.set(services.get() + 1);
+                true
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.get(), 2, "exec preparation restarts exactly once");
+        assert_eq!(services.get(), 1, "the async dependency is serviced once");
+    }
 
     #[test]
     fn oscomp_sdcard_prelude_without_dhcp_flag_does_not_run_udhcpc() {
