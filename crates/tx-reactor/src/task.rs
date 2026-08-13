@@ -295,7 +295,6 @@ impl TaskTable {
         }
         let future = task.future.take().ok_or(TakeRunnableError::Missing)?;
         task.status = TaskStatus::Polling;
-        task.wake_state.clear();
         task.consume_ast_markers();
         let wake_state = Arc::clone(&task.wake_state);
         let mailbox = Arc::clone(&task.mailbox);
@@ -503,7 +502,14 @@ impl TaskTable {
         match task.status {
             TaskStatus::Parked => task.status = TaskStatus::Runnable,
             TaskStatus::Runnable => {}
-            TaskStatus::Polling | TaskStatus::Completed | TaskStatus::Cancelled => return None,
+            TaskStatus::Polling => {
+                // Mailbox routing can race with the owner's current poll. A
+                // Polling task cannot be placed again yet, but the wake must
+                // survive until `finish_polled_pending` commits the result.
+                task.wake_state.wake();
+                return None;
+            }
+            TaskStatus::Completed | TaskStatus::Cancelled => return None,
         }
         let hint = task.mailbox.take_scheduler_hint();
         Some((task.handle(), hint))
@@ -652,6 +658,8 @@ mod tests {
     use core::future::pending;
 
     use super::*;
+    use tx_substrate::step::{InterestMask, WaitSourceId};
+    use tx_substrate::wake::mailbox::{MailboxEvent, WaitGeneration};
 
     #[test]
     fn wake_during_poll_commits_task_back_to_runnable() {
@@ -671,6 +679,58 @@ mod tests {
             Ok(PendingPollCommit::Woken { .. })
         ));
         assert_eq!(tasks.status(handle), Some(TaskStatus::Runnable));
+    }
+
+    #[test]
+    fn runnable_wake_survives_poll_handoff() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let waker = tasks.waker(handle).expect("submitted task should be live");
+        waker.wake_by_ref();
+
+        let (key, future, wake_state, _mailbox) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("submitted task should be runnable");
+
+        drop(wake_state);
+
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken { .. })
+        ));
+    }
+
+    #[test]
+    fn owner_mailbox_post_during_polling_survives_pending_commit() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let (key, future, _wake_state, mailbox) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("submitted task should be runnable");
+
+        assert!(mailbox.post_with_scheduler_hint(
+            MailboxEvent::SourceFired {
+                generation: WaitGeneration::new(1),
+                source: WaitSourceId::new(7),
+                interests: InterestMask::new(0b1),
+            },
+            MailboxSchedulerHint::LifecycleWake,
+        ));
+        assert!(
+            tasks
+                .make_owner_runnable_with_hint(key.id(), key.generation())
+                .is_none(),
+            "Polling owner wake should be committed after poll returns"
+        );
+
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken {
+                hint: MailboxSchedulerHint::LifecycleWake,
+                mailbox_event: true,
+                ..
+            })
+        ));
     }
 
     #[test]

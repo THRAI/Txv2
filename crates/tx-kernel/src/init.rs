@@ -3085,9 +3085,9 @@ impl<P: TxPlatform> CoreInit<P> {
 
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
         let mut signal = SmpRescheduleSignal::<P>::new();
-        let submit_report = BOOT_REACTOR
+        let (owner_task, submit_report) = BOOT_REACTOR
             .with(|reactor| {
-                let (_task, report) = reactor.submit_task_with_meta_from_hart(
+                reactor.submit_task_with_meta_from_hart(
                     OwnerWakeSmpPark {
                         hart: target_cpu.0,
                         source: Arc::clone(&source),
@@ -3104,8 +3104,7 @@ impl<P: TxPlatform> CoreInit<P> {
                         .with_affinity(CpuMask::single(target_cpu).bits()),
                     current_hart,
                     &mut signal,
-                );
-                report
+                )
             })
             .expect("boot reactor must be initialized before owner-wake SMP smoke");
         assert_eq!(
@@ -3113,6 +3112,7 @@ impl<P: TxPlatform> CoreInit<P> {
             "owner-wake SMP submit remote IPI"
         );
         Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_INITIALIZED);
+        Self::wait_for_owner_wake_task_parked(owner_task);
 
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
         let mut signal = SmpRescheduleSignal::<P>::new();
@@ -3140,6 +3140,7 @@ impl<P: TxPlatform> CoreInit<P> {
         assert_eq!(source_wakes, 1, "owner-wake source wake count");
         assert_eq!(source_report.remote_ipis, 1, "owner-wake source remote IPI");
         Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_SOURCE);
+        Self::wait_for_owner_wake_task_parked(owner_task);
 
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
         let mut signal = SmpRescheduleSignal::<P>::new();
@@ -3173,6 +3174,7 @@ impl<P: TxPlatform> CoreInit<P> {
         assert_eq!(timer_fired, 1, "owner-wake timer fire count");
         assert_eq!(timer_report.remote_ipis, 1, "owner-wake timer remote IPI");
         Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_TIMER);
+        Self::wait_for_owner_wake_task_parked(owner_task);
 
         let token = (*OWNER_WAKE_SMP_DELEGATE_TOKEN.lock()).expect("owner-wake delegate token");
         let registry = OWNER_WAKE_SMP_DELEGATE_REGISTRY
@@ -3220,6 +3222,22 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         panic!("owner-wake SMP smoke stage {expected} not observed");
+    }
+
+    fn wait_for_owner_wake_task_parked(task: boot_runtime::TaskKey) {
+        for _ in 0..AP_REACTOR_WAIT_SPINS {
+            let parked = BOOT_REACTOR
+                .with(|reactor| {
+                    reactor.task_key_status(task) == Some(boot_runtime::TaskStatus::Parked)
+                })
+                .expect("boot reactor must be initialized for owner-wake task status");
+            if parked {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+
+        panic!("owner-wake task did not finish its pending-to-parked commit");
     }
 
     fn run_rcu_smp_smoke() {
